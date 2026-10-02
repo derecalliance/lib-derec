@@ -104,60 +104,83 @@ describe('DeRecProtocolBuilder', () => {
     expect(lastConfig!.threshold).toBe(5);
     expect(lastConfig!.keep_versions_count).toBe(7);
     expect(lastConfig!.auto_respond_on_failure).toBe(true);
-    expect(lastConfig!.unpair_ack).toBe(1);
+    expect(lastConfig!.unpair_ack).toBe('not_required');
     expect(lastConfig!.auto_reply_to).toBe(true);
-    expect(lastConfig!.auto_accept).toEqual({
-      pairing: true,
-      pre_pair: false,
-      store_share: false,
-      verify_share: false,
-      discovery: false,
-      get_share: false,
-      unpair: false,
-      update_channel_info: false,
+    // Only the named flow crosses; the library defaults every other one.
+    expect(lastConfig!.auto_accept).toEqual({ pairing: true });
+  });
+
+  it('forwards an explicit false auto-accept flow verbatim', () => {
+    baseBuilder().withAutoAccept({ unpair: false, discovery: true }).build();
+    expect(lastConfig!.auto_accept).toEqual({ unpair: false, discovery: true });
+  });
+
+  it('carries communication_info in the construction config', () => {
+    let setterCalls = 0;
+    // @ts-expect-error test-only global
+    globalThis.__DeRec.protocol_new = (configJson: string) => {
+      lastConfig = JSON.parse(configJson);
+      return {
+        secretId: () => 7n,
+        setCommunicationInfo: async () => {
+          setterCalls += 1;
+        },
+      };
+    };
+    baseBuilder().withCommunicationInfo({ name: 'alice' }).build();
+    expect(lastConfig!.communication_info).toEqual({ name: 'alice' });
+    expect(setterCalls).toBe(0);
+  });
+
+  it('omits communication_info when never configured', () => {
+    baseBuilder().build();
+    expect(lastConfig).not.toHaveProperty('communication_info');
+  });
+
+  it('sends parameter-range bounds as exact decimal strings', () => {
+    baseBuilder()
+      .withParameterRange({
+        min_share_size: 9007199254740993n,
+        max_unresponsive_deactivation_timeout: -9223372036854775808n,
+      })
+      .build();
+    // Bounds not supplied are absent, so the library's default applies.
+    expect(lastConfig!.parameter_range).toEqual({
+      min_share_size: '9007199254740993',
+      max_unresponsive_deactivation_timeout: '-9223372036854775808',
     });
   });
 
-  // F6: an unrecognized value must not silently become "not required" — it
-  // must throw, the same way `protocolDiscriminant` throws on an unknown
-  // transport protocol name.
-  it('withUnpairAck throws on a value that is neither "required" nor "not_required"', () => {
-    expect(() => baseBuilder().withUnpairAck('bogus' as never)).toThrow();
+  // An unrecognized value must reach the library unchanged, so the library
+  // refuses it instead of the wrapper reinterpreting it.
+  it('withUnpairAck forwards an unrecognized value verbatim', () => {
+    baseBuilder().withUnpairAck('bogus' as never).build();
+    expect(lastConfig!.unpair_ack).toBe('bogus');
   });
 });
 
-// The name → `derec_proto::Protocol` mapping is Rust's
-// (`derec_transport_protocol_discriminant`). This SDK forwards the name as
-// given and the result as returned, so an unknown name reaches Rust as `-1`
-// and is rejected by Rust's transport validation, not by a table here.
+// A transport protocol crosses by name, as given. Rust maps the name and
+// rejects one it does not recognise; nothing here translates or checks it.
 describe('own transports protocol names', () => {
-  let names: string[];
   let setOwnTransportsWire: unknown;
 
-  const RUST_DISCRIMINANTS: Record<string, number> = { grpc: 1, GRPC: 1, bogus: -1 };
-
   beforeEach(() => {
-    names = [];
     lastConfig = undefined;
     setOwnTransportsWire = undefined;
     // @ts-expect-error test-only global
     globalThis.__DeRec = {
-      transport_protocol_discriminant: (name: string) => {
-        names.push(name);
-        return RUST_DISCRIMINANTS[name];
-      },
       protocol_new: (configJson: string) => {
         lastConfig = JSON.parse(configJson);
-        const protocol = (lastConfig!.own_transports as { protocol: number }[])[0].protocol;
-        if (protocol === -1) {
-          throw new Error('transport_invalid: unsupported protocol discriminant -1');
+        const protocol = (lastConfig!.own_transports as { protocol: string }[])[0].protocol;
+        if (protocol === 'bogus') {
+          throw new Error('transport_invalid: unknown transport protocol "bogus"');
         }
         return {
           setOwnTransports: async (bytes: Uint8Array) => {
             setOwnTransportsWire = JSON.parse(String.fromCharCode(...Array.from(bytes)));
-            const entries = setOwnTransportsWire as { protocol: number }[];
-            if (entries.some((e) => e.protocol === -1)) {
-              throw new Error('transport_invalid: unsupported protocol discriminant -1');
+            const entries = setOwnTransportsWire as { protocol: string }[];
+            if (entries.some((e) => e.protocol === 'bogus')) {
+              throw new Error('transport_invalid: unknown transport protocol "bogus"');
             }
           },
         };
@@ -173,42 +196,35 @@ describe('own transports protocol names', () => {
       .withUserSecretStore(stores.userSecretStore as never)
       .withStateStore(stores.stateStore as never)
       .withTransport(stores.transport as never)
-      .withOwnTransports([{ uri: 'grpcs://example.com:443', protocol }]);
+      .withOwnTransports([{ uri: 'grpcs://example.com:443', protocol: protocol as never }]);
   }
 
-  it.each(['grpc', 'GRPC'])('withOwnTransports asks Rust for "%s"', (name) => {
-    builderWith(name).build();
-    expect(names).toEqual([name]);
+  it('withOwnTransports forwards the protocol name verbatim', () => {
+    builderWith('grpc').build();
     expect(lastConfig!.own_transports).toEqual([
-      { uri: 'grpcs://example.com:443', protocol: 1 },
+      { uri: 'grpcs://example.com:443', protocol: 'grpc' },
     ]);
   });
 
   it('withOwnTransports forwards an unknown name to Rust, which rejects it', () => {
-    const builder = builderWith('bogus');
-    expect(() => builder.build()).toThrow(/transport_invalid/);
-    expect(names).toEqual(['bogus']);
+    expect(() => builderWith('bogus').build()).toThrow(/transport_invalid/);
     expect(lastConfig!.own_transports).toEqual([
-      { uri: 'grpcs://example.com:443', protocol: -1 },
+      { uri: 'grpcs://example.com:443', protocol: 'bogus' },
     ]);
   });
 
-  it.each(['grpc', 'GRPC'])('setOwnTransports asks Rust for "%s"', async (name) => {
+  it('setOwnTransports forwards the protocol name verbatim', async () => {
     const protocol = builderWith('grpc').build();
-    names = [];
-    await protocol.setOwnTransports([{ uri: 'grpcs://example.com:443', protocol: name }]);
-    expect(names).toEqual([name]);
-    expect(setOwnTransportsWire).toEqual([{ uri: 'grpcs://example.com:443', protocol: 1 }]);
+    await protocol.setOwnTransports([{ uri: 'grpcs://example.com:443', protocol: 'grpc' }]);
+    expect(setOwnTransportsWire).toEqual([{ uri: 'grpcs://example.com:443', protocol: 'grpc' }]);
   });
 
   it('setOwnTransports forwards an unknown name to Rust, which rejects it', async () => {
     const protocol = builderWith('grpc').build();
-    names = [];
     await expect(
-      protocol.setOwnTransports([{ uri: 'grpcs://example.com:443', protocol: 'bogus' }]),
+      protocol.setOwnTransports([{ uri: 'grpcs://example.com:443', protocol: 'bogus' as never }]),
     ).rejects.toThrow(/transport_invalid/);
-    expect(names).toEqual(['bogus']);
-    expect(setOwnTransportsWire).toEqual([{ uri: 'grpcs://example.com:443', protocol: -1 }]);
+    expect(setOwnTransportsWire).toEqual([{ uri: 'grpcs://example.com:443', protocol: 'bogus' }]);
   });
 });
 
@@ -440,5 +456,41 @@ describe('event byte fields', () => {
     expect(recovered.secret.helpers[0].shared_key).toBeInstanceOf(Uint8Array);
     expect(recovered.secret.secrets[0].id).toBeInstanceOf(Uint8Array);
     expect(Array.from(recovered.secret.secrets[0].data)).toEqual([2, 3]);
+  });
+
+  it('passes PeerNotRestored from restore through unchanged', async () => {
+    const events = [
+      {type: 'PeerNotRestored', channel_id: '18446744073709551615', reason: 'NoTransports'},
+      {
+        type: 'PeerNotRestored',
+        channel_id: '21',
+        replica_id: '18446744073709551615',
+        reason: 'NoTransports',
+      },
+    ];
+    let sent: unknown;
+    host.restore = (params: Uint8Array) => {
+      sent = JSON.parse(String.fromCharCode(...Array.from(params)));
+      return Promise.resolve(utf8(JSON.stringify(events)).buffer);
+    };
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    const decoded = (await protocol.restore(
+      {
+        helpers: [{channel_id: '18446744073709551615', transports: [], shared_key: new Uint8Array([1])}],
+        secrets: [],
+      },
+      1,
+    )) as Array<Extract<DeRecEvent, {type: 'PeerNotRestored'}>>;
+
+    // An empty endpoint list is Rust's to judge; the shim forwards it as is.
+    expect((sent as {recovered_secret: {helpers: Array<{transports: unknown}>}})
+      .recovered_secret.helpers[0].transports).toEqual([]);
+    expect(decoded[0]).toEqual(events[0]);
+    expect(decoded[0].replica_id).toBeUndefined();
+    expect(decoded[1].channel_id).toBe('21');
+    expect(decoded[1].replica_id).toBe('18446744073709551615');
+    expect(decoded[1].reason).toBe('NoTransports');
   });
 });

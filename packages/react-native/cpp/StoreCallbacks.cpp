@@ -25,7 +25,7 @@ namespace {
 
 static_assert(sizeof(ChannelStoreCallbacks) == 9 * sizeof(void*),
               "ChannelStoreCallbacks layout changed; update the bindings");
-static_assert(sizeof(SecretStoreCallbacks) == 5 * sizeof(void*),
+static_assert(sizeof(SecretStoreCallbacks) == 6 * sizeof(void*),
               "SecretStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(ShareStoreCallbacks) == 8 * sizeof(void*),
               "ShareStoreCallbacks layout changed; update the bindings");
@@ -265,6 +265,37 @@ ResultConverter makeSecretLoadResult(uint32_t kind) {
   };
 }
 
+/// `SecretStore.loadMany(): Promise<Array<Uint8Array | null | undefined>>`.
+/// Encodes the resolved array element by element, in order, as the wire's
+/// `Vec<Option<SecretValueRecord>>` JSON: the record `load` builds, or `null`
+/// for a `null`/`undefined` entry. The library pairs entries with the
+/// requested ids and decides what a missing one means.
+///
+/// A non-array return is a backend failure, never an empty list.
+ResultConverter makeSecretLoadManyResult(uint32_t kind) {
+  return [kind](jsi::Runtime& rt, const jsi::Value& value) -> CallResult {
+    if (!value.isObject()) {
+      return CallResult{kBackendFailure, {}};
+    }
+    jsi::Array arr = value.asObject(rt).asArray(rt);
+    size_t n = arr.size(rt);
+    std::string text = "[";
+    for (size_t i = 0; i < n; ++i) {
+      if (i != 0) text += ',';
+      jsi::Value entry = arr.getValueAtIndex(rt, i);
+      if (entry.isNull() || entry.isUndefined()) {
+        text += "null";
+        continue;
+      }
+      ByteView bytes = asBytes(rt, entry);
+      std::vector<uint8_t> record = secretValueRecordJson(kind, bytes.ptr, bytes.len);
+      text.append(record.begin(), record.end());
+    }
+    text += ']';
+    return CallResult{0, std::vector<uint8_t>(text.begin(), text.end())};
+  };
+}
+
 /// `StateStore.loadAll(): Promise<Uint8Array[]>`. Each element is already
 /// the exact item-JSON blob the wire expects; splice the raw bytes into an
 /// array rather than re-parsing and re-serialising them.
@@ -450,7 +481,7 @@ extern "C" int32_t channelStoreListReplicas(void* userData, uint64_t secretId, c
   return result.code;
 }
 
-/// `ChannelStore.linkChannel(secretId, channelId, linkedChannelId) -> void`
+/// `ChannelStore.linkChannel(secretId, a, b) -> void`
 extern "C" int32_t channelStoreLinkChannel(void* userData, uint64_t secretId, uint64_t a, uint64_t b) {
   auto* self = static_cast<StoreBindings*>(userData);
   // Kept alive past this call so the lambda handed to `callSync` — which the
@@ -512,6 +543,39 @@ extern "C" int32_t secretStoreLoad(void* userData, uint64_t secretId, uint64_t c
         jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId), idVal(rt, channelId),
                                                   jsi::Value(static_cast<int>(kind)));
         keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), makeSecretLoadResult(kind));
+      });
+  if (result.code == 0) {
+    if (!writeOut(result.bytes, outPtr, outLen)) {
+      return kBackendFailure;
+    }
+  } else {
+    *outPtr = nullptr;
+    *outLen = 0;
+  }
+  return result.code;
+}
+
+/// `SecretStore.loadMany(secretId, channelIds, kind) -> Array<Uint8Array | null>`
+extern "C" int32_t secretStoreLoadMany(void* userData, uint64_t secretId, const uint8_t* channelIdsJsonPtr,
+                                        size_t channelIdsJsonLen, uint32_t kind, uint8_t** outPtr,
+                                        size_t* outLen) {
+  auto* self = static_cast<StoreBindings*>(userData);
+  // Kept alive past this call so the lambda handed to `callSync` — which the
+  // JavaScript CallInvoker's queue may still be holding after this object's
+  // owner has released its own reference — has somewhere safe to run.
+  auto keepAlive = self->shared_from_this();
+  std::vector<uint64_t> channelIds = parseUnsignedJsonArray(channelIdsJsonPtr, channelIdsJsonLen);
+  CallResult result = keepAlive->bridge().callSync(
+      [keepAlive, secretId, channelIds, kind](std::function<void(CallResult)> settle) {
+        jsi::Runtime& rt = keepAlive->runtime();
+        auto store = keepAlive->secretStore();
+        auto method = store->getPropertyAsFunction(rt, "loadMany");
+        jsi::Value promise =
+            method.callWithThis(rt, *store, idVal(rt, secretId),
+                                 jsi::Value(rt, u64VectorToJsStringArray(rt, channelIds)),
+                                 jsi::Value(static_cast<int>(kind)));
+        keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle),
+                                     makeSecretLoadManyResult(kind));
       });
   if (result.code == 0) {
     if (!writeOut(result.bytes, outPtr, outLen)) {
@@ -910,30 +974,25 @@ extern "C" int32_t transportSend(void* userData, const uint8_t* endpointsPtr, si
   // owner has released its own reference — has somewhere safe to run.
   auto keepAlive = self->shared_from_this();
 
-  // A discriminant the crate cannot name fails the send: the application
-  // cannot act on a protocol it does not recognise.
-  std::optional<std::vector<NamedEndpoint>> decoded =
-      decodeTransportEndpoints(endpointsPtr, endpointsLen);
-  if (!decoded) return -1;
-  std::vector<NamedEndpoint> endpoints = std::move(*decoded);
+  // The crate decodes its own endpoint framing, names each protocol, and
+  // fails the send on a discriminant it cannot name; this layer only parses
+  // the JSON array `Transport.send` receives.
+  DeRecMessageJsonResult decoded = derec_transport_endpoints_json(endpointsPtr, endpointsLen);
+  if (decoded.error.code != 0) {
+    derec_free_error(&decoded.error);
+    return -1;
+  }
+  std::vector<uint8_t> endpointsJson = takeBuffer(decoded.bytes);
 
   std::vector<uint8_t> message(bytes, bytes + len);
-  CallResult result = keepAlive->bridge().callSync([keepAlive, endpoints,
+  CallResult result = keepAlive->bridge().callSync([keepAlive, endpointsJson,
                                                 message](std::function<void(CallResult)> settle) {
     jsi::Runtime& rt = keepAlive->runtime();
     auto store = keepAlive->transportStore();
     auto method = store->getPropertyAsFunction(rt, "send");
-    jsi::Array endpointsJs(rt, endpoints.size());
-    for (size_t i = 0; i < endpoints.size(); ++i) {
-      jsi::Object endpoint(rt);
-      endpoint.setProperty(rt, "protocol",
-                            jsi::Value(rt, jsi::String::createFromUtf8(rt, endpoints[i].protocol)));
-      endpoint.setProperty(rt, "uri",
-                            jsi::Value(rt, jsi::String::createFromUtf8(rt, endpoints[i].uri)));
-      endpointsJs.setValueAtIndex(rt, i, endpoint);
-    }
+    jsi::Value endpointsJs = jsonParseUtf8(rt, endpointsJson.data(), endpointsJson.size());
     jsi::Value promise =
-        method.callWithThis(rt, *store, jsi::Value(rt, endpointsJs), toUint8ArrayVal(rt, message));
+        method.callWithThis(rt, *store, endpointsJs, toUint8ArrayVal(rt, message));
     keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
   });
   return result.code;
@@ -1050,11 +1109,12 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
       storeFreeBuffer,             // free_buffer
   };
   bindings->secretCallbacks_ = SecretStoreCallbacks{
-      self,              // user_data
-      secretStoreLoad,   // load
-      secretStoreSave,   // save
-      secretStoreRemove, // remove
-      storeFreeBuffer,   // free_buffer
+      self,                // user_data
+      secretStoreLoad,     // load
+      secretStoreLoadMany, // load_many
+      secretStoreSave,     // save
+      secretStoreRemove,   // remove
+      storeFreeBuffer,     // free_buffer
   };
   bindings->shareCallbacks_ = ShareStoreCallbacks{
       self,                    // user_data
@@ -1098,6 +1158,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
 
   requireField(rt, bindings->secretCallbacks_.user_data, "SecretStoreCallbacks.user_data");
   requireField(rt, bindings->secretCallbacks_.load, "SecretStoreCallbacks.load");
+  requireField(rt, bindings->secretCallbacks_.load_many, "SecretStoreCallbacks.load_many");
   requireField(rt, bindings->secretCallbacks_.save, "SecretStoreCallbacks.save");
   requireField(rt, bindings->secretCallbacks_.remove, "SecretStoreCallbacks.remove");
   requireField(rt, bindings->secretCallbacks_.free_buffer, "SecretStoreCallbacks.free_buffer");

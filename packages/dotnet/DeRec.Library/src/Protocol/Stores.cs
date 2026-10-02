@@ -4,6 +4,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 using DeRec.Library.Primitives;
 
@@ -46,10 +48,34 @@ public enum ChannelStatus
 /// the channel cannot carry it. The value is absolute — every member records
 /// the same role for a given peer, regardless of who is reading.
 /// </remarks>
+[JsonConverter(typeof(ReplicaRoleJsonConverter))]
 public enum ReplicaRole
 {
     Source,
     Destination,
+}
+
+/// <summary>
+/// JSON form of <see cref="ReplicaRole"/>: exactly <c>"Source"</c> or
+/// <c>"Destination"</c>, the names the Rust core reads and writes.
+/// </summary>
+internal sealed class ReplicaRoleJsonConverter : JsonConverter<ReplicaRole>
+{
+    /// <summary>Decode the wire name of a role; any other value is a <see cref="JsonException"/>.</summary>
+    public static ReplicaRole Parse(string? name) => name switch
+    {
+        nameof(ReplicaRole.Source) => ReplicaRole.Source,
+        nameof(ReplicaRole.Destination) => ReplicaRole.Destination,
+        _ => throw new JsonException($"replica role must be \"Source\" or \"Destination\", got \"{name}\""),
+    };
+
+    public override ReplicaRole Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+        reader.TokenType == JsonTokenType.String
+            ? Parse(reader.GetString())
+            : throw new JsonException($"replica role must be a JSON string, got {reader.TokenType}");
+
+    public override void Write(Utf8JsonWriter writer, ReplicaRole value, JsonSerializerOptions options) =>
+        writer.WriteStringValue(value.ToString());
 }
 
 /// <summary>
@@ -315,6 +341,14 @@ public interface IChannelStore
 public interface ISecretStore
 {
     SecretValue? Load(ulong secretId, ulong channelId, SecretKind kind);
+    /// <summary>
+    /// Records of <paramref name="kind"/> for several channels within
+    /// <paramref name="secretId"/>: exactly one entry per id in
+    /// <paramref name="channelIds"/>, in the same order, <c>null</c> where
+    /// nothing of <paramref name="kind"/> is stored. Whether a missing entry
+    /// is an error is decided by the library, not the store.
+    /// </summary>
+    IReadOnlyList<SecretValue?> LoadMany(ulong secretId, ulong[] channelIds, SecretKind kind);
     void Save(ulong secretId, ulong channelId, SecretValue value);
     void Remove(ulong secretId, ulong channelId, SecretKind kind);
 }
@@ -679,6 +713,18 @@ public sealed record StateKey(StateKind Kind, ulong? ChannelId, ulong? SecretId,
 /// </param>
 /// <param name="SyncedReplicas">Replica-id set of members that acknowledged.</param>
 /// <param name="BehindReplicas">Replica-id set of members that refused, timed out, or were unreachable.</param>
+/// <param name="LocalVersion">
+/// The version this device held when a catch-up started (only for
+/// <see cref="StateKind.PendingReplicaDiscovery"/>).
+/// </param>
+/// <param name="Reported">
+/// Version each group member reported so far, by <c>replicaId</c> (only for
+/// <see cref="StateKind.PendingReplicaDiscovery"/>).
+/// </param>
+/// <remarks>
+/// Fields are carried exactly as the library wrote them. A replica-id set
+/// left null is read by the library as empty.
+/// </remarks>
 public sealed record StateItem(
     StateKind Kind,
     ulong? ChannelId,
@@ -727,9 +773,7 @@ public sealed record StateItem(
         ulong[]? syncedReplicas = null,
         ulong[]? behindReplicas = null) =>
         new(StateKind.SharingRound, null, null, version, startedAt, null, null, pending, confirmed, failed,
-            pendingReplicas ?? Array.Empty<ulong>(),
-            syncedReplicas ?? Array.Empty<ulong>(),
-            behindReplicas ?? Array.Empty<ulong>());
+            pendingReplicas, syncedReplicas, behindReplicas);
     public static StateItem PendingReplicaDiscovery(
         uint localVersion,
         ulong[] pendingReplicas,

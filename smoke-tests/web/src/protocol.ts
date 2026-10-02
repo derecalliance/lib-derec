@@ -14,6 +14,7 @@ import type {
   ChannelStatusName,
   ChannelStore,
   ContactMessage,
+  DeRecError,
   DeRecEvent,
   HelperFilter,
   ReplicaFilter,
@@ -72,7 +73,6 @@ class InMemorySecretStore implements SecretStore {
     secretId: string,
     channelIds: string[],
     kind: 0 | 1 | 2,
-    _missingPolicy: "skip" | "fail",
   ): Promise<Array<Uint8Array | null>> {
     return channelIds.map(
       (id) => this.data.get(this.key(secretId, id, kind)) ?? null,
@@ -437,6 +437,8 @@ function makeNode(
     replicaId?: bigint;
     secretId?: bigint;
     threshold?: number;
+    /** Leave `withThreshold` uncalled so the library default applies. */
+    omitThreshold?: boolean;
     unsafeConnection?: boolean;
   } = {},
 ): Node {
@@ -454,9 +456,11 @@ function makeNode(
     .withStateStore(stateStore)
     .withTransport(transport)
     .withOwnTransports([{ uri: endpointUri, protocol: "https" }])
-    .withThreshold(options.threshold ?? THRESHOLD)
     .withKeepVersionsCount(KEEP_VERSIONS_COUNT)
     .withCommunicationInfo({ name });
+  if (!options.omitThreshold) {
+    builder = builder.withThreshold(options.threshold ?? THRESHOLD);
+  }
   if (options.autoReplyTo !== undefined) {
     builder = builder.withAutoReplyTo(options.autoReplyTo);
   }
@@ -908,7 +912,7 @@ async function runHashedKeysPairingFlow(): Promise<void> {
   console.log(`  shared keys match (${ownerSharedKey.length}B)  ✓\n`);
 
   // Negative: tampering the binding hash before the scanner starts must
-  // surface `PREPAIR_HASH_MISMATCH` once the real keys arrive. This is
+  // surface `prepair_hash_mismatch` once the real keys arrive. This is
   // the security-relevant guarantee of HashedKeys — the scanner refuses
   // keys that don't match the commitment they originally accepted.
   console.log("  -- Negative: tampered binding hash --");
@@ -944,7 +948,7 @@ async function runHashedKeysPairingFlow(): Promise<void> {
   if (!caught) {
     throw new Error("tampered binding hash must cause process(PrePairResponse) to throw");
   }
-  if (caught.category !== "pairing" || caught.code !== "PREPAIR_HASH_MISMATCH") {
+  if (caught.category !== "pairing" || caught.code !== "prepair_hash_mismatch") {
     throw new Error(
       `tampered binding hash must surface pairing/PREPAIR_HASH_MISMATCH, got ${caught.category}/${caught.code}: ${caught.message}`,
     );
@@ -1268,6 +1272,36 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   console.log(
     `  [Restored] restore(recovered, 1) → snapshot v1 (${restoredSnapshot.secrets.length} secret) + ${recovered.helpers.length} helper channel(s) ✓`,
   );
+
+  // Restore errors carry the same `category` as every other library error,
+  // and a conflict names the channels that block it.
+  const restoreError = async (label: string): Promise<DeRecError> => {
+    try {
+      await restored.protocol.restore(recovered, 1);
+    } catch (e) {
+      return e as DeRecError;
+    }
+    throw new Error(`${label}: restore must be refused`);
+  };
+  const already = await restoreError("second restore");
+  if (already.code !== "already_restored" || already.category !== "input") {
+    throw new Error(
+      `second restore: expected input/already_restored, got ${already.category}/${already.code}`,
+    );
+  }
+  await restored.userSecretStore.remove(ownerSecretId.toString());
+  const conflict = await restoreError("restore over existing channels");
+  const expectedIds = recovered.helpers.map((h) => h.channel_id).sort();
+  if (
+    conflict.code !== "restore_conflict" ||
+    conflict.category !== "input" ||
+    JSON.stringify([...(conflict.channel_ids ?? [])].sort()) !== JSON.stringify(expectedIds)
+  ) {
+    throw new Error(
+      `restore over existing channels: expected input/restore_conflict naming ${expectedIds.join(",")}, got ${JSON.stringify(conflict)}`,
+    );
+  }
+  console.log("  [Restored] already_restored and restore_conflict carry category \"input\"; restore_conflict names the channels ✓");
 
   console.log("\n✓ Discovery & Recovery flow passed.\n");
 }
@@ -1665,14 +1699,14 @@ async function runUpdateChannelInfoFlow(): Promise<void> {
   await owner.protocol.start(FlowKind.UpdateChannelInfo, {
     target: BigInt(longTermChannelId),
     communication_info: newInfo,
-    own_transports: [{ uri: newUri, protocol: 0 }],
+    own_transports: [{ uri: newUri, protocol: "https" }],
   });
   const updateRequest = drainOne(owner, "Owner");
   console.log(`  [Owner] start(UpdateChannelInfo) → request ${updateRequest.length}B`);
 
   const helperEvents = await processAll(helper, updateRequest);
   const updateAction = requireEvent(helperEvents, "ActionRequired", "Helper");
-  if (JSON.stringify(updateAction.updated_transports) !== JSON.stringify([{ uri: newUri, protocol: 0 }])) {
+  if (JSON.stringify(updateAction.updated_transports) !== JSON.stringify([{ uri: newUri, protocol: "https" }])) {
     throw new Error(
       `ActionRequired(UpdateChannelInfo).updated_transports must match the announced endpoints; got ${JSON.stringify(updateAction.updated_transports)}`,
     );
@@ -1793,6 +1827,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runReplicaSyncVersionProgressionFlow();
   await runAutoAcceptFlow();
   await runExpiredChannelCleanupFlow();
+  await runBindingInputContractFlow();
 
   console.log("━━━ [Protocol] All passed. ━━━\n");
 }
@@ -2653,4 +2688,186 @@ function matchesFilter(
     (record.status ?? "Paired") as ChannelStatusName,
     role as SenderKindName | ReplicaRoleName,
   );
+}
+
+/** The `code` of a structured binding error, or `undefined` for anything else. */
+function errorCode(e: unknown): string | undefined {
+  return typeof e === "object" && e !== null && "code" in e
+    ? String((e as { code: unknown }).code)
+    : undefined;
+}
+
+async function expectCode(
+  label: string,
+  expected: string,
+  call: () => unknown,
+): Promise<void> {
+  let code: string | undefined;
+  try {
+    await call();
+  } catch (e) {
+    code = errorCode(e);
+    if (code === undefined) throw e;
+  }
+  if (code !== expected) {
+    throw new Error(`${label}: expected error code ${expected}, got ${code ?? "no error"}`);
+  }
+}
+
+/**
+ * What crosses the binding is forwarded or rejected, never reinterpreted.
+ *
+ * Each case is one the bridge used to settle on its own: a restated default,
+ * an accepted alias, a number silently truncated to an id, an empty id read
+ * as `0`, a console write in place of the error path.
+ */
+async function runBindingInputContractFlow(): Promise<void> {
+  console.log("=== [Protocol] binding input contract ===\n");
+
+  // No `withThreshold`: the library's default (3) must be what applies. Two
+  // helpers are below it, so the round splits nothing and sends them nothing,
+  // where a 2-of-2 threshold would send each a share.
+  const owner = makeNode("DefaultOwner", "https://default-owner.example.com", {
+    omitThreshold: true,
+  });
+  const helperA = makeNode("DefaultHelperA", "https://default-helper-a.example.com");
+  const helperB = makeNode("DefaultHelperB", "https://default-helper-b.example.com");
+  await doPair(helperA, owner, 9101n, "DefaultOwner↔HelperA");
+  await doPair(helperB, owner, 9102n, "DefaultOwner↔HelperB");
+  owner.transport.drain();
+  await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([1]), name: "s", data: new Uint8Array([1]) }],
+  });
+  const sent = owner.transport.drain();
+  if (sent.length !== 0) {
+    throw new Error(
+      `without withThreshold the library default (3) must apply: 2 helpers get no share, but ${sent.length} request(s) were sent`,
+    );
+  }
+  console.log("  no withThreshold → the library default (3) applies: 2 helpers get no share  ✓");
+
+  const base = () =>
+    new DeRecProtocolBuilder(DEFAULT_TEST_SECRET_ID)
+      .withChannelStore(new InMemoryChannelStore())
+      .withShareStore(new InMemoryShareStore())
+      .withSecretStore(new InMemorySecretStore())
+      .withUserSecretStore(new InMemoryUserSecretStore())
+      .withStateStore(new InMemoryStateStore())
+      .withTransport(new RecordingTransport())
+      .withOwnTransports([{ uri: "https://contract.example.com", protocol: "https" }]);
+
+  // `withUnpairAck` takes the two names `UnpairAck` declares, exactly.
+  base().withUnpairAck("required").withUnpairAck("not_required").build();
+  for (const alias of ["fire_and_forget", "notrequired", "NOT_REQUIRED", "Required"]) {
+    await expectCode(`withUnpairAck(${alias})`, "invalid_unpair_ack", () =>
+      base().withUnpairAck(alias as never),
+    );
+  }
+  console.log("  withUnpairAck accepts only \"required\" / \"not_required\"  ✓");
+
+  // A node with no endpoint cannot be reached by any peer. An absent or empty
+  // own-transport list reaches the library unchanged and is refused there.
+  const unreachable = () =>
+    new DeRecProtocolBuilder(DEFAULT_TEST_SECRET_ID)
+      .withChannelStore(new InMemoryChannelStore())
+      .withShareStore(new InMemoryShareStore())
+      .withSecretStore(new InMemorySecretStore())
+      .withUserSecretStore(new InMemoryUserSecretStore())
+      .withStateStore(new InMemoryStateStore())
+      .withTransport(new RecordingTransport());
+  await expectCode("build() without withOwnTransports", "invalid_input", () =>
+    unreachable().build(),
+  );
+  await expectCode("build() with withOwnTransports([])", "invalid_input", () =>
+    unreachable().withOwnTransports([]).build(),
+  );
+  console.log("  absent or empty own transports refused by the library  ✓");
+
+  // The library's memory is released explicitly. Releasing twice is a no-op,
+  // as with .NET Dispose and Go Close; any call afterwards is refused.
+  const released = base().build();
+  released.free();
+  released.free();
+  let usedAfterFree = false;
+  try {
+    released.secretId();
+    usedAfterFree = true;
+  } catch {
+    // expected
+  }
+  if (usedAfterFree) {
+    throw new Error("a call after free() must throw");
+  }
+  const unbuilt = base();
+  unbuilt.free();
+  unbuilt[Symbol.dispose]();
+  const built = base();
+  const fromBuilt = built.build();
+  built.free();
+  fromBuilt[Symbol.dispose]();
+  console.log("  free() / [Symbol.dispose]() release once and are safe to repeat  ✓");
+
+  const protocol = base().build();
+
+  // `removeExpiredChannels` takes a u64 in every encoding ids use.
+  for (const secs of [0, 5n, "7", 2n ** 64n - 1n]) {
+    const removed = await protocol.removeExpiredChannels(secs);
+    if (!Array.isArray(removed)) {
+      throw new Error(`removeExpiredChannels(${String(secs)}) must resolve to an array`);
+    }
+  }
+  console.log("  removeExpiredChannels accepts number, bigint up to u64::MAX, decimal string  ✓");
+
+  // A number that is not exactly a u64 is refused, not truncated.
+  for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
+    await expectCode(`removeExpiredChannels(${bad})`, "decode_error", () =>
+      protocol.removeExpiredChannels(bad),
+    );
+    await expectCode(`getFingerprint(${bad})`, "decode_error", () =>
+      protocol.getFingerprint(bad),
+    );
+  }
+  for (const bad of ["", "-1", "+1", "1.0", "18446744073709551616"]) {
+    await expectCode(`removeExpiredChannels("${bad}")`, "decode_error", () =>
+      protocol.removeExpiredChannels(bad),
+    );
+  }
+  await expectCode("removeExpiredChannels(2^64)", "decode_error", () =>
+    protocol.removeExpiredChannels(2n ** 64n),
+  );
+  console.log("  fractional, negative, unsafe and out-of-range ids are refused  ✓");
+
+  // A recovered secret with an empty id is malformed, not channel 0.
+  const helper = (channel_id: string) => ({
+    helpers: [{ channel_id, transports: [], shared_key: new Uint8Array(32) }],
+    secrets: [],
+  });
+  for (const bad of ["", "-1", "abc"]) {
+    await expectCode(`restore(channel_id="${bad}")`, "invalid_recovered_secret", () =>
+      protocol.restore(helper(bad) as never, 1),
+    );
+  }
+  console.log("  restore refuses an empty or non-decimal channel_id  ✓");
+
+  // A failed `process` surfaces through the rejected promise only.
+  const original = console.error;
+  const logged: unknown[] = [];
+  console.error = (...args: unknown[]) => {
+    logged.push(args);
+  };
+  let rejected = false;
+  try {
+    await protocol.process(new Uint8Array([0xff, 0x00, 0x01]));
+  } catch {
+    rejected = true;
+  } finally {
+    console.error = original;
+  }
+  if (!rejected) throw new Error("process(garbage) must reject");
+  if (logged.length !== 0) {
+    throw new Error(`process must not write to the console, got ${JSON.stringify(logged)}`);
+  }
+  console.log("  a failed process() rejects without writing to the console  ✓");
+
+  console.log("\n✓ binding input contract passed.\n");
 }

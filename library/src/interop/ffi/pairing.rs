@@ -17,7 +17,6 @@
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use std::ffi::c_char;
 
-use crate::extensions::contact_message::ContactMessageExt as _;
 use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::interop::dto::ContactMessage as ContactMessageDto;
 use crate::interop::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
@@ -243,56 +242,8 @@ pub extern "C" fn create_contact_message(
     }
 }
 
-/// Structurally validate a proto-encoded `ContactMessage`. Returns a
-/// successful [`DeRecError`] iff the contact's `(contact_mode, inline keys,
-/// binding hash)` tuple satisfies the per-mode invariants enforced by the
-/// pairing primitives. Intended for bindings to call at their parse
-/// boundary (e.g. `FromProtoBytes`) so that the decoded value handed to
-/// application code is guaranteed well-formed.
-///
-/// Failure codes:
-/// - [`DEREC_CODE_FFI_BAD_PROTO`] if the bytes do not decode as a
-///   `ContactMessage`.
-/// - The library's `InvalidContactMessage` error code on any structural
-///   violation (unknown `contact_mode`, mode/field mismatch, wrong
-///   binding-hash length).
-///
-/// # Safety
-///
-/// `contact_message_ptr` must point to a readable range of
-/// `contact_message_len` bytes (or be null with `len == 0`).
-#[unsafe(no_mangle)]
-pub extern "C" fn validate_contact_message(
-    contact_message_ptr: *const u8,
-    contact_message_len: usize,
-) -> DeRecError {
-    let contact_message_bytes = match parse_buffer(
-        contact_message_ptr,
-        contact_message_len,
-        "contact_message_ptr",
-    ) {
-        Ok(b) => b,
-        Err(e) => return e,
-    };
-    let contact_message = match ContactMessage::decode(contact_message_bytes) {
-        Ok(c) => c,
-        Err(_) => {
-            return ffi_error(
-                DEREC_CODE_FFI_BAD_PROTO,
-                "contact_message_bytes is not a valid ContactMessage",
-            );
-        }
-    };
-    match contact_message.validate() {
-        Ok(()) => success(),
-        Err(e) => from_lib_error(e),
-    }
-}
-
 /// Encodes a JSON [`ContactMessageDto`] to `ContactMessage` proto wire bytes.
-/// Structurally validates the input first so a locally-constructed contact
-/// that violates the mode/field invariant is rejected at the boundary rather
-/// than silently serialized.
+/// See [`crate::primitives::pairing::request::encode_contact`].
 ///
 /// The JSON shape is [`ContactMessageDto`]'s serde representation with one
 /// adjustment applied at this seam: `channel_id` and `nonce` are decimal
@@ -342,20 +293,18 @@ pub extern "C" fn encode_contact_message(
     };
 
     let contact_message: ContactMessage = dto.into();
-    if let Err(e) = contact_message.validate() {
-        return with_err(from_lib_error(e));
-    }
-    EncodeContactMessageResult {
-        error: success(),
-        wire_bytes: vec_into_buffer(contact_message.encode_to_vec()),
+    match crate::primitives::pairing::request::encode_contact(&contact_message) {
+        Ok(bytes) => EncodeContactMessageResult {
+            error: success(),
+            wire_bytes: vec_into_buffer(bytes),
+        },
+        Err(e) => with_err(from_lib_error(e)),
     }
 }
 
 /// Decodes proto-encoded `ContactMessage` wire bytes into the JSON
 /// [`ContactMessageDto`] shape described on [`encode_contact_message`].
-/// Structurally validates the decoded value before returning it to
-/// application code so consumers can trust the mode/field invariants
-/// documented on the wire format.
+/// See [`crate::primitives::pairing::request::decode_contact`].
 ///
 /// # Safety
 ///
@@ -375,18 +324,10 @@ pub extern "C" fn decode_contact_message(
         Ok(b) => b,
         Err(e) => return with_err(e),
     };
-    let contact_message = match ContactMessage::decode(wire_bytes) {
+    let contact_message = match crate::primitives::pairing::request::decode_contact(wire_bytes) {
         Ok(c) => c,
-        Err(e) => {
-            return with_err(ffi_error(
-                DEREC_CODE_FFI_BAD_PROTO,
-                format!("contact_wire_bytes is not a valid ContactMessage: {e}"),
-            ));
-        }
+        Err(e) => return with_err(from_lib_error(e)),
     };
-    if let Err(e) = contact_message.validate() {
-        return with_err(from_lib_error(e));
-    }
 
     let dto: ContactMessageDto = contact_message.into();
     let mut json = match serde_json::to_value(&dto) {
@@ -505,6 +446,10 @@ pub extern "C" fn produce_pair_request_message(
     }
 }
 
+/// `parameter_range_ptr` may be null / zero-length to declare no parameter
+/// range; otherwise it must be serialized [`derec_proto::ParameterRange`]
+/// proto bytes. See [`crate::primitives::pairing::request::extract`].
+///
 /// # Safety
 ///
 /// Non-null input pointers must point to the corresponding readable byte ranges.
@@ -514,6 +459,8 @@ pub extern "C" fn extract_pair_request(
     request_len: usize,
     secret_key_material_ptr: *const u8,
     secret_key_material_len: usize,
+    parameter_range_ptr: *const u8,
+    parameter_range_len: usize,
 ) -> ExtractPairRequestResult {
     let with_err = |error| ExtractPairRequestResult {
         error,
@@ -531,6 +478,12 @@ pub extern "C" fn extract_pair_request(
             Err(e) => return with_err(e),
         };
 
+    let parameter_range =
+        match decode_optional_parameter_range(parameter_range_ptr, parameter_range_len) {
+            Ok(p) => p,
+            Err(e) => return with_err(e),
+        };
+
     let channel_id = match DeRecMessage::decode(request_bytes) {
         Ok(e) => e.channel_id,
         Err(e) => {
@@ -544,6 +497,7 @@ pub extern "C" fn extract_pair_request(
     match crate::primitives::pairing::request::extract(
         request_bytes,
         pairing_secret_key_material.ecies_secret_key(),
+        parameter_range.as_ref(),
     ) {
         Ok(r) => ExtractPairRequestResult {
             error: success(),
@@ -688,9 +642,14 @@ pub extern "C" fn extract_pair_response(
 /// `response_proto_ptr` / `response_proto_len` must be the
 /// `response_proto_bytes` returned by [`extract_pair_response`].
 ///
+/// `parameter_range_ptr` may be null / zero-length to declare no parameter
+/// range; otherwise it must be serialized [`derec_proto::ParameterRange`]
+/// proto bytes. See [`crate::primitives::pairing::response::process`].
+///
 /// # Safety
 ///
 /// Non-null input pointers must point to the corresponding readable byte ranges.
+#[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub extern "C" fn process_pair_response_message(
     contact_message_ptr: *const u8,
@@ -699,6 +658,8 @@ pub extern "C" fn process_pair_response_message(
     response_proto_len: usize,
     secret_key_material_ptr: *const u8,
     secret_key_material_len: usize,
+    parameter_range_ptr: *const u8,
+    parameter_range_len: usize,
 ) -> ProcessPairResponseMessageResult {
     let with_err = |error| ProcessPairResponseMessageResult {
         error,
@@ -743,10 +704,17 @@ pub extern "C" fn process_pair_response_message(
             Err(e) => return with_err(e),
         };
 
+    let parameter_range =
+        match decode_optional_parameter_range(parameter_range_ptr, parameter_range_len) {
+            Ok(p) => p,
+            Err(e) => return with_err(e),
+        };
+
     match crate::primitives::pairing::response::process(
         &contact_message,
         &response,
         &pairing_secret_key_material,
+        parameter_range.as_ref(),
     ) {
         Ok(r) => ProcessPairResponseMessageResult {
             error: success(),

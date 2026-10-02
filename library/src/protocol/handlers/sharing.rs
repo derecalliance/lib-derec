@@ -220,7 +220,6 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
                 version,
                 secrets: snapshot_secrets,
                 description: snapshot_description,
-                replicas: secret.replicas.clone(),
                 author_replica_id: local.replica_id,
             },
         )
@@ -1560,7 +1559,6 @@ mod group_conformance_tests {
                     version,
                     secrets: Vec::new(),
                     description: None,
-                    replicas: None,
                     author_replica_id: None,
                 },
             )

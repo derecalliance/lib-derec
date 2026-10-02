@@ -14,6 +14,7 @@ import (
 // domain types — see the storeSet doc comment in callbacks.go.
 type secretStore interface {
 	Load(secretID, channelID uint64, kind SecretKind) (SecretValue, bool, error)
+	LoadMany(secretID uint64, channelIDs []uint64, kind SecretKind) ([]*SecretValue, error)
 	Save(secretID, channelID uint64, value SecretValue) error
 	Remove(secretID, channelID uint64, kind SecretKind) error
 }
@@ -23,6 +24,7 @@ type secretStore interface {
 type SecretStoreCallbacks struct {
 	UserData   uintptr
 	Load       uintptr
+	LoadMany   uintptr
 	Save       uintptr
 	Remove     uintptr
 	FreeBuffer uintptr
@@ -40,6 +42,23 @@ func dispatchSecretLoad(s *storeSet, secretID, channelID uint64, kind uint32) (s
 		return ffiStatusNotFound, nil
 	}
 	encoded, err := EncodeSecretValue(v)
+	if err != nil {
+		return ffiStatusFailure, nil
+	}
+	return ffiStatusOK, encoded
+}
+
+func dispatchSecretLoadMany(s *storeSet, secretID uint64, channelIDsJSON []byte, kind uint32) (status int32, out []byte) {
+	defer recoverInto(&status)
+	channelIDs, err := DecodeUint64Array(channelIDsJSON)
+	if err != nil {
+		return ffiStatusFailure, nil
+	}
+	values, err := s.secret.LoadMany(secretID, channelIDs, SecretKind(kind))
+	if err != nil {
+		return ffiStatusFailure, nil
+	}
+	encoded, err := EncodeSecretValueList(values)
 	if err != nil {
 		return ffiStatusFailure, nil
 	}
@@ -82,6 +101,20 @@ func secretLoadCallback(userData uintptr, secretID, channelID uint64, kind uint3
 	return ffiStatusOK
 }
 
+func secretLoadManyCallback(userData uintptr, secretID uint64, channelIDsPtr *byte, channelIDsLen uintptr, kind uint32, outPtr, outLen *uintptr) (status int32) {
+	defer recoverInto(&status)
+	s, ok := lookupStores(storeHandle(userData))
+	if !ok {
+		return ffiStatusFailure
+	}
+	st, out := dispatchSecretLoadMany(s, secretID, unsafe.Slice(channelIDsPtr, channelIDsLen), kind)
+	if st != ffiStatusOK {
+		return st
+	}
+	writeOutBuffer(out, outPtr, outLen)
+	return ffiStatusOK
+}
+
 func secretSaveCallback(userData uintptr, secretID, channelID uint64, kind uint32, bytesPtr *byte, length uintptr) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
@@ -109,13 +142,14 @@ func secretRemoveCallback(userData uintptr, secretID, channelID uint64, kind uin
 var (
 	secretCallbacksOnce sync.Once
 	secretCallbackPtrs  struct {
-		load, save, remove uintptr
+		load, loadMany, save, remove uintptr
 	}
 )
 
 func registerSecretCallbacks() {
 	secretCallbacksOnce.Do(func() {
 		secretCallbackPtrs.load = purego.NewCallback(secretLoadCallback)
+		secretCallbackPtrs.loadMany = purego.NewCallback(secretLoadManyCallback)
 		secretCallbackPtrs.save = purego.NewCallback(secretSaveCallback)
 		secretCallbackPtrs.remove = purego.NewCallback(secretRemoveCallback)
 	})
@@ -129,6 +163,7 @@ func buildSecretStoreCallbacks(h storeHandle) SecretStoreCallbacks {
 	return SecretStoreCallbacks{
 		UserData:   uintptr(h),
 		Load:       secretCallbackPtrs.load,
+		LoadMany:   secretCallbackPtrs.loadMany,
 		Save:       secretCallbackPtrs.save,
 		Remove:     secretCallbackPtrs.remove,
 		FreeBuffer: sharedFreeBufferCallback(),

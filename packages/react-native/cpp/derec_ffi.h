@@ -807,6 +807,12 @@ typedef struct ChannelStoreCallbacks {
 
 /**
  * Caller-supplied callbacks for secret persistence.
+ *
+ * `load_many` receives the requested channel ids as a JSON array of
+ * numbers and returns a JSON array with exactly one entry per requested id,
+ * in the same order: the same `{kind, bytes}` record `load` returns, or
+ * `null` when nothing of `kind` is stored for that channel. Whether a
+ * missing entry is an error is decided by the library, not the callback.
  */
 typedef struct SecretStoreCallbacks {
   void *user_data;
@@ -816,6 +822,13 @@ typedef struct SecretStoreCallbacks {
                   uint32_t kind,
                   uint8_t **out_ptr,
                   size_t *out_len);
+  int32_t (*load_many)(void *user_data,
+                       uint64_t secret_id,
+                       const uint8_t *channel_ids_json_ptr,
+                       size_t channel_ids_json_len,
+                       uint32_t kind,
+                       uint8_t **out_ptr,
+                       size_t *out_len);
   int32_t (*save)(void *user_data,
                   uint64_t secret_id,
                   uint64_t channel_id,
@@ -1405,33 +1418,8 @@ struct CreateContactMessageResult create_contact_message(uint64_t channel_id,
                                                          uint64_t nonce);
 
 /**
- * Structurally validate a proto-encoded `ContactMessage`. Returns a
- * successful [`DeRecError`] iff the contact's `(contact_mode, inline keys,
- * binding hash)` tuple satisfies the per-mode invariants enforced by the
- * pairing primitives. Intended for bindings to call at their parse
- * boundary (e.g. `FromProtoBytes`) so that the decoded value handed to
- * application code is guaranteed well-formed.
- *
- * Failure codes:
- * - [`DEREC_CODE_FFI_BAD_PROTO`] if the bytes do not decode as a
- *   `ContactMessage`.
- * - The library's `InvalidContactMessage` error code on any structural
- *   violation (unknown `contact_mode`, mode/field mismatch, wrong
- *   binding-hash length).
- *
- * # Safety
- *
- * `contact_message_ptr` must point to a readable range of
- * `contact_message_len` bytes (or be null with `len == 0`).
- */
-struct DeRecError validate_contact_message(const uint8_t *contact_message_ptr,
-                                           size_t contact_message_len);
-
-/**
  * Encodes a JSON [`ContactMessageDto`] to `ContactMessage` proto wire bytes.
- * Structurally validates the input first so a locally-constructed contact
- * that violates the mode/field invariant is rejected at the boundary rather
- * than silently serialized.
+ * See [`crate::primitives::pairing::request::encode_contact`].
  *
  * The JSON shape is [`ContactMessageDto`]'s serde representation with one
  * adjustment applied at this seam: `channel_id` and `nonce` are decimal
@@ -1451,9 +1439,7 @@ struct EncodeContactMessageResult encode_contact_message(const uint8_t *contact_
 /**
  * Decodes proto-encoded `ContactMessage` wire bytes into the JSON
  * [`ContactMessageDto`] shape described on [`encode_contact_message`].
- * Structurally validates the decoded value before returning it to
- * application code so consumers can trust the mode/field invariants
- * documented on the wire format.
+ * See [`crate::primitives::pairing::request::decode_contact`].
  *
  * # Safety
  *
@@ -1484,6 +1470,10 @@ struct ProducePairRequestMessageResult produce_pair_request_message(int32_t send
                                                                     size_t parameter_range_len);
 
 /**
+ * `parameter_range_ptr` may be null / zero-length to declare no parameter
+ * range; otherwise it must be serialized [`derec_proto::ParameterRange`]
+ * proto bytes. See [`crate::primitives::pairing::request::extract`].
+ *
  * # Safety
  *
  * Non-null input pointers must point to the corresponding readable byte ranges.
@@ -1491,7 +1481,9 @@ struct ProducePairRequestMessageResult produce_pair_request_message(int32_t send
 struct ExtractPairRequestResult extract_pair_request(const uint8_t *request_ptr,
                                                      size_t request_len,
                                                      const uint8_t *secret_key_material_ptr,
-                                                     size_t secret_key_material_len);
+                                                     size_t secret_key_material_len,
+                                                     const uint8_t *parameter_range_ptr,
+                                                     size_t parameter_range_len);
 
 /**
  * `request_proto_ptr` / `request_proto_len` must be the `request_proto_bytes`
@@ -1531,6 +1523,10 @@ struct ExtractPairResponseResult extract_pair_response(const uint8_t *response_p
  * `response_proto_ptr` / `response_proto_len` must be the
  * `response_proto_bytes` returned by [`extract_pair_response`].
  *
+ * `parameter_range_ptr` may be null / zero-length to declare no parameter
+ * range; otherwise it must be serialized [`derec_proto::ParameterRange`]
+ * proto bytes. See [`crate::primitives::pairing::response::process`].
+ *
  * # Safety
  *
  * Non-null input pointers must point to the corresponding readable byte ranges.
@@ -1540,7 +1536,9 @@ struct ProcessPairResponseMessageResult process_pair_response_message(const uint
                                                                       const uint8_t *response_proto_ptr,
                                                                       size_t response_proto_len,
                                                                       const uint8_t *secret_key_material_ptr,
-                                                                      size_t secret_key_material_len);
+                                                                      size_t secret_key_material_len,
+                                                                      const uint8_t *parameter_range_ptr,
+                                                                      size_t parameter_range_len);
 
 /**
  * Builds a plaintext `PrePairRequestMessage` envelope. Used by the scanner
@@ -1669,27 +1667,25 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  * arguments in a single call — e.g. Go via `purego` (no cgo), which
  * panics with "too many stack arguments" past a handful of
  * parameters. Scalar configuration is bundled into a single JSON
- * buffer; `communication_info` stays a separate proto-encoded
- * `CommunicationInfo` buffer; the 6 store/transport callback structs
+ * buffer; `communication_info` travels either in that JSON or as a
+ * separate proto-encoded `CommunicationInfo` buffer; the 6 store/transport callback structs
  * are still passed as individual pointers, since purego marshals
  * pointer-sized arguments natively.
  *
- * `config_json` must deserialize to the following shape — all field
- * names `snake_case`. `secret_id` is the only required field;
- * `own_transports`, `threshold`, `keep_versions_count`, `auto_respond_on_failure`,
- * `unpair_ack`, `auto_reply_to` and `auto_accept` may each be omitted, in
- * which case the value matches
+ * `config_json` must deserialize to [`ProtocolConfig`] — all field names
+ * `snake_case`. `secret_id` is the only required field. Every other field
+ * may be omitted, in which case the value matches
  * [`crate::protocol::DeRecProtocolBuilder::new`]'s own default for that
- * setting — see [`ProtocolConfig`]'s field-level `#[serde(default)]`
- * attributes, which read the same constants the builder does:
+ * setting: [`ProtocolConfig`]'s field-level `#[serde(default)]` attributes
+ * read the same constants the builder does. A field that is present is
+ * used as given, including `0`, and validated by the builder.
  *
  * ```json
  * {
  *   "secret_id": "12345678901234567890",
- *   "own_transports": [{ "uri": "https://example.com/derec", "protocol": 0 }],
+ *   "own_transports": [{ "uri": "https://example.com/derec", "protocol": "https" }],
  *   "threshold": 3,
- *   "keep_versions_count": 2,
- *   "timeout_in_secs": 30,
+ *   "keep_versions_count": 3,
  *   "auto_respond_on_failure": false,
  *   "unpair_ack": 0,
  *   "auto_reply_to": false,
@@ -1703,32 +1699,64 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *     "unpair": false,
  *     "update_channel_info": false
  *   },
- *   "remove_expired_channels": { "enabled": true, "timeout_in_secs": 300 },
- *   "replica_id": null
+ *   "timeouts": {
+ *     "inbound_message_secs": 300,
+ *     "sharing_round_secs": 60,
+ *     "unpair_ack_secs": 60,
+ *     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
+ *   },
+ *   "unsafe_connection": false,
+ *   "replica_id": null,
+ *   "parameter_range": {
+ *     "min_share_size": 0,
+ *     "max_share_size": 0,
+ *     "min_time_between_verifications": 0,
+ *     "max_time_between_verifications": 0,
+ *     "min_time_between_share_updates": 0,
+ *     "max_time_between_share_updates": 0,
+ *     "min_unresponsive_deletion_timeout": 0,
+ *     "max_unresponsive_deletion_timeout": 0,
+ *     "min_unresponsive_deactivation_timeout": 0,
+ *     "max_unresponsive_deactivation_timeout": 0
+ *   }
  * }
  * ```
  *
  * - `secret_id`: decimal-string `u64`.
  * - `own_transports`: every endpoint this application serves, in
  *   preference order — the order decides which of a peer's offered
- *   endpoints is used. May be empty for the deferred-config path;
- *   `derec_protocol_set_own_transports` must be called before pairing in
- *   that case.
- * - `threshold` / `keep_versions_count`: optional; omitted means
+ *   endpoints is used. `protocol` is its name (`"https"`, `"grpc"`) or
+ *   its `derec_proto::Protocol` discriminant (`0`, `1`). Each entry is validated, and
+ *   two entries of the same protocol are rejected. Required: an absent or
+ *   empty list is refused, since a node with no endpoint cannot be reached
+ *   by any peer.
+ * - `threshold` / `keep_versions_count`: omitted means
  *   [`crate::protocol::DEFAULT_THRESHOLD`] /
- *   [`crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT`].
- * - `unpair_ack`: `0` = Required, `1` = NotRequired; optional, omitted
- *   means `0`.
- * - `auto_respond_on_failure` / `auto_reply_to`: optional, omitted means
- *   `false`.
- * - `auto_accept`: one boolean per flow; the whole object is optional,
- *   omitted means every flow `false`.
- * - `remove_expired_channels`: automatic removal of expired `Pending`
- *   channels. Optional — omitted means `{ "enabled": true,
- *   "timeout_in_secs": 300 }`. Both fields are always sent; when
- *   `enabled` is `false` the timeout is ignored by the library.
+ *   [`crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT`]. A `threshold` below
+ *   `2` is rejected with `DEREC_CODE_INVALID_INPUT`.
+ * - `unpair_ack`: `0` / `"required"` = Required, `1` / `"not_required"` =
+ *   NotRequired; omitted means Required.
+ *   Any other value is rejected with `DEREC_CODE_FFI_INVALID_ENUM`.
+ * - `auto_respond_on_failure` / `auto_reply_to`: omitted means `false`.
+ * - `timeouts`: the four waiting periods, in whole seconds. Each field is
+ *   optional and omitted means the [`crate::protocol::types::Timeouts`]
+ *   default. `expired_channels` is the automatic removal of `Pending`
+ *   channels; both of its fields are always sent, and when `enabled` is
+ *   `false` the timeout is ignored by the library.
+ * - `unsafe_connection`: accept plaintext `http://` and `grpc://`
+ *   endpoints. Development only; omitted means `false`.
  * - `replica_id`: decimal-string `u64`, or absent/`null` for "no
  *   replica id".
+ * - `auto_accept`: each flow is individually optional; an omitted flow
+ *   takes [`crate::protocol::AutoAcceptPolicy::default()`]'s value.
+ * - `parameter_range`: the bounds advertised during pair negotiation,
+ *   mirroring [`derec_proto::ParameterRange`]. Optional object; every bound
+ *   is optional, omitted means `0` ("no constraint"), and each may be a JSON
+ *   number or a decimal string.
+ * - `communication_info`: optional flat JSON object of string keys to
+ *   string values. Mutually exclusive with a non-empty
+ *   `communication_info_ptr` buffer; omitted with an empty buffer means
+ *   no entries.
  *
  * # Safety
  *
@@ -1801,7 +1829,8 @@ struct DeRecError derec_protocol_set_communication_info(struct DeRecProtocolHand
  * [`super::derec_protocol_new`]. A device serves at most one endpoint per
  * protocol, so this list is a preference order over distinct protocols and
  * two entries of the same protocol are rejected. Body is the same JSON
- * shape that config array uses — `[{"uri": "...", "protocol": 0}, ...]`.
+ * shape that config array uses — `[{"uri": "...", "protocol": "https"}, ...]`,
+ * with `protocol` as its name or its `derec_proto::Protocol` discriminant.
  *
  * Every entry is validated before any is stored, so a malformed URI
  * leaves the previous set intact rather than half-applied.
@@ -1925,13 +1954,15 @@ struct DeRecError derec_protocol_reject(struct DeRecProtocolHandle *handle,
  * {
  *   "version": 7,
  *   "recovered_secret": {
- *     "helpers": [{ "channel_id": "11", "transport_uri": "...",
+ *     "helpers": [{ "channel_id": "11",
+ *                   "transports": [{ "uri": "https://helper.example", "protocol": "https" }],
  *                   "shared_key": [..32 bytes..],
  *                   "communication_info": {} }],
  *     "secrets": [{ "id": [..], "name": "...", "data": [..] }],
  *     "replicas": {
  *       "channel_id": "21",
- *       "members": [{ "replica_id": "51966", "transport_uri": "...",
+ *       "members": [{ "replica_id": "51966",
+ *                     "transports": [{ "uri": "https://replica.example", "protocol": "https" }],
  *                     "role": "Source", "communication_info": {} }],
  *       "shared_key": [..32 bytes..]
  *     }
@@ -1940,14 +1971,28 @@ struct DeRecError derec_protocol_reject(struct DeRecProtocolHandle *handle,
  * ```
  *
  * Field names mirror `SecretWire` in `protocol/events/wire.rs` — the
- * same shape `SecretRecovered` carries. `channel_id` and `replica_id`
- * are decimal `u64` strings (empty / absent means zero).
+ * same shape `SecretRecovered` carries, so the `secret` of that event can
+ * be passed back unchanged. `channel_id` and `replica_id` are required
+ * decimal `u64` strings; an absent, empty, or malformed id is rejected.
+ * `transports` is every endpoint the peer advertised, in its preference
+ * order; `protocol` is its name, `"https"` or `"grpc"`. An absent or
+ * `null` `transports` reads as an empty list, and a helper or member with
+ * no endpoint gets no channel: restore skips it and reports it as a
+ * `PeerNotRestored` event. `role` is `"Source"` or `"Destination"`.
  *
  * `replicas` is an **object**, not an array, and is omitted entirely when
  * the `secret_id` has no replica group. Every member of the group shares
  * the one `channel_id` and the one `shared_key` it carries, so neither is
  * repeated per member; a member is identified by `replica_id` alone, and
  * the group's source is the member whose `role` is `"Source"`.
+ *
+ * On success the result carries the events the restore produced, as
+ * [`DeRecProtocolEventsResult`] does — one `PeerNotRestored` per skipped
+ * helper or member among them. When channels already exist at ids
+ * restore is about to write, `error.code` is
+ * `DEREC_CODE_RESTORE_CONFLICT` and `conflicting_channel_ids_json` lists
+ * exactly those ids; nothing is written, so the application can clear
+ * them and retry.
  *
  * # Safety
  *
@@ -2026,6 +2071,25 @@ struct DeRecProtocolCreateContactResult derec_protocol_create_contact(struct DeR
                                                                       int32_t contact_mode,
                                                                       uint32_t has_nonce,
                                                                       uint64_t nonce);
+
+/**
+ * Decode the `endpoints` buffer a [`TransportCallbacks::send`] call
+ * receives into a UTF-8 JSON array of `{"protocol": "...", "uri": "..."}`
+ * objects, order preserved. `protocol` is the name
+ * [`crate::interop::ffi::protocol_names::derec_transport_protocol_name`] gives the
+ * discriminant, the same endpoint shape the WASM SDKs hand to their
+ * transport's `send`. An entry with an unknown protocol discriminant, or a
+ * malformed buffer, is an error rather than a guessed name.
+ *
+ * Release `bytes` with [`crate::interop::ffi::common::derec_free_buffer`].
+ *
+ * # Safety
+ *
+ * `endpoints_ptr` must be valid for reads of `endpoints_len` bytes when
+ * `endpoints_len` is non-zero.
+ */
+struct DeRecMessageJsonResult derec_transport_endpoints_json(const uint8_t *endpoints_ptr,
+                                                             size_t endpoints_len);
 
 /**
  * Static NUL-terminated name (`"https"` or `"grpc"`) for a

@@ -269,7 +269,6 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
                 version,
                 secrets: secret.secrets.clone(),
                 description: Some(description).filter(|d| !d.is_empty()),
-                replicas: secret.replicas.clone(),
                 author_replica_id,
             },
         )

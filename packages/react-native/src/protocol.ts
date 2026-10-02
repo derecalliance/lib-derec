@@ -11,6 +11,7 @@ import type {
   ContactMessage,
   ContactMode,
   DeRecEvent,
+  Endpoint,
   DiscoveryParams,
   PairingParams,
   ParameterRange,
@@ -80,17 +81,6 @@ function reviveEventBytes(value: unknown): unknown {
 
 function decodeEvents(buffer: ArrayBuffer): DeRecEvent[] {
   return reviveEventBytes(jsonFromBytes(buffer)) as DeRecEvent[];
-}
-
-/**
- * The `derec_proto::Protocol` discriminant Rust assigns to a transport
- * protocol name. Forwarded unchanged: a name Rust does not recognise comes
- * back as `-1`, which Rust's own transport validation then rejects.
- */
-function protocolDiscriminant(protocol: string): number {
-  return (getNative() as unknown as NativeHost).transport_protocol_discriminant(
-    protocol,
-  ) as number;
 }
 
 function encodeTarget(target: Target): unknown {
@@ -301,7 +291,6 @@ export class DeRecProtocolBuilder {
   private readonly secretIdValue: bigint;
   private config: Record<string, unknown> = {};
   private stores: Record<string, unknown> = {};
-  private communicationInfo: Record<string, string> | undefined;
 
   constructor(secretId: bigint | number) {
     this.secretIdValue = BigInt(secretId);
@@ -349,14 +338,11 @@ export class DeRecProtocolBuilder {
    * listing an endpoint this application does not serve makes pairing
    * succeed and replies vanish.
    *
-   * Not calling this leaves `own_transports` empty, the deferred-config
-   * path: call {@link DeRecProtocol.setOwnTransports} before pairing.
+   * Required: `build()` with no own transport is refused by the library,
+   * since a node with no endpoint cannot be reached by any peer.
    */
-  withOwnTransports(transports: { uri: string; protocol: string }[]): this {
-    this.config.own_transports = transports.map((t) => ({
-      uri: t.uri,
-      protocol: protocolDiscriminant(t.protocol),
-    }));
+  withOwnTransports(transports: Endpoint[]): this {
+    this.config.own_transports = transports.map(({ uri, protocol }) => ({ uri, protocol }));
     return this;
   }
 
@@ -394,24 +380,11 @@ export class DeRecProtocolBuilder {
   }
 
   /**
-   * Default: empty. `derec_protocol_new`'s own `communication_info` argument
-   * is a pre-encoded `CommunicationInfo` protobuf message, and this SDK has
-   * no encoder for that message — the C ABI exposes one only for
-   * `ContactMessage`. Hand-rolling one here would be SDK-side protocol logic
-   * with no test coverage — exactly what this codebase's "Rust decides, the
-   * SDK only marshals" rule forbids. Instead,
-   * `build()` constructs the protocol with an empty `communication_info`
-   * (a legitimate, always-accepted value — see `decode_communication_info`
-   * in `library/src/interop/ffi/protocol/handle/mod.rs`, which treats a zero-length
-   * buffer as "no entries") and then calls the already-bound
-   * {@link DeRecProtocol.setCommunicationInfo}, which takes the same map as
-   * plain JSON (`derec_protocol_set_communication_info` in
-   * `library/src/interop/ffi/protocol/handle/config.rs`). That setter is queued on
-   * the protocol's serial worker before `build()` returns, so it is ordered
-   * ahead of every call the caller can subsequently make.
+   * Default: empty. Written to the config's `communication_info` key, so the
+   * map is part of the protocol from construction.
    */
   withCommunicationInfo(info: Record<string, string>): this {
-    this.communicationInfo = info;
+    this.config.communication_info = info;
     return this;
   }
 
@@ -423,13 +396,7 @@ export class DeRecProtocolBuilder {
 
   /** Default: "required". */
   withUnpairAck(ack: UnpairAck): this {
-    if (ack === 'required') {
-      this.config.unpair_ack = 0;
-    } else if (ack === 'not_required') {
-      this.config.unpair_ack = 1;
-    } else {
-      throw new Error(`DeRec: unknown unpair ack "${ack as string}"`);
-    }
+    this.config.unpair_ack = ack;
     return this;
   }
 
@@ -439,17 +406,20 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
-  /** Default: empty policy (every flow off). */
+  /**
+   * Default: empty policy (every flow off). A flow left out of `policy` is
+   * left out of the config, and the library applies its own default to it.
+   */
   withAutoAccept(policy: AutoAcceptPolicy): this {
     this.config.auto_accept = {
-      pairing: policy.pairing ?? false,
-      pre_pair: policy.prePair ?? false,
-      store_share: policy.storeShare ?? false,
-      verify_share: policy.verifyShare ?? false,
-      discovery: policy.discovery ?? false,
-      get_share: policy.getShare ?? false,
-      unpair: policy.unpair ?? false,
-      update_channel_info: policy.updateChannelInfo ?? false,
+      pairing: policy.pairing,
+      pre_pair: policy.prePair,
+      store_share: policy.storeShare,
+      verify_share: policy.verifyShare,
+      discovery: policy.discovery,
+      get_share: policy.getShare,
+      unpair: policy.unpair,
+      update_channel_info: policy.updateChannelInfo,
     };
     return this;
   }
@@ -467,30 +437,26 @@ export class DeRecProtocolBuilder {
    * against the peer's range on inbound ones: a range that fails to
    * intersect rejects the pairing. Every bound is optional and defaults to
    * `0`, which the protocol reads as "no constraint on this dimension".
+   * Bounds cross to the library as decimal strings, so the full `i64` range
+   * survives; a bound left out is left out of the config, and the library
+   * applies its default.
    *
    * Default: unset — no constraints advertised, every peer range accepted.
    */
   withParameterRange(range: Partial<ParameterRange>): this {
-    const n = (v: bigint | undefined) => Number(v ?? 0n);
     this.config.parameter_range = {
-      min_share_size: n(range.min_share_size),
-      max_share_size: n(range.max_share_size),
-      min_time_between_verifications: n(range.min_time_between_verifications),
-      max_time_between_verifications: n(range.max_time_between_verifications),
-      min_time_between_share_updates: n(range.min_time_between_share_updates),
-      max_time_between_share_updates: n(range.max_time_between_share_updates),
-      min_unresponsive_deletion_timeout: n(
-        range.min_unresponsive_deletion_timeout,
-      ),
-      max_unresponsive_deletion_timeout: n(
-        range.max_unresponsive_deletion_timeout,
-      ),
-      min_unresponsive_deactivation_timeout: n(
-        range.min_unresponsive_deactivation_timeout,
-      ),
-      max_unresponsive_deactivation_timeout: n(
-        range.max_unresponsive_deactivation_timeout,
-      ),
+      min_share_size: range.min_share_size?.toString(),
+      max_share_size: range.max_share_size?.toString(),
+      min_time_between_verifications: range.min_time_between_verifications?.toString(),
+      max_time_between_verifications: range.max_time_between_verifications?.toString(),
+      min_time_between_share_updates: range.min_time_between_share_updates?.toString(),
+      max_time_between_share_updates: range.max_time_between_share_updates?.toString(),
+      min_unresponsive_deletion_timeout: range.min_unresponsive_deletion_timeout?.toString(),
+      max_unresponsive_deletion_timeout: range.max_unresponsive_deletion_timeout?.toString(),
+      min_unresponsive_deactivation_timeout:
+        range.min_unresponsive_deactivation_timeout?.toString(),
+      max_unresponsive_deactivation_timeout:
+        range.max_unresponsive_deactivation_timeout?.toString(),
     };
     return this;
   }
@@ -506,20 +472,7 @@ export class DeRecProtocolBuilder {
       new Uint8Array(0),
       this.stores,
     ) as NativeHost;
-    const protocol = DeRecProtocol.fromHost(host);
-    if (this.communicationInfo !== undefined) {
-      // `setCommunicationInfo` is asynchronous, but `build()` stays
-      // synchronous: the guarantee callers need is not that the map has been
-      // applied by the time `build()` returns, it is that no flow can run
-      // before it. Posting it here puts it on the protocol's serial worker
-      // queue ahead of anything the caller has had the chance to start, so
-      // every subsequent call observes it. Left unhandled deliberately — a
-      // failure reaches the runtime's unhandled-rejection reporting rather
-      // than being silently discarded, and `build()` has no synchronous
-      // channel to raise it on.
-      void protocol.setCommunicationInfo(this.communicationInfo);
-    }
-    return protocol;
+    return DeRecProtocol.fromHost(host);
   }
 }
 
@@ -581,13 +534,8 @@ export class DeRecProtocol {
    * Queued onto the serial worker for the same reason as
    * {@link setCommunicationInfo}.
    */
-  setOwnTransports(
-    transports: { uri: string; protocol: string }[],
-  ): Promise<void> {
-    const wire = transports.map(({ uri, protocol }) => ({
-      uri,
-      protocol: protocolDiscriminant(protocol),
-    }));
+  setOwnTransports(transports: Endpoint[]): Promise<void> {
+    const wire = transports.map(({ uri, protocol }) => ({ uri, protocol }));
     return this.host.setOwnTransports(jsonToBytes(wire)) as Promise<void>;
   }
 
@@ -665,13 +613,16 @@ export class DeRecProtocol {
   /**
    * Rebuild this protocol's `secret_id` namespace from a recovered `Secret`.
    * Pass the `secret` carried by the `SecretRecovered` event verbatim.
+   * A helper or member whose `transports` is empty gets no channel: it is
+   * reported as a `PeerNotRestored` event in the returned array and the rest
+   * of the roster is restored.
    *
    * Rejects with a `DeRecError`; among its codes:
    *
    * | code               | meaning                                                     |
    * |--------------------|-------------------------------------------------------------|
    * | `already_restored` | A user-secret snapshot already exists for this `secret_id`. |
-   * | `restore_conflict` | Channels live at canonical helper / replica ids. The error  |
+   * | `restore_conflict` | Channels live at ids restore is about to write. The error   |
    * |                    | carries `channel_ids: string[]` listing the collisions.     |
    */
   async restore(
@@ -686,5 +637,10 @@ export class DeRecProtocol {
   /** Release the native handle. Safe to call more than once. */
   free(): void {
     this.host.free();
+  }
+
+  /** Same as {@link DeRecProtocol.free}, for `using`. */
+  [Symbol.dispose](): void {
+    this.free();
   }
 }

@@ -20,6 +20,7 @@ internal static class Primitives
     {
         RunProtocolVersionTest();
         RunPairingFlowTest();
+        RunPairingRefusesIncompatibleParameterRangeTest();
         RunContactOfferListRoundTripTest();
         RunPairingFlowHashedKeysTest();
         RunPairingFlowNoKeysTest();
@@ -160,6 +161,91 @@ internal static class Primitives
         Console.WriteLine($"  channel id rekeyed: {channelId} → {produced.ChannelId}");
 
         Console.WriteLine("Pairing flow test (INLINE_KEYS) passed.");
+    }
+
+    private static byte[] ShareSizeRange(long min, long max) =>
+        Google.Protobuf.MessageExtensions.ToByteArray(new Proto.ParameterRange
+        {
+            MinShareSize = min,
+            MaxShareSize = max,
+            MinTimeBetweenVerifications = 0,
+            MaxTimeBetweenVerifications = long.MaxValue,
+            MinTimeBetweenShareUpdates = 0,
+            MaxTimeBetweenShareUpdates = long.MaxValue,
+            MinUnresponsiveDeletionTimeout = 0,
+            MaxUnresponsiveDeletionTimeout = long.MaxValue,
+            MinUnresponsiveDeactivationTimeout = 0,
+            MaxUnresponsiveDeactivationTimeout = long.MaxValue,
+        });
+
+    private static void ExpectIncompatibleRange(Action action, string what)
+    {
+        try
+        {
+            action();
+        }
+        catch (DeRecException e) when (e.Code == DeRecCode.IncompatibleParameterRange)
+        {
+            Console.WriteLine($"  {what} refused ({e.CategoryName}/{e.CodeName})  ✓");
+            return;
+        }
+        throw new InvalidOperationException($"{what} must refuse a disjoint parameter range.");
+    }
+
+    /// <summary>
+    /// Ranges that cannot overlap are refused by the primitives themselves, on
+    /// both sides, without the application calling any separate check.
+    /// </summary>
+    private static void RunPairingRefusesIncompatibleParameterRangeTest()
+    {
+        Console.WriteLine("=== Pairing refuses an incompatible parameter range ===");
+
+        const ulong channelId = 11;
+        byte[] creatorRange = ShareSizeRange(1_000_000_000, 5_000_000_000);
+        byte[] scannerRange = ShareSizeRange(10_000_000, 500_000_000);
+
+        var contact = Pairing.Request.CreateContact(
+            channelId,
+            ContactMode.InlineKeys,
+            new[] { new TransportProtocol("https://example.com/creator") });
+
+        var refusedRequest = Pairing.Request.Produce(
+            Pairing.SenderKind.Helper,
+            new[] { new TransportProtocol("https://example.com/scanner") },
+            contact.ContactMessage,
+            parameterRange: scannerRange);
+        ExpectIncompatibleRange(
+            () => Pairing.Request.Extract(refusedRequest.Envelope, contact.SecretKeyMaterial, creatorRange),
+            "Request.Extract");
+        var unchecked_ = Pairing.Request.Extract(refusedRequest.Envelope, contact.SecretKeyMaterial);
+        ExpectIncompatibleRange(
+            () => Pairing.Response.Produce(
+                channelId, unchecked_.RequestProtoBytes, contact.SecretKeyMaterial, parameterRange: creatorRange),
+            "Response.Produce");
+
+        var request = Pairing.Request.Produce(
+            Pairing.SenderKind.Helper,
+            new[] { new TransportProtocol("https://example.com/scanner") },
+            contact.ContactMessage);
+        var extracted = Pairing.Request.Extract(request.Envelope, contact.SecretKeyMaterial, creatorRange);
+        var produced = Pairing.Response.Produce(
+            channelId, extracted.RequestProtoBytes, contact.SecretKeyMaterial, parameterRange: creatorRange);
+        var response = Pairing.Response.Extract(produced.Envelope, request.SecretKeyMaterial);
+        ExpectIncompatibleRange(
+            () => Pairing.Response.Process(
+                request.InitiatorContactMessage, response.ResponseProtoBytes, request.SecretKeyMaterial, scannerRange),
+            "Response.Process");
+
+        var processed = Pairing.Response.Process(
+            request.InitiatorContactMessage,
+            response.ResponseProtoBytes,
+            request.SecretKeyMaterial,
+            ShareSizeRange(1_000_000_000, 2_000_000_000));
+        if (!processed.SharedKey.SequenceEqual(produced.SharedKey))
+            throw new InvalidOperationException("overlapping ranges must pair to the same shared key.");
+        Console.WriteLine("  overlapping ranges pair normally  ✓");
+
+        Console.WriteLine("Incompatible parameter range test passed.");
     }
 
     private static void RunPairingFlowHashedKeysTest()
@@ -525,6 +611,38 @@ internal static class Primitives
             var extractedResponse = Sharing.Response.Extract(storeResponse.Envelope, sharedKeys[channel]);
             Sharing.Response.Process(version, extractedResponse.ResponseProtoBytes);
         }
+
+        // The channel key is a 32-byte symmetric key; the library refuses
+        // any other length on both sides of the exchange.
+        ulong firstChannel = channelIds[0];
+        byte[] shortKey = new byte[31];
+        int requestCode = -1;
+        try
+        {
+            Sharing.Request.Produce(
+                firstChannel, version, secretId, shares[firstChannel],
+                Array.Empty<uint>(), string.Empty, shortKey);
+        }
+        catch (DeRecException e)
+        {
+            requestCode = e.Code;
+        }
+        if (requestCode != DeRecCode.FfiBadSharedKey)
+            throw new InvalidOperationException(
+                $"Sharing test failed: short key on request must be refused by the library with FfiBadSharedKey, got {requestCode}.");
+
+        int responseCode = -1;
+        try
+        {
+            Sharing.Response.Produce(firstChannel, Array.Empty<byte>(), shortKey);
+        }
+        catch (DeRecException e)
+        {
+            responseCode = e.Code;
+        }
+        if (responseCode != DeRecCode.FfiBadSharedKey)
+            throw new InvalidOperationException(
+                $"Sharing test failed: short key on response must be refused by the library with FfiBadSharedKey, got {responseCode}.");
 
         Console.WriteLine("Sharing flow test passed.");
     }

@@ -11,15 +11,15 @@ export interface SecretStore {
   ): Promise<Uint8Array | null | undefined>;
   /**
    * Load secrets of the same `kind` for several channels in one call,
-   * scoped to `secretId`. Must return an array with one entry per input
-   * id, in the same order, using `null` (or `undefined`) for channels
-   * with no stored secret of `kind`.
+   * scoped to `secretId`. Must return an array with exactly one entry per
+   * input id, in the same order, using `null` (or `undefined`) for channels
+   * with no stored secret of `kind`. Whether a missing entry is an error is
+   * decided by the library.
    */
   loadMany(
     secretId: string,
     channelIds: string[],
     kind: 0 | 1 | 2,
-    missingPolicy: "skip" | "fail",
   ): Promise<Array<Uint8Array | null | undefined>>;
   save(
     secretId: string,
@@ -223,11 +223,7 @@ export interface ChannelStore {
     secretId: string,
     filter: ReplicaFilter,
   ): Promise<Uint8Array | null | undefined>;
-  linkChannel(
-    secretId: string,
-    channelId: string,
-    linkedChannelId: string,
-  ): Promise<void>;
+  linkChannel(secretId: string, a: string, b: string): Promise<void>;
   linkedChannels(secretId: string, channelId: string): Promise<string[]>;
 }
 
@@ -318,6 +314,18 @@ export interface StateStore {
   loadAll(secretId: string, kind: 0 | 1 | 2 | 3 | 4): Promise<Uint8Array[]>;
 }
 
+/** A transport protocol, by name. */
+export type TransportProtocolName = "https" | "grpc";
+
+/**
+ * One endpoint a node serves or a peer advertised, as every app-facing call
+ * and event carries it.
+ */
+export interface Endpoint {
+  uri: string;
+  protocol: TransportProtocolName;
+}
+
 /**
  * Outbound message delivery.
  *
@@ -363,7 +371,7 @@ export interface Transport {
    * with {@link singleEndpointTransport} rather than by indexing.
    */
   send(
-    endpoints: ReadonlyArray<{ protocol: string; uri: string }>,
+    endpoints: ReadonlyArray<Endpoint>,
     message: Uint8Array,
   ): Promise<void>;
 }
@@ -383,7 +391,7 @@ export interface Transport {
  * a round trip; skipping one that would have worked costs the delivery.
  */
 export type SendOne = (
-  endpoint: { protocol: string; uri: string },
+  endpoint: Endpoint,
   message: Uint8Array,
 ) => Promise<void>;
 
@@ -576,7 +584,7 @@ export interface UpdateChannelInfoParams {
    * Every endpoint this node now serves, in its own preference order.
    * Omitted leaves the target(s)' stored set untouched.
    */
-  own_transports?: TransportProtocol[];
+  own_transports?: Endpoint[];
 }
 
 /**
@@ -658,11 +666,11 @@ export type DeRecEvent =
       updated_communication_info?: Record<string, string>;
       /** Endpoints the peer is moving to (UpdateChannelInfo only). Absent:
        *  unchanged. */
-      updated_transports?: Array<{ uri: string; protocol: number }>;
+      updated_transports?: Endpoint[];
     }
   | { type: "ShareStored"; channel_id: string; version: number }
   | { type: "ShareConfirmed"; channel_id: string; version: number }
-  | { type: "ShareRejected"; channel_id: string; version: number; status: number; memo: string }
+  | { type: "ShareRejected"; channel_id: string; version: number; status: StatusEnum; memo: string }
   /** A publishing round finished — every targeted helper confirmed,
    *  rejected, or timed out.
    *
@@ -687,7 +695,7 @@ export type DeRecEvent =
       replica_id: string;
       secret_id: string;
       version: number;
-      status: number;
+      status: StatusEnum;
       memo: string;
     }
   /** A secret sync could not be delivered to a member at all — distinct from
@@ -740,9 +748,9 @@ export type DeRecEvent =
         helpers: Array<{
           channel_id: string;
           /** Every endpoint this peer advertised, in the order it offered them. */
-          transports: Array<{ uri: string; protocol: number }>;
+          transports: Endpoint[];
           shared_key: Uint8Array;
-          communication_info: Record<string, string>;
+          communication_info?: Record<string, string>;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -762,9 +770,9 @@ export type DeRecEvent =
           members: Array<{
             replica_id: string;
             /** Every endpoint this peer advertised, in the order it offered them. */
-            transports: Array<{ uri: string; protocol: number }>;
+            transports: Endpoint[];
             role: "Source" | "Destination";
-            communication_info: Record<string, string>;
+            communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
         };
@@ -773,12 +781,12 @@ export type DeRecEvent =
 
   | { type: "Unpaired"; channel_id: string }
 
-  | { type: "UnpairRejected"; channel_id: string; status: number; memo: string }
+  | { type: "UnpairRejected"; channel_id: string; status: StatusEnum; memo: string }
 
   /** Contact creator answered the scanner's `PrePairRequest` with a
    *  non-Ok status (HashedKeys flow). Distinct from a cryptographic
    *  hash mismatch, which surfaces as a thrown error from `process()`. */
-  | { type: "PrePairRejected"; channel_id: string; status: number; memo: string }
+  | { type: "PrePairRejected"; channel_id: string; status: StatusEnum; memo: string }
 
   /** Fires alongside `PairingCompleted` on replica-mode pair handshakes.
    *  `peer_replica_id` is the peer's `u64` as a **decimal** string,
@@ -815,9 +823,9 @@ export type DeRecEvent =
         helpers: Array<{
           channel_id: string;
           /** Every endpoint this peer advertised, in the order it offered them. */
-          transports: Array<{ uri: string; protocol: number }>;
+          transports: Endpoint[];
           shared_key: Uint8Array;
-          communication_info: Record<string, string>;
+          communication_info?: Record<string, string>;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -835,9 +843,9 @@ export type DeRecEvent =
           members: Array<{
             replica_id: string;
             /** Every endpoint this peer advertised, in the order it offered them. */
-            transports: Array<{ uri: string; protocol: number }>;
+            transports: Endpoint[];
             role: "Source" | "Destination";
-            communication_info: Record<string, string>;
+            communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
         };
@@ -867,9 +875,9 @@ export type DeRecEvent =
         helpers: Array<{
           channel_id: string;
           /** Every endpoint this peer advertised, in the order it offered them. */
-          transports: Array<{ uri: string; protocol: number }>;
+          transports: Endpoint[];
           shared_key: Uint8Array;
-          communication_info: Record<string, string>;
+          communication_info?: Record<string, string>;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -887,9 +895,9 @@ export type DeRecEvent =
           members: Array<{
             replica_id: string;
             /** Every endpoint this peer advertised, in the order it offered them. */
-            transports: Array<{ uri: string; protocol: number }>;
+            transports: Endpoint[];
             role: "Source" | "Destination";
-            communication_info: Record<string, string>;
+            communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
         };
@@ -922,9 +930,9 @@ export type DeRecEvent =
         helpers: Array<{
           channel_id: string;
           /** Every endpoint this peer advertised, in the order it offered them. */
-          transports: Array<{ uri: string; protocol: number }>;
+          transports: Endpoint[];
           shared_key: Uint8Array;
-          communication_info: Record<string, string>;
+          communication_info?: Record<string, string>;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -941,9 +949,9 @@ export type DeRecEvent =
           members: Array<{
             replica_id: string;
             /** Every endpoint this peer advertised, in the order it offered them. */
-            transports: Array<{ uri: string; protocol: number }>;
+            transports: Endpoint[];
             role: "Source" | "Destination";
-            communication_info: Record<string, string>;
+            communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
         };
@@ -957,7 +965,7 @@ export type DeRecEvent =
       from_replica_id: string;
       secret_id: string;
       version: number;
-      status: number;
+      status: StatusEnum;
       memo: string;
     }
   /** A peer announced an updated `communication_info` map and/or
@@ -974,7 +982,7 @@ export type DeRecEvent =
   | {
       type: "ChannelInfoUpdateRejected";
       channel_id: string;
-      status: number;
+      status: StatusEnum;
       memo: string;
     }
   /** Emitted by `process()` in place of `ActionRequired` when the
@@ -1002,6 +1010,21 @@ export type DeRecEvent =
       channel_id: string;
       reason: IgnoreReason;
       trace_id: string;
+    }
+  /** Returned by `restore`: a roster entry got no channel, so this device
+   *  cannot reach that peer. Every other entry and the user-secret snapshot
+   *  were restored; `reason` says why this one was not. `"NoTransports"`
+   *  means the recovered roster names no endpoint for it.
+   *
+   *  For a helper, `channel_id` is its channel and `replica_id` is absent.
+   *  For a replica group member, `channel_id` is the group's channel and
+   *  `replica_id` names the member. The peer itself is untouched — a helper
+   *  still holds its share — and pairing with it again makes it reachable. */
+  | {
+      type: "PeerNotRestored";
+      channel_id: string;
+      replica_id?: string;
+      reason: NotRestoredReason;
     }
   /** A pairing handshake was dispatched successfully. `kind` is the
    *  local party's role — same value the subsequent `PairingCompleted`
@@ -1100,10 +1123,23 @@ export interface AutoAcceptPolicy {
  * between them without reaching for reference docs.
  *
  * Required setters: `withChannelStore`, `withShareStore`,
- * `withSecretStore`, `withTransport`, and `withOwnTransports`. Calling
- * `build()` without all five throws.
+ * `withSecretStore`, `withUserSecretStore`, `withStateStore`,
+ * `withTransport`, and `withOwnTransports`. Calling `build()` without all
+ * seven throws.
+ *
+ * An optional setter that is never called leaves the library's default in
+ * force.
  */
 export declare class DeRecProtocolBuilder {
+  /**
+   * Release the builder's memory in the library. `build()` already releases
+   * it; call this only for a builder that is discarded unbuilt. Safe to call
+   * more than once.
+   */
+  free(): void;
+  /** Same as {@link DeRecProtocolBuilder.free}, for `using`. */
+  [Symbol.dispose](): void;
+
   /**
    * Construct a builder bound to a specific secret. `secretId`
    * identifies the single secret this protocol instance manages.
@@ -1129,11 +1165,11 @@ export declare class DeRecProtocolBuilder {
    * because delivery is push-only — listing an endpoint this application
    * does not serve makes pairing succeed and replies vanish.
    */
-  withOwnTransports(transports: { uri: string; protocol: string }[]): DeRecProtocolBuilder;
+  withOwnTransports(transports: Endpoint[]): DeRecProtocolBuilder;
 
-  /** Default: 3. */
+  /** Minimum number of shares required to reconstruct the secret. Default: 3. */
   withThreshold(threshold: number): DeRecProtocolBuilder;
-  /** Default: 3. */
+  /** Number of recent versions each helper must retain. Default: 3. */
   withKeepVersionsCount(count: number): DeRecProtocolBuilder;
   /**
    * Configure how long the protocol waits on each thing that can keep it
@@ -1175,7 +1211,8 @@ export declare class DeRecProtocolBuilder {
   withCommunicationInfo(info: Record<string, string>): DeRecProtocolBuilder;
   /** Default: false. */
   withAutoRespondOnFailure(enabled: boolean): DeRecProtocolBuilder;
-  /** Default: "required". */
+  /** Exactly `"required"` or `"not_required"`; any other string throws
+   *  `invalid_unpair_ack`. Default: `"required"`. */
   withUnpairAck(ack: UnpairAck): DeRecProtocolBuilder;
   /**
    * When `true`, every outbound channel-mode request stamps
@@ -1235,6 +1272,17 @@ export declare class DeRecProtocolBuilder {
 export declare class DeRecProtocol {
   /** Use {@link DeRecProtocolBuilder} to construct instances. */
   private constructor();
+
+  /**
+   * Release this protocol's memory in the library, and its references to the
+   * stores and transport. The library's memory is not reclaimed by the
+   * JavaScript garbage collector in time to rely on, so call this when done.
+   * Safe to call more than once; any other method called afterwards throws,
+   * as does calling this while a call is in flight.
+   */
+  free(): void;
+  /** Same as {@link DeRecProtocol.free}, for `using`. */
+  [Symbol.dispose](): void;
 
   /** The secret identifier this protocol instance is bound to. */
   secretId(): bigint;
@@ -1306,7 +1354,7 @@ export declare class DeRecProtocol {
    * Every entry is validated before any is stored, so a malformed URI
    * leaves the previous set intact. An empty array is rejected.
    */
-  setOwnTransports(transports: { uri: string; protocol: string }[]): Promise<void>;
+  setOwnTransports(transports: Endpoint[]): Promise<void>;
 
   process(message: Uint8Array): Promise<DeRecEvent[]>;
 
@@ -1352,23 +1400,32 @@ export declare class DeRecProtocol {
    * threshold given even when that policy is disabled. The age comparison
    * is strict, so a channel created within the current second survives
    * even `0`.
+   *
+   * `olderThanSecs` is a `u64`: a `bigint`, a non-negative safe-integer
+   * `number`, or a decimal string. Anything else throws `decode_error`.
    */
-  removeExpiredChannels(olderThanSecs: number): Promise<string[]>;
+  removeExpiredChannels(olderThanSecs: bigint | number | string): Promise<string[]>;
 
   /**
    * Rebuild this protocol's `secret_id` namespace from a recovered
    * `Secret`. Mirrors the Rust `DeRecProtocol::restore` — pass the
    * typed `secret` carried by the `SecretRecovered` event verbatim.
    *
-   * Errors surface as structured objects with a `code` field:
+   * A helper or member whose `transports` is empty gets no channel: it is
+   * reported as a `PeerNotRestored` event in the returned array and the rest
+   * of the roster is restored.
+   *
+   * Errors surface as a `DeRecError` (`category`, `code`, `message`):
    *
    * | code               | meaning                                                          |
    * |--------------------|------------------------------------------------------------------|
-   * | `ALREADY_RESTORED` | A user-secret snapshot already exists for this `secret_id`.      |
-   * | `CONFLICT`         | Channels live at canonical helper / replica ids. The error       |
+   * | `already_restored` | A user-secret snapshot already exists for this `secret_id`.      |
+   * | `restore_conflict` | Channels live at ids restore is about to write. The error        |
    * |                    | carries `channel_ids: string[]` listing the collisions.          |
-   * | `INVARIANT`        | The recovered `Secret` is internally inconsistent.               |
-   * | `STORAGE`          | A store I/O call failed mid-restore.                             |
+   * | `invariant`        | The recovered `Secret` is internally inconsistent.               |
+   * | `invalid_recovered_secret` | `recoveredSecret` is malformed — e.g. a missing or       |
+   * |                    | non-decimal `channel_id` / `replica_id`.                         |
+   * | `store_error`      | A store call failed mid-restore; `category` names the store.     |
    */
   restore(
     recoveredSecret: Extract<DeRecEvent, { type: "SecretRecovered" }>["secret"],
@@ -1478,6 +1535,10 @@ export interface CommunicationInfo {
 /** Why a `MessageIgnored` event dropped a message. Matches the Rust
  *  `IgnoreReason` discriminants one-for-one. */
 export type IgnoreReason = "PendingVerification" | "Expired";
+
+/** Why a `PeerNotRestored` event left a roster entry without a channel.
+ *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */
+export type NotRestoredReason = "NoTransports";
 
 export type PendingActionKind =
   | "Pairing"
@@ -1801,6 +1862,8 @@ export interface DeRecError {
   got?: number;
   /** The channel the failing inbound message arrived on, when `process()` could tell. */
   channel_id?: string;
+  /** On a `restore` `CONFLICT`: the pre-existing channels at canonical ids. */
+  channel_ids?: string[];
 }
 
 export declare const primitives: {
@@ -1850,7 +1913,17 @@ export declare const primitives: {
         transport_protocols: TransportProtocol[],
         nonce?: bigint | number | null,
       ): CreateContactResult;
+      /**
+       * Serializes a `ContactMessage` to the bytes delivered out of band.
+       * Throws on a contact that violates the invariants of its contact mode
+       * or advertises no endpoint.
+       */
       encode_contact(contact_message: ContactMessage): Uint8Array;
+      /**
+       * Parses out-of-band contact bytes back into a `ContactMessage`. Throws
+       * on bytes that are not a contact, or a contact that violates the
+       * invariants of its contact mode.
+       */
       decode_contact(bytes: Uint8Array): ContactMessage;
       produce(
         kind: SenderKind,
@@ -1860,7 +1933,17 @@ export declare const primitives: {
         parameter_range: ParameterRange | null,
       ): PairingRequestProduceResult;
 
-      extract(envelope_bytes: Uint8Array, secret_key: Uint8Array): { request: PairRequestMessage };
+      /**
+       * @param parameter_range  The range this side accepts, or `null` for
+       *                         none. A request advertising a range that does
+       *                         not overlap it is refused with
+       *                         `incompatible_parameter_range`.
+       */
+      extract(
+        envelope_bytes: Uint8Array,
+        secret_key: Uint8Array,
+        parameter_range: ParameterRange | null,
+      ): { request: PairRequestMessage };
 
       /**
        * Scanner-side: build a plaintext `PrePairRequest` envelope when the
@@ -1886,6 +1969,10 @@ export declare const primitives: {
     };
     response: {
       /**
+       * @param parameter_range    The range this side accepts and advertises,
+       *                           or `null` for none. A request advertising a
+       *                           range that does not overlap it is refused
+       *                           with `incompatible_parameter_range`.
        * @param unsafe_connection  Accept plaintext peer endpoints
        *                           (`http://`, `grpc://`). Development only.
        */
@@ -1899,10 +1986,18 @@ export declare const primitives: {
       ): PairingResponseProduceResult;
 
       extract(envelope_bytes: Uint8Array, secret_key: Uint8Array): { response: PairResponseMessage };
+      /**
+       * @param parameter_range  The range this side accepts, or `null` for
+       *                         none. A response advertising a range that
+       *                         does not overlap it is refused with
+       *                         `incompatible_parameter_range` before any key
+       *                         is derived.
+       */
       process(
         contact_message: ContactMessage,
         response: PairResponseMessage,
         secret_key: Uint8Array,
+        parameter_range: ParameterRange | null,
       ): PairingProcessResult;
 
       /**

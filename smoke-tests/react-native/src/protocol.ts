@@ -67,6 +67,8 @@ const kindName = (k: SenderKind): string => {
 // kind 2 = PairingContact (ephemeral). Keyed by `${secretId}:${channelId}:${kind}`.
 class InMemorySecretStore implements SecretStore {
   private readonly data = new Map<string, Uint8Array>();
+  /** The `channelIds` of every `loadMany` call, in order. */
+  readonly loadManyCalls: string[][] = [];
 
   private key(secretId: string, channelId: string, kind: 0 | 1 | 2): string {
     return `${secretId}:${channelId}:${kind}`;
@@ -84,8 +86,8 @@ class InMemorySecretStore implements SecretStore {
     secretId: string,
     channelIds: string[],
     kind: 0 | 1 | 2,
-    _missingPolicy: "skip" | "fail",
   ): Promise<Array<Uint8Array | null>> {
+    this.loadManyCalls.push([...channelIds]);
     return channelIds.map(
       (id) => this.data.get(this.key(secretId, id, kind)) ?? null,
     );
@@ -1065,6 +1067,7 @@ async function runSharingFlow(): Promise<void> {
   console.log();
 
   const secretData = utf8Encode("super-secret-value");
+  owner.secretStore.loadManyCalls.length = 0;
   await owner.protocol.start(FlowKind.ProtectSecret, {
     secrets: [{ id: new Uint8Array([1]), name: "smoke", data: secretData }],
     description: "smoke-test secret",
@@ -1074,6 +1077,15 @@ async function runSharingFlow(): Promise<void> {
   if (outbound.length !== 2) {
     throw new Error(`expected 2 StoreShareRequests, got ${outbound.length}`);
   }
+  // The broadcast reads every helper's SharedKey through one
+  // SecretStore.loadMany call rather than one load per channel.
+  const keyCalls = owner.secretStore.loadManyCalls;
+  if (keyCalls.length !== 1 || keyCalls[0].length !== 2) {
+    throw new Error(
+      `ProtectSecret broadcast must call SecretStore.loadMany once with both helper channels, got ${JSON.stringify(keyCalls)}`,
+    );
+  }
+  console.log(`  [Owner] ProtectSecret → one SecretStore.loadMany([${keyCalls[0].join(", ")}])`);
   console.log(
     `\n  [Owner] start(ProtectSecret) → ${outbound.length} StoreShareRequest(s)`,
   );
@@ -1924,14 +1936,14 @@ async function runUpdateChannelInfoFlow(): Promise<void> {
   await owner.protocol.start(FlowKind.UpdateChannelInfo, {
     target: BigInt(longTermChannelId),
     communication_info: newInfo,
-    own_transports: [{ uri: newUri, protocol: 0 }],
+    own_transports: [{ uri: newUri, protocol: "https" }],
   });
   const updateRequest = drainOne(owner, "Owner");
   console.log(`  [Owner] start(UpdateChannelInfo) → request ${updateRequest.length}B`);
 
   const helperEvents = await processAll(helper, updateRequest);
   const updateAction = requireEvent(helperEvents, "ActionRequired", "Helper");
-  if (JSON.stringify(updateAction.updated_transports) !== JSON.stringify([{ uri: newUri, protocol: 0 }])) {
+  if (JSON.stringify(updateAction.updated_transports) !== JSON.stringify([{ uri: newUri, protocol: "https" }])) {
     throw new Error(
       `ActionRequired(UpdateChannelInfo).updated_transports must match the announced endpoints; got ${JSON.stringify(updateAction.updated_transports)}`,
     );

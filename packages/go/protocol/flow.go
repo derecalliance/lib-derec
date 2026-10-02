@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 	"github.com/derecalliance/lib-derec/packages/go/internal/native"
 )
 
@@ -89,12 +90,10 @@ func (t Target) MarshalJSON() ([]byte, error) {
 
 // PairingParams are the parameters for FlowKindPairing.
 type PairingParams struct {
-	// Kind is the local party's role in the handshake. Matches
-	// derec_proto::SenderKind's numeric values — the same ones the
-	// SenderKind* constants in this package hold (0=Owner, 1=Helper,
-	// 3=ReplicaSource, 4=ReplicaDestination), e.g.
-	// int32(SenderKindHelper).
-	Kind int32
+	// Kind is the local party's role in the handshake, e.g.
+	// SenderKindHelper. Crosses to the library as its
+	// derec_proto::SenderKind numeric value.
+	Kind SenderKind
 	// Contact is the prost-encoded ContactMessage received out-of-band
 	// (the peer's CreatedContact.ContactBytes from CreateContact).
 	Contact []byte
@@ -233,7 +232,7 @@ func marshalFlowParams(flowKind FlowKind, params any) ([]byte, error) {
 			return nil, fmt.Errorf("protocol: Start: FlowKindPairing requires PairingParams, got %T", params)
 		}
 		return json.Marshal(pairingParamsWire{
-			Kind:                  pp.Kind,
+			Kind:                  int32(pp.Kind),
 			Contact:               native.JSONByteArray(pp.Contact),
 			PeerCommunicationInfo: pp.PeerCommunicationInfo,
 		})
@@ -365,13 +364,13 @@ func (p *DeRecProtocol) Accept(action []byte) ([]Event, error) {
 }
 
 // Reject rejects a pending action carried by an ActionRequired event's
-// Action field, with a status + memo. status matches
-// derec_proto::StatusEnum.
-func (p *DeRecProtocol) Reject(action []byte, status int32, memo string) error {
+// Action field, with a status + memo. status is the StatusEnum the peer
+// receives in the response.
+func (p *DeRecProtocol) Reject(action []byte, status derecpb.StatusEnum, memo string) error {
 	if p.closed {
 		return errors.New("protocol: Reject: protocol is closed")
 	}
-	return p.instance.Reject(action, status, memo)
+	return p.instance.Reject(action, int32(status), memo)
 }
 
 // Restore rebuilds this protocol's secret_id namespace from a recovered
@@ -379,7 +378,11 @@ func (p *DeRecProtocol) Reject(action []byte, status int32, memo string) error {
 // (and ReplicaSecretReceivedEvent.Secret); pass it verbatim along with the
 // version it was recovered at.
 //
-// When channels already exist at ids the recovered Secret uses, Restore
+// A helper or member whose Transports is empty (or nil) gets no channel: it
+// is reported as an EventTypePeerNotRestored event in the returned slice and
+// the rest of the roster is restored.
+//
+// When channels already exist at ids Restore is about to write, Restore
 // fails with a *derec.Error whose Code is derec.CodeRestoreConflict and
 // whose ConflictingChannelIDs lists exactly those ids, so the application
 // can clear them and retry.

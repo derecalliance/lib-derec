@@ -62,7 +62,8 @@ pub unsafe extern "C" fn derec_protocol_set_communication_info(
 /// [`super::derec_protocol_new`]. A device serves at most one endpoint per
 /// protocol, so this list is a preference order over distinct protocols and
 /// two entries of the same protocol are rejected. Body is the same JSON
-/// shape that config array uses — `[{"uri": "...", "protocol": 0}, ...]`.
+/// shape that config array uses — `[{"uri": "...", "protocol": "https"}, ...]`,
+/// with `protocol` as its name or its `derec_proto::Protocol` discriminant.
 ///
 /// Every entry is validated before any is stored, so a malformed URI
 /// leaves the previous set intact rather than half-applied.
@@ -116,6 +117,9 @@ pub unsafe extern "C" fn derec_protocol_set_own_transports(
 #[derive(serde::Deserialize)]
 struct OwnTransportEntry {
     uri: String,
+    #[serde(
+        deserialize_with = "crate::interop::protocol_names::protocol_from_name_or_discriminant"
+    )]
     protocol: i32,
 }
 

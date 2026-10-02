@@ -138,6 +138,11 @@ _test-native: _packages
 	cd $(ROOT)/smoke-tests/dotnet && dotnet run --configuration Release
 	$(call section,"Node.js binding smoke")
 	cd $(ROOT)/smoke-tests/nodejs && ./run_test.sh
+	$(call section,"Web binding smoke")
+	# Headless Chromium against a served build: the page fetches the `.wasm`
+	# over HTTP and runs as an ES module, the path an application takes. The
+	# first run downloads the browser.
+	$(ROOT)/smoke-tests/web/run_test.sh
 
 _test-js: _packages
 	$(call section,"TypeScript tests")

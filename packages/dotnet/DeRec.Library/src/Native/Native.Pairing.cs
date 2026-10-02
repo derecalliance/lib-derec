@@ -22,6 +22,20 @@ internal static class Pairing
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    internal struct EncodeContactMessageResult
+    {
+        public DeRecError Error;
+        public Buffer WireBytes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct DecodeContactMessageResult
+    {
+        public DeRecError Error;
+        public Buffer ContactJson;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     internal struct ProducePairRequestMessageResult
     {
         public DeRecError Error;
@@ -131,9 +145,15 @@ internal static class Pairing
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern DeRecError validate_contact_message(
-        byte[] contactMessageBytes,
-        UIntPtr contactMessageBytesLen
+    internal static extern EncodeContactMessageResult encode_contact_message(
+        byte[] contactJson,
+        UIntPtr contactJsonLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DecodeContactMessageResult decode_contact_message(
+        byte[] contactWireBytes,
+        UIntPtr contactWireBytesLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
@@ -154,7 +174,9 @@ internal static class Pairing
         byte[] requestBytes,
         UIntPtr requestBytesLen,
         byte[] secretKeyMaterial,
-        UIntPtr secretKeyMaterialLen
+        UIntPtr secretKeyMaterialLen,
+        byte[]? parameterRangeBytes,
+        UIntPtr parameterRangeBytesLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
@@ -186,7 +208,9 @@ internal static class Pairing
         byte[] responseProtoBytes,
         UIntPtr responseProtoBytesLen,
         byte[] secretKeyMaterial,
-        UIntPtr secretKeyMaterialLen
+        UIntPtr secretKeyMaterialLen,
+        byte[]? parameterRangeBytes,
+        UIntPtr parameterRangeBytesLen
     );
 
 

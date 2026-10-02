@@ -83,9 +83,9 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 ) -> Result<Vec<DeRecEvent>> {
     match message {
         MessageBody::PairRequest(request) => {
-            if let Err(err) = crate::primitives::pairing::parameter_range::check_compatibility(
+            if let Err(err) = crate::primitives::pairing::request::check_parameter_range(
+                request,
                 pairing.parameter_range,
-                request.parameter_range.as_ref(),
             ) {
                 pair::reject(
                     stores,

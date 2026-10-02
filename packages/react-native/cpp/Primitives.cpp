@@ -340,21 +340,6 @@ jsi::Value createContactMessage(jsi::Runtime& rt,
   return jsi::Value(rt, payload);
 }
 
-/// `validate_contact_message(contactMessage: ArrayBuffer) -> undefined`
-jsi::Value validateContactMessage(jsi::Runtime& rt,
-                                  const jsi::Value&,
-                                  const jsi::Value* args,
-                                  size_t count) {
-  requireArgs(rt, "validate_contact_message", count, 1);
-  ByteView contactMessage = asBytes(rt, args[0]);
-  DeRecError error =
-      validate_contact_message(contactMessage.ptr, contactMessage.len);
-  if (error.code != 0) {
-    throwDeRecError(rt, error);
-  }
-  return jsi::Value::undefined();
-}
-
 /// `encode_contact_message(contactJson: ArrayBuffer) -> ArrayBuffer`
 jsi::Value encodeContactMessage(jsi::Runtime& rt,
                                 const jsi::Value&,
@@ -478,17 +463,19 @@ jsi::Value producePairRequestMessage(jsi::Runtime& rt,
   return jsi::Value(rt, payload);
 }
 
-/// `extract_pair_request(request: ArrayBuffer, secretKeyMaterial: ArrayBuffer)
-///   -> { channel_id, request_proto_bytes }`
+/// `extract_pair_request(request: ArrayBuffer, secretKeyMaterial: ArrayBuffer,
+///   parameterRange: ArrayBuffer|null) -> { channel_id, request_proto_bytes }`
 jsi::Value extractPairRequest(jsi::Runtime& rt,
                               const jsi::Value&,
                               const jsi::Value* args,
                               size_t count) {
-  requireArgs(rt, "extract_pair_request", count, 2);
+  requireArgs(rt, "extract_pair_request", count, 3);
   ByteView request = asBytes(rt, args[0]);
   ByteView secretKeyMaterial = asBytes(rt, args[1]);
+  ByteView parameterRange = asBytes(rt, args[2]);
   ExtractPairRequestResult result = extract_pair_request(
-      request.ptr, request.len, secretKeyMaterial.ptr, secretKeyMaterial.len);
+      request.ptr, request.len, secretKeyMaterial.ptr, secretKeyMaterial.len,
+      parameterRange.ptr, parameterRange.len);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
@@ -569,19 +556,21 @@ jsi::Value extractPairResponse(jsi::Runtime& rt,
 }
 
 /// `process_pair_response_message(contactMessage: ArrayBuffer, responseProto:
-///   ArrayBuffer, secretKeyMaterial: ArrayBuffer) -> { shared_key,
-///   channel_id }`
+///   ArrayBuffer, secretKeyMaterial: ArrayBuffer, parameterRange:
+///   ArrayBuffer|null) -> { shared_key, channel_id }`
 jsi::Value processPairResponseMessage(jsi::Runtime& rt,
                                       const jsi::Value&,
                                       const jsi::Value* args,
                                       size_t count) {
-  requireArgs(rt, "process_pair_response_message", count, 3);
+  requireArgs(rt, "process_pair_response_message", count, 4);
   ByteView contactMessage = asBytes(rt, args[0]);
   ByteView responseProto = asBytes(rt, args[1]);
   ByteView secretKeyMaterial = asBytes(rt, args[2]);
+  ByteView parameterRange = asBytes(rt, args[3]);
   ProcessPairResponseMessageResult result = process_pair_response_message(
       contactMessage.ptr, contactMessage.len, responseProto.ptr,
-      responseProto.len, secretKeyMaterial.ptr, secretKeyMaterial.len);
+      responseProto.len, secretKeyMaterial.ptr, secretKeyMaterial.len,
+      parameterRange.ptr, parameterRange.len);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
@@ -1285,7 +1274,6 @@ void installPrimitives(jsi::Runtime& rt, jsi::Object& host) {
   bind(rt, host, "apply_trace_id_to_envelope", 2, applyTraceId);
   bind(rt, host, "read_trace_id_from_envelope", 1, readTraceId);
   bind(rt, host, "create_contact_message", 5, createContactMessage);
-  bind(rt, host, "validate_contact_message", 1, validateContactMessage);
   bind(rt, host, "encode_contact_message", 1, encodeContactMessage);
   bind(rt, host, "decode_contact_message", 1, decodeContactMessage);
   bind(rt, host, "transport_protocol_discriminant", 1,
@@ -1293,10 +1281,10 @@ void installPrimitives(jsi::Runtime& rt, jsi::Object& host) {
   bind(rt, host, "decode_message_json", 2, decodeMessageJson);
   bind(rt, host, "encode_message_json", 2, encodeMessageJson);
   bind(rt, host, "produce_pair_request_message", 5, producePairRequestMessage);
-  bind(rt, host, "extract_pair_request", 2, extractPairRequest);
+  bind(rt, host, "extract_pair_request", 3, extractPairRequest);
   bind(rt, host, "produce_pair_response_message", 7, producePairResponseMessage);
   bind(rt, host, "extract_pair_response", 2, extractPairResponse);
-  bind(rt, host, "process_pair_response_message", 3, processPairResponseMessage);
+  bind(rt, host, "process_pair_response_message", 4, processPairResponseMessage);
   bind(rt, host, "produce_pre_pair_request_message", 2,
        producePrePairRequestMessage);
   bind(rt, host, "extract_pre_pair_request", 1, extractPrePairRequest);

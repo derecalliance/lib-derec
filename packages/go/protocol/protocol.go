@@ -8,11 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"time"
 
-	"google.golang.org/protobuf/proto"
-
-	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 	"github.com/derecalliance/lib-derec/packages/go/internal/native"
 )
 
@@ -71,9 +67,11 @@ type AutoAcceptPolicy struct {
 }
 
 // Config configures a DeRecProtocol instance. Mirrors the Rust
-// DeRecProtocolBuilder / dotnet DeRecProtocolBuilder field for field; a
-// zero-valued field falls back to the same default those builders use,
-// documented per field below.
+// DeRecProtocolBuilder / dotnet DeRecProtocolBuilder field for field. An
+// unset field falls back to the default the library uses, documented per
+// field below. Numeric settings whose zero value the library must be able to
+// see — and accept or reject — are pointers, where nil means unset; build one
+// inline with proto.Uint32 / proto.Uint64 from google.golang.org/protobuf/proto.
 type Config struct {
 	// SecretID identifies the single secret this protocol instance
 	// manages.
@@ -81,9 +79,9 @@ type Config struct {
 
 	// OwnTransports is every transport endpoint this application serves,
 	// in preference order. Each entry's Protocol is 0 = HTTPS
-	// (derecpb.Protocol_HTTPS) or 1 = gRPC (derecpb.Protocol_GRPC). Empty
-	// defers configuration to a later SetOwnTransports call; any pairing
-	// flow requires it to be set first.
+	// (derecpb.Protocol_HTTPS) or 1 = gRPC (derecpb.Protocol_GRPC).
+	// Required: New returns a *derec.Error (CodeInvalidInput) when it is
+	// empty, since a node with no endpoint cannot be reached by any peer.
 	//
 	// The order given is the order forwarded to the library — it is not
 	// sorted, deduplicated, or reordered here. It is this application's
@@ -94,17 +92,21 @@ type Config struct {
 	OwnTransports []TransportProtocolParam
 
 	// Threshold is the minimum number of shares required to reconstruct
-	// the secret. Default: 3.
-	Threshold uint32
+	// the secret. nil uses the library default (3). Every non-nil value,
+	// including 0, is forwarded as given: the library rejects a threshold
+	// below 2 with a *derec.Error, because a threshold of 0 or 1 lets a
+	// single helper reconstruct the secret.
+	Threshold *uint32
 	// KeepVersionsCount is the number of recent share versions each
-	// helper retains. Default: 3.
-	KeepVersionsCount uint32
+	// helper retains. nil uses the library default (3); every non-nil
+	// value, including 0, is forwarded as given.
+	KeepVersionsCount *uint32
 	// CommunicationInfo carries key/value pairs included in
 	// pairing-request and pairing-response CommunicationInfo. Default:
 	// empty.
 	CommunicationInfo map[string]string
 	// Timeouts configures how long the protocol waits on each thing that
-	// can keep it waiting. nil, or a zero field inside it, leaves the
+	// can keep it waiting. nil, or a nil field inside it, leaves the
 	// library's own default in force. See Timeouts.
 	Timeouts *Timeouts
 	// UnsafeConnection accepts plaintext http:// and grpc:// transport
@@ -184,35 +186,36 @@ func nativeParameterRange(r *ParameterRange) *native.ParameterRangeConfig {
 }
 
 // Timeouts configures how long the protocol waits on each thing that can keep
-// it waiting. A zero field means "use the library default"; the defaults live
-// in the Rust library, not here.
+// it waiting. Every value is in whole seconds, the unit the library takes, so
+// what is set here reaches it unchanged. A nil field means "use the library
+// default"; the defaults live in the Rust library, not here. Every non-nil
+// value, including 0, is forwarded as given and the library decides what it
+// means.
 //
-// These were one knob until it became clear they answer different questions.
-// InboundMessage is a security boundary — it bounds how stale a message may be
-// and still be accepted, so it must tolerate transport latency and clock skew.
-// The other three are liveness budgets: how long to keep hoping a peer will
-// answer. Collapsing them meant tightening the replay window every time
-// someone wanted rounds to settle faster.
+// InboundMessageSecs is a security boundary — it bounds how stale a message
+// may be and still be accepted, so it must tolerate transport latency and
+// clock skew. The other three are liveness budgets: how long to keep hoping a
+// peer will answer.
 type Timeouts struct {
-	// InboundMessage is the staleness boundary for inbound envelopes: any
-	// message older than this is discarded on receipt, whatever the flow.
-	// This is the replay-defence window, and lowering it starts refusing
-	// legitimately old messages from slow transports or skewed clocks.
-	// Default: 300s.
-	InboundMessage time.Duration
-	// SharingRound bounds how long a publishing round waits on a peer that
-	// has not answered. It is what limits how long SharingComplete can be
-	// delayed by one unreachable peer. Default: 60s.
-	SharingRound time.Duration
-	// UnpairAck bounds the wait for an unpair acknowledgement before local
-	// channel state is dropped anyway. Default: 60s.
-	UnpairAck time.Duration
+	// InboundMessageSecs is the staleness boundary for inbound envelopes:
+	// any message older than this is discarded on receipt, whatever the
+	// flow. This is the replay-defence window, and lowering it starts
+	// refusing legitimately old messages from slow transports or skewed
+	// clocks. Default: 300.
+	InboundMessageSecs *uint64
+	// SharingRoundSecs bounds how long a publishing round waits on a peer
+	// that has not answered. It is what limits how long SharingComplete can
+	// be delayed by one unreachable peer. Default: 60.
+	SharingRoundSecs *uint64
+	// UnpairAckSecs bounds the wait for an unpair acknowledgement before
+	// local channel state is dropped anyway. Default: 60.
+	UnpairAckSecs *uint64
 	// ExpiredChannels governs removal of channels still awaiting out-of-band
 	// fingerprint confirmation — every replica pairing, and every NoKeys
 	// pairing. Unlike the others it can be disabled, leaving the sweep to
 	// the application. The budget is a human one: someone comparing a
 	// fingerprint, possibly over the phone. nil leaves the default
-	// (enabled, 300s) in force.
+	// (enabled, 300 seconds) in force.
 	ExpiredChannels *RemoveExpiredChannelsPolicy
 }
 
@@ -286,21 +289,12 @@ func New(
 		return nil, errors.New("protocol: New: transport is required")
 	}
 
-	// Timeouts are forwarded verbatim; an unset field is omitted so the
-	// library applies its own default rather than this wrapper choosing one.
 	var nativeTimeouts *native.TimeoutsConfig
 	if config.Timeouts != nil {
-		secs := func(d time.Duration) *uint64 {
-			if d == 0 {
-				return nil
-			}
-			v := uint64(d.Truncate(time.Second).Seconds())
-			return &v
-		}
 		nativeTimeouts = &native.TimeoutsConfig{
-			InboundMessageSecs: secs(config.Timeouts.InboundMessage),
-			SharingRoundSecs:   secs(config.Timeouts.SharingRound),
-			UnpairAckSecs:      secs(config.Timeouts.UnpairAck),
+			InboundMessageSecs: config.Timeouts.InboundMessageSecs,
+			SharingRoundSecs:   config.Timeouts.SharingRoundSecs,
+			UnpairAckSecs:      config.Timeouts.UnpairAckSecs,
 		}
 		if p := config.Timeouts.ExpiredChannels; p != nil {
 			nativeTimeouts.ExpiredChannels = &native.RemoveExpiredChannelsPolicy{
@@ -308,11 +302,6 @@ func New(
 				TimeoutInSecs: p.TimeoutInSecs,
 			}
 		}
-	}
-
-	commInfo, err := encodeCommunicationInfo(config.CommunicationInfo)
-	if err != nil {
-		return nil, err
 	}
 
 	// Order preserved verbatim — it is the application's own preference
@@ -330,7 +319,7 @@ func New(
 		OwnTransports:        nativeOwnTransports,
 		Threshold:            config.Threshold,
 		KeepVersionsCount:    config.KeepVersionsCount,
-		CommunicationInfo:    commInfo,
+		CommunicationInfo:    config.CommunicationInfo,
 		Timeouts:             nativeTimeouts,
 		UnsafeConnection:     config.UnsafeConnection,
 		AutoRespondOnFailure: config.AutoRespondOnFailure,
@@ -369,8 +358,6 @@ func New(
 	}, nil
 }
 
-// Close frees the underlying protocol handle and releases the store
-// registration. Idempotent — safe to call more than once.
 // SecretID is the single secret this protocol instance manages, as supplied
 // in Config.SecretID.
 //
@@ -380,6 +367,8 @@ func (p *DeRecProtocol) SecretID() uint64 {
 	return p.secretID
 }
 
+// Close frees the underlying protocol handle and releases the store
+// registration. Idempotent — safe to call more than once.
 func (p *DeRecProtocol) Close() error {
 	if p.closed {
 		return nil
@@ -415,8 +404,8 @@ func (p *DeRecProtocol) VerifyFingerprint(channelID uint64, fingerprint string) 
 // olderThanSecs, along with their pairing keys, returning the ids
 // removed.
 //
-// Independent of Config.RemoveExpiredChannels — this sweeps at the
-// threshold given even when that policy is disabled. The age comparison
+// Independent of Config.Timeouts.ExpiredChannels — this sweeps at the
+// age given even when that policy is disabled. The age comparison
 // is strict, so a channel created within the current second survives
 // even olderThanSecs == 0.
 func (p *DeRecProtocol) RemoveExpiredChannels(olderThanSecs uint64) ([]uint64, error) {
@@ -509,24 +498,4 @@ func (p *DeRecProtocol) Tick() ([]Event, error) {
 		return nil, err
 	}
 	return decodeEvents(eventsJSON)
-}
-
-// encodeCommunicationInfo proto-encodes info as a derecpb.CommunicationInfo,
-// the wire shape derec_protocol_new expects for its
-// communication_info argument. A nil/empty map encodes to nil bytes,
-// matching the FFI's "no entries" convention (communication_info_len == 0).
-func encodeCommunicationInfo(info map[string]string) ([]byte, error) {
-	if len(info) == 0 {
-		return nil, nil
-	}
-	msg := &derecpb.CommunicationInfo{
-		CommunicationInfoEntries: make([]*derecpb.CommunicationInfoKeyValue, 0, len(info)),
-	}
-	for k, v := range info {
-		msg.CommunicationInfoEntries = append(msg.CommunicationInfoEntries, &derecpb.CommunicationInfoKeyValue{
-			Key:   k,
-			Value: &derecpb.CommunicationInfoKeyValue_StringValue{StringValue: v},
-		})
-	}
-	return proto.Marshal(msg)
 }

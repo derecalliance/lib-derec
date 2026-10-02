@@ -60,6 +60,16 @@ internal static class Utils
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern IntPtr derec_error_code_name(int code);
+
+    // Static NUL-terminated name ("https", "grpc") for a Protocol
+    // discriminant, or NULL when it names no defined protocol; never free it.
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern IntPtr derec_transport_protocol_name(int protocol);
+
+    // Protocol discriminant for a UTF-8 protocol name, or -1 when it names
+    // no defined protocol.
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int derec_transport_protocol_discriminant(byte[]? name, UIntPtr nameLen);
 }
 
 /// <summary>

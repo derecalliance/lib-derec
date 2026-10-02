@@ -146,12 +146,17 @@ impl<
     /// `SharedKey`; canonical replica channels are persisted
     /// with the group key from `secret.replicas.shared_key`;
     /// the user-secret snapshot is committed at `recovered_version`;
-    /// every other
-    /// channel under `self.secret_id` (i.e. the recovery-mode
-    /// channels) is unpaired (request sent to the helper, local
-    /// state dropped). The protocol resumes normal operation
+    /// every channel under `self.secret_id` at no roster id (i.e. the
+    /// recovery-mode channels) is unpaired (request sent to the helper,
+    /// local state dropped). The protocol resumes normal operation
     /// immediately — the next `start(ProtectSecret)` publishes
     /// `recovered_version + 1` to the restored helpers.
+    ///
+    /// A helper or replica member whose `transports` is empty gets no
+    /// channel — there would be nothing to send to. It is reported as
+    /// [`DeRecEvent::PeerNotRestored`] in the returned events and the rest
+    /// of the roster is restored; it is neither a conflict nor wiped. See
+    /// the restore handler for the full rule.
     ///
     /// The snapshot write is the commit point — nothing is removed
     /// before it succeeds. Any mid-flight failure leaves state the
@@ -185,16 +190,12 @@ impl<
     /// - [`RestoreError::AlreadyRestored`](crate::protocol::RestoreError::AlreadyRestored) when a user-secret
     ///   snapshot exists for this `secret_id`.
     /// - [`RestoreError::Conflict`](crate::protocol::RestoreError::Conflict) when one or more channels live
-    ///   at canonical helper / replica ids carried by `secret`.
+    ///   at the helper / replica ids restore is about to write.
     /// - [`RestoreError::Invariant`](crate::protocol::RestoreError::Invariant) when the recovered `Secret`
     ///   is internally inconsistent (e.g. non-empty `replicas` with
-    ///   empty `replicas.shared_key`).
-    ///
-    /// [`crate::Error::Transport`] surfaces on the same terms when a roster
-    /// entry's `transport_uri` names a scheme this library serves no
-    /// transport for: the roster carries no protocol discriminant, so each
-    /// peer's is derived from its URI scheme, and an unknown scheme leaves
-    /// nothing to derive.
+    ///   empty `replicas.shared_key`, or a helper key that is not 32
+    ///   bytes). Every roster entry is checked, including one skipped for
+    ///   having no endpoint.
     ///
     /// Store I/O failures mid-restore propagate as the underlying
     /// [`crate::Error::ChannelStore`] or [`crate::Error::SecretStore`]

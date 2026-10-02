@@ -192,6 +192,11 @@ type SecretStore interface {
 	// Load returns the value at (secretID, channelID, kind), or
 	// ok=false if none is stored.
 	Load(secretID, channelID uint64, kind SecretKind) (value SecretValue, ok bool, err error)
+	// LoadMany returns the values of kind for several channels within
+	// secretID: exactly one entry per channelIDs element, in the same
+	// order, nil where nothing of kind is stored. Whether a missing entry
+	// is an error is decided by the library, not the store.
+	LoadMany(secretID uint64, channelIDs []uint64, kind SecretKind) ([]*SecretValue, error)
 	// Save inserts or replaces the value at (secretID, channelID,
 	// value.Kind).
 	Save(secretID, channelID uint64, value SecretValue) error

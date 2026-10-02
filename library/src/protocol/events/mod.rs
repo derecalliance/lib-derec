@@ -39,6 +39,15 @@ pub enum IgnoreReason {
     Expired,
 }
 
+/// Why [`DeRecEvent::PeerNotRestored`] left a roster entry without a channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NotRestoredReason {
+    /// The recovered roster names no endpoint for the peer, so a channel to
+    /// it would have nothing to send to. A legacy roster whose single URI had
+    /// a scheme this library does not serve decodes this way.
+    NoTransports,
+}
+
 /// Lightweight discriminant of [`PendingAction`].
 ///
 /// Carries no payload — useful for the
@@ -1092,6 +1101,23 @@ pub enum DeRecEvent {
         /// peer's `*Started` event for the same round. `0` when the sender
         /// set none.
         trace_id: u64,
+    },
+
+    /// [`super::DeRecProtocol::restore`] wrote no channel for one entry of
+    /// the recovered roster. Every other entry and the user-secret snapshot
+    /// were restored as usual; `reason` says why this one was not.
+    ///
+    /// Nothing is stored for the peer, so this device cannot reach it. The
+    /// peer itself is untouched: a helper still holds its share, and pairing
+    /// with it again is what makes it reachable from this device.
+    PeerNotRestored {
+        /// The helper's channel, or the replica group's channel when the
+        /// entry is a group member.
+        channel_id: ChannelId,
+        /// The member's `replica_id` when the entry is a replica group
+        /// member; `None` for a helper.
+        replica_id: Option<u64>,
+        reason: NotRestoredReason,
     },
 
     /// A pairing flow was initiated for `channel_id` with the local

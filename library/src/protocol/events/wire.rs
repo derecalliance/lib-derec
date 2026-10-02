@@ -252,6 +252,16 @@ pub(crate) enum Event {
         reason: String,
         trace_id: String,
     },
+    /// `restore` wrote no channel for this roster entry.
+    PeerNotRestored {
+        channel_id: String,
+        /// Decimal `replica_id` of a replica group member; absent for a
+        /// helper.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replica_id: Option<String>,
+        /// [`not_restored_reason_label`] — `"NoTransports"`.
+        reason: String,
+    },
     PairingStarted {
         channel_id: String,
         kind: i32,
@@ -347,19 +357,22 @@ pub struct ReplicasWire {
     pub shared_key: Vec<u8>,
 }
 
-/// One advertised endpoint, carrying its protocol discriminant so an SDK
-/// never infers a protocol from a URI scheme.
+/// One advertised endpoint, carrying its protocol by name (`"https"`,
+/// `"grpc"`) so an SDK never infers a protocol from a URI scheme. Every
+/// endpoint reaching an event was validated on entry, so an undefined
+/// discriminant does not occur; it would read as `"unknown"`.
 #[derive(Serialize)]
 pub struct Endpoint {
     pub uri: String,
-    pub protocol: i32,
+    pub protocol: &'static str,
 }
 
 impl From<derec_proto::TransportProtocol> for Endpoint {
     fn from(t: derec_proto::TransportProtocol) -> Self {
         Endpoint {
             uri: t.uri,
-            protocol: t.protocol,
+            protocol: crate::interop::protocol_names::protocol_discriminant_to_name(t.protocol)
+                .unwrap_or("unknown"),
         }
     }
 }
@@ -762,6 +775,15 @@ impl Event {
                 reason: ignore_reason_label(reason).to_owned(),
                 trace_id: trace_id.to_string(),
             },
+            DeRecEvent::PeerNotRestored {
+                channel_id,
+                replica_id,
+                reason,
+            } => Self::PeerNotRestored {
+                channel_id: channel_id.0.to_string(),
+                replica_id: replica_id.map(encode_replica_id),
+                reason: not_restored_reason_label(reason).to_owned(),
+            },
             DeRecEvent::PairingStarted {
                 channel_id,
                 kind,
@@ -875,6 +897,17 @@ pub(crate) fn ignore_reason_label(reason: crate::protocol::IgnoreReason) -> &'st
     match reason {
         IgnoreReason::PendingVerification => "PendingVerification",
         IgnoreReason::Expired => "Expired",
+    }
+}
+
+/// Wire label for a [`NotRestoredReason`](crate::protocol::NotRestoredReason):
+/// the variant name, matching `library/tests/fixtures/enums.json`.
+pub(crate) fn not_restored_reason_label(
+    reason: crate::protocol::NotRestoredReason,
+) -> &'static str {
+    use crate::protocol::NotRestoredReason;
+    match reason {
+        NotRestoredReason::NoTransports => "NoTransports",
     }
 }
 
@@ -1034,7 +1067,7 @@ mod tests {
             json["updated_transports"][0]["uri"],
             "grpcs://alice.example:443"
         );
-        assert_eq!(json["updated_transports"][0]["protocol"], 1);
+        assert_eq!(json["updated_transports"][0]["protocol"], "grpc");
 
         // An update carrying only endpoints leaves the stored map alone, which
         // is distinct from clearing it.
@@ -1085,5 +1118,38 @@ mod tests {
         assert_eq!(json["channel_id"], u64::MAX.to_string());
         assert_eq!(json["reason"], "PendingVerification");
         assert_eq!(json["trace_id"], "42");
+    }
+
+    /// A helper carries no `replica_id` — the key is absent, as
+    /// `fetched_from` is, so the FFI JSON and the WASM object agree; a group
+    /// member is named by it, on the group's channel.
+    #[test]
+    fn peer_not_restored_maps_helper_and_member_entries() {
+        let helper = serde_json::to_value(
+            Event::from_event(DeRecEvent::PeerNotRestored {
+                channel_id: ChannelId(u64::MAX),
+                replica_id: None,
+                reason: crate::protocol::NotRestoredReason::NoTransports,
+            })
+            .expect("PeerNotRestored must map"),
+        )
+        .expect("serializes");
+        assert_eq!(helper["type"], "PeerNotRestored");
+        assert_eq!(helper["channel_id"], u64::MAX.to_string());
+        assert!(!helper.as_object().unwrap().contains_key("replica_id"));
+        assert_eq!(helper["reason"], "NoTransports");
+
+        let member = serde_json::to_value(
+            Event::from_event(DeRecEvent::PeerNotRestored {
+                channel_id: ChannelId(21),
+                replica_id: Some(u64::MAX),
+                reason: crate::protocol::NotRestoredReason::NoTransports,
+            })
+            .expect("PeerNotRestored must map"),
+        )
+        .expect("serializes");
+        assert_eq!(member["channel_id"], "21");
+        assert_eq!(member["replica_id"], u64::MAX.to_string());
+        assert_eq!(member["reason"], "NoTransports");
     }
 }

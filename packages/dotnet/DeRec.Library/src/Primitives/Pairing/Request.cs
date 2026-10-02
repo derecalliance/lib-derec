@@ -96,7 +96,7 @@ public static partial class Pairing
                 Utils.ThrowIfError(nativeResult.Error);
                 return new CreateContactResult
                 {
-                    ContactMessage = ContactMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.ContactWireBytes)),
+                    ContactMessage = DecodeContact(Utils.CopyBuffer(nativeResult.ContactWireBytes)),
                     // Empty for NoKeys (no key material at contact-creation
                     // time); populated for InlineKeys / HashedKeys.
                     SecretKeyMaterial = Utils.CopyBuffer(nativeResult.SecretKeyMaterial),
@@ -106,6 +106,56 @@ public static partial class Pairing
             {
                 Utils.FreeBuffer(nativeResult.ContactWireBytes);
                 Utils.FreeBuffer(nativeResult.SecretKeyMaterial);
+            }
+        }
+
+        /// <summary>
+        /// Serializes a <see cref="ContactMessage"/> to the protobuf bytes
+        /// delivered out of band (typically as a QR code).
+        /// </summary>
+        /// <exception cref="DeRecException">
+        /// The contact violates the invariants of its <see cref="ContactMode"/>,
+        /// or advertises no endpoint.
+        /// </exception>
+        public static byte[] EncodeContact(ContactMessage contactMessage)
+        {
+            byte[] json = contactMessage.ToWireJson();
+
+            Native.Pairing.EncodeContactMessageResult nativeResult =
+                Native.Pairing.encode_contact_message(json, (UIntPtr)json.Length);
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                return Utils.CopyBuffer(nativeResult.WireBytes);
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.WireBytes);
+            }
+        }
+
+        /// <summary>
+        /// Parses out-of-band contact bytes back into the
+        /// <see cref="ContactMessage"/> a scanner pairs against.
+        /// </summary>
+        /// <exception cref="DeRecException">
+        /// The bytes are not a contact, or the contact violates the invariants
+        /// of its <see cref="ContactMode"/>.
+        /// </exception>
+        public static ContactMessage DecodeContact(byte[] bytes)
+        {
+            Native.Pairing.DecodeContactMessageResult nativeResult =
+                Native.Pairing.decode_contact_message(bytes, (UIntPtr)bytes.Length);
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                return ContactMessage.FromWireJson(Utils.CopyBuffer(nativeResult.ContactJson));
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.ContactJson);
             }
         }
 
@@ -125,7 +175,7 @@ public static partial class Pairing
         )
         {
             byte[] transportProtocolBytes = TransportProtocol.ToProtoBytesList(transportProtocols);
-            byte[] contactMessageBytes = contactMessage.ToProtoBytes();
+            byte[] contactMessageBytes = EncodeContact(contactMessage);
 
             Native.Pairing.ProducePairRequestMessageResult nativeResult =
                 Native.Pairing.produce_pair_request_message(
@@ -146,7 +196,7 @@ public static partial class Pairing
                 return new ProduceResult
                 {
                     Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.RequestWireBytes)),
-                    InitiatorContactMessage = ContactMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.InitiatorContactMessageWireBytes)),
+                    InitiatorContactMessage = DecodeContact(Utils.CopyBuffer(nativeResult.InitiatorContactMessageWireBytes)),
                     SecretKeyMaterial = Utils.CopyBuffer(nativeResult.SecretKeyMaterial),
                 };
             }
@@ -158,7 +208,17 @@ public static partial class Pairing
             }
         }
 
-        public static ExtractResult Extract(DeRecMessage request, byte[] secretKeyMaterial)
+        /// <summary>
+        /// Decrypts a pairing request. <paramref name="parameterRange"/> is the
+        /// serialized <c>ParameterRange</c> this side accepts, or null for none;
+        /// a request advertising a range that does not overlap it is refused
+        /// with <see cref="DeRecCode.IncompatibleParameterRange"/>.
+        /// </summary>
+        public static ExtractResult Extract(
+            DeRecMessage request,
+            byte[] secretKeyMaterial,
+            byte[]? parameterRange = null
+        )
         {
             byte[] requestBytes = request.ToProtoBytes();
 
@@ -167,7 +227,9 @@ public static partial class Pairing
                     requestBytes,
                     (UIntPtr)requestBytes.Length,
                     secretKeyMaterial,
-                    (UIntPtr)secretKeyMaterial.Length
+                    (UIntPtr)secretKeyMaterial.Length,
+                    parameterRange,
+                    (UIntPtr)(parameterRange?.Length ?? 0)
                 );
 
             try
@@ -199,7 +261,7 @@ public static partial class Pairing
         )
         {
             byte[] transportProtocolBytes = TransportProtocol.ToProtoBytesList(transportProtocols);
-            byte[] contactMessageBytes = contactMessage.ToProtoBytes();
+            byte[] contactMessageBytes = EncodeContact(contactMessage);
 
             Native.Pairing.ProducePrePairRequestMessageResult nativeResult =
                 Native.Pairing.produce_pre_pair_request_message(

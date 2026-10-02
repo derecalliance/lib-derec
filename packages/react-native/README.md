@@ -141,9 +141,14 @@ declared in `src/types.ts`:
 - **`StateStore`** — in-flight orchestrator bookkeeping (pending
   verifications, recoveries, unpairs, sharing rounds, replica discoveries) so a
   multi-round flow survives an app restart.
-- **`Transport`** — outbound delivery. `send(endpoint, message)` posts a
-  wire-format envelope to a peer; it is a mailbox, not a request/response
-  call, since not every peer (e.g. a phone behind NAT) can be dialed back.
+- **`Transport`** — outbound delivery.
+  `send(endpoints: ReadonlyArray<{ protocol: string; uri: string }>, message: Uint8Array): Promise<void>`
+  posts a wire-format envelope to a peer. `endpoints` is every address that
+  peer advertised, in its own order (`protocol` is `"https"` or `"grpc"`);
+  deliver once, to the first one that accepts it, and reject only when none
+  did. `sequentialFailover` and `singleEndpointTransport` implement that
+  choice for you. It is a mailbox, not a request/response call, since not
+  every peer (e.g. a phone behind NAT) can be dialed back.
 
 Every method is `async` and keyed by decimal-string ids — see the next
 section for why that differs from `DeRecProtocol`'s own methods. Full field-

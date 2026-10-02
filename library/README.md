@@ -333,6 +333,11 @@ before any target-level events are emitted.
   teardown is fire-and-forget, so local state is dropped anyway and an
   `Unpaired` for the same channel follows; the pair means "gone locally,
   peer not told"
+- `PeerNotRestored { channel_id, replica_id, reason }` — emitted by
+  `restore` for a roster entry it wrote no channel for. `reason` is
+  `NotRestoredReason::NoTransports`: the recovered roster names no endpoint
+  for that helper (`replica_id` is `None`) or replica member (`channel_id` is
+  the group's channel). The rest of the roster is restored.
 
 - `ChannelInfoUpdated { channel_id }` /
   `ChannelInfoUpdateRejected { channel_id, status, memo }`
@@ -1290,7 +1295,11 @@ let request::ProduceResult {
 
 // Step 3 — Initiator extracts the request and produces the response.
 let request::ExtractResult { request: pair_request } =
-    request::extract(&pair_request_envelope, initiator_secret_key.ecies_secret_key()).unwrap();
+    request::extract(
+        &pair_request_envelope,
+        initiator_secret_key.ecies_secret_key(),
+        None, // local ParameterRange; checked against the requester's
+    ).unwrap();
 let response::ProduceResult {
     envelope: pair_response_envelope,
     shared_key: initiator_shared_key,
@@ -1313,6 +1322,7 @@ let response::ProcessResult {
     &initiator_contact_message,
     &pair_response,
     &responder_secret_key,
+    None, // local ParameterRange; checked against the contact creator's
 ).unwrap();
 
 // Both sides now hold the same shared key and the same rekeyed channel id;

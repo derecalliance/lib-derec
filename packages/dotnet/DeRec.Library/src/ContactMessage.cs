@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-using Google.Protobuf;
+using System.Globalization;
+using System.Text.Json;
 
 namespace DeRec.Library;
 
@@ -68,100 +69,87 @@ public sealed record ContactMessage(
     public Timestamp? Timestamp { get; init; }
 
     /// <summary>
-    /// Serializes this <see cref="ContactMessage"/> to protobuf wire bytes.
+    /// The JSON shape <c>encode_contact_message</c> reads and
+    /// <c>decode_contact_message</c> writes. Encoding and decoding the wire
+    /// bytes, and enforcing the contact's mode invariants, happen in the
+    /// core: see <see cref="Primitives.Pairing.Request.EncodeContact"/> and
+    /// <see cref="Primitives.Pairing.Request.DecodeContact"/>.
     /// </summary>
-    /// <exception cref="DeRecException">
-    /// The contact violates its <see cref="ContactMode"/> invariant.
-    /// </exception>
-    public byte[] ToProtoBytes()
+    internal byte[] ToWireJson()
     {
-        var proto = new Org.Derecalliance.Derec.Protobuf.ContactMessage
+        using var buffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer))
         {
-            ChannelId = ChannelId,
-            ContactMode = (Org.Derecalliance.Derec.Protobuf.ContactMode)(int)ContactMode,
-            Nonce = Nonce,
-        };
-        foreach (TransportProtocol offer in SupportedTransports)
-        {
-            proto.SupportedTransports.Add(new Org.Derecalliance.Derec.Protobuf.TransportProtocol
+            writer.WriteStartObject();
+            writer.WriteString("channel_id", ChannelId.ToString(CultureInfo.InvariantCulture));
+            writer.WriteString("nonce", Nonce.ToString(CultureInfo.InvariantCulture));
+            writer.WriteNumber("contact_mode", (int)ContactMode);
+            WriteBytes(writer, "mlkem_encapsulation_key", MlkemEncapsulationKey);
+            WriteBytes(writer, "ecies_public_key", EciesPublicKey);
+            WriteBytes(writer, "contact_binding_hash", ContactBindingHash);
+            if (Timestamp is { } ts)
             {
-                Uri = offer.Uri,
-                Protocol = (Org.Derecalliance.Derec.Protobuf.Protocol)(int)offer.Protocol,
-            });
-        }
-        if (MlkemEncapsulationKey is { Length: > 0 } mlkem)
-        {
-            proto.MlkemEncapsulationKey = Google.Protobuf.ByteString.CopyFrom(mlkem);
-        }
-        if (EciesPublicKey is { Length: > 0 } ecies)
-        {
-            proto.EciesPublicKey = Google.Protobuf.ByteString.CopyFrom(ecies);
-        }
-        if (ContactBindingHash is { Length: > 0 } hash)
-        {
-            proto.ContactBindingHash = Google.Protobuf.ByteString.CopyFrom(hash);
-        }
-        if (Timestamp is { } ts)
-        {
-            proto.Timestamp = new Google.Protobuf.WellKnownTypes.Timestamp
+                writer.WriteStartObject("timestamp");
+                writer.WriteNumber("seconds", ts.Seconds);
+                writer.WriteNumber("nanos", ts.Nanos);
+                writer.WriteEndObject();
+            }
+            writer.WriteStartArray("supported_transports");
+            foreach (TransportProtocol endpoint in SupportedTransports)
             {
-                Seconds = ts.Seconds,
-                Nanos = ts.Nanos,
-            };
+                writer.WriteStartObject();
+                writer.WriteString("uri", endpoint.Uri);
+                writer.WriteNumber("protocol", (int)endpoint.Protocol);
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+            writer.WriteEndObject();
         }
-        byte[] bytes = proto.ToByteArray();
-        Validate(bytes);
-        return bytes;
+        return buffer.ToArray();
     }
 
-    /// <summary>
-    /// Decodes a <see cref="ContactMessage"/> from protobuf wire bytes, such
-    /// as those received out of band from a QR code.
-    /// </summary>
-    /// <exception cref="DeRecException">
-    /// The bytes are not a valid contact: undecodable, unknown
-    /// <see cref="ContactMode"/>, fields inconsistent with the mode, or a
-    /// binding hash of the wrong length.
-    /// </exception>
-    public static ContactMessage FromProtoBytes(byte[] bytes)
+    /// <summary>Reads the JSON <see cref="ToWireJson"/> writes.</summary>
+    internal static ContactMessage FromWireJson(byte[] json)
     {
-        Validate(bytes);
-
-        var proto = Org.Derecalliance.Derec.Protobuf.ContactMessage.Parser.ParseFrom(bytes);
-
-        // proto3 `optional bytes` fields are reported via `HasFoo` once set;
-        // if the field was never set the property still returns `ByteString.Empty`,
-        // so we map that case to `null` to match the wire semantics.
-        byte[]? mlkem = proto.HasMlkemEncapsulationKey
-            ? proto.MlkemEncapsulationKey.ToByteArray()
-            : null;
-        byte[]? ecies = proto.HasEciesPublicKey
-            ? proto.EciesPublicKey.ToByteArray()
-            : null;
-        byte[]? hash = proto.HasContactBindingHash
-            ? proto.ContactBindingHash.ToByteArray()
-            : null;
-
+        using JsonDocument doc = JsonDocument.Parse(json);
+        JsonElement root = doc.RootElement;
         return new ContactMessage(
-            ChannelId: proto.ChannelId,
-            ContactMode: (ContactMode)(int)proto.ContactMode,
-            Nonce: proto.Nonce,
-            MlkemEncapsulationKey: mlkem,
-            EciesPublicKey: ecies,
-            ContactBindingHash: hash
+            ChannelId: ulong.Parse(root.GetProperty("channel_id").GetString()!, CultureInfo.InvariantCulture),
+            ContactMode: (ContactMode)root.GetProperty("contact_mode").GetInt32(),
+            Nonce: ulong.Parse(root.GetProperty("nonce").GetString()!, CultureInfo.InvariantCulture),
+            MlkemEncapsulationKey: ReadBytes(root, "mlkem_encapsulation_key"),
+            EciesPublicKey: ReadBytes(root, "ecies_public_key"),
+            ContactBindingHash: ReadBytes(root, "contact_binding_hash")
         )
         {
-            SupportedTransports = proto.SupportedTransports
-                .Select(t => new TransportProtocol(t.Uri, (Protocol)(int)t.Protocol))
+            SupportedTransports = root.GetProperty("supported_transports")
+                .EnumerateArray()
+                .Select(t => new TransportProtocol(
+                    t.GetProperty("uri").GetString()!,
+                    (Protocol)t.GetProperty("protocol").GetInt32()))
                 .ToList(),
-            Timestamp = proto.Timestamp is { } ts ? new Timestamp(ts.Seconds, ts.Nanos) : null,
+            Timestamp = root.TryGetProperty("timestamp", out JsonElement ts) && ts.ValueKind == JsonValueKind.Object
+                ? new Timestamp(ts.GetProperty("seconds").GetInt64(), ts.GetProperty("nanos").GetInt32())
+                : null,
         };
     }
 
-    private static void Validate(byte[] bytes)
+    private static void WriteBytes(Utf8JsonWriter writer, string name, byte[]? value)
     {
-        Native.DeRecError error =
-            Native.Pairing.validate_contact_message(bytes, (UIntPtr)bytes.Length);
-        Utils.ThrowIfError(error);
+        if (value is null)
+        {
+            return;
+        }
+        writer.WriteStartArray(name);
+        foreach (byte b in value)
+        {
+            writer.WriteNumberValue(b);
+        }
+        writer.WriteEndArray();
     }
+
+    private static byte[]? ReadBytes(JsonElement root, string name) =>
+        root.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.Array
+            ? value.EnumerateArray().Select(b => b.GetByte()).ToArray()
+            : null;
 }

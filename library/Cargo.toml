@@ -49,7 +49,6 @@ wasm-bindgen = { version = "0.2.126", features = ["serde-serialize"] }
 wasm-bindgen-futures = { version = "0.4.76" }
 serde-wasm-bindgen = { version = "0.6.5" }
 js-sys = { version = "0.3.103" }
-web-sys = { version = "0.3.103", features = ["console"] }
 getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
 getrandom_04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }
 console_error_panic_hook = "0.1.7"

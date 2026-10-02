@@ -530,4 +530,28 @@ mod tests {
             })
         ));
     }
+
+    /// Bindings forward state rows verbatim, so every per-kind requirement
+    /// is enforced here: a missing required field or an unknown kind is
+    /// refused, never defaulted.
+    #[test]
+    fn a_row_missing_what_its_kind_requires_is_refused() {
+        for json in [
+            r#"{"kind":0,"bytes":[]}"#,
+            r#"{"kind":0,"channel_id":"7"}"#,
+            r#"{"kind":1,"version":3,"shares":[]}"#,
+            r#"{"kind":1,"secret_id":"11","shares":[]}"#,
+            r#"{"kind":1,"secret_id":"11","version":3}"#,
+            r#"{"kind":2,"started_at":"100"}"#,
+            r#"{"kind":2,"channel_id":"9"}"#,
+            r#"{"kind":3,"started_at":"100","pending":[],"confirmed":[],"failed":[]}"#,
+            r#"{"kind":3,"version":2,"started_at":"100","confirmed":[],"failed":[]}"#,
+            r#"{"kind":4,"started_at":"100"}"#,
+            r#"{"kind":4,"local_version":5}"#,
+            r#"{"kind":9}"#,
+        ] {
+            let row: StateItemRecord = serde_json::from_str(json).expect("parses");
+            assert!(row.into_item().is_err(), "{json} must be refused");
+        }
+    }
 }

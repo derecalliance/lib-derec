@@ -19,14 +19,12 @@
 //! - [`RestoreError::AlreadyRestored`] — a user-secret snapshot
 //!   already exists for this `secret_id`.
 //! - [`RestoreError::Conflict`] — a channel already lives at one of
-//!   the canonical helper / replica ids carried by the recovered
-//!   `Secret`.
+//!   the canonical helper / replica ids restore is about to write.
 //!
-//! A third, [`crate::Error::Transport`], joins them: the roster stores each
-//! peer as a bare `transport_uri`, so its protocol is derived from the URI
-//! scheme on the way back in, and a scheme this library serves no stores.transport
-//! for cannot become a channel record. Checked with the other preconditions,
-//! so it too costs no partial write.
+//! A roster entry with no transport endpoint is not an error: a channel to
+//! it would have nothing to send to, so restore writes none and reports the
+//! entry as [`DeRecEvent::PeerNotRestored`] instead. Every other entry is
+//! restored as usual.
 //!
 //! Store I/O failures mid-restore propagate as their underlying
 //! [`crate::Error`] variant (`ChannelStore`, `SecretStore`, and
@@ -43,10 +41,11 @@
 //! precondition on that publish.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecUserSecretStore, SecretValue, UnpairAck,
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecUserSecretStore, NotRestoredReason,
+    SecretValue, UnpairAck,
     types::{
-        ChannelRecord, ChannelStatus, HelperChannel, HelperInfo, ReplicaMember, ReplicaRole,
-        Replicas, Secret, UserSecrets,
+        ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole, Secret,
+        UserSecrets,
     },
 };
 use crate::protocol::context::Local;
@@ -96,9 +95,10 @@ pub enum RestoreError {
 /// persisted with the group key from `secret.replicas.shared_key`; the
 /// user-secret snapshot is committed at `recovered_version`; every
 /// recovery-mode channel under `secret_id` is unpaired
-/// (`UnpairAck::NotRequired`). The returned events come from the
-/// recovery-channel wipe and should be drained into the protocol's
-/// `pending_start_events`.
+/// (`UnpairAck::NotRequired`). The returned events are one
+/// [`DeRecEvent::PeerNotRestored`] per roster entry that got no channel,
+/// followed by those of the recovery-channel wipe, and should be drained
+/// into the protocol's `pending_start_events`.
 ///
 /// # Verification after a restore
 ///
@@ -122,27 +122,46 @@ pub enum RestoreError {
 /// publish until the application configures a `replica_id` that the
 /// roster names — see step 3 on why restore does not adopt one itself.
 ///
+/// # Peers without an endpoint
+///
+/// A helper or replica member whose `transports` is empty gets no channel:
+/// it would be a channel with nothing to send to. Restore skips it, reports
+/// it as [`DeRecEvent::PeerNotRestored`] with
+/// [`NotRestoredReason::NoTransports`], and restores the rest of the roster.
+/// A legacy roster whose single URI had a scheme this library does not serve
+/// decodes to exactly such an entry.
+///
+/// A skipped entry is still validated — its key length, `replica_id` and
+/// role are part of the recovered `Secret`, and an inconsistent `Secret` is
+/// refused whole whether or not every entry is reachable. What the skip
+/// changes is which ids restore claims. A skipped helper's `channel_id` is
+/// not written, so a channel already sitting there is not a conflict; it
+/// is a roster id, so it is not a recovery channel either, and the wipe
+/// leaves it alone rather than send an unpair to a peer that holds a share.
+/// The replica group's channel is written only when at least one member is
+/// restored; with every member skipped, neither the group key nor any
+/// member record is written and the group's id is treated like a skipped
+/// helper's.
+///
 /// # Sequence
 ///
-/// 1. **Preconditions.** Validate the protocol can restore and collect
-///    what the rest of the flow needs (the canonical id set plus the
-///    current channel list, reused for the wipe).
+/// 1. **Preconditions.** Validate the protocol can restore and plan
+///    every write the rest of the flow makes.
 ///    [`RestoreError::AlreadyRestored`] when a snapshot is already
-///    committed, [`RestoreError::Invariant`] when
-///    `secret.replicas.shared_key` is mis-sized, and
-///    [`RestoreError::Conflict`] when an existing channel sits at a
-///    canonical helper / replica id, and [`crate::Error::Transport`] when
-///    a roster entry names a URI scheme this library serves no stores.transport
-///    for. All four are reported before any store mutation. Channels *not*
-///    at canonical ids are recovery channels — wiped in step 5, never
-///    flagged as collisions.
-/// 2. **Helper channels.** Persist each helper's canonical channel
-///    record and its `SharedKey`. No tracking share — see
+///    committed, [`RestoreError::Invariant`] when a key is mis-sized or a
+///    member's role is unknown, [`crate::Error::InvalidInput`] when a
+///    member's `replica_id` is the reserved `0`, and
+///    [`RestoreError::Conflict`] when an existing channel sits at an id
+///    restore is about to write. All are reported before any store
+///    mutation. Channels at no roster id are recovery channels — wiped in
+///    step 5, never flagged as collisions.
+/// 2. **Helper channels.** Persist each reachable helper's canonical
+///    channel record and its `SharedKey`. No tracking share — see
 ///    *Verification after a restore* above.
-/// 3. **Replica members.** Persist every member of the roster against the
-///    one group channel, with the group key as that channel's `SharedKey`.
-///    Each member's `role` is taken verbatim from the roster: it is a
-///    property of the group, not of the reader.
+/// 3. **Replica members.** Persist every reachable member of the roster
+///    against the one group channel, with the group key as that channel's
+///    `SharedKey`. Each member's `role` is taken verbatim from the roster:
+///    it is a property of the group, not of the reader.
 ///
 ///    The device's own `replica_id` is **not** adopted from the recovered
 ///    `Secret`. The roster names its source, but a recovering device
@@ -154,9 +173,9 @@ pub enum RestoreError {
 ///    `recovered_version`. This write is the commit point — nothing is
 ///    removed before it succeeds, so any earlier failure is fully
 ///    retryable.
-/// 5. **Wipe.** Send unpair requests to every channel not at a
-///    canonical id — the recovery-mode channels minted to drive
-///    `start(RecoverSecret)` — and drop their local state.
+/// 5. **Wipe.** Send unpair requests to every channel at no roster id —
+///    the recovery-mode channels minted to drive `start(RecoverSecret)` —
+///    and drop their local state.
 ///
 ///    `UnpairAck::NotRequired` is forced here, deliberately, and does
 ///    not follow the protocol's configured ack mode. Waiting on an
@@ -185,23 +204,27 @@ pub(in crate::protocol) async fn restore<S: StoreSet>(
     secret: &Secret,
     recovered_version: u32,
 ) -> Result<Vec<DeRecEvent>> {
-    let (canonical_ids, existing_channels) = check_preconditions(stores, local, secret).await?;
+    let plan = plan_restore(secret)?;
+    let existing_channels = check_preconditions(stores, local, &plan).await?;
 
-    write_helper_channels(stores, local, &secret.helpers).await?;
+    write_helper_channels(stores, local, &plan.helpers).await?;
 
-    if let Some(group) = secret.replicas.as_ref().filter(|g| !g.members.is_empty()) {
+    if let Some(group) = &plan.replicas {
         write_replica_channels(stores, local, group).await?;
     }
 
     commit_snapshot(stores, local, secret, recovered_version).await?;
 
-    let events = unpair_recovery_channels(stores, local, &existing_channels, &canonical_ids).await;
+    let mut events = plan.not_restored;
+    events.extend(
+        unpair_recovery_channels(stores, local, &existing_channels, &plan.roster_ids).await,
+    );
 
     #[cfg(feature = "logging")]
     tracing::info!(
         local.secret_id,
-        helpers_restored = secret.helpers.len(),
-        replicas_restored = secret.replicas.as_ref().map_or(0, |g| g.members.len()),
+        helpers_restored = plan.helpers.len(),
+        replicas_restored = plan.replicas.as_ref().map_or(0, |g| g.members.len()),
         user_secrets_restored = secret.secrets.len(),
         "DeRecProtocol restored from recovered Secret"
     );
@@ -209,11 +232,129 @@ pub(in crate::protocol) async fn restore<S: StoreSet>(
     Ok(events)
 }
 
+/// Every write restore makes, derived from the recovered [`Secret`] alone
+/// and fully validated before any store is touched.
+struct RestorePlan {
+    helpers: Vec<(HelperChannel, SharedKey)>,
+    replicas: Option<GroupPlan>,
+    /// One [`DeRecEvent::PeerNotRestored`] per roster entry that gets no
+    /// channel, in roster order.
+    not_restored: Vec<DeRecEvent>,
+    /// Ids restore writes. A pre-existing channel at one of these is a
+    /// conflict.
+    written_ids: HashSet<u64>,
+    /// Every id the roster names, written or not. A channel at none of them
+    /// is a recovery channel.
+    roster_ids: HashSet<u64>,
+}
+
+struct GroupPlan {
+    channel_id: ChannelId,
+    members: Vec<ReplicaMember>,
+    group_key: SharedKey,
+}
+
+fn plan_restore(secret: &Secret) -> Result<RestorePlan> {
+    let mut not_restored = Vec::new();
+    let mut helpers = Vec::new();
+    let mut written_ids = HashSet::new();
+    let mut roster_ids = HashSet::new();
+
+    for h in &secret.helpers {
+        let shared_key: SharedKey = h
+            .shared_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| RestoreError::Invariant("helper.shared_key must be 32 bytes"))?;
+        let channel_id = ChannelId(h.channel_id);
+        roster_ids.insert(h.channel_id);
+        if h.transports.is_empty() {
+            not_restored.push(DeRecEvent::PeerNotRestored {
+                channel_id,
+                replica_id: None,
+                reason: NotRestoredReason::NoTransports,
+            });
+            continue;
+        }
+        written_ids.insert(h.channel_id);
+        helpers.push((
+            HelperChannel {
+                channel_id,
+                transports: h.transports.clone(),
+                communication_info: h.communication_info.clone(),
+                status: ChannelStatus::Paired,
+                created_at: now_secs(),
+                peer_role: derec_proto::SenderKind::Helper,
+            },
+            shared_key,
+        ));
+    }
+
+    let replicas = match &secret.replicas {
+        Some(group) if !group.members.is_empty() => {
+            let group_key: SharedKey = group.shared_key.as_slice().try_into().map_err(|_| {
+                RestoreError::Invariant(
+                    "recovered Secret carries replicas but replicas.shared_key is missing or wrong size",
+                )
+            })?;
+            let channel_id = ChannelId(group.channel_id);
+            roster_ids.insert(group.channel_id);
+            let mut members = Vec::new();
+            for r in &group.members {
+                let replica_id = crate::types::ReplicaId::try_from(r.replica_id)?;
+                let role = ReplicaRole::from_i32(r.role).ok_or(RestoreError::Invariant(
+                    "roster member carries an unknown role",
+                ))?;
+                if r.transports.is_empty() {
+                    not_restored.push(DeRecEvent::PeerNotRestored {
+                        channel_id,
+                        replica_id: Some(r.replica_id),
+                        reason: NotRestoredReason::NoTransports,
+                    });
+                    continue;
+                }
+                members.push(ReplicaMember {
+                    channel_id,
+                    replica_id,
+                    transports: r.transports.clone(),
+                    communication_info: r.communication_info.clone(),
+                    role,
+                    status: ChannelStatus::Paired,
+                    created_at: now_secs(),
+                });
+            }
+            if members.is_empty() {
+                None
+            } else {
+                written_ids.insert(group.channel_id);
+                Some(GroupPlan {
+                    channel_id,
+                    members,
+                    group_key,
+                })
+            }
+        }
+        Some(group) => {
+            roster_ids.insert(group.channel_id);
+            None
+        }
+        None => None,
+    };
+
+    Ok(RestorePlan {
+        helpers,
+        replicas,
+        not_restored,
+        written_ids,
+        roster_ids,
+    })
+}
+
 async fn check_preconditions<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-    secret: &Secret,
-) -> Result<(HashSet<u64>, Vec<HelperChannel>)> {
+    plan: &RestorePlan,
+) -> Result<Vec<HelperChannel>> {
     if stores
         .user_secrets
         .load_latest(local.secret_id)
@@ -223,56 +364,9 @@ async fn check_preconditions<S: StoreSet>(
         return Err(RestoreError::AlreadyRestored.into());
     }
 
-    if let Some(group) = &secret.replicas
-        && !group.members.is_empty()
-        && group.shared_key.len() != 32
-    {
-        return Err(RestoreError::Invariant(
-            "recovered Secret carries replicas but replicas.shared_key is missing or wrong size",
-        )
-        .into());
-    }
-
-    // Rehydrating an endpoint derives its protocol from the URI scheme, so a
-    // roster naming a scheme this library does not serve cannot be turned into
-    // channel records at all. Checked here, alongside the other preconditions,
-    // so the refusal costs no partial write.
-    // A roster entry with no endpoint cannot be restored into a usable
-    // channel — there would be nothing to send to. Checked here, alongside
-    // the other preconditions, so the refusal costs no partial write.
-    //
-    // The endpoints themselves need no re-derivation: a v3 roster stores each
-    // one with its protocol discriminant, and a v2 roster had its single URI
-    // resolved during decode.
-    let rosters_have_endpoints = secret
-        .helpers
-        .iter()
-        .map(|h| &h.transports)
-        .chain(
-            secret
-                .replicas
-                .iter()
-                .flat_map(|g| g.members.iter().map(|m| &m.transports)),
-        )
-        .all(|endpoints| !endpoints.is_empty());
-
-    if !rosters_have_endpoints {
-        return Err(crate::Error::InvalidInput(
-            "recovered roster has an entry with no transport endpoint",
-        ));
-    }
-
-    // Every member shares the group channel, so the roster contributes one id
-    // rather than one per member.
-    let canonical_ids: HashSet<u64> = secret
-        .helpers
-        .iter()
-        .map(|h| h.channel_id)
-        .chain(secret.replicas.as_ref().map(|g| g.channel_id))
-        .collect();
-    // Unfiltered deliberately: the caller partitions this listing, unpairing
-    // every channel `canonical_ids` does *not* name while this function
-    // rejects the ones it does. Narrowing either way loses the other half.
+    // Unfiltered deliberately: the caller unpairs every channel at no roster
+    // id while this function rejects the ones at ids restore writes.
+    // Narrowing either way loses the other half.
     let existing_channels = stores
         .channels
         .helpers_matching(
@@ -282,46 +376,31 @@ async fn check_preconditions<S: StoreSet>(
         .await?;
     let collisions: Vec<ChannelId> = existing_channels
         .iter()
-        .filter(|c| canonical_ids.contains(&c.channel_id.0))
+        .filter(|c| plan.written_ids.contains(&c.channel_id.0))
         .map(|c| c.channel_id)
         .collect();
     if !collisions.is_empty() {
         return Err(RestoreError::Conflict(collisions).into());
     }
 
-    Ok((canonical_ids, existing_channels))
+    Ok(existing_channels)
 }
 
 async fn write_helper_channels<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-    helpers: &[HelperInfo],
+    helpers: &[(HelperChannel, SharedKey)],
 ) -> Result<()> {
     let secret_id = local.secret_id;
-    for h in helpers {
-        let cid = ChannelId(h.channel_id);
-        let shared_key: SharedKey = h
-            .shared_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| RestoreError::Invariant("helper.shared_key must be 32 bytes"))?;
+    for (channel, shared_key) in helpers {
+        let cid = channel.channel_id;
         stores
             .channels
-            .save(
-                secret_id,
-                ChannelRecord::Helper(HelperChannel {
-                    channel_id: cid,
-                    transports: h.transports.clone(),
-                    communication_info: h.communication_info.clone(),
-                    status: ChannelStatus::Paired,
-                    created_at: now_secs(),
-                    peer_role: derec_proto::SenderKind::Helper,
-                }),
-            )
+            .save(secret_id, ChannelRecord::Helper(channel.clone()))
             .await?;
         stores
             .secrets
-            .save(secret_id, cid, SecretValue::SharedKey(shared_key))
+            .save(secret_id, cid, SecretValue::SharedKey(*shared_key))
             .await?;
     }
     Ok(())
@@ -330,35 +409,22 @@ async fn write_helper_channels<S: StoreSet>(
 async fn write_replica_channels<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-    group: &Replicas,
+    group: &GroupPlan,
 ) -> Result<()> {
-    let group_key: SharedKey = group.shared_key.as_slice().try_into().map_err(|_| {
-        RestoreError::Invariant("replicas.shared_key must be 32 bytes when replicas is non-empty")
-    })?;
-    let cid = ChannelId(group.channel_id);
-    for r in &group.members {
+    for member in &group.members {
         stores
             .channels
-            .save(
-                local.secret_id,
-                ChannelRecord::Replica(ReplicaMember {
-                    channel_id: cid,
-                    replica_id: crate::types::ReplicaId::try_from(r.replica_id)?,
-                    transports: r.transports.clone(),
-                    communication_info: r.communication_info.clone(),
-                    role: ReplicaRole::from_i32(r.role).ok_or(RestoreError::Invariant(
-                        "roster member carries an unknown role",
-                    ))?,
-                    status: ChannelStatus::Paired,
-                    created_at: now_secs(),
-                }),
-            )
+            .save(local.secret_id, ChannelRecord::Replica(member.clone()))
             .await?;
     }
     // One key at the one channel every member is addressed on.
     stores
         .secrets
-        .save(local.secret_id, cid, SecretValue::SharedKey(group_key))
+        .save(
+            local.secret_id,
+            group.channel_id,
+            SecretValue::SharedKey(group.group_key),
+        )
         .await?;
     Ok(())
 }
@@ -377,22 +443,22 @@ async fn commit_snapshot<S: StoreSet>(
                 version: recovered_version,
                 secrets: secret.secrets.clone(),
                 description: None,
-                replicas: secret.replicas.clone(),
                 author_replica_id: None,
             },
         )
         .await?;
     Ok(())
 }
+
 async fn unpair_recovery_channels<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     existing_channels: &[HelperChannel],
-    canonical_ids: &HashSet<u64>,
+    roster_ids: &HashSet<u64>,
 ) -> Vec<DeRecEvent> {
     let recovery_ids: Vec<ChannelId> = existing_channels
         .iter()
-        .filter(|c| !canonical_ids.contains(&c.channel_id.0))
+        .filter(|c| !roster_ids.contains(&c.channel_id.0))
         .map(|c| c.channel_id)
         .collect();
     if recovery_ids.is_empty() {
@@ -768,11 +834,64 @@ mod tests {
         });
     }
 
-    /// A roster entry that names no endpoint cannot become a usable channel
-    /// — there would be nothing to send to. Refused with the rest of the
-    /// preconditions, so nothing is written and the call stays retryable.
+    fn not_restored(events: &[DeRecEvent]) -> Vec<(ChannelId, Option<u64>, NotRestoredReason)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DeRecEvent::PeerNotRestored {
+                    channel_id,
+                    replica_id,
+                    reason,
+                } => Some((*channel_id, *replica_id, *reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn helper_record(rig: &TestRig, secret_id: u64, id: u64) -> Option<ChannelRecord> {
+        rig.channel_store
+            .load(
+                secret_id,
+                ChannelQuery::Helper {
+                    channel_id: ChannelId(id),
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn member_record(
+        rig: &TestRig,
+        secret_id: u64,
+        channel_id: u64,
+        replica_id: u64,
+    ) -> Option<ChannelRecord> {
+        rig.channel_store
+            .load(
+                secret_id,
+                ChannelQuery::Replica {
+                    channel_id: ChannelId(channel_id),
+                    replica_id: crate::types::ReplicaId(replica_id),
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn shared_key_at(rig: &TestRig, secret_id: u64, id: u64) -> Option<SecretValue> {
+        rig.secret_store
+            .load(secret_id, ChannelId(id), SecretKind::SharedKey)
+            .await
+            .unwrap()
+    }
+
+    // ---------------- Peers without an endpoint ----------------
+
+    /// A helper that names no endpoint would be a channel with nothing to
+    /// send to. It is skipped and reported; the reachable helper and the
+    /// snapshot are restored exactly as they would be without it.
     #[test]
-    fn a_roster_entry_without_an_endpoint_is_refused_before_any_write() {
+    fn a_helper_without_an_endpoint_is_skipped_and_reported() {
         run_async(async {
             let secret_id: u64 = 0xDE_2EC;
             let mut rig = build_rig(secret_id);
@@ -780,37 +899,294 @@ mod tests {
             let mut secret = fixture_secret();
             secret.helpers[1].transports = Vec::new();
 
-            let err = rig
+            let events = rig
                 .protocol
                 .restore(&secret, 7)
                 .await
-                .expect_err("a peer with no endpoint must not restore silently");
-            assert!(
-                matches!(err, crate::Error::InvalidInput(_)),
-                "expected the precondition refusal, got {err:?}"
+                .expect("an unreachable helper must not block the restore");
+
+            assert_eq!(
+                not_restored(&events),
+                vec![(ChannelId(12), None, NotRestoredReason::NoTransports)],
+                "exactly the unreachable helper is reported, got {events:?}"
             );
 
+            assert!(helper_record(&rig, secret_id, 11).await.is_some());
+            assert!(shared_key_at(&rig, secret_id, 11).await.is_some());
             assert!(
-                rig.channel_store
-                    .load(
-                        secret_id,
-                        ChannelQuery::Helper {
-                            channel_id: ChannelId(11)
-                        }
-                    )
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "a precondition failure must leave the stores untouched"
+                helper_record(&rig, secret_id, 12).await.is_none(),
+                "no channel is written for a helper with no endpoint"
+            );
+            assert!(
+                shared_key_at(&rig, secret_id, 12).await.is_none(),
+                "no key is written for a helper that has no channel"
+            );
+
+            assert!(member_record(&rig, secret_id, 21, 0xBEEF).await.is_some());
+            assert!(member_record(&rig, secret_id, 21, 0xCAFE).await.is_some());
+            let snapshot = rig
+                .user_secret_store
+                .load_latest(secret_id)
+                .await
+                .unwrap()
+                .expect("the snapshot is committed");
+            assert_eq!(snapshot.version, 7);
+            assert_eq!(snapshot.secrets.len(), 2);
+        });
+    }
+
+    /// A member with no endpoint is skipped the same way. The group channel
+    /// and its key are still written for the members that remain.
+    #[test]
+    fn a_replica_member_without_an_endpoint_is_skipped_and_reported() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EC;
+            let mut rig = build_rig(secret_id);
+
+            let mut secret = fixture_secret();
+            secret.replicas.as_mut().unwrap().members[0].transports = Vec::new();
+
+            let events = rig
+                .protocol
+                .restore(&secret, 7)
+                .await
+                .expect("an unreachable member must not block the restore");
+
+            assert_eq!(
+                not_restored(&events),
+                vec![(ChannelId(21), Some(0xBEEF), NotRestoredReason::NoTransports)],
+                "exactly the unreachable member is reported, got {events:?}"
+            );
+            assert!(
+                member_record(&rig, secret_id, 21, 0xBEEF).await.is_none(),
+                "no record is written for a member with no endpoint"
+            );
+            assert!(member_record(&rig, secret_id, 21, 0xCAFE).await.is_some());
+            assert!(
+                matches!(
+                    shared_key_at(&rig, secret_id, 21).await,
+                    Some(SecretValue::SharedKey(k)) if k == [0xCC; 32]
+                ),
+                "the group key is written for the members that remain"
+            );
+            assert!(helper_record(&rig, secret_id, 11).await.is_some());
+            assert!(helper_record(&rig, secret_id, 12).await.is_some());
+        });
+    }
+
+    /// With no reachable member there is no group to address, so neither the
+    /// group key nor any member record is written.
+    #[test]
+    fn a_group_with_no_reachable_member_writes_nothing() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EC;
+            let mut rig = build_rig(secret_id);
+
+            let mut secret = fixture_secret();
+            for m in &mut secret.replicas.as_mut().unwrap().members {
+                m.transports = Vec::new();
+            }
+
+            let events = rig.protocol.restore(&secret, 7).await.expect("restores");
+
+            assert_eq!(
+                not_restored(&events),
+                vec![
+                    (ChannelId(21), Some(0xBEEF), NotRestoredReason::NoTransports),
+                    (ChannelId(21), Some(0xCAFE), NotRestoredReason::NoTransports),
+                ],
+            );
+            assert!(member_record(&rig, secret_id, 21, 0xBEEF).await.is_none());
+            assert!(member_record(&rig, secret_id, 21, 0xCAFE).await.is_none());
+            assert!(
+                shared_key_at(&rig, secret_id, 21).await.is_none(),
+                "a group key with no member to use it is not written"
+            );
+            assert!(helper_record(&rig, secret_id, 11).await.is_some());
+        });
+    }
+
+    /// Restore claims only the ids it writes. A channel already at a skipped
+    /// helper's id is not overwritten, so it is no conflict; and it sits at a
+    /// roster id, so it is no recovery channel either — the wipe must not
+    /// send an unpair to a peer that holds a share.
+    #[test]
+    fn a_channel_at_a_skipped_helpers_id_is_neither_a_conflict_nor_wiped() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EC;
+            let mut rig = build_rig(secret_id);
+            rig.channel_store.helper_rows.lock().unwrap().insert(
+                (secret_id, 12),
+                HelperChannel {
+                    channel_id: ChannelId(12),
+                    transports: vec![TransportProtocol {
+                        uri: "https://repaired.example".to_owned(),
+                        protocol: 0,
+                    }],
+                    communication_info: HashMap::new(),
+                    status: ChannelStatus::Paired,
+                    created_at: 1,
+                    peer_role: SenderKind::Helper,
+                },
+            );
+            rig.secret_store.data.lock().unwrap().insert(
+                (secret_id, 12, SecretKind::SharedKey as u8),
+                SecretValue::SharedKey([0x77; 32]),
+            );
+
+            let mut secret = fixture_secret();
+            secret.helpers[1].transports = Vec::new();
+
+            let events = rig
+                .protocol
+                .restore(&secret, 7)
+                .await
+                .expect("a skipped helper's id must not be reported as a conflict");
+
+            assert_eq!(
+                not_restored(&events),
+                vec![(ChannelId(12), None, NotRestoredReason::NoTransports)]
+            );
+            assert!(
+                !events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::Unpaired { channel_id }
+                        | DeRecEvent::UnpairStarted { channel_id, .. }
+                        | DeRecEvent::UnpairFailed { channel_id, .. }
+                        if *channel_id == ChannelId(12)
+                )),
+                "the channel at a roster id is not a recovery channel, got {events:?}"
+            );
+            let Some(ChannelRecord::Helper(kept)) = helper_record(&rig, secret_id, 12).await else {
+                panic!("the pre-existing channel must survive");
+            };
+            assert_eq!(kept.transports[0].uri, "https://repaired.example");
+            assert!(
+                matches!(
+                    shared_key_at(&rig, secret_id, 12).await,
+                    Some(SecretValue::SharedKey(k)) if k == [0x77; 32]
+                ),
+                "its key is left as it was"
+            );
+        });
+    }
+
+    /// Skipping is about reachability, not validity: a skipped entry that
+    /// makes the `Secret` inconsistent still refuses the whole restore.
+    #[test]
+    fn a_skipped_helper_with_a_malformed_key_still_refuses_the_restore() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EC;
+            let mut rig = build_rig(secret_id);
+
+            let mut secret = fixture_secret();
+            secret.helpers[1].transports = Vec::new();
+            secret.helpers[1].shared_key = vec![0xBB; 31];
+
+            let err = rig.protocol.restore(&secret, 7).await.unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Restore(RestoreError::Invariant(_))),
+                "got {err:?}"
+            );
+            assert!(
+                helper_record(&rig, secret_id, 11).await.is_none(),
+                "an invariant failure is reported before any write"
             );
             assert!(
                 rig.user_secret_store
                     .load_latest(secret_id)
                     .await
                     .unwrap()
-                    .is_none(),
-                "a precondition failure must not commit a snapshot"
+                    .is_none()
             );
+        });
+    }
+
+    /// A malformed key on a later entry used to be found mid-write, after the
+    /// earlier helpers were already persisted. It is now part of the plan.
+    #[test]
+    fn a_malformed_helper_key_is_refused_before_any_write() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EC;
+            let mut rig = build_rig(secret_id);
+
+            let mut secret = fixture_secret();
+            secret.helpers[1].shared_key = vec![0xBB; 31];
+
+            let err = rig.protocol.restore(&secret, 7).await.unwrap_err();
+            assert!(matches!(
+                err,
+                crate::Error::Restore(RestoreError::Invariant(_))
+            ));
+            assert!(helper_record(&rig, secret_id, 11).await.is_none());
+            assert!(shared_key_at(&rig, secret_id, 11).await.is_none());
+        });
+    }
+
+    /// End to end from the bytes a pre-0.0.3 owner protected: a v2 roster
+    /// whose helper URI names a scheme this library does not serve decodes
+    /// with no endpoint, and restore skips that helper instead of refusing
+    /// the whole secret.
+    #[test]
+    fn a_legacy_roster_with_an_unserved_scheme_restores_the_rest() {
+        use std::io::Write as _;
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EC;
+            let mut rig = build_rig(secret_id);
+
+            let json = r#"{
+                "helpers": [
+                    {
+                        "channel_id": "11",
+                        "transport_uri": "ws://helper-a.example",
+                        "shared_key": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo="
+                    },
+                    {
+                        "channel_id": "12",
+                        "transport_uri": "https://helper-b.example",
+                        "shared_key": "u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s="
+                    }
+                ],
+                "secrets": [{"id": "AQ==", "name": "wallet", "data": "c2VjcmV0"}],
+                "replicas": {
+                    "channel_id": "21",
+                    "shared_key": "zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw=",
+                    "members": [{
+                        "replica_id": "48879",
+                        "transport_uri": "https://owner.example",
+                        "role": "Source"
+                    }]
+                }
+            }"#;
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            gz.write_all(json.as_bytes()).unwrap();
+            let mut bytes = vec![2_u8];
+            bytes.extend(gz.finish().unwrap());
+
+            let secret = Secret::decode(&bytes).expect("a v2 secret still decodes");
+            assert!(secret.helpers[0].transports.is_empty());
+
+            let events = rig
+                .protocol
+                .restore(&secret, 3)
+                .await
+                .expect("one unusable URI must not refuse the whole secret");
+
+            assert_eq!(
+                not_restored(&events),
+                vec![(ChannelId(11), None, NotRestoredReason::NoTransports)]
+            );
+            assert!(helper_record(&rig, secret_id, 11).await.is_none());
+            assert!(helper_record(&rig, secret_id, 12).await.is_some());
+            assert!(member_record(&rig, secret_id, 21, 0xBEEF).await.is_some());
+            let snapshot = rig
+                .user_secret_store
+                .load_latest(secret_id)
+                .await
+                .unwrap()
+                .expect("the snapshot is committed");
+            assert_eq!(snapshot.version, 3);
+            assert_eq!(snapshot.secrets[0].data, b"secret");
         });
     }
 
@@ -1064,7 +1440,6 @@ mod tests {
                     version: 1,
                     secrets: Vec::new(),
                     description: None,
-                    replicas: None,
                     author_replica_id: None,
                 },
             );

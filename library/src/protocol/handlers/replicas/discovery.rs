@@ -439,7 +439,6 @@ mod tests {
                     version,
                     secrets: Vec::new(),
                     description: None,
-                    replicas: None,
                     author_replica_id: None,
                 },
             )

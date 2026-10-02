@@ -123,58 +123,6 @@ std::optional<std::string> quotedFieldValue(const std::string& json, const char*
   return json.substr(pos + 1, end - pos - 1);
 }
 
-/// Minimal reader for an encoded `TransportProtocol`: field 1 is the URI
-/// (length-delimited string), field 2 the protocol discriminant (varint).
-/// Hand-rolled rather than linking a protobuf runtime into the JSI layer for
-/// two fields; unknown fields are skipped so a newer library stays readable.
-std::optional<std::pair<std::string, int32_t>> decodeTransportProtocol(
-    const uint8_t* data, size_t len) {
-  std::string uri;
-  int32_t protocol = 0;
-  size_t i = 0;
-
-  auto readVarint = [&](uint64_t& out) -> bool {
-    out = 0;
-    int shift = 0;
-    while (i < len) {
-      uint8_t b = data[i++];
-      out |= static_cast<uint64_t>(b & 0x7F) << shift;
-      if ((b & 0x80) == 0) return true;
-      shift += 7;
-      if (shift > 63) return false;
-    }
-    return false;
-  };
-
-  while (i < len) {
-    uint64_t tag = 0;
-    if (!readVarint(tag)) return std::nullopt;
-    uint32_t field = static_cast<uint32_t>(tag >> 3);
-    uint32_t wire = static_cast<uint32_t>(tag & 0x7);
-
-    if (field == 1 && wire == 2) {
-      uint64_t size = 0;
-      if (!readVarint(size) || i + size > len) return std::nullopt;
-      uri.assign(reinterpret_cast<const char*>(data + i), size);
-      i += size;
-    } else if (field == 2 && wire == 0) {
-      uint64_t value = 0;
-      if (!readVarint(value)) return std::nullopt;
-      protocol = static_cast<int32_t>(value);
-    } else if (wire == 0) {
-      uint64_t skip = 0;
-      if (!readVarint(skip)) return std::nullopt;
-    } else if (wire == 2) {
-      uint64_t size = 0;
-      if (!readVarint(size) || i + size > len) return std::nullopt;
-      i += size;
-    } else {
-      return std::nullopt;
-    }
-  }
-  return std::make_pair(uri, protocol);
-}
-
 }  // namespace
 
 /// Parse a bare `[n, n, ...]` array of unsigned decimal integers.
@@ -222,30 +170,6 @@ std::optional<DecodedShare> decodeShareRecord(const uint8_t* ptr, size_t len) {
   out.version = static_cast<uint32_t>(parseUnsignedAt(json, versionPos));
   out.bytes = parseByteArrayAt(json, bytesPos);
   return out;
-}
-
-std::optional<std::vector<NamedEndpoint>> decodeTransportEndpoints(const uint8_t* ptr,
-                                                                   size_t len) {
-  std::vector<NamedEndpoint> endpoints;
-  size_t offset = 0;
-  while (offset < len) {
-    uint64_t size = 0;
-    int shift = 0;
-    while (offset < len) {
-      uint8_t b = ptr[offset++];
-      size |= static_cast<uint64_t>(b & 0x7F) << shift;
-      if ((b & 0x80) == 0) break;
-      shift += 7;
-    }
-    if (offset + size > len) return std::nullopt;
-    auto parsed = decodeTransportProtocol(ptr + offset, size);
-    if (!parsed) return std::nullopt;
-    const char* name = derec_transport_protocol_name(parsed->second);
-    if (name == nullptr) return std::nullopt;
-    endpoints.push_back(NamedEndpoint{name, parsed->first});
-    offset += size;
-  }
-  return endpoints;
 }
 
 }  // namespace derec

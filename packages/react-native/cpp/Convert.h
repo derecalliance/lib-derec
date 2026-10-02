@@ -48,7 +48,7 @@ RestoreOutcome takeRestoreResult(DeRecProtocolRestoreResult& result);
 /// Resolve the `(category, code)` name pair from the crate's accessors.
 std::pair<std::string, std::string> errorName(int32_t category, int32_t code);
 
-// Decoders for the payloads Rust hands the store and transport callbacks.
+// Decoders for the payloads Rust hands the store callbacks.
 // They hold no `jsi` state, so the standalone test harness exercises them
 // against the real crate.
 
@@ -69,18 +69,5 @@ struct DecodedShare {
 /// Decode `{"secret_id":"...","version":<n>,"bytes":[<n>,...]}`. Empty when
 /// any of the three fields is absent.
 std::optional<DecodedShare> decodeShareRecord(const uint8_t* ptr, size_t len);
-
-/// One endpoint `Transport.send` receives, its protocol named by the crate.
-struct NamedEndpoint {
-  std::string protocol;
-  std::string uri;
-};
-
-/// Decode the length-delimited `TransportProtocol` sequence the transport
-/// callback receives, naming each discriminant through
-/// `derec_transport_protocol_name`. Empty when the framing is malformed or a
-/// discriminant has no name.
-std::optional<std::vector<NamedEndpoint>> decodeTransportEndpoints(const uint8_t* ptr,
-                                                                   size_t len);
 
 }  // namespace derec

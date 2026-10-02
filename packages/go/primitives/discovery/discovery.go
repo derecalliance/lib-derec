@@ -113,8 +113,6 @@ func (responseAPI) Process(responseProto []byte) ([]SecretVersionEntry, error) {
 //	    [version: u32 LE]
 //	    [description_len: u32 LE]
 //	    [description: UTF-8 bytes]
-//	    [has_replica_id: u8]
-//	    [replica_id: u64 LE]  (present only when has_replica_id != 0)
 func encodeSecretList(entries []SecretVersionEntry) []byte {
 	out := make([]byte, 0)
 	out = appendUint32(out, uint32(len(entries)))

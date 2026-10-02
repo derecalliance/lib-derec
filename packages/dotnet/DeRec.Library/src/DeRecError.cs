@@ -55,8 +55,8 @@ public static class DeRecCode
     public const int StoreError = 8;
     public const int BuilderError = 9;
     /// <summary>
-    /// Returned by the secret store's <c>LoadMany</c> with <c>MissingPolicy.Fail</c>
-    /// when one or more channels had no <c>SharedKey</c> entry. The formatted
+    /// Returned when <see cref="ISecretStore.LoadMany"/> answers <c>null</c> for
+    /// one or more channels whose <c>SharedKey</c> the operation requires. The formatted
     /// <see cref="DeRecException.Message"/> carries the missing channel ids
     /// (e.g. <c>"secret store: missing SharedKey entries for channel(s): [42, 7]"</c>).
     /// <see cref="DeRecException.Category"/> is

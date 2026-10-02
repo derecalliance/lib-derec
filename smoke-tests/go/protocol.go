@@ -15,12 +15,14 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"strconv"
+	"slices"
 	"sync"
 
 	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 	"github.com/derecalliance/lib-derec/packages/go/protocol"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // protocolSecretID is the shared secret identity both peers configure —
@@ -167,6 +169,8 @@ type secretStoreKey struct {
 type memSecretStore struct {
 	mu   sync.Mutex
 	data map[secretStoreKey]protocol.SecretValue
+	// loadManyCalls records the channelIDs of every LoadMany call, in order.
+	loadManyCalls [][]uint64
 }
 
 func newMemSecretStore() *memSecretStore {
@@ -178,6 +182,19 @@ func (s *memSecretStore) Load(secretID, channelID uint64, kind protocol.SecretKi
 	defer s.mu.Unlock()
 	v, ok := s.data[secretStoreKey{secretID, channelID, kind}]
 	return v, ok, nil
+}
+
+func (s *memSecretStore) LoadMany(secretID uint64, channelIDs []uint64, kind protocol.SecretKind) ([]*protocol.SecretValue, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadManyCalls = append(s.loadManyCalls, append([]uint64(nil), channelIDs...))
+	out := make([]*protocol.SecretValue, len(channelIDs))
+	for i, c := range channelIDs {
+		if v, ok := s.data[secretStoreKey{secretID, c, kind}]; ok {
+			out[i] = &v
+		}
+	}
+	return out, nil
 }
 
 func (s *memSecretStore) Save(secretID, channelID uint64, value protocol.SecretValue) error {
@@ -450,8 +467,8 @@ func newPeerWithReplicaID(label, uri string, threshold uint32, replicaID *uint64
 	cfg := protocol.Config{
 		SecretID:          protocolSecretID,
 		OwnTransports:     []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:         threshold,
-		KeepVersionsCount: 3,
+		Threshold:         proto.Uint32(threshold),
+		KeepVersionsCount: proto.Uint32(3),
 		ReplicaID:         replicaID,
 	}
 	p, err := protocol.New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
@@ -583,7 +600,7 @@ func pairPeersWithMode(owner, helper *peer, pairingChannelID uint64, mode protoc
 	assertTrue(contact.ChannelID == pairingChannelID, "CreateContact.ChannelID = %d, want %d", contact.ChannelID, pairingChannelID)
 
 	startEvents, err := helper.proto.Start(protocol.FlowKindPairing, protocol.PairingParams{
-		Kind:                  int32(protocol.SenderKindHelper),
+		Kind:                  protocol.SenderKindHelper,
 		Contact:               contact.ContactBytes,
 		PeerCommunicationInfo: map[string]string{"name": "helper"},
 	})
@@ -594,8 +611,8 @@ func pairPeersWithMode(owner, helper *peer, pairingChannelID uint64, mode protoc
 		assertTrue(ev.Type != protocol.EventTypePairingCompleted, "PairingCompleted must not appear in Start(Pairing) — it fires from Process() after the peer round-trip")
 		if ev.Type == protocol.EventTypePairingStarted {
 			sawPairingStarted = true
-			assertTrue(ev.ChannelID == strconv.FormatUint(pairingChannelID, 10), "PairingStarted.ChannelID = %s, want %d", ev.ChannelID, pairingChannelID)
-			assertTrue(ev.Kind == int32(protocol.SenderKindHelper), "PairingStarted.Kind = %d, want %d (Helper)", ev.Kind, protocol.SenderKindHelper)
+			assertTrue(ev.ChannelID == pairingChannelID, "PairingStarted.ChannelID = %d, want %d", ev.ChannelID, pairingChannelID)
+			assertTrue(ev.Kind == protocol.SenderKindHelper, "PairingStarted.Kind = %d, want %d (Helper)", ev.Kind, protocol.SenderKindHelper)
 		}
 	}
 	assertTrue(sawPairingStarted, "Start(Pairing) must emit PairingStarted")
@@ -616,13 +633,11 @@ func pairPeersWithMode(owner, helper *peer, pairingChannelID uint64, mode protoc
 	}
 	assertTrue(len(completions) >= 2, "expected PairingCompleted on both sides, got %d", len(completions))
 
-	newChannelID, err := strconv.ParseUint(completions[0].ChannelID, 10, 64)
-	must(err, "parse PairingCompleted.ChannelID")
+	newChannelID := completions[0].ChannelID
 
 	for _, ev := range completions {
-		assertTrue(ev.PairingChannelID == strconv.FormatUint(pairingChannelID, 10), "PairingCompleted.PairingChannelID = %s, want %d (the transient contact channel_id)", ev.PairingChannelID, pairingChannelID)
-		cid, err := strconv.ParseUint(ev.ChannelID, 10, 64)
-		must(err, "parse PairingCompleted.ChannelID")
+		assertTrue(ev.PairingChannelID == pairingChannelID, "PairingCompleted.PairingChannelID = %d, want %d (the transient contact channel_id)", ev.PairingChannelID, pairingChannelID)
+		cid := ev.ChannelID
 		assertTrue(cid == newChannelID, "both peers must rotate to the same long-term channel_id: got %d and %d", cid, newChannelID)
 	}
 
@@ -777,6 +792,7 @@ func runProtocol() {
 
 	fmt.Println("  pairing: two channels paired, fingerprints match ✓")
 
+	owner.secretStore.loadManyCalls = nil
 	secretData := []byte("super-secret-value")
 	description := "smoke-test distribution"
 	protectEvents, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
@@ -785,7 +801,15 @@ func runProtocol() {
 	})
 	must(err, "owner.Start(ProtectSecret)")
 
-	protectStartedVersions := map[string]uint32{}
+	// The broadcast reads every helper's SharedKey through one
+	// SecretStore.LoadMany call rather than one Load per channel.
+	keyCalls := owner.secretStore.loadManyCalls
+	assertTrue(len(keyCalls) == 1, "ProtectSecret broadcast must call SecretStore.LoadMany once, got %v", keyCalls)
+	assertTrue(len(keyCalls[0]) == 2 && slices.Contains(keyCalls[0], channelA) && slices.Contains(keyCalls[0], channelB),
+		"SecretStore.LoadMany must receive both helper channels [%d %d], got %v", channelA, channelB, keyCalls[0])
+	fmt.Printf("  ProtectSecret broadcast → one SecretStore.LoadMany(%v)  ✓\n", keyCalls[0])
+
+	protectStartedVersions := map[uint64]uint32{}
 	for _, ev := range protectEvents {
 		assertTrue(ev.Type != protocol.EventTypeProtectSecretFailed, "Start(ProtectSecret) emitted ProtectSecretFailed: %+v", ev)
 		if ev.Type == protocol.EventTypeProtectSecretStarted && ev.Version != nil {
@@ -796,14 +820,14 @@ func runProtocol() {
 
 	shareEvents := pumpMany([]*peer{owner, helperA, helperB})
 
-	storedFor := map[string]bool{}
+	storedFor := map[uint64]bool{}
 	confirmedCount := 0
 	storeShareActions := 0
 	for _, ev := range shareEvents {
 		if ev.Type == protocol.EventTypeActionRequired && ev.ActionKind == protocol.ActionKindStoreShare {
 			storeShareActions++
 			assertTrue(ev.ShareSize != nil && *ev.ShareSize > 0, "StoreShare ActionRequired must carry a positive ShareSize, got %+v", ev)
-			assertTrue(ev.TraceID != "", "StoreShare ActionRequired must carry a TraceID, got %+v", ev)
+			assertTrue(ev.TraceID != 0, "StoreShare ActionRequired must carry a TraceID, got %+v", ev)
 		}
 		switch ev.Type {
 		case protocol.EventTypeShareStored:
@@ -812,8 +836,8 @@ func runProtocol() {
 			confirmedCount++
 		}
 	}
-	assertTrue(storedFor[strconv.FormatUint(channelA, 10)], "expected a ShareStored event for channel-a (%d)", channelA)
-	assertTrue(storedFor[strconv.FormatUint(channelB, 10)], "expected a ShareStored event for channel-b (%d)", channelB)
+	assertTrue(storedFor[channelA], "expected a ShareStored event for channel-a (%d)", channelA)
+	assertTrue(storedFor[channelB], "expected a ShareStored event for channel-b (%d)", channelB)
 	assertTrue(storeShareActions == 2, "expected 2 StoreShare ActionRequired events (one per helper), got %d", storeShareActions)
 	assertTrue(confirmedCount == 2, "expected 2 ShareConfirmed events (one per helper), got %d", confirmedCount)
 
@@ -829,7 +853,7 @@ func runProtocol() {
 		must(err, fmt.Sprintf("%s.shareStore.Load", check.label))
 		assertTrue(len(storedShares) != 0, "%s shareStore has no shares for channel %d — the Save callback never fired", check.label, check.channelID)
 		assertTrue(len(storedShares[0].Bytes) != 0, "%s stored share has empty Bytes", check.label)
-		wantVersion, ok := protectStartedVersions[strconv.FormatUint(check.channelID, 10)]
+		wantVersion, ok := protectStartedVersions[check.channelID]
 		assertTrue(ok, "%s: no ProtectSecretStarted version recorded for channel %d", check.label, check.channelID)
 		assertTrue(storedShares[0].Version == wantVersion, "%s stored share version = %d, want %d (from ProtectSecretStarted)", check.label, storedShares[0].Version, wantVersion)
 	}
@@ -867,8 +891,8 @@ func runExpiredChannelCleanup() {
 	cfg := protocol.Config{
 		SecretID:          protocolSecretID,
 		OwnTransports:     []protocol.TransportProtocolParam{{URI: "https://cleanup.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:         2,
-		KeepVersionsCount: 3,
+		Threshold:         proto.Uint32(2),
+		KeepVersionsCount: proto.Uint32(3),
 		Timeouts: &protocol.Timeouts{
 			ExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{
 				Enabled:       false,
@@ -906,8 +930,8 @@ func runUnsafeConnection() {
 		cfg := protocol.Config{
 			SecretID:          protocolSecretID,
 			OwnTransports:     []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
-			Threshold:         2,
-			KeepVersionsCount: 3,
+			Threshold:         proto.Uint32(2),
+			KeepVersionsCount: proto.Uint32(3),
 			UnsafeConnection:  &allow,
 		}
 		p, err := protocol.New(
@@ -951,8 +975,8 @@ func runConfigSurface() {
 		return protocol.Config{
 			SecretID:          protocolSecretID,
 			OwnTransports:     []protocol.TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-			Threshold:         2,
-			KeepVersionsCount: 3,
+			Threshold:         proto.Uint32(2),
+			KeepVersionsCount: proto.Uint32(3),
 		}
 	}
 	build := func(cfg protocol.Config) (*protocol.DeRecProtocol, error) {
@@ -1050,7 +1074,7 @@ func runUnconfirmedDestination() {
 	contact, err := source.proto.CreateContact(&pairingChannelID, protocol.ContactModeInlineKeys, nil)
 	must(err, "source.CreateContact")
 	_, err = destination.proto.Start(protocol.FlowKindPairing, protocol.PairingParams{
-		Kind:    int32(protocol.SenderKindReplicaDestination),
+		Kind:    protocol.SenderKindReplicaDestination,
 		Contact: contact.ContactBytes,
 	})
 	must(err, "destination.Start(Pairing)")
@@ -1058,8 +1082,7 @@ func runUnconfirmedDestination() {
 	var replicaChannel uint64
 	for _, ev := range handshake {
 		if ev.Type == protocol.EventTypePairingCompleted {
-			replicaChannel, err = strconv.ParseUint(ev.ChannelID, 10, 64)
-			must(err, "parse PairingCompleted.ChannelID")
+			replicaChannel = ev.ChannelID
 		}
 	}
 	assertTrue(replicaChannel != 0, "the replica handshake must complete")
@@ -1075,7 +1098,7 @@ func runUnconfirmedDestination() {
 		switch ev.Type {
 		case protocol.EventTypeMessageIgnored:
 			ignored = ignored || (ev.Reason == protocol.IgnoreReasonPendingVerification &&
-				ev.ChannelID == strconv.FormatUint(replicaChannel, 10))
+				ev.ChannelID == replicaChannel)
 		case protocol.EventTypeReplicaSecretInstalled, protocol.EventTypeReplicaSecretReceived, protocol.EventTypeReplicaSecretAcked:
 			fail("nothing may be installed or acknowledged before the destination confirms, got %s", ev.Type)
 		}
@@ -1102,9 +1125,8 @@ func runUnconfirmedDestination() {
 	assertTrue(installed != nil, "after confirming, ReplicaDiscovery must install the copy, got %v", seen)
 	fmt.Println("  destination pulled the copy with ReplicaDiscovery after confirming  ✓")
 
-	sourceIDText := strconv.FormatUint(sourceID, 10)
-	assertTrue(installed.AuthorReplicaID != nil && *installed.AuthorReplicaID == sourceIDText,
-		"ReplicaSecretInstalled.AuthorReplicaID must name the publisher %s, got %v", sourceIDText, installed.AuthorReplicaID)
+	assertTrue(installed.AuthorReplicaID != nil && *installed.AuthorReplicaID == sourceID,
+		"ReplicaSecretInstalled.AuthorReplicaID must name the publisher %d, got %v", sourceID, installed.AuthorReplicaID)
 	held, ok, err := destination.userSecrets.LoadLatest(protocolSecretID)
 	must(err, "destination.userSecrets.LoadLatest")
 	assertTrue(ok, "the destination must persist the installed user secrets")

@@ -288,17 +288,10 @@ type SecretValue struct {
 
 // Share is a single stored share entry, keyed by (channelID, secretID,
 // version) at the store layer. Mirrors the Rust-side Share struct.
-//
-// ReplicaID does NOT round-trip through EncodeShare/DecodeShare: the wire
-// record used by the FFI bridge (ShareRecord in stores.rs) never carries
-// it — Save drops it on encode and Load always sets it to nil on decode,
-// matching Rust's ShareRecord::into_share() exactly. Callers must not rely
-// on ReplicaID surviving a store round trip through this codec.
 type Share struct {
-	SecretID  uint64
-	Version   uint32
-	ReplicaID *uint64
-	Bytes     []byte
+	SecretID uint64
+	Version  uint32
+	Bytes    []byte
 }
 
 // StateKind tags which category of in-flight orchestrator state a

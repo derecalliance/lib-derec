@@ -77,6 +77,12 @@ internal static class Protocol
         out IntPtr outPtr, out UIntPtr outLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int SecretStoreLoadManyDelegate(
+        IntPtr userData, ulong secretId,
+        IntPtr channelIdsJsonPtr, UIntPtr channelIdsJsonLen, uint kind,
+        out IntPtr outPtr, out UIntPtr outLen);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int SecretStoreSaveDelegate(
         IntPtr userData, ulong secretId, ulong channelId, uint kind,
         IntPtr bytes, UIntPtr len);
@@ -90,6 +96,7 @@ internal static class Protocol
     {
         public IntPtr UserData;
         public IntPtr Load;
+        public IntPtr LoadMany;
         public IntPtr Save;
         public IntPtr Remove;
         public IntPtr FreeBuffer;
@@ -227,8 +234,8 @@ internal static class Protocol
     /// <summary>
     /// Constructs a protocol handle. Scalar configuration is bundled into a
     /// single JSON buffer (see <c>ProtocolConfig</c> in the Rust FFI crate
-    /// for the exact shape); <c>communicationInfo</c> is a separate proto
-    /// buffer. Bundling the scalar config into JSON keeps the native
+    /// for the exact shape), including <c>communication_info</c>, so the
+    /// <c>communicationInfo</c> proto buffer is passed empty. Bundling the scalar config into JSON keeps the native
     /// signature small enough for every FFI consumer (Go via purego, .NET)
     /// to call — some callers cannot marshal many native arguments in a
     /// single call.

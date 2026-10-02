@@ -112,6 +112,9 @@ pub struct ProcessPrePairResult {
 /// * `communication_info` - Optional application-level identity metadata to advertise to the
 ///   peer (free-form key/value pairs). Pass `None` to send no metadata; the protocol treats
 ///   this as opaque.
+/// * `parameter_range` - The [`derec_proto::ParameterRange`] this side accepts. It is
+///   advertised in the response and checked against the range the requester advertised;
+///   `None` declares no constraints.
 ///
 /// # Returns
 ///
@@ -128,6 +131,8 @@ pub struct ProcessPrePairResult {
 /// Returns [`crate::Error`] (specifically `Error::Pairing(...)`) in the following cases:
 ///
 /// - [`PairingError::InvalidPairRequestMessage`] if the request is malformed or missing fields
+/// - [`PairingError::IncompatibleParameterRange`] if the requester's advertised range and
+///   `parameter_range` do not overlap on some field; no shared key is derived
 /// - [`PairingError::EmptyTransportUri`] if the request transport information is missing or empty
 /// - [`PairingError::Invariant`] if `pairing_secret_key_material` is not the `Initiator` variant
 /// - [`PairingError::FinishPairingInitiator`] if pairing finalization fails
@@ -191,6 +196,7 @@ pub struct ProcessPrePairResult {
 /// let request::ExtractResult { request: pair_request } = request::extract(
 ///     &request_envelope,
 ///     initiator_key.as_ref().unwrap().ecies_secret_key(),
+///     None,
 /// ).expect("extract failed");
 ///
 /// let response::ProduceResult { envelope, shared_key, .. } = response::produce(
@@ -228,6 +234,8 @@ pub fn produce(
     policy: crate::transport::TransportPolicy,
 ) -> Result<ProduceResult, crate::Error> {
     request.validate()?;
+
+    super::request::check_parameter_range(request, parameter_range.as_ref())?;
 
     let peer_transports = policy.admit_peer_endpoints(request.advertised_endpoints())?;
 
@@ -567,6 +575,7 @@ pub fn produce_pre_pair_no_keys(
 /// let request::ExtractResult { request: pair_request } = request::extract(
 ///     &request_envelope,
 ///     initiator_key.as_ref().unwrap().ecies_secret_key(),
+///     None,
 /// ).expect("extract request failed");
 /// let response::ProduceResult { envelope: response_envelope, .. } =
 ///     response::produce(
@@ -725,6 +734,8 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 ///   [`super::request::produce`]. Must be the
 ///   [`derec_cryptography::pairing::PairingSecretKeyMaterial::Responder`] variant; passing the
 ///   `Initiator` variant will return [`PairingError::Invariant`].
+/// * `parameter_range` - The [`derec_proto::ParameterRange`] this side accepts, the same
+///   value it passed to [`super::request::produce`]. `None` declares no constraints.
 ///
 /// # Returns
 ///
@@ -732,10 +743,19 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 ///
 /// - `shared_key`: the responder-side derived pairing shared key
 ///
+/// # Parameter-range compatibility
+///
+/// The range the contact creator advertised is checked against `parameter_range` before
+/// anything else, so no shared key is derived for a pairing the two sides could never
+/// agree on. A `PairResponse` is the last leg of the handshake: there is nothing to send
+/// back, and the caller discards its pairing state.
+///
 /// # Errors
 ///
 /// Returns [`crate::Error`] (specifically `Error::Pairing(...)`) in the following cases:
 ///
+/// - [`PairingError::IncompatibleParameterRange`] if the advertised range and
+///   `parameter_range` do not overlap on some field
 /// - [`PairingError::NonOkStatus`] if `result.status != Ok`, carrying the peer's status code
 ///   and memo string
 /// - [`PairingError::InvalidPairResponseMessage`] if the response is malformed (e.g. missing result)
@@ -791,6 +811,7 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 /// let request::ExtractResult { request: pair_request } = request::extract(
 ///     &request_envelope,
 ///     initiator_key.as_ref().unwrap().ecies_secret_key(),
+///     None,
 /// ).expect("extract request failed");
 ///
 /// let response::ProduceResult { envelope: response_envelope, shared_key: initiator_shared_key, .. } =
@@ -811,7 +832,7 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 /// ).expect("extract response failed");
 ///
 /// let response::ProcessResult { shared_key: responder_shared_key, .. } =
-///     response::process(&initiator_contact_message, &pair_response, &responder_key)
+///     response::process(&initiator_contact_message, &pair_response, &responder_key, None)
 ///         .expect("process failed");
 ///
 /// assert_eq!(initiator_shared_key, responder_shared_key);
@@ -824,7 +845,13 @@ pub fn process(
     contact_message: &ContactMessage,
     response: &PairResponseMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
+    parameter_range: Option<&derec_proto::ParameterRange>,
 ) -> Result<ProcessResult, crate::Error> {
+    super::parameter_range::check_compatibility(
+        parameter_range,
+        response.parameter_range.as_ref(),
+    )?;
+
     let responder_material =
         validate_process_inputs(contact_message, response, pairing_secret_key_material)?;
 

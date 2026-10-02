@@ -85,6 +85,16 @@
         }
       ]
     },
+    "NotRestoredReason": {
+      "encoding": "name",
+      "note": "PeerNotRestored.reason",
+      "variants": [
+        {
+          "name": "NoTransports",
+          "wire": "NoTransports"
+        }
+      ]
+    },
     "DeRecEvent": {
       "encoding": "name",
       "note": "the serde `type` discriminator on every emitted event",
@@ -128,6 +138,10 @@
         {
           "name": "PairingStarted",
           "wire": "PairingStarted"
+        },
+        {
+          "name": "PeerNotRestored",
+          "wire": "PeerNotRestored"
         },
         {
           "name": "PrePairRejected",

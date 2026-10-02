@@ -247,7 +247,7 @@ export function runPrimitivesSmoke(): void {
 
   // Initiator extracts the request and produces a response.
   const { request: pairRequest }: { request: PairRequestMessage } =
-    primitives.pairing.request.extract(pairingRequest.envelope, contact.secret_key);
+    primitives.pairing.request.extract(pairingRequest.envelope, contact.secret_key, null);
   const produced = primitives.pairing.response.produce(
     pairingChannelId, pairRequest, contact.secret_key, null, null,
   );
@@ -259,6 +259,7 @@ export function runPrimitivesSmoke(): void {
     pairingRequest.initiator_contact_message as ContactMessage,
     pairResponse,
     pairingRequest.secret_key,
+    null,
   );
 
   if (produced.shared_key.length !== processed.shared_key.length ||
@@ -364,7 +365,7 @@ export function runPrimitivesSmoke(): void {
     null,
   );
   const { request: hkPairRequest }: { request: PairRequestMessage } =
-    primitives.pairing.request.extract(hkPairingRequest.envelope, hkContact.secret_key);
+    primitives.pairing.request.extract(hkPairingRequest.envelope, hkContact.secret_key, null);
   const hkProduced = primitives.pairing.response.produce(
     hashedKeysChannelId, hkPairRequest, hkContact.secret_key, null, null,
   );
@@ -374,6 +375,7 @@ export function runPrimitivesSmoke(): void {
     hkPairingRequest.initiator_contact_message as ContactMessage,
     hkPairResponse,
     hkPairingRequest.secret_key,
+    null,
   );
   if (hkProduced.shared_key.length !== hkProcessed.shared_key.length ||
       !hkProduced.shared_key.every((b, i) => b === hkProcessed.shared_key[i])) {
@@ -481,6 +483,7 @@ export function runPrimitivesSmoke(): void {
   const { request: nkPairRequest }: { request: PairRequestMessage } =
     primitives.pairing.request.extract(
       nkPairingRequest.envelope, nkPrePairResponseEnvelope.secret_key_material,
+      null,
     );
   const nkProduced = primitives.pairing.response.produce(
     noKeysChannelId, nkPairRequest, nkPrePairResponseEnvelope.secret_key_material, null, null,
@@ -491,6 +494,7 @@ export function runPrimitivesSmoke(): void {
     nkPairingRequest.initiator_contact_message as ContactMessage,
     nkPairResponse,
     nkPairingRequest.secret_key,
+    null,
   );
   if (nkProduced.shared_key.length !== nkProcessed.shared_key.length ||
       !nkProduced.shared_key.every((b, i) => b === nkProcessed.shared_key[i])) {

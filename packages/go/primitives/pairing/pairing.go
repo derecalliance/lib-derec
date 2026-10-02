@@ -20,7 +20,11 @@
 // band before use.
 package pairing
 
-import "github.com/derecalliance/lib-derec/packages/go/internal/native"
+import (
+	"encoding/json"
+
+	"github.com/derecalliance/lib-derec/packages/go/internal/native"
+)
 
 // Endpoint is a transport endpoint: a URI and the protocol discriminant that
 // says how to reach it (see derecpb.Protocol: 0 = HTTPS, 1 = GRPC).
@@ -49,20 +53,128 @@ const (
 
 // SenderKind identifies the logical role of the sender of a
 // PairRequestMessage. Mirrors org.derecalliance.derec.protobuf.SenderKind.
-type SenderKind int32
+//
+// Aliased rather than redeclared so it is the same type the protocol package
+// exposes (PairingParams.Kind, Event.Kind, ChannelRecord.PeerRole), without a
+// conversion between layers.
+type SenderKind = native.SenderKind
 
 const (
 	// SenderKindOwner marks the sender as an Owner (normal or recovery mode).
-	SenderKindOwner SenderKind = 0
+	SenderKindOwner = native.SenderKindOwner
 	// SenderKindHelper marks the sender as acting as a Helper.
-	SenderKindHelper SenderKind = 1
+	SenderKindHelper = native.SenderKindHelper
 	// SenderKindReplicaSource marks the sender as the Source side of a
 	// replica pair.
-	SenderKindReplicaSource SenderKind = 3
+	SenderKindReplicaSource = native.SenderKindReplicaSource
 	// SenderKindReplicaDestination marks the sender as the Destination side
 	// of a replica pair.
-	SenderKindReplicaDestination SenderKind = 4
+	SenderKindReplicaDestination = native.SenderKindReplicaDestination
 )
+
+// Timestamp is a point in time as seconds and nanoseconds since the Unix
+// epoch, mirroring google.protobuf.Timestamp.
+type Timestamp struct {
+	Seconds int64
+	Nanos   int32
+}
+
+// ContactMessage is the decoded out-of-band contact a scanner pairs
+// against: what Request.DecodeContact returns and Request.EncodeContact
+// serializes. Mirrors org.derecalliance.derec.protobuf.ContactMessage.
+//
+// The key fields present depend on ContactMode: ContactModeInlineKeys
+// carries MlkemEncapsulationKey and EciesPublicKey, ContactModeHashedKeys
+// carries ContactBindingHash, and ContactModeNoKeys carries neither. A nil
+// slice is an absent field.
+type ContactMessage struct {
+	ChannelID             uint64
+	Nonce                 uint64
+	ContactMode           ContactMode
+	MlkemEncapsulationKey []byte
+	EciesPublicKey        []byte
+	ContactBindingHash    []byte
+	// Timestamp is when the creator produced the contact; nil if unset.
+	Timestamp *Timestamp
+	// SupportedTransports is every endpoint the creator can be reached on,
+	// in its own preference order.
+	SupportedTransports []Endpoint
+}
+
+// contactMessageWire is the JSON shape encode_contact_message reads and
+// decode_contact_message writes. ChannelID and Nonce cross as decimal
+// strings; byte fields as arrays of small integers.
+type contactMessageWire struct {
+	ChannelID             uint64                `json:"channel_id,string"`
+	Nonce                 uint64                `json:"nonce,string"`
+	ContactMode           int32                 `json:"contact_mode"`
+	MlkemEncapsulationKey *native.JSONByteArray `json:"mlkem_encapsulation_key,omitempty"`
+	EciesPublicKey        *native.JSONByteArray `json:"ecies_public_key,omitempty"`
+	ContactBindingHash    *native.JSONByteArray `json:"contact_binding_hash,omitempty"`
+	Timestamp             *timestampWire        `json:"timestamp"`
+	SupportedTransports   []endpointWire        `json:"supported_transports"`
+}
+
+type timestampWire struct {
+	Seconds int64 `json:"seconds"`
+	Nanos   int32 `json:"nanos"`
+}
+
+type endpointWire struct {
+	URI      string `json:"uri"`
+	Protocol int32  `json:"protocol"`
+}
+
+func optionalBytesWire(b []byte) *native.JSONByteArray {
+	if b == nil {
+		return nil
+	}
+	v := native.JSONByteArray(b)
+	return &v
+}
+
+func (c ContactMessage) toWire() contactMessageWire {
+	w := contactMessageWire{
+		ChannelID:             c.ChannelID,
+		Nonce:                 c.Nonce,
+		ContactMode:           int32(c.ContactMode),
+		MlkemEncapsulationKey: optionalBytesWire(c.MlkemEncapsulationKey),
+		EciesPublicKey:        optionalBytesWire(c.EciesPublicKey),
+		ContactBindingHash:    optionalBytesWire(c.ContactBindingHash),
+		SupportedTransports:   make([]endpointWire, 0, len(c.SupportedTransports)),
+	}
+	if c.Timestamp != nil {
+		w.Timestamp = &timestampWire{Seconds: c.Timestamp.Seconds, Nanos: c.Timestamp.Nanos}
+	}
+	for _, e := range c.SupportedTransports {
+		w.SupportedTransports = append(w.SupportedTransports, endpointWire{URI: e.URI, Protocol: e.Protocol})
+	}
+	return w
+}
+
+func (w contactMessageWire) toContact() ContactMessage {
+	c := ContactMessage{
+		ChannelID:   w.ChannelID,
+		Nonce:       w.Nonce,
+		ContactMode: ContactMode(w.ContactMode),
+	}
+	if w.MlkemEncapsulationKey != nil {
+		c.MlkemEncapsulationKey = []byte(*w.MlkemEncapsulationKey)
+	}
+	if w.EciesPublicKey != nil {
+		c.EciesPublicKey = []byte(*w.EciesPublicKey)
+	}
+	if w.ContactBindingHash != nil {
+		c.ContactBindingHash = []byte(*w.ContactBindingHash)
+	}
+	if w.Timestamp != nil {
+		c.Timestamp = &Timestamp{Seconds: w.Timestamp.Seconds, Nanos: w.Timestamp.Nanos}
+	}
+	for _, e := range w.SupportedTransports {
+		c.SupportedTransports = append(c.SupportedTransports, Endpoint{URI: e.URI, Protocol: e.Protocol})
+	}
+	return c
+}
 
 // CreatedContact is the result of creating an out-of-band ContactMessage.
 type CreatedContact struct {
@@ -211,10 +323,31 @@ func (requestAPI) CreateContact(channelID uint64, contactMode ContactMode, trans
 	return CreatedContact{ContactWireBytes: contactWireBytes, SecretKeyMaterial: secretKeyMaterial}, nil
 }
 
-// Validate structurally validates proto-encoded ContactMessage bytes against
-// the per-contactMode field-presence invariants.
-func (requestAPI) Validate(contactMessage []byte) error {
-	return native.ValidateContact(contactMessage)
+// EncodeContact serializes contactMessage to the protobuf bytes delivered
+// out of band (typically as a QR code). A contact that violates the
+// invariants of its ContactMode, or advertises no endpoint, is refused with
+// derec.CodeInvalidContactMessage.
+func (requestAPI) EncodeContact(contactMessage ContactMessage) ([]byte, error) {
+	contactJSON, err := json.Marshal(contactMessage.toWire())
+	if err != nil {
+		return nil, err
+	}
+	return native.EncodeContact(contactJSON)
+}
+
+// DecodeContact parses out-of-band contact bytes back into the
+// ContactMessage a scanner pairs against. Bytes that are not a contact, or a
+// contact that violates the invariants of its ContactMode, are refused.
+func (requestAPI) DecodeContact(contactMessage []byte) (ContactMessage, error) {
+	contactJSON, err := native.DecodeContact(contactMessage)
+	if err != nil {
+		return ContactMessage{}, err
+	}
+	var wire contactMessageWire
+	if err := json.Unmarshal(contactJSON, &wire); err != nil {
+		return ContactMessage{}, err
+	}
+	return wire.toContact(), nil
 }
 
 // Produce builds a pairing request envelope addressed to the creator of
@@ -237,8 +370,11 @@ func (requestAPI) Produce(senderKind SenderKind, transportProtocol, contactMessa
 // Extract decrypts a pairing request envelope (the Envelope returned by
 // Produce) using secretKeyMaterial (the contact creator's SecretKeyMaterial
 // from CreateContact) and returns its channel id and inner proto bytes.
-func (requestAPI) Extract(request, secretKeyMaterial []byte) (ExtractedRequest, error) {
-	channelID, requestProto, err := native.ExtractPairRequest(request, secretKeyMaterial)
+// parameterRange is the optional serialized ParameterRange this side accepts
+// (nil for none); a request advertising a range that does not overlap it is
+// refused with derec.CodeIncompatibleParameterRange.
+func (requestAPI) Extract(request, secretKeyMaterial, parameterRange []byte) (ExtractedRequest, error) {
+	channelID, requestProto, err := native.ExtractPairRequest(request, secretKeyMaterial, parameterRange)
 	if err != nil {
 		return ExtractedRequest{}, err
 	}
@@ -282,7 +418,9 @@ var Response responseAPI
 // RequestProto returned by Request.Extract), derives the pairing shared key,
 // and returns the rekeyed channel id the responder commits to.
 // communicationInfo and parameterRange are optional serialized proto bytes
-// (nil for none).
+// (nil for none). A request advertising a range that does not overlap
+// parameterRange is refused with derec.CodeIncompatibleParameterRange and no
+// key is derived.
 //
 // unsafeConnection accepts plaintext peer endpoints (http://, grpc://) and is
 // development-only.
@@ -315,9 +453,12 @@ func (responseAPI) Extract(response, secretKeyMaterial []byte) (ExtractedRespons
 // Process validates a pairing response (the ResponseProto returned by
 // Extract) against contactMessage (the InitiatorContactMessage returned by
 // Request.Produce), derives the pairing shared key, and returns the
-// validated rekeyed channel id.
-func (responseAPI) Process(contactMessage, responseProto, secretKeyMaterial []byte) (ProcessedResponse, error) {
-	sharedKey, channelID, err := native.ProcessPairResponse(contactMessage, responseProto, secretKeyMaterial)
+// validated rekeyed channel id. parameterRange is the optional serialized
+// ParameterRange this side accepts (nil for none); a response advertising a
+// range that does not overlap it is refused with
+// derec.CodeIncompatibleParameterRange before any key is derived.
+func (responseAPI) Process(contactMessage, responseProto, secretKeyMaterial, parameterRange []byte) (ProcessedResponse, error) {
+	sharedKey, channelID, err := native.ProcessPairResponse(contactMessage, responseProto, secretKeyMaterial, parameterRange)
 	if err != nil {
 		return ProcessedResponse{}, err
 	}

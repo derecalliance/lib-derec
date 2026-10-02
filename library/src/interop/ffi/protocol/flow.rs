@@ -252,6 +252,9 @@ struct UpdateChannelInfoParamsJson {
 #[derive(Deserialize)]
 struct TransportProtocolJson {
     uri: String,
+    #[serde(
+        deserialize_with = "crate::interop::protocol_names::protocol_from_name_or_discriminant"
+    )]
     protocol: i32,
 }
 

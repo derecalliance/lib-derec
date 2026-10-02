@@ -9,8 +9,9 @@ use crate::primitives::pairing::{
         CreateContactResult as CreateContactMessageResult,
         ExtractResult as ExtractPairingRequestResult, PrePairExtractResult, ProducePrePairResult,
         ProduceResult as ProducePairingRequestMessageResult,
-        create_contact as create_contact_message, extract as extract_pairing_request,
-        extract_pre_pair, produce as produce_pairing_request_message, produce_pre_pair_request,
+        create_contact as create_contact_message, decode_contact, encode_contact,
+        extract as extract_pairing_request, extract_pre_pair,
+        produce as produce_pairing_request_message, produce_pre_pair_request,
     },
     response::{
         ExtractResult as ExtractPairingResponseResult,
@@ -248,6 +249,7 @@ fn test_produce_pairing_request_message() {
     } = extract_pairing_request(
         &envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -526,6 +528,7 @@ fn test_extract_pairing_request_rejects_envelope_timestamp_mismatch() {
     let result = extract_pairing_request(
         &tampered_bytes,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     );
 
     assert!(matches!(result, Err(Error::Invariant(_))));
@@ -570,6 +573,7 @@ fn test_process_pairing_response_message_missing_result() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -586,6 +590,7 @@ fn test_process_pairing_response_message_missing_result() {
         &initiator_contact_message,
         &pair_response_msg,
         &bob_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -634,6 +639,7 @@ fn test_process_pairing_response_message_result_non_ok() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -653,6 +659,7 @@ fn test_process_pairing_response_message_result_non_ok() {
         &initiator_contact_message,
         &pair_response_msg,
         &bob_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -701,6 +708,7 @@ fn test_process_pairing_response_message_invalid_status() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -720,6 +728,7 @@ fn test_process_pairing_response_message_invalid_status() {
         &initiator_contact_message,
         &pair_response_msg,
         &bob_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -768,6 +777,7 @@ fn test_process_pairing_response_message_nonce_mismatch() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -787,6 +797,7 @@ fn test_process_pairing_response_message_nonce_mismatch() {
         &initiator_contact_message,
         &pair_response_msg,
         &bob_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -835,6 +846,7 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -854,7 +866,7 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
     invalid_contact.mlkem_encapsulation_key = Some(Vec::new());
 
     let result =
-        process_pairing_response_message(&invalid_contact, &pair_response_msg, &bob_sk_state);
+        process_pairing_response_message(&invalid_contact, &pair_response_msg, &bob_sk_state, None);
 
     assert!(matches!(
         result,
@@ -902,6 +914,7 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -921,7 +934,7 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
     invalid_contact.ecies_public_key = Some(Vec::new());
 
     let result =
-        process_pairing_response_message(&invalid_contact, &pair_response_msg, &bob_sk_state);
+        process_pairing_response_message(&invalid_contact, &pair_response_msg, &bob_sk_state, None);
 
     assert!(matches!(
         result,
@@ -967,6 +980,7 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
     let ExtractPairingRequestResult { request } = extract_pairing_request(
         &request_envelope,
         initiator_secret_key.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -1033,6 +1047,7 @@ fn test_alice_bob_pairing_flow() {
     } = extract_pairing_request(
         &bob_pair_req_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -1063,6 +1078,7 @@ fn test_alice_bob_pairing_flow() {
         &initiator_contact_message,
         &alice_pair_resp_msg,
         &bob_sk_state,
+        None,
     )
     .expect("failed to process pairing response");
 
@@ -1127,6 +1143,7 @@ fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -1845,6 +1862,7 @@ fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
     } = extract_pairing_request(
         &bob_pair_req_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("extract_pairing_request failed");
 
@@ -1872,6 +1890,7 @@ fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
         &initiator_contact_message,
         &tampered_response,
         &bob_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -1956,6 +1975,7 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
     } = extract_pairing_request(
         &bob_pair_req_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("extract_pairing_request failed");
 
@@ -1985,6 +2005,7 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
         &initiator_contact_message,
         &alice_pair_resp_msg,
         &bob_sk_state,
+        None,
     )
     .expect("process_pairing_response_message failed");
 
@@ -2270,7 +2291,11 @@ fn test_extract_pairing_request_rejects_missing_mlkem_ciphertext() {
         timestamp,
     );
 
-    let result = extract_pairing_request(&envelope, alice_sk.as_ref().unwrap().ecies_secret_key());
+    let result = extract_pairing_request(
+        &envelope,
+        alice_sk.as_ref().unwrap().ecies_secret_key(),
+        None,
+    );
 
     assert!(
         matches!(
@@ -2317,7 +2342,11 @@ fn test_extract_pairing_request_rejects_a_request_advertising_no_endpoint() {
         timestamp,
     );
 
-    let result = extract_pairing_request(&envelope, alice_sk.as_ref().unwrap().ecies_secret_key());
+    let result = extract_pairing_request(
+        &envelope,
+        alice_sk.as_ref().unwrap().ecies_secret_key(),
+        None,
+    );
 
     assert!(
         matches!(result, Err(Error::Pairing(PairingError::EmptyTransportUri))),
@@ -2356,8 +2385,12 @@ fn test_extract_pairing_request_accepts_a_well_formed_request() {
     )
     .expect("failed to produce valid pairing request");
 
-    extract_pairing_request(&envelope, alice_sk.as_ref().unwrap().ecies_secret_key())
-        .expect("a well-formed request extracts");
+    extract_pairing_request(
+        &envelope,
+        alice_sk.as_ref().unwrap().ecies_secret_key(),
+        None,
+    )
+    .expect("a well-formed request extracts");
 }
 
 /// A contact that names no endpoint at all leaves the scanner nowhere to
@@ -2476,4 +2509,255 @@ fn test_produce_pre_pair_request_rejects_an_empty_transport_list() {
         ),
         "a PrePair request naming no endpoint must be refused"
     );
+}
+
+fn endpoint(uri: &str) -> TransportProtocol {
+    TransportProtocol {
+        uri: uri.to_owned(),
+        protocol: Protocol::Https.into(),
+    }
+}
+
+/// Every field at its widest except `shareSize`, so a disjoint pair of these
+/// fails on that field alone.
+fn share_size_range(min: i64, max: i64) -> derec_proto::ParameterRange {
+    derec_proto::ParameterRange {
+        min_share_size: min,
+        max_share_size: max,
+        min_time_between_verifications: 0,
+        max_time_between_verifications: i64::MAX,
+        min_time_between_share_updates: 0,
+        max_time_between_share_updates: i64::MAX,
+        min_unresponsive_deletion_timeout: 0,
+        max_unresponsive_deletion_timeout: i64::MAX,
+        min_unresponsive_deactivation_timeout: 0,
+        max_unresponsive_deactivation_timeout: i64::MAX,
+    }
+}
+
+fn is_incompatible_share_size(result: &Result<impl Sized, Error>) -> bool {
+    matches!(
+        result,
+        Err(Error::Pairing(PairingError::IncompatibleParameterRange { field, .. }))
+            if *field == "shareSize"
+    )
+}
+
+#[test]
+fn test_contact_codec_round_trips_every_mode() {
+    for mode in [
+        ContactMode::InlineKeys,
+        ContactMode::HashedKeys,
+        ContactMode::NoKeys,
+    ] {
+        let CreateContactMessageResult {
+            contact_message, ..
+        } = create_contact_message(
+            ChannelId(u64::MAX),
+            mode,
+            vec![
+                endpoint("https://relay.example/alice"),
+                endpoint("https://backup.example/alice"),
+            ],
+            Some(123_456),
+        )
+        .expect("failed to create contact message");
+
+        let bytes = encode_contact(&contact_message).expect("encode_contact failed");
+        assert_eq!(
+            bytes,
+            contact_message.encode_to_vec(),
+            "the codec is the contact's protobuf encoding"
+        );
+        assert_eq!(
+            decode_contact(&bytes).expect("decode_contact failed"),
+            contact_message,
+            "{mode:?} must survive the round trip"
+        );
+    }
+}
+
+/// An `InlineKeys` contact carrying a binding hash violates its mode. It is
+/// refused on the way out, so it is never published, and on the way in, so
+/// a scanner never pairs against it.
+#[test]
+fn test_contact_codec_refuses_an_invalid_contact_both_ways() {
+    let invalid = ContactMessage {
+        channel_id: 7,
+        nonce: 9,
+        contact_mode: ContactMode::InlineKeys as i32,
+        mlkem_encapsulation_key: Some(vec![1, 2, 3]),
+        ecies_public_key: Some(vec![4, 5, 6]),
+        contact_binding_hash: Some(vec![7; 48]),
+        timestamp: None,
+        supported_transports: vec![endpoint("https://relay.example/alice")],
+    };
+
+    assert!(matches!(
+        encode_contact(&invalid),
+        Err(Error::Pairing(PairingError::InvalidContactMessage(_)))
+    ));
+    assert!(matches!(
+        decode_contact(&invalid.encode_to_vec()),
+        Err(Error::Pairing(PairingError::InvalidContactMessage(_)))
+    ));
+
+    let no_endpoint = ContactMessage {
+        supported_transports: Vec::new(),
+        contact_binding_hash: None,
+        ..invalid
+    };
+    assert!(encode_contact(&no_endpoint).is_err());
+    assert!(decode_contact(&no_endpoint.encode_to_vec()).is_err());
+}
+
+#[test]
+fn test_decode_contact_refuses_bytes_that_are_not_a_contact() {
+    assert!(matches!(
+        decode_contact(&[0xFF, 0xFF, 0xFF]),
+        Err(Error::ProtobufDecode(_))
+    ));
+}
+
+/// The contact creator refuses a requester whose range cannot overlap its
+/// own, both when the request is extracted and when a response would be
+/// produced from it, so no shared key is ever derived for it.
+#[test]
+fn test_contact_creator_refuses_an_incompatible_parameter_range() {
+    let creator_range = share_size_range(1_000_000_000, 5_000_000_000);
+    let requester_range = share_size_range(10_000_000, 500_000_000);
+
+    let CreateContactMessageResult {
+        contact_message,
+        secret_key,
+    } = create_contact_message(
+        ChannelId(42),
+        ContactMode::InlineKeys,
+        vec![endpoint("https://relay.example/alice")],
+        None,
+    )
+    .expect("failed to create contact message");
+    let secret_key = secret_key.expect("InlineKeys contact carries key material");
+
+    let ProducePairingRequestMessageResult { envelope, .. } = produce_pairing_request_message(
+        SenderKind::Helper,
+        vec![endpoint("https://relay.example/bob")],
+        &contact_message,
+        None,
+        Some(requester_range),
+    )
+    .expect("producing a request is not where ranges are compared");
+
+    let refused = extract_pairing_request(
+        &envelope,
+        secret_key.ecies_secret_key(),
+        Some(&creator_range),
+    );
+    assert!(
+        is_incompatible_share_size(&refused),
+        "extract must refuse a disjoint range"
+    );
+
+    let ExtractPairingRequestResult { request } =
+        extract_pairing_request(&envelope, secret_key.ecies_secret_key(), None)
+            .expect("no local range accepts any peer range");
+    assert_eq!(request.parameter_range.as_ref(), Some(&requester_range));
+
+    let refused = produce_pairing_response_message(
+        ChannelId(42),
+        &request,
+        &secret_key,
+        None,
+        Some(creator_range),
+        test_policy(),
+    );
+    assert!(
+        is_incompatible_share_size(&refused),
+        "produce must refuse a disjoint range"
+    );
+
+    let overlapping = share_size_range(100_000_000, 1_000_000_000);
+    extract_pairing_request(&envelope, secret_key.ecies_secret_key(), Some(&overlapping))
+        .expect("an overlapping range is accepted");
+    produce_pairing_response_message(
+        ChannelId(42),
+        &request,
+        &secret_key,
+        None,
+        Some(overlapping),
+        test_policy(),
+    )
+    .expect("an overlapping range is accepted");
+}
+
+/// The scanner refuses a response whose advertised range cannot overlap its
+/// own before deriving any key.
+#[test]
+fn test_scanner_refuses_an_incompatible_parameter_range() {
+    let creator_range = share_size_range(1_000_000_000, 5_000_000_000);
+    let scanner_range = share_size_range(10_000_000, 500_000_000);
+
+    let CreateContactMessageResult {
+        contact_message,
+        secret_key,
+    } = create_contact_message(
+        ChannelId(42),
+        ContactMode::InlineKeys,
+        vec![endpoint("https://relay.example/alice")],
+        None,
+    )
+    .expect("failed to create contact message");
+    let creator_key = secret_key.expect("InlineKeys contact carries key material");
+
+    let ProducePairingRequestMessageResult {
+        envelope,
+        initiator_contact_message,
+        secret_key: scanner_key,
+    } = produce_pairing_request_message(
+        SenderKind::Helper,
+        vec![endpoint("https://relay.example/bob")],
+        &contact_message,
+        None,
+        None,
+    )
+    .expect("failed to produce pairing request");
+
+    let ExtractPairingRequestResult { request } =
+        extract_pairing_request(&envelope, creator_key.ecies_secret_key(), None)
+            .expect("failed to extract pairing request");
+    let ProducePairingResponseMessageResult {
+        envelope: response_envelope,
+        ..
+    } = produce_pairing_response_message(
+        ChannelId(42),
+        &request,
+        &creator_key,
+        None,
+        Some(creator_range),
+        test_policy(),
+    )
+    .expect("the request advertised no range, so the creator accepts it");
+
+    let ExtractPairingResponseResult { response } =
+        extract_pairing_response(&response_envelope, scanner_key.ecies_secret_key())
+            .expect("failed to extract pairing response");
+
+    let refused = process_pairing_response_message(
+        &initiator_contact_message,
+        &response,
+        &scanner_key,
+        Some(&scanner_range),
+    );
+    assert!(
+        is_incompatible_share_size(&refused),
+        "process must refuse a disjoint range"
+    );
+
+    process_pairing_response_message(
+        &initiator_contact_message,
+        &response,
+        &scanner_key,
+        Some(&share_size_range(1_000_000_000, 2_000_000_000)),
+    )
+    .expect("an overlapping range is accepted");
 }

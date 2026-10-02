@@ -102,6 +102,7 @@ fn run_pairing_flow_test() {
             .as_ref()
             .unwrap()
             .ecies_secret_key(),
+        None,
     )
     .expect("pair_request::extract failed");
 
@@ -132,6 +133,7 @@ fn run_pairing_flow_test() {
         &pair_req.initiator_contact_message,
         &extracted_response.response,
         &pair_req.secret_key,
+        None,
     )
     .expect("pair_response::process failed");
 
@@ -259,6 +261,7 @@ fn run_pairing_flow_hashed_keys_test() {
     let extracted_request = pair_request::extract(
         &pair_req.envelope,
         alice_secret.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("pair_request::extract failed");
 
@@ -280,6 +283,7 @@ fn run_pairing_flow_hashed_keys_test() {
         &pair_req.initiator_contact_message,
         &extracted_response.response,
         &pair_req.secret_key,
+        None,
     )
     .expect("pair_response::process failed");
 

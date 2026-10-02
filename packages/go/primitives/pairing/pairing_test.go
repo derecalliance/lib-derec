@@ -6,6 +6,7 @@ package pairing_test
 import (
 	"bytes"
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/derecalliance/lib-derec/packages/go/derec"
@@ -65,8 +66,8 @@ func TestPairingInlineKeysHandshakeRoundTrip(t *testing.T) {
 		t.Fatal("CreateContact returned empty secret key material")
 	}
 
-	if err := pairing.Request.Validate(created.ContactWireBytes); err != nil {
-		t.Fatalf("Validate: %v", err)
+	if _, err := pairing.Request.DecodeContact(created.ContactWireBytes); err != nil {
+		t.Fatalf("DecodeContact: %v", err)
 	}
 
 	bobTransport := encodeTransportList("https://example.com/helper")
@@ -81,7 +82,7 @@ func TestPairingInlineKeysHandshakeRoundTrip(t *testing.T) {
 		t.Fatal("Request.Produce returned empty secret key material")
 	}
 
-	extractedReq, err := pairing.Request.Extract(producedReq.Envelope, created.SecretKeyMaterial)
+	extractedReq, err := pairing.Request.Extract(producedReq.Envelope, created.SecretKeyMaterial, nil)
 	if err != nil {
 		t.Fatalf("Request.Extract: %v", err)
 	}
@@ -117,7 +118,7 @@ func TestPairingInlineKeysHandshakeRoundTrip(t *testing.T) {
 		t.Fatal("Response.Extract returned empty response proto")
 	}
 
-	processed, err := pairing.Response.Process(producedReq.InitiatorContactMessage, extractedResp.ResponseProto, producedReq.SecretKeyMaterial)
+	processed, err := pairing.Response.Process(producedReq.InitiatorContactMessage, extractedResp.ResponseProto, producedReq.SecretKeyMaterial, nil)
 	if err != nil {
 		t.Fatalf("Response.Process: %v", err)
 	}
@@ -136,14 +137,168 @@ func TestPairingInlineKeysHandshakeRoundTrip(t *testing.T) {
 	}
 }
 
-func TestValidateContactMessageRejectsGarbageBytes(t *testing.T) {
-	err := pairing.Request.Validate([]byte{0xFF, 0xFF, 0xFF})
+func TestDecodeContactRejectsGarbageBytes(t *testing.T) {
+	_, err := pairing.Request.DecodeContact([]byte{0xFF, 0xFF, 0xFF})
 	if err == nil {
 		t.Fatal("expected an error for malformed contact message bytes")
 	}
 	var derr *derec.Error
-	if !errors.As(err, &derr) || derr.Code != derec.CodeFFIBadProto {
-		t.Fatalf("want *derec.Error CodeFFIBadProto, got %#v", err)
+	if !errors.As(err, &derr) || derr.Code != derec.CodeProtobufDecode {
+		t.Fatalf("want *derec.Error CodeProtobufDecode, got %#v", err)
+	}
+}
+
+// TestContactCodecRoundTripsEveryMode decodes the bytes the core produced
+// into the typed contact and re-encodes it: the bytes must come back
+// identical, so no field is lost on the way through this SDK.
+func TestContactCodecRoundTripsEveryMode(t *testing.T) {
+	nonce := uint64(777)
+	for _, mode := range []pairing.ContactMode{
+		pairing.ContactModeInlineKeys,
+		pairing.ContactModeHashedKeys,
+		pairing.ContactModeNoKeys,
+	} {
+		created, err := pairing.Request.CreateContact(^uint64(0), mode,
+			encodeTransportList("https://example.com/alice", "https://example.com/alice/backup"), &nonce)
+		if err != nil {
+			t.Fatalf("CreateContact(%d): %v", mode, err)
+		}
+		contact, err := pairing.Request.DecodeContact(created.ContactWireBytes)
+		if err != nil {
+			t.Fatalf("DecodeContact(%d): %v", mode, err)
+		}
+		if contact.ChannelID != ^uint64(0) || contact.Nonce != nonce || contact.ContactMode != mode {
+			t.Fatalf("DecodeContact(%d): unexpected header %+v", mode, contact)
+		}
+		if len(contact.SupportedTransports) != 2 || contact.SupportedTransports[1].URI != "https://example.com/alice/backup" {
+			t.Fatalf("DecodeContact(%d): endpoints %+v", mode, contact.SupportedTransports)
+		}
+		if contact.Timestamp == nil {
+			t.Fatalf("DecodeContact(%d): timestamp missing", mode)
+		}
+		encoded, err := pairing.Request.EncodeContact(contact)
+		if err != nil {
+			t.Fatalf("EncodeContact(%d): %v", mode, err)
+		}
+		if !bytes.Equal(encoded, created.ContactWireBytes) {
+			t.Fatalf("EncodeContact(%d): bytes differ from the core's", mode)
+		}
+	}
+}
+
+// TestContactCodecRefusesAnInvalidContact builds an INLINE_KEYS contact that
+// also carries a binding hash: it is refused on encode, and the same value
+// as wire bytes is refused on decode.
+func TestContactCodecRefusesAnInvalidContact(t *testing.T) {
+	invalid := pairing.ContactMessage{
+		ChannelID:             7,
+		Nonce:                 9,
+		ContactMode:           pairing.ContactModeInlineKeys,
+		MlkemEncapsulationKey: []byte{1, 2, 3},
+		EciesPublicKey:        []byte{4, 5, 6},
+		ContactBindingHash:    make([]byte, 48),
+		SupportedTransports:   []pairing.Endpoint{{URI: "https://example.com/alice"}},
+	}
+	_, err := pairing.Request.EncodeContact(invalid)
+	var derr *derec.Error
+	if !errors.As(err, &derr) || derr.Code != derec.CodeInvalidContactMessage {
+		t.Fatalf("EncodeContact: want CodeInvalidContactMessage, got %#v", err)
+	}
+
+	wire, err := proto.Marshal(&derecpb.ContactMessage{
+		ChannelId:             7,
+		Nonce:                 9,
+		ContactMode:           derecpb.ContactMode_INLINE_KEYS,
+		MlkemEncapsulationKey: []byte{1, 2, 3},
+		EciesPublicKey:        []byte{4, 5, 6},
+		ContactBindingHash:    make([]byte, 48),
+		SupportedTransports:   []*derecpb.TransportProtocol{{Uri: "https://example.com/alice"}},
+	})
+	if err != nil {
+		t.Fatalf("proto.Marshal: %v", err)
+	}
+	_, err = pairing.Request.DecodeContact(wire)
+	if !errors.As(err, &derr) || derr.Code != derec.CodeInvalidContactMessage {
+		t.Fatalf("DecodeContact: want CodeInvalidContactMessage, got %#v", err)
+	}
+}
+
+func shareSizeRange(t *testing.T, minSize, maxSize int64) []byte {
+	t.Helper()
+	b, err := proto.Marshal(&derecpb.ParameterRange{
+		MinShareSize:                       minSize,
+		MaxShareSize:                       maxSize,
+		MaxTimeBetweenVerifications:        math.MaxInt64,
+		MaxTimeBetweenShareUpdates:         math.MaxInt64,
+		MaxUnresponsiveDeletionTimeout:     math.MaxInt64,
+		MaxUnresponsiveDeactivationTimeout: math.MaxInt64,
+	})
+	if err != nil {
+		t.Fatalf("proto.Marshal(ParameterRange): %v", err)
+	}
+	return b
+}
+
+func requireIncompatibleRange(t *testing.T, what string, err error) {
+	t.Helper()
+	var derr *derec.Error
+	if !errors.As(err, &derr) || derr.Code != derec.CodeIncompatibleParameterRange {
+		t.Fatalf("%s: want CodeIncompatibleParameterRange, got %#v", what, err)
+	}
+}
+
+// TestPairingRefusesAnIncompatibleParameterRange: disjoint ranges are
+// refused by the primitives themselves on both sides, with no separate check
+// for the application to call.
+func TestPairingRefusesAnIncompatibleParameterRange(t *testing.T) {
+	const channelID = uint64(9)
+	creatorRange := shareSizeRange(t, 1_000_000_000, 5_000_000_000)
+	scannerRange := shareSizeRange(t, 10_000_000, 500_000_000)
+
+	created, err := pairing.Request.CreateContact(channelID, pairing.ContactModeInlineKeys, encodeTransportList("https://example.com/alice"), nil)
+	if err != nil {
+		t.Fatalf("CreateContact: %v", err)
+	}
+
+	ranged, err := pairing.Request.Produce(pairing.SenderKindHelper, encodeTransportList("https://example.com/helper"), created.ContactWireBytes, nil, scannerRange)
+	if err != nil {
+		t.Fatalf("Request.Produce: %v", err)
+	}
+	_, err = pairing.Request.Extract(ranged.Envelope, created.SecretKeyMaterial, creatorRange)
+	requireIncompatibleRange(t, "Request.Extract", err)
+	unchecked, err := pairing.Request.Extract(ranged.Envelope, created.SecretKeyMaterial, nil)
+	if err != nil {
+		t.Fatalf("Request.Extract without a local range: %v", err)
+	}
+	_, err = pairing.Response.Produce(channelID, unchecked.RequestProto, created.SecretKeyMaterial, nil, creatorRange, false)
+	requireIncompatibleRange(t, "Response.Produce", err)
+
+	plain, err := pairing.Request.Produce(pairing.SenderKindHelper, encodeTransportList("https://example.com/helper"), created.ContactWireBytes, nil, nil)
+	if err != nil {
+		t.Fatalf("Request.Produce: %v", err)
+	}
+	extracted, err := pairing.Request.Extract(plain.Envelope, created.SecretKeyMaterial, creatorRange)
+	if err != nil {
+		t.Fatalf("Request.Extract: %v", err)
+	}
+	produced, err := pairing.Response.Produce(channelID, extracted.RequestProto, created.SecretKeyMaterial, nil, creatorRange, false)
+	if err != nil {
+		t.Fatalf("Response.Produce: %v", err)
+	}
+	extractedResp, err := pairing.Response.Extract(produced.Envelope, plain.SecretKeyMaterial)
+	if err != nil {
+		t.Fatalf("Response.Extract: %v", err)
+	}
+	_, err = pairing.Response.Process(plain.InitiatorContactMessage, extractedResp.ResponseProto, plain.SecretKeyMaterial, scannerRange)
+	requireIncompatibleRange(t, "Response.Process", err)
+
+	processed, err := pairing.Response.Process(plain.InitiatorContactMessage, extractedResp.ResponseProto, plain.SecretKeyMaterial,
+		shareSizeRange(t, 1_000_000_000, 2_000_000_000))
+	if err != nil {
+		t.Fatalf("Response.Process with an overlapping range: %v", err)
+	}
+	if !bytes.Equal(processed.SharedKey, produced.SharedKey) {
+		t.Fatal("overlapping ranges must pair to the same shared key")
 	}
 }
 
@@ -201,8 +356,8 @@ func TestPairingHashedKeysPrePairRoundTrip(t *testing.T) {
 		t.Fatal("CreateContact (HASHED_KEYS) returned empty secret key material")
 	}
 
-	if err := pairing.Request.Validate(aliceContact.ContactWireBytes); err != nil {
-		t.Fatalf("Validate (HASHED_KEYS contact): %v", err)
+	if _, err := pairing.Request.DecodeContact(aliceContact.ContactWireBytes); err != nil {
+		t.Fatalf("DecodeContact (HASHED_KEYS contact): %v", err)
 	}
 
 	// PrePair now advertises the scanner's whole list, framed like every
@@ -330,7 +485,7 @@ func TestPairingResponseRejectsPlaintextPeerEndpoint(t *testing.T) {
 		t.Fatalf("Request.Produce: %v", err)
 	}
 
-	extractedReq, err := pairing.Request.Extract(producedReq.Envelope, created.SecretKeyMaterial)
+	extractedReq, err := pairing.Request.Extract(producedReq.Envelope, created.SecretKeyMaterial, nil)
 	if err != nil {
 		t.Fatalf("Request.Extract: %v", err)
 	}
@@ -364,8 +519,8 @@ func TestPairingNoKeysPrePairRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateContact (NO_KEYS): %v", err)
 	}
-	if err := pairing.Request.Validate(aliceContact.ContactWireBytes); err != nil {
-		t.Fatalf("Validate (NO_KEYS contact): %v", err)
+	if _, err := pairing.Request.DecodeContact(aliceContact.ContactWireBytes); err != nil {
+		t.Fatalf("DecodeContact (NO_KEYS contact): %v", err)
 	}
 
 	bobTransport := encodeTransportList("https://example.com/helper/ephemeral")
@@ -416,7 +571,7 @@ func TestPairingNoKeysPrePairRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request.Produce: %v", err)
 	}
-	extractedPairReq, err := pairing.Request.Extract(pairReq.Envelope, prepairResp.SecretKeyMaterial)
+	extractedPairReq, err := pairing.Request.Extract(pairReq.Envelope, prepairResp.SecretKeyMaterial, nil)
 	if err != nil {
 		t.Fatalf("Request.Extract: %v", err)
 	}
@@ -428,7 +583,7 @@ func TestPairingNoKeysPrePairRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Response.Extract: %v", err)
 	}
-	processedPair, err := pairing.Response.Process(pairReq.InitiatorContactMessage, extractedPairResp.ResponseProto, pairReq.SecretKeyMaterial)
+	processedPair, err := pairing.Response.Process(pairReq.InitiatorContactMessage, extractedPairResp.ResponseProto, pairReq.SecretKeyMaterial, nil)
 	if err != nil {
 		t.Fatalf("Response.Process: %v", err)
 	}

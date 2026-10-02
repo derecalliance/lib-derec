@@ -60,6 +60,7 @@ func TestBuildCallbacks_PopulatesAllSixStructs(t *testing.T) {
 
 	checkNonZero("Secret.UserData", built.Secret.UserData)
 	checkNonZero("Secret.Load", built.Secret.Load)
+	checkNonZero("Secret.LoadMany", built.Secret.LoadMany)
 	checkNonZero("Secret.Save", built.Secret.Save)
 	checkNonZero("Secret.Remove", built.Secret.Remove)
 	checkNonZero("Secret.FreeBuffer", built.Secret.FreeBuffer)
@@ -408,6 +409,7 @@ func TestBuildCallbacks_ManyInstancesDoNotExhaustCallbackTable(t *testing.T) {
 		checkNonZero("Channel.FreeBuffer", built.Channel.FreeBuffer)
 
 		checkNonZero("Secret.Load", built.Secret.Load)
+		checkNonZero("Secret.LoadMany", built.Secret.LoadMany)
 		checkNonZero("Secret.Save", built.Secret.Save)
 		checkNonZero("Secret.Remove", built.Secret.Remove)
 		checkNonZero("Secret.FreeBuffer", built.Secret.FreeBuffer)

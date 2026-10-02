@@ -88,6 +88,22 @@ export const envelope = {
 export const DeRecProtocol = DeRecProtocolWasm;
 export const DeRecProtocolBuilder = DeRecProtocolBuilderImpl;
 
+// A second `free()`, or one after `build()` consumed the builder, finds the
+// handle already released; it returns instead of passing a null handle to the
+// library, the same as .NET `Dispose` and Go `Close`.
+function releaseOnce(Class) {
+  const release = Class.prototype.free;
+  Class.prototype.free = function free() {
+    if (this.__wbg_ptr !== 0) release.call(this);
+  };
+  Class.prototype[Symbol.dispose] = function dispose() {
+    this.free();
+  };
+}
+
+releaseOnce(DeRecProtocol);
+releaseOnce(DeRecProtocolBuilder);
+
 export const SenderKind = Object.freeze({ Owner: 0, Helper: 1, ReplicaSource: 3, ReplicaDestination: 4 });
 
 export const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1, NoKeys: 2 });

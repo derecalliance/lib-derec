@@ -65,7 +65,8 @@ pub struct PrePairExtractResult {
 /// In DeRec, pairing begins with an **out-of-band contact transfer** (typically QR or
 /// another side channel). Unlike normal DeRec protocol traffic, the contact message is
 /// **not wrapped in a `DeRecMessage` envelope** and is **not encrypted**. It is sent as
-/// plain protobuf bytes (serialize the returned `contact_message` with `.encode_to_vec()`).
+/// plain protobuf bytes: serialize the returned `contact_message` with [`encode_contact`],
+/// and the recipient turns the bytes back into a contact with [`decode_contact`].
 ///
 /// Single entry point for all three `contact_mode` variants. Mode-specific
 /// assembly happens in private helpers (`create_contact_inlined_keys`,
@@ -97,7 +98,7 @@ pub struct PrePairExtractResult {
 ///
 /// [`CreateContactResult`] with:
 ///
-/// - `contact_message`: decoded [`ContactMessage`] — serialize with `.encode_to_vec()`
+/// - `contact_message`: decoded [`ContactMessage`] — serialize with [`encode_contact`]
 ///   before sending out-of-band.
 /// - `secret_key`: `Some(...)` for `InlineKeys` and `HashedKeys` (must be persisted);
 ///   `None` for `NoKeys` (no key material at contact-creation time).
@@ -190,6 +191,68 @@ pub fn create_contact(
         contact_message,
         secret_key,
     })
+}
+
+/// Serializes a [`ContactMessage`] to the protobuf bytes delivered out of band
+/// (typically as a QR code).
+///
+/// The contact is checked against the invariants of its declared
+/// [`ContactMode`] before it is encoded, so a contact this side could not have
+/// produced with [`create_contact`] never leaves the device:
+///
+/// - [`ContactMode::InlineKeys`]: both public keys present and non-empty, no
+///   binding hash.
+/// - [`ContactMode::HashedKeys`]: a SHA-384 binding hash, no inline keys.
+/// - [`ContactMode::NoKeys`]: neither keys nor a binding hash.
+///
+/// The contact must also advertise at least one transport endpoint.
+///
+/// # Errors
+///
+/// - [`PairingError::InvalidContactMessage`] if the contact violates any of the
+///   invariants above, including an unknown `contact_mode`.
+///
+/// # Example
+///
+/// ```
+/// use derec_library::primitives::pairing::request;
+/// use derec_library::types::ChannelId;
+/// use derec_proto::{ContactMode, Protocol, TransportProtocol};
+///
+/// let request::CreateContactResult { contact_message, .. } = request::create_contact(
+///     ChannelId(42),
+///     ContactMode::InlineKeys,
+///     vec![TransportProtocol {
+///         uri: "https://relay.example/derec".to_owned(),
+///         protocol: Protocol::Https.into(),
+///     }],
+///     None,
+/// ).expect("create_contact failed");
+///
+/// let bytes = request::encode_contact(&contact_message).expect("encode_contact failed");
+/// assert_eq!(request::decode_contact(&bytes).expect("decode_contact failed"), contact_message);
+/// ```
+pub fn encode_contact(contact_message: &ContactMessage) -> Result<Vec<u8>, crate::Error> {
+    contact_message.validate()?;
+    Ok(contact_message.encode_to_vec())
+}
+
+/// Parses the out-of-band bytes produced by [`encode_contact`] back into the
+/// [`ContactMessage`] the scanner pairs against.
+///
+/// The decoded contact is held to the same per-[`ContactMode`] invariants
+/// [`encode_contact`] enforces, so a contact this returns is safe to hand to
+/// [`produce`] or [`produce_pre_pair_request`].
+///
+/// # Errors
+///
+/// - [`crate::Error::ProtobufDecode`] if the bytes are not a `ContactMessage`.
+/// - [`PairingError::InvalidContactMessage`] if the decoded contact violates the
+///   invariants of its declared mode.
+pub fn decode_contact(bytes: &[u8]) -> Result<ContactMessage, crate::Error> {
+    let contact_message = ContactMessage::decode(bytes).map_err(crate::Error::ProtobufDecode)?;
+    contact_message.validate()?;
+    Ok(contact_message)
 }
 
 /// Produces a pairing request [`derec_proto::DeRecMessage`] envelope, continuing the DeRec
@@ -466,12 +529,21 @@ pub fn produce_pre_pair_request(
 /// * `ecies_secret_key` - The initiator's ECIES secret key. Must correspond to the
 ///   `ecies_public_key` the initiator published in their [`derec_proto::ContactMessage`],
 ///   which is the key used by [`produce`] to encrypt the inner request.
+/// * `parameter_range` - The [`derec_proto::ParameterRange`] this side accepts, the same
+///   value it will pass to [`super::response::produce`]. `None` declares no constraints.
 ///
 /// # Returns
 ///
 /// On success returns [`ExtractResult`] containing:
 ///
 /// - `request`: the decrypted inner [`derec_proto::PairRequestMessage`]
+///
+/// # Parameter-range compatibility
+///
+/// The requester's advertised range is checked against `parameter_range` here, before
+/// the request is handed to the application, so a pairing the two sides could never
+/// agree on is refused before anyone is asked to confirm it. The protocol answers such
+/// a request with a `PairResponse` carrying status `INCOMPATIBLE_PARAMETER_RANGE`.
 ///
 /// # Errors
 ///
@@ -482,6 +554,8 @@ pub fn produce_pre_pair_request(
 /// - the decrypted bytes cannot be decoded as a [`derec_proto::PairRequestMessage`]
 /// - `envelope.timestamp != request.timestamp`
 /// - the inner message is not a [`derec_proto::PairRequestMessage`]
+/// - [`PairingError::IncompatibleParameterRange`] if the requester's advertised range
+///   and `parameter_range` do not overlap on some field
 ///
 /// # Security: no freshness or replay protection
 ///
@@ -532,7 +606,7 @@ pub fn produce_pre_pair_request(
 ///
 /// // Initiator: decrypt the pairing request with the ECIES secret key.
 /// let request::ExtractResult { request: pair_request } =
-///     request::extract(&envelope, initiator_key.as_ref().unwrap().ecies_secret_key())
+///     request::extract(&envelope, initiator_key.as_ref().unwrap().ecies_secret_key(), None)
 ///         .expect("extract failed");
 ///
 /// assert_eq!(pair_request.nonce, contact_message.nonce);
@@ -544,6 +618,7 @@ pub fn produce_pre_pair_request(
 pub fn extract(
     envelope_bytes: &[u8],
     ecies_secret_key: &[u8],
+    parameter_range: Option<&derec_proto::ParameterRange>,
 ) -> Result<ExtractResult, crate::Error> {
     let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
 
@@ -576,6 +651,8 @@ pub fn extract(
     // advertise several, and `TransportPolicy::admit_peer_endpoints` skips a
     // bad one rather than refusing the whole request.
     request.validate()?;
+
+    check_parameter_range(&request, parameter_range)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("pairing request extracted and validated");
@@ -649,6 +726,18 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
     tracing::info!("PrePair request envelope decoded and validated");
 
     Ok(PrePairExtractResult { request })
+}
+
+/// Refuses a `PairRequest` whose advertised range does not overlap `local`.
+///
+/// Shared by [`extract`] and the protocol's own `PairRequest` handling, which
+/// decrypts through a generic path and so never calls [`extract`]; both refuse
+/// at the same point, before the request reaches the application.
+pub(crate) fn check_parameter_range(
+    request: &PairRequestMessage,
+    local: Option<&derec_proto::ParameterRange>,
+) -> Result<(), PairingError> {
+    super::parameter_range::check_compatibility(local, request.parameter_range.as_ref())
 }
 
 fn validate_inputs(

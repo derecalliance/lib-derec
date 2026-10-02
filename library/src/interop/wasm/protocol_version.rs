@@ -16,5 +16,5 @@ pub fn protocol_version() -> Result<JsValue, JsValue> {
         major: version.major,
         minor: version.minor,
     })
-    .map_err(|e| crate::interop::wasm::ts_bindings_utils::js_error("SERIALIZE", e.to_string()))
+    .map_err(|e| crate::interop::wasm::ts_bindings_utils::js_error("serialize", e.to_string()))
 }

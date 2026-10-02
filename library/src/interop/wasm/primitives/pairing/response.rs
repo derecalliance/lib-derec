@@ -68,13 +68,7 @@ pub fn produce(
         };
     let communication_info_proto: Option<derec_proto::CommunicationInfo> =
         communication_info.map(Into::into);
-    let parameter_range_proto: Option<derec_proto::ParameterRange> =
-        if parameter_range.is_null() || parameter_range.is_undefined() {
-            None
-        } else {
-            let pr: super::ParameterRange = from_js(parameter_range)?;
-            Some(pr.into())
-        };
+    let parameter_range_proto = super::optional_parameter_range(parameter_range)?;
 
     let result = response::produce(
         crate::types::ChannelId(channel_id),
@@ -109,15 +103,22 @@ pub fn process(
     contact_message: JsValue,
     response: JsValue,
     secret_key: &[u8],
+    parameter_range: JsValue,
 ) -> Result<JsValue, JsValue> {
     let pairing_sk = deserialize_pairing_secret_key_material(secret_key)?;
     let contact_message: ContactMessage = from_js(contact_message)?;
     let contact_message_proto: derec_proto::ContactMessage = contact_message.into();
     let response: PairResponseMessage = from_js(response)?;
     let response_proto: derec_proto::PairResponseMessage = response.into();
+    let parameter_range = super::optional_parameter_range(parameter_range)?;
 
-    let result = response::process(&contact_message_proto, &response_proto, &pairing_sk)
-        .map_err(js_error_from_lib)?;
+    let result = response::process(
+        &contact_message_proto,
+        &response_proto,
+        &pairing_sk,
+        parameter_range.as_ref(),
+    )
+    .map_err(js_error_from_lib)?;
 
     to_js(&ProcessResult {
         shared_key: result.shared_key.to_vec(),

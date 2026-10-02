@@ -219,7 +219,7 @@ export function runPrimitivesSmoke(): void {
 
   // Initiator extracts the request and produces a response.
   const { request: pairRequest }: { request: PairRequestMessage } =
-    primitives.pairing.request.extract(pairingRequest.envelope, contact.secret_key);
+    primitives.pairing.request.extract(pairingRequest.envelope, contact.secret_key, null);
   const produced = primitives.pairing.response.produce(
     pairingChannelId, pairRequest, contact.secret_key, null, null,
   );
@@ -231,6 +231,7 @@ export function runPrimitivesSmoke(): void {
     pairingRequest.initiator_contact_message as ContactMessage,
     pairResponse,
     pairingRequest.secret_key,
+    null,
   );
 
   if (produced.shared_key.length !== processed.shared_key.length ||
@@ -247,6 +248,88 @@ export function runPrimitivesSmoke(): void {
   }
   console.log(`  shared keys match (${produced.shared_key.length}B)  ✓`);
   console.log(`  channel id rekeyed: ${pairingChannelId} → ${produced.channel_id}  ✓`);
+
+  // ── Contact codec: the core's one encoder/decoder for the out-of-band bytes
+  {
+    const wire = primitives.pairing.request.encode_contact(contact.contact_message);
+    const decoded = primitives.pairing.request.decode_contact(wire);
+    const reencoded = primitives.pairing.request.encode_contact(decoded);
+    if (reencoded.length !== wire.length || !reencoded.every((b, i) => b === wire[i])) {
+      throw new Error("contact codec: decode → encode must reproduce the core's bytes");
+    }
+    if (decoded.channel_id !== pairingChannelId || decoded.nonce !== contact.contact_message.nonce) {
+      throw new Error("contact codec: decoded contact lost its channel id or nonce");
+    }
+    console.log("  contact codec round-trips to the core's bytes  ✓");
+
+    const expectCode = (what: string, code: string, f: () => unknown): void => {
+      try {
+        f();
+      } catch (e) {
+        const got = String((e as { code: unknown }).code);
+        if (got !== code) throw new Error(`${what}: expected ${code}, got ${got}`);
+        console.log(`  ${what} refused (${code})  ✓`);
+        return;
+      }
+      throw new Error(`${what}: expected ${code}, nothing was thrown`);
+    };
+    expectCode("encode_contact(InlineKeys + binding hash)", "invalid_contact_message", () =>
+      primitives.pairing.request.encode_contact({
+        ...decoded,
+        contact_binding_hash: new Uint8Array(48),
+      } as ContactMessage),
+    );
+    expectCode("decode_contact(garbage)", "protobuf_decode", () =>
+      primitives.pairing.request.decode_contact(new Uint8Array([0xff, 0xff, 0xff])),
+    );
+
+    // ── Parameter-range compatibility is enforced by the primitives
+    const shareSize = (min: bigint, max: bigint) => ({
+      min_share_size: min,
+      max_share_size: max,
+      min_time_between_verifications: 0n,
+      max_time_between_verifications: 0x7fff_ffff_ffff_ffffn,
+      min_time_between_share_updates: 0n,
+      max_time_between_share_updates: 0x7fff_ffff_ffff_ffffn,
+      min_unresponsive_deletion_timeout: 0n,
+      max_unresponsive_deletion_timeout: 0x7fff_ffff_ffff_ffffn,
+      min_unresponsive_deactivation_timeout: 0n,
+      max_unresponsive_deactivation_timeout: 0x7fff_ffff_ffff_ffffn,
+    });
+    const creatorRange = shareSize(1_000_000_000n, 5_000_000_000n);
+    const scannerRange = shareSize(10_000_000n, 500_000_000n);
+
+    const ranged = primitives.pairing.request.produce(
+      SenderKind.Helper,
+      [{ protocol: 0, uri: "https://example.com/helper" }],
+      contact.contact_message,
+      null,
+      scannerRange,
+    );
+    expectCode("request.extract(disjoint range)", "incompatible_parameter_range", () =>
+      primitives.pairing.request.extract(ranged.envelope, contact.secret_key, creatorRange),
+    );
+    const { request: unchecked } =
+      primitives.pairing.request.extract(ranged.envelope, contact.secret_key, null);
+    expectCode("response.produce(disjoint range)", "incompatible_parameter_range", () =>
+      primitives.pairing.response.produce(
+        pairingChannelId, unchecked, contact.secret_key, null, creatorRange,
+      ),
+    );
+    const accepted = primitives.pairing.response.produce(
+      pairingChannelId, pairRequest, contact.secret_key, null, creatorRange,
+    );
+    const { response: rangedResponse } =
+      primitives.pairing.response.extract(accepted.envelope, pairingRequest.secret_key);
+    expectCode("response.process(disjoint range)", "incompatible_parameter_range", () =>
+      primitives.pairing.response.process(
+        pairingRequest.initiator_contact_message as ContactMessage,
+        rangedResponse,
+        pairingRequest.secret_key,
+        scannerRange,
+      ),
+    );
+  }
 
   console.log("✓ Pairing flow (INLINE_KEYS) passed.\n");
 
@@ -336,7 +419,7 @@ export function runPrimitivesSmoke(): void {
     null,
   );
   const { request: hkPairRequest }: { request: PairRequestMessage } =
-    primitives.pairing.request.extract(hkPairingRequest.envelope, hkContact.secret_key);
+    primitives.pairing.request.extract(hkPairingRequest.envelope, hkContact.secret_key, null);
   const hkProduced = primitives.pairing.response.produce(
     hashedKeysChannelId, hkPairRequest, hkContact.secret_key, null, null,
   );
@@ -346,6 +429,7 @@ export function runPrimitivesSmoke(): void {
     hkPairingRequest.initiator_contact_message as ContactMessage,
     hkPairResponse,
     hkPairingRequest.secret_key,
+    null,
   );
   if (hkProduced.shared_key.length !== hkProcessed.shared_key.length ||
       !hkProduced.shared_key.every((b, i) => b === hkProcessed.shared_key[i])) {
@@ -453,6 +537,7 @@ export function runPrimitivesSmoke(): void {
   const { request: nkPairRequest }: { request: PairRequestMessage } =
     primitives.pairing.request.extract(
       nkPairingRequest.envelope, nkPrePairResponseEnvelope.secret_key_material,
+      null,
     );
   const nkProduced = primitives.pairing.response.produce(
     noKeysChannelId, nkPairRequest, nkPrePairResponseEnvelope.secret_key_material, null, null,
@@ -463,6 +548,7 @@ export function runPrimitivesSmoke(): void {
     nkPairingRequest.initiator_contact_message as ContactMessage,
     nkPairResponse,
     nkPairingRequest.secret_key,
+    null,
   );
   if (nkProduced.shared_key.length !== nkProcessed.shared_key.length ||
       !nkProduced.shared_key.every((b, i) => b === nkProcessed.shared_key[i])) {

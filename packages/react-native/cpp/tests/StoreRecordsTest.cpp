@@ -8,6 +8,7 @@
 #include "TestMain.h"
 
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -87,30 +88,38 @@ static void shareRecordWithoutSecretIdIsRejected() {
          "a share record missing secret_id does not decode");
 }
 
+/// The JSON `Transport.send` receives for `framed`, or empty when the crate
+/// refuses the buffer.
+static std::optional<std::string> endpointsJson(const std::vector<uint8_t>& framed) {
+  DeRecMessageJsonResult result = derec_transport_endpoints_json(framed.data(), framed.size());
+  if (result.error.code != 0) {
+    derec_free_error(&result.error);
+    return std::nullopt;
+  }
+  std::vector<uint8_t> bytes = takeBuffer(result.bytes);
+  return std::string(bytes.begin(), bytes.end());
+}
+
 static void grpcEndpointIsNamedGrpc() {
-  auto framed = frame({encodeEndpoint("grpcs://helper.example:443", 1)});
-  auto endpoints = decodeTransportEndpoints(framed.data(), framed.size());
-  expect(endpoints.has_value(), "a gRPC endpoint decodes");
-  if (!endpoints) return;
-  expect(endpoints->size() == 1, "one endpoint");
-  expect((*endpoints)[0].protocol == "grpc", "discriminant 1 reaches Transport.send as \"grpc\"");
-  expect((*endpoints)[0].uri == "grpcs://helper.example:443", "uri passes through");
+  auto json = endpointsJson(frame({encodeEndpoint("grpcs://helper.example:443", 1)}));
+  expect(json == std::optional<std::string>(
+                     "[{\"protocol\":\"grpc\",\"uri\":\"grpcs://helper.example:443\"}]"),
+         "discriminant 1 reaches Transport.send as \"grpc\", uri verbatim");
 }
 
 static void endpointsKeepPeerOrderAndNames() {
-  auto framed = frame({encodeEndpoint("https://helper.example/derec", 0),
-                       encodeEndpoint("grpcs://helper.example:443", 1)});
-  auto endpoints = decodeTransportEndpoints(framed.data(), framed.size());
-  expect(endpoints.has_value() && endpoints->size() == 2, "both endpoints decode");
-  if (!endpoints || endpoints->size() != 2) return;
-  expect((*endpoints)[0].protocol == "https", "discriminant 0 is \"https\"");
-  expect((*endpoints)[1].protocol == "grpc", "discriminant 1 is \"grpc\"");
+  auto json = endpointsJson(frame({encodeEndpoint("https://helper.example/derec", 0),
+                                   encodeEndpoint("grpcs://helper.example:443", 1)}));
+  expect(json == std::optional<std::string>(
+                     "[{\"protocol\":\"https\",\"uri\":\"https://helper.example/derec\"},"
+                     "{\"protocol\":\"grpc\",\"uri\":\"grpcs://helper.example:443\"}]"),
+         "both endpoints decode in the peer's order");
 }
 
 static void undefinedDiscriminantFailsTheSend() {
   auto framed = frame({encodeEndpoint("https://helper.example/derec", 0),
                        encodeEndpoint("x://helper.example", 7)});
-  expect(!decodeTransportEndpoints(framed.data(), framed.size()).has_value(),
+  expect(!endpointsJson(framed).has_value(),
          "an undefined discriminant fails decoding rather than reaching Transport.send");
 }
 

@@ -32,7 +32,16 @@ pub mod dto;
 mod ffi;
 
 #[cfg(any(target_arch = "wasm32", feature = "ffi"))]
-mod protocol_names;
+mod error_codes;
+
+#[cfg(any(target_arch = "wasm32", feature = "ffi"))]
+pub(crate) mod protocol_names;
+
+#[cfg(any(target_arch = "wasm32", feature = "ffi"))]
+mod recovered_secret;
+
+#[cfg(any(target_arch = "wasm32", feature = "ffi"))]
+mod secret_batch;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;

@@ -4,7 +4,7 @@
 mod error;
 pub use error::*;
 
-pub mod parameter_range;
+pub(crate) mod parameter_range;
 pub mod request;
 pub mod response;
 

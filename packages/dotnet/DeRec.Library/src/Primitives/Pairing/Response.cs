@@ -116,7 +116,10 @@ public static partial class Pairing
         /// <paramref name="communicationInfo"/> and <paramref name="parameterRange"/>
         /// are optional and may be null. Both must be serialized proto
         /// bytes (<c>CommunicationInfo</c> and <c>ParameterRange</c>
-        /// respectively).
+        /// respectively). A request advertising a range that does not overlap
+        /// <paramref name="parameterRange"/> is refused with
+        /// <see cref="DeRecCode.IncompatibleParameterRange"/> and no key is
+        /// derived.
         /// </summary>
         /// <param name="unsafeConnection">Accept plaintext peer endpoints
         /// (<c>http://</c>, <c>grpc://</c>). Development only.</param>
@@ -192,14 +195,20 @@ public static partial class Pairing
         /// <summary>
         /// Processes a pairing response and derives the shared key. Throws
         /// <see cref="DeRecException"/> on peer rejection.
+        /// <paramref name="parameterRange"/> is the serialized
+        /// <c>ParameterRange</c> this side accepts, or null for none; a
+        /// response advertising a range that does not overlap it is refused
+        /// with <see cref="DeRecCode.IncompatibleParameterRange"/> before any
+        /// key is derived.
         /// </summary>
         public static ProcessResult Process(
             ContactMessage contactMessage,
             byte[] responseProtoBytes,
-            byte[] secretKeyMaterial
+            byte[] secretKeyMaterial,
+            byte[]? parameterRange = null
         )
         {
-            byte[] contactMessageBytes = contactMessage.ToProtoBytes();
+            byte[] contactMessageBytes = Request.EncodeContact(contactMessage);
 
             Native.Pairing.ProcessPairResponseMessageResult nativeResult =
                 Native.Pairing.process_pair_response_message(
@@ -208,7 +217,9 @@ public static partial class Pairing
                     responseProtoBytes,
                     (UIntPtr)responseProtoBytes.Length,
                     secretKeyMaterial,
-                    (UIntPtr)secretKeyMaterial.Length
+                    (UIntPtr)secretKeyMaterial.Length,
+                    parameterRange,
+                    (UIntPtr)(parameterRange?.Length ?? 0)
                 );
 
             try
@@ -299,7 +310,7 @@ public static partial class Pairing
             byte[] responseProtoBytes
         )
         {
-            byte[] contactMessageBytes = contactMessage.ToProtoBytes();
+            byte[] contactMessageBytes = Request.EncodeContact(contactMessage);
 
             Native.Pairing.ProcessPrePairResponseMessageResult nativeResult =
                 Native.Pairing.process_pre_pair_response_message(
@@ -386,7 +397,7 @@ public static partial class Pairing
             byte[] responseProtoBytes
         )
         {
-            byte[] contactMessageBytes = contactMessage.ToProtoBytes();
+            byte[] contactMessageBytes = Request.EncodeContact(contactMessage);
 
             Native.Pairing.ProcessPrePairResponseMessageResult nativeResult =
                 Native.Pairing.process_pre_pair_no_keys_response_message(

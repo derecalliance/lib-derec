@@ -45,13 +45,13 @@ function goldenRestoreInput(): Extract<DeRecEvent, { type: 'SecretRecovered' }>[
     helpers: [
       {
         channel_id: '11',
-        transports: [{ uri: 'https://helper-a.example.com', protocol: 0 }],
+        transports: [{ uri: 'https://helper-a.example.com', protocol: 'https' }],
         shared_key: sharedKey1,
         communication_info: { foo: 'bar' },
       },
       {
         channel_id: '22',
-        transports: [{ uri: 'https://helper-b.example.com', protocol: 0 }],
+        transports: [{ uri: 'https://helper-b.example.com', protocol: 'https' }],
         shared_key: sharedKey2,
         communication_info: {},
       },
@@ -62,13 +62,13 @@ function goldenRestoreInput(): Extract<DeRecEvent, { type: 'SecretRecovered' }>[
       members: [
         {
           replica_id: '44',
-          transports: [{ uri: 'https://replica-a.example.com', protocol: 0 }],
+          transports: [{ uri: 'https://replica-a.example.com', protocol: 'https' }],
           role: 'Source',
           communication_info: { baz: 'qux' },
         },
         {
           replica_id: '66',
-          transports: [{ uri: 'https://replica-b.example.com', protocol: 0 }],
+          transports: [{ uri: 'https://replica-b.example.com', protocol: 'https' }],
           role: 'Destination',
           communication_info: {},
         },
@@ -85,5 +85,13 @@ describe('wire golden vectors', () => {
 
   it('restore params match the shared fixture', () => {
     expect(buildRestoreParams(goldenRestoreInput(), 7)).toEqual(golden.restore);
+  });
+
+  // A section added to the fixture with no assertion here would leave this
+  // SDK's params builder for it unchecked.
+  it('covers every fixture section', () => {
+    const covered = ['protect_secret', 'restore'];
+    const sections = Object.keys(golden).filter((k) => !k.startsWith('$')).sort();
+    expect(sections).toEqual(covered);
   });
 });

@@ -95,8 +95,6 @@ public static partial class Sharing
             ArgumentNullException.ThrowIfNull(committedShare);
             ArgumentNullException.ThrowIfNull(keepList);
             ArgumentNullException.ThrowIfNull(sharedKey);
-            if (sharedKey.Length != 32)
-                throw new ArgumentException("sharedKey must be exactly 32 bytes.", nameof(sharedKey));
 
             byte[] descriptionBytes = System.Text.Encoding.UTF8.GetBytes(description ?? string.Empty);
             byte[]? replyToBytes = replyTo is { Count: > 0 }

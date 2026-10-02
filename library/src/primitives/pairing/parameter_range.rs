@@ -51,7 +51,12 @@ const FIELDS: &[Accessor] = &[
 /// field, or the first incompatible field as a
 /// [`PairingError::IncompatibleParameterRange`]. When either side
 /// passes `None` the pair is unconditionally compatible.
-pub fn check_compatibility(
+///
+/// Crate-private by design: compatibility is a protocol rule, so the
+/// pairing primitives that receive a peer's range run it themselves
+/// ([`super::request::extract`], [`super::response::produce`] and
+/// [`super::response::process`]) and no binding can skip it.
+pub(crate) fn check_compatibility(
     local: Option<&ParameterRange>,
     peer: Option<&ParameterRange>,
 ) -> Result<(), PairingError> {

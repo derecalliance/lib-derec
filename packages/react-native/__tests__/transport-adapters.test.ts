@@ -1,9 +1,9 @@
 import { sequentialFailover, singleEndpointTransport } from '../src/types';
-import type { SendOne } from '../src/types';
+import type { Endpoint, SendOne } from '../src/types';
 
-const a = { uri: 'https://a.example', protocol: 'https' };
-const b = { uri: 'https://b.example', protocol: 'https' };
-const c = { uri: 'https://c.example', protocol: 'https' };
+const a: Endpoint = { uri: 'https://a.example', protocol: 'https' };
+const b: Endpoint = { uri: 'https://b.example', protocol: 'https' };
+const c: Endpoint = { uri: 'https://c.example', protocol: 'https' };
 
 const message = new Uint8Array([1, 2, 3]);
 

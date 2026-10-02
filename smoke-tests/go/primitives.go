@@ -125,7 +125,8 @@ func runPairingFlow() {
 	assertTrue(len(created.ContactWireBytes) != 0, "contact wire bytes must not be empty")
 	assertTrue(len(created.SecretKeyMaterial) != 0, "contact secret key material must not be empty")
 
-	must(pairing.Request.Validate(created.ContactWireBytes), "pairing.Request.Validate")
+	_, err = pairing.Request.DecodeContact(created.ContactWireBytes)
+	must(err, "pairing.Request.DecodeContact")
 
 	bobTransport := transportListBytes("https://example.com/helper")
 	producedReq, err := pairing.Request.Produce(pairing.SenderKindHelper, bobTransport, created.ContactWireBytes, nil, nil)
@@ -133,7 +134,7 @@ func runPairingFlow() {
 	assertTrue(len(producedReq.Envelope) != 0, "pair request envelope must not be empty")
 	assertTrue(len(producedReq.SecretKeyMaterial) != 0, "pair request secret key material must not be empty")
 
-	extractedReq, err := pairing.Request.Extract(producedReq.Envelope, created.SecretKeyMaterial)
+	extractedReq, err := pairing.Request.Extract(producedReq.Envelope, created.SecretKeyMaterial, nil)
 	must(err, "pairing.Request.Extract")
 	assertTrue(len(extractedReq.RequestProto) != 0, "extracted pair request proto must not be empty")
 
@@ -147,7 +148,7 @@ func runPairingFlow() {
 	must(err, "pairing.Response.Extract")
 	assertTrue(len(extractedResp.ResponseProto) != 0, "extracted pair response proto must not be empty")
 
-	processed, err := pairing.Response.Process(producedReq.InitiatorContactMessage, extractedResp.ResponseProto, producedReq.SecretKeyMaterial)
+	processed, err := pairing.Response.Process(producedReq.InitiatorContactMessage, extractedResp.ResponseProto, producedReq.SecretKeyMaterial, nil)
 	must(err, "pairing.Response.Process")
 	assertTrue(len(processed.SharedKey) != 0, "responder shared key must not be empty")
 
@@ -171,7 +172,8 @@ func runNoKeysPairingFlow() {
 
 	aliceContact, err := pairing.Request.CreateContact(channelID, pairing.ContactModeNoKeys, transportListBytes("https://example.com/alice/ephemeral"), &nonce)
 	must(err, "pairing.Request.CreateContact (NO_KEYS)")
-	must(pairing.Request.Validate(aliceContact.ContactWireBytes), "pairing.Request.Validate (NO_KEYS)")
+	_, err = pairing.Request.DecodeContact(aliceContact.ContactWireBytes)
+	must(err, "pairing.Request.DecodeContact (NO_KEYS)")
 
 	prepairReq, err := pairing.Request.ProducePrePair(transportListBytes("https://example.com/helper/ephemeral"), aliceContact.ContactWireBytes)
 	must(err, "pairing.Request.ProducePrePair")
@@ -205,13 +207,13 @@ func runNoKeysPairingFlow() {
 
 	pairReq, err := pairing.Request.Produce(pairing.SenderKindHelper, transportListBytes("https://example.com/helper"), filledIn, nil, nil)
 	must(err, "pairing.Request.Produce")
-	extractedPairReq, err := pairing.Request.Extract(pairReq.Envelope, prepairResp.SecretKeyMaterial)
+	extractedPairReq, err := pairing.Request.Extract(pairReq.Envelope, prepairResp.SecretKeyMaterial, nil)
 	must(err, "pairing.Request.Extract")
 	produced, err := pairing.Response.Produce(channelID, extractedPairReq.RequestProto, prepairResp.SecretKeyMaterial, nil, nil, false)
 	must(err, "pairing.Response.Produce")
 	extractedPairResp, err := pairing.Response.Extract(produced.Envelope, pairReq.SecretKeyMaterial)
 	must(err, "pairing.Response.Extract")
-	processedPair, err := pairing.Response.Process(pairReq.InitiatorContactMessage, extractedPairResp.ResponseProto, pairReq.SecretKeyMaterial)
+	processedPair, err := pairing.Response.Process(pairReq.InitiatorContactMessage, extractedPairResp.ResponseProto, pairReq.SecretKeyMaterial, nil)
 	must(err, "pairing.Response.Process")
 
 	assertTrue(bytes.Equal(produced.SharedKey, processedPair.SharedKey), "shared keys derived by both sides must match (NO_KEYS path)")

@@ -29,6 +29,8 @@ async function main(): Promise<void> {
   console.log("╔══════════════════════════════════════════╗");
   console.log("║  All web smoke tests passed. ✓           ║");
   console.log("╚══════════════════════════════════════════╝");
+  // The line run.mjs waits for: the outcome of an unattended run.
+  console.log("DEREC_SMOKE_RESULT: PASS");
 
   const app = document.getElementById("app");
   if (app) {
@@ -39,6 +41,13 @@ async function main(): Promise<void> {
 
 main().catch((error: unknown) => {
   console.error("Web smoke test failed:", error);
+  const detail =
+    error instanceof Error
+      ? (error.stack ?? error.message)
+      : typeof error === "object" && error !== null
+        ? JSON.stringify(error)
+        : String(error);
+  console.log(`DEREC_SMOKE_RESULT: FAIL ${detail}`);
   const app = document.getElementById("app");
   if (app) {
     app.textContent = `DeRec web smoke test failed: ${String(error)}`;

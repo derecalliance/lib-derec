@@ -15,6 +15,16 @@ type createContactMessageResult struct {
 	SecretKeyMaterial DeRecBuffer
 }
 
+type encodeContactMessageResult struct {
+	Error     DeRecError
+	WireBytes DeRecBuffer
+}
+
+type decodeContactMessageResult struct {
+	Error       DeRecError
+	ContactJSON DeRecBuffer
+}
+
 type producePairRequestMessageResult struct {
 	Error                            DeRecError
 	RequestWireBytes                 DeRecBuffer
@@ -94,8 +104,11 @@ var (
 		transportProtocol *byte, transportProtocolLen uintptr,
 		hasNonce uint32, nonce uint64) createContactMessageResult
 
-	validateContactOnce sync.Once
-	validateContactFn   func(contactMessage *byte, contactMessageLen uintptr) DeRecError
+	encodeContactOnce sync.Once
+	encodeContactFn   func(contactJSON *byte, contactJSONLen uintptr) encodeContactMessageResult
+
+	decodeContactOnce sync.Once
+	decodeContactFn   func(contactWire *byte, contactWireLen uintptr) decodeContactMessageResult
 
 	producePairRequestOnce sync.Once
 	producePairRequestFn   func(senderKind int32,
@@ -106,7 +119,8 @@ var (
 
 	extractPairReqOnce sync.Once
 	extractPairReqFn   func(request *byte, requestLen uintptr,
-		secretKeyMaterial *byte, secretKeyMaterialLen uintptr) extractPairRequestResult
+		secretKeyMaterial *byte, secretKeyMaterialLen uintptr,
+		parameterRange *byte, parameterRangeLen uintptr) extractPairRequestResult
 
 	producePairResponseOnce sync.Once
 	producePairResponseFn   func(channelID uint64,
@@ -123,7 +137,8 @@ var (
 	processPairRespOnce sync.Once
 	processPairRespFn   func(contactMessage *byte, contactMessageLen uintptr,
 		responseProto *byte, responseProtoLen uintptr,
-		secretKeyMaterial *byte, secretKeyMaterialLen uintptr) processPairResponseMessageResult
+		secretKeyMaterial *byte, secretKeyMaterialLen uintptr,
+		parameterRange *byte, parameterRangeLen uintptr) processPairResponseMessageResult
 
 	producePrePairRequestOnce sync.Once
 	producePrePairRequestFn   func(transportProtocol *byte, transportProtocolLen uintptr,
@@ -183,14 +198,32 @@ func CreateContact(channelID uint64, contactMode int32, transportProtocol []byte
 	return bytesFromBuffer(res.ContactWireBytes), bytesFromBuffer(res.SecretKeyMaterial), nil
 }
 
-// ValidateContact structurally validates proto-encoded ContactMessage bytes
-// against the per-contactMode field-presence invariants.
-func ValidateContact(contactMessage []byte) error {
-	validateContactOnce.Do(func() {
-		purego.RegisterFunc(&validateContactFn, symbol("validate_contact_message"))
+// EncodeContact turns contactJSON, the JSON shape encode_contact_message
+// reads, into the ContactMessage wire bytes delivered out of band. The core
+// refuses a contact that violates the invariants of its contact mode.
+func EncodeContact(contactJSON []byte) ([]byte, error) {
+	encodeContactOnce.Do(func() {
+		purego.RegisterFunc(&encodeContactFn, symbol("encode_contact_message"))
 	})
-	res := validateContactFn(bytePtr(contactMessage), uintptr(len(contactMessage)))
-	return errorFrom(res)
+	res := encodeContactFn(bytePtr(contactJSON), uintptr(len(contactJSON)))
+	if err := errorFrom(res.Error); err != nil {
+		return nil, err
+	}
+	return bytesFromBuffer(res.WireBytes), nil
+}
+
+// DecodeContact turns out-of-band ContactMessage wire bytes into the JSON
+// shape decode_contact_message writes. The core refuses bytes that are not a
+// contact, or a contact that violates the invariants of its contact mode.
+func DecodeContact(contactWire []byte) ([]byte, error) {
+	decodeContactOnce.Do(func() {
+		purego.RegisterFunc(&decodeContactFn, symbol("decode_contact_message"))
+	})
+	res := decodeContactFn(bytePtr(contactWire), uintptr(len(contactWire)))
+	if err := errorFrom(res.Error); err != nil {
+		return nil, err
+	}
+	return bytesFromBuffer(res.ContactJSON), nil
 }
 
 // ProducePairRequest builds a pairing request envelope addressed to the
@@ -221,13 +254,16 @@ func ProducePairRequest(senderKind int32, transportProtocol, contactMessage, com
 // ExtractPairRequest decrypts a pairing request envelope using
 // secretKeyMaterial (the contact creator's opaque pairing secret key
 // material) and returns its channel id and inner PairRequestMessage proto
-// bytes for chaining into ProducePairResponse.
-func ExtractPairRequest(request, secretKeyMaterial []byte) (uint64, []byte, error) {
+// bytes for chaining into ProducePairResponse. parameterRange is the
+// optional serialized ParameterRange this side accepts (nil for none); a
+// request whose range does not overlap it is refused.
+func ExtractPairRequest(request, secretKeyMaterial, parameterRange []byte) (uint64, []byte, error) {
 	extractPairReqOnce.Do(func() {
 		purego.RegisterFunc(&extractPairReqFn, symbol("extract_pair_request"))
 	})
 	res := extractPairReqFn(bytePtr(request), uintptr(len(request)),
-		bytePtr(secretKeyMaterial), uintptr(len(secretKeyMaterial)))
+		bytePtr(secretKeyMaterial), uintptr(len(secretKeyMaterial)),
+		bytePtr(parameterRange), uintptr(len(parameterRange)))
 	if err := errorFrom(res.Error); err != nil {
 		return 0, nil, err
 	}
@@ -289,13 +325,17 @@ func ExtractPairResponse(response, secretKeyMaterial []byte) (uint64, []byte, er
 // returned by ExtractPairResponse) against contactMessage (the initiator
 // ContactMessage wire bytes returned by ProducePairRequest), derives the
 // pairing shared key, and returns the validated rekeyed channel id.
-func ProcessPairResponse(contactMessage, responseProto, secretKeyMaterial []byte) ([]byte, uint64, error) {
+// parameterRange is the optional serialized ParameterRange this side accepts
+// (nil for none); a response whose range does not overlap it is refused
+// before any key is derived.
+func ProcessPairResponse(contactMessage, responseProto, secretKeyMaterial, parameterRange []byte) ([]byte, uint64, error) {
 	processPairRespOnce.Do(func() {
 		purego.RegisterFunc(&processPairRespFn, symbol("process_pair_response_message"))
 	})
 	res := processPairRespFn(bytePtr(contactMessage), uintptr(len(contactMessage)),
 		bytePtr(responseProto), uintptr(len(responseProto)),
-		bytePtr(secretKeyMaterial), uintptr(len(secretKeyMaterial)))
+		bytePtr(secretKeyMaterial), uintptr(len(secretKeyMaterial)),
+		bytePtr(parameterRange), uintptr(len(parameterRange)))
 	if err := errorFrom(res.Error); err != nil {
 		return nil, 0, err
 	}

@@ -15,14 +15,17 @@ namespace DeRec.Library.Orchestrator;
 /// <para>
 /// Required setters: <see cref="WithChannelStore"/>,
 /// <see cref="WithShareStore"/>, <see cref="WithSecretStore"/>,
+/// <see cref="WithUserSecretStore"/>, <see cref="WithStateStore"/>,
 /// <see cref="WithTransport"/>, and <see cref="WithOwnTransports"/>.
-/// Calling <see cref="Build"/> without all five throws
-/// <see cref="InvalidOperationException"/>.
+/// Calling <see cref="Build"/> without one of the six stores and transport
+/// throws <see cref="InvalidOperationException"/>; without at least one own
+/// transport, the library refuses the build with a
+/// <see cref="DeRecException"/> (<c>InvalidInput</c>), since a node with no
+/// endpoint cannot be reached by any peer.
 /// </para>
 ///
 /// <para>
-/// Optional setters all carry the defaults documented on the Rust
-/// builder: <see cref="WithThreshold"/> (3), <see cref="WithKeepVersionsCount"/> (3),
+/// Optional setters left uncalled take the library's defaults: <see cref="WithThreshold"/> (3), <see cref="WithKeepVersionsCount"/> (3),
 /// <see cref="WithTimeouts"/> (library defaults), <see cref="WithCommunicationInfo"/> (empty),
 /// <see cref="WithAutoRespondOnFailure"/> (false),
 /// <see cref="WithUnpairAck"/> (<see cref="UnpairAck.Required"/>),
@@ -39,17 +42,17 @@ public sealed class DeRecProtocolBuilder
     private IStateStore? _stateStore;
     private ITransport? _transport;
     private IReadOnlyList<TransportProtocol>? _ownTransports;
-    private int _threshold = 3;
-    private int _keepVersionsCount = 3;
+    private int? _threshold;
+    private int? _keepVersionsCount;
     private Dictionary<string, string> _communicationInfo = new();
-    private bool _autoRespondOnFailure = false;
-    private UnpairAck _unpairAck = UnpairAck.Required;
-    private bool _autoReplyTo = false;
-    private AutoAcceptPolicy _autoAccept = new();
+    private bool? _autoRespondOnFailure;
+    private UnpairAck? _unpairAck;
+    private bool? _autoReplyTo;
+    private AutoAcceptPolicy? _autoAccept;
     private ulong? _replicaId = null;
     private ParameterRange? _parameterRange = null;
     private Timeouts? _timeouts = null;
-    private bool _unsafeConnection = false;
+    private bool? _unsafeConnection;
 
     /// <summary>
     /// Construct a builder bound to a specific secret.
@@ -125,7 +128,7 @@ public sealed class DeRecProtocolBuilder
 
     /// <summary>
     /// Minimum number of shares required to reconstruct the secret.
-    /// Default: 3.
+    /// Not calling this leaves the Rust library's default (3) in force.
     /// </summary>
     public DeRecProtocolBuilder WithThreshold(int threshold)
     {
@@ -134,7 +137,8 @@ public sealed class DeRecProtocolBuilder
     }
 
     /// <summary>
-    /// Number of recent versions each helper must retain. Default: 3.
+    /// Number of recent versions each helper must retain. Not calling this
+    /// leaves the Rust library's default (3) in force.
     /// </summary>
     public DeRecProtocolBuilder WithKeepVersionsCount(int count)
     {
@@ -298,8 +302,6 @@ public sealed class DeRecProtocolBuilder
         if (_userSecretStore is null) throw new InvalidOperationException("WithUserSecretStore is required");
         if (_stateStore is null) throw new InvalidOperationException("WithStateStore is required");
         if (_transport is null) throw new InvalidOperationException("WithTransport is required");
-        if (_ownTransports is null || _ownTransports.Count == 0)
-            throw new InvalidOperationException("WithOwnTransports is required");
 
         return new DeRecProtocol(
             secretId: _secretId,
@@ -309,7 +311,7 @@ public sealed class DeRecProtocolBuilder
             userSecretStore: _userSecretStore,
             stateStore: _stateStore,
             transport: _transport,
-            ownTransports: _ownTransports,
+            ownTransports: _ownTransports ?? Array.Empty<TransportProtocol>(),
             threshold: _threshold,
             keepVersionsCount: _keepVersionsCount,
             communicationInfo: _communicationInfo,

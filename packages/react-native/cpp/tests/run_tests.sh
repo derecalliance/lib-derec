@@ -49,7 +49,8 @@ for src in "$HERE"/*JsiTest.cpp; do
     continue
   fi
   c++ -std=c++20 -I"$HERE/.." -I"$HERMES_DIR/include" "$src" "$HERE/../UserSecretsJson.cpp" \
-      "$HERE/../Primitives.cpp" "$HERE/../Convert.cpp" "$LIB" \
+      "$HERE/../Primitives.cpp" "$HERE/../Convert.cpp" "$HERE/../StoreCallbacks.cpp" \
+      "$HERE/../JsCallbackBridge.cpp" "$LIB" \
       -F"$HERMES_FW" -framework hermesvm -Wl,-rpath,"$HERMES_FW" \
       -framework CoreFoundation -framework Security -o "$OUT/$name"
   "$OUT/$name" || status=1

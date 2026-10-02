@@ -98,6 +98,7 @@ describe('message marshalling', () => {
     const { request } = primitives.pairing.request.extract(
       new Uint8Array([9]),
       new Uint8Array(32),
+      null,
     );
 
     expect(find('decode_message_json').args[0]).toBe(MessageKind.PairRequest);
@@ -107,6 +108,48 @@ describe('message marshalling', () => {
     // `request_proto_bytes` is an implementation detail of the C ABI and must
     // not leak into the typed surface.
     expect((request as unknown as Record<string, unknown>).request_proto_bytes).toBeUndefined();
+  });
+
+  // Parameter-range compatibility is decided in the core; the binding only
+  // forwards the caller's range, and an absent one as an empty buffer.
+  it('forwards the local parameter range to extract and process', () => {
+    const range = {
+      min_share_size: 1n,
+      max_share_size: 2n,
+      min_time_between_verifications: 0n,
+      max_time_between_verifications: 0n,
+      min_time_between_share_updates: 0n,
+      max_time_between_share_updates: 0n,
+      min_unresponsive_deletion_timeout: 0n,
+      max_unresponsive_deletion_timeout: 0n,
+      min_unresponsive_deactivation_timeout: 0n,
+      max_unresponsive_deactivation_timeout: 0n,
+    };
+    replies.extract_pair_request = { request_proto_bytes: new Uint8Array().buffer };
+    replies.process_pair_response_message = {
+      shared_key: new Uint8Array(32).buffer,
+      channel_id: 1n,
+    };
+
+    primitives.pairing.request.extract(new Uint8Array([9]), new Uint8Array(32), range);
+    const extract = find('extract_pair_request');
+    expect(extract.args).toHaveLength(3);
+    expect(Array.from(extract.args[2] as Uint8Array)).toEqual([0xaa]);
+    expect(
+      calls.some(
+        (c) => c.name === 'encode_message_json' && c.args[0] === MessageKind.ParameterRange,
+      ),
+    ).toBe(true);
+
+    primitives.pairing.response.process(
+      { channel_id: 1n, nonce: 2n, contact_mode: 0, supported_transports: [] } as never,
+      { nonce: 2n } as never,
+      new Uint8Array(32),
+      null,
+    );
+    const process = find('process_pair_response_message');
+    expect(process.args).toHaveLength(4);
+    expect((process.args[3] as Uint8Array).length).toBe(0);
   });
 
   it('selects the right message kind for each extract', () => {

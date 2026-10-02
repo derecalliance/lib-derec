@@ -4,11 +4,16 @@
 package protocol
 
 import (
+	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/derecpb"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // This file is the M3 payoff: two real DeRecProtocol instances (Owner +
@@ -76,12 +81,24 @@ type orchestratorPeer struct {
 	transport    *inProcessTransport
 	shareStore   *inMemoryShareStore
 	channelStore *inMemoryChannelStore
+	secretStore  *inMemorySecretStore
+
+	// rejectStoreShare, when set, makes this peer Reject every StoreShare
+	// action with that status instead of accepting it.
+	rejectStoreShare *derecpb.StatusEnum
 }
 
 // newOrchestratorPeer builds a peer with its own full set of in-memory
 // store doubles, an in-process transport, and a live DeRecProtocol
 // instance bound to them.
 func newOrchestratorPeer(t *testing.T, label, uri string, threshold uint32) *orchestratorPeer {
+	t.Helper()
+	return newOrchestratorPeerWith(t, label, uri, threshold, nil)
+}
+
+// newOrchestratorPeerWith is newOrchestratorPeer with configure applied to
+// the Config before the protocol is built.
+func newOrchestratorPeerWith(t *testing.T, label, uri string, threshold uint32, configure func(*Config)) *orchestratorPeer {
 	t.Helper()
 	channelStore := newInMemoryChannelStore()
 	shareStore := newInMemoryShareStore()
@@ -93,8 +110,11 @@ func newOrchestratorPeer(t *testing.T, label, uri string, threshold uint32) *orc
 	cfg := Config{
 		SecretID:          orchestratorSecretID,
 		OwnTransports:     []TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:         threshold,
-		KeepVersionsCount: 3,
+		Threshold:         proto.Uint32(threshold),
+		KeepVersionsCount: proto.Uint32(3),
+	}
+	if configure != nil {
+		configure(&cfg)
 	}
 	p, err := New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
 	if err != nil {
@@ -109,6 +129,7 @@ func newOrchestratorPeer(t *testing.T, label, uri string, threshold uint32) *orc
 		transport:    transport,
 		shareStore:   shareStore,
 		channelStore: channelStore,
+		secretStore:  secretStore,
 	}
 }
 
@@ -127,6 +148,12 @@ func deliverToOrchestratorPeer(t *testing.T, peer *orchestratorPeer, bytes []byt
 	}
 	for i := 0; i < len(collected); i++ {
 		if collected[i].Type != EventTypeActionRequired {
+			continue
+		}
+		if peer.rejectStoreShare != nil && collected[i].ActionKind == ActionKindStoreShare {
+			if err := peer.protocol.Reject(collected[i].Action, *peer.rejectStoreShare, "over quota"); err != nil {
+				t.Fatalf("[%s] Reject() failed: %v", peer.label, err)
+			}
 			continue
 		}
 		acceptEvents, err := peer.protocol.Accept(collected[i].Action)
@@ -230,7 +257,7 @@ func pairOrchestratorPeers(t *testing.T, owner, helper *orchestratorPeer, pairin
 	}
 
 	startEvents, err := helper.protocol.Start(FlowKindPairing, PairingParams{
-		Kind:                  int32(SenderKindHelper),
+		Kind:                  SenderKindHelper,
 		Contact:               contact.ContactBytes,
 		PeerCommunicationInfo: map[string]string{"name": "helper"},
 	})
@@ -245,10 +272,10 @@ func pairOrchestratorPeers(t *testing.T, owner, helper *orchestratorPeer, pairin
 		}
 		if ev.Type == EventTypePairingStarted {
 			sawPairingStarted = true
-			if ev.ChannelID != strconv.FormatUint(pairingChannelID, 10) {
-				t.Fatalf("PairingStarted.ChannelID = %s, want %d", ev.ChannelID, pairingChannelID)
+			if ev.ChannelID != pairingChannelID {
+				t.Fatalf("PairingStarted.ChannelID = %d, want %d", ev.ChannelID, pairingChannelID)
 			}
-			if ev.Kind != int32(SenderKindHelper) {
+			if ev.Kind != SenderKindHelper {
 				t.Fatalf("PairingStarted.Kind = %d, want %d (Helper)", ev.Kind, SenderKindHelper)
 			}
 		}
@@ -276,20 +303,13 @@ func pairOrchestratorPeers(t *testing.T, owner, helper *orchestratorPeer, pairin
 			len(completions), helperToOwner, ownerToHelper)
 	}
 
-	newChannelID, err := strconv.ParseUint(completions[0].ChannelID, 10, 64)
-	if err != nil {
-		t.Fatalf("PairingCompleted.ChannelID = %q: %v", completions[0].ChannelID, err)
-	}
+	newChannelID := completions[0].ChannelID
 	for _, ev := range completions {
-		if ev.PairingChannelID != strconv.FormatUint(pairingChannelID, 10) {
-			t.Fatalf("PairingCompleted.PairingChannelID = %s, want %d (the transient contact channel_id)",
+		if ev.PairingChannelID != pairingChannelID {
+			t.Fatalf("PairingCompleted.PairingChannelID = %d, want %d (the transient contact channel_id)",
 				ev.PairingChannelID, pairingChannelID)
 		}
-		cid, err := strconv.ParseUint(ev.ChannelID, 10, 64)
-		if err != nil {
-			t.Fatalf("PairingCompleted.ChannelID = %q: %v", ev.ChannelID, err)
-		}
-		if cid != newChannelID {
+		if cid := ev.ChannelID; cid != newChannelID {
 			t.Fatalf("both peers must rotate to the same long-term channel_id: got %d and %d", cid, newChannelID)
 		}
 	}
@@ -371,7 +391,7 @@ func TestOrchestrator_PairingAndProtectSecret_EndToEnd(t *testing.T) {
 		t.Fatalf("owner.Start(ProtectSecret) failed: %v", err)
 	}
 
-	protectStartedVersions := map[string]uint32{}
+	protectStartedVersions := map[uint64]uint32{}
 	for _, ev := range protectEvents {
 		if ev.Type == EventTypeProtectSecretFailed {
 			t.Fatalf("start(ProtectSecret) emitted ProtectSecretFailed: %+v", ev)
@@ -386,7 +406,7 @@ func TestOrchestrator_PairingAndProtectSecret_EndToEnd(t *testing.T) {
 
 	shareEvents := pumpOrchestratorPeersMany(t, []*orchestratorPeer{owner, helperA, helperB})
 
-	storedFor := map[string]bool{}
+	storedFor := map[uint64]bool{}
 	confirmedCount := 0
 	storeShareActions := 0
 	for _, ev := range shareEvents {
@@ -395,7 +415,7 @@ func TestOrchestrator_PairingAndProtectSecret_EndToEnd(t *testing.T) {
 			if ev.ShareSize == nil || *ev.ShareSize == 0 {
 				t.Fatalf("StoreShare ActionRequired must carry a positive ShareSize, got %+v", ev)
 			}
-			if ev.TraceID == "" {
+			if ev.TraceID == 0 {
 				t.Fatalf("StoreShare ActionRequired must carry a TraceID, got %+v", ev)
 			}
 		}
@@ -406,10 +426,10 @@ func TestOrchestrator_PairingAndProtectSecret_EndToEnd(t *testing.T) {
 			confirmedCount++
 		}
 	}
-	if !storedFor[strconv.FormatUint(channelA, 10)] {
+	if !storedFor[channelA] {
 		t.Fatalf("expected a ShareStored event for channel-a (%d), got %+v", channelA, shareEvents)
 	}
-	if !storedFor[strconv.FormatUint(channelB, 10)] {
+	if !storedFor[channelB] {
 		t.Fatalf("expected a ShareStored event for channel-b (%d), got %+v", channelB, shareEvents)
 	}
 	if storeShareActions != 2 {
@@ -440,12 +460,205 @@ func TestOrchestrator_PairingAndProtectSecret_EndToEnd(t *testing.T) {
 		if len(storedShares[0].Bytes) == 0 {
 			t.Fatalf("%s stored share has empty Bytes", check.label)
 		}
-		wantVersion, ok := protectStartedVersions[strconv.FormatUint(check.channelID, 10)]
+		wantVersion, ok := protectStartedVersions[check.channelID]
 		if !ok {
 			t.Fatalf("%s: no ProtectSecretStarted version recorded for channel %d", check.label, check.channelID)
 		}
 		if storedShares[0].Version != wantVersion {
 			t.Fatalf("%s stored share version = %d, want %d (from ProtectSecretStarted)", check.label, storedShares[0].Version, wantVersion)
 		}
+	}
+}
+
+// TestOrchestrator_RejectForwardsStatusEnum has one helper Reject its
+// StoreShare with a typed StatusEnum; the owner must observe exactly that
+// status on the ShareRejected event for that helper's channel.
+func TestOrchestrator_RejectForwardsStatusEnum(t *testing.T) {
+	const threshold = 2
+
+	owner := newOrchestratorPeer(t, "owner", "https://owner.example.com", threshold)
+	helperA := newOrchestratorPeer(t, "helper-a", "https://helper-a.example.com", threshold)
+	helperB := newOrchestratorPeer(t, "helper-b", "https://helper-b.example.com", threshold)
+
+	channelA := pairOrchestratorPeers(t, owner, helperA, 1)
+	pairOrchestratorPeers(t, owner, helperB, 2)
+
+	status := derecpb.StatusEnum_SIZE_LIMIT_EXCEEDED
+	helperA.rejectStoreShare = &status
+
+	if _, err := owner.protocol.Start(FlowKindProtectSecret, ProtectSecretParams{
+		Secrets: []UserSecret{{ID: []byte{1}, Name: "n", Data: []byte("v")}},
+	}); err != nil {
+		t.Fatalf("owner.Start(ProtectSecret): %v", err)
+	}
+	events := pumpOrchestratorPeersMany(t, []*orchestratorPeer{owner, helperA, helperB})
+
+	var rejected []Event
+	for _, ev := range events {
+		if ev.Type == EventTypeShareRejected {
+			rejected = append(rejected, ev)
+		}
+	}
+	if len(rejected) != 1 {
+		t.Fatalf("expected one ShareRejected, got %+v", events)
+	}
+	if rejected[0].ChannelID != channelA || rejected[0].Status != derecpb.StatusEnum_SIZE_LIMIT_EXCEEDED ||
+		rejected[0].Memo != "over quota" {
+		t.Fatalf("ShareRejected: got %+v", rejected[0])
+	}
+}
+
+// TestOrchestrator_ConfigCommunicationInfoReachesPairingPeer builds both
+// peers with Config.CommunicationInfo and pairs them: each side's
+// PairingCompleted carries the other side's map as PeerCommunicationInfo.
+func TestOrchestrator_ConfigCommunicationInfoReachesPairingPeer(t *testing.T) {
+	const threshold = 2
+
+	ownerInfo := map[string]string{"name": "owner", "email": "owner@example.com"}
+	helperInfo := map[string]string{"name": "helper-cfg"}
+	owner := newOrchestratorPeerWith(t, "owner", "https://owner.example.com", threshold, func(c *Config) {
+		c.CommunicationInfo = ownerInfo
+	})
+	helper := newOrchestratorPeerWith(t, "helper", "https://helper.example.com", threshold, func(c *Config) {
+		c.CommunicationInfo = helperInfo
+	})
+
+	const pairingChannelID = 1
+	contact, err := owner.protocol.CreateContact(proto.Uint64(pairingChannelID), ContactModeInlineKeys, nil)
+	if err != nil {
+		t.Fatalf("owner.CreateContact: %v", err)
+	}
+	if _, err := helper.protocol.Start(FlowKindPairing, PairingParams{
+		Kind:    SenderKindHelper,
+		Contact: contact.ContactBytes,
+	}); err != nil {
+		t.Fatalf("helper.Start(Pairing): %v", err)
+	}
+	events := append(pumpOrchestratorPeers(t, helper, owner), pumpOrchestratorPeers(t, owner, helper)...)
+
+	sameMap := func(a, b map[string]string) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for k, v := range b {
+			if a[k] != v {
+				return false
+			}
+		}
+		return true
+	}
+	var sawOwnerInfo, sawHelperInfo bool
+	for _, ev := range events {
+		if ev.Type != EventTypePairingCompleted {
+			continue
+		}
+		switch {
+		case sameMap(ev.PeerCommunicationInfo, ownerInfo):
+			sawOwnerInfo = true
+		case sameMap(ev.PeerCommunicationInfo, helperInfo):
+			sawHelperInfo = true
+		default:
+			t.Fatalf("unexpected PeerCommunicationInfo %+v", ev.PeerCommunicationInfo)
+		}
+	}
+	if !sawOwnerInfo || !sawHelperInfo {
+		t.Fatalf("expected each PairingCompleted to carry the other side's Config.CommunicationInfo; got %+v", events)
+	}
+}
+
+// TestOrchestrator_UpdateChannelInfoAnnouncesEndpointsByName drives a real
+// UpdateChannelInfo round: the endpoints the owner announces reach the
+// helper's ActionRequired with their protocol intact, decoded from the
+// protocol names the library emits.
+func TestOrchestrator_UpdateChannelInfoAnnouncesEndpointsByName(t *testing.T) {
+	owner := newOrchestratorPeer(t, "owner", "https://owner.example.com", 2)
+	helper := newOrchestratorPeer(t, "helper", "https://helper.example.com", 2)
+	channel := pairOrchestratorPeers(t, owner, helper, 1)
+
+	announced := []TransportProtocolParam{
+		{URI: "https://owner.new.example.com", Protocol: int32(derecpb.Protocol_HTTPS)},
+		{URI: "grpcs://owner.new.example.com", Protocol: int32(derecpb.Protocol_GRPC)},
+	}
+	if _, err := owner.protocol.Start(FlowKindUpdateChannelInfo, UpdateChannelInfoParams{
+		Target:        TargetOne(channel),
+		OwnTransports: announced,
+	}); err != nil {
+		t.Fatalf("owner.Start(UpdateChannelInfo): %v", err)
+	}
+	outbox := owner.transport.drain()
+	if len(outbox) != 1 {
+		t.Fatalf("expected one UpdateChannelInfo request, got %d", len(outbox))
+	}
+	events, err := helper.protocol.Process(outbox[0].message)
+	if err != nil {
+		t.Fatalf("helper.Process: %v", err)
+	}
+	var prompt *Event
+	for i := range events {
+		if events[i].Type == EventTypeActionRequired {
+			prompt = &events[i]
+		}
+	}
+	if prompt == nil || prompt.ActionKind != ActionKindUpdateChannelInfo {
+		t.Fatalf("expected ActionRequired(UpdateChannelInfo), got %+v", events)
+	}
+	want := []EndpointJSON{
+		{URI: announced[0].URI, Protocol: announced[0].Protocol},
+		{URI: announced[1].URI, Protocol: announced[1].Protocol},
+	}
+	if len(prompt.UpdatedTransports) != 2 || prompt.UpdatedTransports[0] != want[0] || prompt.UpdatedTransports[1] != want[1] {
+		t.Fatalf("UpdatedTransports: got %+v, want %+v", prompt.UpdatedTransports, want)
+	}
+	if _, err := helper.protocol.Accept(prompt.Action); err != nil {
+		t.Fatalf("helper.Accept: %v", err)
+	}
+}
+
+// TestOrchestrator_SecretStoreLoadManyServesTheWholeBroadcast checks that a
+// broadcast to several helpers reads every SharedKey through one
+// SecretStore.LoadMany call, and that a nil entry is judged by the
+// library's missing-entry policy: discovery needs a key for every target,
+// so it fails with CodeMissingSharedKey naming the channel without one.
+func TestOrchestrator_SecretStoreLoadManyServesTheWholeBroadcast(t *testing.T) {
+	const threshold = 2
+
+	owner := newOrchestratorPeer(t, "owner", "https://owner.example.com", threshold)
+	helperA := newOrchestratorPeer(t, "helper-a", "https://helper-a.example.com", threshold)
+	helperB := newOrchestratorPeer(t, "helper-b", "https://helper-b.example.com", threshold)
+
+	channelA := pairOrchestratorPeers(t, owner, helperA, 1)
+	channelB := pairOrchestratorPeers(t, owner, helperB, 2)
+
+	owner.secretStore.loadManyCalls = nil
+	if _, err := owner.protocol.Start(FlowKindDiscovery, DiscoveryParams{Target: TargetMany(channelA, channelB)}); err != nil {
+		t.Fatalf("Start(Discovery): %v", err)
+	}
+	calls := owner.secretStore.loadManyCalls
+	if len(calls) != 1 {
+		t.Fatalf("discovery broadcast must call LoadMany once, got %d calls: %v", len(calls), calls)
+	}
+	got := map[uint64]bool{}
+	for _, c := range calls[0] {
+		got[c] = true
+	}
+	if len(calls[0]) != 2 || !got[channelA] || !got[channelB] {
+		t.Fatalf("LoadMany must receive both helper channels [%d %d], got %v", channelA, channelB, calls[0])
+	}
+	owner.transport.drain()
+
+	if err := owner.secretStore.Remove(orchestratorSecretID, channelB, SecretKindSharedKey); err != nil {
+		t.Fatal(err)
+	}
+	owner.secretStore.loadManyCalls = nil
+	_, err := owner.protocol.Start(FlowKindDiscovery, DiscoveryParams{Target: TargetMany(channelA, channelB)})
+	var derecErr *derec.Error
+	if !errors.As(err, &derecErr) || derecErr.Code != derec.CodeMissingSharedKey {
+		t.Fatalf("a nil LoadMany entry must surface CodeMissingSharedKey, got %v", err)
+	}
+	if !strings.Contains(derecErr.Message, strconv.FormatUint(channelB, 10)) {
+		t.Fatalf("MissingSharedKey must name channel %d: %s", channelB, derecErr.Message)
+	}
+	if len(owner.secretStore.loadManyCalls) != 1 {
+		t.Fatalf("the failing broadcast must still be one LoadMany call, got %v", owner.secretStore.loadManyCalls)
 	}
 }

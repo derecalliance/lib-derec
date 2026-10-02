@@ -200,7 +200,7 @@ fn typescript_surfaces_declare_every_dto_field() {
     );
 }
 
-/// `withUnsafeConnection` and the `Grpc` transport discriminant have no
+/// `withUnsafeConnection` and the `grpc` transport protocol have no
 /// `dto::` struct behind them to destructure exhaustively: `unsafe_connection`
 /// lives on the private FFI `ProtocolConfig`
 /// (`library/src/interop/ffi/protocol/handle/mod.rs`), and the transport
@@ -231,12 +231,26 @@ fn typescript_surfaces_forward_unsafe_connection_and_grpc() {
             && rn.contains("this.config.unsafe_connection = allow;"),
         "{rn_path} does not forward unsafe_connection to the wire config"
     );
-    // Protocol names resolve in the core, never in a table of the binding's
-    // own: a table is how a defined protocol came to reach the transport as
-    // "unknown".
+    // Protocol names cross as given and resolve in the core, never in a table
+    // of the binding's own: a table is how a defined protocol came to reach
+    // the transport as "unknown".
+    let forwards_verbatim = "transports.map(({ uri, protocol }) => ({ uri, protocol }))";
     assert!(
-        rn.contains("transport_protocol_discriminant(") && !rn.contains("case 'grpc':"),
-        "{rn_path} must resolve protocol names through the core's \
-         transport_protocol_discriminant, not a local table"
+        rn.matches(forwards_verbatim).count() == 2
+            && !rn.contains("case 'grpc':")
+            && !rn.contains("grpc: 1"),
+        "{rn_path} must forward protocol names verbatim from withOwnTransports \
+         and setOwnTransports, not translate them through a local table"
     );
+    for path in [
+        format!("{root}/packages/nodejs/index.d.ts"),
+        format!("{root}/packages/web/index.d.ts"),
+        format!("{root}/packages/react-native/src/types.ts"),
+    ] {
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        assert!(
+            src.contains(r#"export type TransportProtocolName = "https" | "grpc";"#),
+            "{path} does not name both transport protocols"
+        );
+    }
 }

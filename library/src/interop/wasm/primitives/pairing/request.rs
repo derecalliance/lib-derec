@@ -6,7 +6,6 @@ use super::{
     TransportProtocol, deserialize_pairing_secret_key_material, get_sender_kind,
     serialize_pairing_secret_key_material,
 };
-use crate::extensions::contact_message::ContactMessageExt as _;
 use crate::{
     interop::wasm::{
         primitives::helpers::{from_js, to_js},
@@ -14,7 +13,6 @@ use crate::{
     },
     primitives::pairing::request,
 };
-use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -51,7 +49,7 @@ pub fn create_contact(
 ) -> Result<JsValue, JsValue> {
     let contact_mode = derec_proto::ContactMode::try_from(contact_mode as i32).map_err(|_| {
         js_error(
-            "INVALID_CONTACT_MODE",
+            "invalid_contact_mode",
             format!("invalid contact_mode value: {contact_mode}"),
         )
     })?;
@@ -63,13 +61,13 @@ pub fn create_contact(
     } else if nonce.is_bigint() {
         Some(
             u64::try_from(js_sys::BigInt::from(nonce))
-                .map_err(|e| js_error("INVALID_NONCE", format!("nonce out of u64 range: {e:?}")))?,
+                .map_err(|e| js_error("invalid_nonce", format!("nonce out of u64 range: {e:?}")))?,
         )
     } else {
         Some(
             nonce
                 .as_f64()
-                .ok_or_else(|| js_error("INVALID_NONCE", "nonce must be BigInt, number, or null"))?
+                .ok_or_else(|| js_error("invalid_nonce", "nonce must be BigInt, number, or null"))?
                 as u64,
         )
     };
@@ -92,36 +90,20 @@ pub fn create_contact(
     })
 }
 
-/// Structurally validate a JS-side [`ContactMessage`]. Throws on any
-/// mode/field inconsistency (unknown `contact_mode`, mode/field mismatch,
-/// wrong binding-hash length).
-#[wasm_bindgen(js_name = "pairing_contact_message_validate")]
-pub fn validate_contact_message(contact_message: JsValue) -> Result<(), JsValue> {
-    let cm: ContactMessage = from_js(contact_message)?;
-    let cm_proto: derec_proto::ContactMessage = cm.into();
-    cm_proto.validate().map_err(js_error_from_lib)
-}
-
-/// Encodes a [`ContactMessage`] to proto wire bytes. Structurally validates
-/// the input first so a locally-constructed contact that violates the
-/// mode/field invariant is rejected at the boundary rather than silently
-/// serialized.
+/// Encodes a [`ContactMessage`] to proto wire bytes. See
+/// [`crate::primitives::pairing::request::encode_contact`].
 #[wasm_bindgen(js_name = "pairing_request_encode_contact")]
 pub fn encode_contact(contact_message: JsValue) -> Result<Vec<u8>, JsValue> {
     let cm: ContactMessage = from_js(contact_message)?;
     let cm_proto: derec_proto::ContactMessage = cm.into();
-    cm_proto.validate().map_err(js_error_from_lib)?;
-    Ok(cm_proto.encode_to_vec())
+    request::encode_contact(&cm_proto).map_err(js_error_from_lib)
 }
 
-/// Decodes a proto-encoded [`ContactMessage`]. Structurally validates the
-/// decoded value before returning it to application code so consumers can
-/// trust the mode/field invariants documented on the wire format.
+/// Decodes proto `ContactMessage` wire bytes. See
+/// [`crate::primitives::pairing::request::decode_contact`].
 #[wasm_bindgen(js_name = "pairing_request_decode_contact")]
 pub fn decode_contact(bytes: &[u8]) -> Result<JsValue, JsValue> {
-    let cm = derec_proto::ContactMessage::decode(bytes)
-        .map_err(|e| js_error("PROTOBUF_DECODE_ERROR", e.to_string()))?;
-    cm.validate().map_err(js_error_from_lib)?;
+    let cm = request::decode_contact(bytes).map_err(js_error_from_lib)?;
     let cm_js: ContactMessage = cm.into();
     to_js(&cm_js)
 }
@@ -148,13 +130,7 @@ pub fn produce(
         };
     let communication_info_proto: Option<derec_proto::CommunicationInfo> =
         communication_info.map(Into::into);
-    let parameter_range_proto: Option<derec_proto::ParameterRange> =
-        if parameter_range.is_null() || parameter_range.is_undefined() {
-            None
-        } else {
-            let pr: super::ParameterRange = from_js(parameter_range)?;
-            Some(pr.into())
-        };
+    let parameter_range_proto = super::optional_parameter_range(parameter_range)?;
 
     let result = request::produce(
         sender_kind,
@@ -173,10 +149,19 @@ pub fn produce(
 }
 
 #[wasm_bindgen(js_name = "pairing_request_extract")]
-pub fn extract(envelope_bytes: &[u8], secret_key: &[u8]) -> Result<JsValue, JsValue> {
+pub fn extract(
+    envelope_bytes: &[u8],
+    secret_key: &[u8],
+    parameter_range: JsValue,
+) -> Result<JsValue, JsValue> {
     let pairing_sk = deserialize_pairing_secret_key_material(secret_key)?;
-    let result = request::extract(envelope_bytes, pairing_sk.ecies_secret_key())
-        .map_err(js_error_from_lib)?;
+    let parameter_range = super::optional_parameter_range(parameter_range)?;
+    let result = request::extract(
+        envelope_bytes,
+        pairing_sk.ecies_secret_key(),
+        parameter_range.as_ref(),
+    )
+    .map_err(js_error_from_lib)?;
     to_js(&ExtractResult {
         request: result.request.into(),
     })

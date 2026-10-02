@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-//! The transport protocol names every binding exposes to its host.
+//! The enum names every binding exposes to its host.
 
 /// Maps a transport protocol *name* to its wire discriminant.
 ///
@@ -34,9 +34,86 @@ pub(crate) fn protocol_discriminant_to_name(discriminant: i32) -> Option<&'stati
     }
 }
 
+/// Reads a transport `protocol` field written either as its name
+/// (`"https"`, `"grpc"`) or as its wire discriminant. Names are what every
+/// app-facing surface uses; the discriminant stays accepted so a binding's
+/// own marshalling of a typed enum needs no name lookup. A discriminant is
+/// passed through unchanged and validated where the endpoint is built.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn protocol_from_name_or_discriminant<'de, D>(de: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum NameOrDiscriminant {
+        Discriminant(i32),
+        Name(String),
+    }
+    match <NameOrDiscriminant as serde::Deserialize>::deserialize(de)? {
+        NameOrDiscriminant::Discriminant(d) => Ok(d),
+        NameOrDiscriminant::Name(name) => protocol_name_to_discriminant(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!("unknown transport protocol {name:?}"))
+        }),
+    }
+}
+
+/// Reads a transport `protocol` field written as its name only.
+pub(crate) fn protocol_from_name<'de, D>(de: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name = <String as serde::Deserialize>::deserialize(de)?;
+    protocol_name_to_discriminant(&name)
+        .ok_or_else(|| serde::de::Error::custom(format!("unknown transport protocol {name:?}")))
+}
+
+/// Maps an unpair-ack *name* to its [`crate::protocol::UnpairAck`] variant.
+///
+/// Accepts exactly `"required"` and `"not_required"`, the names every binding
+/// exposes, so the host passes the name through and the library decides
+/// whether it is valid.
+pub(crate) fn unpair_ack_from_name(name: &str) -> Option<crate::protocol::UnpairAck> {
+    match name {
+        "required" => Some(crate::protocol::UnpairAck::Required),
+        "not_required" => Some(crate::protocol::UnpairAck::NotRequired),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct Either {
+        #[serde(deserialize_with = "protocol_from_name_or_discriminant")]
+        protocol: i32,
+    }
+
+    #[test]
+    fn a_binding_input_takes_the_name_or_the_discriminant() {
+        let read = |json: &str| serde_json::from_str::<Either>(json).map(|e| e.protocol);
+        assert_eq!(read(r#"{"protocol":"https"}"#).unwrap(), 0);
+        assert_eq!(read(r#"{"protocol":"grpc"}"#).unwrap(), 1);
+        assert_eq!(read(r#"{"protocol":1}"#).unwrap(), 1);
+        assert!(read(r#"{"protocol":"ftp"}"#).is_err());
+    }
+
+    #[test]
+    fn unpair_ack_names_are_exact() {
+        assert_eq!(
+            unpair_ack_from_name("required"),
+            Some(crate::protocol::UnpairAck::Required)
+        );
+        assert_eq!(
+            unpair_ack_from_name("not_required"),
+            Some(crate::protocol::UnpairAck::NotRequired)
+        );
+        for alias in ["Required", "notrequired", "fire_and_forget", ""] {
+            assert_eq!(unpair_ack_from_name(alias), None, "{alias:?}");
+        }
+    }
 
     #[test]
     fn every_protocol_round_trips_through_its_name() {

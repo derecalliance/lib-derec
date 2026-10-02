@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 using Google.Protobuf;
@@ -140,6 +143,43 @@ public sealed record TransportProtocol(
         new(proto.Uri, (Protocol)(int)proto.Protocol);
 
     /// <summary>
+    /// The library's name for <paramref name="protocol"/> (<c>"https"</c>,
+    /// <c>"grpc"</c>): the form an endpoint's protocol takes in event and
+    /// restore JSON.
+    /// </summary>
+    internal static string ProtocolName(Protocol protocol) =>
+        Marshal.PtrToStringUTF8(Native.Utils.derec_transport_protocol_name((int)protocol))
+            ?? throw new JsonException($"no transport protocol with discriminant {(int)protocol}");
+
+    /// <summary>
+    /// The <see cref="Protocol"/> the library defines for
+    /// <paramref name="name"/>; a name it does not define is a
+    /// <see cref="JsonException"/>.
+    /// </summary>
+    internal static Protocol ProtocolFromName(string? name)
+    {
+        byte[] bytes = Encoding.UTF8.GetBytes(name ?? string.Empty);
+        int discriminant = Native.Utils.derec_transport_protocol_discriminant(bytes, (UIntPtr)bytes.Length);
+        return discriminant >= 0
+            ? (Protocol)discriminant
+            : throw new JsonException($"unknown transport protocol \"{name}\"");
+    }
+
+    /// <summary>
+    /// Read one endpoint of event or restore JSON:
+    /// <c>{ "uri": ..., "protocol": "&lt;name&gt;" }</c>.
+    /// </summary>
+    internal static TransportProtocol FromWireEndpoint(JsonElement endpoint)
+    {
+        var protocol = endpoint.GetProperty("protocol");
+        return new TransportProtocol(
+            endpoint.GetProperty("uri").GetString()!,
+            protocol.ValueKind == JsonValueKind.String
+                ? ProtocolFromName(protocol.GetString())
+                : throw new JsonException($"transport protocol must be a name, got {protocol.GetRawText()}"));
+    }
+
+    /// <summary>
     /// Convert a request's <c>replyToTransports</c> into the endpoints the
     /// requester asked to be answered on, in its own order.
     /// </summary>
@@ -150,4 +190,33 @@ public sealed record TransportProtocol(
     internal static IReadOnlyList<TransportProtocol> ResolveReplyTo(
         IEnumerable<Org.Derecalliance.Derec.Protobuf.TransportProtocol> list) =>
         list.Select(FromProtoValue).ToList();
+}
+
+/// <summary>
+/// JSON form of an endpoint list in event and restore payloads: each entry is
+/// <c>{ "uri": ..., "protocol": "&lt;name&gt;" }</c>, the protocol carried by
+/// the name the library defines for it.
+/// </summary>
+internal sealed class TransportEndpointListJsonConverter : JsonConverter<IReadOnlyList<TransportProtocol>>
+{
+    public override IReadOnlyList<TransportProtocol> Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        using var doc = JsonDocument.ParseValue(ref reader);
+        if (doc.RootElement.ValueKind != JsonValueKind.Array)
+            throw new JsonException($"expected an endpoint array, got {doc.RootElement.ValueKind}");
+        return doc.RootElement.EnumerateArray().Select(TransportProtocol.FromWireEndpoint).ToList();
+    }
+
+    public override void Write(Utf8JsonWriter writer, IReadOnlyList<TransportProtocol> value, JsonSerializerOptions options)
+    {
+        writer.WriteStartArray();
+        foreach (var endpoint in value)
+        {
+            writer.WriteStartObject();
+            writer.WriteString("uri", endpoint.Uri);
+            writer.WriteString("protocol", TransportProtocol.ProtocolName(endpoint.Protocol));
+            writer.WriteEndObject();
+        }
+        writer.WriteEndArray();
+    }
 }

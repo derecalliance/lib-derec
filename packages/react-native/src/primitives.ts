@@ -95,22 +95,17 @@ function replyTo(value: TransportProtocol[] | undefined): Uint8Array {
 }
 
 /**
- * `ContactMessage` keeps its own dedicated codec rather than going through
- * the generic message codec: `encode_contact_message` /
- * `decode_contact_message` also enforce the mode/field invariant — an
- * `InlineKeys` contact must carry keys, a `HashedKeys` one must carry only
- * the commitment — so a malformed contact is rejected here rather than
- * travelling.
+ * Every contact crossing the native seam goes through the core's contact
+ * codec, which also refuses a contact that violates the invariants of its
+ * contact mode. Delegates to `pairing.request.encode_contact` /
+ * `decode_contact`, defined below.
  */
 function encodeContact(contact_message: ContactMessage): Uint8Array {
-  return bytes(
-    call('encode_contact_message', jsonToBytes(plainMessage(contact_message))),
-  );
+  return pairing.request.encode_contact(contact_message);
 }
 
 function decodeContact(wire: Uint8Array | ArrayBuffer): ContactMessage {
-  const json = call('decode_contact_message', wire) as ArrayBuffer;
-  return reviveMessage(jsonFromBytes(json)) as ContactMessage;
+  return pairing.request.decode_contact(wire);
 }
 
 const discovery = {
@@ -273,13 +268,22 @@ const pairing = {
       };
     },
 
-    /** Proto-encodes a `ContactMessage`. Rejects a contact that violates the
-     *  mode/field invariant rather than serializing it. */
-    encode_contact: encodeContact,
+    /** Serializes a `ContactMessage` to the bytes delivered out of band.
+     *  Refuses a contact that violates the invariants of its contact mode or
+     *  advertises no endpoint. */
+    encode_contact(contact_message: ContactMessage): Uint8Array {
+      return bytes(
+        call('encode_contact_message', jsonToBytes(plainMessage(contact_message))),
+      );
+    },
 
-    /** Decodes proto `ContactMessage` bytes. Rejects a contact that violates
-     *  the mode/field invariant rather than returning it. */
-    decode_contact: decodeContact,
+    /** Parses out-of-band contact bytes back into a `ContactMessage`.
+     *  Refuses bytes that are not a contact, or a contact that violates the
+     *  invariants of its contact mode. */
+    decode_contact(bytes: Uint8Array | ArrayBuffer): ContactMessage {
+      const json = call('decode_contact_message', bytes) as ArrayBuffer;
+      return reviveMessage(jsonFromBytes(json)) as ContactMessage;
+    },
 
     produce(
       kind: SenderKind,
@@ -309,8 +313,17 @@ const pairing = {
       };
     },
 
-    extract(envelope_bytes: Uint8Array, secret_key: Uint8Array): { request: PairRequestMessage } {
-      const result = call('extract_pair_request', envelope_bytes, secret_key) as {
+    extract(
+      envelope_bytes: Uint8Array,
+      secret_key: Uint8Array,
+      parameter_range: ParameterRange | null,
+    ): { request: PairRequestMessage } {
+      const result = call(
+        'extract_pair_request',
+        envelope_bytes,
+        secret_key,
+        encodeOptionalMessage(MessageKind.ParameterRange, parameter_range),
+      ) as {
         request_proto_bytes: ArrayBuffer;
       };
       return {
@@ -396,12 +409,14 @@ const pairing = {
       contact_message: ContactMessage,
       response: PairResponseMessage,
       secret_key: Uint8Array,
+      parameter_range: ParameterRange | null,
     ): PairingProcessResult {
       const result = call(
         'process_pair_response_message',
         encodeContact(contact_message),
         encodeMessage(MessageKind.PairResponse, response),
         secret_key,
+        encodeOptionalMessage(MessageKind.ParameterRange, parameter_range),
       ) as { shared_key: ArrayBuffer; channel_id: bigint };
       return { shared_key: bytes(result.shared_key), channel_id: result.channel_id };
     },

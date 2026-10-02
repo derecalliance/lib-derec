@@ -803,7 +803,7 @@ mod replica_id_conflict_tests {
 
             let request::ExtractResult {
                 request: mut pair_request,
-            } = request::extract(&request_envelope, initiator_secret.ecies_secret_key())
+            } = request::extract(&request_envelope, initiator_secret.ecies_secret_key(), None)
                 .expect("extract");
 
             pair_request.supported_transports = vec![

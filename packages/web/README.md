@@ -72,7 +72,7 @@ These represent **opaque wire-level protocol messages**.
 ## Initialization
 
 ```ts
-import init from "@derec-alliance/web";
+import { init } from "@derec-alliance/web";
 
 await init();
 ```
@@ -82,7 +82,7 @@ await init();
 ## Quick Example
 
 ```ts
-import init, { primitives } from "@derec-alliance/web";
+import { init, primitives } from "@derec-alliance/web";
 
 async function main() {
   await init();
@@ -122,7 +122,7 @@ the long-running channel to its pairing-time id.
 ### `InlineKeys` flow
 
 ```ts
-import init, { ContactMode, primitives, SenderKind } from "@derec-alliance/web";
+import { init, ContactMode, primitives, SenderKind } from "@derec-alliance/web";
 
 async function main() {
   await init();
@@ -146,7 +146,7 @@ async function main() {
 
   // Step 3: Initiator extracts the request and produces the response.
   const { request: pairRequest } =
-    primitives.pairing.request.extract(request.envelope, contact.secret_key);
+    primitives.pairing.request.extract(request.envelope, contact.secret_key, null);
   const produced = primitives.pairing.response.produce(
     channelId,
     pairRequest,
@@ -161,6 +161,7 @@ async function main() {
     request.initiator_contact_message,
     pairResponse,
     request.secret_key,
+    null,
   );
 
   // Both sides hold the same shared key and rekeyed channel id.
@@ -188,7 +189,8 @@ against `contact.contact_binding_hash`, and then runs the normal pairing
 flow on a synthesized contact with the keys filled in.
 
 ```ts
-import init, {
+import {
+  init,
   ContactMode,
   primitives,
   SenderKind,
@@ -282,7 +284,7 @@ SDK. See [End-to-end test coverage](https://github.com/derecalliance/lib-derec#e
 ## Share Distribution (Sharing Flow)
 
 ```ts
-import init, { primitives } from "@derec-alliance/web";
+import { init, primitives } from "@derec-alliance/web";
 
 async function main() {
   await init();
@@ -319,7 +321,7 @@ main();
 ## Recovery Flow
 
 ```ts
-import init, { primitives } from "@derec-alliance/web";
+import { init, primitives } from "@derec-alliance/web";
 
 async function main() {
   await init();
@@ -366,6 +368,9 @@ to `protocol.restore(secret, version)` on a fresh `DeRecProtocol` instance to
 commit canonical helper / replica state and wipe the throwaway recovery-mode
 channels — at that point the device resumes normal operation as if the secret
 had been protected here originally.
+A helper or member with no endpoint in the recovered roster gets no channel;
+`restore` returns a `PeerNotRestored` event for it (`reason: "NoTransports"`)
+and restores the rest.
 
 ```ts
 const events = await protocol.process(responseBytes);
@@ -376,8 +381,10 @@ for (const ev of events) {
 }
 ```
 
-Errors surface as objects with a `code` field — `ALREADY_RESTORED`,
-`CONFLICT` (with `channel_ids`), `INVARIANT`, or `STORAGE`.
+Errors surface as a `DeRecError` with a `category` and `code` —
+`already_restored`, `restore_conflict` (with `channel_ids`), `invariant`,
+`invalid_recovered_secret` (a malformed `secret`), or `store_error` (a store call failed; `category`
+names the store).
 
 > **Secret format:** the recoverable secret (the bytes helpers store and
 > recovery reconstructs) is `[version byte] · payload` — v1's payload is
@@ -391,7 +398,7 @@ Errors surface as objects with a `code` field — `ALREADY_RESTORED`,
 ## Verification Flow
 
 ```ts
-import init, { primitives } from "@derec-alliance/web";
+import { init, primitives } from "@derec-alliance/web";
 
 async function main() {
   await init();
@@ -435,7 +442,7 @@ Compatible with:
 - Parcel
 
 ```ts
-import init from "@derec-alliance/web";
+import { init } from "@derec-alliance/web";
 
 await init();
 ```
@@ -446,7 +453,7 @@ await init();
 
 ```html
 <script type="module">
-  import init from "https://cdn.jsdelivr.net/npm/@derec-alliance/web/+esm";
+  import { init } from "https://cdn.jsdelivr.net/npm/@derec-alliance/web/+esm";
 
   await init();
 </script>

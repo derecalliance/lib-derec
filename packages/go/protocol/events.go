@@ -5,7 +5,10 @@ package protocol
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
 
+	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 	"github.com/derecalliance/lib-derec/packages/go/internal/native"
 )
 
@@ -44,6 +47,7 @@ const (
 	EventTypeAutoAccepted              = "AutoAccepted"
 	EventTypeNoOp                      = "NoOp"
 	EventTypeMessageIgnored            = "MessageIgnored"
+	EventTypePeerNotRestored           = "PeerNotRestored"
 	EventTypePairingStarted            = "PairingStarted"
 	EventTypeDiscoveryStarted          = "DiscoveryStarted"
 	EventTypeDiscoveryFailed           = "DiscoveryFailed"
@@ -71,10 +75,11 @@ const (
 // their Go zero value (or nil, for pointer/slice/map fields) because the
 // Rust encoder omits them from the JSON entirely.
 //
-// u64 identifiers (ChannelID, PairingChannelID, PeerReplicaID,
-// FromReplicaID, SecretID) stay decimal strings, a literal mirror of the
-// wire shape — see the field-name-conventions doc comment atop wire.rs.
-// Parse with strconv.ParseUint(id, 10, 64) if a numeric value is needed.
+// u64 identifiers (TraceID, ChannelID, PairingChannelID, PeerReplicaID,
+// FromReplicaID, SecretID, the *ReplicaID fields, Synced, Behind,
+// FetchedFrom, ShareSecretID) are uint64. The wire carries them as decimal
+// strings so JavaScript keeps full precision; decoding parses them back to
+// the exact u64 value.
 //
 // Fields that are `Option<T>` on the Rust side (and therefore genuinely
 // absent — not just zero — on some variants) are Go pointers: Version,
@@ -94,23 +99,23 @@ type Event struct {
 	// across all of its targets, and the peer echoes it on the response.
 	//
 	// ActionRequired, MessageIgnored: the correlation token of the inbound
-	// request, decimal-encoded. Always present on ActionRequired.
-	TraceID string `json:"trace_id"`
+	// request. Always present on ActionRequired.
+	TraceID uint64 `json:"trace_id,string"`
 
 	// PairingCompleted, PairingStarted, ShareStored (with Version), and
 	// most other channel-scoped events.
-	ChannelID             string            `json:"channel_id"`
-	PairingChannelID      string            `json:"pairing_channel_id"`
-	Kind                  int32             `json:"kind"`
+	ChannelID             uint64            `json:"channel_id,string"`
+	PairingChannelID      uint64            `json:"pairing_channel_id,string"`
+	Kind                  SenderKind        `json:"-"`
 	PeerCommunicationInfo map[string]string `json:"peer_communication_info"`
 
 	// ReplicaPaired, ReplicaSecretReceived, ReplicaSecretInstalled,
 	// ReplicaVersionConflict, ReplicaSecretAcked. FromReplicaID is the member
 	// the copy came from: the publisher on a push, the responder on a
 	// catch-up.
-	PeerReplicaID string         `json:"peer_replica_id"`
-	FromReplicaID string         `json:"from_replica_id"`
-	SecretID      string         `json:"secret_id"`
+	PeerReplicaID uint64         `json:"peer_replica_id,string"`
+	FromReplicaID uint64         `json:"from_replica_id,string"`
+	SecretID      uint64         `json:"secret_id,string"`
 	Version       *uint32        `json:"version"`
 	Secret        *Secret        `json:"secret"`
 	Shares        []ChannelShare `json:"shares"`
@@ -118,25 +123,30 @@ type Event struct {
 	// ReplicaSecretReceived, ReplicaSecretInstalled — the member that
 	// published Version; nil when the serving member's snapshot records no
 	// author.
-	AuthorReplicaID *string `json:"author_replica_id"`
+	AuthorReplicaID *uint64 `json:"author_replica_id,string"`
 
 	// ReplicaVersionConflict — a member offered a different copy of the
 	// version this device holds. HeldAuthorReplicaID is the publisher of the
 	// local copy, IncomingAuthorReplicaID the publisher of the offered one
 	// (carried in Secret); either is nil when its copy records no author.
-	HeldAuthorReplicaID     *string `json:"held_author_replica_id"`
-	IncomingAuthorReplicaID *string `json:"incoming_author_replica_id"`
+	HeldAuthorReplicaID     *uint64 `json:"held_author_replica_id,string"`
+	IncomingAuthorReplicaID *uint64 `json:"incoming_author_replica_id,string"`
 
-	// ReplicaSecretAcked, ShareRejected, UnpairRejected, PrePairRejected,
-	// ChannelInfoUpdateRejected.
-	Status int32  `json:"status"`
-	Memo   string `json:"memo"`
+	// ReplicaSecretAcked, ReplicaSyncRejected, ShareRejected, UnpairRejected,
+	// PrePairRejected, ChannelInfoUpdateRejected. Status is the protocol
+	// StatusEnum the peer answered with.
+	Status derecpb.StatusEnum `json:"status"`
+	Memo   string             `json:"memo"`
 
 	// ReplicaSyncRejected, ReplicaSyncFailed, ReplicaRemoved,
 	// ReplicaSourceChanged — the member the event is about. The sync events
 	// are keyed by replicaID, not channelID, because every member answers on
 	// the one group channel.
-	ReplicaID *string `json:"replica_id"`
+	//
+	// PeerNotRestored — the replica group member Restore wrote no record for
+	// (ChannelID is then the group's channel); nil when the entry is a helper,
+	// whose channel ChannelID names.
+	ReplicaID *uint64 `json:"replica_id,string"`
 
 	// ReplicaSyncFailed — the transport or encoding failure, rendered for
 	// display. Distinct from Error, which the flow-level *Failed events use.
@@ -148,13 +158,19 @@ type Event struct {
 	// it, so a replica destination calls Start(FlowKindReplicaDiscovery)
 	// after VerifyFingerprint succeeds to pull the copy itself. TraceID and
 	// ChannelID are set too.
+	//
+	// PeerNotRestored — why Restore wrote no channel for a roster entry, one
+	// of the NotRestoredReason* constants. Every other entry and the
+	// user-secret snapshot were restored. The peer itself is untouched — a
+	// helper still holds its share — and pairing with it again makes it
+	// reachable.
 	Reason string `json:"reason"`
 
 	// ReplicaSyncComplete. Synced acknowledged; Behind refused, timed out, or
 	// were unreachable. Behind is the application's retry list — the library
 	// keeps no durable per-member sync state.
-	Synced []string `json:"synced"`
-	Behind []string `json:"behind"`
+	Synced []uint64 `json:"synced"`
+	Behind []uint64 `json:"behind"`
 
 	// ReplicaDiscoveryComplete. LocalVersion is what this device held when the
 	// catch-up ran, GroupVersion the newest any member reported, and
@@ -162,7 +178,7 @@ type Event struct {
 	// device was already current, in which case no hydration event follows.
 	LocalVersion *uint32 `json:"local_version"`
 	GroupVersion *uint32 `json:"group_version"`
-	FetchedFrom  *string `json:"fetched_from"`
+	FetchedFrom  *uint64 `json:"fetched_from,string"`
 
 	// SharingComplete. These counts describe helpers only.
 	//
@@ -208,9 +224,9 @@ type Event struct {
 	//     moving to; nil when the update leaves its endpoints unchanged.
 	Action                   []byte            `json:"action"`
 	ActionKind               string            `json:"action_kind"`
-	SenderKind               *int32            `json:"sender_kind"`
+	SenderKind               *SenderKind       `json:"-"`
 	ShareDescription         *string           `json:"share_description"`
-	ShareSecretID            *string           `json:"share_secret_id"`
+	ShareSecretID            *uint64           `json:"share_secret_id,string"`
 	ShareSize                *uint64           `json:"share_size"`
 	UnpairMemo               *string           `json:"unpair_memo"`
 	UpdatedCommunicationInfo map[string]string `json:"updated_communication_info"`
@@ -237,6 +253,14 @@ const (
 const (
 	IgnoreReasonPendingVerification = "PendingVerification"
 	IgnoreReasonExpired             = "Expired"
+)
+
+// The label vocabulary for Event.Reason on a PeerNotRestored event. Matches
+// the Rust NotRestoredReason discriminants one-for-one.
+const (
+	// NotRestoredReasonNoTransports: the recovered roster names no endpoint
+	// for the peer.
+	NotRestoredReasonNoTransports = "NoTransports"
 )
 
 // Secret mirrors SecretWire in wire.rs — the typed secret snapshot carried
@@ -290,7 +314,7 @@ func (s Secret) MarshalJSON() ([]byte, error) {
 // by Role, so a reader can identify where the secret originated without a
 // separate field.
 type Replicas struct {
-	ChannelID string    `json:"channel_id"`
+	ChannelID uint64    `json:"channel_id,string"`
 	Members   []Replica `json:"members"`
 	SharedKey []byte    `json:"shared_key"`
 }
@@ -307,7 +331,7 @@ func (r Replicas) MarshalJSON() ([]byte, error) {
 		members = []Replica{}
 	}
 	return json.Marshal(struct {
-		ChannelID string               `json:"channel_id"`
+		ChannelID uint64               `json:"channel_id,string"`
 		Members   []Replica            `json:"members"`
 		SharedKey native.JSONByteArray `json:"shared_key"`
 	}{
@@ -317,18 +341,49 @@ func (r Replicas) MarshalJSON() ([]byte, error) {
 	})
 }
 
-// Helper mirrors the Helper wire DTO in wire.rs — one entry of Secret's
-// helper roster.
 // EndpointJSON is one advertised address — in the recovered-secret roster
 // and in ActionRequired.UpdatedTransports: URI plus the protocol
-// discriminant, so nothing is inferred from a scheme.
+// discriminant, so nothing is inferred from a scheme. On the wire the
+// protocol travels as its name ("https", "grpc"); the name/discriminant
+// mapping is the library's.
 type EndpointJSON struct {
 	URI      string `json:"uri"`
 	Protocol int32  `json:"protocol"`
 }
 
+type endpointWire struct {
+	URI      string `json:"uri"`
+	Protocol string `json:"protocol"`
+}
+
+// MarshalJSON implements json.Marshaler, writing Protocol as its name.
+func (e EndpointJSON) MarshalJSON() ([]byte, error) {
+	name, ok := native.TransportProtocolName(e.Protocol)
+	if !ok {
+		return nil, fmt.Errorf("protocol: no transport protocol with discriminant %d", e.Protocol)
+	}
+	return json.Marshal(endpointWire{URI: e.URI, Protocol: name})
+}
+
+// UnmarshalJSON implements json.Unmarshaler, reading Protocol from its name.
+// A name the library does not define is an error.
+func (e *EndpointJSON) UnmarshalJSON(data []byte) error {
+	var w endpointWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	d, ok := native.TransportProtocolDiscriminant(w.Protocol)
+	if !ok {
+		return fmt.Errorf("protocol: unknown transport protocol %q", w.Protocol)
+	}
+	*e = EndpointJSON{URI: w.URI, Protocol: d}
+	return nil
+}
+
+// Helper mirrors the Helper wire DTO in wire.rs — one entry of Secret's
+// helper roster.
 type Helper struct {
-	ChannelID         string            `json:"channel_id"`
+	ChannelID         uint64            `json:"channel_id,string"`
 	Transports        []EndpointJSON    `json:"transports"`
 	SharedKey         []byte            `json:"shared_key"`
 	CommunicationInfo map[string]string `json:"communication_info"`
@@ -341,7 +396,7 @@ type Helper struct {
 // "Option::is_none")]` on communication_info.
 func (h Helper) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		ChannelID         string               `json:"channel_id"`
+		ChannelID         uint64               `json:"channel_id,string"`
 		Transports        []EndpointJSON       `json:"transports"`
 		SharedKey         native.JSONByteArray `json:"shared_key"`
 		CommunicationInfo map[string]string    `json:"communication_info,omitempty"`
@@ -354,12 +409,11 @@ func (h Helper) MarshalJSON() ([]byte, error) {
 }
 
 // Replica mirrors the Replica wire DTO in wire.rs — one member of Secret's
-// replica group. Role is "Source" or "Destination"; exactly one member of a
-// group carries "Source".
+// replica group. Exactly one member of a group has Role ReplicaRoleSource.
 type Replica struct {
-	ReplicaID         string            `json:"replica_id"`
+	ReplicaID         uint64            `json:"replica_id,string"`
 	Transports        []EndpointJSON    `json:"transports"`
-	Role              string            `json:"role"`
+	Role              ReplicaRole       `json:"role"`
 	CommunicationInfo map[string]string `json:"communication_info"`
 }
 
@@ -370,9 +424,9 @@ type Replica struct {
 // for the omitempty behavior, not a number-array encoding.
 func (r Replica) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		ReplicaID         string            `json:"replica_id"`
+		ReplicaID         uint64            `json:"replica_id,string"`
 		Transports        []EndpointJSON    `json:"transports"`
-		Role              string            `json:"role"`
+		Role              ReplicaRole       `json:"role"`
 		CommunicationInfo map[string]string `json:"communication_info,omitempty"`
 	}{
 		ReplicaID:         r.ReplicaID,
@@ -387,7 +441,7 @@ func (r Replica) MarshalJSON() ([]byte, error) {
 // mirrors a different Rust type) — one helper's committed share bytes, as
 // carried by ReplicaSecretReceived.
 type ChannelShare struct {
-	ChannelID      string `json:"channel_id"`
+	ChannelID      uint64 `json:"channel_id,string"`
 	CommittedShare []byte `json:"committed_share"`
 }
 
@@ -395,7 +449,7 @@ type ChannelShare struct {
 // secret_id's stored versions, as reported by a Helper in response to a
 // Discovery flow.
 type DiscoveredSecret struct {
-	SecretID string              `json:"secret_id"`
+	SecretID uint64              `json:"secret_id,string"`
 	Versions []DiscoveredVersion `json:"versions"`
 }
 
@@ -403,6 +457,60 @@ type DiscoveredSecret struct {
 type DiscoveredVersion struct {
 	Version     uint32 `json:"version"`
 	Description string `json:"description"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler. Every field decodes through
+// its json tag except Synced and Behind, which the wire carries as arrays of
+// decimal strings the `,string` option cannot express for a slice, and Kind
+// and SenderKind, which the wire carries as the derec_proto::SenderKind
+// numeric value.
+func (e *Event) UnmarshalJSON(data []byte) error {
+	type plain Event
+	aux := struct {
+		*plain
+		Synced     []decimalU64 `json:"synced"`
+		Behind     []decimalU64 `json:"behind"`
+		Kind       int32        `json:"kind"`
+		SenderKind *int32       `json:"sender_kind"`
+	}{plain: (*plain)(e)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	e.Synced = decimalU64s(aux.Synced)
+	e.Behind = decimalU64s(aux.Behind)
+	e.Kind = SenderKind(aux.Kind)
+	if aux.SenderKind != nil {
+		sk := SenderKind(*aux.SenderKind)
+		e.SenderKind = &sk
+	}
+	return nil
+}
+
+// decimalU64 is a u64 carried on the wire as a decimal string.
+type decimalU64 uint64
+
+func (d *decimalU64) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return fmt.Errorf("protocol: id %q is not a decimal u64: %w", s, err)
+	}
+	*d = decimalU64(v)
+	return nil
+}
+
+func decimalU64s(in []decimalU64) []uint64 {
+	if in == nil {
+		return nil
+	}
+	out := make([]uint64, len(in))
+	for i, v := range in {
+		out[i] = uint64(v)
+	}
+	return out
 }
 
 // decodeEvents parses the UTF-8 JSON array emitted by

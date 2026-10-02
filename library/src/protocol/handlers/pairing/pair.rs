@@ -271,10 +271,6 @@ pub(super) async fn on_response<S: StoreSet>(
 ) -> Result<Vec<DeRecEvent>> {
     let replica_id = local.replica_id;
     let secret_id = local.secret_id;
-    crate::primitives::pairing::parameter_range::check_compatibility(
-        pairing.parameter_range,
-        response.parameter_range.as_ref(),
-    )?;
 
     let contact = match stores
         .secrets
@@ -289,7 +285,7 @@ pub(super) async fn on_response<S: StoreSet>(
         }
     };
 
-    let result = response::process(&contact, response, pairing_secret)?;
+    let result = response::process(&contact, response, pairing_secret, pairing.parameter_range)?;
 
     let new_channel_id = result.channel_id;
 

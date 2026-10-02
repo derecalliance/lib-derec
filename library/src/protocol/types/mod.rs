@@ -799,13 +799,6 @@ pub struct UserSecrets {
     /// Optional human-readable label for this version, forwarded to
     /// helpers in `StoreShareRequest.description`.
     pub description: Option<String>,
-    /// Owner-side cached replica composite for this version, populated
-    /// after the VSS split completes. Lets the Owner resume future
-    /// `ProtectSecret` rounds without re-deriving share material, and
-    /// surfaces under [`Secret::replicas`] on the next snapshot rebuild.
-    /// `None` when this `secret_id` has no replica setup (or before
-    /// the first sharing round commits).
-    pub replicas: Option<Replicas>,
     /// The replica-group member that published this version.
     ///
     /// Set on every publish, whatever changed — the secrets or only the
