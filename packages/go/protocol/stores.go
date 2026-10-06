@@ -237,6 +237,15 @@ type ShareStore interface {
 	// RemoveChannel deletes every share stored for channelID within
 	// secretID.
 	RemoveChannel(secretID, channelID uint64) error
+	// RemoveVersions deletes the shares stored for channelID within
+	// secretID at each of versions. Idempotent: a version that is not
+	// stored is skipped, and an empty slice is a no-op.
+	//
+	// A helper calls it to apply StoreShareRequestMessage.keepList, the
+	// complete set of versions the owner wants retained: every stored
+	// version outside it is removed once the incoming share is persisted.
+	// Shares under other channels or partitions must be left untouched.
+	RemoveVersions(secretID, channelID uint64, versions []uint32) error
 }
 
 // UserSecretStore persists the user-facing secret contents, keyed by

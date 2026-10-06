@@ -653,6 +653,10 @@ the peer acknowledges, retire the ephemeral URI. This keeps the
 plaintext PrePair window tight while letting subsequent traffic ride
 on the long-lived endpoint.
 
+`UpdateChannelInfo` reaches helper channels only. A replica member that
+changes its endpoint or `communication_info` publishes a new version first,
+then updates its helpers; see [On a replica member](https://github.com/derecalliance/lib-derec/tree/main/library#on-a-replica-member).
+
 ### Replica fingerprint verification is mandatory
 
 Replica channels are created with `status: "Pending"` and remain there

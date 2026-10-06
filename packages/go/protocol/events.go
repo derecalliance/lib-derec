@@ -34,6 +34,7 @@ const (
 	EventTypeShareRejected             = "ShareRejected"
 	EventTypeSharingComplete           = "SharingComplete"
 	EventTypeShareVerified             = "ShareVerified"
+	EventTypeShareVerifyRejected       = "ShareVerifyRejected"
 	EventTypeSecretsDiscovered         = "SecretsDiscovered"
 	EventTypeRecoveryShareReceived     = "RecoveryShareReceived"
 	EventTypeRecoveryShareError        = "RecoveryShareError"
@@ -129,12 +130,21 @@ type Event struct {
 	// version this device holds. HeldAuthorReplicaID is the publisher of the
 	// local copy, IncomingAuthorReplicaID the publisher of the offered one
 	// (carried in Secret); either is nil when its copy records no author.
+	//
+	// On this event, or on ReplicaSyncRejected with status VERSION_CONFLICT,
+	// do not publish from this device again until the conflict is resolved:
+	// any further ProtectSecret is a higher version that every other member
+	// applies over its own copy, losing the change it never merged. Get the
+	// rival copy (Secret here; after ReplicaSyncRejected, run
+	// ReplicaDiscovery), merge, and publish the result once with
+	// ProtectSecret.
 	HeldAuthorReplicaID     *uint64 `json:"held_author_replica_id,string"`
 	IncomingAuthorReplicaID *uint64 `json:"incoming_author_replica_id,string"`
 
-	// ReplicaSecretAcked, ReplicaSyncRejected, ShareRejected, UnpairRejected,
-	// PrePairRejected, ChannelInfoUpdateRejected. Status is the protocol
-	// StatusEnum the peer answered with.
+	// ReplicaSecretAcked, ReplicaSyncRejected, ShareRejected,
+	// ShareVerifyRejected, UnpairRejected, PrePairRejected,
+	// ChannelInfoUpdateRejected. Status is the protocol StatusEnum the peer
+	// answered with.
 	Status derecpb.StatusEnum `json:"status"`
 	Memo   string             `json:"memo"`
 

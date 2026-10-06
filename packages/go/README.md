@@ -431,6 +431,8 @@ All replicas of one `secretID` also share a single **group channel key**: every 
 
 The recommended pattern: pair on the ephemeral URI, then — as soon as pairing completes on the contact-creator side — call `SetOwnTransports` with the permanent endpoint and start an `UpdateChannelInfo` flow to announce the swap. This keeps the plaintext `PrePair` window tight while subsequent traffic rides on the long-lived endpoint.
 
+`UpdateChannelInfo` reaches helper channels only. A replica member that changes its endpoint or `CommunicationInfo` publishes a new version first, then updates its helpers; see [On a replica member](https://github.com/derecalliance/lib-derec/tree/main/library#on-a-replica-member).
+
 ### Replica fingerprint verification is mandatory
 
 Replica channels are created `Pending` and remain there until both sides call `VerifyFingerprint` with the value the peer derived from the shared key — confirmed out of band. The orchestrator enforces this: `Start(FlowKindProtectSecret, ...)` rejects a target that is still `Pending`. Treat verification as a required step in the pairing UX — a scanner that auto-pairs without it accepts a MITM-vulnerable replica.

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 import { DeRecProtocolBuilder } from '../src/protocol';
-import { FlowKind } from '../src/types';
+import { FlowKind, StatusEnum } from '../src/types';
 import type { DeRecEvent } from '../src/types';
 
 let lastConfig: Record<string, unknown> | undefined;
@@ -456,6 +456,29 @@ describe('event byte fields', () => {
     expect(recovered.secret.helpers[0].shared_key).toBeInstanceOf(Uint8Array);
     expect(recovered.secret.secrets[0].id).toBeInstanceOf(Uint8Array);
     expect(Array.from(recovered.secret.secrets[0].data)).toEqual([2, 3]);
+  });
+
+  it('passes ShareVerifyRejected through with its status and memo', async () => {
+    const events = [
+      {
+        type: 'ShareVerifyRejected',
+        channel_id: '18446744073709551615',
+        version: 2,
+        status: StatusEnum.UnknownShareVersion,
+        memo: 'no stored share',
+      },
+    ];
+    host.tick = () => Promise.resolve(utf8(JSON.stringify(events)).buffer);
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    const decoded = (await protocol.tick()) as Array<
+      Extract<DeRecEvent, {type: 'ShareVerifyRejected'}>
+    >;
+
+    expect(decoded[0]).toEqual(events[0]);
+    expect(decoded[0].channel_id).toBe('18446744073709551615');
+    expect(decoded[0].status).toBe(StatusEnum.UnknownShareVersion);
   });
 
   it('passes PeerNotRestored from restore through unchanged', async () => {

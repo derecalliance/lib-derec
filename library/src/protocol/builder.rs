@@ -1008,6 +1008,14 @@ mod tests {
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
+            fn remove_versions(
+                &mut self,
+                _: u64,
+                _: ChannelId,
+                _: &[u32],
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
         }
 
         struct NoopSecretStore;
@@ -1199,6 +1207,14 @@ mod tests {
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
+            fn remove_versions(
+                &mut self,
+                _: u64,
+                _: ChannelId,
+                _: &[u32],
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
         }
         struct NoopSecretStore;
         impl DeRecSecretStore for NoopSecretStore {
@@ -1377,6 +1393,14 @@ mod tests {
                 Box::pin(std::future::ready(Ok(())))
             }
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_versions(
+                &mut self,
+                _: u64,
+                _: ChannelId,
+                _: &[u32],
+            ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -1563,6 +1587,14 @@ mod tests {
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
+            fn remove_versions(
+                &mut self,
+                _: u64,
+                _: ChannelId,
+                _: &[u32],
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
         }
         struct NoopSecretStore;
         impl DeRecSecretStore for NoopSecretStore {
@@ -1744,6 +1776,14 @@ mod tests {
                 Box::pin(std::future::ready(Ok(())))
             }
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_versions(
+                &mut self,
+                _: u64,
+                _: ChannelId,
+                _: &[u32],
+            ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }

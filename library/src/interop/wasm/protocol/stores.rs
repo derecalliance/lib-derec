@@ -48,6 +48,9 @@
 //!   // Called when an unpair flow tears down a channel. Implementations must
 //!   // treat a non-existent channel as a no-op.
 //!   removeChannel(channelId: string): Promise<void>;
+//!   // Drop the shares stored under (secretId, channelId) at each listed
+//!   // version. A version that is not stored is a no-op.
+//!   removeVersions(secretId: string, channelId: string, versions: number[]): Promise<void>;
 //!   latestVersion(): Promise<number | null>;
 //! }
 //! ```
@@ -770,6 +773,34 @@ impl DeRecShareStore for JsShareStore {
             args.push(&JsValue::from_str(&secret_str));
             args.push(&JsValue::from_str(&channel_str));
             let promise_val = call_method(&obj, "removeChannel", &args)
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            resolve_promise(promise_val)
+                .await
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            Ok(())
+        })
+    }
+
+    fn remove_versions(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        let channel_str = channel_id.0.to_string();
+        let versions_vec: Vec<u32> = versions.to_vec();
+        Box::pin(async move {
+            let js_versions = Array::new();
+            for v in &versions_vec {
+                js_versions.push(&JsValue::from_f64(*v as f64));
+            }
+            let args = Array::new();
+            args.push(&JsValue::from_str(&secret_str));
+            args.push(&JsValue::from_str(&channel_str));
+            args.push(&js_versions);
+            let promise_val = call_method(&obj, "removeVersions", &args)
                 .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
             resolve_promise(promise_val)
                 .await

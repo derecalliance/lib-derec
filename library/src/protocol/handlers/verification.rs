@@ -39,6 +39,12 @@ use prost::Message;
 /// is enforced by the primitive before the SHA-384 check. A binding
 /// mismatch surfaces as `Error::Verification(..)` and is returned to the
 /// caller rather than swallowed.
+///
+/// A bound response whose status is not OK is the helper refusing the
+/// challenge, not a failure of this device: it surfaces as
+/// `ShareVerifyRejected` carrying the helper's status and memo. The
+/// challenge row is consumed all the same, so the helper is challenged again
+/// only by a new round.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
@@ -95,21 +101,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     round: &Round<'_>,
 ) -> Result<Vec<DeRecEvent>> {
     let secret_id = local.secret_id;
-    let known: Vec<ChannelId> = stores
-        .channels
-        .helpers_matching(
-            secret_id,
-            crate::protocol::types::HelperFilter {
-                ids: target.ids(),
-                ..Default::default()
-            },
-        )
-        .await?
-        .iter()
-        .map(|c| c.channel_id)
-        .collect();
-
-    let channel_ids = target.filter(&known);
+    let channel_ids = stores.channels.resolve_target(secret_id, target).await?;
 
     let keys = stores
         .secrets
@@ -314,7 +306,29 @@ async fn on_response<S: StoreSet>(
             "no committed share stored for this channel/version — cannot verify proof",
         ))?;
 
-    let valid = verification_response::process(&request, response, &committed_share_bytes)?;
+    let valid = match verification_response::process(&request, response, &committed_share_bytes) {
+        Ok(valid) => valid,
+        Err(err) => {
+            let Some((status, memo)) = err.as_non_ok_status() else {
+                return Err(err);
+            };
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                channel_id = channel_id.0,
+                secret_id = response.secret_id,
+                version = version,
+                status,
+                memo,
+                "verification challenge rejected by helper"
+            );
+            return Ok(vec![DeRecEvent::ShareVerifyRejected {
+                channel_id,
+                version,
+                status,
+                memo: memo.to_owned(),
+            }]);
+        }
+    };
 
     if !valid {
         return Err(Error::Invariant("verification proof is invalid"));
@@ -441,4 +455,103 @@ async fn dispatch_one<S: StoreSet>(
     let envelope = crate::derec_message::apply_trace_id(&msg.envelope, round.trace_id)?;
     stores.transport.send(&endpoint, envelope).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::test::{StoreRig, run_async};
+    use crate::protocol::types::Share;
+
+    const SECRET_ID: u64 = 0x5E1F;
+    const CHANNEL: ChannelId = ChannelId(21);
+    const VERSION: u32 = 3;
+
+    /// A helper refusing a challenge is reported with its status and memo,
+    /// as a refused share is, rather than failing `process` with no event.
+    #[test]
+    fn a_refused_challenge_surfaces_as_share_verify_rejected() {
+        run_async(async {
+            let mut rig = StoreRig::new();
+            let request = VerifyShareRequestMessage {
+                secret_id: SECRET_ID,
+                version: VERSION,
+                nonce: 0x0BAD_5EED,
+                timestamp: None,
+                reply_to_transports: Vec::new(),
+            };
+            rig.state
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingVerification {
+                        channel_id: CHANNEL,
+                        request: request.clone(),
+                    },
+                )
+                .await
+                .expect("seed challenge");
+            rig.shares
+                .save(
+                    SECRET_ID,
+                    CHANNEL,
+                    Share {
+                        secret_id: SECRET_ID,
+                        version: VERSION,
+                        bytes: vec![0x5A; 16],
+                    },
+                )
+                .await
+                .expect("seed committed share");
+
+            let response = VerifyShareResponseMessage {
+                result: Some(DeRecResult {
+                    status: StatusEnum::UnknownShareVersion as i32,
+                    memo: "no stored share for verification request".to_owned(),
+                }),
+                secret_id: SECRET_ID,
+                version: VERSION,
+                nonce: request.nonce,
+                hash: Vec::new(),
+                timestamp: Some(current_timestamp()),
+            };
+            let local = crate::protocol::test::LocalFixture::new(SECRET_ID);
+            let events = handle(
+                &mut rig.stores(),
+                &local.local(),
+                &Exchange {
+                    channel_id: CHANNEL,
+                    shared_key: &[0u8; 32],
+                    trace_id: 0,
+                },
+                MessageBody::VerifyShareResponse(response),
+            )
+            .await
+            .expect("a refusal is an outcome, not an error");
+
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [DeRecEvent::ShareVerifyRejected { channel_id, version, status, memo }]
+                        if *channel_id == CHANNEL
+                            && *version == VERSION
+                            && *status == StatusEnum::UnknownShareVersion as i32
+                            && memo == "no stored share for verification request"
+                ),
+                "got {events:?}"
+            );
+            assert!(
+                rig.state
+                    .load(
+                        SECRET_ID,
+                        StateKey::PendingVerification {
+                            channel_id: CHANNEL
+                        }
+                    )
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "the refused challenge is consumed"
+            );
+        });
+    }
 }

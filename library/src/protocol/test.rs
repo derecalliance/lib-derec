@@ -185,13 +185,25 @@ impl DeRecSecretStore for InMemSecretStore {
         sid: u64,
         cids: &[ChannelId],
         kind: SecretKind,
-        _: MissingPolicy,
+        missing_policy: MissingPolicy,
     ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
+        let data = self.data.lock().unwrap();
         let mut out = Vec::new();
+        let mut missing = Vec::new();
         for c in cids {
-            if let Some(v) = self.data.lock().unwrap().get(&(sid, c.0, kind as u8)) {
-                out.push((*c, v.clone()));
+            match data.get(&(sid, c.0, kind as u8)) {
+                Some(v) => out.push((*c, v.clone())),
+                None => missing.push(c.0),
             }
+        }
+        drop(data);
+        if missing_policy == MissingPolicy::Fail && !missing.is_empty() {
+            return Box::pin(std::future::ready(Err(
+                crate::protocol::SecretStoreError::MissingEntries {
+                    kind,
+                    channel_ids: missing,
+                },
+            )));
         }
         Box::pin(std::future::ready(Ok(out)))
     }
@@ -266,6 +278,18 @@ impl DeRecShareStore for InMemShareStore {
         Box::pin(std::future::ready(Ok(())))
     }
     fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+    fn remove_versions(
+        &mut self,
+        sid: u64,
+        cid: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, ()> {
+        self.data
+            .lock()
+            .unwrap()
+            .retain(|(s, c, v), _| !(*s == sid && *c == cid.0 && versions.contains(v)));
         Box::pin(std::future::ready(Ok(())))
     }
 }

@@ -525,6 +525,22 @@
             "secret_id",
             "channel_id"
           ]
+        },
+        {
+          "rust": "remove_versions",
+          "dotnet": "RemoveVersions",
+          "go": "RemoveVersions",
+          "ts": "removeVersions",
+          "rust_params": [
+            "secret_id",
+            "channel_id",
+            "versions"
+          ],
+          "params": [
+            "secret_id",
+            "channel_id",
+            "versions"
+          ]
         }
       ]
     },

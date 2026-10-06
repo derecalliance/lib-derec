@@ -240,6 +240,10 @@
           "wire": "ShareVerified"
         },
         {
+          "name": "ShareVerifyRejected",
+          "wire": "ShareVerifyRejected"
+        },
+        {
           "name": "SharingComplete",
           "wire": "SharingComplete"
         },

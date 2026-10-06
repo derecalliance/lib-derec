@@ -465,6 +465,13 @@ pub struct ShareStoreCallbacks {
     ) -> i32,
     pub remove_channel:
         extern "C" fn(user_data: *mut c_void, secret_id: u64, channel_id: u64) -> i32,
+    pub remove_versions: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        channel_id: u64,
+        versions_json_ptr: *const u8,
+        versions_json_len: usize,
+    ) -> i32,
     pub free_buffer: extern "C" fn(user_data: *mut c_void, ptr: *mut u8, len: usize),
 }
 
@@ -1225,6 +1232,32 @@ impl DeRecShareStore for DotnetShareStore {
             if rc != 0 {
                 Err(ShareStoreError::Backend(boxed_err(format!(
                     "share store remove_channel failed (rc={rc})"
+                ))))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn remove_versions(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let versions_json = serde_json::to_vec(versions).unwrap_or_else(|_| b"[]".to_vec());
+        let rc = (cb.remove_versions)(
+            cb.user_data,
+            secret_id,
+            channel_id.0,
+            versions_json.as_ptr(),
+            versions_json.len(),
+        );
+        Box::pin(async move {
+            if rc != 0 {
+                Err(ShareStoreError::Backend(boxed_err(format!(
+                    "share store remove_versions failed (rc={rc})"
                 ))))
             } else {
                 Ok(())

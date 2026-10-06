@@ -132,6 +132,11 @@ impl<
     /// [`crate::protocol::types::Secret`] handed up by a
     /// [`DeRecEvent::SecretRecovered`] event.
     ///
+    /// Recovery and restore are separate steps on purpose.
+    /// `SecretRecovered` writes nothing: it hands the recovered secret to the
+    /// application, which shows it to the user, or asks them, before calling
+    /// `restore`. Only `restore` commits it to this device.
+    ///
     /// # Caller flow
     ///
     /// ```text
@@ -622,6 +627,98 @@ mod tests {
                 })
                 .await
                 .expect("this instance's own secret_id is the legal value");
+        });
+    }
+
+    /// A broadcast flow reaches every paired helper and skips one still
+    /// `Pending`: that channel has no shared key yet, so including it would
+    /// fail the key load for the whole fan-out.
+    #[test]
+    fn broadcast_flows_skip_a_pending_channel() {
+        run_async(async {
+            let rig = StoreRig::new();
+            let mut channels = rig.channels.clone();
+            let mut secrets = rig.secrets.clone();
+            seed_helper(&mut channels, &mut secrets, 11, 0xA1).await;
+            channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Helper(HelperChannel {
+                        channel_id: ChannelId(12),
+                        transports: vec![derec_proto::TransportProtocol {
+                            uri: "https://helper-12.example".to_owned(),
+                            protocol: derec_proto::Protocol::Https as i32,
+                        }],
+                        communication_info: HashMap::new(),
+                        peer_role: derec_proto::SenderKind::Helper,
+                        status: ChannelStatus::Pending,
+                        created_at: 0,
+                    }),
+                )
+                .await
+                .expect("seed pending helper");
+
+            let mut protocol = DeRecProtocolBuilder::new(SECRET_ID)
+                .with_channel_store(channels)
+                .with_share_store(InMemShareStore::default())
+                .with_secret_store(secrets)
+                .with_user_secret_store(InMemUserSecretStore::default())
+                .with_state_store(InMemPersistedStateStore::default())
+                .with_transport(rig.transport.clone())
+                .with_own_transports(["https://owner.example"])
+                .build()
+                .expect("test rig builds");
+
+            let flows = [
+                (
+                    "UpdateChannelInfo",
+                    DeRecFlow::UpdateChannelInfo {
+                        target: crate::protocol::types::Target::All,
+                        communication_info: Some(HashMap::from([(
+                            "name".to_owned(),
+                            "owner".to_owned(),
+                        )])),
+                        own_transports: Vec::new(),
+                    },
+                ),
+                (
+                    "Discovery",
+                    DeRecFlow::Discovery {
+                        target: crate::protocol::types::Target::All,
+                    },
+                ),
+                (
+                    "VerifyShares",
+                    DeRecFlow::VerifyShares {
+                        secret_id: SECRET_ID,
+                        version: 1,
+                        target: crate::protocol::types::Target::All,
+                    },
+                ),
+            ];
+            for (name, flow) in flows {
+                let sent_before = rig.transport.sent_uris().len();
+                let events = protocol
+                    .start(flow)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name} must start: {e:?}"));
+
+                assert_eq!(
+                    rig.transport.sent_uris()[sent_before..],
+                    ["https://helper-11.example".to_owned()],
+                    "{name} reaches the paired helper only"
+                );
+                let started: Vec<ChannelId> = events
+                    .iter()
+                    .filter_map(|e| match e {
+                        DeRecEvent::UpdateChannelInfoStarted { channel_id, .. }
+                        | DeRecEvent::DiscoveryStarted { channel_id, .. }
+                        | DeRecEvent::VerifySharesStarted { channel_id, .. } => Some(*channel_id),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(started, vec![ChannelId(11)], "{name}: {events:?}");
+            }
         });
     }
 

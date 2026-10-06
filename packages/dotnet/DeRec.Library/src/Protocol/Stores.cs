@@ -408,6 +408,18 @@ public interface IShareStore
     /// </summary>
     void Save(ulong secretId, ulong channelId, Share share);
     void RemoveChannel(ulong secretId, ulong channelId);
+    /// <summary>
+    /// Drop the shares stored under <c>(secretId, channelId)</c> at each of
+    /// <paramref name="versions"/>. Idempotent: a version that is not stored
+    /// is skipped, and an empty array is a no-op.
+    /// <para>
+    /// A helper calls this to apply <c>StoreShareRequestMessage.keepList</c>,
+    /// the complete set of versions the owner wants retained: every stored
+    /// version outside it is removed once the incoming share is persisted.
+    /// Shares under other channels or partitions must be left untouched.
+    /// </para>
+    /// </summary>
+    void RemoveVersions(ulong secretId, ulong channelId, uint[] versions);
 }
 
 /// <summary>

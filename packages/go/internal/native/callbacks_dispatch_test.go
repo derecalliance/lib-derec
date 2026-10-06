@@ -74,12 +74,13 @@ func (m *mockSecretStore) Remove(secretID, channelID uint64, kind SecretKind) er
 var _ secretStore = (*mockSecretStore)(nil)
 
 type mockShareStore struct {
-	loadFn          func(secretID, channelID uint64, versions []uint32) ([]Share, error)
-	loadManyFn      func(secretID uint64, channelIDs []uint64, versions []uint32) ([]Share, error)
-	loadAllFn       func(secretID uint64, channelIDs []uint64) ([]Share, error)
-	latestVersionFn func(secretID uint64) (uint32, bool, error)
-	saveFn          func(secretID, channelID uint64, share Share) error
-	removeChannelFn func(secretID, channelID uint64) error
+	loadFn           func(secretID, channelID uint64, versions []uint32) ([]Share, error)
+	loadManyFn       func(secretID uint64, channelIDs []uint64, versions []uint32) ([]Share, error)
+	loadAllFn        func(secretID uint64, channelIDs []uint64) ([]Share, error)
+	latestVersionFn  func(secretID uint64) (uint32, bool, error)
+	saveFn           func(secretID, channelID uint64, share Share) error
+	removeChannelFn  func(secretID, channelID uint64) error
+	removeVersionsFn func(secretID, channelID uint64, versions []uint32) error
 }
 
 func (m *mockShareStore) Load(secretID, channelID uint64, versions []uint32) ([]Share, error) {
@@ -99,6 +100,9 @@ func (m *mockShareStore) Save(secretID, channelID uint64, share Share) error {
 }
 func (m *mockShareStore) RemoveChannel(secretID, channelID uint64) error {
 	return m.removeChannelFn(secretID, channelID)
+}
+func (m *mockShareStore) RemoveVersions(secretID, channelID uint64, versions []uint32) error {
+	return m.removeVersionsFn(secretID, channelID, versions)
 }
 
 var _ shareStore = (*mockShareStore)(nil)
@@ -596,6 +600,34 @@ func TestDispatchShareRemoveChannel(t *testing.T) {
 	status := dispatchShareRemoveChannel(s, 5, 6)
 	if status != ffiStatusOK || !called {
 		t.Fatalf("status=%d called=%v", status, called)
+	}
+}
+
+func TestDispatchShareRemoveVersions(t *testing.T) {
+	var gotSecretID, gotChannelID uint64
+	var gotVersions []uint32
+	s := &storeSet{share: &mockShareStore{
+		removeVersionsFn: func(secretID, channelID uint64, versions []uint32) error {
+			gotSecretID, gotChannelID, gotVersions = secretID, channelID, versions
+			return nil
+		},
+	}}
+	status := dispatchShareRemoveVersions(s, 5, 6, []byte("[1,3]"))
+	if status != ffiStatusOK || gotSecretID != 5 || gotChannelID != 6 ||
+		len(gotVersions) != 2 || gotVersions[0] != 1 || gotVersions[1] != 3 {
+		t.Fatalf("status=%d secretID=%d channelID=%d versions=%v", status, gotSecretID, gotChannelID, gotVersions)
+	}
+
+	failing := &storeSet{share: &mockShareStore{
+		removeVersionsFn: func(secretID, channelID uint64, versions []uint32) error {
+			return errors.New("backend down")
+		},
+	}}
+	if status := dispatchShareRemoveVersions(failing, 5, 6, []byte("[1]")); status != ffiStatusFailure {
+		t.Fatalf("store error must surface as ffiStatusFailure, got %d", status)
+	}
+	if status := dispatchShareRemoveVersions(s, 5, 6, []byte("not json")); status != ffiStatusFailure {
+		t.Fatalf("malformed versions JSON must surface as ffiStatusFailure, got %d", status)
 	}
 }
 

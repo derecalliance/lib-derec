@@ -217,8 +217,10 @@ loop {
                 for entry in &secret.secrets {
                     println!("recovered {} ({}B)", entry.name, entry.data.len());
                 }
-                // Commit the recovered Secret into this fresh protocol's
-                // stores. Wipes the throwaway recovery-mode channels and
+                // Nothing has been written yet: show the user what was
+                // recovered, or ask them, before committing it. `restore`
+                // commits the recovered Secret into this fresh protocol's
+                // stores, wipes the throwaway recovery-mode channels and
                 // reseats canonical helper / replica state at the recovered
                 // version. See `DeRecProtocol::restore`.
                 protocol.restore(&secret, recovered_version).await?;
@@ -320,7 +322,8 @@ before any target-level events are emitted.
 - `PairingCompleted { channel_id, kind, peer_communication_info }`
 - `ShareStored { channel_id, version }` / `ShareConfirmed { … }` /
   `ShareRejected { … }` / `SharingComplete { … }`
-- `ShareVerified { channel_id, version }`
+- `ShareVerified { channel_id, version }` /
+  `ShareVerifyRejected { channel_id, version, status, memo }`
 - `SecretsDiscovered { channel_id, secrets }`
 - `RecoveryShareReceived { … }` /
   `SecretRecovered { secret: Secret }` (typed; `secret.secrets` is the
@@ -685,6 +688,13 @@ Confirmation is also the moment the peer becomes reachable, so the current
 snapshot is published to it then — a `NoKeys` helper was not an eligible
 target at handshake time, and the pairing-time auto-publish skipped it.
 
+On a replica **destination**, confirming is also the decision to adopt the
+group's vault. Once the channel is `Paired`, the source's publish is
+installed into this device's stores as it arrives, with no further prompt.
+Ask the user whether to adopt the vault before calling `verify_fingerprint`;
+to decline, never confirm, and the channel stays `Pending`, unused, until
+expired-channel cleanup removes it.
+
 ### Secret distribution
 
 Once the destination is paired (status `Paired`), the source includes it
@@ -743,6 +753,43 @@ Two things follow for application authors:
 
 A helpers-only round is unaffected and completes as soon as the helpers
 answer.
+
+#### Version conflicts: what the application must do
+
+Every member derives the next version from the one it holds, and a newer
+version replaces an older one wherever it lands. Two copies of the **same**
+version collide, and the library reports the collision instead of merging:
+
+- the member that received a rival copy emits `ReplicaVersionConflict`,
+  carrying the rival's full state in `secret`, and keeps its own copy;
+- the member whose copy was refused emits `ReplicaSyncRejected` with status
+  `VERSION_CONFLICT`.
+
+This does not need two devices to be edited at the same moment. A member
+that was offline while another published, and then protects a change of its
+own, publishes the same version as a rival copy.
+
+From either event until the conflict is resolved, the device's copy has
+diverged from the group's. **Do not publish from it again until the user has
+resolved the conflict.** A further `ProtectSecret` writes a higher version,
+which every other member applies over its own copy: the change it never
+merged is lost, from the members and, on that round, from the helpers.
+
+To resolve:
+
+1. Mark the vault as diverged and stop offering `ProtectSecret` on this
+   device.
+2. Get the rival copy. `ReplicaVersionConflict` already carries it in
+   `secret`. After `ReplicaSyncRejected`, run `ReplicaDiscovery`: the group's
+   copy arrives as a `ReplicaVersionConflict`.
+3. Show the user both copies — this device's, from its own stores, and the
+   rival's — and let them merge them or keep one.
+4. Publish the result once with `ProtectSecret`. It writes the next version,
+   which every member and helper takes, and the conflict is resolved. To keep
+   the rival's copy unchanged, publish its secrets.
+
+A member that changes its endpoint or `communication_info` announces it by
+publishing too; see [On a replica member](#on-a-replica-member).
 
 ---
 
@@ -1127,28 +1174,30 @@ Every SDK exposes the same correlation primitive: `Envelope.ReadTraceId`
 
 ### Updating channel info post-pairing
 
-A peer's `communication_info` and transport endpoint are exchanged at pairing
-time. To propagate later changes, mutate local state with
-`DeRecProtocol::set_communication_info` / `set_own_transport` and then run
+A peer's `communication_info` and transport endpoints are exchanged at
+pairing time. To propagate later changes, mutate local state with
+`DeRecProtocol::set_communication_info` / `set_own_transports` and then run
 `start(DeRecFlow::UpdateChannelInfo { ... })` against the target channels.
 Per-field semantics:
 
 - `communication_info: Option<HashMap<String, String>>` — `None` leaves the
   peer's stored map untouched. `Some(_)` replaces it; an empty map clears it.
-- `transport_protocol: Option<TransportProtocol>` — `None` leaves it
-  untouched. `Some(_)` updates both URI and protocol.
+- `own_transports: Vec<TransportProtocol>` — empty leaves the peer's stored
+  endpoints untouched; otherwise it replaces them, in preference order.
+
+`UpdateChannelInfo` reaches helper channels only. A replica member announces
+a change by publishing instead — see
+[On a replica member](#on-a-replica-member) below.
 
 The flow is symmetric — either Owner or Helper may initiate it — and
 auto-applies on the receiver via the standard `ActionRequired` → `accept`
 path. Outcome surfaces as `DeRecEvent::ChannelInfoUpdated` (or
 `ChannelInfoUpdateRejected` if the peer refused).
 
-A switch to a transport the receiving side serves no endpoint for is
-**refused, not recorded**: the receiver answers
-`StatusEnum::UNSUPPORTED_TRANSPORT_PROTOCOL` over the previous — still
-working — endpoint, and the initiator sees `ChannelInfoUpdateRejected`.
-Recording it would have pointed every later message at an address the
-receiver cannot deliver to, with nothing to indicate it.
+The receiver filters the announced endpoints with its transport policy when
+it accepts the update, exactly as it filters a peer's endpoints at pairing.
+Which transports the receiver serves itself has no bearing on where the peer
+may listen.
 
 > [!WARNING]
 > **Endpoint changeover discipline.** When `transport_protocol` is updated,
@@ -1159,8 +1208,46 @@ receiver cannot deliver to, with nothing to indicate it.
 > `ChannelInfoUpdated` / `ChannelInfoUpdateRejected` (plus a grace window
 > for in-flight messages from peers not yet aware of the update). Failing
 > to keep both endpoints reachable during this window will cause messages
-> to be lost. See the rustdoc on `set_own_transport` / `set_own_transports`
-> for details.
+> to be lost. See the rustdoc on `set_own_transports` for details.
+
+#### On a replica member
+
+Replica members do not exchange `UpdateChannelInfo`. A member's endpoints and
+`communication_info` travel in the group roster, and a member's own row is
+refreshed from its current configuration each time it publishes. Every member
+that receives the publish takes the roster as authoritative and records the
+new values. A member that changes either one therefore announces it in two
+steps:
+
+1. **Publish a new version** with `ProtectSecret` — the same secrets are
+   fine. Every replica records the member's new row, so any of them can take
+   over immediately, and the helpers receive a roster that is recoverable with
+   the new values. The version is new, and so is the helper re-share round; a
+   roster that must be recoverable has to reach the helpers anyway.
+2. **Run `UpdateChannelInfo` against the helpers.** A helper cannot read the
+   roster — it holds an encrypted share — so it learns the new endpoint only
+   from this flow.
+
+The order is the application's choice: publishing first lets the replicas
+follow at once. Until enough peers have the update, keep the old endpoint
+serving:
+
+- **Advertise only the new endpoint, keep the old one serving.** A device
+  advertises at most one endpoint per protocol, so the old one is not listed;
+  it simply keeps answering until peers stop using it. A peer that already has
+  the update answers on the new endpoint and drops the old one. In step 1,
+  helpers still hold the old endpoint, so set `reply_to` on the round to have
+  their answers come back on the new one.
+- **Enough peers, not all.** Wait until enough helpers to recover the secret,
+  and the replicas the application relies on, have confirmed. Retry the rest,
+  or suggest a new round later; how long the old endpoint stays up is the
+  application's decision.
+- **A member that missed step 1 still holds the old row.** If it publishes
+  before catching up, its roster carries the old values back to everyone. Its
+  version collides with the new one, so the rule in
+  [Version conflicts](#version-conflicts-what-the-application-must-do)
+  applies: it must not publish until it has caught up, and the application
+  can retry the update once it has.
 
 ---
 

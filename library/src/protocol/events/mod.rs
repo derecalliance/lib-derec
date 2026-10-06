@@ -463,6 +463,27 @@ pub enum DeRecFlow {
     /// a newer roster excluding it. Absence alone never destroys a copy of the
     /// secret — a publisher that silently omitted a member would otherwise
     /// destroy that member's state instead of merely forgetting it.
+    ///
+    /// # Who may remove whom
+    ///
+    /// Any member may remove any member, the source included: a lost or
+    /// stolen source must be removable by the devices that remain. The library
+    /// checks no role, and could not enforce one, since every member holds the
+    /// same group key. Ask the user before starting this flow, above all when
+    /// it names the source.
+    ///
+    /// Removing the source promotes a successor: the first remaining member in
+    /// the order [`DeRecChannelStore::replicas`](crate::protocol::DeRecChannelStore::replicas)
+    /// returns, which is how the application chooses it. The device running
+    /// this flow decides, and every other member reads the result from the
+    /// roster. Removing a sole source dissolves the group.
+    ///
+    /// # What the removed member experiences
+    ///
+    /// It is not asked, and gets no event when it is told to leave. When a
+    /// roster excluding it arrives, it drops its whole `secret_id` partition
+    /// automatically and emits [`DeRecEvent::SelfRemovedFromGroup`]. The
+    /// secret survives on the remaining members and the helpers.
     UnpairReplica {
         replica_id: u64,
         memo: Option<String>,
@@ -691,6 +712,10 @@ pub enum DeRecEvent {
     /// one is `secret`. Publishing the resolved state with
     /// [`crate::protocol::DeRecFlow::ProtectSecret`] writes the next
     /// version, which supersedes both on every member and helper.
+    ///
+    /// Until then, the application must not publish from this device: any
+    /// further `ProtectSecret` is a higher version that every other member
+    /// applies over its own copy, losing the change it never merged.
     ReplicaVersionConflict {
         /// The channel the copy arrived on.
         channel_id: ChannelId,
@@ -750,8 +775,13 @@ pub enum DeRecEvent {
         /// `version` echoed from the response.
         version: u32,
         /// The `StatusEnum` value from the member's response.
-        /// `VERSION_CONFLICT` means the round must be resolved and
-        /// republished at a new version — see [`Self::ReplicaSyncComplete`].
+        /// `VERSION_CONFLICT` means another member holds a different copy of
+        /// this version. The application must not publish from this device
+        /// again until the conflict is resolved: run
+        /// [`crate::protocol::DeRecFlow::ReplicaDiscovery`] to receive the
+        /// group's copy as [`Self::ReplicaVersionConflict`], merge, and publish
+        /// the result once with
+        /// [`crate::protocol::DeRecFlow::ProtectSecret`].
         status: i32,
         /// Human-readable explanation from the member.
         memo: String,
@@ -799,6 +829,11 @@ pub enum DeRecEvent {
     ///
     /// Fires only after both halves of the safety rule hold: this device was
     /// told to leave, and has since seen a roster excluding it.
+    ///
+    /// The teardown is automatic: this device is not asked first, and gets no
+    /// earlier event. The secret survives on the remaining members and the
+    /// helpers. Any member may cause it, the source included — see
+    /// [`DeRecFlow::UnpairReplica`].
     SelfRemovedFromGroup {
         /// The version whose roster completed the removal.
         version: u32,
@@ -911,6 +946,21 @@ pub enum DeRecEvent {
 
     /// A Helper's verification proof checked out (Owner side).
     ShareVerified { channel_id: ChannelId, version: u32 },
+
+    /// A Helper refused a verification challenge (Owner side): its
+    /// `VerifyShareResponse` carried a non-OK status instead of a proof.
+    ///
+    /// The challenge is spent either way — a later response to it is dropped
+    /// — so checking this helper again takes a new
+    /// [`DeRecFlow::VerifyShares`] round.
+    ShareVerifyRejected {
+        channel_id: ChannelId,
+        version: u32,
+        /// The `StatusEnum` value from the Helper's response.
+        status: i32,
+        /// Human-readable reason from the Helper.
+        memo: String,
+    },
 
     /// A Helper reported all secrets it currently stores for this channel (Owner side).
     ///
@@ -1194,8 +1244,8 @@ pub enum DeRecEvent {
     },
 
     /// A verify-share challenge was dispatched to `channel_id` for
-    /// `version`. Followed by [`Self::ShareVerified`] once the helper
-    /// responds.
+    /// `version`. Followed by [`Self::ShareVerified`] or
+    /// [`Self::ShareVerifyRejected`] once the helper responds.
     VerifySharesStarted {
         channel_id: ChannelId,
         version: u32,
@@ -1273,10 +1323,8 @@ pub enum DeRecEvent {
         trace_id: u64,
     },
 
-    /// An update-channel-info exchange failed for `channel_id`: either an
-    /// outbound request could not be dispatched, or an inbound request
-    /// announcing an unservable transport switch was refused (see
-    /// [`crate::Error::NoUsableEndpoint`]).
+    /// An update-channel-info request could not be dispatched to
+    /// `channel_id`.
     UpdateChannelInfoFailed {
         channel_id: ChannelId,
         error: String,

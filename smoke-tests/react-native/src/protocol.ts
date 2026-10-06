@@ -314,6 +314,15 @@ class InMemoryShareStore implements ShareStore {
     this.data.delete(this.key(secretId, channelId));
   }
 
+  readonly removeVersionsCalls: Array<{ secretId: string; channelId: string; versions: number[] }> = [];
+
+  async removeVersions(secretId: string, channelId: string, versions: number[]): Promise<void> {
+    this.removeVersionsCalls.push({ secretId, channelId, versions: [...versions] });
+    const byVersion = this.data.get(this.key(secretId, channelId));
+    if (!byVersion) return;
+    for (const v of versions) byVersion.delete(v);
+  }
+
   async latestVersion(secretId: string): Promise<number | null> {
     return this.ownerVersions.get(secretId) ?? null;
   }

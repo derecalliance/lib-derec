@@ -135,6 +135,11 @@ internal static class Protocol
     internal delegate int ShareStoreRemoveChannelDelegate(
         IntPtr userData, ulong secretId, ulong channelId);
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int ShareStoreRemoveVersionsDelegate(
+        IntPtr userData, ulong secretId, ulong channelId,
+        IntPtr versionsJsonPtr, UIntPtr versionsJsonLen);
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct ShareStoreCallbacks
     {
@@ -145,6 +150,7 @@ internal static class Protocol
         public IntPtr LatestVersion;
         public IntPtr Save;
         public IntPtr RemoveChannel;
+        public IntPtr RemoveVersions;
         public IntPtr FreeBuffer;
     }
 

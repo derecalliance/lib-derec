@@ -878,6 +878,11 @@ typedef struct ShareStoreCallbacks {
                   const uint8_t *share_json_ptr,
                   size_t share_json_len);
   int32_t (*remove_channel)(void *user_data, uint64_t secret_id, uint64_t channel_id);
+  int32_t (*remove_versions)(void *user_data,
+                             uint64_t secret_id,
+                             uint64_t channel_id,
+                             const uint8_t *versions_json_ptr,
+                             size_t versions_json_len);
   void (*free_buffer)(void *user_data, uint8_t *ptr, size_t len);
 } ShareStoreCallbacks;
 

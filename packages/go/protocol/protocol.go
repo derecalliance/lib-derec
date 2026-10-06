@@ -393,6 +393,11 @@ func (p *DeRecProtocol) GetFingerprint(channelID uint64) (string, error) {
 // Paired and this returns true. Every non-nil error, and every legitimate
 // mismatch, returns false — callers must check err to distinguish "did
 // not match" from "could not be verified".
+//
+// On a replica destination, confirming is also the decision to adopt the
+// group's vault: the source's publish is then installed as it arrives, with
+// no further prompt. Ask the user before calling this; to decline, never
+// confirm.
 func (p *DeRecProtocol) VerifyFingerprint(channelID uint64, fingerprint string) (bool, error) {
 	if p.closed {
 		return false, errors.New("protocol: VerifyFingerprint: protocol is closed")

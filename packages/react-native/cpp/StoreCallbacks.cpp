@@ -27,7 +27,7 @@ static_assert(sizeof(ChannelStoreCallbacks) == 9 * sizeof(void*),
               "ChannelStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(SecretStoreCallbacks) == 6 * sizeof(void*),
               "SecretStoreCallbacks layout changed; update the bindings");
-static_assert(sizeof(ShareStoreCallbacks) == 8 * sizeof(void*),
+static_assert(sizeof(ShareStoreCallbacks) == 9 * sizeof(void*),
               "ShareStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(UserSecretStoreCallbacks) == 5 * sizeof(void*),
               "UserSecretStoreCallbacks layout changed; update the bindings");
@@ -802,6 +802,28 @@ extern "C" int32_t shareStoreRemoveChannel(void* userData, uint64_t secretId, ui
   return result.code;
 }
 
+/// `ShareStore.removeVersions(secretId, channelId, versions) -> void`
+extern "C" int32_t shareStoreRemoveVersions(void* userData, uint64_t secretId, uint64_t channelId,
+                                             const uint8_t* versionsJsonPtr, size_t versionsJsonLen) {
+  auto* self = static_cast<StoreBindings*>(userData);
+  // Kept alive past this call so the lambda handed to `callSync` — which the
+  // JavaScript CallInvoker's queue may still be holding after this object's
+  // owner has released its own reference — has somewhere safe to run.
+  auto keepAlive = self->shared_from_this();
+  std::vector<uint64_t> raw = parseUnsignedJsonArray(versionsJsonPtr, versionsJsonLen);
+  std::vector<uint32_t> versions(raw.begin(), raw.end());
+  CallResult result = keepAlive->bridge().callSync(
+      [keepAlive, secretId, channelId, versions](std::function<void(CallResult)> settle) {
+        jsi::Runtime& rt = keepAlive->runtime();
+        auto store = keepAlive->shareStore();
+        auto method = store->getPropertyAsFunction(rt, "removeVersions");
+        jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId), idVal(rt, channelId),
+                                                  jsi::Value(rt, u32VectorToJsArray(rt, versions)));
+        keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
+      });
+  return result.code;
+}
+
 /// `UserSecretStore.loadLatest(secretId) -> UserSecrets | null`
 extern "C" int32_t userSecretStoreLoadLatest(void* userData, uint64_t secretId, uint8_t** outPtr,
                                               size_t* outLen) {
@@ -1123,8 +1145,9 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
       shareStoreLoadAll,       // load_all
       shareStoreLatestVersion, // latest_version
       shareStoreSave,          // save
-      shareStoreRemoveChannel, // remove_channel
-      storeFreeBuffer,         // free_buffer
+      shareStoreRemoveChannel,  // remove_channel
+      shareStoreRemoveVersions, // remove_versions
+      storeFreeBuffer,          // free_buffer
   };
   bindings->userSecretCallbacks_ = UserSecretStoreCallbacks{
       self,                       // user_data
@@ -1170,6 +1193,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
   requireField(rt, bindings->shareCallbacks_.latest_version, "ShareStoreCallbacks.latest_version");
   requireField(rt, bindings->shareCallbacks_.save, "ShareStoreCallbacks.save");
   requireField(rt, bindings->shareCallbacks_.remove_channel, "ShareStoreCallbacks.remove_channel");
+  requireField(rt, bindings->shareCallbacks_.remove_versions, "ShareStoreCallbacks.remove_versions");
   requireField(rt, bindings->shareCallbacks_.free_buffer, "ShareStoreCallbacks.free_buffer");
 
   requireField(rt, bindings->userSecretCallbacks_.user_data, "UserSecretStoreCallbacks.user_data");

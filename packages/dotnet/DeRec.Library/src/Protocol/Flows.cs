@@ -220,6 +220,17 @@ public sealed record ReplicaDiscoveryParams;
 /// <c>ReplicaRemovedEvent</c> fires. A group with no secret to publish
 /// therefore cannot complete a removal.
 /// </para>
+/// <para>
+/// Any member may remove any member, the source included: a lost or stolen
+/// source must be removable by the devices that remain, and the library checks
+/// no role. Ask the user before starting this flow, above all when it names the
+/// source. Removing the source promotes the first remaining member in the order
+/// <c>IChannelStore.ListReplicas</c> returns. The removed member is not asked
+/// and gets no event when told to leave: when a roster excluding it arrives it
+/// drops its whole <c>secret_id</c> partition and emits
+/// <see cref="SelfRemovedFromGroupEvent"/>. The secret survives on the
+/// remaining members and the helpers.
+/// </para>
 /// </remarks>
 public sealed record UnpairReplicaParams
 {
@@ -416,6 +427,20 @@ public sealed record ShareVerifiedEvent : DeRecEvent
     public required uint Version { get; init; }
 }
 
+/// <summary>
+/// A helper refused a verification challenge: its response carried a non-OK
+/// <c>Status</c> instead of a proof. The challenge is spent; a new
+/// <c>VerifyShares</c> round challenges the helper again.
+/// </summary>
+public sealed record ShareVerifyRejectedEvent : DeRecEvent
+{
+    public override string EventType => "ShareVerifyRejected";
+    public required ulong ChannelId { get; init; }
+    public required uint Version { get; init; }
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
+    public required string Memo { get; init; }
+}
+
 public sealed record DiscoveredSecretVersion(uint Version, string Description);
 
 public sealed record DiscoveredSecret(ulong SecretId, IReadOnlyList<DiscoveredSecretVersion> Versions);
@@ -569,7 +594,8 @@ public sealed record ReplicaSourceChangedEvent : DeRecEvent
 /// <summary>
 /// This device left the group and dropped its whole <c>SecretId</c>
 /// partition. Fires only once it was told to leave and has since seen a
-/// roster excluding it.
+/// roster excluding it. The teardown is automatic: this device is not asked
+/// first and gets no earlier event.
 /// </summary>
 public sealed record SelfRemovedFromGroupEvent : DeRecEvent
 {
@@ -631,6 +657,11 @@ public sealed record ReplicaSecretInstalledEvent : DeRecEvent
 /// state with <c>FlowKind.ProtectSecret</c> writes the next version, which
 /// supersedes both on every member and helper.
 /// </para>
+/// <para>
+/// Until then, do not publish from this device: any further
+/// <c>ProtectSecret</c> is a higher version that every other member applies
+/// over its own copy, losing the change it never merged.
+/// </para>
 /// </summary>
 public sealed record ReplicaVersionConflictEvent : DeRecEvent
 {
@@ -660,8 +691,11 @@ public sealed record ReplicaVersionConflictEvent : DeRecEvent
 /// <summary>
 /// A group member refused a secret sync. Keyed by <c>ReplicaId</c>, not
 /// <c>ChannelId</c>: every member answers on the one group channel.
-/// A <c>VERSION_CONFLICT</c> status means the round must be resolved and
-/// republished at a new version.
+/// A <c>VERSION_CONFLICT</c> status means another member holds a different
+/// copy of this version: do not publish from this device again until the
+/// conflict is resolved. Run <c>FlowKind.ReplicaDiscovery</c> to receive the
+/// group's copy as <see cref="ReplicaVersionConflictEvent"/>, merge, and
+/// publish the result once with <c>FlowKind.ProtectSecret</c>.
 /// </summary>
 public sealed record ReplicaSyncRejectedEvent : DeRecEvent
 {
@@ -1003,6 +1037,13 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
+            },
+            "ShareVerifyRejected" => new ShareVerifyRejectedEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Version = root.GetProperty("version").GetUInt32(),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
+                Memo = root.GetProperty("memo").GetString() ?? string.Empty,
             },
             "SecretsDiscovered" => ParseSecretsDiscovered(root),
             "RecoveryShareReceived" => new RecoveryShareReceivedEvent

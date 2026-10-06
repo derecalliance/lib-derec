@@ -66,6 +66,12 @@ impl<
     /// two sides holding different shared keys, and so different fingerprints.
     /// Compare the two values out of band before calling this.
     ///
+    /// On a replica destination, confirming is also the decision to adopt
+    /// the group's vault: once the channel is `Paired`, the source's publish
+    /// is installed into this device's stores as it arrives, with no further
+    /// prompt. Ask the user whether to adopt before calling this; to decline,
+    /// never confirm, and the channel stays `Pending` and is never used.
+    ///
     /// A match promotes every row on the channel, not just the peer that was
     /// confirmed: on a group channel that is every member and this device's
     /// own row, so the whole group becomes usable at once and the roster stays

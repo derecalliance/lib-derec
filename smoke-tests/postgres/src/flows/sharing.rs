@@ -179,5 +179,54 @@ pub async fn run() {
     assert_eq!(v2_snapshot.secrets[0].data, payload_v2);
     println!("  v2 publish: latest_version=2, user_secrets upserted in place  ✓");
 
+    for version in [3u32, 4] {
+        protect_secret(
+            &mut owner,
+            &mut [&mut helper_a, &mut helper_b],
+            UserSecret {
+                id: vec![0x01],
+                name: "smoke".to_owned(),
+                data: format!("postgres-shared-secret-v{version}").into_bytes(),
+            },
+            "keepList publish",
+        )
+        .await;
+    }
+    for (name, db, channel_id) in [
+        ("HelperA", helper_a_db.client(), cid_a),
+        ("HelperB", helper_b_db.client(), cid_b),
+    ] {
+        let store = PostgresShareStore::new(db.clone());
+        let mut versions: Vec<u32> = store
+            .load(DEFAULT_TEST_SECRET_ID, channel_id, &[])
+            .await
+            .expect("share load failed")
+            .into_iter()
+            .map(|share| share.version)
+            .collect();
+        versions.sort_unstable();
+        assert_eq!(
+            versions,
+            vec![2, 3, 4],
+            "{name}: v4 carries keepList [2, 3, 4], so the v1 row must be deleted"
+        );
+
+        let mut store = store;
+        store
+            .remove_versions(DEFAULT_TEST_SECRET_ID, channel_id, &[2, 99])
+            .await
+            .expect("remove_versions failed");
+        store
+            .remove_versions(DEFAULT_TEST_SECRET_ID, channel_id, &[2])
+            .await
+            .expect("remove_versions must be idempotent");
+        assert_eq!(
+            count_shares_for_channel(&db, DEFAULT_TEST_SECRET_ID, channel_id.0).await,
+            2,
+            "{name}: remove_versions drops exactly the listed stored versions"
+        );
+    }
+    println!("  v4 keepList pruned v1 on every helper; remove_versions is idempotent  ✓");
+
     println!("✓ Sharing flow passed.\n");
 }

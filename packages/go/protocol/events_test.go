@@ -336,6 +336,20 @@ func TestDecodeEvents_ShareVerified(t *testing.T) {
 	}
 }
 
+func TestDecodeEvents_ShareVerifyRejected(t *testing.T) {
+	ev := decodeOne(t, `{
+		"type": "ShareVerifyRejected",
+		"channel_id": "11",
+		"version": 2,
+		"status": 6,
+		"memo": "no stored share"
+	}`)
+	if ev.Type != EventTypeShareVerifyRejected || ev.ChannelID != 11 || ev.Version == nil || *ev.Version != 2 ||
+		ev.Status != derecpb.StatusEnum_UNKNOWN_SHARE_VERSION || ev.Memo != "no stored share" {
+		t.Fatalf("got %+v", ev)
+	}
+}
+
 func TestDecodeEvents_SecretsDiscovered(t *testing.T) {
 	ev := decodeOne(t, `{
 		"type": "SecretsDiscovered",

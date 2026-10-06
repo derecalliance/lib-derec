@@ -70,6 +70,7 @@ internal static class Protocol
         RunOrchestratorCommunicationInfoPairTest();
         RunStateKeyVersionTest();
         RunOrchestratorSharingRoundKeyTest();
+        RunHelperKeepListPrunesShareStoreTest();
         RunLibraryDefaultThresholdTest();
         RunOrchestratorHashedKeysPairFlowTest();
         RunOrchestratorNoKeysPairFlowTest();
@@ -629,6 +630,60 @@ internal static class Protocol
         Console.WriteLine("  round completes after both confirmations  ✓");
 
         Console.WriteLine("Orchestrator SharingRound key round-trip test passed.\n");
+    }
+
+    /// <summary>
+    /// A helper applies each request's <c>keepList</c> through
+    /// <see cref="IShareStore.RemoveVersions"/>. With the default keep count
+    /// of 3, the v4 publish carries <c>keepList [2, 3, 4]</c>, so v1 must
+    /// leave the helper's store and nothing else may.
+    /// </summary>
+    private static void RunHelperKeepListPrunesShareStoreTest()
+    {
+        Console.WriteLine("=== Helper keepList prunes the share store ===");
+
+        const ulong secretId = 0x6262UL;
+        using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions(SecretId: secretId));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com", new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com", new NodeOptions(SecretId: secretId));
+        DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 21UL);
+        DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 22UL);
+
+        var helpersByUri = new Dictionary<string, Node>
+        {
+            ["https://helper-a.example.com"] = helperA,
+            ["https://helper-b.example.com"] = helperB,
+        };
+        for (var round = 1; round <= 4; round++)
+        {
+            owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+            {
+                Secrets = new[]
+                {
+                    new UserSecret { Id = new byte[] { 0x03 }, Name = "kept", Data = Encoding.UTF8.GetBytes($"round-{round}") },
+                },
+                Description = $"round {round}",
+            }).GetAwaiter().GetResult();
+            foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
+            {
+                var h = helpersByUri[uri];
+                h.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+                owner.Protocol.ProcessAndAcceptAllAsync(h.Transport.DrainOne()).GetAwaiter().GetResult();
+            }
+        }
+
+        foreach (var h in new[] { helperA, helperB })
+        {
+            var versions = h.ShareStore.StoredVersions(secretId);
+            if (!versions.SequenceEqual(new uint[] { 2, 3, 4 }))
+                throw new InvalidOperationException(
+                    $"helper must keep exactly versions [2, 3, 4]; got [{string.Join(", ", versions)}]");
+            if (!h.ShareStore.RemoveVersionsCalls.Any(c => c.SecretId == secretId && c.Versions.SequenceEqual(new uint[] { 1 })))
+                throw new InvalidOperationException("RemoveVersions must reach the app store with [1]");
+        }
+        Console.WriteLine("  v4 keepList removed v1 via RemoveVersions on both helpers  ✓");
+
+        Console.WriteLine("Helper keepList test passed.\n");
     }
 
     /// <summary>
@@ -1323,6 +1378,8 @@ internal static class Protocol
         {
             ("""{ "type": "ShareRejected", "channel_id": "1", "version": 1, "status": 3, "memo": "m" }""",
                 e => ((ShareRejectedEvent)e).Status),
+            ("""{ "type": "ShareVerifyRejected", "channel_id": "1", "version": 1, "status": 3, "memo": "m" }""",
+                e => ((ShareVerifyRejectedEvent)e).Status),
             ("""{ "type": "UnpairRejected", "channel_id": "1", "status": 3, "memo": "m" }""",
                 e => ((UnpairRejectedEvent)e).Status),
             ("""{ "type": "PrePairRejected", "channel_id": "1", "status": 3, "memo": "m" }""",

@@ -253,6 +253,17 @@ export interface ShareStore {
   save(secretId: string, channelId: string, share: Share): Promise<void>;
   latestVersion(secretId: string): Promise<number | null>;
   removeChannel(secretId: string, channelId: string): Promise<void>;
+  /**
+   * Drop the shares stored under `(secretId, channelId)` at each of
+   * `versions`. Idempotent: a version that is not stored is skipped, and
+   * an empty array is a no-op.
+   *
+   * A helper calls this to apply `StoreShareRequestMessage.keepList`, the
+   * complete set of versions the owner wants retained: every stored
+   * version outside it is removed once the incoming share is persisted.
+   * Shares under other channels or partitions must be left untouched.
+   */
+  removeVersions(secretId: string, channelId: string, versions: number[]): Promise<void>;
 }
 
 export interface UserSecretEntry {
@@ -615,6 +626,15 @@ export interface Timeouts {
  *  are both read from the stores. The argument may be omitted entirely. */
 export type ReplicaDiscoveryParams = Record<string, never>;
 
+/** Any member may remove any member, the source included: a lost or stolen
+ *  source must be removable by the devices that remain, and the library
+ *  checks no role. Ask the user before starting this flow, above all when it
+ *  names the source. Removing the source promotes the first remaining member
+ *  in the order the channel store's `listReplicas` returns. The removed
+ *  member is not asked and gets no event when told to leave: when a roster
+ *  excluding it arrives it drops its whole `secret_id` partition and emits
+ *  `SelfRemovedFromGroup`. The secret survives on the remaining members and
+ *  the helpers. */
 export interface UnpairReplicaParams {
   /** The member to remove, as a **decimal** `u64` string — the same form
    *  `ReplicaPaired.peer_replica_id` hands back. A value naming no current
@@ -686,8 +706,11 @@ export type DeRecEvent =
   | { type: "SharingComplete"; version: number; confirmed_count: number; failed_count: number; threshold_met: boolean }
   /** A group member refused a secret sync. Keyed by `replica_id`, not
    *  `channel_id`: every member answers on the one group channel. A
-   *  `VERSION_CONFLICT` status means the round must be resolved and
-   *  republished at a new version. */
+   *  `VERSION_CONFLICT` status means another member holds a different copy
+   *  of this version: do not publish from this device again until the
+   *  conflict is resolved. Run `start(FlowKind.ReplicaDiscovery)` to receive
+   *  the group's copy as `ReplicaVersionConflict`, merge, and publish the
+   *  result once with `start(FlowKind.ProtectSecret)`. */
   | {
       type: "ReplicaSyncRejected";
       replica_id: string;
@@ -710,7 +733,8 @@ export type DeRecEvent =
   /** This device left the group and dropped its whole `secret_id` partition —
    *  group channel, helper channels, shares, secrets and the snapshot. Fires
    *  only once it was told to leave *and* has since seen a roster excluding
-   *  it; absence alone never destroys a copy of the secret. */
+   *  it; absence alone never destroys a copy of the secret. The teardown is
+   *  automatic: this device is not asked first and gets no earlier event. */
   | { type: "SelfRemovedFromGroup"; version: number }
   /** A replica catch-up finished. `fetched_from` is absent when this device
    *  was already current, in which case no hydration event follows. */
@@ -726,6 +750,10 @@ export type DeRecEvent =
    *  library keeps no durable per-member sync state. */
   | { type: "ReplicaSyncComplete"; version: number; synced: string[]; behind: string[] }
   | { type: "ShareVerified"; channel_id: string; version: number }
+  /** A helper refused a verification challenge: its response carried a
+   *  non-OK `status` instead of a proof. The challenge is spent; a new
+   *  `VerifyShares` round challenges the helper again. */
+  | { type: "ShareVerifyRejected"; channel_id: string; version: number; status: StatusEnum; memo: string }
   | {
       type: "SecretsDiscovered";
       channel_id: string;
@@ -911,7 +939,10 @@ export type DeRecEvent =
    *  `ReplicaSyncRejected`. Both copies are complete states — the held one
    *  is in the local stores, the incoming one is `secret`. Resolve by
    *  publishing the chosen state with `start(FlowKind.ProtectSecret)`; the
-   *  next version supersedes both on every member and helper.
+   *  next version supersedes both on every member and helper. Until then,
+   *  do not publish from this device: any further `ProtectSecret` is a
+   *  higher version that every other member applies over its own copy,
+   *  losing the change it never merged.
    *
    *  `held_author_replica_id` / `incoming_author_replica_id` are the
    *  decimal `replica_id` of each copy's publisher, or `null` when that
@@ -1388,6 +1419,11 @@ export declare class DeRecProtocol {
    * Verify `fingerprint` against the channel's locally-derived one. On
    * match, the channel transitions from `Pending` to `Paired`. Returns
    * `true` on confirmation, `false` on mismatch.
+   *
+   * On a replica destination, confirming is also the decision to adopt the
+   * group's vault: the source's publish is then installed as it arrives,
+   * with no further prompt. Ask the user before calling this; to decline,
+   * never confirm.
    */
   verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<boolean>;
   /**
@@ -1408,6 +1444,10 @@ export declare class DeRecProtocol {
    * Rebuild this protocol's `secret_id` namespace from a recovered
    * `Secret`. Mirrors the Rust `DeRecProtocol::restore` — pass the
    * typed `secret` carried by the `SecretRecovered` event verbatim.
+   *
+   * Recovery and restore are separate steps on purpose: `SecretRecovered`
+   * writes nothing. Show the user what was recovered, or ask them, before
+   * calling `restore`, which commits it to this device.
    *
    * A helper or member whose `transports` is empty gets no channel: it is
    * reported as a `PeerNotRestored` event in the returned array and the rest

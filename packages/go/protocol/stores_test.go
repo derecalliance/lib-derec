@@ -127,6 +127,9 @@ func (m *mockShareStore) Save(secretID, channelID uint64, share Share) error {
 func (m *mockShareStore) RemoveChannel(secretID, channelID uint64) error {
 	return nil
 }
+func (m *mockShareStore) RemoveVersions(secretID, channelID uint64, versions []uint32) error {
+	return nil
+}
 
 var _ ShareStore = (*mockShareStore)(nil)
 

@@ -313,6 +313,15 @@ func (s *memShareStore) RemoveChannel(secretID, channelID uint64) error {
 	return nil
 }
 
+func (s *memShareStore) RemoveVersions(secretID, channelID uint64, versions []uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, v := range versions {
+		delete(s.data, shareStoreKey{channelID, secretID, v})
+	}
+	return nil
+}
+
 var _ protocol.ShareStore = (*memShareStore)(nil)
 
 type memUserSecretStore struct {

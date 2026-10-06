@@ -474,6 +474,22 @@ pub trait DeRecShareStore {
     /// when an unpair flow tears down a channel. Idempotent.
     fn remove_channel(&mut self, secret_id: u64, channel_id: ChannelId)
     -> ShareStoreFuture<'_, ()>;
+
+    /// Drop the shares stored under `(secret_id, channel_id)` at each of
+    /// `versions`. Idempotent: a version that is not stored is skipped
+    /// and is not an error, and an empty slice is a no-op.
+    ///
+    /// Used by a Helper to apply `StoreShareRequestMessage.keepList`,
+    /// the complete set of versions the Owner wants retained: every
+    /// stored version outside it is removed once the incoming share is
+    /// persisted. Shares under other channels or other `secret_id`
+    /// partitions must be left untouched.
+    fn remove_versions(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, ()>;
 }
 
 /// Storage for the user-facing secret contents, keyed by `secret_id`.
@@ -903,6 +919,14 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for Box<T> {
     ) -> ShareStoreFuture<'_, ()> {
         (**self).remove_channel(secret_id, channel_id)
     }
+    fn remove_versions(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, ()> {
+        (**self).remove_versions(secret_id, channel_id, versions)
+    }
 }
 
 impl<T: DeRecUserSecretStore + ?Sized> DeRecUserSecretStore for Box<T> {
@@ -1060,6 +1084,14 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for &mut T {
         channel_id: ChannelId,
     ) -> ShareStoreFuture<'_, ()> {
         (**self).remove_channel(secret_id, channel_id)
+    }
+    fn remove_versions(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, ()> {
+        (**self).remove_versions(secret_id, channel_id, versions)
     }
 }
 

@@ -261,6 +261,29 @@ pub(in crate::protocol) struct SharingRoundResult {
         )
     )
 )]
+/// Helper side of a `StoreShareRequestMessage`: persist the incoming
+/// share, apply the request's `keepList`, and acknowledge.
+///
+/// # Retention (`keepList`)
+///
+/// A non-empty `keepList` is the complete set of versions the Owner wants
+/// retained on this channel; every other version stored under
+/// `(secret_id, channel_id)` is removed via
+/// [`DeRecShareStore::remove_versions`](crate::protocol::DeRecShareStore::remove_versions)
+/// once the incoming share is persisted.
+///
+/// - An empty `keepList` retains every stored version plus the new one.
+/// - A request whose `version` is older than the latest version already
+///   stored on this channel has its `keepList` ignored, so a replayed or
+///   delayed request can never delete newer shares.
+/// - The version carried by the request is never removed, even when the
+///   `keepList` omits it: deleting the share this very request stores
+///   would acknowledge a share the Helper no longer holds.
+///
+/// "Latest" is scoped to this channel rather than to
+/// [`DeRecShareStore::latest_version`](crate::protocol::DeRecShareStore::latest_version),
+/// which spans every channel of the partition and would let one Owner's
+/// newer version suppress another Owner's `keepList`.
 pub(in crate::protocol) async fn accept<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -270,7 +293,20 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     let channel_id = exchange.channel_id;
     let secret_id = local.secret_id;
     let version = request.version;
+    let keep_list = &request.keep_list;
     let encoded_request = request.encode_to_vec();
+
+    // Applying a `keepList` needs every version stored on the channel;
+    // otherwise only the incoming version is needed for the check below.
+    let versions_to_load: &[u32] = if keep_list.is_empty() {
+        std::slice::from_ref(&version)
+    } else {
+        &[]
+    };
+    let stored_on_channel = stores
+        .shares
+        .load(secret_id, channel_id, versions_to_load)
+        .await?;
 
     // A version has exactly one writer, so an existing entry at this
     // version is either that writer re-sending the identical envelope —
@@ -284,11 +320,8 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     //
     // Enforced here rather than delegated to store implementations so
     // every binding inherits one rule.
-    let already_stored = stores
-        .shares
-        .load(secret_id, channel_id, &[version])
-        .await?
-        .into_iter()
+    let already_stored = stored_on_channel
+        .iter()
         .find(|stored| stored.version == version);
 
     match already_stored {
@@ -336,6 +369,32 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
                     },
                 )
                 .await?;
+        }
+    }
+
+    let is_latest = stored_on_channel
+        .iter()
+        .all(|stored| stored.version <= version);
+    if !keep_list.is_empty() && is_latest {
+        let stale: Vec<u32> = stored_on_channel
+            .iter()
+            .map(|stored| stored.version)
+            .filter(|v| *v != version && !keep_list.contains(v))
+            .collect();
+        if !stale.is_empty() {
+            stores
+                .shares
+                .remove_versions(secret_id, channel_id, &stale)
+                .await?;
+
+            #[cfg(feature = "logging")]
+            tracing::debug!(
+                channel_id = channel_id.0,
+                secret_id = secret_id,
+                version = version,
+                removed = ?stale,
+                "share versions outside keepList removed"
+            );
         }
     }
 
@@ -1218,6 +1277,161 @@ mod tests {
         });
     }
 
+    const KEEP_SECRET_ID: u64 = 0xA11CE;
+    const KEEP_CHANNEL: ChannelId = ChannelId(11);
+    const KEEP_KEY: SharedKey = [42u8; 32];
+
+    fn store_request(version: u32, keep_list: &[u32]) -> derec_proto::StoreShareRequestMessage {
+        let split = request::split(
+            &[KEEP_CHANNEL, ChannelId(12)],
+            KEEP_SECRET_ID,
+            version,
+            format!("secret at version {version}").as_bytes(),
+            2,
+        )
+        .expect("split secret");
+        let committed = split.shares.get(&KEEP_CHANNEL).expect("share");
+        let produced = request::produce(
+            KEEP_CHANNEL,
+            version,
+            KEEP_SECRET_ID,
+            committed,
+            keep_list,
+            "",
+            &KEEP_KEY,
+            &[],
+        )
+        .expect("produce request");
+        request::extract(&produced.envelope, &KEEP_KEY)
+            .expect("extract request")
+            .request
+    }
+
+    async fn accept_version(rig: &mut StoreRig, version: u32, keep_list: &[u32]) {
+        accept_request(rig, &store_request(version, keep_list)).await;
+    }
+
+    async fn accept_request(rig: &mut StoreRig, request: &derec_proto::StoreShareRequestMessage) {
+        let lf = LocalFixture::new(KEEP_SECRET_ID);
+        let events = super::accept(
+            &mut rig.stores(),
+            &lf.local(),
+            &Exchange {
+                channel_id: KEEP_CHANNEL,
+                shared_key: &KEEP_KEY,
+                trace_id: 1,
+            },
+            request,
+        )
+        .await
+        .expect("accept stores share");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [crate::protocol::DeRecEvent::ShareStored { .. }]
+            ),
+            "every request in these scenarios is acknowledged as stored"
+        );
+    }
+
+    async fn keep_rig_with_versions(versions: &[u32]) -> StoreRig {
+        let mut rig = StoreRig::new();
+        seed_owner_channel(&mut rig.channels, KEEP_SECRET_ID, KEEP_CHANNEL).await;
+        for v in versions {
+            accept_version(&mut rig, *v, &[]).await;
+        }
+        rig
+    }
+
+    fn stored_versions(rig: &StoreRig) -> Vec<u32> {
+        let mut versions: Vec<u32> = rig
+            .shares
+            .data
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(s, c, _)| *s == KEEP_SECRET_ID && *c == KEEP_CHANNEL.0)
+            .map(|(_, _, v)| *v)
+            .collect();
+        versions.sort_unstable();
+        versions
+    }
+
+    /// `keepList` is the complete set of versions to retain: every stored
+    /// version outside it is deleted once the new share is stored.
+    #[test]
+    fn accept_deletes_versions_outside_the_keep_list() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[1, 2, 3]).await;
+            accept_version(&mut rig, 4, &[3, 4]).await;
+            assert_eq!(stored_versions(&rig), vec![3, 4]);
+        });
+    }
+
+    /// An empty `keepList` retains every existing version plus the new one.
+    #[test]
+    fn accept_with_an_empty_keep_list_keeps_every_version() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[1, 2, 3]).await;
+            accept_version(&mut rig, 4, &[]).await;
+            assert_eq!(stored_versions(&rig), vec![1, 2, 3, 4]);
+        });
+    }
+
+    /// A request older than the latest stored version must have its
+    /// `keepList` ignored, so a replay cannot delete newer shares.
+    #[test]
+    fn accept_ignores_the_keep_list_of_an_older_version() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[1, 3, 4]).await;
+            accept_version(&mut rig, 2, &[2]).await;
+            assert_eq!(stored_versions(&rig), vec![1, 2, 3, 4]);
+        });
+    }
+
+    /// The share carried by the request is kept even when its own version
+    /// is missing from the `keepList`, including on an idempotent re-send
+    /// where that version is already stored.
+    #[test]
+    fn accept_never_deletes_the_incoming_version() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[1, 2, 3]).await;
+            let request = store_request(4, &[3]);
+            accept_request(&mut rig, &request).await;
+            assert_eq!(stored_versions(&rig), vec![3, 4]);
+            accept_request(&mut rig, &request).await;
+            assert_eq!(stored_versions(&rig), vec![3, 4]);
+        });
+    }
+
+    /// The `keepList` only governs the channel it arrived on.
+    #[test]
+    fn accept_keep_list_leaves_other_channels_untouched() {
+        run_async(async {
+            use crate::protocol::DeRecShareStore;
+            let mut rig = keep_rig_with_versions(&[1, 2]).await;
+            let other = crate::protocol::types::Share {
+                secret_id: KEEP_SECRET_ID,
+                version: 1,
+                bytes: vec![1, 2, 3],
+            };
+            rig.shares
+                .save(KEEP_SECRET_ID, ChannelId(99), other)
+                .await
+                .expect("seed other channel");
+            accept_version(&mut rig, 3, &[3]).await;
+            assert_eq!(stored_versions(&rig), vec![3]);
+            assert!(
+                rig.shares
+                    .data
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(KEEP_SECRET_ID, 99, 1)),
+                "a share on another channel must survive"
+            );
+        });
+    }
+
     /// Both conflict tests need a channel record so `accept` can resolve
     /// a response endpoint.
     async fn seed_owner_channel(
@@ -2013,25 +2227,26 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
     let author_replica_id = composite.author_replica_id;
     let channel_id = ChannelId(secret.replicas.as_ref().map_or(0, |g| g.channel_id));
 
-    let is_install = match replica::arrival(stores, local, version, author_replica_id).await? {
-        replica::Arrival::Apply { is_install } => is_install,
-        replica::Arrival::Resend | replica::Arrival::Stale => {
-            return Ok(vec![DeRecEvent::NoOp]);
-        }
-        replica::Arrival::Conflict {
-            held_author_replica_id,
-        } => {
-            return Ok(vec![DeRecEvent::ReplicaVersionConflict {
-                channel_id,
-                from_replica_id,
-                secret_id,
-                version,
+    let is_install =
+        match replica::arrival(stores, local, version, author_replica_id, &secret.secrets).await? {
+            replica::Arrival::Apply { is_install } => is_install,
+            replica::Arrival::Resend | replica::Arrival::Stale => {
+                return Ok(vec![DeRecEvent::NoOp]);
+            }
+            replica::Arrival::Conflict {
                 held_author_replica_id,
-                incoming_author_replica_id: author_replica_id,
-                secret,
-            }]);
-        }
-    };
+            } => {
+                return Ok(vec![DeRecEvent::ReplicaVersionConflict {
+                    channel_id,
+                    from_replica_id,
+                    secret_id,
+                    version,
+                    held_author_replica_id,
+                    incoming_author_replica_id: author_replica_id,
+                    secret,
+                }]);
+            }
+        };
 
     replica::hydrate(
         stores,

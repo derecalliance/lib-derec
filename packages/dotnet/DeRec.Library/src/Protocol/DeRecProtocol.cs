@@ -49,6 +49,7 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.ShareStoreLatestVersionDelegate _shareLatest;
     private readonly NP.ShareStoreSaveDelegate _shareSave;
     private readonly NP.ShareStoreRemoveChannelDelegate _shareRemoveChannel;
+    private readonly NP.ShareStoreRemoveVersionsDelegate _shareRemoveVersions;
     private readonly NP.FreeBufferDelegate _shareFreeBuffer;
     private readonly NP.UserSecretStoreLoadLatestDelegate _userSecretLoadLatest;
     private readonly NP.UserSecretStoreSaveLatestDelegate _userSecretSaveLatest;
@@ -135,6 +136,7 @@ public sealed class DeRecProtocol : IDisposable
         _shareLatest = ShareLatestVersionImpl;
         _shareSave = ShareSaveImpl;
         _shareRemoveChannel = ShareRemoveChannelImpl;
+        _shareRemoveVersions = ShareRemoveVersionsImpl;
         _shareFreeBuffer = FreeBufferImpl;
 
         _userSecretLoadLatest = UserSecretLoadLatestImpl;
@@ -180,6 +182,7 @@ public sealed class DeRecProtocol : IDisposable
             LatestVersion = Marshal.GetFunctionPointerForDelegate(_shareLatest),
             Save = Marshal.GetFunctionPointerForDelegate(_shareSave),
             RemoveChannel = Marshal.GetFunctionPointerForDelegate(_shareRemoveChannel),
+            RemoveVersions = Marshal.GetFunctionPointerForDelegate(_shareRemoveVersions),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_shareFreeBuffer),
         };
         var userSecretCb = new NP.UserSecretStoreCallbacks
@@ -302,6 +305,12 @@ public sealed class DeRecProtocol : IDisposable
     /// one. On match, transitions the channel from <c>Pending</c> to
     /// <c>Paired</c>. Returns <c>true</c> on match, <c>false</c> on
     /// mismatch.
+    /// <para>
+    /// On a replica destination, confirming is also the decision to adopt
+    /// the group's vault: the source's publish is then installed as it
+    /// arrives, with no further prompt. Ask the user before calling this; to
+    /// decline, never confirm.
+    /// </para>
     /// </summary>
     public Task<bool> VerifyFingerprintAsync(ulong channelId, string fingerprint)
     {
@@ -534,6 +543,12 @@ public sealed class DeRecProtocol : IDisposable
     /// pass it verbatim. A helper or member whose transports list is empty
     /// gets no channel: it is reported as a <see cref="PeerNotRestoredEvent"/>
     /// in the returned list and the rest of the roster is restored.
+    /// <para>
+    /// Recovery and restore are separate steps on purpose:
+    /// <see cref="SecretRecoveredEvent"/> writes nothing. Show the user what
+    /// was recovered, or ask them, before calling this, which commits it to
+    /// this device.
+    /// </para>
     /// </summary>
     /// <exception cref="DeRecException">
     /// Thrown with <see cref="DeRecCode.AlreadyRestored"/>,
@@ -1022,6 +1037,19 @@ public sealed class DeRecProtocol : IDisposable
     private int ShareRemoveChannelImpl(IntPtr userData, ulong secretId, ulong channelId)
     {
         try { _shareStore.RemoveChannel(secretId, channelId); return 0; }
+        catch { return -1; }
+    }
+
+    private int ShareRemoveVersionsImpl(
+        IntPtr userData, ulong secretId, ulong channelId,
+        IntPtr versionsJsonPtr, UIntPtr versionsJsonLen)
+    {
+        try
+        {
+            uint[] versions = DeserializeJsonArray<uint>(versionsJsonPtr, versionsJsonLen) ?? Array.Empty<uint>();
+            _shareStore.RemoveVersions(secretId, channelId, versions);
+            return 0;
+        }
         catch { return -1; }
     }
 

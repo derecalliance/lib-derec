@@ -37,10 +37,10 @@ use prost::Message;
 pub(in crate::protocol) enum Arrival {
     /// Newer than what is held, or nothing is held: hydrate it.
     Apply { is_install: bool },
-    /// The held version, from the same author: a re-send. Nothing to write.
+    /// The held version, re-sent: nothing to write.
     Resend,
-    /// The held version from a different author, or from an unknown one: two
-    /// members published the same version.
+    /// The held version with different contents: two members published the
+    /// same version.
     Conflict { held_author_replica_id: Option<u64> },
     /// Older than what is held.
     Stale,
@@ -50,13 +50,16 @@ pub(in crate::protocol) enum Arrival {
 ///
 /// A version is identified by who published it, not by its bytes: the same
 /// author re-sending a version may carry a roster that has since changed.
-/// When either author is unknown the two copies cannot be told apart, and
-/// they are reported as a conflict rather than silently merged.
+/// A held version with no recorded author — one restored from recovery, or
+/// published before the device had a replica id — is identified by its user
+/// secrets instead: the same secrets are a re-send, different ones a
+/// conflict.
 pub(in crate::protocol) async fn arrival<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     version: u32,
     incoming_author_replica_id: Option<u64>,
+    incoming_secrets: &[crate::protocol::types::UserSecret],
 ) -> Result<Arrival> {
     let Some(held) = stores.user_secrets.load_latest(local.secret_id).await? else {
         return Ok(Arrival::Apply { is_install: true });
@@ -65,8 +68,10 @@ pub(in crate::protocol) async fn arrival<S: StoreSet>(
         std::cmp::Ordering::Greater => Arrival::Apply { is_install: false },
         std::cmp::Ordering::Less => Arrival::Stale,
         std::cmp::Ordering::Equal
-            if held.author_replica_id.is_some()
-                && held.author_replica_id == incoming_author_replica_id =>
+            if match held.author_replica_id {
+                Some(author) => Some(author) == incoming_author_replica_id,
+                None => held.secrets == incoming_secrets,
+            } =>
         {
             Arrival::Resend
         }
@@ -349,61 +354,62 @@ async fn on_request<S: StoreSet>(
 
     // Decided before hydration writes the snapshot that would erase the
     // distinction between install, update and conflict.
-    let is_install = match arrival(stores, local, version, author_replica_id).await? {
-        Arrival::Apply { is_install } => is_install,
-        Arrival::Resend => {
-            answer(
-                stores,
-                local,
-                channel,
-                &request,
-                (channel.channel_id, shared_key),
-                StatusEnum::Ok,
-                "",
-                inbound_trace_id,
-            )
-            .await?;
-            return Ok(vec![DeRecEvent::NoOp]);
-        }
-        Arrival::Conflict {
-            held_author_replica_id,
-        } => {
-            answer(
-                stores,
-                local,
-                channel,
-                &request,
-                (channel.channel_id, shared_key),
-                StatusEnum::VersionConflict,
-                "a different copy of this version is already held",
-                inbound_trace_id,
-            )
-            .await?;
-            return Ok(vec![DeRecEvent::ReplicaVersionConflict {
-                channel_id: channel.channel_id,
-                from_replica_id,
-                secret_id,
-                version,
+    let is_install =
+        match arrival(stores, local, version, author_replica_id, &secret.secrets).await? {
+            Arrival::Apply { is_install } => is_install,
+            Arrival::Resend => {
+                answer(
+                    stores,
+                    local,
+                    channel,
+                    &request,
+                    (channel.channel_id, shared_key),
+                    StatusEnum::Ok,
+                    "",
+                    inbound_trace_id,
+                )
+                .await?;
+                return Ok(vec![DeRecEvent::NoOp]);
+            }
+            Arrival::Conflict {
                 held_author_replica_id,
-                incoming_author_replica_id: author_replica_id,
-                secret,
-            }]);
-        }
-        Arrival::Stale => {
-            answer(
-                stores,
-                local,
-                channel,
-                &request,
-                (channel.channel_id, shared_key),
-                StatusEnum::VersionConflict,
-                "a newer version is already held",
-                inbound_trace_id,
-            )
-            .await?;
-            return Ok(vec![DeRecEvent::NoOp]);
-        }
-    };
+            } => {
+                answer(
+                    stores,
+                    local,
+                    channel,
+                    &request,
+                    (channel.channel_id, shared_key),
+                    StatusEnum::VersionConflict,
+                    "a different copy of this version is already held",
+                    inbound_trace_id,
+                )
+                .await?;
+                return Ok(vec![DeRecEvent::ReplicaVersionConflict {
+                    channel_id: channel.channel_id,
+                    from_replica_id,
+                    secret_id,
+                    version,
+                    held_author_replica_id,
+                    incoming_author_replica_id: author_replica_id,
+                    secret,
+                }]);
+            }
+            Arrival::Stale => {
+                answer(
+                    stores,
+                    local,
+                    channel,
+                    &request,
+                    (channel.channel_id, shared_key),
+                    StatusEnum::VersionConflict,
+                    "a newer version is already held",
+                    inbound_trace_id,
+                )
+                .await?;
+                return Ok(vec![DeRecEvent::NoOp]);
+            }
+        };
 
     // The roster is the single source of truth for the group key. The
     // payload's own `shared_key` predates that and is now only a
@@ -1288,6 +1294,108 @@ mod tests {
                 );
                 assert_eq!(last_answer(&rig), (StatusEnum::Ok as i32, 2));
                 assert_eq!(held(&rig).await, (2, Some(B), "b".to_owned()));
+            });
+        }
+
+        /// A device holding `v2` with no recorded author, as after a restore,
+        /// installed through a catch-up whose payload names no author.
+        async fn rig_holding_authorless_v2() -> (LocalFixture, StoreRig) {
+            let lf = LocalFixture::with_replica(SECRET_ID, A);
+            let mut rig = StoreRig::new();
+            for (id, role) in [
+                (B, ReplicaRole::Source),
+                (A, ReplicaRole::Destination),
+                (C, ReplicaRole::Destination),
+            ] {
+                seed_member(&mut rig.channels, id, role, &format!("https://m{id}")).await;
+            }
+            let events = catch_up(&mut rig, &lf, &payload(2, None, "b")).await;
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [DeRecEvent::ReplicaSecretInstalled { .. }]
+                ),
+                "{events:?}"
+            );
+            assert_eq!(held(&rig).await, (2, None, "b".to_owned()));
+            (lf, rig)
+        }
+
+        async fn catch_up(
+            rig: &mut StoreRig,
+            lf: &LocalFixture,
+            payload: &ReplicaSecretPayload,
+        ) -> Vec<DeRecEvent> {
+            crate::protocol::handlers::sharing::hydrate_catch_up(
+                &mut rig.stores(),
+                &lf.local(),
+                B,
+                SECRET_ID,
+                payload.version,
+                &payload.encode_to_vec(),
+            )
+            .await
+            .expect("a catch-up is handled")
+        }
+
+        /// A held version with no recorded author is identified by its user
+        /// secrets: the same secrets pushed again are a re-send.
+        #[test]
+        fn the_same_secrets_resent_over_an_authorless_version_are_acknowledged() {
+            run_async(async {
+                let (lf, mut rig) = rig_holding_authorless_v2().await;
+
+                let events = deliver(&mut rig, &lf, B, push(B, &payload(2, Some(B), "b"))).await;
+
+                assert!(
+                    matches!(events.as_slice(), [DeRecEvent::NoOp]),
+                    "{events:?}"
+                );
+                assert_eq!(last_answer(&rig), (StatusEnum::Ok as i32, 2));
+                assert_eq!(held(&rig).await, (2, None, "b".to_owned()));
+            });
+        }
+
+        /// The same authorless catch-up answered twice is one version, not two.
+        #[test]
+        fn a_repeated_authorless_catch_up_is_not_a_conflict() {
+            run_async(async {
+                let (lf, mut rig) = rig_holding_authorless_v2().await;
+
+                let events = catch_up(&mut rig, &lf, &payload(2, None, "b")).await;
+
+                assert!(
+                    matches!(events.as_slice(), [DeRecEvent::NoOp]),
+                    "{events:?}"
+                );
+                assert_eq!(held(&rig).await, (2, None, "b".to_owned()));
+            });
+        }
+
+        /// Different secrets at an authorless held version are still a rival
+        /// copy, reported and not written.
+        #[test]
+        fn different_secrets_over_an_authorless_version_are_a_conflict() {
+            run_async(async {
+                let (lf, mut rig) = rig_holding_authorless_v2().await;
+
+                let events = deliver(&mut rig, &lf, C, push(C, &payload(2, Some(C), "c"))).await;
+
+                match events.as_slice() {
+                    [
+                        DeRecEvent::ReplicaVersionConflict {
+                            held_author_replica_id,
+                            incoming_author_replica_id,
+                            ..
+                        },
+                    ] => {
+                        assert_eq!(*held_author_replica_id, None);
+                        assert_eq!(*incoming_author_replica_id, Some(C));
+                    }
+                    other => panic!("expected one ReplicaVersionConflict, got {other:?}"),
+                }
+                assert_eq!(last_answer(&rig), (StatusEnum::VersionConflict as i32, 2));
+                assert_eq!(held(&rig).await, (2, None, "b".to_owned()));
             });
         }
 

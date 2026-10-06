@@ -228,6 +228,10 @@ endpoint to a long-term one via `UpdateChannelInfo`. The ephemeral endpoint
 advertised in the `HashedKeys` contact is intended to be retired immediately
 after pairing.
 
+`UpdateChannelInfo` reaches helper channels only. A replica member that
+changes its endpoint or `CommunicationInfo` publishes a new version first,
+then updates its helpers; see [On a replica member](https://github.com/derecalliance/lib-derec/tree/main/library#on-a-replica-member).
+
 Catch the security-relevant binding-hash mismatch with a typed code:
 
 ```csharp
@@ -485,7 +489,7 @@ await helper.RejectAsync(action.Action,
 ```
 
 The answer arrives typed the same way: `Status` on `ShareRejectedEvent`,
-`UnpairRejectedEvent`, `PrePairRejectedEvent`,
+`ShareVerifyRejectedEvent`, `UnpairRejectedEvent`, `PrePairRejectedEvent`,
 `ChannelInfoUpdateRejectedEvent`, `ReplicaSyncRejectedEvent` and
 `ReplicaSecretAckedEvent` is that `StatusEnum`:
 

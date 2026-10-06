@@ -320,10 +320,11 @@ async fn step_4_rotate_helpers(
         "one version per admission; the recovered v2 has none"
     );
 
-    // Each helper holds exactly the versions published since it joined: the
-    // survivors have all four, spare #6 has v3 and v4, spare #7 only v4.
-    let expected_shares = [4, 4, 4, 2, 1];
-    for (helper, shares) in helpers.iter().zip(expected_shares) {
+    // Each helper holds the versions published since it joined, trimmed by
+    // v4's keepList [2, 3, 4]: the survivors drop v1 and keep three, spare #6
+    // has v3 and v4, spare #7 only v4.
+    for (i, helper) in helpers.iter().enumerate() {
+        let shares = helper_shares(i, 0);
         assert_tables(
             &helper.peer.client(),
             SECRET_ID,
@@ -1392,12 +1393,21 @@ fn assert_secrets_round_tripped(recovered: &Secret, expected: &[UserSecret], ste
     }
 }
 
-/// Share rows each helper holds as of step 4, in `helpers` order: the three
-/// survivors carry every version, spare #6 joined at v3 and spare #7 at v4.
-const HELPER_BASE_SHARES: [i64; 5] = [4, 4, 4, 2, 1];
+/// Versions each helper has received as of step 4, in `helpers` order: the
+/// three survivors every version, spare #6 from v3 and spare #7 from v4.
+const HELPER_VERSIONS_AT_STEP_4: [i64; 5] = [4, 4, 4, 2, 1];
 
-/// Assert every helper at once. Publishing is always a full round reaching all
-/// five, so each publish since step 4 adds exactly one row to each.
+/// Share rows helper `i` holds. Publishing is always a full round reaching all
+/// five, so each publish since step 4 delivers one more version to each; every
+/// publish also carries a keepList of the newest
+/// [`DEFAULT_KEEP_VERSIONS_COUNT`](derec_library::protocol::DEFAULT_KEEP_VERSIONS_COUNT)
+/// versions, and the helper deletes the rest.
+fn helper_shares(i: usize, publishes_since_step_4: i64) -> i64 {
+    let kept = derec_library::protocol::DEFAULT_KEEP_VERSIONS_COUNT as i64;
+    (HELPER_VERSIONS_AT_STEP_4[i] + publishes_since_step_4).min(kept)
+}
+
+/// Assert every helper at once.
 async fn assert_helpers(helpers: &[HelperDevice], step: &str, publishes_since_step_4: i64) {
     for (i, helper) in helpers.iter().enumerate() {
         assert_tables(
@@ -1408,7 +1418,7 @@ async fn assert_helpers(helpers: &[HelperDevice], step: &str, publishes_since_st
             Tables {
                 channels: 1,
                 secrets: 1,
-                shares: HELPER_BASE_SHARES[i] + publishes_since_step_4,
+                shares: helper_shares(i, publishes_since_step_4),
                 ..Default::default()
             },
         )

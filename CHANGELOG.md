@@ -7,6 +7,115 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
+### Unreleased
+
+Six defects found by the reference application's QA against 0.0.6.
+
+- **Fixed: admitting a second replica moved the group to the joiner's
+  channel.** *(bug fix; every SDK)*
+
+  When an existing member initiated the pairing, completing it re-pointed
+  that member's own roster row onto the joiner's channel, so every admission
+  redefined the group channel and its key, and earlier members stopped
+  receiving mirrors. A member already in a group now keeps its row; only a
+  device joining its first group moves onto the new channel.
+
+- **Fixed: `UpdateChannelInfo` refused a move to a transport the receiver
+  does not serve itself.** *(bug fix; every SDK)*
+
+  Following a peer to a new endpoint only needs the receiver to reach it, and
+  pairing never compares a peer's endpoints with the receiver's own. A device
+  serving only gRPC could pair with an HTTPS peer but not follow that peer's
+  move to a new HTTPS endpoint. The peer's endpoints are now filtered by the
+  transport policy alone, when the update is accepted, as in pairing.
+  `UpdateChannelInfoFailed` is now only an outbound dispatch failure.
+
+- **Fixed: one Pending channel aborted `UpdateChannelInfo`, `Discovery` and
+  `VerifyShares`.** *(bug fix; every SDK)*
+
+  A pairing that never completed leaves a Pending channel with no shared key,
+  and these flows targeted it anyway, so every later rename, address change,
+  discovery or verification failed with `missing_shared_key`. They now target
+  Paired channels only, as their documentation said; a Pending id named in a
+  target is dropped.
+
+- **Fixed: a replica reported an identical copy as a conflict when the
+  version it held had no author.** *(bug fix; every SDK)*
+
+  A version restored from recovery, or published before the device had a
+  replica id, carries no author, and a re-sent copy of it was reported as
+  `ReplicaVersionConflict` — "two replicas published different copies" —
+  though nothing differed. A held version with no author is now identified by
+  its user secrets: the same secrets are a re-send, different ones are still
+  a conflict. Versions with an author keep the author rule.
+
+- **Fixed: helpers ignored `keepList`.** *(bug fix; breaking — every share
+  store gains a method)*
+
+  `StoreShareRequest.keepList` is the complete set of versions a helper
+  should keep, and helpers kept every version forever instead. A helper now
+  deletes the versions a request's `keepList` does not name, when that
+  request is at least as new as anything it holds on the channel. An empty
+  `keepList` keeps everything, an older (replayed) request's list is ignored,
+  and the share the request carries is never deleted. Share stores implement
+  the new idempotent `remove_versions(secret_id, channel_id, versions)` —
+  .NET `IShareStore.RemoveVersions`, Go `ShareStore.RemoveVersions`,
+  TypeScript `ShareStore.removeVersions` — and the C ABI
+  `ShareStoreCallbacks` gains a `remove_versions` slot before `free_buffer`.
+
+- **Added: `ShareVerifyRejected { channel_id, version, status, memo }`.**
+  *(new event; every SDK)*
+
+  A helper that refused a verification challenge surfaced only as an error
+  from `process()`, with no event, so the owner could not tell which helper
+  said no. The refusal is now this event, mirroring `ShareRejected`. The
+  challenge is consumed; checking that helper again takes a new
+  `VerifyShares` round.
+
+- **Docs: what an application must do on a replica version conflict.**
+
+  The library README and the `ReplicaVersionConflict` / `ReplicaSyncRejected`
+  docs in every SDK now state the rule: once either event reports a conflict,
+  the device must not publish again until the user has resolved it, because a
+  further `ProtectSecret` is a higher version that replaces every other
+  member's copy. The README gives the steps — get the rival copy, merge,
+  publish once — and notes that a member that was offline while another
+  published reaches the same conflict without any simultaneous edit.
+
+- **Docs: where the application asks the user.**
+
+  Two decisions belong to the application, and the docs in every SDK now say
+  so. Recovery and restore are separate steps: `SecretRecovered` writes
+  nothing, so the application shows the recovered secret, or asks, before
+  calling `restore`. On a replica destination, confirming the fingerprint is
+  also the decision to adopt the group's vault — its publishes are installed
+  as they arrive — so the application asks before calling
+  `verify_fingerprint`, and declines by never confirming.
+
+- **Docs: who may remove a replica member, and what the removed one sees.**
+
+  `UnpairReplica` and `SelfRemovedFromGroup` in every SDK now state that any
+  member may remove any member, the source included — so a lost or stolen
+  source can be removed — with no role check, and that the application should
+  ask the user first. They name the successor rule (the first remaining member
+  in the channel store's replica order) and that the removed member is not
+  asked and gets no warning: its partition is dropped automatically when a
+  roster excluding it arrives, while the secret survives on the remaining
+  members and the helpers.
+
+- **Docs: how a replica member announces a new endpoint or
+  `communication_info`.**
+
+  `UpdateChannelInfo` reaches helper channels only; a replica member's values
+  travel in the roster. The library README now describes the procedure:
+  publish a new version, so every replica and the recoverable roster carry
+  the new values, then run `UpdateChannelInfo` against the helpers, keeping
+  the old endpoint serving until enough peers have the update. The
+  "Updating channel info post-pairing" section also drops its description of
+  a servability refusal that no longer exists, and the removed
+  `set_own_transport` / `transport_protocol` names. The SDK READMEs point to
+  the procedure.
+
 ### 0.0.6
 
 Two security fixes and fifteen defects. Every message on a channel was encrypted
