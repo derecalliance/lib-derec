@@ -229,6 +229,10 @@ impl DeRecShareStore for SqliteShareStore {
             .expect("share remove_versions failed");
         Box::pin(std::future::ready(Ok(())))
     }
+
+    fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+        Box::pin(std::future::ready(Ok(None)))
+    }
 }
 
 fn map_share_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Share> {

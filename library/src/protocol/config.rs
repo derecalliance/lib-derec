@@ -60,7 +60,6 @@ impl<
         transport: T,
         own_transports: Vec<TransportProtocol>,
         threshold: usize,
-        keep_versions_count: usize,
         timeouts: crate::protocol::types::Timeouts,
     ) -> Result<Self> {
         if threshold < 2 {
@@ -79,7 +78,6 @@ impl<
             own_transports,
             unpair_ack: UnpairAck::Required,
             threshold,
-            keep_versions_count,
             timeouts,
             unsafe_connection: false,
             communication_info: HashMap::new(),

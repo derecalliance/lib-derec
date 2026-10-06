@@ -391,6 +391,10 @@ impl DeRecShareStore for InMemoryShareStore {
             .retain(|(c, s, v), _| !(*c == cid && *s == secret_id && versions.contains(v)));
         Box::pin(std::future::ready(Ok(())))
     }
+
+    fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+        Box::pin(std::future::ready(Ok(None)))
+    }
 }
 
 #[derive(Default)]

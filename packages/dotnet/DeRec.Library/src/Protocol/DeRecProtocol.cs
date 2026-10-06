@@ -50,6 +50,7 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.ShareStoreSaveDelegate _shareSave;
     private readonly NP.ShareStoreRemoveChannelDelegate _shareRemoveChannel;
     private readonly NP.ShareStoreRemoveVersionsDelegate _shareRemoveVersions;
+    private readonly NP.ShareStoreKeepListDelegate _shareKeepList;
     private readonly NP.FreeBufferDelegate _shareFreeBuffer;
     private readonly NP.UserSecretStoreLoadLatestDelegate _userSecretLoadLatest;
     private readonly NP.UserSecretStoreSaveLatestDelegate _userSecretSaveLatest;
@@ -96,7 +97,6 @@ public sealed class DeRecProtocol : IDisposable
         ITransport transport,
         IReadOnlyList<TransportProtocol> ownTransports,
         int? threshold = null,
-        int? keepVersionsCount = null,
         Dictionary<string, string>? communicationInfo = null,
         bool? autoRespondOnFailure = null,
         UnpairAck? unpairAck = null,
@@ -137,6 +137,7 @@ public sealed class DeRecProtocol : IDisposable
         _shareSave = ShareSaveImpl;
         _shareRemoveChannel = ShareRemoveChannelImpl;
         _shareRemoveVersions = ShareRemoveVersionsImpl;
+        _shareKeepList = ShareKeepListImpl;
         _shareFreeBuffer = FreeBufferImpl;
 
         _userSecretLoadLatest = UserSecretLoadLatestImpl;
@@ -183,6 +184,7 @@ public sealed class DeRecProtocol : IDisposable
             Save = Marshal.GetFunctionPointerForDelegate(_shareSave),
             RemoveChannel = Marshal.GetFunctionPointerForDelegate(_shareRemoveChannel),
             RemoveVersions = Marshal.GetFunctionPointerForDelegate(_shareRemoveVersions),
+            KeepList = Marshal.GetFunctionPointerForDelegate(_shareKeepList),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_shareFreeBuffer),
         };
         var userSecretCb = new NP.UserSecretStoreCallbacks
@@ -216,7 +218,6 @@ public sealed class DeRecProtocol : IDisposable
             SecretId: secretId.ToString(System.Globalization.CultureInfo.InvariantCulture),
             OwnTransports: ownTransportsDto,
             Threshold: (uint?)threshold,
-            KeepVersionsCount: (uint?)keepVersionsCount,
             AutoRespondOnFailure: autoRespondOnFailure,
             UnpairAck: (int?)unpairAck,
             AutoReplyTo: autoReplyTo,
@@ -477,6 +478,11 @@ public sealed class DeRecProtocol : IDisposable
     /// Process an inbound envelope. Returns every <see cref="DeRecEvent"/>
     /// the orchestrator emits while handling it.
     /// </summary>
+    /// <exception cref="DeRecException">
+    /// The message failed. <see cref="DeRecException.ChannelId"/> names the
+    /// channel it arrived on, and <see cref="DeRecException.Events"/> carries
+    /// the events produced before the failure, which are not reported again.
+    /// </exception>
     public Task<IReadOnlyList<DeRecEvent>> ProcessAsync(byte[] message)
     {
         EnsureNotDisposed();
@@ -485,10 +491,15 @@ public sealed class DeRecProtocol : IDisposable
             var result = NP.derec_protocol_process(_handle, message, (UIntPtr)message.Length);
             try
             {
-                ThrowOnError(result.Error);
                 byte[] json = DeRec.Library.Utils.CopyBuffer(result.EventsJson);
-                return JsonSerializer.Deserialize<List<DeRecEvent>>(json, JsonOpts)
-                    ?? new List<DeRecEvent>();
+                var events = json.Length == 0
+                    ? new List<DeRecEvent>()
+                    : JsonSerializer.Deserialize<List<DeRecEvent>>(json, JsonOpts) ?? new List<DeRecEvent>();
+                DeRec.Library.Utils.ThrowIfError(
+                    result.Error,
+                    channelId: result.HasChannelId ? result.ChannelId : null,
+                    events: events);
+                return events;
             }
             finally
             {
@@ -1053,6 +1064,23 @@ public sealed class DeRecProtocol : IDisposable
         catch { return -1; }
     }
 
+    private int ShareKeepListImpl(
+        IntPtr userData, ulong secretId, uint version,
+        out IntPtr outPtr, out UIntPtr outLen)
+    {
+        try
+        {
+            byte[] json = JsonSerializer.SerializeToUtf8Bytes(_shareStore.KeepList(secretId, version), JsonOpts);
+            return WriteOut(json, out outPtr, out outLen);
+        }
+        catch
+        {
+            outPtr = IntPtr.Zero;
+            outLen = UIntPtr.Zero;
+            return -1;
+        }
+    }
+
     private int UserSecretLoadLatestImpl(
         IntPtr userData, ulong secretId,
         out IntPtr outPtr, out UIntPtr outLen)
@@ -1129,7 +1157,8 @@ public sealed class DeRecProtocol : IDisposable
         string[]? synced_replicas,
         string[]? behind_replicas,
         uint? local_version,
-        ReplicaDiscoveryReportDto[]? reported);
+        ReplicaDiscoveryReportDto[]? reported,
+        string[]? share_channels);
 
     private sealed record ReplicaDiscoveryReportDto(string replica_id, uint version);
 
@@ -1158,7 +1187,8 @@ public sealed class DeRecProtocol : IDisposable
         item.Reported?
             .OrderBy(r => r.Key)
             .Select(r => new ReplicaDiscoveryReportDto(r.Key.ToString(), r.Value))
-            .ToArray());
+            .ToArray(),
+        item.ShareChannels?.Select(c => c.ToString()).ToArray());
 
     private static StateItem FromDto(StateItemDto dto)
     {
@@ -1190,13 +1220,16 @@ public sealed class DeRecProtocol : IDisposable
         ulong[]? behindReplicas = dto.behind_replicas?
             .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
             .ToArray();
+        ulong[]? shareChannels = dto.share_channels?
+            .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
+            .ToArray();
         var reported = dto.reported?.ToDictionary(
             r => ulong.Parse(r.replica_id, System.Globalization.CultureInfo.InvariantCulture),
             r => r.version);
         return new StateItem(
             kind, channelId, secretId, dto.version, startedAt, dto.bytes, dto.shares,
             pending, confirmed, failed, pendingReplicas, syncedReplicas, behindReplicas,
-            dto.local_version, reported);
+            dto.local_version, reported, shareChannels);
     }
 
     private static StateKey ParseKeyBuffer(IntPtr ptr, UIntPtr len)
@@ -1412,7 +1445,6 @@ public sealed class DeRecProtocol : IDisposable
         [property: JsonPropertyName("secret_id")] string SecretId,
         [property: JsonPropertyName("own_transports")] List<TransportOfferDto> OwnTransports,
         [property: JsonPropertyName("threshold")] uint? Threshold,
-        [property: JsonPropertyName("keep_versions_count")] uint? KeepVersionsCount,
         [property: JsonPropertyName("auto_respond_on_failure")] bool? AutoRespondOnFailure,
         [property: JsonPropertyName("unpair_ack")] int? UnpairAck,
         [property: JsonPropertyName("auto_reply_to")] bool? AutoReplyTo,

@@ -244,7 +244,6 @@ impl<
             secrets,
             description,
             self.threshold,
-            self.keep_versions_count,
             round,
         )
         .await?

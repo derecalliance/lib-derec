@@ -314,6 +314,14 @@ class InMemoryShareStore implements ShareStore {
     for (const v of versions) byVersion.delete(v);
   }
 
+  keep: number[] | null = null;
+  readonly keepListCalls: Array<{ secretId: string; version: number }> = [];
+
+  async keepList(secretId: string, version: number): Promise<number[] | null> {
+    this.keepListCalls.push({ secretId, version });
+    return this.keep;
+  }
+
   async latestVersion(secretId: string): Promise<number | null> {
     return this.ownerVersions.get(secretId) ?? null;
   }
@@ -446,7 +454,6 @@ interface Node {
 }
 
 const THRESHOLD = 2;
-const KEEP_VERSIONS_COUNT = 3;
 const DEFAULT_TEST_SECRET_ID = 0xDE_2ECn;
 
 function makeNode(
@@ -478,7 +485,6 @@ function makeNode(
     .withStateStore(stateStore)
     .withTransport(transport)
     .withOwnTransports([{ uri: endpointUri, protocol: "https" }])
-    .withKeepVersionsCount(KEEP_VERSIONS_COUNT)
     .withCommunicationInfo({ name });
   if (!options.omitThreshold) {
     builder = builder.withThreshold(options.threshold ?? THRESHOLD);
@@ -1126,8 +1132,9 @@ async function runSharingFlow(): Promise<void> {
 
 
 // A helper applies each request's keepList through `ShareStore.removeVersions`.
-// With the default keep count of 3, the v4 publish carries keepList [2, 3, 4],
-// so v1 must leave every helper's store and nothing else may.
+// The owner's `keepList` returns null for v1 to v3, which sends an empty
+// keepList, and [2, 3] for v4, so the v4 publish carries keepList [2, 3, 4]
+// and v1 must leave every helper's store and nothing else may.
 async function runHelperKeepListFlow(): Promise<void> {
   console.log("=== [Protocol] Helper keepList Flow ===\n");
 
@@ -1143,6 +1150,7 @@ async function runHelperKeepListFlow(): Promise<void> {
     ["https://helper-b.example.com", [helperB, "HelperB", pairedB.longTermChannelId]],
   ]);
   for (let round = 1; round <= 4; round++) {
+    owner.shareStore.keep = round === 4 ? [2, 3] : null;
     await owner.protocol.start(FlowKind.ProtectSecret, {
       secrets: [{ id: new Uint8Array([3]), name: "kept", data: new TextEncoder().encode(`round-${round}`) }],
       description: `round ${round}`,
@@ -1171,6 +1179,59 @@ async function runHelperKeepListFlow(): Promise<void> {
   }
 
   console.log("\n✓ Helper keepList flow passed.\n");
+}
+
+/**
+ * The owner asks `ShareStore.keepList` once per round and sends its answer,
+ * plus the new version, to every helper. The app rolls back v2 by listing
+ * only v1 for v3, so both helpers end up holding exactly v1 and v3.
+ */
+async function runOwnerKeepListFlow(): Promise<void> {
+  console.log("=== [Protocol] Owner keepList Flow ===\n");
+
+  const secretId = 44n;
+  const owner = makeNode("Owner", "https://owner.example.com", { secretId });
+  const helperA = makeNode("HelperA", "https://helper-a.example.com", { secretId });
+  const helperB = makeNode("HelperB", "https://helper-b.example.com", { secretId });
+  const pairedA = await doPair(helperA, owner, 31n, "Owner↔HelperA");
+  const pairedB = await doPair(helperB, owner, 32n, "Owner↔HelperB");
+
+  const helpersByUri = new Map<string, [Node, string, string]>([
+    ["https://helper-a.example.com", [helperA, "HelperA", pairedA.longTermChannelId]],
+    ["https://helper-b.example.com", [helperB, "HelperB", pairedB.longTermChannelId]],
+  ]);
+  for (let round = 1; round <= 3; round++) {
+    owner.shareStore.keep = round === 3 ? [1] : null;
+    await owner.protocol.start(FlowKind.ProtectSecret, {
+      secrets: [{ id: new Uint8Array([4]), name: "kept", data: new TextEncoder().encode(`round-${round}`) }],
+      description: `round ${round}`,
+    });
+    for (const { endpoint, message } of owner.transport.drain()) {
+      const [helper, label] = helpersByUri.get(endpoint.uri)!;
+      requireEvent(await processAll(helper, message), "ShareStored", label);
+      await owner.protocol.process(drainOne(helper, label));
+    }
+  }
+
+  const asked = owner.shareStore.keepListCalls
+    .filter((c) => c.secretId === secretId.toString())
+    .map((c) => c.version);
+  if (asked.join(",") !== "1,2,3") {
+    throw new Error(`keepList must be asked once per round; got versions [${asked.join(", ")}]`);
+  }
+  console.log("  keepList asked once per round with the version being sent  ✓");
+
+  for (const [helper, label, channelId] of helpersByUri.values()) {
+    const versions = (await helper.shareStore.load(secretId.toString(), channelId, []))
+      .map((share) => share.version)
+      .sort((a, b) => a - b);
+    if (versions.join(",") !== "1,3") {
+      throw new Error(`[${label}] must keep exactly versions [1, 3]; got [${versions.join(", ")}]`);
+    }
+    console.log(`  [${label}] holds exactly [1, 3] after the v3 round  ✓`);
+  }
+
+  console.log("\n✓ Owner keepList flow passed.\n");
 }
 
 // VSS sharing requires threshold ≥ 2, so this scenario pairs the Owner with
@@ -2169,6 +2230,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runOverlappingCallsFlow();
   await runSharingFlow();
   await runHelperKeepListFlow();
+  await runOwnerKeepListFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();
   await runUpdateChannelInfoFlow();

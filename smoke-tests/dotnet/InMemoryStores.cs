@@ -176,6 +176,16 @@ internal sealed class InMemoryShareStore : IShareStore
         foreach (var v in versions) _data.Remove((secretId, channelId, v));
     }
 
+    public uint[]? Keep { get; set; }
+
+    public List<(ulong SecretId, uint Version)> KeepListCalls { get; } = new();
+
+    public uint[]? KeepList(ulong secretId, uint version)
+    {
+        KeepListCalls.Add((secretId, version));
+        return Keep;
+    }
+
     public uint[] StoredVersions(ulong secretId) =>
         _data.Keys.Where(k => k.Item1 == secretId).Select(k => k.Item3).Distinct().OrderBy(v => v).ToArray();
 

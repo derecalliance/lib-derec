@@ -7,9 +7,9 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
-### Unreleased
+### 0.0.7
 
-Six defects found by the reference application's QA against 0.0.6.
+Nine defects found by the reference application's QA against 0.0.6.
 
 - **Fixed: admitting a second replica moved the group to the joiner's
   channel.** *(bug fix; every SDK)*
@@ -63,6 +63,79 @@ Six defects found by the reference application's QA against 0.0.6.
   TypeScript `ShareStore.removeVersions` — and the C ABI
   `ShareStoreCallbacks` gains a `remove_versions` slot before `free_buffer`.
 
+- **Added: the application decides which versions helpers keep.**
+  *(new store method; breaking — every share store gains it)*
+
+  The owner filled `keepList` with the last `keep_versions_count` version
+  numbers, whether those rounds reached threshold or not, so a version the
+  application abandoned stayed on helpers and in discovery. Only the
+  application knows which versions committed — from `SharingComplete` — so
+  the owner now asks the share store, once per round and before anything is
+  sent, including the rounds the library starts itself:
+  `keep_list(secret_id, version)` (.NET `IShareStore.KeepList`, Go
+  `ShareStore.KeepList`, TypeScript `ShareStore.keepList`). A list is sent to
+  every helper with the version being distributed added; `None` / `null`
+  sends an empty `keepList`, so helpers keep every version they hold — an
+  application that wants a cap returns it from `keep_list`. List only
+  committed versions and always the latest committed one: helpers delete
+  everything not listed. The C ABI `ShareStoreCallbacks` gains a `keep_list`
+  slot before `free_buffer`.
+
+- **Removed: `keep_versions_count`.** *(breaking; every SDK)*
+
+  `keep_list` is now the only source of the owner's `keepList`. Removed Rust
+  `DeRecProtocolBuilder::with_keep_versions_count` and
+  `DEFAULT_KEEP_VERSIONS_COUNT`, .NET `WithKeepVersionsCount`, Go
+  `Config.KeepVersionsCount` and TypeScript `withKeepVersionsCount`. The C ABI
+  `derec_protocol_new` config ignores a `keep_versions_count` key still sent.
+  An owner whose share store returns `None` used to cap helpers at the last
+  three versions; helpers now keep every version unless the application lists
+  the ones to keep.
+
+- **Fixed: one helper's refusal blocked recovery for good.** *(bug fix; every
+  SDK)*
+
+  The owner collected a refused `GetShareResponse` (for example
+  `UNKNOWN_SHARE_VERSION`) as if it were a share, and every later
+  reconstruction attempt failed on it, so recovery never completed however
+  many good shares arrived. A refusal is now set aside and reported as the new
+  `RecoveryShareRefused { channel_id, version, status, memo }` event (.NET
+  `RecoveryShareRefusedEvent`, Go `EventTypeRecoveryShareRefused`); it does
+  not count towards `shares_received`, and the other helpers' shares complete
+  the recovery.
+
+- **Fixed: a corrupted recovery share blocked recovery, and the app could not
+  tell which helper sent it.** *(bug fix; every SDK — breaking for code that
+  builds `StateItem::PendingRecovery` directly, and for the .NET
+  `StateItem.PendingRecovery` factory)*
+
+  A helper that answered with a tampered or foreign share made every later
+  reconstruction fail, so recovery succeeded only if enough good shares
+  happened to arrive first. Each share is now checked on arrival; one that
+  fails is set aside and reported as the new
+  `RecoveryShareCorrupted { channel_id, version, reason }` event, with
+  `reason` `Malformed` or `InvalidProof`. Shares valid on their own but
+  disagreeing with the others are grouped by commitment root and ciphertext;
+  the first group that reconstructs, largest first, yields the secret, and
+  every share outside it is reported as `Inconsistent` alongside
+  `SecretRecovered`. An honest helper never sends a corrupted share, so the
+  application may treat the event as a sign of a damaged or compromised
+  helper and offer to unpair it. The recovery state now records which channel
+  each collected share came from (`StateItemRecord.share_channels`, Go and
+  .NET `StateItem.ShareChannels`); a pending recovery saved by an older
+  version re-collects its shares. A malformed share could also crash the
+  owner: `vss::recover` now returns an error instead of panicking on a
+  repeated or undecodable coordinate.
+
+- **Fixed: a helper asked for a version it does not hold sent no answer.**
+  *(bug fix; every SDK)*
+
+  `accept` on a `GetShareRequest` or `VerifyShareRequest` for a share the
+  helper does not hold failed with `InvalidInput` and sent nothing, so the
+  owner waited for a timeout. The helper now answers `UNKNOWN_SHARE_VERSION`,
+  as the protocol specifies, whether it accepts manually or automatically; the
+  owner sees `RecoveryShareRefused` or `ShareVerifyRejected`.
+
 - **Added: `ShareVerifyRejected { channel_id, version, status, memo }`.**
   *(new event; every SDK)*
 
@@ -71,6 +144,33 @@ Six defects found by the reference application's QA against 0.0.6.
   said no. The refusal is now this event, mirroring `ShareRejected`. The
   challenge is consumed; checking that helper again takes a new
   `VerifyShares` round.
+
+- **Fixed: a failing `process()` lost the timeouts it had settled.**
+  *(bug fix; breaking — every SDK)*
+
+  `process()` settles expired sharing-round and unpair deadlines, and saves
+  them, before it handles the message. When the message then failed, those
+  events were dropped and never reported again, and the round never closed.
+  The error now carries every event produced before the failure: Rust
+  `ProcessError::events`, .NET `DeRecException.Events`, Go
+  `ProcessError.Events`, and `events` on the JavaScript `DeRecError`. Handle
+  them as a successful call's events.
+  - **Go:** `Process` now returns a `*protocol.ProcessError` with `ChannelID`,
+    `Events` and `Err`. `errors.As(err, &derecErr)` still reaches the
+    `*derec.Error`; a direct type assertion on `*derec.Error` no longer
+    matches.
+  - **FFI:** `derec_protocol_process` returns the new
+    `DeRecProtocolProcessResult`, whose `events_json` is filled on failure
+    too.
+
+- **Fixed: .NET, Go and React Native did not say which channel a `process()`
+  error came from.** *(bug fix; .NET, Go, React Native)*
+
+  The core knew the channel, and the web and Node.js SDKs already reported it,
+  but the FFI dropped it. `DeRecProtocolProcessResult` now carries
+  `has_channel_id` and `channel_id`; .NET exposes `DeRecException.ChannelId`,
+  Go `ProcessError.ChannelID`, and React Native `channel_id` on the thrown
+  error. It is empty when the bytes were not a decodable envelope.
 
 - **Docs: what an application must do on a replica version conflict.**
 

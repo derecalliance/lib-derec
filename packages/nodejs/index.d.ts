@@ -264,6 +264,22 @@ export interface ShareStore {
    * Shares under other channels or partitions must be left untouched.
    */
   removeVersions(secretId: string, channelId: string, versions: number[]): Promise<void>;
+  /**
+   * Owner only: the versions every helper keeps after the owner distributes
+   * `version`. Asked once per sharing round, before anything is sent,
+   * including the rounds the library starts itself; the answer becomes
+   * `keepList` for every helper.
+   *
+   * Return `null` or `undefined` to send no `keepList` (it goes out empty):
+   * helpers then keep every version they hold. An app that wants to cap how
+   * many versions helpers retain returns that cap here. A returned list is
+   * used as is, plus `version`, which the library always adds. Helpers
+   * delete every version that is not listed, so list only versions that
+   * committed (for example, those whose `SharingComplete` reported
+   * `threshold_met`) and always keep the latest committed version; an
+   * over-eager list can make the secret unrecoverable.
+   */
+  keepList(secretId: string, version: number): Promise<number[] | null | undefined>;
 }
 
 export interface UserSecretEntry {
@@ -762,6 +778,22 @@ export type DeRecEvent =
     }
   | { type: "RecoveryShareReceived"; channel_id: string; shares_received: number }
   | { type: "RecoveryShareError"; channel_id: string; shares_received: number; error: string }
+  /** A helper refused a recovery share request: its response carried a
+   *  non-OK `status` (e.g. `UNKNOWN_SHARE_VERSION`) instead of a share. The
+   *  refusal is not collected — it does not count towards `shares_received`
+   *  and the recovery stays open for the other helpers' shares — but it does
+   *  answer that helper's `RecoverSecretStarted`. */
+  | { type: "RecoveryShareRefused"; channel_id: string; version: number; status: StatusEnum; memo: string }
+  /** A helper answered with a share that cannot be part of the secret;
+   *  `reason` says how it failed. `Malformed` and `InvalidProof` are judged
+   *  on arrival; `Inconsistent` (valid on its own but disagreeing with the
+   *  shares the secret was rebuilt from) is reported alongside
+   *  `SecretRecovered`, once per helper. The share is set aside — it does
+   *  not count towards `shares_received` and never blocks the recovery. An
+   *  honest helper never sends one, so the app may treat it as a sign of a
+   *  damaged or compromised helper, e.g. offer to unpair it. It also
+   *  answers that helper's `RecoverSecretStarted`. */
+  | { type: "RecoveryShareCorrupted"; channel_id: string; version: number; reason: CorruptionReason }
   /** Recovery completed — the typed `Secret` snapshot the owner
    *  originally protected. Mirrors `ReplicaSecretReceived.secret`:
    *  `secrets` is the user-facing `Vec<UserSecret>` the application
@@ -1198,8 +1230,6 @@ export declare class DeRecProtocolBuilder {
 
   /** Minimum number of shares required to reconstruct the secret. Default: 3. */
   withThreshold(threshold: number): DeRecProtocolBuilder;
-  /** Number of recent versions each helper must retain. Default: 3. */
-  withKeepVersionsCount(count: number): DeRecProtocolBuilder;
   /**
    * Configure how long the protocol waits on each thing that can keep it
    * waiting. Every field is optional and **absent means "keep the library
@@ -1578,6 +1608,14 @@ export type IgnoreReason = "PendingVerification" | "Expired";
  *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */
 export type NotRestoredReason = "NoTransports";
 
+/** Why a `RecoveryShareCorrupted` event set a helper's share aside.
+ *  Matches the Rust `CorruptionReason` discriminants one-for-one:
+ *  `Malformed` — no decodable share for the requested secret and version;
+ *  `InvalidProof` — the share fails its own Merkle proof;
+ *  `Inconsistent` — valid on its own, but its commitment root or ciphertext
+ *  disagrees with the shares the secret was rebuilt from. */
+export type CorruptionReason = "Malformed" | "InvalidProof" | "Inconsistent";
+
 export type PendingActionKind =
   | "Pairing"
   | "PrePair"
@@ -1900,6 +1938,12 @@ export interface DeRecError {
   got?: number;
   /** The channel the failing inbound message arrived on, when `process()` could tell. */
   channel_id?: string;
+  /**
+   * On a failed `process()`: the events it produced before failing, such as
+   * sharing-round and unpair timeouts. They are not reported again, so
+   * handle them as you would a successful call's events.
+   */
+  events?: DeRecEvent[];
   /** On a `restore` `CONFLICT`: the pre-existing channels at canonical ids. */
   channel_ids?: string[];
 }

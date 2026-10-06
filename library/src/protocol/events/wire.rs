@@ -170,6 +170,19 @@ pub(crate) enum Event {
         shares_received: u32,
         error: String,
     },
+    RecoveryShareRefused {
+        channel_id: String,
+        version: u32,
+        status: i32,
+        memo: String,
+    },
+    RecoveryShareCorrupted {
+        channel_id: String,
+        version: u32,
+        /// [`corruption_reason_label`] — `"Malformed"`, `"InvalidProof"` or
+        /// `"Inconsistent"`.
+        reason: String,
+    },
     SecretRecovered {
         /// Same nested wire shape as
         /// [`Self::ReplicaSecretReceived::secret`] — the typed
@@ -691,6 +704,26 @@ impl Event {
                 shares_received: shares_received as u32,
                 error,
             },
+            DeRecEvent::RecoveryShareRefused {
+                channel_id,
+                version,
+                status,
+                memo,
+            } => Self::RecoveryShareRefused {
+                channel_id: channel_id.0.to_string(),
+                version,
+                status,
+                memo,
+            },
+            DeRecEvent::RecoveryShareCorrupted {
+                channel_id,
+                version,
+                reason,
+            } => Self::RecoveryShareCorrupted {
+                channel_id: channel_id.0.to_string(),
+                version,
+                reason: corruption_reason_label(reason).to_owned(),
+            },
             DeRecEvent::SecretRecovered { secret } => Self::SecretRecovered {
                 secret: secret.into(),
             },
@@ -926,6 +959,17 @@ pub(crate) fn not_restored_reason_label(
     }
 }
 
+/// Wire label for a [`CorruptionReason`](crate::protocol::CorruptionReason):
+/// the variant name, matching `library/tests/fixtures/enums.json`.
+pub(crate) fn corruption_reason_label(reason: crate::protocol::CorruptionReason) -> &'static str {
+    use crate::protocol::CorruptionReason;
+    match reason {
+        CorruptionReason::Malformed => "Malformed",
+        CorruptionReason::InvalidProof => "InvalidProof",
+        CorruptionReason::Inconsistent => "Inconsistent",
+    }
+}
+
 pub(crate) fn pending_action_kind_label(
     kind: crate::protocol::events::PendingActionKind,
 ) -> &'static str {
@@ -1138,6 +1182,55 @@ mod tests {
             derec_proto::StatusEnum::UnknownShareVersion as i32
         );
         assert_eq!(json["memo"], "no stored share");
+    }
+
+    #[test]
+    fn recovery_share_refused_maps_status_and_memo() {
+        let mapped = Event::from_event(DeRecEvent::RecoveryShareRefused {
+            channel_id: ChannelId(u64::MAX),
+            version: 4,
+            status: derec_proto::StatusEnum::UnknownShareVersion as i32,
+            memo: "no stored share".to_owned(),
+        })
+        .expect("RecoveryShareRefused must map");
+
+        let json = serde_json::to_value(&mapped).expect("serializes");
+        assert_eq!(json["type"], "RecoveryShareRefused");
+        assert_eq!(json["channel_id"], u64::MAX.to_string());
+        assert_eq!(json["version"], 4);
+        assert_eq!(
+            json["status"],
+            derec_proto::StatusEnum::UnknownShareVersion as i32
+        );
+        assert_eq!(json["memo"], "no stored share");
+    }
+
+    #[test]
+    fn recovery_share_corrupted_maps_channel_version_and_reason() {
+        for (reason, label) in [
+            (crate::protocol::CorruptionReason::Malformed, "Malformed"),
+            (
+                crate::protocol::CorruptionReason::InvalidProof,
+                "InvalidProof",
+            ),
+            (
+                crate::protocol::CorruptionReason::Inconsistent,
+                "Inconsistent",
+            ),
+        ] {
+            let mapped = Event::from_event(DeRecEvent::RecoveryShareCorrupted {
+                channel_id: ChannelId(u64::MAX),
+                version: 4,
+                reason,
+            })
+            .expect("RecoveryShareCorrupted must map");
+
+            let json = serde_json::to_value(&mapped).expect("serializes");
+            assert_eq!(json["type"], "RecoveryShareCorrupted");
+            assert_eq!(json["channel_id"], u64::MAX.to_string());
+            assert_eq!(json["version"], 4);
+            assert_eq!(json["reason"], label);
+        }
     }
 
     #[test]

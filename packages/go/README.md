@@ -307,7 +307,7 @@ For applications that don't want to drive the primitive produce/extract/process 
 
 - `protocol.ChannelStore` — channel records, keyed by `(secretID, channelID, replicaID)`. A `replicaID` of `0` addresses the helper channel; any other value addresses that member of the replica group
 - `protocol.SecretStore` — pairing/session secret material
-- `protocol.ShareStore` — stored shares
+- `protocol.ShareStore` — stored shares. On an owner, `KeepList` chooses which versions helpers keep, and `ok=false` sends no keepList so helpers keep every version; see [the owner's keep list](https://github.com/derecalliance/lib-derec/tree/main/library#share-store-the-owners-keep-list)
 - `protocol.UserSecretStore` — the latest user-facing secret snapshot per `secretID`
 - `protocol.StateStore` — in-flight orchestrator state (pending verification/recovery/unpair/sharing rounds)
 - `protocol.Transport` — outbound delivery (`Send(endpoints []protocol.Endpoint, message []byte) error`). Implement `protocol.SendOne` for a single endpoint and wrap it in `protocol.SequentialFailover` (or `protocol.SingleEndpointTransport`); when every endpoint fails, the adapter returns the last dialer error unchanged, so `errors.Is` / `errors.As` against your own dialer errors keep working
@@ -348,8 +348,7 @@ cfg := protocol.Config{
 	OwnTransports: []protocol.TransportProtocolParam{
 		{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)},
 	},
-	Threshold:         proto.Uint32(2), // nil: library default (3)
-	KeepVersionsCount: proto.Uint32(3), // nil: library default (3)
+	Threshold: proto.Uint32(2), // nil: library default (3)
 	Timeouts: &protocol.Timeouts{
 		SharingRoundSecs: proto.Uint64(30), // whole seconds; nil: library default
 	},
@@ -396,9 +395,22 @@ for _, ev := range events {
 }
 ```
 
+When the core rejects a message, `Process` returns a `*protocol.ProcessError`. It settles expired deadlines (sharing-round and unpair timeouts) before it handles the message, and those are never reported again, so the error carries them: `Events` holds every event produced before the failure, and `ChannelID` (`*uint64`) names the channel the message came from (`nil` when the bytes were not a decodable envelope). Handle the events as you would a successful call's, then the error. The underlying `*derec.Error` is `Err`, and `errors.As` reaches it too:
+
+```go
+events, err = p.Process(inboundBytes)
+var processErr *protocol.ProcessError
+if errors.As(err, &processErr) {
+	handle(processErr.Events)
+	report(processErr.ChannelID, processErr.Err)
+}
+```
+
 `Start` accepts a `FlowKind` plus the matching params struct: `protocol.PairingParams`, `protocol.DiscoveryParams`, `protocol.ProtectSecretParams`, `protocol.VerifySharesParams`, `protocol.RecoverSecretParams`, `protocol.UnpairParams`, or `protocol.UpdateChannelInfoParams`. Fan-out flows (`FlowKindDiscovery`, `FlowKindVerifyShares`, `FlowKindUpdateChannelInfo`) take a `protocol.Target`, built with `protocol.TargetAll()`, `protocol.TargetOne(channelID)`, or `protocol.TargetMany(channelIDs...)`.
 
 `Process` returns `[]protocol.Event`, decoded from the same JSON event stream the Rust core emits — compare `Event.Type` against the `protocol.EventType*` constants (`EventTypePairingCompleted`, `EventTypeShareStored`, `EventTypeShareConfirmed`, `EventTypeSecretRecovered`, `EventTypeActionRequired`, …) rather than hand-typing the string. Every u64 identifier on an event (`ChannelID`, `PairingChannelID`, `SecretID`, `TraceID`, the replica ids, `Synced` / `Behind`) and inside the recovered `Secret` (`Helper.ChannelID`, `Replicas.ChannelID`, `Replica.ReplicaID`) is a `uint64`, `Replica.Role` is a `protocol.ReplicaRole` (`ReplicaRoleSource` / `ReplicaRoleDestination`), and `Event.Kind` / `Event.SenderKind` are a `protocol.SenderKind` (`SenderKindOwner` / `SenderKindHelper` / `SenderKindReplicaSource` / `SenderKindReplicaDestination`) — the same type as `pairing.SenderKind` and `PairingParams.Kind`.
+
+During recovery, a helper that answers with a share that cannot be part of the secret is reported as an event with `Type == EventTypeRecoveryShareCorrupted` and `Reason` one of `CorruptionReasonMalformed`, `CorruptionReasonInvalidProof` or `CorruptionReasonInconsistent`; the share is set aside and never blocks the recovery from the others. An honest helper never sends one, so treat it as a sign of a damaged or compromised helper — for example, offer to unpair it.
 
 When recovering a secret onto a fresh instance, pass the typed `Secret` from a `SecretRecovered` (or `ReplicaSecretReceived`) event to `p.Restore(secret, version)` to commit canonical helper state and wipe the throwaway recovery-mode channels. A helper or member with no endpoint in the recovered roster gets no channel; `Restore` returns an event with `Type == EventTypePeerNotRestored` and `Reason == NotRestoredReasonNoTransports` for it (`ReplicaID` is set for a replica member) and restores the rest. If channels already exist at ids `Restore` is about to write, `Restore` fails with a `*derec.Error` whose `Code` is `derec.CodeRestoreConflict` and whose `ConflictingChannelIDs` (`[]uint64`) lists exactly those ids — clear them and retry.
 

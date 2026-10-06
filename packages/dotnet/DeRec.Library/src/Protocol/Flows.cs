@@ -468,6 +468,64 @@ public sealed record RecoveryShareErrorEvent : DeRecEvent
 }
 
 /// <summary>
+/// A helper refused a recovery share request: its response carried a non-OK
+/// <c>Status</c> (e.g. <c>UnknownShareVersion</c>) instead of a share. The
+/// refusal is not collected — it does not count towards
+/// <c>SharesReceived</c> and the recovery stays open for the other helpers'
+/// shares — but it does answer that helper's
+/// <see cref="RecoverSecretStartedEvent"/>.
+/// </summary>
+public sealed record RecoveryShareRefusedEvent : DeRecEvent
+{
+    public override string EventType => "RecoveryShareRefused";
+    public required ulong ChannelId { get; init; }
+    public required uint Version { get; init; }
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
+    public required string Memo { get; init; }
+}
+
+/// <summary>
+/// A helper answered a recovery share request with a share that cannot be
+/// part of the secret. <see cref="Reason"/> is one of the
+/// <see cref="CorruptionReason"/> constants.
+/// </summary>
+/// <remarks>
+/// The share is set aside: it does not count towards <c>SharesReceived</c>
+/// and never blocks the recovery — the other helpers' shares still complete
+/// it. <see cref="CorruptionReason.Malformed"/> and
+/// <see cref="CorruptionReason.InvalidProof"/> are reported as the share
+/// arrives; <see cref="CorruptionReason.Inconsistent"/> alongside
+/// <see cref="SecretRecoveredEvent"/>, once per helper. An honest helper never
+/// sends a corrupted share, so the application may treat this as a sign of a
+/// damaged or compromised helper — for example by offering to unpair it. It
+/// also answers that helper's <see cref="RecoverSecretStartedEvent"/>.
+/// </remarks>
+public sealed record RecoveryShareCorruptedEvent : DeRecEvent
+{
+    public override string EventType => "RecoveryShareCorrupted";
+    public required ulong ChannelId { get; init; }
+    public required uint Version { get; init; }
+    public required string Reason { get; init; }
+}
+
+/// <summary>
+/// The label vocabulary for <see cref="RecoveryShareCorruptedEvent.Reason"/>.
+/// Matches the Rust <c>CorruptionReason</c> discriminants one-for-one.
+/// </summary>
+public static class CorruptionReason
+{
+    /// <summary>The response carries no decodable share for the requested secret and version.</summary>
+    public const string Malformed = "Malformed";
+    /// <summary>The share fails its own Merkle proof, e.g. a value altered after it was split.</summary>
+    public const string InvalidProof = "InvalidProof";
+    /// <summary>
+    /// The share is valid on its own, but its commitment root or ciphertext
+    /// disagrees with the shares the secret was rebuilt from.
+    /// </summary>
+    public const string Inconsistent = "Inconsistent";
+}
+
+/// <summary>
 /// Recovery completed — the reconstructed <see cref="Secret"/> is
 /// returned exactly once. Mirrors
 /// <see cref="ReplicaSecretReceivedEvent.Secret"/>: the nested
@@ -1056,6 +1114,19 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 SharesReceived = root.GetProperty("shares_received").GetUInt32(),
                 Error = root.GetProperty("error").GetString() ?? string.Empty,
+            },
+            "RecoveryShareRefused" => new RecoveryShareRefusedEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Version = root.GetProperty("version").GetUInt32(),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
+                Memo = root.GetProperty("memo").GetString() ?? string.Empty,
+            },
+            "RecoveryShareCorrupted" => new RecoveryShareCorruptedEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Version = root.GetProperty("version").GetUInt32(),
+                Reason = root.GetProperty("reason").GetString() ?? string.Empty,
             },
             "SecretRecovered" => new SecretRecoveredEvent
             {

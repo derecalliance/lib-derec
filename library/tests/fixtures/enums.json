@@ -95,6 +95,24 @@
         }
       ]
     },
+    "CorruptionReason": {
+      "encoding": "name",
+      "note": "RecoveryShareCorrupted.reason",
+      "variants": [
+        {
+          "name": "Malformed",
+          "wire": "Malformed"
+        },
+        {
+          "name": "InvalidProof",
+          "wire": "InvalidProof"
+        },
+        {
+          "name": "Inconsistent",
+          "wire": "Inconsistent"
+        }
+      ]
+    },
     "DeRecEvent": {
       "encoding": "name",
       "note": "the serde `type` discriminator on every emitted event",
@@ -164,12 +182,20 @@
           "wire": "RecoverSecretStarted"
         },
         {
+          "name": "RecoveryShareCorrupted",
+          "wire": "RecoveryShareCorrupted"
+        },
+        {
           "name": "RecoveryShareError",
           "wire": "RecoveryShareError"
         },
         {
           "name": "RecoveryShareReceived",
           "wire": "RecoveryShareReceived"
+        },
+        {
+          "name": "RecoveryShareRefused",
+          "wire": "RecoveryShareRefused"
         },
         {
           "name": "ReplicaPaired",

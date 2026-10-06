@@ -20,6 +20,13 @@ void throwDeRecError(jsi::Runtime& rt, const DeRecError& error) {
 void throwDeRecError(jsi::Runtime& rt,
                      const DeRecError& error,
                      const std::vector<uint8_t>& conflictingChannelIdsJson) {
+  throwDeRecError(rt, error, conflictingChannelIdsJson, {});
+}
+
+void throwDeRecError(jsi::Runtime& rt,
+                     const DeRecError& error,
+                     const std::vector<uint8_t>& conflictingChannelIdsJson,
+                     const ProcessFailureDetails& process) {
   auto names = errorName(error.category, error.code);
   // `message` and `peer_memo` are Rust-owned strings; copy before releasing.
   std::string message =
@@ -52,6 +59,15 @@ void throwDeRecError(jsi::Runtime& rt,
     payload.setProperty(rt, "channel_ids",
                         jsi::Value::createFromJsonUtf8(rt, conflictingChannelIdsJson.data(),
                                                        conflictingChannelIdsJson.size()));
+  }
+  if (process.hasChannelId) {
+    payload.setProperty(rt, "channel_id",
+                        jsi::String::createFromUtf8(rt, std::to_string(process.channelId)));
+  }
+  if (!process.eventsJson.empty()) {
+    payload.setProperty(rt, "events",
+                        jsi::Value::createFromJsonUtf8(rt, process.eventsJson.data(),
+                                                       process.eventsJson.size()));
   }
   throw jsi::JSError(rt, jsi::Value(rt, payload));
 }

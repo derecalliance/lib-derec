@@ -29,11 +29,6 @@ pub struct BuilderSlotSetMarker<T>(T);
 /// config's serde default both read it rather than each hardcoding `3`.
 pub const DEFAULT_THRESHOLD: usize = 3;
 
-/// Number of recent share versions each helper retains, absent an explicit
-/// [`DeRecProtocolBuilder::with_keep_versions_count`](crate::protocol::DeRecProtocolBuilder::with_keep_versions_count) call. Sole definition
-/// of the value; see [`DEFAULT_THRESHOLD`].
-pub const DEFAULT_KEEP_VERSIONS_COUNT: usize = 3;
-
 /// Typestate builder for [`DeRecProtocol`].
 ///
 /// Call each store/transport setter, then [`build`](DeRecProtocolBuilder::build).
@@ -77,7 +72,6 @@ pub struct DeRecProtocolBuilder<
     transport: Transport,
     own_transport: OwnTransport,
     threshold: usize,
-    keep_versions_count: usize,
     timeouts: crate::protocol::types::Timeouts,
     unsafe_connection: Option<bool>,
     communication_info: HashMap<String, String>,
@@ -116,7 +110,6 @@ impl
             transport: BuilderSlotMissingMarker,
             own_transport: BuilderSlotMissingMarker,
             threshold: DEFAULT_THRESHOLD,
-            keep_versions_count: DEFAULT_KEEP_VERSIONS_COUNT,
             timeouts: crate::protocol::types::Timeouts::default(),
             unsafe_connection: None,
             communication_info: HashMap::new(),
@@ -151,14 +144,6 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// across the language boundary).
     pub fn with_threshold(mut self, threshold: usize) -> Self {
         self.threshold = threshold;
-        self
-    }
-
-    /// Number of recent versions each helper must retain.
-    ///
-    /// Default: [`DEFAULT_KEEP_VERSIONS_COUNT`].
-    pub fn with_keep_versions_count(mut self, count: usize) -> Self {
-        self.keep_versions_count = count;
         self
     }
 
@@ -404,7 +389,6 @@ impl<ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTranspo
             transport: self.transport,
             own_transport: self.own_transport,
             threshold: self.threshold,
-            keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
@@ -453,7 +437,6 @@ impl<ChannelStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTrans
             transport: self.transport,
             own_transport: self.own_transport,
             threshold: self.threshold,
-            keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
@@ -502,7 +485,6 @@ impl<ChannelStore, ShareStore, UserSecretStore, StateStore, Transport, OwnTransp
             transport: self.transport,
             own_transport: self.own_transport,
             threshold: self.threshold,
-            keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
@@ -554,7 +536,6 @@ impl<ChannelStore, ShareStore, SecretStore, StateStore, Transport, OwnTransport>
             transport: self.transport,
             own_transport: self.own_transport,
             threshold: self.threshold,
-            keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
@@ -603,7 +584,6 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, OwnTran
             transport: BuilderSlotSetMarker(transport),
             own_transport: self.own_transport,
             threshold: self.threshold,
-            keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
@@ -681,7 +661,6 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             transport: self.transport,
             own_transport: BuilderSlotSetMarker(own_transports),
             threshold: self.threshold,
-            keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
@@ -735,7 +714,6 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTrans
             transport: self.transport,
             own_transport: self.own_transport,
             threshold: self.threshold,
-            keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
@@ -842,7 +820,6 @@ impl<
             self.transport.0,
             own_transports,
             self.threshold,
-            self.keep_versions_count,
             self.timeouts,
         )?;
         protocol.communication_info = self.communication_info;
@@ -861,15 +838,14 @@ impl<
 mod tests {
     use super::*;
 
-    /// A freshly-constructed builder carries `DEFAULT_THRESHOLD` /
-    /// `DEFAULT_KEEP_VERSIONS_COUNT` until a setter overrides them — the
-    /// same constants the FFI config's serde defaults read, so both paths
-    /// stay in lockstep by construction rather than by convention.
+    /// A freshly-constructed builder carries `DEFAULT_THRESHOLD` until a
+    /// setter overrides it — the same constant the FFI config's serde
+    /// default reads, so both paths stay in lockstep by construction rather
+    /// than by convention.
     #[test]
     fn new_defaults_to_the_shared_constants() {
         let b = DeRecProtocolBuilder::new(0);
         assert_eq!(b.threshold, DEFAULT_THRESHOLD);
-        assert_eq!(b.keep_versions_count, DEFAULT_KEEP_VERSIONS_COUNT);
     }
 
     /// Boundary value: threshold == 2 is the minimum valid input.
@@ -1016,6 +992,9 @@ mod tests {
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
+            fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
         }
 
         struct NoopSecretStore;
@@ -1114,7 +1093,6 @@ mod tests {
                 protocol: 0,
             }],
             0, // ← invalid threshold
-            3,
             crate::protocol::types::Timeouts::default(),
         );
         assert!(matches!(result, Err(crate::Error::InvalidInput(_))));
@@ -1214,6 +1192,9 @@ mod tests {
                 _: &[u32],
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
+            }
+            fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+                Box::pin(std::future::ready(Ok(None)))
             }
         }
         struct NoopSecretStore;
@@ -1402,6 +1383,9 @@ mod tests {
                 _: &[u32],
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
+            }
+            fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+                Box::pin(std::future::ready(Ok(None)))
             }
         }
         struct NoopSecretStore;
@@ -1595,6 +1579,9 @@ mod tests {
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
+            fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
         }
         struct NoopSecretStore;
         impl DeRecSecretStore for NoopSecretStore {
@@ -1785,6 +1772,9 @@ mod tests {
                 _: &[u32],
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
+            }
+            fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+                Box::pin(std::future::ready(Ok(None)))
             }
         }
         struct NoopSecretStore;

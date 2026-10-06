@@ -94,12 +94,6 @@
       "ts": "withThreshold"
     },
     {
-      "rust": "keep_versions_count",
-      "dotnet": "WithKeepVersionsCount",
-      "go": "KeepVersionsCount",
-      "ts": "withKeepVersionsCount"
-    },
-    {
       "rust": "auto_respond_on_failure",
       "dotnet": "WithAutoRespondOnFailure",
       "go": "AutoRespondOnFailure",
@@ -540,6 +534,20 @@
             "secret_id",
             "channel_id",
             "versions"
+          ]
+        },
+        {
+          "rust": "keep_list",
+          "dotnet": "KeepList",
+          "go": "KeepList",
+          "ts": "keepList",
+          "rust_params": [
+            "secret_id",
+            "version"
+          ],
+          "params": [
+            "secret_id",
+            "version"
           ]
         }
       ]

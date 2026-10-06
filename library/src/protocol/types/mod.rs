@@ -1222,6 +1222,11 @@ pub enum StateItem {
     /// 3. …repeat until threshold. On threshold met, library `remove`s
     ///    the accumulator.
     ///
+    /// Each entry names the channel its share arrived on, and a channel
+    /// holds at most one entry: a later share from the same channel
+    /// replaces the earlier one. A share that fails its own checks is never
+    /// written here (see [`crate::protocol::DeRecEvent::RecoveryShareCorrupted`]).
+    ///
     /// Implementations MUST accept `shares` vectors of any length,
     /// including one. Every `save` replaces the stored value in place
     /// with the caller-supplied Vec; no append primitive is required.
@@ -1241,7 +1246,7 @@ pub enum StateItem {
         /// may differ from the `secret_id` partitioning the row.
         secret_id: u64,
         version: u32,
-        shares: Vec<derec_proto::GetShareResponseMessage>,
+        shares: Vec<CollectedShare>,
     },
 
     /// Outstanding unpair acknowledgement window. `started_at` is the
@@ -1342,6 +1347,18 @@ impl StateItem {
             },
         }
     }
+}
+
+/// One share collected towards a recovery, with the channel it arrived on.
+///
+/// The channel is what lets a share that turns out to disagree with the
+/// rest be attributed to the helper that sent it.
+#[derive(Debug, Clone)]
+pub struct CollectedShare {
+    /// The helper channel the response arrived on.
+    pub channel_id: ChannelId,
+    /// The helper's response, carrying its committed share.
+    pub response: derec_proto::GetShareResponseMessage,
 }
 
 /// A single stored share entry, fully self-describing.

@@ -48,6 +48,29 @@ pub enum NotRestoredReason {
     NoTransports,
 }
 
+/// Why [`DeRecEvent::RecoveryShareCorrupted`] set a helper's share aside.
+///
+/// Every case means the helper answered with an OK status but a share that
+/// cannot be part of the recovered secret. An honest helper never sends one,
+/// so each is a sign of storage or transport damage on that helper — or of a
+/// compromised helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CorruptionReason {
+    /// The response carries no decodable share for the requested secret and
+    /// version: the share bytes are missing or undecodable, or the share is
+    /// bound to another secret or version. Judged on arrival.
+    Malformed,
+    /// The share decodes but its Merkle proof does not open to its own
+    /// commitment root — for example a share whose value was altered after it
+    /// was split. Judged on arrival.
+    InvalidProof,
+    /// The share verifies on its own, but its commitment root or ciphertext
+    /// disagrees with the shares the secret was reconstructed from — a share
+    /// of some other split, or one built from scratch. Only judgeable against
+    /// the other shares, so it is reported when the secret is recovered.
+    Inconsistent,
+}
+
 /// Lightweight discriminant of [`PendingAction`].
 ///
 /// Carries no payload — useful for the
@@ -412,6 +435,30 @@ pub enum DeRecFlow {
         version: u32,
         target: Target,
     },
+    /// Ask every paired Helper for its share of `(secret_id, version)` and
+    /// reconstruct the secret as the shares arrive.
+    ///
+    /// Each answer settles as one of [`DeRecEvent::RecoveryShareReceived`],
+    /// [`DeRecEvent::RecoveryShareRefused`],
+    /// [`DeRecEvent::RecoveryShareCorrupted`] or, once enough consistent
+    /// shares are in, [`DeRecEvent::SecretRecovered`].
+    ///
+    /// A corrupted share is reported per Helper and set aside, so it never
+    /// blocks recovery from the honest shares. A share that fails on its own
+    /// — it does not decode, or fails its Merkle proof — is reported as it
+    /// arrives and never collected. Shares that are each valid but disagree
+    /// (a different commitment root or ciphertext) are grouped by
+    /// `(root, ciphertext)`; groups are tried largest first, ties going to
+    /// the group whose first share arrived earliest, and the first that
+    /// reconstructs is the secret. Every share outside it is reported as
+    /// [`CorruptionReason::Inconsistent`] alongside `SecretRecovered`. The
+    /// shares a secret is rebuilt from therefore always share one root and
+    /// one ciphertext. No group is reconstructed from a single share.
+    ///
+    /// An honest Helper never sends a corrupted share, so the application
+    /// may treat [`DeRecEvent::RecoveryShareCorrupted`] as a sign that the
+    /// Helper is damaged or compromised — for example by offering to unpair
+    /// it.
     RecoverSecret {
         secret_id: u64,
         version: u32,
@@ -982,16 +1029,19 @@ pub enum DeRecEvent {
     /// cannot succeed yet — more shares are needed to meet the threshold.
     ///
     /// - `channel_id` identifies the Helper that sent this share response.
-    /// - `shares_received` is the total number of share responses collected so far
-    ///   for this `(secret_id, version)` recovery context.
+    /// - `shares_received` is the number of Helpers whose shares are collected
+    ///   so far for this `(secret_id, version)` recovery context: one per
+    ///   channel, not counting refused or corrupted shares.
     RecoveryShareReceived {
         channel_id: ChannelId,
         shares_received: usize,
     },
 
-    /// A recovery share response was received but reconstruction failed for a
-    /// reason other than insufficient shares (e.g. corrupted share, version
-    /// mismatch, decode error).
+    /// A recovery share response was received and reconstruction succeeded,
+    /// but the reconstructed bytes did not decode as a secret.
+    ///
+    /// A corrupted share never causes this: it is set aside and reported as
+    /// [`Self::RecoveryShareCorrupted`] instead.
     ///
     /// - `channel_id` identifies the Helper that sent this share response.
     /// - `shares_received` is the total number of share responses collected so far.
@@ -1000,6 +1050,46 @@ pub enum DeRecEvent {
         channel_id: ChannelId,
         shares_received: usize,
         error: String,
+    },
+
+    /// A Helper refused a recovery share request (Owner side): its
+    /// `GetShareResponse` carried a non-OK status instead of a share — for
+    /// example `UNKNOWN_SHARE_VERSION` when it holds no share for `version`.
+    ///
+    /// The refusal is not collected: it does not count towards
+    /// `shares_received`, triggers no reconstruction attempt, and leaves the
+    /// recovery open for the other Helpers' shares. It still answers the
+    /// [`Self::RecoverSecretStarted`] issued for `channel_id`, so an
+    /// application counting answers against those requests counts it.
+    RecoveryShareRefused {
+        channel_id: ChannelId,
+        version: u32,
+        /// The `StatusEnum` value from the Helper's response.
+        status: i32,
+        /// Human-readable reason from the Helper.
+        memo: String,
+    },
+
+    /// A Helper answered a recovery share request with a share that cannot
+    /// be part of the recovered secret (Owner side). `reason` says how it
+    /// failed; see [`CorruptionReason`].
+    ///
+    /// The share is set aside: it is never used for reconstruction, does not
+    /// count towards `shares_received`, and cannot block the recovery — the
+    /// other Helpers' shares still complete it. A share that fails on its
+    /// own ([`CorruptionReason::Malformed`],
+    /// [`CorruptionReason::InvalidProof`]) is reported as it arrives; one that
+    /// only disagrees with the rest ([`CorruptionReason::Inconsistent`]) is
+    /// reported alongside [`Self::SecretRecovered`], once per Helper.
+    ///
+    /// An honest Helper never sends a corrupted share, so the application may
+    /// treat this as a sign that the Helper's device or storage is damaged or
+    /// compromised — for example by offering to unpair it. It also answers
+    /// the [`Self::RecoverSecretStarted`] issued for `channel_id`.
+    RecoveryShareCorrupted {
+        channel_id: ChannelId,
+        version: u32,
+        reason: CorruptionReason,
     },
 
     /// Recovery completed — the reconstructed
@@ -1266,8 +1356,9 @@ pub enum DeRecEvent {
 
     /// A recovery share request was dispatched to `channel_id` for
     /// `version`. Followed by [`Self::RecoveryShareReceived`] /
-    /// [`Self::RecoveryShareError`] / [`Self::SecretRecovered`] as
-    /// helper responses arrive.
+    /// [`Self::RecoveryShareError`] / [`Self::RecoveryShareRefused`] /
+    /// [`Self::RecoveryShareCorrupted`] / [`Self::SecretRecovered`] as helper
+    /// responses arrive.
     RecoverSecretStarted {
         channel_id: ChannelId,
         version: u32,

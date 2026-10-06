@@ -25,7 +25,7 @@ namespace DeRec.Library.Orchestrator;
 /// </para>
 ///
 /// <para>
-/// Optional setters left uncalled take the library's defaults: <see cref="WithThreshold"/> (3), <see cref="WithKeepVersionsCount"/> (3),
+/// Optional setters left uncalled take the library's defaults: <see cref="WithThreshold"/> (3),
 /// <see cref="WithTimeouts"/> (library defaults), <see cref="WithCommunicationInfo"/> (empty),
 /// <see cref="WithAutoRespondOnFailure"/> (false),
 /// <see cref="WithUnpairAck"/> (<see cref="UnpairAck.Required"/>),
@@ -43,7 +43,6 @@ public sealed class DeRecProtocolBuilder
     private ITransport? _transport;
     private IReadOnlyList<TransportProtocol>? _ownTransports;
     private int? _threshold;
-    private int? _keepVersionsCount;
     private Dictionary<string, string> _communicationInfo = new();
     private bool? _autoRespondOnFailure;
     private UnpairAck? _unpairAck;
@@ -133,16 +132,6 @@ public sealed class DeRecProtocolBuilder
     public DeRecProtocolBuilder WithThreshold(int threshold)
     {
         _threshold = threshold;
-        return this;
-    }
-
-    /// <summary>
-    /// Number of recent versions each helper must retain. Not calling this
-    /// leaves the Rust library's default (3) in force.
-    /// </summary>
-    public DeRecProtocolBuilder WithKeepVersionsCount(int count)
-    {
-        _keepVersionsCount = count;
         return this;
     }
 
@@ -313,7 +302,6 @@ public sealed class DeRecProtocolBuilder
             transport: _transport,
             ownTransports: _ownTransports ?? Array.Empty<TransportProtocol>(),
             threshold: _threshold,
-            keepVersionsCount: _keepVersionsCount,
             communicationInfo: _communicationInfo,
             autoRespondOnFailure: _autoRespondOnFailure,
             unpairAck: _unpairAck,

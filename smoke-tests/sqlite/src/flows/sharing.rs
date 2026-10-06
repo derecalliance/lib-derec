@@ -188,7 +188,7 @@ pub async fn run() {
                 name: "smoke".to_owned(),
                 data: format!("sqlite-shared-secret-v{version}").into_bytes(),
             },
-            "keepList publish",
+            "empty keepList publish",
         )
         .await;
     }
@@ -207,8 +207,8 @@ pub async fn run() {
         versions.sort_unstable();
         assert_eq!(
             versions,
-            vec![2, 3, 4],
-            "{name}: v4 carries keepList [2, 3, 4], so the v1 row must be deleted"
+            vec![1, 2, 3, 4],
+            "{name}: the store's keep_list returns None, so v4 carries an empty keepList and every version stays"
         );
 
         let mut store = store;
@@ -222,11 +222,13 @@ pub async fn run() {
             .expect("remove_versions must be idempotent");
         assert_eq!(
             count_shares_for_channel(&db, DEFAULT_TEST_SECRET_ID, channel_id.0),
-            2,
+            3,
             "{name}: remove_versions drops exactly the listed stored versions"
         );
     }
-    println!("  v4 keepList pruned v1 on every helper; remove_versions is idempotent  ✓");
+    println!(
+        "  empty keepList kept every version on every helper; remove_versions is idempotent  ✓"
+    );
 
     println!("✓ Sharing flow passed.\n");
 }

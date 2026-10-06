@@ -490,6 +490,40 @@ pub trait DeRecShareStore {
         channel_id: ChannelId,
         versions: &[u32],
     ) -> ShareStoreFuture<'_, ()>;
+
+    /// Choose the versions every Helper keeps after the Owner distributes
+    /// `version` of `secret_id`.
+    ///
+    /// Called by the Owner once per sharing round, before anything is
+    /// sent, on every round that distributes shares to Helpers: an
+    /// application-started `ProtectSecret` and the library-started
+    /// publishes (pair-completion and fingerprint confirmation) alike.
+    /// The answer becomes `StoreShareRequestMessage.keepList`, the same
+    /// list for every Helper in the round.
+    ///
+    /// - `Some(list)`: the Helpers keep exactly `list` plus `version`.
+    ///   The library always adds `version`, removes duplicates and sorts
+    ///   ascending, so `list` may omit it.
+    /// - `None`: no `keepList` is sent (it goes out empty), and the
+    ///   Helpers keep every version they hold. An application that wants
+    ///   to cap how many versions Helpers retain returns that cap here as
+    ///   a list.
+    ///
+    /// # The rule a list must follow
+    ///
+    /// Helpers delete every stored version that is not listed, so an
+    /// over-eager list can leave the secret unrecoverable. List only
+    /// versions that committed, such as those whose
+    /// [`SharingComplete`](crate::protocol::DeRecEvent::SharingComplete)
+    /// reported `threshold_met`, and always keep the latest committed
+    /// version: `version` itself has not committed yet when this is
+    /// called, and the round distributing it may never reach threshold.
+    /// Only the application knows which versions committed; nothing in
+    /// the stores records it.
+    ///
+    /// Replica pushes never consult this and always send an empty
+    /// `keepList`.
+    fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>>;
 }
 
 /// Storage for the user-facing secret contents, keyed by `secret_id`.
@@ -927,6 +961,9 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for Box<T> {
     ) -> ShareStoreFuture<'_, ()> {
         (**self).remove_versions(secret_id, channel_id, versions)
     }
+    fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+        (**self).keep_list(secret_id, version)
+    }
 }
 
 impl<T: DeRecUserSecretStore + ?Sized> DeRecUserSecretStore for Box<T> {
@@ -1092,6 +1129,9 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for &mut T {
         versions: &[u32],
     ) -> ShareStoreFuture<'_, ()> {
         (**self).remove_versions(secret_id, channel_id, versions)
+    }
+    fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+        (**self).keep_list(secret_id, version)
     }
 }
 

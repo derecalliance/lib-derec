@@ -51,6 +51,11 @@
 //!   // Drop the shares stored under (secretId, channelId) at each listed
 //!   // version. A version that is not stored is a no-op.
 //!   removeVersions(secretId: string, channelId: string, versions: number[]): Promise<void>;
+//!   // Owner only: the versions every Helper keeps after `version` is
+//!   // distributed. `null`/`undefined` sends an empty keepList, so Helpers
+//!   // keep every version. List only committed versions; the library
+//!   // always adds `version`.
+//!   keepList(secretId: string, version: number): Promise<number[] | null | undefined>;
 //!   latestVersion(): Promise<number | null>;
 //! }
 //! ```
@@ -806,6 +811,43 @@ impl DeRecShareStore for JsShareStore {
                 .await
                 .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
             Ok(())
+        })
+    }
+
+    fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        Box::pin(async move {
+            let args = Array::new();
+            args.push(&JsValue::from_str(&secret_str));
+            args.push(&JsValue::from_f64(f64::from(version)));
+            let promise_val = call_method(&obj, "keepList", &args)
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            let value = resolve_promise(promise_val)
+                .await
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            if value.is_null() || value.is_undefined() {
+                return Ok(None);
+            }
+            if !Array::is_array(&value) {
+                return Err(ShareStoreError::Backend(box_err(
+                    "keepList must return an array of numbers, null or undefined".to_string(),
+                )));
+            }
+            Array::from(&value)
+                .iter()
+                .map(|v| {
+                    v.as_f64()
+                        .filter(|f| f.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(f))
+                        .map(|f| f as u32)
+                        .ok_or_else(|| {
+                            ShareStoreError::Backend(box_err(
+                                "keepList entries must be integers in 0..=4294967295".to_string(),
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<u32>, _>>()
+                .map(Some)
         })
     }
 }

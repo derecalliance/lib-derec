@@ -200,7 +200,6 @@ pub struct DeRecProtocolBuilderWasm {
     /// Set by `withOwnTransports`, in preference order.
     own_transports: Vec<crate::transport::TransportProtocol>,
     threshold: Option<u32>,
-    keep_versions_count: Option<u32>,
     communication_info: Option<HashMap<String, String>>,
     timeouts: Option<TimeoutsJs>,
     unsafe_connection: Option<bool>,
@@ -231,7 +230,6 @@ impl DeRecProtocolBuilderWasm {
             transport: None,
             own_transports: Vec::new(),
             threshold: None,
-            keep_versions_count: None,
             communication_info: None,
             timeouts: None,
             unsafe_connection: None,
@@ -330,14 +328,6 @@ impl DeRecProtocolBuilderWasm {
     #[wasm_bindgen(js_name = withThreshold)]
     pub fn with_threshold(mut self, threshold: u32) -> DeRecProtocolBuilderWasm {
         self.threshold = Some(threshold);
-        self
-    }
-
-    /// Number of recent versions each helper must retain.
-    /// Default: [`crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT`].
-    #[wasm_bindgen(js_name = withKeepVersionsCount)]
-    pub fn with_keep_versions_count(mut self, count: u32) -> DeRecProtocolBuilderWasm {
-        self.keep_versions_count = Some(count);
         self
     }
 
@@ -560,9 +550,6 @@ impl DeRecProtocolBuilderWasm {
             .with_own_transports(self.own_transports);
         if let Some(threshold) = self.threshold {
             builder = builder.with_threshold(threshold as usize);
-        }
-        if let Some(count) = self.keep_versions_count {
-            builder = builder.with_keep_versions_count(count as usize);
         }
         if let Some(info) = self.communication_info {
             builder = builder.with_communication_info(info);
@@ -916,6 +903,16 @@ impl DeRecProtocolWasm {
                         &JsValue::from_str(&channel_id.0.to_string()),
                     );
                 }
+                let settled = Array::new();
+                for event in e.events {
+                    match events::event_to_js(event) {
+                        Ok(js_event) => {
+                            settled.push(&js_event);
+                        }
+                        Err(encode_error) => return encode_error,
+                    }
+                }
+                let _ = js_sys::Reflect::set(&error, &JsValue::from_str("events"), &settled);
                 error
             })?;
         let js_events = Array::new();

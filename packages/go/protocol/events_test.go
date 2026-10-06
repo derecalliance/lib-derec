@@ -390,6 +390,35 @@ func TestDecodeEvents_RecoveryShareError(t *testing.T) {
 	}
 }
 
+func TestDecodeEvents_RecoveryShareRefused(t *testing.T) {
+	ev := decodeOne(t, `{
+		"type": "RecoveryShareRefused",
+		"channel_id": "11",
+		"version": 2,
+		"status": 6,
+		"memo": "no share stored for this secret and version"
+	}`)
+	if ev.Type != EventTypeRecoveryShareRefused || ev.ChannelID != 11 || ev.Version == nil || *ev.Version != 2 ||
+		ev.Status != derecpb.StatusEnum_UNKNOWN_SHARE_VERSION || ev.Memo != "no share stored for this secret and version" {
+		t.Fatalf("got %+v", ev)
+	}
+}
+
+func TestDecodeEvents_RecoveryShareCorrupted(t *testing.T) {
+	for _, reason := range []string{CorruptionReasonMalformed, CorruptionReasonInvalidProof, CorruptionReasonInconsistent} {
+		ev := decodeOne(t, `{
+			"type": "RecoveryShareCorrupted",
+			"channel_id": "18446744073709551615",
+			"version": 2,
+			"reason": "`+reason+`"
+		}`)
+		if ev.Type != EventTypeRecoveryShareCorrupted || ev.ChannelID != 18446744073709551615 ||
+			ev.Version == nil || *ev.Version != 2 || ev.Reason != reason {
+			t.Fatalf("got %+v", ev)
+		}
+	}
+}
+
 func TestDecodeEvents_SecretRecovered(t *testing.T) {
 	ev := decodeOne(t, `{
 		"type": "SecretRecovered",

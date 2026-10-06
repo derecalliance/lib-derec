@@ -51,6 +51,10 @@ use crate::{
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{DeRecMessage, MessageBody};
 
+/// The memo a helper sends with `UNKNOWN_SHARE_VERSION` when it is asked to
+/// serve or prove a share it does not hold.
+const NO_SHARE_FOR_VERSION: &str = "no share stored for this secret and version";
+
 /// Route a decrypted channel message to the module that owns its flow.
 ///
 /// Does only the part that is identical for every message: the peer-supplied

@@ -246,6 +246,19 @@ type ShareStore interface {
 	// version outside it is removed once the incoming share is persisted.
 	// Shares under other channels or partitions must be left untouched.
 	RemoveVersions(secretID, channelID uint64, versions []uint32) error
+	// KeepList is asked by an owner, once per sharing round and before
+	// anything is sent, which versions every helper keeps after version
+	// is distributed. It is asked on library-started publishes too.
+	//
+	// Return ok=false to send no keepList (it goes out empty): helpers then
+	// keep every version they hold. An application that wants to cap how
+	// many versions helpers retain returns that cap here. With ok=true,
+	// helpers keep exactly versions plus version, which the library always
+	// adds. Helpers delete every version that is not listed, so list only
+	// versions that committed (for example, those whose SharingComplete
+	// event reported ThresholdMet) and always keep the latest committed
+	// version; an over-eager list can make the secret unrecoverable.
+	KeepList(secretID uint64, version uint32) (versions []uint32, ok bool, err error)
 }
 
 // UserSecretStore persists the user-facing secret contents, keyed by

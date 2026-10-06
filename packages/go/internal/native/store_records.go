@@ -410,9 +410,12 @@ type stateItemWire struct {
 	StartedAt *string          `json:"started_at,omitempty"`
 	Bytes     *JSONByteArray   `json:"bytes,omitempty"`
 	Shares    *[]JSONByteArray `json:"shares,omitempty"`
-	Pending   *[]string        `json:"pending,omitempty"`
-	Confirmed *[]string        `json:"confirmed,omitempty"`
-	Failed    *[]string        `json:"failed,omitempty"`
+	// ShareChannels is index-aligned with Shares. Absent on rows written
+	// before 0.0.7; the library reads such a row as no shares collected.
+	ShareChannels *[]string `json:"share_channels,omitempty"`
+	Pending       *[]string `json:"pending,omitempty"`
+	Confirmed     *[]string `json:"confirmed,omitempty"`
+	Failed        *[]string `json:"failed,omitempty"`
 	// Replica-leg accounting, keyed by replica_id. Absent on rows written
 	// before the leg existed, which decode as empty rather than failing.
 	PendingReplicas *[]string               `json:"pending_replicas,omitempty"`
@@ -477,6 +480,10 @@ func EncodeStateItem(item StateItem) ([]byte, error) {
 			shares[i] = JSONByteArray(s)
 		}
 		w.Shares = &shares
+		if item.ShareChannels != nil {
+			shareChannels := stringifyUint64s(item.ShareChannels)
+			w.ShareChannels = &shareChannels
+		}
 	case StateKindSharingRound:
 		pending := stringifyUint64s(item.Pending)
 		confirmed := stringifyUint64s(item.Confirmed)
@@ -539,6 +546,7 @@ func DecodeStateItem(data []byte) (StateItem, error) {
 		field string
 		out   *[]uint64
 	}{
+		{w.ShareChannels, "share_channels", &item.ShareChannels},
 		{w.Pending, "pending", &item.Pending},
 		{w.Confirmed, "confirmed", &item.Confirmed},
 		{w.Failed, "failed", &item.Failed},

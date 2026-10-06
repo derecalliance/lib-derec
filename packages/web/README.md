@@ -362,8 +362,15 @@ async function main() {
 main();
 ```
 
-When driving the protocol layer instead of the primitives, the recovering
-device receives a `SecretRecovered` event carrying the typed `secret`. Pass it
+When driving the protocol layer instead of the primitives, a helper that
+answers with a share that cannot be part of the secret is reported as a
+`RecoveryShareCorrupted` event (`reason`: `"Malformed"`, `"InvalidProof"` or
+`"Inconsistent"`); the share is set aside and never blocks the recovery from
+the others. An honest helper never sends one, so treat it as a sign of a
+damaged or compromised helper — for example, offer to unpair it.
+
+The recovering device receives a `SecretRecovered` event carrying the typed
+`secret`. Pass it
 to `protocol.restore(secret, version)` on a fresh `DeRecProtocol` instance to
 commit canonical helper / replica state and wipe the throwaway recovery-mode
 channels — at that point the device resumes normal operation as if the secret
@@ -530,14 +537,18 @@ side runs as `SenderKind.ReplicaSource` (owns the secret), the other as
 with a stable `replicaId`:
 
 ```ts
-const owner = new DeRecProtocol(
-  channelStore, shareStore, secretStore, transport,
-  "https://owner.example.com", "https",
-  /* threshold */ 2, /* keepVersionsCount */ 3,
-  { name: "Owner" },
-  null, null, null, null,
-  /* replicaId */ 0xAAAA_AAAA_AAAA_AAAAn,
-);
+const owner = new DeRecProtocolBuilder(secretId)
+  .withChannelStore(channelStore)
+  .withShareStore(shareStore)
+  .withSecretStore(secretStore)
+  .withUserSecretStore(userSecretStore)
+  .withStateStore(stateStore)
+  .withTransport(transport)
+  .withOwnTransports([{ uri: "https://owner.example.com", protocol: "https" }])
+  .withThreshold(2)
+  .withCommunicationInfo({ name: "Owner" })
+  .withReplicaId(0xAAAA_AAAA_AAAA_AAAAn)
+  .build();
 ```
 
 A typical Source↔Destination handshake:
@@ -587,6 +598,27 @@ Source's place during recovery.
 
 End-to-end coverage lives in the repository's tests — see
 [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
+
+---
+
+## When `process()` fails
+
+`process()` settles expired deadlines (sharing-round and unpair timeouts)
+before it handles the message, and those are never reported again. So when
+the message then fails, the thrown `DeRecError` carries them: `events` holds
+every event produced before the failure, and `channel_id` names the channel
+the message came from (absent when the bytes were not a decodable envelope).
+Handle the events as you would a successful call's, then the error:
+
+```ts
+try {
+  handle(await protocol.process(bytes));
+} catch (error) {
+  const failure = error as DeRecError;
+  handle(failure.events ?? []);
+  report(failure.channel_id, failure);
+}
+```
 
 ---
 

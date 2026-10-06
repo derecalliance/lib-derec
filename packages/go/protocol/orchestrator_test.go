@@ -5,6 +5,8 @@ package protocol
 
 import (
 	"errors"
+	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -108,10 +110,9 @@ func newOrchestratorPeerWith(t *testing.T, label, uri string, threshold uint32, 
 	transport := newInProcessTransport()
 
 	cfg := Config{
-		SecretID:          orchestratorSecretID,
-		OwnTransports:     []TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:         proto.Uint32(threshold),
-		KeepVersionsCount: proto.Uint32(3),
+		SecretID:      orchestratorSecretID,
+		OwnTransports: []TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:     proto.Uint32(threshold),
 	}
 	if configure != nil {
 		configure(&cfg)
@@ -619,6 +620,58 @@ func TestOrchestrator_UpdateChannelInfoAnnouncesEndpointsByName(t *testing.T) {
 // SecretStore.LoadMany call, and that a nil entry is judged by the
 // library's missing-entry policy: discovery needs a key for every target,
 // so it fails with CodeMissingSharedKey naming the channel without one.
+// TestOrchestrator_OwnerKeepListReachesHelpers has the owner roll back v2
+// by listing only v1 for the v3 round: KeepList is asked once per round,
+// and both helpers end up holding exactly v1 and v3.
+func TestOrchestrator_OwnerKeepListReachesHelpers(t *testing.T) {
+	const threshold = 2
+
+	owner := newOrchestratorPeer(t, "owner", "https://owner.example.com", threshold)
+	helperA := newOrchestratorPeer(t, "helper-a", "https://helper-a.example.com", threshold)
+	helperB := newOrchestratorPeer(t, "helper-b", "https://helper-b.example.com", threshold)
+	channelA := pairOrchestratorPeers(t, owner, helperA, 1)
+	channelB := pairOrchestratorPeers(t, owner, helperB, 2)
+
+	for round := 1; round <= 3; round++ {
+		if round == 3 {
+			owner.shareStore.mu.Lock()
+			owner.shareStore.keep, owner.shareStore.keepOK = []uint32{1}, true
+			owner.shareStore.mu.Unlock()
+		}
+		if _, err := owner.protocol.Start(FlowKindProtectSecret, ProtectSecretParams{
+			Secrets: []UserSecret{{ID: []byte{4}, Name: "kept", Data: []byte(fmt.Sprintf("round-%d", round))}},
+		}); err != nil {
+			t.Fatalf("round %d Start(ProtectSecret): %v", round, err)
+		}
+		pumpOrchestratorPeersMany(t, []*orchestratorPeer{owner, helperA, helperB})
+	}
+
+	if got := owner.shareStore.keepListCalls; !slices.Equal(got, []uint32{1, 2, 3}) {
+		t.Fatalf("KeepList must be asked once per round with the version being sent, got %v", got)
+	}
+	for _, check := range []struct {
+		label     string
+		store     *inMemoryShareStore
+		channelID uint64
+	}{
+		{"helper-a", helperA.shareStore, channelA},
+		{"helper-b", helperB.shareStore, channelB},
+	} {
+		shares, err := check.store.Load(orchestratorSecretID, check.channelID, nil)
+		if err != nil {
+			t.Fatalf("%s.shareStore.Load: %v", check.label, err)
+		}
+		var versions []uint32
+		for _, sh := range shares {
+			versions = append(versions, sh.Version)
+		}
+		slices.Sort(versions)
+		if !slices.Equal(versions, []uint32{1, 3}) {
+			t.Fatalf("%s must hold exactly versions [1 3], got %v", check.label, versions)
+		}
+	}
+}
+
 func TestOrchestrator_SecretStoreLoadManyServesTheWholeBroadcast(t *testing.T) {
 	const threshold = 2
 

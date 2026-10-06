@@ -38,6 +38,8 @@ const (
 	EventTypeSecretsDiscovered         = "SecretsDiscovered"
 	EventTypeRecoveryShareReceived     = "RecoveryShareReceived"
 	EventTypeRecoveryShareError        = "RecoveryShareError"
+	EventTypeRecoveryShareRefused      = "RecoveryShareRefused"
+	EventTypeRecoveryShareCorrupted    = "RecoveryShareCorrupted"
 	EventTypeSecretRecovered           = "SecretRecovered"
 	EventTypeUnpaired                  = "Unpaired"
 	EventTypeUnpairRejected            = "UnpairRejected"
@@ -142,9 +144,15 @@ type Event struct {
 	IncomingAuthorReplicaID *uint64 `json:"incoming_author_replica_id,string"`
 
 	// ReplicaSecretAcked, ReplicaSyncRejected, ShareRejected,
-	// ShareVerifyRejected, UnpairRejected, PrePairRejected,
-	// ChannelInfoUpdateRejected. Status is the protocol StatusEnum the peer
-	// answered with.
+	// ShareVerifyRejected, RecoveryShareRefused, UnpairRejected,
+	// PrePairRejected, ChannelInfoUpdateRejected. Status is the protocol
+	// StatusEnum the peer answered with.
+	//
+	// RecoveryShareRefused is a helper answering a recovery share request
+	// with a non-OK Status (e.g. UNKNOWN_SHARE_VERSION) instead of a share.
+	// The refusal is not collected — it does not count towards
+	// SharesReceived and the recovery stays open for the other helpers'
+	// shares — but it does answer that helper's RecoverSecretStarted.
 	Status derecpb.StatusEnum `json:"status"`
 	Memo   string             `json:"memo"`
 
@@ -174,6 +182,17 @@ type Event struct {
 	// user-secret snapshot were restored. The peer itself is untouched — a
 	// helper still holds its share — and pairing with it again makes it
 	// reachable.
+	//
+	// RecoveryShareCorrupted — why a helper's share was set aside, one of the
+	// CorruptionReason* constants. CorruptionReasonMalformed and
+	// CorruptionReasonInvalidProof are judged as the share arrives;
+	// CorruptionReasonInconsistent (valid on its own, but disagreeing with
+	// the shares the secret was rebuilt from) is reported alongside
+	// SecretRecovered, once per helper. The share does not count towards
+	// SharesReceived and never blocks the recovery. An honest helper never
+	// sends one, so the application may treat it as a sign of a damaged or
+	// compromised helper, e.g. offer to unpair it. ChannelID and Version are
+	// set too, and the event answers that helper's RecoverSecretStarted.
 	Reason string `json:"reason"`
 
 	// ReplicaSyncComplete. Synced acknowledged; Behind refused, timed out, or
@@ -271,6 +290,21 @@ const (
 	// NotRestoredReasonNoTransports: the recovered roster names no endpoint
 	// for the peer.
 	NotRestoredReasonNoTransports = "NoTransports"
+)
+
+// The label vocabulary for Event.Reason on a RecoveryShareCorrupted event.
+// Matches the Rust CorruptionReason discriminants one-for-one.
+const (
+	// CorruptionReasonMalformed: the response carries no decodable share for
+	// the requested secret and version.
+	CorruptionReasonMalformed = "Malformed"
+	// CorruptionReasonInvalidProof: the share fails its own Merkle proof,
+	// e.g. a value altered after it was split.
+	CorruptionReasonInvalidProof = "InvalidProof"
+	// CorruptionReasonInconsistent: the share is valid on its own, but its
+	// commitment root or ciphertext disagrees with the shares the secret was
+	// rebuilt from.
+	CorruptionReasonInconsistent = "Inconsistent"
 )
 
 // Secret mirrors SecretWire in wire.rs — the typed secret snapshot carried

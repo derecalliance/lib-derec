@@ -226,6 +226,11 @@ impl DeRecSecretStore for InMemSecretStore {
 pub(crate) struct InMemShareStore {
     #[allow(clippy::type_complexity)]
     pub(crate) data: Arc<Mutex<HashMap<(u64, u64, u32), Share>>>,
+    /// What [`DeRecShareStore::keep_list`] answers on every call.
+    pub(crate) keep: Arc<Mutex<Option<Vec<u32>>>>,
+    /// Every `(secret_id, version)` [`DeRecShareStore::keep_list`] was asked
+    /// about, in call order.
+    pub(crate) keep_list_calls: Arc<Mutex<Vec<(u64, u32)>>>,
 }
 
 impl DeRecShareStore for InMemShareStore {
@@ -291,6 +296,11 @@ impl DeRecShareStore for InMemShareStore {
             .unwrap()
             .retain(|(s, c, v), _| !(*s == sid && *c == cid.0 && versions.contains(v)));
         Box::pin(std::future::ready(Ok(())))
+    }
+    fn keep_list(&self, sid: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+        self.keep_list_calls.lock().unwrap().push((sid, version));
+        let keep = self.keep.lock().unwrap().clone();
+        Box::pin(std::future::ready(Ok(keep)))
     }
 }
 

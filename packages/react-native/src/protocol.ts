@@ -280,9 +280,9 @@ function toBigInt(id: bigint | number): bigint {
  *
  * Every value the caller supplies is forwarded verbatim — defaults, clamping
  * and the meaning of a disabled cleanup policy are library decisions.
- * `threshold`, `keep_versions_count`, `auto_respond_on_failure`,
- * `unpair_ack`, `auto_reply_to` and `auto_accept` are omitted entirely from
- * the emitted config unless their setter was called: `ProtocolConfig` has a
+ * `threshold`, `auto_respond_on_failure`, `unpair_ack`, `auto_reply_to`
+ * and `auto_accept` are omitted entirely from the emitted config unless
+ * their setter was called: `ProtocolConfig` has a
  * `#[serde(default = "...")]` on each of them, reading the same constants
  * `DeRecProtocolBuilder::new` uses, so an absent key resolves to the
  * library's own default rather than one frozen into this shim.
@@ -349,12 +349,6 @@ export class DeRecProtocolBuilder {
   /** Default: 3. */
   withThreshold(threshold: number): this {
     this.config.threshold = threshold;
-    return this;
-  }
-
-  /** Default: 3. */
-  withKeepVersionsCount(count: number): this {
-    this.config.keep_versions_count = count;
     return this;
   }
 
@@ -579,7 +573,16 @@ export class DeRecProtocol {
   }
 
   async process(message: Uint8Array): Promise<DeRecEvent[]> {
-    const buffer = (await this.host.process(message)) as ArrayBuffer;
+    let buffer: ArrayBuffer;
+    try {
+      buffer = (await this.host.process(message)) as ArrayBuffer;
+    } catch (error) {
+      const failure = error as { events?: unknown };
+      if (Array.isArray(failure.events)) {
+        failure.events = reviveEventBytes(failure.events);
+      }
+      throw error;
+    }
     return decodeEvents(buffer);
   }
 

@@ -322,6 +322,10 @@ func (s *memShareStore) RemoveVersions(secretID, channelID uint64, versions []ui
 	return nil
 }
 
+func (s *memShareStore) KeepList(secretID uint64, version uint32) ([]uint32, bool, error) {
+	return nil, false, nil
+}
+
 var _ protocol.ShareStore = (*memShareStore)(nil)
 
 type memUserSecretStore struct {
@@ -474,11 +478,10 @@ func newPeerWithReplicaID(label, uri string, threshold uint32, replicaID *uint64
 	transport := newMemTransport()
 
 	cfg := protocol.Config{
-		SecretID:          protocolSecretID,
-		OwnTransports:     []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:         proto.Uint32(threshold),
-		KeepVersionsCount: proto.Uint32(3),
-		ReplicaID:         replicaID,
+		SecretID:      protocolSecretID,
+		OwnTransports: []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:     proto.Uint32(threshold),
+		ReplicaID:     replicaID,
 	}
 	p, err := protocol.New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
 	must(err, fmt.Sprintf("protocol.New(%s)", label))
@@ -898,10 +901,9 @@ func runExpiredChannelCleanup() {
 	transport := newMemTransport()
 
 	cfg := protocol.Config{
-		SecretID:          protocolSecretID,
-		OwnTransports:     []protocol.TransportProtocolParam{{URI: "https://cleanup.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:         proto.Uint32(2),
-		KeepVersionsCount: proto.Uint32(3),
+		SecretID:      protocolSecretID,
+		OwnTransports: []protocol.TransportProtocolParam{{URI: "https://cleanup.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:     proto.Uint32(2),
 		Timeouts: &protocol.Timeouts{
 			ExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{
 				Enabled:       false,
@@ -937,11 +939,10 @@ func runUnsafeConnection() {
 
 	build := func(uri string, allow bool) error {
 		cfg := protocol.Config{
-			SecretID:          protocolSecretID,
-			OwnTransports:     []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
-			Threshold:         proto.Uint32(2),
-			KeepVersionsCount: proto.Uint32(3),
-			UnsafeConnection:  &allow,
+			SecretID:         protocolSecretID,
+			OwnTransports:    []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:        proto.Uint32(2),
+			UnsafeConnection: &allow,
 		}
 		p, err := protocol.New(
 			newMemChannelStore(), newMemShareStore(), newMemSecretStore(),
@@ -982,10 +983,9 @@ func runConfigSurface() {
 
 	base := func() protocol.Config {
 		return protocol.Config{
-			SecretID:          protocolSecretID,
-			OwnTransports:     []protocol.TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-			Threshold:         proto.Uint32(2),
-			KeepVersionsCount: proto.Uint32(3),
+			SecretID:      protocolSecretID,
+			OwnTransports: []protocol.TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(2),
 		}
 	}
 	build := func(cfg protocol.Config) (*protocol.DeRecProtocol, error) {
