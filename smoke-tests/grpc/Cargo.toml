@@ -19,3 +19,6 @@ derec-proto = { path = "../../protobufs", features = ["descriptor"] }
 
 [features]
 logging = ["dep:tracing", "derec-library/logging"]
+
+[package.metadata.cargo-shear]
+ignored = ["tonic-prost"]

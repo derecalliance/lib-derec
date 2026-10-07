@@ -7,6 +7,76 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
+### 0.0.8
+
+Every random value the library produces now comes straight from the operating
+system's generator, and DeRec's own code uses a single `rand` (0.10).
+
+- **Fixed (security): a forked process could repeat channel message nonces.**
+  *(bug fix; every SDK)*
+
+  Nonces, seeds and random ids were drawn from `rand`'s thread-local
+  generator, which is not reseeded after `fork()`. A child process continued
+  its parent's sequence, so two processes on one channel could encrypt with
+  the same AES-GCM nonce and key. They are now drawn from the operating system
+  generator directly, with nothing buffered in the process: the channel
+  message nonce, the pairing envelope nonce and one-time key, the contact
+  nonce, the verification challenge nonce, generated channel and replica ids,
+  `trace_id`, and the 32-byte seeds behind key generation and secret
+  splitting.
+
+- **Changed: seeded generation uses ChaCha20.** *(hardening; every SDK)*
+
+  Pairing key generation, Shamir coefficients and coordinates, and Merkle
+  padding leaves used ChaCha8 seeded from fresh entropy. They now use
+  ChaCha20.
+
+- **Changed: one generation of `rand`.** *(dependencies; Rust)*
+
+  `derec-cryptography` moves from `rand` 0.8, `rand_chacha` 0.3 and
+  `rand_core` 0.6 to `rand` 0.10, and `ml-kem` from 0.2 to 0.3. Field elements
+  are sampled from 64 random bytes reduced modulo the field order instead of
+  through arkworks' `UniformRand`, which only accepts the old generator type.
+  arkworks still depends on `rand` 0.8 internally; it has no access to the
+  operating system's randomness and DeRec never calls it.
+  - **Breaking for direct users of `derec-cryptography`:** the generator
+    parameters of `pairing_ecies::generate_key`,
+    `pairing_mlkem::generate_keypair`, `pairing_mlkem::encapsulate`,
+    `shamir::share` and `build_merkle_tree` now take a `rand` 0.10
+    `CryptoRng`.
+  - **Stricter key checks:** `pairing_mlkem::encapsulate` rejects bytes that
+    are not a valid encapsulation key, and `pairing_mlkem::decapsulate`
+    rejects an expanded decapsulation key that fails validation.
+  - **Compatibility:** wire formats are unchanged. Tests built from material
+    produced by the previous release prove that stored decapsulation keys,
+    pairings started on the previous release, and shares helpers already hold
+    keep working.
+
+- **Deprecated: expanded ML-KEM decapsulation keys, removed at 0.0.13.**
+  *(deprecation; every SDK)*
+
+  New pairing secrets store the ML-KEM decapsulation key as its 64-byte seed,
+  the form FIPS 203 implementations have converged on, instead of the
+  3168-byte expanded form; `pairing_mlkem::DECAPSULATION_KEY_SIZE_IN_BYTES` is
+  now 64. Secrets stored before 0.0.8 hold the expanded form, so
+  `pairing_mlkem::decapsulate` keeps accepting it, and with the `logging`
+  feature it logs a warning each time it does.
+  - **What an application must do:** nothing now. A pairing started before
+    0.0.8 that is still pending at 0.0.13 can no longer complete; re-create
+    its contact.
+  - **Removed at 0.0.13:** the expanded form and
+    `pairing_mlkem::EXPANDED_DECAPSULATION_KEY_SIZE_IN_BYTES`, deprecated now.
+    The test suite fails once the version reaches 0.0.13 while they remain.
+
+- **Removed: unused dependencies.** *(dependencies; Rust)*
+
+  `k256` (from `derec-cryptography` and `derec-library`), the WASM-only
+  `getrandom` 0.2 backend, and three dependencies of the Rust smoke test.
+  `make all` now fails when a crate declares a dependency its code does not
+  use (`cargo-shear`; see `DEVELOPMENT.md`).
+
+- **Docs:** `VSSShare::merkle_path` holds SHA-256 hashes, not SHA-384.
+
 ### 0.0.7
 
 Fixes to replica admission, broadcast flows, share retention, recovery and `process()` error reporting found against 0.0.6.

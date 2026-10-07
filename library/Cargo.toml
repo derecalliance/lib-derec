@@ -1,6 +1,6 @@
 [package]
 name = "derec-library"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -22,11 +22,11 @@ include = [
 crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
-derec-cryptography = { version = "0.0.7", path = "../cryptography" }
-derec-proto = { version = "0.0.7", path = "../protobufs" }
+derec-cryptography = { version = "0.0.8", path = "../cryptography" }
+derec-proto = { version = "0.0.8", path = "../protobufs" }
 prost = "0.14.4"
 prost-types = "0.14.4"
-rand = { version = "0.10.2", features = ["sys_rng"] }
+rand = { version = "0.10.2", default-features = false, features = ["sys_rng"] }
 sha2 = "0.11.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_bytes = "0.11.19"
@@ -37,19 +37,17 @@ ark-serialize = { version = "0.6.0", default-features = true }
 thiserror = "2.0.19"
 zeroize = "1.9.0"
 subtle = "2.6.1"
-k256 = { version = "0.14.0", features = ["ecdsa"] }
 tracing = { version = "0.1.44", default-features = false, features = ["attributes"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.53.1", features = ["rt"], default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-derec-proto = { version = "0.0.7", path = "../protobufs", features = ["serde"] }
+derec-proto = { version = "0.0.8", path = "../protobufs", features = ["serde"] }
 wasm-bindgen = { version = "0.2.126", features = ["serde-serialize"] }
 wasm-bindgen-futures = { version = "0.4.76" }
 serde-wasm-bindgen = { version = "0.6.5" }
 js-sys = { version = "0.3.103" }
-getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
 getrandom_04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }
 console_error_panic_hook = "0.1.7"
 tokio = { version = "1.53.1", features = ["sync"], default-features = false }
@@ -69,8 +67,10 @@ serde = ["derec-proto/serde"]
 [package.metadata.docs.rs]
 features = ["serde"]
 
+[package.metadata.cargo-shear]
+ignored = ["getrandom_04"]
+
 [dev-dependencies]
-rand08 = { package = "rand", version = "0.8.5" }
 # Captures span/event output so a test can assert a log actually carries the
 # fields its span records; the library itself depends only on the facade.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }

@@ -1,6 +1,6 @@
 [package]
 name = "derec-proto"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -37,3 +37,5 @@ descriptor = []
 prost = "0.14.4"
 prost-types = "0.14.4"
 
+[package.metadata.cargo-shear]
+ignored = ["serde"]

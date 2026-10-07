@@ -84,8 +84,7 @@ pub fn apply_trace_id(envelope_bytes: &[u8], trace_id: u64) -> Result<Vec<u8>, c
 /// there is a 2^-64 chance of drawing a token downstream code might read as
 /// "no correlation requested" — not worth coding around.
 pub(crate) fn fresh_trace_id() -> u64 {
-    use rand::Rng as _;
-    rand::rng().next_u64()
+    crate::utils::random_u64()
 }
 
 /// Read the `trace_id` field off an inbound DeRecMessage envelope without

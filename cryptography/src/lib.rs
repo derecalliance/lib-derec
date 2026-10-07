@@ -52,5 +52,6 @@
 
 pub mod channel;
 pub mod pairing;
+mod random;
 pub mod replica;
 pub mod vss;

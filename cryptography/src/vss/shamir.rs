@@ -32,8 +32,7 @@
 use ark_ff::{BigInteger, PrimeField, Zero};
 use ark_poly::{Polynomial, univariate::DensePolynomial};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use ark_std::UniformRand;
-use rand::Rng;
+use rand::CryptoRng;
 
 use super::*;
 
@@ -48,7 +47,7 @@ use ark_bw6_761::Fr as F;
 /// * `access` - A tuple `(t, n)` where:
 ///     - `t` is the reconstruction threshold (minimum number of shares required to recover the secret),
 ///     - `n` is the total number of shares to generate.
-/// * `rng` - A mutable reference to a random number generator implementing the `Rng` trait.
+/// * `rng` - A mutable reference to a cryptographically secure random number generator.
 ///
 /// # Returns
 ///
@@ -56,7 +55,7 @@ use ark_bw6_761::Fr as F;
 /// - The first element is the serialized x-coordinate (as a field element).
 /// - The second element is the serialized y-coordinate (as a field element).
 ///
-pub fn share<R: Rng>(
+pub fn share<R: CryptoRng + ?Sized>(
     secret: &[u8; λ],
     threshold: u64,
     total_shares: u64,
@@ -64,8 +63,8 @@ pub fn share<R: Rng>(
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     let rng_cell = std::cell::RefCell::new(rng);
 
-    let sample_coeff = || F::rand(&mut *rng_cell.borrow_mut());
-    let sample_x = || F::rand(&mut *rng_cell.borrow_mut());
+    let sample_coeff = || crate::random::field_element::<F, R>(&mut **rng_cell.borrow_mut());
+    let sample_x = || crate::random::field_element::<F, R>(&mut **rng_cell.borrow_mut());
 
     share_with_samplers(secret, threshold, total_shares, sample_coeff, sample_x)
 }
@@ -214,22 +213,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::thread_rng;
-    use rand_chacha::rand_core::SeedableRng;
+    use rand::rngs::ChaCha20Rng;
+    use rand::{Rng as _, SeedableRng};
 
     #[test]
     fn test_shamir_correctness() {
         // test if recovery on shares produces the shared secret
 
-        let mut rng = thread_rng();
+        let mut rng = crate::random::os_rng();
 
         let mut seed = [0u8; 32];
-        rng.fill(&mut seed);
+        rng.fill_bytes(&mut seed);
 
         let mut secret: [u8; 32] = [0u8; 32];
-        rng.fill(&mut secret);
+        rng.fill_bytes(&mut secret);
 
-        let mut rng = rand_chacha::ChaCha8Rng::from_seed(seed);
+        let mut rng = ChaCha20Rng::from_seed(seed);
 
         let shares = share(&secret, 3, 5, &mut rng);
         let recovered = recover(shares).expect("well-formed shares interpolate");
@@ -238,7 +237,7 @@ mod tests {
     }
 
     fn sample_shares() -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut rng = rand_chacha::ChaCha8Rng::from_seed([9u8; 32]);
+        let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
         share(&[7u8; λ], 2, 3, &mut rng)
     }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use rand::Rng;
+use rand::CryptoRng;
 use sha2::{Digest, Sha256};
 
 use super::{DerecVSSError, VSSShare, λ};
@@ -50,7 +50,7 @@ pub fn detect_error(shares: &Vec<VSSShare>) -> Option<DerecVSSError> {
 // we will specify a depth of the tree, even though
 // we may not have that many shares. This is to
 // avoid leaking the number of shares to the attacker.
-pub fn build_merkle_tree<R: Rng>(
+pub fn build_merkle_tree<R: CryptoRng + ?Sized>(
     shares: &[(Vec<u8>, Vec<u8>)],
     depth: u32,
     rng: &mut R,
@@ -75,7 +75,7 @@ pub fn build_merkle_tree<R: Rng>(
         } else {
             // generate a garbage values for non-existent leaf nodes
             let mut rand = [0u8; 32];
-            rng.fill(&mut rand);
+            rng.fill_bytes(&mut rand);
 
             merkle_nodes[node_label - 1] = rand.to_vec();
         }
@@ -195,19 +195,19 @@ fn compute_sha256_hash(input: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::vss;
-    use rand::{Rng, thread_rng};
+    use rand::Rng as _;
 
     #[test]
     fn test_vss_correctness() {
         // test if recovery on shares produces the shared secret
 
-        let mut rng = thread_rng();
+        let mut rng = crate::random::os_rng();
 
         let mut rand = [0u8; 32];
-        rng.fill(&mut rand);
+        rng.fill_bytes(&mut rand);
 
         let mut msg: [u8; 1024] = [0u8; 1024];
-        rng.fill(&mut msg);
+        rng.fill_bytes(&mut msg);
 
         let shares = vss::share(3, 5, &msg, &rand).unwrap();
         let recovered = vss::recover(&shares).unwrap();
@@ -217,21 +217,21 @@ mod tests {
 
     #[test]
     fn test_merkle_tree_correctness() {
-        let mut rng = thread_rng();
+        let mut rng = crate::random::os_rng();
 
         let mut seed1 = [0u8; 32];
-        rng.fill(&mut seed1);
+        rng.fill_bytes(&mut seed1);
 
         let mut seed2 = [0u8; 32];
-        rng.fill(&mut seed2);
+        rng.fill_bytes(&mut seed2);
 
         let mut msg: [u8; 1024] = [0u8; 1024];
-        rng.fill(&mut msg);
+        rng.fill_bytes(&mut msg);
 
         let shares = vss::share(5, 7, &msg, &seed1).unwrap();
         let share_points: Vec<(Vec<u8>, Vec<u8>)> =
             shares.iter().map(|s| (s.x.clone(), s.y.clone())).collect();
-        let merkle_tree = build_merkle_tree(&share_points, 3, &mut thread_rng());
+        let merkle_tree = build_merkle_tree(&share_points, 3, &mut crate::random::os_rng());
         assert_merkle_tree_wff(&merkle_tree);
     }
 

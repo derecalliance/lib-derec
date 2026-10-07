@@ -68,10 +68,11 @@
 //!
 //! ```rust
 //! use derec_cryptography::pairing::{envelope, pairing_ecies};
-//! use rand::rngs::OsRng;
+//! use rand::rand_core::UnwrapErr;
+//! use rand::rngs::SysRng;
 //!
 //! // `generate_key` returns the secret key first, then the public key.
-//! let (secret_key, public_key) = pairing_ecies::generate_key(&mut OsRng).unwrap();
+//! let (secret_key, public_key) = pairing_ecies::generate_key(&mut UnwrapErr(SysRng)).unwrap();
 //!
 //! let ciphertext = envelope::encrypt(b"hello derec", &public_key).unwrap();
 //! let plaintext = envelope::decrypt(&ciphertext, &secret_key).unwrap();
@@ -79,7 +80,7 @@
 //! assert_eq!(plaintext, b"hello derec");
 //! ```
 
-use rand::rngs::OsRng;
+use rand::Rng as _;
 use thiserror::Error;
 
 use crate::channel;
@@ -135,9 +136,10 @@ pub enum DerecEncryptionError {
 ///
 /// ```rust
 /// use derec_cryptography::pairing::{envelope, pairing_ecies};
-/// use rand::rngs::OsRng;
+/// use rand::rand_core::UnwrapErr;
+/// use rand::rngs::SysRng;
 ///
-/// let (_secret_key, public_key) = pairing_ecies::generate_key(&mut OsRng).unwrap();
+/// let (_secret_key, public_key) = pairing_ecies::generate_key(&mut UnwrapErr(SysRng)).unwrap();
 ///
 /// let ciphertext = envelope::encrypt(b"hello", &public_key).unwrap();
 /// assert!(!ciphertext.is_empty());
@@ -153,7 +155,7 @@ pub fn encrypt(bytes: &[u8], public_key: &[u8]) -> Result<Vec<u8>, DerecEncrypti
         return Err(DerecEncryptionError::InvalidPublicKey);
     }
 
-    let (esk, epk) = pairing_ecies::generate_key(&mut OsRng).map_err(|_e| {
+    let (esk, epk) = pairing_ecies::generate_key(&mut crate::random::os_rng()).map_err(|_e| {
         #[cfg(feature = "logging")]
         tracing::warn!(error = %_e, "ephemeral keypair generation failed");
         DerecEncryptionError::EncryptionFailed
@@ -165,7 +167,8 @@ pub fn encrypt(bytes: &[u8], public_key: &[u8]) -> Result<Vec<u8>, DerecEncrypti
         DerecEncryptionError::EncryptionFailed
     })?;
 
-    let nonce = rand::random::<[u8; NONCE_SIZE]>();
+    let mut nonce = [0u8; NONCE_SIZE];
+    crate::random::os_rng().fill_bytes(&mut nonce);
 
     let ciphertext = channel::encrypt_message(bytes, &shared, &nonce).map_err(|_e| {
         #[cfg(feature = "logging")]
@@ -215,9 +218,10 @@ pub fn encrypt(bytes: &[u8], public_key: &[u8]) -> Result<Vec<u8>, DerecEncrypti
 ///
 /// ```rust
 /// use derec_cryptography::pairing::{envelope, pairing_ecies};
-/// use rand::rngs::OsRng;
+/// use rand::rand_core::UnwrapErr;
+/// use rand::rngs::SysRng;
 ///
-/// let (secret_key, public_key) = pairing_ecies::generate_key(&mut OsRng).unwrap();
+/// let (secret_key, public_key) = pairing_ecies::generate_key(&mut UnwrapErr(SysRng)).unwrap();
 /// let ciphertext = envelope::encrypt(b"hello", &public_key).unwrap();
 ///
 /// let plaintext = envelope::decrypt(&ciphertext, &secret_key).unwrap();
@@ -278,10 +282,10 @@ pub fn decrypt(ciphertext: &[u8], secret_key: &[u8]) -> Result<Vec<u8>, DerecEnc
 mod tests {
     use super::*;
     use crate::pairing::pairing_ecies;
-    use rand::rngs::OsRng;
 
     fn generate_recipient_keypair() -> (Vec<u8>, Vec<u8>) {
-        pairing_ecies::generate_key(&mut OsRng).expect("failed to generate recipient keypair")
+        pairing_ecies::generate_key(&mut crate::random::os_rng())
+            .expect("failed to generate recipient keypair")
     }
 
     #[test]

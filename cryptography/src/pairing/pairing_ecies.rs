@@ -5,9 +5,8 @@
 //! Elliptic Curve Integrated Encryption Scheme (ECIES) operations over secp256k1.
 
 use ark_ec::*;
-use ark_ff::*;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use rand::Rng;
+use rand::CryptoRng;
 use sha2::*;
 
 use super::DerecPairingError;
@@ -22,8 +21,10 @@ use super::DerecPairingError;
 /// - The secret key as a vector of bytes (uncompressed serialization).
 /// - The public key as a vector of bytes (uncompressed serialization).
 ///
-pub fn generate_key<R: Rng>(rng: &mut R) -> Result<(Vec<u8>, Vec<u8>), DerecPairingError> {
-    let sk = ark_secp256k1::Fr::rand(rng);
+pub fn generate_key<R: CryptoRng + ?Sized>(
+    rng: &mut R,
+) -> Result<(Vec<u8>, Vec<u8>), DerecPairingError> {
+    let sk: ark_secp256k1::Fr = crate::random::field_element(rng);
     let pk = ark_secp256k1::Affine::generator() * sk;
 
     let mut sk_bytes = Vec::new();

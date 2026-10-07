@@ -39,7 +39,8 @@
 //!
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use rand_chacha::rand_core::SeedableRng;
+use rand::SeedableRng;
+use rand::rngs::ChaCha20Rng;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub mod envelope;
@@ -234,7 +235,7 @@ pub type PairingSharedKey = [u8; 32];
 pub fn contact_message(
     entropy: [u8; 32],
 ) -> Result<(PairingContactMessageMaterial, InitiatorSecretKeyMaterial), DerecPairingError> {
-    let mut csprng = rand_chacha::ChaCha8Rng::from_seed(entropy);
+    let mut csprng = ChaCha20Rng::from_seed(entropy);
     let (dk, ek) = pairing_mlkem::generate_keypair(&mut csprng);
     let (sk, pk) = pairing_ecies::generate_key(&mut csprng).inspect_err(|_e| {
         #[cfg(feature = "logging")]
@@ -314,7 +315,7 @@ pub fn pairing_request_message(
     entropy: [u8; 32],
     received: &PairingContactMessageMaterial,
 ) -> Result<(PairingRequestMessageMaterial, ResponderSecretKeyMaterial), DerecPairingError> {
-    let mut csprng = rand_chacha::ChaCha8Rng::from_seed(entropy);
+    let mut csprng = ChaCha20Rng::from_seed(entropy);
 
     let (ct, shared_key) =
         pairing_mlkem::encapsulate(&received.mlkem_encapsulation_key, &mut csprng).inspect_err(

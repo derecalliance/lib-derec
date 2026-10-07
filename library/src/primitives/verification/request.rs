@@ -9,7 +9,6 @@ use crate::{
 };
 use derec_proto::{DeRecMessage, MessageBody, VerifyShareRequestMessage};
 use prost::Message;
-use rand::{Rng, rng};
 
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] envelope with the encrypted request payload.
@@ -129,10 +128,8 @@ pub fn produce(
     shared_key: &SharedKey,
     reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<ProduceResult, crate::Error> {
-    let mut rng = rng();
-
     let timestamp = current_timestamp();
-    let nonce = rng.next_u64();
+    let nonce = crate::utils::random_u64();
 
     let reply_to_transports = reply_to.to_vec();
     let message = VerifyShareRequestMessage {

@@ -159,7 +159,7 @@ impl<
         contact_mode: ContactMode,
         nonce: Option<u64>,
     ) -> Result<ContactMessage> {
-        let channel_id = channel_id.unwrap_or_else(|| ChannelId(rand::random::<u64>()));
+        let channel_id = channel_id.unwrap_or_else(|| ChannelId(crate::utils::random_u64()));
 
         #[cfg(feature = "logging")]
         tracing::debug!(

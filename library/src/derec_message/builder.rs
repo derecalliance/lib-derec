@@ -254,15 +254,14 @@ impl<State, Mode> DeRecMessageBuilder<State, Mode> {
     /// Sets a freshly-drawn random `trace_id` on the envelope.
     ///
     /// Convenience for request producers that want a new correlation token
-    /// without managing the RNG themselves. Uses the same random source as the
-    /// rest of the library (`rand::rng().next_u64()`).
+    /// without managing the RNG themselves. Drawn from the operating system's
+    /// random number generator, like every random value the library produces.
     ///
     /// # Returns
     ///
     /// The updated builder with a random `trace_id`.
     pub fn auto_trace_id(mut self) -> Self {
-        use rand::Rng as _;
-        self.trace_id = Some(rand::rng().next_u64());
+        self.trace_id = Some(crate::utils::random_u64());
         self
     }
 
@@ -431,7 +430,7 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
             .ok_or(DeRecMessageBuilderError::MissingChannelId)?;
 
         let mut nonce = [0u8; 32];
-        rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce[..12]);
+        rand::Rng::fill_bytes(&mut crate::utils::os_rng(), &mut nonce[..12]);
 
         let encoded = self.message.unwrap().encode_to_vec();
         let encrypted = derec_cryptography::channel::encrypt_message(&encoded, shared_key, &nonce)?;

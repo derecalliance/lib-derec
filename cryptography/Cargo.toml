@@ -1,6 +1,6 @@
 [package]
 name = "derec-cryptography"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -27,18 +27,14 @@ sha2 = "0.11.0"
 aead = "0.6.1"
 aes = "0.9.1"
 aes-gcm = "0.11.0"
-rand = "0.8.5"
-rand_chacha = "0.3.1"
-rand_core = "0.6.4"
-ark-std = "0.6.0"
+rand = { version = "0.10.2", default-features = false, features = ["chacha", "sys_rng"] }
 ark-ec = "0.6.0"
-ark-ff = "0.6.0"
+ark-ff = { version = "0.6.0", features = ["std"] }
 ark-poly = "0.6.0"
 ark-serialize = { version = "0.6.0", default-features = true }
 ark-bw6-761 = "0.6.0"
 ark-secp256k1 = "0.6.0"
 thiserror = "2.0.19"
-ml-kem = "0.2.3"
+ml-kem = "0.3.2"
 zeroize = { version = "1.9.0", features = ["derive"] }
-k256 = { version = "0.14.0", features = ["ecdsa"] }
 

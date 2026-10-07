@@ -21,7 +21,6 @@ use derec_proto::{
     PrePairRequestMessage, SenderKind, TransportProtocol,
 };
 use prost::Message;
-use rand::{Rng, rng};
 
 pub struct CreateContactResult {
     pub contact_message: ContactMessage,
@@ -165,7 +164,7 @@ pub fn create_contact(
         return Err(PairingError::EmptyTransportUri.into());
     }
 
-    let nonce = nonce.unwrap_or_else(|| rng().next_u64());
+    let nonce = nonce.unwrap_or_else(crate::utils::random_u64);
 
     let (contact_message, secret_key) = match contact_mode {
         ContactMode::InlineKeys => {
