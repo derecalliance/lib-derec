@@ -408,6 +408,38 @@ public interface IShareStore
     /// </summary>
     void Save(ulong secretId, ulong channelId, Share share);
     void RemoveChannel(ulong secretId, ulong channelId);
+    /// <summary>
+    /// Drop the shares stored under <c>(secretId, channelId)</c> at each of
+    /// <paramref name="versions"/>. Idempotent: a version that is not stored
+    /// is skipped, and an empty array is a no-op.
+    /// <para>
+    /// A helper calls this to apply <c>StoreShareRequestMessage.keepList</c>,
+    /// the complete set of versions the owner wants retained: every stored
+    /// version outside it is removed once the incoming share is persisted.
+    /// Shares under other channels or partitions must be left untouched.
+    /// </para>
+    /// </summary>
+    void RemoveVersions(ulong secretId, ulong channelId, uint[] versions);
+    /// <summary>
+    /// Owner only: the versions every helper keeps after the owner
+    /// distributes <paramref name="version"/>. Called once per sharing
+    /// round, before anything is sent, including the rounds the library
+    /// starts itself; the answer becomes <c>keepList</c> for every helper.
+    /// <para>
+    /// Return <c>null</c> to send no <c>keepList</c> (it goes out empty):
+    /// helpers then keep every version they hold. An application that
+    /// wants to cap how many versions helpers retain returns that cap
+    /// here. A returned list is used as is, plus
+    /// <paramref name="version"/>, which the library always adds.
+    /// Helpers delete every version that is not listed, so list every
+    /// version that could still become the latest: those that committed
+    /// (for example, whose <see cref="SharingCompleteEvent"/> reported
+    /// <c>ThresholdMet</c>) and those whose round is still open. Leave out
+    /// only versions whose round failed or that the user rolled back; a
+    /// list that leaves out too much can make the secret unrecoverable.
+    /// </para>
+    /// </summary>
+    uint[]? KeepList(ulong secretId, uint version);
 }
 
 /// <summary>
@@ -721,6 +753,11 @@ public sealed record StateKey(StateKind Kind, ulong? ChannelId, ulong? SecretId,
 /// Version each group member reported so far, by <c>replicaId</c> (only for
 /// <see cref="StateKind.PendingReplicaDiscovery"/>).
 /// </param>
+/// <param name="ShareChannels">
+/// The channel each entry of <paramref name="Shares"/> arrived on,
+/// index-aligned with it (only for <see cref="StateKind.PendingRecovery"/>).
+/// A row without it is read by the library as no shares collected.
+/// </param>
 /// <remarks>
 /// Fields are carried exactly as the library wrote them. A replica-id set
 /// left null is read by the library as empty.
@@ -740,7 +777,8 @@ public sealed record StateItem(
     ulong[]? SyncedReplicas = null,
     ulong[]? BehindReplicas = null,
     uint? LocalVersion = null,
-    IReadOnlyDictionary<ulong, uint>? Reported = null)
+    IReadOnlyDictionary<ulong, uint>? Reported = null,
+    ulong[]? ShareChannels = null)
 {
     public StateKey Key() => Kind switch
     {
@@ -759,8 +797,8 @@ public sealed record StateItem(
 
     public static StateItem PendingVerification(ulong channelId, byte[] requestBytes) =>
         new(StateKind.PendingVerification, channelId, null, null, null, requestBytes, null);
-    public static StateItem PendingRecovery(ulong secretId, uint version, byte[][] shares) =>
-        new(StateKind.PendingRecovery, null, secretId, version, null, null, shares);
+    public static StateItem PendingRecovery(ulong secretId, uint version, byte[][] shares, ulong[] shareChannels) =>
+        new(StateKind.PendingRecovery, null, secretId, version, null, null, shares, ShareChannels: shareChannels);
     public static StateItem PendingUnpair(ulong channelId, ulong startedAt) =>
         new(StateKind.PendingUnpair, channelId, null, null, startedAt, null, null);
     public static StateItem SharingRound(

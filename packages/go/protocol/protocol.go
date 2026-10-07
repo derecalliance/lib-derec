@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/internal/native"
 )
 
@@ -97,10 +98,6 @@ type Config struct {
 	// below 2 with a *derec.Error, because a threshold of 0 or 1 lets a
 	// single helper reconstruct the secret.
 	Threshold *uint32
-	// KeepVersionsCount is the number of recent share versions each
-	// helper retains. nil uses the library default (3); every non-nil
-	// value, including 0, is forwarded as given.
-	KeepVersionsCount *uint32
 	// CommunicationInfo carries key/value pairs included in
 	// pairing-request and pairing-response CommunicationInfo. Default:
 	// empty.
@@ -318,7 +315,6 @@ func New(
 		SecretID:             config.SecretID,
 		OwnTransports:        nativeOwnTransports,
 		Threshold:            config.Threshold,
-		KeepVersionsCount:    config.KeepVersionsCount,
 		CommunicationInfo:    config.CommunicationInfo,
 		Timeouts:             nativeTimeouts,
 		UnsafeConnection:     config.UnsafeConnection,
@@ -393,6 +389,11 @@ func (p *DeRecProtocol) GetFingerprint(channelID uint64) (string, error) {
 // Paired and this returns true. Every non-nil error, and every legitimate
 // mismatch, returns false — callers must check err to distinguish "did
 // not match" from "could not be verified".
+//
+// On a replica destination, confirming is also the decision to adopt the
+// group's vault: the source's publish is then installed as it arrives, with
+// no further prompt. Ask the user before calling this; to decline, never
+// confirm.
 func (p *DeRecProtocol) VerifyFingerprint(channelID uint64, fingerprint string) (bool, error) {
 	if p.closed {
 		return false, errors.New("protocol: VerifyFingerprint: protocol is closed")
@@ -466,15 +467,50 @@ func (p *DeRecProtocol) SetCommunicationInfo(info map[string]string) error {
 // (the core surfaces that as an error, not a panic); an expired or
 // pending-fingerprint-verification message that produces no actionable
 // effect decodes to a single NoOp event rather than an empty slice.
+//
+// A message the core rejects returns a *ProcessError carrying the failing
+// channel and the events produced before the failure.
 func (p *DeRecProtocol) Process(message []byte) ([]Event, error) {
 	if p.closed {
 		return nil, errors.New("protocol: Process: protocol is closed")
 	}
-	eventsJSON, err := p.instance.Process(message)
+	eventsJSON, channelID, err := p.instance.Process(message)
+	events, decodeErr := decodeEvents(eventsJSON)
 	if err != nil {
-		return nil, err
+		derecErr, ok := err.(*derec.Error)
+		if !ok {
+			return nil, err
+		}
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		return nil, &ProcessError{ChannelID: channelID, Events: events, Err: derecErr}
 	}
-	return decodeEvents(eventsJSON)
+	return events, decodeErr
+}
+
+// ProcessError is the error Process returns when the protocol core rejects
+// a message. It mirrors derec_library::protocol::ProcessError.
+//
+// ChannelID names the channel the failing message arrived on; nil when the
+// bytes were not a decodable envelope. Events holds what the call produced
+// before failing, such as sharing-round and unpair timeouts: they are not
+// reported again, so handle them as a successful call's events. Err is the
+// underlying *derec.Error, also reachable through errors.As.
+type ProcessError struct {
+	ChannelID *uint64
+	Events    []Event
+	Err       *derec.Error
+}
+
+// Error implements the error interface with the underlying error's message.
+func (e *ProcessError) Error() string {
+	return e.Err.Error()
+}
+
+// Unwrap returns the underlying *derec.Error.
+func (e *ProcessError) Unwrap() error {
+	return e.Err
 }
 
 // Tick advances time-driven state without an inbound message, returning the

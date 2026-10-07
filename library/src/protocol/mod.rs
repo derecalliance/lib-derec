@@ -91,7 +91,7 @@ pub(crate) mod sweeps;
 #[cfg(test)]
 pub(crate) mod test;
 
-pub use builder::{DEFAULT_KEEP_VERSIONS_COUNT, DEFAULT_THRESHOLD, DeRecProtocolBuilder};
+pub use builder::{DEFAULT_THRESHOLD, DeRecProtocolBuilder};
 use derec_proto::TransportProtocol;
 pub use error::{
     ChannelStoreError, ProcessError, SecretStoreError, ShareStoreError, StateStoreError,
@@ -104,15 +104,15 @@ pub use traits::{
 };
 pub use transport_adapters::{SendOne, SequentialFailover, SingleEndpointTransport};
 pub use types::{
-    ChannelQuery, ChannelRecord, ChannelShare, ChannelStatus, ExpiredChannelCleanup, HelperChannel,
-    HelperInfo, MissingPolicy, PairingKeyMaterial, ReplicaInfo, ReplicaMember, ReplicaRole,
-    ReplicaSecretPayload, Secret, SecretKind, SecretValue, Share, StateItem, StateKey, StateKind,
-    Target, UserSecret, UserSecrets,
+    ChannelQuery, ChannelRecord, ChannelShare, ChannelStatus, CollectedShare,
+    ExpiredChannelCleanup, HelperChannel, HelperInfo, MissingPolicy, PairingKeyMaterial,
+    ReplicaInfo, ReplicaMember, ReplicaRole, ReplicaSecretPayload, Secret, SecretKind, SecretValue,
+    Share, StateItem, StateKey, StateKind, Target, UserSecret, UserSecrets,
 };
 
 pub use events::{
-    AutoAcceptPolicy, DeRecEvent, DeRecFlow, IgnoreReason, NotRestoredReason, PendingAction,
-    PendingActionKind, UnpairAck,
+    AutoAcceptPolicy, CorruptionReason, DeRecEvent, DeRecFlow, IgnoreReason, NotRestoredReason,
+    PendingAction, PendingActionKind, UnpairAck,
 };
 pub use handlers::restore::RestoreError;
 
@@ -197,8 +197,6 @@ pub struct DeRecProtocol<
     pub(crate) unpair_ack: UnpairAck,
     /// Configured via [`DeRecProtocolBuilder::with_threshold`](crate::protocol::DeRecProtocolBuilder::with_threshold).
     threshold: usize,
-    /// Configured via [`DeRecProtocolBuilder::with_keep_versions_count`](crate::protocol::DeRecProtocolBuilder::with_keep_versions_count).
-    keep_versions_count: usize,
     /// Configured via [`Timeouts`](crate::protocol::types::Timeouts).
     /// Configured via [`DeRecProtocolBuilder::with_timeouts`](crate::protocol::DeRecProtocolBuilder::with_timeouts).
     pub(crate) timeouts: crate::protocol::types::Timeouts,

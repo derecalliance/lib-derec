@@ -5,6 +5,7 @@ use super::super::{
     DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport, MissingPolicy,
     PendingAction, SecretKind, SecretValue, StateItem, StateKey,
 };
+use super::NO_SHARE_FOR_VERSION;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::protocol::context::{Exchange, Local, Round};
 use crate::protocol::stores::{StoreSet, Stores};
@@ -39,6 +40,12 @@ use prost::Message;
 /// is enforced by the primitive before the SHA-384 check. A binding
 /// mismatch surfaces as `Error::Verification(..)` and is returned to the
 /// caller rather than swallowed.
+///
+/// A bound response whose status is not OK is the helper refusing the
+/// challenge, not a failure of this device: it surfaces as
+/// `ShareVerifyRejected` carrying the helper's status and memo. The
+/// challenge row is consumed all the same, so the helper is challenged again
+/// only by a new round.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
@@ -95,21 +102,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     round: &Round<'_>,
 ) -> Result<Vec<DeRecEvent>> {
     let secret_id = local.secret_id;
-    let known: Vec<ChannelId> = stores
-        .channels
-        .helpers_matching(
-            secret_id,
-            crate::protocol::types::HelperFilter {
-                ids: target.ids(),
-                ..Default::default()
-            },
-        )
-        .await?
-        .iter()
-        .map(|c| c.channel_id)
-        .collect();
-
-    let channel_ids = target.filter(&known);
+    let channel_ids = stores.channels.resolve_target(secret_id, target).await?;
 
     let keys = stores
         .secrets
@@ -143,6 +136,15 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     Ok(events)
 }
 
+/// Answer a verification challenge with the proof for the stored share.
+///
+/// A helper holding no share for the challenged version still answers: the
+/// response carries `UNKNOWN_SHARE_VERSION` and no proof, which the owner
+/// surfaces as [`DeRecEvent::ShareVerifyRejected`] rather than waiting on a
+/// reply that never comes. That is an answer rather than a failure of this
+/// device, so `accept` succeeds either way, whether the application accepted
+/// the action or the [`AutoAcceptPolicy`](crate::protocol::AutoAcceptPolicy)
+/// did.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(
@@ -162,16 +164,32 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
 ) -> Result<Vec<DeRecEvent>> {
     let (secret_id, channel_id) = (local.secret_id, exchange.channel_id);
 
-    let stored_bytes = stores
+    let Some(stored_bytes) = stores
         .shares
         .load(secret_id, channel_id, &[request.version])
         .await?
         .into_iter()
         .next()
         .map(|s| s.bytes)
-        .ok_or(Error::InvalidInput(
-            "no stored share for verification request",
-        ))?;
+    else {
+        #[cfg(feature = "logging")]
+        tracing::info!(
+            channel_id = channel_id.0,
+            secret_id = request.secret_id,
+            version = request.version,
+            "no stored share for the challenged version; answering UNKNOWN_SHARE_VERSION"
+        );
+        reject(
+            stores,
+            local,
+            exchange,
+            request,
+            StatusEnum::UnknownShareVersion,
+            NO_SHARE_FOR_VERSION,
+        )
+        .await?;
+        return Ok(vec![DeRecEvent::NoOp]);
+    };
 
     let stored =
         StoreShareRequestMessage::decode(stored_bytes.as_slice()).map_err(Error::ProtobufDecode)?;
@@ -314,7 +332,29 @@ async fn on_response<S: StoreSet>(
             "no committed share stored for this channel/version — cannot verify proof",
         ))?;
 
-    let valid = verification_response::process(&request, response, &committed_share_bytes)?;
+    let valid = match verification_response::process(&request, response, &committed_share_bytes) {
+        Ok(valid) => valid,
+        Err(err) => {
+            let Some((status, memo)) = err.as_non_ok_status() else {
+                return Err(err);
+            };
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                channel_id = channel_id.0,
+                secret_id = response.secret_id,
+                version = version,
+                status,
+                memo,
+                "verification challenge rejected by helper"
+            );
+            return Ok(vec![DeRecEvent::ShareVerifyRejected {
+                channel_id,
+                version,
+                status,
+                memo: memo.to_owned(),
+            }]);
+        }
+    };
 
     if !valid {
         return Err(Error::Invariant("verification proof is invalid"));
@@ -441,4 +481,313 @@ async fn dispatch_one<S: StoreSet>(
     let envelope = crate::derec_message::apply_trace_id(&msg.envelope, round.trace_id)?;
     stores.transport.send(&endpoint, envelope).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::test::{StoreRig, run_async};
+    use crate::protocol::types::Share;
+
+    const SECRET_ID: u64 = 0x5E1F;
+    const CHANNEL: ChannelId = ChannelId(21);
+    const VERSION: u32 = 3;
+
+    /// A helper refusing a challenge is reported with its status and memo,
+    /// as a refused share is, rather than failing `process` with no event.
+    #[test]
+    fn a_refused_challenge_surfaces_as_share_verify_rejected() {
+        run_async(async {
+            let mut rig = StoreRig::new();
+            let request = VerifyShareRequestMessage {
+                secret_id: SECRET_ID,
+                version: VERSION,
+                nonce: 0x0BAD_5EED,
+                timestamp: None,
+                reply_to_transports: Vec::new(),
+            };
+            rig.state
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingVerification {
+                        channel_id: CHANNEL,
+                        request: request.clone(),
+                    },
+                )
+                .await
+                .expect("seed challenge");
+            rig.shares
+                .save(
+                    SECRET_ID,
+                    CHANNEL,
+                    Share {
+                        secret_id: SECRET_ID,
+                        version: VERSION,
+                        bytes: vec![0x5A; 16],
+                    },
+                )
+                .await
+                .expect("seed committed share");
+
+            let response = VerifyShareResponseMessage {
+                result: Some(DeRecResult {
+                    status: StatusEnum::UnknownShareVersion as i32,
+                    memo: "no stored share for verification request".to_owned(),
+                }),
+                secret_id: SECRET_ID,
+                version: VERSION,
+                nonce: request.nonce,
+                hash: Vec::new(),
+                timestamp: Some(current_timestamp()),
+            };
+            let local = crate::protocol::test::LocalFixture::new(SECRET_ID);
+            let events = handle(
+                &mut rig.stores(),
+                &local.local(),
+                &Exchange {
+                    channel_id: CHANNEL,
+                    shared_key: &[0u8; 32],
+                    trace_id: 0,
+                },
+                MessageBody::VerifyShareResponse(response),
+            )
+            .await
+            .expect("a refusal is an outcome, not an error");
+
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [DeRecEvent::ShareVerifyRejected { channel_id, version, status, memo }]
+                        if *channel_id == CHANNEL
+                            && *version == VERSION
+                            && *status == StatusEnum::UnknownShareVersion as i32
+                            && memo == "no stored share for verification request"
+                ),
+                "got {events:?}"
+            );
+            assert!(
+                rig.state
+                    .load(
+                        SECRET_ID,
+                        StateKey::PendingVerification {
+                            channel_id: CHANNEL
+                        }
+                    )
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "the refused challenge is consumed"
+            );
+        });
+    }
+
+    /// A helper challenged for a version it does not hold answers
+    /// `UNKNOWN_SHARE_VERSION` instead of leaving the challenge unanswered,
+    /// and the owner reads that answer as [`DeRecEvent::ShareVerifyRejected`].
+    mod helper_without_the_share {
+        use super::*;
+        use crate::protocol::test::{
+            InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
+            InMemUserSecretStore, RecordingTransport,
+        };
+        use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel};
+        use crate::protocol::{AutoAcceptPolicy, DeRecChannelStore, DeRecProtocolBuilder};
+        use derec_proto::{DeRecMessage, SenderKind, TransportProtocol};
+
+        type TestProto = crate::protocol::DeRecProtocol<
+            InMemChannelStore,
+            InMemShareStore,
+            InMemSecretStore,
+            InMemUserSecretStore,
+            InMemPersistedStateStore,
+            RecordingTransport,
+        >;
+
+        const HELPER_PARTITION: u64 = 0x4E1;
+        const KEY: SharedKey = [0xC3; 32];
+
+        async fn helper(auto_accept: AutoAcceptPolicy) -> (TestProto, RecordingTransport) {
+            let mut rig = StoreRig::new();
+            rig.channels
+                .save(
+                    HELPER_PARTITION,
+                    ChannelRecord::Helper(HelperChannel {
+                        channel_id: CHANNEL,
+                        transports: vec![TransportProtocol {
+                            uri: "https://owner.example".to_owned(),
+                            protocol: derec_proto::Protocol::Https as i32,
+                        }],
+                        communication_info: Default::default(),
+                        status: ChannelStatus::Paired,
+                        created_at: 1,
+                        peer_role: SenderKind::Owner,
+                    }),
+                )
+                .await
+                .expect("channel saved");
+            rig.secrets
+                .save(HELPER_PARTITION, CHANNEL, SecretValue::SharedKey(KEY))
+                .await
+                .expect("shared key saved");
+            let protocol = DeRecProtocolBuilder::new(HELPER_PARTITION)
+                .with_channel_store(rig.channels)
+                .with_share_store(InMemShareStore::default())
+                .with_secret_store(rig.secrets)
+                .with_user_secret_store(InMemUserSecretStore::default())
+                .with_state_store(rig.state)
+                .with_transport(rig.transport.clone())
+                .with_own_transports(["https://helper.example"])
+                .with_auto_accept(auto_accept)
+                .build()
+                .expect("test rig builds");
+            (protocol, rig.transport)
+        }
+
+        fn sent_response(transport: &RecordingTransport) -> VerifyShareResponseMessage {
+            let envelopes = transport.sent_envelopes();
+            assert_eq!(envelopes.len(), 1, "exactly one answer must be sent");
+            let msg = DeRecMessage::decode(envelopes[0].as_slice()).expect("envelope decodes");
+            match crate::derec_message::extract_inner_message(&msg.message, &KEY)
+                .expect("inner message decrypts")
+            {
+                MessageBody::VerifyShareResponse(r) => r,
+                other => panic!("expected VerifyShareResponse, got {other:?}"),
+            }
+        }
+
+        /// Feed the helper's answer to an owner holding the challenge it
+        /// answers, and return what the owner reports.
+        async fn owner_reads(nonce: u64, response: VerifyShareResponseMessage) -> Vec<DeRecEvent> {
+            let mut rig = StoreRig::new();
+            rig.state
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingVerification {
+                        channel_id: CHANNEL,
+                        request: VerifyShareRequestMessage {
+                            secret_id: SECRET_ID,
+                            version: VERSION,
+                            nonce,
+                            timestamp: None,
+                            reply_to_transports: Vec::new(),
+                        },
+                    },
+                )
+                .await
+                .expect("seed challenge");
+            rig.shares
+                .save(
+                    SECRET_ID,
+                    CHANNEL,
+                    Share {
+                        secret_id: SECRET_ID,
+                        version: VERSION,
+                        bytes: vec![0x5A; 16],
+                    },
+                )
+                .await
+                .expect("seed committed share");
+            let local = crate::protocol::test::LocalFixture::new(SECRET_ID);
+            handle(
+                &mut rig.stores(),
+                &local.local(),
+                &Exchange {
+                    channel_id: CHANNEL,
+                    shared_key: &KEY,
+                    trace_id: 0,
+                },
+                MessageBody::VerifyShareResponse(response),
+            )
+            .await
+            .expect("a refusal is an outcome, not an error")
+        }
+
+        fn assert_owner_sees_rejection(events: &[DeRecEvent]) {
+            assert!(
+                matches!(
+                    events,
+                    [DeRecEvent::ShareVerifyRejected { channel_id, version, status, .. }]
+                        if *channel_id == CHANNEL
+                            && *version == VERSION
+                            && *status == StatusEnum::UnknownShareVersion as i32
+                ),
+                "got {events:?}"
+            );
+        }
+
+        fn challenge() -> (Vec<u8>, u64) {
+            let produced =
+                produce_verify_share_request_message(CHANNEL, SECRET_ID, VERSION, &KEY, &[])
+                    .expect("challenge produced");
+            (produced.envelope, produced.nonce)
+        }
+
+        #[test]
+        fn auto_accept_answers_unknown_share_version_end_to_end() {
+            run_async(async {
+                let (mut protocol, transport) = helper(AutoAcceptPolicy {
+                    verify_share: true,
+                    ..Default::default()
+                })
+                .await;
+                let (envelope, nonce) = challenge();
+
+                let events = protocol
+                    .process(&envelope)
+                    .await
+                    .expect("a challenge for a share not held is answered, not failed");
+                assert!(
+                    events
+                        .iter()
+                        .any(|e| matches!(e, DeRecEvent::AutoAccepted { .. })),
+                    "got {events:?}"
+                );
+
+                let response = sent_response(&transport);
+                assert_eq!(
+                    response.result.as_ref().map(|r| r.status),
+                    Some(StatusEnum::UnknownShareVersion as i32)
+                );
+                assert_eq!(response.nonce, nonce);
+                assert!(response.hash.is_empty());
+
+                assert_owner_sees_rejection(&owner_reads(nonce, response).await);
+            });
+        }
+
+        #[test]
+        fn manual_accept_answers_unknown_share_version_end_to_end() {
+            run_async(async {
+                let (mut protocol, transport) = helper(AutoAcceptPolicy::default()).await;
+                let (envelope, nonce) = challenge();
+
+                let action = protocol
+                    .process(&envelope)
+                    .await
+                    .expect("the challenge surfaces for a decision")
+                    .into_iter()
+                    .find_map(|e| match e {
+                        DeRecEvent::ActionRequired { action, .. } => Some(action),
+                        _ => None,
+                    })
+                    .expect("ActionRequired for the VerifyShare request");
+
+                let accepted = protocol
+                    .accept(action)
+                    .await
+                    .expect("accepting a challenge for a share not held succeeds");
+                assert!(
+                    matches!(accepted.as_slice(), [DeRecEvent::NoOp]),
+                    "got {accepted:?}"
+                );
+
+                let response = sent_response(&transport);
+                assert_eq!(
+                    response.result.as_ref().map(|r| r.status),
+                    Some(StatusEnum::UnknownShareVersion as i32)
+                );
+                assert_owner_sees_rejection(&owner_reads(nonce, response).await);
+            });
+        }
+    }
 }

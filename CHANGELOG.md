@@ -7,6 +7,231 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
+### 0.0.7
+
+Fixes to replica admission, broadcast flows, share retention, recovery and `process()` error reporting found against 0.0.6.
+
+- **Fixed: admitting a second replica moved the group to the joiner's
+  channel.** *(bug fix; every SDK)*
+
+  When an existing member initiated the pairing, completing it re-pointed
+  that member's own roster row onto the joiner's channel, so every admission
+  redefined the group channel and its key, and earlier members stopped
+  receiving mirrors. A member already in a group now keeps its row; only a
+  device joining its first group moves onto the new channel.
+
+- **Fixed: `UpdateChannelInfo` refused a move to a transport the receiver
+  does not serve itself.** *(bug fix; every SDK)*
+
+  Following a peer to a new endpoint only needs the receiver to reach it, and
+  pairing never compares a peer's endpoints with the receiver's own. A device
+  serving only gRPC could pair with an HTTPS peer but not follow that peer's
+  move to a new HTTPS endpoint. The peer's endpoints are now filtered by the
+  transport policy alone, when the update is accepted, as in pairing.
+  `UpdateChannelInfoFailed` is now only an outbound dispatch failure.
+
+- **Fixed: one Pending channel aborted `UpdateChannelInfo`, `Discovery` and
+  `VerifyShares`.** *(bug fix; every SDK)*
+
+  A pairing that never completed leaves a Pending channel with no shared key,
+  and these flows targeted it anyway, so every later rename, address change,
+  discovery or verification failed with `missing_shared_key`. They now target
+  Paired channels only, as their documentation said; a Pending id named in a
+  target is dropped.
+
+- **Fixed: a new replica member missed publishes sent during its admission.**
+  *(bug fix; every SDK)*
+
+  The admitter's first copy to a joiner travels on their pairing channel and
+  hands over the group channel and key; the joiner moves to the group channel
+  and drops the pairing channel at once. The admitter kept addressing the
+  joiner on the pairing channel until the joiner's acknowledgement came back,
+  so any publish sent in between was lost, and if that acknowledgement never
+  arrived every later publish from the admitter was lost too. The admitter
+  now moves the joiner onto the group channel as soon as it sends the
+  handover.
+
+- **Fixed: a replica reported an identical copy as a conflict when the
+  version it held had no author.** *(bug fix; every SDK)*
+
+  A version restored from recovery, or published before the device had a
+  replica id, carries no author, and a re-sent copy of it was reported as
+  `ReplicaVersionConflict` — "two replicas published different copies" —
+  though nothing differed. A held version with no author is now identified by
+  its user secrets: the same secrets are a re-send, different ones are still
+  a conflict. Versions with an author keep the author rule.
+
+- **Fixed: helpers ignored `keepList`.** *(bug fix; breaking — every share
+  store gains a method)*
+
+  `StoreShareRequest.keepList` is the complete set of versions a helper
+  should keep, and helpers kept every version forever instead. A helper now
+  deletes the versions a request's `keepList` does not name, when that
+  request is at least as new as anything it holds on the channel. An empty
+  `keepList` keeps everything, an older (replayed) request's list is ignored,
+  and the share the request carries is never deleted. Share stores implement
+  the new idempotent `remove_versions(secret_id, channel_id, versions)` —
+  .NET `IShareStore.RemoveVersions`, Go `ShareStore.RemoveVersions`,
+  TypeScript `ShareStore.removeVersions` — and the C ABI
+  `ShareStoreCallbacks` gains a `remove_versions` slot before `free_buffer`.
+
+- **Added: the application decides which versions helpers keep.**
+  *(new store method; breaking — every share store gains it)*
+
+  The owner filled `keepList` with the last `keep_versions_count` version
+  numbers, whether those rounds reached threshold or not, so a version the
+  application abandoned stayed on helpers and in discovery. Only the
+  application knows which versions committed — from `SharingComplete` — so
+  the owner now asks the share store, once per round and before anything is
+  sent, including the rounds the library starts itself:
+  `keep_list(secret_id, version)` (.NET `IShareStore.KeepList`, Go
+  `ShareStore.KeepList`, TypeScript `ShareStore.keepList`). A list is sent to
+  every helper with the version being distributed added; `None` / `null`
+  sends an empty `keepList`, so helpers keep every version they hold — an
+  application that wants a cap returns it from `keep_list`. List every
+  version that could still become the latest, meaning committed versions and
+  those whose round is still open, and leave out only failed or rolled-back
+  ones: helpers delete everything not listed. The C ABI `ShareStoreCallbacks` gains a `keep_list`
+  slot before `free_buffer`.
+
+- **Removed: `keep_versions_count`.** *(breaking; every SDK)*
+
+  `keep_list` is now the only source of the owner's `keepList`. Removed Rust
+  `DeRecProtocolBuilder::with_keep_versions_count` and
+  `DEFAULT_KEEP_VERSIONS_COUNT`, .NET `WithKeepVersionsCount`, Go
+  `Config.KeepVersionsCount` and TypeScript `withKeepVersionsCount`. The C ABI
+  `derec_protocol_new` config ignores a `keep_versions_count` key still sent.
+  An owner whose share store returns `None` used to cap helpers at the last
+  three versions; helpers now keep every version unless the application lists
+  the ones to keep.
+
+- **Fixed: one helper's refusal blocked recovery for good.** *(bug fix; every
+  SDK)*
+
+  The owner collected a refused `GetShareResponse` (for example
+  `UNKNOWN_SHARE_VERSION`) as if it were a share, and every later
+  reconstruction attempt failed on it, so recovery never completed however
+  many good shares arrived. A refusal is now set aside and reported as the new
+  `RecoveryShareRefused { channel_id, version, status, memo }` event (.NET
+  `RecoveryShareRefusedEvent`, Go `EventTypeRecoveryShareRefused`); it does
+  not count towards `shares_received`, and the other helpers' shares complete
+  the recovery.
+
+- **Fixed: a corrupted recovery share blocked recovery, and the app could not
+  tell which helper sent it.** *(bug fix; every SDK — breaking for code that
+  builds `StateItem::PendingRecovery` directly, and for the .NET
+  `StateItem.PendingRecovery` factory)*
+
+  A helper that answered with a tampered or foreign share made every later
+  reconstruction fail, so recovery succeeded only if enough good shares
+  happened to arrive first. Each share is now checked on arrival; one that
+  fails is set aside and reported as the new
+  `RecoveryShareCorrupted { channel_id, version, reason }` event, with
+  `reason` `Malformed` or `InvalidProof`. Shares valid on their own but
+  disagreeing with the others are grouped by commitment root and ciphertext;
+  the first group that reconstructs, largest first, yields the secret, and
+  every share outside it is reported as `Inconsistent` alongside
+  `SecretRecovered`. An honest helper never sends a corrupted share, so the
+  application may treat the event as a sign of a damaged or compromised
+  helper and offer to unpair it. The recovery state now records which channel
+  each collected share came from (`StateItemRecord.share_channels`, Go and
+  .NET `StateItem.ShareChannels`); a pending recovery saved by an older
+  version re-collects its shares. A malformed share could also crash the
+  owner: `vss::recover` now returns an error instead of panicking on a
+  repeated or undecodable coordinate.
+
+- **Fixed: a helper asked for a version it does not hold sent no answer.**
+  *(bug fix; every SDK)*
+
+  `accept` on a `GetShareRequest` or `VerifyShareRequest` for a share the
+  helper does not hold failed with `InvalidInput` and sent nothing, so the
+  owner waited for a timeout. The helper now answers `UNKNOWN_SHARE_VERSION`,
+  as the protocol specifies, whether it accepts manually or automatically; the
+  owner sees `RecoveryShareRefused` or `ShareVerifyRejected`.
+
+- **Added: `ShareVerifyRejected { channel_id, version, status, memo }`.**
+  *(new event; every SDK)*
+
+  A helper that refused a verification challenge surfaced only as an error
+  from `process()`, with no event, so the owner could not tell which helper
+  said no. The refusal is now this event, mirroring `ShareRejected`. The
+  challenge is consumed; checking that helper again takes a new
+  `VerifyShares` round.
+
+- **Fixed: a failing `process()` lost the timeouts it had settled.**
+  *(bug fix; breaking — every SDK)*
+
+  `process()` settles expired sharing-round and unpair deadlines, and saves
+  them, before it handles the message. When the message then failed, those
+  events were dropped and never reported again, and the round never closed.
+  The error now carries every event produced before the failure: Rust
+  `ProcessError::events`, .NET `DeRecException.Events`, Go
+  `ProcessError.Events`, and `events` on the JavaScript `DeRecError`. Handle
+  them as a successful call's events.
+  - **Go:** `Process` now returns a `*protocol.ProcessError` with `ChannelID`,
+    `Events` and `Err`. `errors.As(err, &derecErr)` still reaches the
+    `*derec.Error`; a direct type assertion on `*derec.Error` no longer
+    matches.
+  - **FFI:** `derec_protocol_process` returns the new
+    `DeRecProtocolProcessResult`, whose `events_json` is filled on failure
+    too.
+
+- **Fixed: .NET, Go and React Native did not say which channel a `process()`
+  error came from.** *(bug fix; .NET, Go, React Native)*
+
+  The core knew the channel, and the web and Node.js SDKs already reported it,
+  but the FFI dropped it. `DeRecProtocolProcessResult` now carries
+  `has_channel_id` and `channel_id`; .NET exposes `DeRecException.ChannelId`,
+  Go `ProcessError.ChannelID`, and React Native `channel_id` on the thrown
+  error. It is empty when the bytes were not a decodable envelope.
+
+- **Docs: what an application must do on a replica version conflict.**
+
+  The library README and the `ReplicaVersionConflict` / `ReplicaSyncRejected`
+  docs in every SDK now state the rule: once either event reports a conflict,
+  the device must not publish again until the user has resolved it, because a
+  further `ProtectSecret` is a higher version that replaces every other
+  member's copy. The README gives the steps — get the rival copy, merge,
+  publish once — and notes that a member that was offline while another
+  published reaches the same conflict without any simultaneous edit.
+
+- **Docs: where the application asks the user.**
+
+  Two decisions belong to the application, and the docs in every SDK now say
+  so. Recovery and restore are separate steps: `SecretRecovered` writes
+  nothing, so the application shows the recovered secret, or asks, before
+  calling `restore`. On a replica destination, confirming the fingerprint is
+  also the decision to adopt the group's vault — its publishes are installed
+  as they arrive — so the application asks before calling
+  `verify_fingerprint`, and declines by never confirming.
+
+- **Docs: who may remove a replica member, and what the removed one sees.**
+
+  `UnpairReplica` and `SelfRemovedFromGroup` in every SDK now state that any
+  member may remove any member, the source included — so a lost or stolen
+  source can be removed — with no role check, and that the application should
+  ask the user first. They name the successor rule (the first remaining member
+  in the channel store's replica order) and that the removed member is not
+  asked and gets no warning: its partition is dropped automatically when a
+  roster excluding it arrives, while the secret survives on the remaining
+  members and the helpers.
+
+- **Docs: how a replica member announces a new endpoint or
+  `communication_info`.**
+
+  `UpdateChannelInfo` reaches helper channels only; a replica member's values
+  travel in the roster. The library README now describes the procedure:
+  publish a new version, so every replica and the recoverable roster carry
+  the new values, then run `UpdateChannelInfo` against the helpers, keeping
+  the old endpoint serving until enough peers have the update. Helpers answer
+  the announcing publish on the new endpoint when the protocol is built with
+  auto reply-to and `set_own_transports` is called first; `ProtectSecret` has
+  no per-round `reply_to`. The
+  "Updating channel info post-pairing" section also drops its description of
+  a servability refusal that no longer exists, and the removed
+  `set_own_transport` / `transport_protocol` names. The SDK READMEs point to
+  the procedure.
+
 ### 0.0.6
 
 Two security fixes and fifteen defects. Every message on a channel was encrypted

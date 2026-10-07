@@ -6,6 +6,7 @@ package native
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 )
@@ -432,17 +433,46 @@ func TestStateItemRoundTrip_PendingVerification(t *testing.T) {
 func TestStateItemRoundTrip_PendingRecovery(t *testing.T) {
 	sid := uint64(0xA0)
 	ver := uint32(4)
-	want := StateItem{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver, Shares: [][]byte{{1, 2}, {3, 4, 5}}}
+	want := StateItem{
+		Kind:          StateKindPendingRecovery,
+		SecretID:      &sid,
+		Version:       &ver,
+		Shares:        [][]byte{{1, 2}, {3, 4, 5}},
+		ShareChannels: []uint64{math.MaxUint64, 7},
+	}
 	wire, err := EncodeStateItem(want)
 	if err != nil {
 		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	if !strings.Contains(string(wire), `"share_channels":["18446744073709551615","7"]`) {
+		t.Fatalf("share_channels must travel as decimal strings, got %s", wire)
 	}
 	got, err := DecodeStateItem(wire)
 	if err != nil {
 		t.Fatalf("DecodeStateItem: %v", err)
 	}
-	if got.Kind != want.Kind || *got.Version != *want.Version || len(got.Shares) != 2 {
+	if got.Kind != want.Kind || *got.Version != *want.Version || len(got.Shares) != 2 ||
+		len(got.ShareChannels) != 2 || got.ShareChannels[0] != math.MaxUint64 || got.ShareChannels[1] != 7 {
 		t.Fatalf("mismatch: got %+v want %+v", got, want)
+	}
+}
+
+// A row written before share_channels existed must reach the library
+// without one, so it is read as no shares collected rather than misattributed.
+func TestStateItemRoundTrip_PendingRecoveryWithoutShareChannels(t *testing.T) {
+	got, err := DecodeStateItem([]byte(`{"kind":1,"secret_id":"160","version":4,"shares":[[1,2]]}`))
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if got.ShareChannels != nil {
+		t.Fatalf("absent share_channels must stay absent, got %v", got.ShareChannels)
+	}
+	wire, err := EncodeStateItem(got)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	if strings.Contains(string(wire), "share_channels") {
+		t.Fatalf("absent share_channels must not be invented, got %s", wire)
 	}
 }
 

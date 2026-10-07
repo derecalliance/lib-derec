@@ -66,6 +66,12 @@ impl<
     /// two sides holding different shared keys, and so different fingerprints.
     /// Compare the two values out of band before calling this.
     ///
+    /// On a replica destination, confirming is also the decision to adopt
+    /// the group's vault: once the channel is `Paired`, the source's publish
+    /// is installed into this device's stores as it arrives, with no further
+    /// prompt. Ask the user whether to adopt before calling this; to decline,
+    /// never confirm, and the channel stays `Pending` and is never used.
+    ///
     /// A match promotes every row on the channel, not just the peer that was
     /// confirmed: on a group channel that is every member and this device's
     /// own row, so the whole group becomes usable at once and the roster stays
@@ -353,6 +359,91 @@ mod tests {
 
             let mut check = channels.clone();
             assert_eq!(status_of(&mut check).await, ChannelStatus::Paired);
+        });
+    }
+
+    /// The publish a confirmation triggers is an ordinary sharing round, so
+    /// the application's keep list governs it like any other.
+    #[test]
+    fn the_confirmation_publish_sends_the_app_keep_list() {
+        run_async(async {
+            use crate::protocol::test::RecordingTransport;
+            const OTHER: ChannelId = ChannelId(78);
+            let mut channels = InMemChannelStore::default();
+            let mut secrets = InMemSecretStore::default();
+            seed_pending_helper(&mut channels, &mut secrets, ChannelStatus::Pending).await;
+            channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Helper(HelperChannel {
+                        channel_id: OTHER,
+                        transports: vec![endpoint()],
+                        communication_info: std::collections::HashMap::new(),
+                        status: ChannelStatus::Paired,
+                        created_at: now_secs(),
+                        peer_role: derec_proto::SenderKind::Helper,
+                    }),
+                )
+                .await
+                .expect("seed paired helper");
+            secrets
+                .save(SECRET_ID, OTHER, SecretValue::SharedKey([7u8; 32]))
+                .await
+                .expect("seed shared key");
+            let mut user_secrets = InMemUserSecretStore::default();
+            user_secrets
+                .save_latest(
+                    SECRET_ID,
+                    crate::protocol::types::UserSecrets {
+                        version: 4,
+                        secrets: Vec::new(),
+                        description: None,
+                        author_replica_id: None,
+                    },
+                )
+                .await
+                .expect("seed snapshot");
+            let shares = InMemShareStore::default();
+            *shares.keep.lock().unwrap() = Some(vec![2]);
+            let transport = RecordingTransport::default();
+
+            let mut protocol = DeRecProtocolBuilder::new(SECRET_ID)
+                .with_channel_store(channels)
+                .with_share_store(shares.clone())
+                .with_secret_store(secrets)
+                .with_user_secret_store(user_secrets)
+                .with_transport(transport.clone())
+                .with_state_store(InMemStateStore)
+                .with_own_transports(["https://owner.example.com"])
+                .with_threshold(2)
+                .build()
+                .expect("test protocol builds");
+            let fingerprint = protocol
+                .get_fingerprint(CHANNEL)
+                .await
+                .expect("fingerprint");
+            assert!(
+                protocol
+                    .verify_fingerprint(CHANNEL, &fingerprint)
+                    .await
+                    .expect("verify_fingerprint")
+            );
+
+            assert_eq!(
+                *shares.keep_list_calls.lock().unwrap(),
+                vec![(SECRET_ID, 5)]
+            );
+            let keep_lists: Vec<Vec<u32>> = transport
+                .sent_envelopes()
+                .iter()
+                .map(|envelope| {
+                    crate::primitives::sharing::request::extract(envelope, &[7u8; 32])
+                        .expect("extract store-share request")
+                        .request
+                        .keep_list
+                })
+                .collect();
+            assert_eq!(keep_lists, vec![vec![2, 5], vec![2, 5]]);
         });
     }
 }

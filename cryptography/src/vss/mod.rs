@@ -191,6 +191,10 @@ pub fn share(
 /// and then walking up `share.merkle_path`. The computed root is compared to
 /// `share.commitment`. `share.encrypted_secret` is not examined.
 ///
+/// The root is the one the share carries, so a share that passes is intact,
+/// not necessarily valid: whether it belongs to a secret is only known by
+/// comparing it with other shares, which [`recover`] does.
+///
 /// # Arguments
 ///
 /// * `share` - The [`VSSShare`] to verify.
@@ -254,9 +258,12 @@ pub fn verify(share: &VSSShare) -> bool {
 ///
 /// - [`DerecVSSError::InconsistentCommitments`] — shares carry different Merkle roots
 /// - [`DerecVSSError::InconsistentCiphertexts`] — shares carry different ciphertexts
-/// - [`DerecVSSError::CorruptShares`] — one or more Merkle proofs fail to verify
-/// - [`DerecVSSError::InsufficientShares`] — Shamir interpolation produced a key that
-///   fails to decrypt the ciphertext (fewer than `t` valid shares were supplied)
+/// - [`DerecVSSError::CorruptShares`] — one or more Merkle proofs fail to verify,
+///   a coordinate is not a valid field element, or two shares carry the same
+///   x-coordinate
+/// - [`DerecVSSError::InsufficientShares`] — `shares` is empty, or Shamir
+///   interpolation produced a key that fails to decrypt the ciphertext (fewer
+///   than `t` valid shares were supplied)
 ///
 /// # Example
 ///
@@ -272,7 +279,9 @@ pub fn verify(share: &VSSShare) -> bool {
     tracing::instrument(skip_all, fields(shares_count = shares.len()))
 )]
 pub fn recover(shares: &Vec<VSSShare>) -> Result<Vec<u8>, DerecVSSError> {
-    assert!(!shares.is_empty());
+    if shares.is_empty() {
+        return Err(DerecVSSError::InsufficientShares);
+    }
 
     // Stage 1: verify consistency across shares and validate each Merkle proof.
     let detected_error = utils::detect_error(shares);
@@ -284,7 +293,7 @@ pub fn recover(shares: &Vec<VSSShare>) -> Result<Vec<u8>, DerecVSSError> {
 
     // Stage 2: reconstruct the AES key via Shamir polynomial interpolation.
     let shamir_shares = shares.iter().map(|s| (s.x.clone(), s.y.clone())).collect();
-    let k = shamir::recover(shamir_shares);
+    let k = shamir::recover(shamir_shares).ok_or(DerecVSSError::CorruptShares)?;
 
     // Stage 3: decrypt the ciphertext with the recovered key.
     // A decryption failure here means insufficient or wrong shares were provided.
@@ -451,6 +460,37 @@ mod tests {
         shares[0].y[0] ^= 0xFF;
 
         let err = recover(&shares[..3].to_vec()).expect_err("corrupt share should be detected");
+        assert!(matches!(err, DerecVSSError::CorruptShares));
+    }
+
+    #[test]
+    fn test_recover_rejects_empty_input_without_panicking() {
+        let err = recover(&Vec::new()).expect_err("no shares cannot recover");
+        assert!(matches!(err, DerecVSSError::InsufficientShares));
+    }
+
+    #[test]
+    fn test_recover_rejects_a_repeated_share_without_panicking() {
+        let shares = share(2, 3, b"my secret", ENTROPY).unwrap();
+        let repeated = vec![shares[0].clone(), shares[0].clone()];
+        let err = recover(&repeated).expect_err("one point twice cannot interpolate");
+        assert!(matches!(err, DerecVSSError::CorruptShares));
+    }
+
+    #[test]
+    fn test_recover_rejects_a_proven_coordinate_that_is_not_a_field_element() {
+        let mut shares = share(2, 2, b"my secret", ENTROPY).unwrap();
+        shares[0].y = vec![0xFF; shares[0].y.len()];
+        let root = utils::intermediate_hash_pub(
+            &utils::leaf_hash_pub(&shares[0].x, &shares[0].y),
+            &utils::leaf_hash_pub(&shares[1].x, &shares[1].y),
+        );
+        shares[0].commitment = root.clone();
+        shares[0].merkle_path = vec![(false, utils::leaf_hash_pub(&shares[1].x, &shares[1].y))];
+        shares[1].commitment = root;
+        shares[1].merkle_path = vec![(true, utils::leaf_hash_pub(&shares[0].x, &shares[0].y))];
+
+        let err = recover(&shares).expect_err("an undecodable coordinate cannot interpolate");
         assert!(matches!(err, DerecVSSError::CorruptShares));
     }
 

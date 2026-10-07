@@ -68,9 +68,8 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 
 /// Dispatch a discovery request to each targeted channel.
 ///
-/// The target is narrowed by [`Target::filter`] to channels this `secret_id`
-/// actually holds — a caller-supplied id may name an unpaired channel, which
-/// would otherwise trip the shared-key invariant below.
+/// The target is narrowed to the paired channels this `secret_id` holds; an
+/// id naming an unknown or `Pending` channel is dropped.
 ///
 /// Dispatch failure is isolated per channel and surfaced as
 /// `DiscoveryFailed` rather than short-circuiting the fan-out, so one
@@ -82,21 +81,10 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     target: Target,
     round: &Round<'_>,
 ) -> Result<Vec<DeRecEvent>> {
-    let known: Vec<ChannelId> = stores
+    let channel_ids = stores
         .channels
-        .helpers_matching(
-            local.secret_id,
-            crate::protocol::types::HelperFilter {
-                ids: target.ids(),
-                ..Default::default()
-            },
-        )
-        .await?
-        .iter()
-        .map(|ch| ch.channel_id)
-        .collect();
-
-    let channel_ids = target.filter(&known);
+        .resolve_target(local.secret_id, target)
+        .await?;
 
     let keys = stores
         .secrets

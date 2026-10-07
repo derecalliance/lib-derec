@@ -191,6 +191,37 @@ impl DeRecShareStore for PostgresShareStore {
             Ok(())
         })
     }
+
+    fn remove_versions(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, ()> {
+        let versions: Vec<i64> = versions.iter().map(|v| *v as i64).collect();
+        let client = self.client.clone();
+        let secret_id = u64_to_sql(secret_id);
+        let channel_id = u64_to_sql(channel_id.0);
+        Box::pin(async move {
+            if versions.is_empty() {
+                return Ok(());
+            }
+            let params: [&(dyn ToSql + Sync); 3] = [&secret_id, &channel_id, &versions];
+            client
+                .execute(
+                    "DELETE FROM shares \
+                     WHERE secret_id = $1 AND channel_id = $2 AND version = ANY($3::bigint[])",
+                    &params,
+                )
+                .await
+                .expect("share remove_versions failed");
+            Ok(())
+        })
+    }
+
+    fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+        Box::pin(std::future::ready(Ok(None)))
+    }
 }
 
 fn row_to_share(row: tokio_postgres::Row) -> Share {

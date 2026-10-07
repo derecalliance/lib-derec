@@ -293,6 +293,23 @@ class InMemoryShareStore implements ShareStore {
     this.data.delete(this.key(secretId, channelId));
   }
 
+  readonly removeVersionsCalls: Array<{ secretId: string; channelId: string; versions: number[] }> = [];
+
+  async removeVersions(secretId: string, channelId: string, versions: number[]): Promise<void> {
+    this.removeVersionsCalls.push({ secretId, channelId, versions: [...versions] });
+    const byVersion = this.data.get(this.key(secretId, channelId));
+    if (!byVersion) return;
+    for (const v of versions) byVersion.delete(v);
+  }
+
+  keep: number[] | null = null;
+  readonly keepListCalls: Array<{ secretId: string; version: number }> = [];
+
+  async keepList(secretId: string, version: number): Promise<number[] | null> {
+    this.keepListCalls.push({ secretId, version });
+    return this.keep;
+  }
+
   async latestVersion(secretId: string): Promise<number | null> {
     return this.ownerVersions.get(secretId) ?? null;
   }
@@ -425,7 +442,6 @@ interface Node {
 }
 
 const THRESHOLD = 2;
-const KEEP_VERSIONS_COUNT = 3;
 const DEFAULT_TEST_SECRET_ID = 0xDE_2ECn;
 
 function makeNode(
@@ -456,7 +472,6 @@ function makeNode(
     .withStateStore(stateStore)
     .withTransport(transport)
     .withOwnTransports([{ uri: endpointUri, protocol: "https" }])
-    .withKeepVersionsCount(KEEP_VERSIONS_COUNT)
     .withCommunicationInfo({ name });
   if (!options.omitThreshold) {
     builder = builder.withThreshold(options.threshold ?? THRESHOLD);

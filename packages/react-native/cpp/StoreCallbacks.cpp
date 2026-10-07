@@ -27,7 +27,7 @@ static_assert(sizeof(ChannelStoreCallbacks) == 9 * sizeof(void*),
               "ChannelStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(SecretStoreCallbacks) == 6 * sizeof(void*),
               "SecretStoreCallbacks layout changed; update the bindings");
-static_assert(sizeof(ShareStoreCallbacks) == 8 * sizeof(void*),
+static_assert(sizeof(ShareStoreCallbacks) == 10 * sizeof(void*),
               "ShareStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(UserSecretStoreCallbacks) == 5 * sizeof(void*),
               "UserSecretStoreCallbacks layout changed; update the bindings");
@@ -315,6 +315,40 @@ CallResult toStateLoadAllResult(jsi::Runtime& rt, const jsi::Value& value) {
     if (i != 0) text += ',';
     ByteView bv = asBytes(rt, arr.getValueAtIndex(rt, i));
     text.append(reinterpret_cast<const char*>(bv.ptr), bv.len);
+  }
+  text += ']';
+  return CallResult{0, std::vector<uint8_t>(text.begin(), text.end())};
+}
+
+/// `ShareStore.keepList(): Promise<number[] | null | undefined>`. Encodes the
+/// resolved value as the wire's `Option<Vec<u32>>` JSON: `null` for
+/// `null`/`undefined`, otherwise the array of versions.
+///
+/// Anything else, or an entry that is not an integer in `0..=4294967295`, is
+/// a backend failure: reading it as `null` would silently send an empty
+/// keepList, so helpers would keep every version instead of the list the
+/// application meant to send.
+CallResult toKeepListResult(jsi::Runtime& rt, const jsi::Value& value) {
+  if (value.isNull() || value.isUndefined()) {
+    return CallResult{0, {'n', 'u', 'l', 'l'}};
+  }
+  if (!value.isObject() || !value.asObject(rt).isArray(rt)) {
+    return CallResult{kBackendFailure, {}};
+  }
+  jsi::Array arr = value.asObject(rt).asArray(rt);
+  size_t n = arr.size(rt);
+  std::string text = "[";
+  for (size_t i = 0; i < n; ++i) {
+    jsi::Value entry = arr.getValueAtIndex(rt, i);
+    if (!entry.isNumber()) {
+      return CallResult{kBackendFailure, {}};
+    }
+    double version = entry.asNumber();
+    if (!(version >= 0 && version <= 4294967295.0) || version != static_cast<double>(static_cast<uint32_t>(version))) {
+      return CallResult{kBackendFailure, {}};
+    }
+    if (i != 0) text += ',';
+    text += std::to_string(static_cast<uint32_t>(version));
   }
   text += ']';
   return CallResult{0, std::vector<uint8_t>(text.begin(), text.end())};
@@ -802,6 +836,53 @@ extern "C" int32_t shareStoreRemoveChannel(void* userData, uint64_t secretId, ui
   return result.code;
 }
 
+/// `ShareStore.removeVersions(secretId, channelId, versions) -> void`
+extern "C" int32_t shareStoreRemoveVersions(void* userData, uint64_t secretId, uint64_t channelId,
+                                             const uint8_t* versionsJsonPtr, size_t versionsJsonLen) {
+  auto* self = static_cast<StoreBindings*>(userData);
+  // Kept alive past this call so the lambda handed to `callSync` — which the
+  // JavaScript CallInvoker's queue may still be holding after this object's
+  // owner has released its own reference — has somewhere safe to run.
+  auto keepAlive = self->shared_from_this();
+  std::vector<uint64_t> raw = parseUnsignedJsonArray(versionsJsonPtr, versionsJsonLen);
+  std::vector<uint32_t> versions(raw.begin(), raw.end());
+  CallResult result = keepAlive->bridge().callSync(
+      [keepAlive, secretId, channelId, versions](std::function<void(CallResult)> settle) {
+        jsi::Runtime& rt = keepAlive->runtime();
+        auto store = keepAlive->shareStore();
+        auto method = store->getPropertyAsFunction(rt, "removeVersions");
+        jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId), idVal(rt, channelId),
+                                                  jsi::Value(rt, u32VectorToJsArray(rt, versions)));
+        keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
+      });
+  return result.code;
+}
+
+/// `ShareStore.keepList(secretId, version) -> number[] | null`
+extern "C" int32_t shareStoreKeepList(void* userData, uint64_t secretId, uint32_t version, uint8_t** outPtr,
+                                       size_t* outLen) {
+  auto* self = static_cast<StoreBindings*>(userData);
+  auto keepAlive = self->shared_from_this();
+  CallResult result =
+      keepAlive->bridge().callSync([keepAlive, secretId, version](std::function<void(CallResult)> settle) {
+        jsi::Runtime& rt = keepAlive->runtime();
+        auto store = keepAlive->shareStore();
+        auto method = store->getPropertyAsFunction(rt, "keepList");
+        jsi::Value promise =
+            method.callWithThis(rt, *store, idVal(rt, secretId), jsi::Value(static_cast<double>(version)));
+        keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toKeepListResult);
+      });
+  if (result.code == 0) {
+    if (!writeOut(result.bytes, outPtr, outLen)) {
+      return kBackendFailure;
+    }
+  } else {
+    *outPtr = nullptr;
+    *outLen = 0;
+  }
+  return result.code;
+}
+
 /// `UserSecretStore.loadLatest(secretId) -> UserSecrets | null`
 extern "C" int32_t userSecretStoreLoadLatest(void* userData, uint64_t secretId, uint8_t** outPtr,
                                               size_t* outLen) {
@@ -1123,8 +1204,10 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
       shareStoreLoadAll,       // load_all
       shareStoreLatestVersion, // latest_version
       shareStoreSave,          // save
-      shareStoreRemoveChannel, // remove_channel
-      storeFreeBuffer,         // free_buffer
+      shareStoreRemoveChannel,  // remove_channel
+      shareStoreRemoveVersions, // remove_versions
+      shareStoreKeepList,       // keep_list
+      storeFreeBuffer,          // free_buffer
   };
   bindings->userSecretCallbacks_ = UserSecretStoreCallbacks{
       self,                       // user_data
@@ -1170,6 +1253,8 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
   requireField(rt, bindings->shareCallbacks_.latest_version, "ShareStoreCallbacks.latest_version");
   requireField(rt, bindings->shareCallbacks_.save, "ShareStoreCallbacks.save");
   requireField(rt, bindings->shareCallbacks_.remove_channel, "ShareStoreCallbacks.remove_channel");
+  requireField(rt, bindings->shareCallbacks_.remove_versions, "ShareStoreCallbacks.remove_versions");
+  requireField(rt, bindings->shareCallbacks_.keep_list, "ShareStoreCallbacks.keep_list");
   requireField(rt, bindings->shareCallbacks_.free_buffer, "ShareStoreCallbacks.free_buffer");
 
   requireField(rt, bindings->userSecretCallbacks_.user_data, "UserSecretStoreCallbacks.user_data");

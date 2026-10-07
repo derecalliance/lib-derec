@@ -74,12 +74,14 @@ func (m *mockSecretStore) Remove(secretID, channelID uint64, kind SecretKind) er
 var _ secretStore = (*mockSecretStore)(nil)
 
 type mockShareStore struct {
-	loadFn          func(secretID, channelID uint64, versions []uint32) ([]Share, error)
-	loadManyFn      func(secretID uint64, channelIDs []uint64, versions []uint32) ([]Share, error)
-	loadAllFn       func(secretID uint64, channelIDs []uint64) ([]Share, error)
-	latestVersionFn func(secretID uint64) (uint32, bool, error)
-	saveFn          func(secretID, channelID uint64, share Share) error
-	removeChannelFn func(secretID, channelID uint64) error
+	loadFn           func(secretID, channelID uint64, versions []uint32) ([]Share, error)
+	loadManyFn       func(secretID uint64, channelIDs []uint64, versions []uint32) ([]Share, error)
+	loadAllFn        func(secretID uint64, channelIDs []uint64) ([]Share, error)
+	latestVersionFn  func(secretID uint64) (uint32, bool, error)
+	saveFn           func(secretID, channelID uint64, share Share) error
+	removeChannelFn  func(secretID, channelID uint64) error
+	removeVersionsFn func(secretID, channelID uint64, versions []uint32) error
+	keepListFn       func(secretID uint64, version uint32) ([]uint32, bool, error)
 }
 
 func (m *mockShareStore) Load(secretID, channelID uint64, versions []uint32) ([]Share, error) {
@@ -99,6 +101,12 @@ func (m *mockShareStore) Save(secretID, channelID uint64, share Share) error {
 }
 func (m *mockShareStore) RemoveChannel(secretID, channelID uint64) error {
 	return m.removeChannelFn(secretID, channelID)
+}
+func (m *mockShareStore) RemoveVersions(secretID, channelID uint64, versions []uint32) error {
+	return m.removeVersionsFn(secretID, channelID, versions)
+}
+func (m *mockShareStore) KeepList(secretID uint64, version uint32) ([]uint32, bool, error) {
+	return m.keepListFn(secretID, version)
 }
 
 var _ shareStore = (*mockShareStore)(nil)
@@ -596,6 +604,76 @@ func TestDispatchShareRemoveChannel(t *testing.T) {
 	status := dispatchShareRemoveChannel(s, 5, 6)
 	if status != ffiStatusOK || !called {
 		t.Fatalf("status=%d called=%v", status, called)
+	}
+}
+
+func TestDispatchShareRemoveVersions(t *testing.T) {
+	var gotSecretID, gotChannelID uint64
+	var gotVersions []uint32
+	s := &storeSet{share: &mockShareStore{
+		removeVersionsFn: func(secretID, channelID uint64, versions []uint32) error {
+			gotSecretID, gotChannelID, gotVersions = secretID, channelID, versions
+			return nil
+		},
+	}}
+	status := dispatchShareRemoveVersions(s, 5, 6, []byte("[1,3]"))
+	if status != ffiStatusOK || gotSecretID != 5 || gotChannelID != 6 ||
+		len(gotVersions) != 2 || gotVersions[0] != 1 || gotVersions[1] != 3 {
+		t.Fatalf("status=%d secretID=%d channelID=%d versions=%v", status, gotSecretID, gotChannelID, gotVersions)
+	}
+
+	failing := &storeSet{share: &mockShareStore{
+		removeVersionsFn: func(secretID, channelID uint64, versions []uint32) error {
+			return errors.New("backend down")
+		},
+	}}
+	if status := dispatchShareRemoveVersions(failing, 5, 6, []byte("[1]")); status != ffiStatusFailure {
+		t.Fatalf("store error must surface as ffiStatusFailure, got %d", status)
+	}
+	if status := dispatchShareRemoveVersions(s, 5, 6, []byte("not json")); status != ffiStatusFailure {
+		t.Fatalf("malformed versions JSON must surface as ffiStatusFailure, got %d", status)
+	}
+}
+
+func TestDispatchShareKeepList(t *testing.T) {
+	var gotSecretID uint64
+	var gotVersion uint32
+	listing := &storeSet{share: &mockShareStore{
+		keepListFn: func(secretID uint64, version uint32) ([]uint32, bool, error) {
+			gotSecretID, gotVersion = secretID, version
+			return []uint32{1, 3}, true, nil
+		},
+	}}
+	status, out := dispatchShareKeepList(listing, 5, 4)
+	if status != ffiStatusOK || string(out) != "[1,3]" || gotSecretID != 5 || gotVersion != 4 {
+		t.Fatalf("status=%d out=%s secretID=%d version=%d", status, out, gotSecretID, gotVersion)
+	}
+
+	emptyList := &storeSet{share: &mockShareStore{
+		keepListFn: func(secretID uint64, version uint32) ([]uint32, bool, error) {
+			return nil, true, nil
+		},
+	}}
+	if status, out := dispatchShareKeepList(emptyList, 5, 4); status != ffiStatusOK || string(out) != "[]" {
+		t.Fatalf("an empty list must cross as [], got status=%d out=%s", status, out)
+	}
+
+	noList := &storeSet{share: &mockShareStore{
+		keepListFn: func(secretID uint64, version uint32) ([]uint32, bool, error) {
+			return []uint32{9}, false, nil
+		},
+	}}
+	if status, out := dispatchShareKeepList(noList, 5, 4); status != ffiStatusOK || string(out) != "null" {
+		t.Fatalf("ok=false must cross as null, got status=%d out=%s", status, out)
+	}
+
+	failing := &storeSet{share: &mockShareStore{
+		keepListFn: func(secretID uint64, version uint32) ([]uint32, bool, error) {
+			return nil, false, errors.New("backend down")
+		},
+	}}
+	if status, _ := dispatchShareKeepList(failing, 5, 4); status != ffiStatusFailure {
+		t.Fatalf("store error must surface as ffiStatusFailure, got %d", status)
 	}
 }
 

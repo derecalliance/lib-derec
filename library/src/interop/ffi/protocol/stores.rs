@@ -420,6 +420,11 @@ pub struct SecretStoreCallbacks {
 /// arrays (`channel_ids[]`, `versions[]`) cross the FFI as JSON
 /// strings, matching the `Vec<u8>` ↔ JSON-array convention used for
 /// every other wire-format buffer in this module.
+///
+/// `keep_list` returns the JSON encoding of the application's answer:
+/// `null` for no list (the owner sends an empty `keepList` and helpers keep
+/// every version) or an array of version numbers. An empty buffer or return code `1` also
+/// means `null`.
 #[repr(C)]
 pub struct ShareStoreCallbacks {
     pub user_data: *mut c_void,
@@ -465,6 +470,20 @@ pub struct ShareStoreCallbacks {
     ) -> i32,
     pub remove_channel:
         extern "C" fn(user_data: *mut c_void, secret_id: u64, channel_id: u64) -> i32,
+    pub remove_versions: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        channel_id: u64,
+        versions_json_ptr: *const u8,
+        versions_json_len: usize,
+    ) -> i32,
+    pub keep_list: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        version: u32,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> i32,
     pub free_buffer: extern "C" fn(user_data: *mut c_void, ptr: *mut u8, len: usize),
 }
 
@@ -1230,6 +1249,45 @@ impl DeRecShareStore for DotnetShareStore {
                 Ok(())
             }
         })
+    }
+
+    fn remove_versions(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let versions_json = serde_json::to_vec(versions).unwrap_or_else(|_| b"[]".to_vec());
+        let rc = (cb.remove_versions)(
+            cb.user_data,
+            secret_id,
+            channel_id.0,
+            versions_json.as_ptr(),
+            versions_json.len(),
+        );
+        Box::pin(async move {
+            if rc != 0 {
+                Err(ShareStoreError::Backend(boxed_err(format!(
+                    "share store remove_versions failed (rc={rc})"
+                ))))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+        let result = self
+            .fetch_bytes(|p, l| (self.cb.keep_list)(self.cb.user_data, secret_id, version, p, l));
+        let res = match result {
+            Err(e) => Err(ShareStoreError::Backend(boxed_err(e))),
+            Ok(None) => Ok(None),
+            Ok(Some(bytes)) if bytes.is_empty() => Ok(None),
+            Ok(Some(bytes)) => serde_json::from_slice::<Option<Vec<u32>>>(&bytes)
+                .map_err(|e| ShareStoreError::Backend(boxed_err(format!("keep list JSON: {e}")))),
+        };
+        Box::pin(async move { res })
     }
 }
 

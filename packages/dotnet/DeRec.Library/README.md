@@ -228,6 +228,10 @@ endpoint to a long-term one via `UpdateChannelInfo`. The ephemeral endpoint
 advertised in the `HashedKeys` contact is intended to be retired immediately
 after pairing.
 
+`UpdateChannelInfo` reaches helper channels only. A replica member that
+changes its endpoint or `CommunicationInfo` publishes a new version first,
+then updates its helpers; see [On a replica member](https://github.com/derecalliance/lib-derec/tree/main/library#on-a-replica-member).
+
 Catch the security-relevant binding-hash mismatch with a typed code:
 
 ```csharp
@@ -414,8 +418,16 @@ byte[] recovered = Recovery.Response.Recover(
     version);
 ```
 
-When driving the orchestrator instead of the primitives, the recovering
-device receives a `SecretRecoveredEvent` carrying the typed `Secret`. Pass it
+When driving the orchestrator instead of the primitives, a helper that
+answers with a share that cannot be part of the secret is reported as a
+`RecoveryShareCorruptedEvent` (`Reason` is a `CorruptionReason` constant:
+`Malformed`, `InvalidProof` or `Inconsistent`); the share is set aside and
+never blocks the recovery from the others. An honest helper never sends one,
+so treat it as a sign of a damaged or compromised helper — for example, offer
+to unpair it.
+
+The recovering device receives a `SecretRecoveredEvent` carrying the typed
+`Secret`. Pass it
 to `protocol.RestoreAsync(secret, version)` on a fresh `DeRecProtocol` to
 commit canonical helper / replica state and wipe the throwaway recovery-mode
 channels. A helper or member with no endpoint in the recovered roster gets no
@@ -485,7 +497,7 @@ await helper.RejectAsync(action.Action,
 ```
 
 The answer arrives typed the same way: `Status` on `ShareRejectedEvent`,
-`UnpairRejectedEvent`, `PrePairRejectedEvent`,
+`ShareVerifyRejectedEvent`, `RecoveryShareRefusedEvent`, `UnpairRejectedEvent`, `PrePairRejectedEvent`,
 `ChannelInfoUpdateRejectedEvent`, `ReplicaSyncRejectedEvent` and
 `ReplicaSecretAckedEvent` is that `StatusEnum`:
 
@@ -576,6 +588,9 @@ App-side responsibilities (mirrors the other SDKs):
 - Implement `IChannelStore`, `IShareStore`, `ISecretStore`, `ITransport`
   with persistent backends. `InMemoryChannelStore` / `InMemoryShareStore`
   / `InMemorySecretStore` / `RecordingTransport` ship for tests.
+- On an owner, `IShareStore.KeepList` chooses which versions helpers keep;
+  returning `null` sends no keepList, so helpers keep every version;
+  see [the owner's keep list](https://github.com/derecalliance/lib-derec/tree/main/library#share-store-the-owners-keep-list).
 - After pairing, link old↔new channel IDs on the helper side
   (`channelStore.LinkChannel(oldId, newId)`) so recovery can fan out on
   the new pair while still surfacing shares stored under the old one.
@@ -678,6 +693,28 @@ catch (DeRecException ex) when (ex.Code == DeRecCode.VersionMismatch)
 `DeRecCode` identifies the specific reason (`NonOkStatus`, `VersionMismatch`,
 `Invariant`, `ProtobufDecode`, …). Both are global — the same value means the
 same thing across categories.
+
+### When `ProcessAsync` fails
+
+`ProcessAsync` settles expired deadlines (sharing-round and unpair
+timeouts) before it handles the message, and those are never reported
+again. So a failed call still carries them: `DeRecException.Events` holds
+every event produced before the failure, and `DeRecException.ChannelId`
+(`ulong?`) names the channel the message came from (`null` when the bytes
+were not a decodable envelope). Handle the events as you would a successful
+call's, then the error:
+
+```csharp
+try
+{
+    Handle(await protocol.ProcessAsync(bytes));
+}
+catch (DeRecException e)
+{
+    Handle(e.Events);
+    Report(e.ChannelId, e);
+}
+```
 
 ---
 
