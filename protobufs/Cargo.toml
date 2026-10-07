@@ -37,3 +37,5 @@ descriptor = []
 prost = "0.14.4"
 prost-types = "0.14.4"
 
+[package.metadata.cargo-shear]
+ignored = ["serde"]

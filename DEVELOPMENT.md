@@ -18,6 +18,30 @@ cargo --version
 
 ---
 
+## Unused-dependency check (`cargo-shear`)
+
+`make all` fails if a crate declares a dependency its code does not use.
+The check is [`cargo-shear`](https://crates.io/crates/cargo-shear). Its
+dependencies need a newer compiler than the one this workspace builds with,
+so install it with a recent stable toolchain:
+
+```bash
+rustup toolchain install 1.99
+cargo +1.99 install cargo-shear --locked
+cargo shear --version
+```
+
+Once installed it runs under any toolchain. A dependency that is needed but
+never named in code (one that only enables a feature, or is used only by
+generated code) goes in that crate's `Cargo.toml`:
+
+```toml
+[package.metadata.cargo-shear]
+ignored = ["crate-name"]
+```
+
+---
+
 ## Protobuf (`protoc`)
 
 The **Protocol Buffers compiler** (`protoc`) compiler is required to generate Rust types from the

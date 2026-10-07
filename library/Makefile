@@ -42,7 +42,7 @@ check-descriptor:
 # whichever tool happens to be missing.
 _preflight:
 	$(call section,"Preflight")
-	@for tool in cargo rustup wasm-pack cbindgen cargo-ndk dotnet go node npx rsync lipo xcodebuild; do \
+	@for tool in cargo rustup cargo-shear wasm-pack cbindgen cargo-ndk dotnet go node npx rsync lipo xcodebuild; do \
 	  command -v $$tool >/dev/null 2>&1 || { echo "missing required tool: $$tool" >&2; exit 1; }; \
 	done
 	@test -n "$$ANDROID_NDK_HOME" || { echo "ANDROID_NDK_HOME is not set" >&2; exit 1; }
@@ -58,10 +58,11 @@ _lint:
 	# ABI layer and every logging call site would never be linted.
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 	cargo clippy -p derec-library --target wasm32-unknown-unknown -- -D warnings
+	cargo shear
 	# The SQL smoke crates are their own Cargo projects, outside the
 	# workspace, so the runs above do not reach them.
-	cd $(ROOT)/smoke-tests/sqlite && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings
-	cd $(ROOT)/smoke-tests/postgres && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings
+	cd $(ROOT)/smoke-tests/sqlite && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings && cargo shear
+	cd $(ROOT)/smoke-tests/postgres && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings && cargo shear
 
 # Three crates publish to docs.rs, so a broken intra-doc link is as public as
 # a broken API. `-D warnings` makes rustdoc's lints fail the build the way
