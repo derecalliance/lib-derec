@@ -73,6 +73,11 @@ impl<
     /// events this message produced. An application reading the returned
     /// list in order therefore sees deadlines settle before new work.
     ///
+    /// A failed call still reports what it produced before failing, in
+    /// [`ProcessError::events`]: the timeout events at least, and every
+    /// event of the message when only the follow-up auto-publish failed.
+    /// Those deadlines are already settled and are never reported again.
+    ///
     /// # Security: bounding inbound message size
     ///
     /// This function does **not** enforce an upper bound on `message.len()`,
@@ -114,45 +119,58 @@ impl<
         &mut self,
         message: &[u8],
     ) -> std::result::Result<Vec<DeRecEvent>, ProcessError> {
-        let mut timeout_events = self.run_timeout_sweeps().await;
+        let mut events = self.run_timeout_sweeps().await;
 
-        let envelope = DeRecMessage::decode(message).map_err(|e| ProcessError {
-            channel_id: None,
-            source: Error::ProtobufDecode(e),
-        })?;
+        let handled = self.handle_message(message).await;
+        let channel_id = match handled {
+            Ok((channel_id, mut message_events)) => {
+                events.append(&mut message_events);
+                channel_id
+            }
+            Err((channel_id, source)) => {
+                self.update_sharing_round(&mut events).await;
+                return Err(ProcessError {
+                    channel_id,
+                    source,
+                    events,
+                });
+            }
+        };
+
+        self.update_sharing_round(&mut events).await;
+
+        match self.maybe_auto_publish_after_pair(&events).await {
+            Ok(auto_publish_events) => {
+                events.extend(auto_publish_events);
+                Ok(events)
+            }
+            Err(source) => Err(ProcessError {
+                channel_id: Some(channel_id),
+                source,
+                events,
+            }),
+        }
+    }
+
+    async fn handle_message(
+        &mut self,
+        message: &[u8],
+    ) -> std::result::Result<(ChannelId, Vec<DeRecEvent>), (Option<ChannelId>, Error)> {
+        let envelope =
+            DeRecMessage::decode(message).map_err(|e| (None, Error::ProtobufDecode(e)))?;
         let channel_id = ChannelId(envelope.channel_id);
         #[cfg(feature = "logging")]
         tracing::Span::current().record("trace_id", envelope.trace_id);
 
-        let result = self.process_inner(&envelope, channel_id).await;
-        let mut events = result.map_err(|source| ProcessError {
-            channel_id: Some(channel_id),
-            source,
-        })?;
-
-        events = self
+        let events = self
+            .process_inner(&envelope, channel_id)
+            .await
+            .map_err(|source| (Some(channel_id), source))?;
+        let events = self
             .apply_auto_accept(events)
             .await
-            .map_err(|source| ProcessError {
-                channel_id: Some(channel_id),
-                source,
-            })?;
-
-        timeout_events.append(&mut events);
-        let mut events = timeout_events;
-
-        self.update_sharing_round(&mut events).await;
-
-        let auto_publish_events =
-            self.maybe_auto_publish_after_pair(&events)
-                .await
-                .map_err(|source| ProcessError {
-                    channel_id: Some(channel_id),
-                    source,
-                })?;
-        events.extend(auto_publish_events);
-
-        Ok(events)
+            .map_err(|source| (Some(channel_id), source))?;
+        Ok((channel_id, events))
     }
 
     async fn is_pending_verification(&self, channel_id: ChannelId) -> Result<bool> {

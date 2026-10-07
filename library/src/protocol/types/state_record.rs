@@ -17,7 +17,7 @@
 //! Gated on `serde` because it exists only to be serialized; `wasm32` gets it
 //! unconditionally since the WASM store shim always needs it.
 
-use super::{StateItem, StateKey};
+use super::{CollectedShare, StateItem, StateKey};
 use crate::types::ChannelId;
 use prost::Message;
 
@@ -86,7 +86,9 @@ impl From<&StateKey> for StateKeyRecord {
 ///   [`derec_proto::VerifyShareRequestMessage`])
 /// - `1` = PendingRecovery — `secret_id` (stringified u64, the secret
 ///   being recovered), `version`, `shares` (each entry is a
-///   prost-encoded [`derec_proto::GetShareResponseMessage`])
+///   prost-encoded [`derec_proto::GetShareResponseMessage`]),
+///   `share_channels` (the channel each share arrived on, stringified
+///   u64, index-aligned with `shares`)
 /// - `2` = PendingUnpair — `channel_id`, `started_at` (stringified u64
 ///   unix-seconds)
 /// - `3` = SharingRound — `version`, `pending`, `confirmed`, `failed`
@@ -119,6 +121,12 @@ pub struct StateItemRecord {
     pub bytes: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shares: Option<Vec<Vec<u8>>>,
+    /// PendingRecovery only: the channel each entry of `shares` arrived on
+    /// (stringified u64), index-aligned with `shares`. Rows written before
+    /// 0.0.7 lack it; their collected shares cannot be attributed to a
+    /// helper and decode as none collected, so the recovery re-collects them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_channels: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,6 +170,7 @@ impl From<&StateItem> for StateItemRecord {
                 local_version: None,
                 bytes: Some(request.encode_to_vec()),
                 shares: None,
+                share_channels: None,
                 pending: None,
                 confirmed: None,
                 failed: None,
@@ -182,7 +191,8 @@ impl From<&StateItem> for StateItemRecord {
                 started_at: None,
                 local_version: None,
                 bytes: None,
-                shares: Some(shares.iter().map(|s| s.encode_to_vec()).collect()),
+                shares: Some(shares.iter().map(|s| s.response.encode_to_vec()).collect()),
+                share_channels: Some(shares.iter().map(|s| s.channel_id.0.to_string()).collect()),
                 pending: None,
                 confirmed: None,
                 failed: None,
@@ -203,6 +213,7 @@ impl From<&StateItem> for StateItemRecord {
                 local_version: None,
                 bytes: None,
                 shares: None,
+                share_channels: None,
                 pending: None,
                 confirmed: None,
                 failed: None,
@@ -225,6 +236,7 @@ impl From<&StateItem> for StateItemRecord {
                 local_version: Some(*local_version),
                 bytes: None,
                 shares: None,
+                share_channels: None,
                 pending: None,
                 confirmed: None,
                 failed: None,
@@ -250,6 +262,7 @@ impl From<&StateItem> for StateItemRecord {
                 local_version: None,
                 bytes: None,
                 shares: None,
+                share_channels: None,
                 pending: Some(round.pending.iter().map(|c| c.0.to_string()).collect()),
                 confirmed: Some(round.confirmed.iter().map(|c| c.0.to_string()).collect()),
                 failed: Some(round.failed.iter().map(|c| c.0.to_string()).collect()),
@@ -348,10 +361,27 @@ impl StateItemRecord {
                     .shares
                     .ok_or_else(|| "PendingRecovery requires shares".to_string())?;
                 let mut shares = Vec::with_capacity(raw_shares.len());
-                for (i, blob) in raw_shares.into_iter().enumerate() {
-                    let msg = derec_proto::GetShareResponseMessage::decode(blob.as_slice())
-                        .map_err(|e| format!("GetShareResponseMessage[{i}] decode: {e}"))?;
-                    shares.push(msg);
+                if let Some(channels) = self.share_channels {
+                    if channels.len() != raw_shares.len() {
+                        return Err(format!(
+                            "PendingRecovery has {} shares but {} share_channels",
+                            raw_shares.len(),
+                            channels.len()
+                        ));
+                    }
+                    for (i, (blob, channel)) in raw_shares.into_iter().zip(channels).enumerate() {
+                        let response =
+                            derec_proto::GetShareResponseMessage::decode(blob.as_slice())
+                                .map_err(|e| format!("GetShareResponseMessage[{i}] decode: {e}"))?;
+                        let channel_id = channel
+                            .parse::<u64>()
+                            .map(ChannelId)
+                            .map_err(|e| format!("share_channels[{i}] not a decimal u64: {e}"))?;
+                        shares.push(CollectedShare {
+                            channel_id,
+                            response,
+                        });
+                    }
                 }
                 Ok(StateItem::PendingRecovery {
                     secret_id,
@@ -494,6 +524,69 @@ mod tests {
             assert_eq!(record.secret_id, key.secret_id, "secret_id of {item:?}");
             assert_eq!(record.version, key.version, "version of {item:?}");
         }
+    }
+
+    #[test]
+    fn a_recovery_row_round_trips_with_the_channel_of_each_share() {
+        let response = |version| derec_proto::GetShareResponseMessage {
+            secret_id: 11,
+            version,
+            ..Default::default()
+        };
+        let item = StateItem::PendingRecovery {
+            secret_id: 11,
+            version: 3,
+            shares: vec![
+                CollectedShare {
+                    channel_id: ChannelId(u64::MAX),
+                    response: response(3),
+                },
+                CollectedShare {
+                    channel_id: ChannelId(5),
+                    response: response(3),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&StateItemRecord::from(&item)).expect("encodes");
+        let back: StateItemRecord = serde_json::from_str(&json).expect("decodes");
+        match back.into_item().expect("valid row") {
+            StateItem::PendingRecovery { shares, .. } => {
+                let channels: Vec<ChannelId> = shares.iter().map(|s| s.channel_id).collect();
+                assert_eq!(channels, vec![ChannelId(u64::MAX), ChannelId(5)]);
+                assert!(shares.iter().all(|s| s.response == response(3)));
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_recovery_row_without_share_channels_decodes_as_nothing_collected() {
+        let blob = derec_proto::GetShareResponseMessage::default().encode_to_vec();
+        let record: StateItemRecord = serde_json::from_value(serde_json::json!({
+            "kind": 1,
+            "secret_id": "11",
+            "version": 3,
+            "shares": [blob],
+        }))
+        .expect("a row written before share_channels existed parses");
+        match record.into_item().expect("valid row") {
+            StateItem::PendingRecovery { shares, .. } => assert!(shares.is_empty()),
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_recovery_row_whose_channels_do_not_match_its_shares_is_rejected() {
+        let blob = derec_proto::GetShareResponseMessage::default().encode_to_vec();
+        let record: StateItemRecord = serde_json::from_value(serde_json::json!({
+            "kind": 1,
+            "secret_id": "11",
+            "version": 3,
+            "shares": [blob.clone(), blob],
+            "share_channels": ["1"],
+        }))
+        .expect("parses");
+        assert!(record.into_item().is_err());
     }
 
     #[test]

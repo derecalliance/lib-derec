@@ -84,16 +84,6 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         .ok_or(Error::InvalidInput("no such member in this replica group"))?
         .clone();
 
-    // Removing the source leaves the group without one, so a successor is
-    // chosen here and published in the roster that completes the removal.
-    // Exactly one device runs this flow, so exactly one device decides; every
-    // other member reads the outcome from `ReplicaInfo.role` rather than
-    // deriving it, which is what keeps the group from disagreeing mid-handover.
-    //
-    // The pick is the first remaining member in store order. That order is the
-    // application's to define — see [`DeRecChannelStore::replicas`] — which is
-    // how an application steers the succession without the protocol having to
-    // model a policy. A sole source leaves no successor and the group dissolves.
     let successor = if member.role == ReplicaRole::Source {
         roster
             .iter()

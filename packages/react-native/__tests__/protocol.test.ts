@@ -2,8 +2,8 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 import { DeRecProtocolBuilder } from '../src/protocol';
-import { FlowKind } from '../src/types';
-import type { DeRecEvent } from '../src/types';
+import { FlowKind, StatusEnum } from '../src/types';
+import type { CorruptionReason, DeRecEvent } from '../src/types';
 
 let lastConfig: Record<string, unknown> | undefined;
 
@@ -73,16 +73,15 @@ describe('DeRecProtocolBuilder', () => {
   });
 
   // F4: `ProtocolConfig` (library/src/interop/ffi/protocol/handle/mod.rs) now has a
-  // `#[serde(default = "...")]` on each of these six fields, reading the same
+  // `#[serde(default = "...")]` on each of these five fields, reading the same
   // constants `DeRecProtocolBuilder::new` does. This SDK must not reintroduce
   // its own copy of those defaults — omitting the key when the caller never
   // called the setter is what lets serde's default (and therefore any future
   // change to it) apply. Pinning the *absence* of the key here means a
   // regression back to hardcoding a value shows up as a failing test.
-  it('omits the six Rust-defaulted keys from the config when their setters are never called', () => {
+  it('omits the five Rust-defaulted keys from the config when their setters are never called', () => {
     baseBuilder().build();
     expect(lastConfig).not.toHaveProperty('threshold');
-    expect(lastConfig).not.toHaveProperty('keep_versions_count');
     expect(lastConfig).not.toHaveProperty('auto_respond_on_failure');
     expect(lastConfig).not.toHaveProperty('unpair_ack');
     expect(lastConfig).not.toHaveProperty('auto_reply_to');
@@ -92,17 +91,15 @@ describe('DeRecProtocolBuilder', () => {
   // Complements the omission test above: a caller who *does* call the
   // setter must still see its exact value on the wire — omission only
   // applies to the unset case, never to an explicit caller-supplied value.
-  it('forwards the six Rust-defaulted keys verbatim when the caller sets them', () => {
+  it('forwards the five Rust-defaulted keys verbatim when the caller sets them', () => {
     baseBuilder()
       .withThreshold(5)
-      .withKeepVersionsCount(7)
       .withAutoRespondOnFailure(true)
       .withUnpairAck('not_required')
       .withAutoReplyTo(true)
       .withAutoAccept({ pairing: true })
       .build();
     expect(lastConfig!.threshold).toBe(5);
-    expect(lastConfig!.keep_versions_count).toBe(7);
     expect(lastConfig!.auto_respond_on_failure).toBe(true);
     expect(lastConfig!.unpair_ack).toBe('not_required');
     expect(lastConfig!.auto_reply_to).toBe(true);
@@ -456,6 +453,75 @@ describe('event byte fields', () => {
     expect(recovered.secret.helpers[0].shared_key).toBeInstanceOf(Uint8Array);
     expect(recovered.secret.secrets[0].id).toBeInstanceOf(Uint8Array);
     expect(Array.from(recovered.secret.secrets[0].data)).toEqual([2, 3]);
+  });
+
+  it('passes ShareVerifyRejected through with its status and memo', async () => {
+    const events = [
+      {
+        type: 'ShareVerifyRejected',
+        channel_id: '18446744073709551615',
+        version: 2,
+        status: StatusEnum.UnknownShareVersion,
+        memo: 'no stored share',
+      },
+    ];
+    host.tick = () => Promise.resolve(utf8(JSON.stringify(events)).buffer);
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    const decoded = (await protocol.tick()) as Array<
+      Extract<DeRecEvent, {type: 'ShareVerifyRejected'}>
+    >;
+
+    expect(decoded[0]).toEqual(events[0]);
+    expect(decoded[0].channel_id).toBe('18446744073709551615');
+    expect(decoded[0].status).toBe(StatusEnum.UnknownShareVersion);
+  });
+
+  it('passes RecoveryShareRefused through with its status and memo', async () => {
+    const events = [
+      {
+        type: 'RecoveryShareRefused',
+        channel_id: '18446744073709551615',
+        version: 2,
+        status: StatusEnum.UnknownShareVersion,
+        memo: 'no share stored for this secret and version',
+      },
+    ];
+    host.tick = () => Promise.resolve(utf8(JSON.stringify(events)).buffer);
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    const decoded = (await protocol.tick()) as Array<
+      Extract<DeRecEvent, {type: 'RecoveryShareRefused'}>
+    >;
+
+    expect(decoded[0]).toEqual(events[0]);
+    expect(decoded[0].channel_id).toBe('18446744073709551615');
+    expect(decoded[0].version).toBe(2);
+    expect(decoded[0].status).toBe(StatusEnum.UnknownShareVersion);
+  });
+
+  it('passes RecoveryShareCorrupted through with every reason', async () => {
+    const reasons: CorruptionReason[] = ['Malformed', 'InvalidProof', 'Inconsistent'];
+    const events = reasons.map(reason => ({
+      type: 'RecoveryShareCorrupted',
+      channel_id: '18446744073709551615',
+      version: 2,
+      reason,
+    }));
+    host.tick = () => Promise.resolve(utf8(JSON.stringify(events)).buffer);
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    const decoded = (await protocol.tick()) as Array<
+      Extract<DeRecEvent, {type: 'RecoveryShareCorrupted'}>
+    >;
+
+    expect(decoded).toEqual(events);
+    expect(decoded.map(e => e.reason)).toEqual(reasons);
+    expect(decoded[0].channel_id).toBe('18446744073709551615');
+    expect(decoded[0].version).toBe(2);
   });
 
   it('passes PeerNotRestored from restore through unchanged', async () => {

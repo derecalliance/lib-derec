@@ -20,7 +20,9 @@
 
 use std::collections::BTreeSet;
 
-use derec_library::protocol::events::{IgnoreReason, NotRestoredReason, PendingActionKind};
+use derec_library::protocol::events::{
+    CorruptionReason, IgnoreReason, NotRestoredReason, PendingActionKind,
+};
 use derec_library::protocol::types::{ChannelStatus, ReplicaRole, SecretKind, StateKind};
 
 /// Names the fixture records for one enum, in wire encoding.
@@ -181,6 +183,24 @@ fn not_restored_reason_fixture_is_complete() {
         })
         .collect();
     assert_matches_fixture("NotRestoredReason", &names);
+}
+
+#[test]
+fn corruption_reason_fixture_is_complete() {
+    let all = [
+        CorruptionReason::Malformed,
+        CorruptionReason::InvalidProof,
+        CorruptionReason::Inconsistent,
+    ];
+    let names: Vec<&str> = all
+        .iter()
+        .map(|r| match r {
+            CorruptionReason::Malformed => "Malformed",
+            CorruptionReason::InvalidProof => "InvalidProof",
+            CorruptionReason::Inconsistent => "Inconsistent",
+        })
+        .collect();
+    assert_matches_fixture("CorruptionReason", &names);
 }
 
 #[test]
@@ -434,7 +454,7 @@ fn every_typescript_surface_names_every_event_and_reason() {
             .filter(|tag| !source.contains(&format!("type: \"{tag}\"")))
             .collect();
 
-        for reason in ["IgnoreReason", "NotRestoredReason"] {
+        for reason in ["IgnoreReason", "NotRestoredReason", "CorruptionReason"] {
             let header = format!("export type {reason} =");
             let line = source
                 .lines()

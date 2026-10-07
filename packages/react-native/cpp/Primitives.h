@@ -5,6 +5,7 @@
 
 #include <jsi/jsi.h>
 
+#include <cstdint>
 #include <vector>
 
 extern "C" {
@@ -24,6 +25,22 @@ namespace derec {
 [[noreturn]] void throwDeRecError(facebook::jsi::Runtime& rt,
                                   const DeRecError& error,
                                   const std::vector<uint8_t>& conflictingChannelIdsJson);
+
+/// What a failed `derec_protocol_process` adds to its error: the events it
+/// produced before failing, and the channel the failing message came from.
+struct ProcessFailureDetails {
+  std::vector<uint8_t> eventsJson;
+  bool hasChannelId = false;
+  uint64_t channelId = 0;
+};
+
+/// As above, additionally attaching `channel_id` (a decimal string) when
+/// `process.hasChannelId` is set, and `events` (the JSON array verbatim)
+/// when `process.eventsJson` is non-empty. Only `process` produces these.
+[[noreturn]] void throwDeRecError(facebook::jsi::Runtime& rt,
+                                  const DeRecError& error,
+                                  const std::vector<uint8_t>& conflictingChannelIdsJson,
+                                  const ProcessFailureDetails& process);
 
 /// Read an `ArrayBuffer` or typed-array argument as a byte range.
 /// Returns `{nullptr, 0}` for `null`/`undefined`.

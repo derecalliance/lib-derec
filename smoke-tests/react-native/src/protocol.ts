@@ -314,6 +314,19 @@ class InMemoryShareStore implements ShareStore {
     this.data.delete(this.key(secretId, channelId));
   }
 
+  readonly removeVersionsCalls: Array<{ secretId: string; channelId: string; versions: number[] }> = [];
+
+  async removeVersions(secretId: string, channelId: string, versions: number[]): Promise<void> {
+    this.removeVersionsCalls.push({ secretId, channelId, versions: [...versions] });
+    const byVersion = this.data.get(this.key(secretId, channelId));
+    if (!byVersion) return;
+    for (const v of versions) byVersion.delete(v);
+  }
+
+  async keepList(): Promise<number[] | null> {
+    return null;
+  }
+
   async latestVersion(secretId: string): Promise<number | null> {
     return this.ownerVersions.get(secretId) ?? null;
   }
@@ -446,7 +459,6 @@ interface Node {
 }
 
 const THRESHOLD = 2;
-const KEEP_VERSIONS_COUNT = 3;
 const DEFAULT_TEST_SECRET_ID = 0xDE_2ECn;
 
 
@@ -478,7 +490,6 @@ function makeNode(
     .withTransport(transport)
     .withOwnTransports([{ uri: endpointUri, protocol: "https" }])
     .withThreshold(options.threshold ?? THRESHOLD)
-    .withKeepVersionsCount(KEEP_VERSIONS_COUNT)
     .withCommunicationInfo({ name });
   if (options.autoReplyTo !== undefined) {
     builder = builder.withAutoReplyTo(options.autoReplyTo);
