@@ -76,9 +76,10 @@ Nine defects found by the reference application's QA against 0.0.6.
   `ShareStore.KeepList`, TypeScript `ShareStore.keepList`). A list is sent to
   every helper with the version being distributed added; `None` / `null`
   sends an empty `keepList`, so helpers keep every version they hold — an
-  application that wants a cap returns it from `keep_list`. List only
-  committed versions and always the latest committed one: helpers delete
-  everything not listed. The C ABI `ShareStoreCallbacks` gains a `keep_list`
+  application that wants a cap returns it from `keep_list`. List every
+  version that could still become the latest, meaning committed versions and
+  those whose round is still open, and leave out only failed or rolled-back
+  ones: helpers delete everything not listed. The C ABI `ShareStoreCallbacks` gains a `keep_list`
   slot before `free_buffer`.
 
 - **Removed: `keep_versions_count`.** *(breaking; every SDK)*
@@ -210,7 +211,10 @@ Nine defects found by the reference application's QA against 0.0.6.
   travel in the roster. The library README now describes the procedure:
   publish a new version, so every replica and the recoverable roster carry
   the new values, then run `UpdateChannelInfo` against the helpers, keeping
-  the old endpoint serving until enough peers have the update. The
+  the old endpoint serving until enough peers have the update. Helpers answer
+  the announcing publish on the new endpoint when the protocol is built with
+  auto reply-to and `set_own_transports` is called first; `ProtectSecret` has
+  no per-round `reply_to`. The
   "Updating channel info post-pairing" section also drops its description of
   a servability refusal that no longer exists, and the removed
   `set_own_transport` / `transport_protocol` names. The SDK READMEs point to

@@ -954,17 +954,26 @@ helper in the round receives the same list.
 
 Only the application knows which versions committed: it learns that from
 `SharingComplete { threshold_met }` and `ShareConfirmed`, and nothing in the
-stores records it. So the rule for a list is:
+stores records it. The rule for a list is to keep every version that could
+still become the latest:
 
-- **List only versions that committed**, such as those whose
-  `SharingComplete` reported `threshold_met`. A version that never reached
-  threshold, or one the user rolled back, can be left out.
-- **Always keep the latest committed version.** The version being sent has
-  not committed yet when `keep_list` is asked, and the round may never reach
-  threshold.
+- **List every version that committed**, such as those whose
+  `SharingComplete` reported `threshold_met`. The version being sent has not
+  committed yet when `keep_list` is asked, and its round may never reach
+  threshold, so the latest committed version must stay listed.
+- **List every version whose round is still open.** If the owner sends v5
+  while v4's round is open and leaves v4 out, helpers delete v4's share. If
+  v5 then fails and v4 commits, the version the owner considers latest is
+  gone from those helpers.
+- **Leave out only versions whose round failed, or that the user rolled
+  back.**
 
-Helpers delete everything that is not listed, so an over-eager list can make
-the secret unrecoverable. Replica pushes never consult `keep_list` and always
+A replica member publishing as the source cannot tell which versions it
+mirrored had committed on the previous source. Listing every mirrored version
+it holds is safe: at worst helpers keep a version that was rolled back.
+
+Helpers delete everything that is not listed, so a list that leaves out too
+much can make the secret unrecoverable. Replica pushes never consult `keep_list` and always
 send an empty `keepList`.
 
 ### Transport: implement `SendOne`, not `send`
@@ -1306,9 +1315,17 @@ serving:
 - **Advertise only the new endpoint, keep the old one serving.** A device
   advertises at most one endpoint per protocol, so the old one is not listed;
   it simply keeps answering until peers stop using it. A peer that already has
-  the update answers on the new endpoint and drops the old one. In step 1,
-  helpers still hold the old endpoint, so set `reply_to` on the round to have
-  their answers come back on the new one.
+  the update answers on the new endpoint and drops the old one.
+- **Switch endpoints before step 1.** Call `set_own_transports` with the new
+  endpoint before publishing: the member's roster row is taken from it. In
+  step 1, helpers still hold the old endpoint. To have their answers come
+  back on the new one, build the protocol with `with_auto_reply_to(true)`:
+  every round then carries `reply_to` set to the current own transports,
+  which `set_own_transports` has just changed. There is no per-round
+  `reply_to` on `ProtectSecret`; this flag is how every SDK sets it
+  (`withAutoReplyTo`, `WithAutoReplyTo`, Go's `Config.AutoReplyTo`).
+  Without it, helpers answer on the old endpoint, which is why it keeps
+  serving.
 - **Enough peers, not all.** Wait until enough helpers to recover the secret,
   and the replicas the application relies on, have confirmed. Retry the rest,
   or suggest a new round later; how long the old endpoint stays up is the

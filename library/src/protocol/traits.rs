@@ -511,15 +511,21 @@ pub trait DeRecShareStore {
     ///
     /// # The rule a list must follow
     ///
-    /// Helpers delete every stored version that is not listed, so an
-    /// over-eager list can leave the secret unrecoverable. List only
-    /// versions that committed, such as those whose
-    /// [`SharingComplete`](crate::protocol::DeRecEvent::SharingComplete)
-    /// reported `threshold_met`, and always keep the latest committed
-    /// version: `version` itself has not committed yet when this is
-    /// called, and the round distributing it may never reach threshold.
-    /// Only the application knows which versions committed; nothing in
-    /// the stores records it.
+    /// Helpers delete every stored version that is not listed, so a list
+    /// that leaves out too much can make the secret unrecoverable. List
+    /// every version that could still become the latest:
+    ///
+    /// - versions that committed, such as those whose
+    ///   [`SharingComplete`](crate::protocol::DeRecEvent::SharingComplete)
+    ///   reported `threshold_met`;
+    /// - versions whose round is still open. Starting `version` does not
+    ///   settle them: if its round never reaches threshold, an open
+    ///   round that then commits is the latest, and helpers must still
+    ///   hold it.
+    ///
+    /// Leave out only versions whose round failed or that the user rolled
+    /// back. Only the application knows which versions committed; nothing
+    /// in the stores records it.
     ///
     /// Replica pushes never consult this and always send an empty
     /// `keepList`.

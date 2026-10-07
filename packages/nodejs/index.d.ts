@@ -274,10 +274,12 @@ export interface ShareStore {
    * helpers then keep every version they hold. An app that wants to cap how
    * many versions helpers retain returns that cap here. A returned list is
    * used as is, plus `version`, which the library always adds. Helpers
-   * delete every version that is not listed, so list only versions that
-   * committed (for example, those whose `SharingComplete` reported
-   * `threshold_met`) and always keep the latest committed version; an
-   * over-eager list can make the secret unrecoverable.
+   * delete every version that is not listed, so list every version that
+   * could still become the latest: those that committed (for example, whose
+   * `SharingComplete` reported `threshold_met`) and those whose round is
+   * still open. Leave out only versions whose round failed or that the user
+   * rolled back; a list that leaves out too much can make the secret
+   * unrecoverable.
    */
   keepList(secretId: string, version: number): Promise<number[] | null | undefined>;
 }

@@ -254,10 +254,12 @@ type ShareStore interface {
 	// keep every version they hold. An application that wants to cap how
 	// many versions helpers retain returns that cap here. With ok=true,
 	// helpers keep exactly versions plus version, which the library always
-	// adds. Helpers delete every version that is not listed, so list only
-	// versions that committed (for example, those whose SharingComplete
-	// event reported ThresholdMet) and always keep the latest committed
-	// version; an over-eager list can make the secret unrecoverable.
+	// adds. Helpers delete every version that is not listed, so list every
+	// version that could still become the latest: those that committed (for
+	// example, whose SharingComplete event reported ThresholdMet) and those
+	// whose round is still open. Leave out only versions whose round failed
+	// or that the user rolled back; a list that leaves out too much can make
+	// the secret unrecoverable.
 	KeepList(secretID uint64, version uint32) (versions []uint32, ok bool, err error)
 }
 

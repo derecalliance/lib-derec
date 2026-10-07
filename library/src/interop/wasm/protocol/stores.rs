@@ -53,8 +53,8 @@
 //!   removeVersions(secretId: string, channelId: string, versions: number[]): Promise<void>;
 //!   // Owner only: the versions every Helper keeps after `version` is
 //!   // distributed. `null`/`undefined` sends an empty keepList, so Helpers
-//!   // keep every version. List only committed versions; the library
-//!   // always adds `version`.
+//!   // keep every version. List committed versions and those whose round
+//!   // is still open; the library always adds `version`.
 //!   keepList(secretId: string, version: number): Promise<number[] | null | undefined>;
 //!   latestVersion(): Promise<number | null>;
 //! }

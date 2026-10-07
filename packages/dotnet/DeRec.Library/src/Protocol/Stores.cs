@@ -431,11 +431,12 @@ public interface IShareStore
     /// wants to cap how many versions helpers retain returns that cap
     /// here. A returned list is used as is, plus
     /// <paramref name="version"/>, which the library always adds.
-    /// Helpers delete every version that is not listed, so list only
-    /// versions that committed (for example, those whose
-    /// <see cref="SharingCompleteEvent"/> reported <c>ThresholdMet</c>) and
-    /// always keep the latest committed version; an over-eager list can
-    /// make the secret unrecoverable.
+    /// Helpers delete every version that is not listed, so list every
+    /// version that could still become the latest: those that committed
+    /// (for example, whose <see cref="SharingCompleteEvent"/> reported
+    /// <c>ThresholdMet</c>) and those whose round is still open. Leave out
+    /// only versions whose round failed or that the user rolled back; a
+    /// list that leaves out too much can make the secret unrecoverable.
     /// </para>
     /// </summary>
     uint[]? KeepList(ulong secretId, uint version);
