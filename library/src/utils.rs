@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use rand::{Rng, rng};
+use rand::Rng as _;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
+/// The operating system's random number generator, drawn from directly.
+///
+/// Every nonce, seed and random id the library produces comes from here.
+/// Nothing is buffered in the process, so a forked child never repeats its
+/// parent's output.
+///
+/// # Panics
+///
+/// When the operating system cannot provide randomness.
+pub(crate) fn os_rng() -> UnwrapErr<SysRng> {
+    UnwrapErr(SysRng)
+}
+
+pub(crate) fn random_u64() -> u64 {
+    os_rng().next_u64()
+}
+
 pub(crate) fn generate_seed<const N: usize>() -> Zeroizing<[u8; N]> {
     let mut entropy = Zeroizing::new([0u8; N]);
-    let mut rng = rng();
-    rng.fill_bytes(&mut *entropy);
+    os_rng().fill_bytes(&mut *entropy);
     entropy
 }
 

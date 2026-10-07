@@ -2245,6 +2245,39 @@ fn every_deprecation_shares_the_release_horizon() {
     );
 }
 
+/// A deprecation wave is gone by the release it is removed at.
+///
+/// The horizon is a promise to consumers. Without this check a release can
+/// reach `removed_at` with the deprecated symbols still in place, and the
+/// promised removal silently slips.
+#[test]
+fn the_deprecation_wave_is_removed_by_its_horizon() {
+    let horizon = &fixture()["documented_api"]["deprecation_horizon"];
+    if horizon.is_null() {
+        return;
+    }
+    let removed_at = horizon["removed_at"]
+        .as_str()
+        .expect("horizon names a `removed_at`");
+    let version = |v: &str| -> Vec<u64> {
+        v.split('.')
+            .map(|part| part.parse().expect("a numeric version component"))
+            .collect()
+    };
+    let current = env!("CARGO_PKG_VERSION");
+    assert!(
+        version(current) < version(removed_at),
+        "version {current} has reached the deprecation horizon ({removed_at}) but these \
+         symbols are still deprecated:\n  {}\n\n\
+         Remove them and set `documented_api.deprecation_horizon` to null.",
+        deprecations()
+            .iter()
+            .map(|(rel, symbol, _)| format!("{rel}: `{symbol}`"))
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}
+
 /// Every deprecated symbol is named in the changelog.
 ///
 /// A deprecation the release notes do not mention reaches a consumer as a
@@ -2269,12 +2302,13 @@ fn changelog_names_every_deprecated_symbol() {
 /// text).
 fn deprecations() -> Vec<(String, String, String)> {
     let mut out = Vec::new();
-    let sources = rust_sources("library/src");
+    let library = rust_sources("library/src");
+    let cryptography = rust_sources("cryptography/src");
     assert!(
-        !sources.is_empty(),
-        "no library sources were found — the walk is reading nothing"
+        !library.is_empty() && !cryptography.is_empty(),
+        "no library or cryptography sources were found — the walk is reading nothing"
     );
-    for rel in sources {
+    for rel in library.into_iter().chain(cryptography) {
         let src = read(&rel);
         let mut lines = src.lines().peekable();
         while let Some(line) = lines.next() {
@@ -2313,11 +2347,21 @@ fn deprecations() -> Vec<(String, String, String)> {
 /// The name a declaration introduces: the token after `fn`, or the leading
 /// identifier for an enum variant.
 fn item_name(decl: &str) -> String {
-    let head = match decl.split_once("fn ") {
-        Some((_, rest)) => rest,
-        None => decl,
-    };
-    head.split(|c: char| !c.is_alphanumeric() && c != '_')
+    const KEYWORDS: [&str; 9] = [
+        "fn", "const", "static", "struct", "enum", "type", "trait", "mod", "union",
+    ];
+    let mut words = decl.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        if KEYWORDS.contains(&word) && words.peek().is_some_and(|next| !KEYWORDS.contains(next)) {
+            let name = words.next().unwrap_or("");
+            return name
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("")
+                .to_owned();
+        }
+    }
+    decl.split(|c: char| !c.is_alphanumeric() && c != '_')
         .next()
         .unwrap_or("")
         .to_owned()

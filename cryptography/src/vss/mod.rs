@@ -6,7 +6,8 @@
 //! sharing algorithm, so that each share can be individually verified during reconstruction.
 
 use super::channel::{decrypt_message, encrypt_message};
-use rand_chacha::rand_core::SeedableRng;
+use rand::SeedableRng;
+use rand::rngs::ChaCha20Rng;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 mod shamir;
@@ -31,7 +32,7 @@ pub struct VSSShare {
     /// Merkle-root commitment to all shares
     pub commitment: Vec<u8>,
     /// bottom-up Merkle authentication path.
-    /// The `bool` denotes `is_left`, while the `Vec<u8>` is the SHA-384 hash.
+    /// The `bool` denotes `is_left`, while the `Vec<u8>` is the SHA-256 hash.
     pub merkle_path: Vec<(bool, Vec<u8>)>,
 }
 
@@ -159,13 +160,13 @@ pub fn share(
         &k,
         threshold,
         total_shares,
-        &mut rand_chacha::ChaCha8Rng::from_seed(seed1),
+        &mut ChaCha20Rng::from_seed(seed1),
     );
 
     let merkle_tree = utils::build_merkle_tree(
         &shamir_shares,
         MERKLE_TREE_DEPTH,
-        &mut rand_chacha::ChaCha8Rng::from_seed(seed2),
+        &mut ChaCha20Rng::from_seed(seed2),
     );
     let merkle_proofs = utils::extract_merkle_proofs(&merkle_tree, MERKLE_TREE_DEPTH, total_shares);
 

@@ -8,14 +8,13 @@ use crate::{
 use derec_cryptography::pairing::pairing_ecies;
 use derec_proto::{MessageBody, PairRequestMessage};
 use prost::Message;
-use rand08::thread_rng;
 
 const CHANNEL_ID: ChannelId = ChannelId(42);
 const SEQUENCE: u32 = 7;
 const SHARED_KEY: [u8; 32] = [0xAB; 32];
 
 fn pairing_keypair() -> (Vec<u8>, Vec<u8>) {
-    pairing_ecies::generate_key(&mut thread_rng()).unwrap()
+    pairing_ecies::generate_key(&mut crate::utils::os_rng()).unwrap()
 }
 
 fn sample_message() -> PairRequestMessage {

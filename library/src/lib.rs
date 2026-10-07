@@ -87,7 +87,7 @@ pub use error::Error;
 /// Never returns `0`, which no replica id may be.
 pub fn generate_replica_id() -> u64 {
     loop {
-        let id: u64 = rand::random();
+        let id = utils::random_u64();
         if id != 0 {
             return id;
         }

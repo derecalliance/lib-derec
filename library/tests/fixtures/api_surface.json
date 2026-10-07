@@ -1264,6 +1264,10 @@
       }
     ],
     "$deprecation_horizon_note": "The open deprecation wave: `since`, `removed_at` and any `exceptions`. `null` means no wave is open, and then no `#[deprecated]` may exist in the library — a deprecation is only ever introduced together with the horizon it is removed at.",
-    "deprecation_horizon": null
+    "deprecation_horizon": {
+      "since": "0.0.8",
+      "removed_at": "0.0.13",
+      "exceptions": []
+    }
   }
 }
