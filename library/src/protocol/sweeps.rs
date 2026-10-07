@@ -1150,6 +1150,62 @@ mod sharing_round_outcome_tests {
         });
     }
 
+    /// The sweep inside `process` saves the failed participants before the
+    /// message is even decoded, so a message that then fails must still
+    /// hand back the timeouts and the closed round.
+    #[test]
+    fn a_failing_process_still_reports_the_timeouts_it_settled() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeouts.sharing_round = std::time::Duration::from_secs(60);
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                        version: 3,
+                        pending: [ChannelId(9001)].into_iter().collect(),
+                        confirmed: [ChannelId(9002)].into_iter().collect(),
+                        failed: HashSet::new(),
+                        pending_replicas: HashSet::new(),
+                        synced_replicas: HashSet::new(),
+                        behind_replicas: HashSet::new(),
+                        started_at: now_secs().saturating_sub(600),
+                    })),
+                )
+                .await
+                .expect("seed round");
+
+            let error = protocol
+                .process(&[0xFF, 0xFF, 0xFF])
+                .await
+                .expect_err("garbage bytes do not decode");
+
+            assert!(error.channel_id.is_none());
+            assert!(
+                error.events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::ShareRejected { channel_id, memo, .. }
+                        if *channel_id == ChannelId(9001) && memo == "timeout"
+                )),
+                "the timeout travels with the error; got {:?}",
+                error.events
+            );
+            assert!(
+                error
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::SharingComplete { version: 3, .. })),
+                "the round closes on the failing call; got {:?}",
+                error.events
+            );
+            assert!(
+                protocol.tick().await.is_empty(),
+                "settled deadlines are not reported twice"
+            );
+        });
+    }
+
     /// `tick` runs the unpair sweep too, not only the sharing round.
     ///
     /// An unpair sent under `UnpairAck::Required` keeps local state alive

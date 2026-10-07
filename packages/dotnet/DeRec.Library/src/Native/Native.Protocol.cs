@@ -135,6 +135,16 @@ internal static class Protocol
     internal delegate int ShareStoreRemoveChannelDelegate(
         IntPtr userData, ulong secretId, ulong channelId);
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int ShareStoreRemoveVersionsDelegate(
+        IntPtr userData, ulong secretId, ulong channelId,
+        IntPtr versionsJsonPtr, UIntPtr versionsJsonLen);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int ShareStoreKeepListDelegate(
+        IntPtr userData, ulong secretId, uint version,
+        out IntPtr outPtr, out UIntPtr outLen);
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct ShareStoreCallbacks
     {
@@ -145,6 +155,8 @@ internal static class Protocol
         public IntPtr LatestVersion;
         public IntPtr Save;
         public IntPtr RemoveChannel;
+        public IntPtr RemoveVersions;
+        public IntPtr KeepList;
         public IntPtr FreeBuffer;
     }
 
@@ -300,8 +312,17 @@ internal static class Protocol
     internal static extern DeRecProtocolEventsResult derec_protocol_start(
         IntPtr handle, uint flowKind, byte[]? paramsJson, UIntPtr paramsJsonLen);
 
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct DeRecProtocolProcessResult
+    {
+        public DeRecError Error;
+        public Buffer EventsJson;
+        [MarshalAs(UnmanagedType.U1)] public bool HasChannelId;
+        public ulong ChannelId;
+    }
+
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern DeRecProtocolEventsResult derec_protocol_process(
+    internal static extern DeRecProtocolProcessResult derec_protocol_process(
         IntPtr handle, byte[] message, UIntPtr messageLen);
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

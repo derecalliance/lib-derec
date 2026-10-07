@@ -66,13 +66,6 @@
 #define DEFAULT_THRESHOLD 3
 
 /**
- * Number of recent share versions each helper retains, absent an explicit
- * [`DeRecProtocolBuilder::with_keep_versions_count`](crate::protocol::DeRecProtocolBuilder::with_keep_versions_count) call. Sole definition
- * of the value; see [`DEFAULT_THRESHOLD`].
- */
-#define DEFAULT_KEEP_VERSIONS_COUNT 3
-
-/**
  * Maximum accepted transport URI length, in bytes.
  *
  * Matches the de-facto 2048-byte limit most HTTP stacks enforce
@@ -844,6 +837,11 @@ typedef struct SecretStoreCallbacks {
  * arrays (`channel_ids[]`, `versions[]`) cross the FFI as JSON
  * strings, matching the `Vec<u8>` ↔ JSON-array convention used for
  * every other wire-format buffer in this module.
+ *
+ * `keep_list` returns the JSON encoding of the application's answer:
+ * `null` for no list (the owner sends an empty `keepList` and helpers keep
+ * every version) or an array of version numbers. An empty buffer or return code `1` also
+ * means `null`.
  */
 typedef struct ShareStoreCallbacks {
   void *user_data;
@@ -878,6 +876,16 @@ typedef struct ShareStoreCallbacks {
                   const uint8_t *share_json_ptr,
                   size_t share_json_len);
   int32_t (*remove_channel)(void *user_data, uint64_t secret_id, uint64_t channel_id);
+  int32_t (*remove_versions)(void *user_data,
+                             uint64_t secret_id,
+                             uint64_t channel_id,
+                             const uint8_t *versions_json_ptr,
+                             size_t versions_json_len);
+  int32_t (*keep_list)(void *user_data,
+                       uint64_t secret_id,
+                       uint32_t version,
+                       uint8_t **out_ptr,
+                       size_t *out_len);
   void (*free_buffer)(void *user_data, uint8_t *ptr, size_t len);
 } ShareStoreCallbacks;
 
@@ -1000,6 +1008,30 @@ typedef struct DeRecProtocolEventsResult {
    */
   struct DeRecBuffer events_json;
 } DeRecProtocolEventsResult;
+
+/**
+ * Result of [`derec_protocol_process`].
+ *
+ * A failed call still carries the events produced before the failure in
+ * `events_json`, and names the channel the failing message came from.
+ */
+typedef struct DeRecProtocolProcessResult {
+  struct DeRecError error;
+  /**
+   * UTF-8 JSON array of events, as on [`DeRecProtocolEventsResult`].
+   * Filled on success and on failure.
+   */
+  struct DeRecBuffer events_json;
+  /**
+   * Whether `channel_id` is set. False on success and when the bytes
+   * were not a decodable envelope.
+   */
+  bool has_channel_id;
+  /**
+   * The channel the failing message came from.
+   */
+  uint64_t channel_id;
+} DeRecProtocolProcessResult;
 
 /**
  * Result of [`derec_protocol_restore`].
@@ -1685,7 +1717,6 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *   "secret_id": "12345678901234567890",
  *   "own_transports": [{ "uri": "https://example.com/derec", "protocol": "https" }],
  *   "threshold": 3,
- *   "keep_versions_count": 3,
  *   "auto_respond_on_failure": false,
  *   "unpair_ack": 0,
  *   "auto_reply_to": false,
@@ -1730,10 +1761,8 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *   two entries of the same protocol are rejected. Required: an absent or
  *   empty list is refused, since a node with no endpoint cannot be reached
  *   by any peer.
- * - `threshold` / `keep_versions_count`: omitted means
- *   [`crate::protocol::DEFAULT_THRESHOLD`] /
- *   [`crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT`]. A `threshold` below
- *   `2` is rejected with `DEREC_CODE_INVALID_INPUT`.
+ * - `threshold`: omitted means [`crate::protocol::DEFAULT_THRESHOLD`]. A
+ *   `threshold` below `2` is rejected with `DEREC_CODE_INVALID_INPUT`.
  * - `unpair_ack`: `0` / `"required"` = Required, `1` / `"not_required"` =
  *   NotRequired; omitted means Required.
  *   Any other value is rejected with `DEREC_CODE_FFI_INVALID_ENUM`.
@@ -1880,7 +1909,8 @@ struct DeRecProtocolEventsResult derec_protocol_start(struct DeRecProtocolHandle
 
 /**
  * Process an inbound `DeRecMessage` envelope. See
- * [`crate::protocol::DeRecProtocol::process`].
+ * [`crate::protocol::DeRecProtocol::process`]. On failure the result still
+ * carries the events produced before it and the failing channel.
  *
  * # Safety
  *
@@ -1888,9 +1918,9 @@ struct DeRecProtocolEventsResult derec_protocol_start(struct DeRecProtocolHandle
  * [`super::derec_protocol_new`]. `message_ptr`/`message_len` must
  * describe a readable byte range.
  */
-struct DeRecProtocolEventsResult derec_protocol_process(struct DeRecProtocolHandle *handle,
-                                                        const uint8_t *message_ptr,
-                                                        size_t message_len);
+struct DeRecProtocolProcessResult derec_protocol_process(struct DeRecProtocolHandle *handle,
+                                                         const uint8_t *message_ptr,
+                                                         size_t message_len);
 
 /**
  * Advance time-driven state without an inbound message. See

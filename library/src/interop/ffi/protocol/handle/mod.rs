@@ -317,8 +317,6 @@ struct ProtocolConfig {
     own_transports: Vec<OwnTransportConfig>,
     #[serde(default = "default_threshold")]
     threshold: u32,
-    #[serde(default = "default_keep_versions_count")]
-    keep_versions_count: u32,
     #[serde(default)]
     auto_respond_on_failure: bool,
     #[serde(default)]
@@ -370,7 +368,6 @@ struct ProtocolConfig {
 ///   "secret_id": "12345678901234567890",
 ///   "own_transports": [{ "uri": "https://example.com/derec", "protocol": "https" }],
 ///   "threshold": 3,
-///   "keep_versions_count": 3,
 ///   "auto_respond_on_failure": false,
 ///   "unpair_ack": 0,
 ///   "auto_reply_to": false,
@@ -415,10 +412,8 @@ struct ProtocolConfig {
 ///   two entries of the same protocol are rejected. Required: an absent or
 ///   empty list is refused, since a node with no endpoint cannot be reached
 ///   by any peer.
-/// - `threshold` / `keep_versions_count`: omitted means
-///   [`crate::protocol::DEFAULT_THRESHOLD`] /
-///   [`crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT`]. A `threshold` below
-///   `2` is rejected with `DEREC_CODE_INVALID_INPUT`.
+/// - `threshold`: omitted means [`crate::protocol::DEFAULT_THRESHOLD`]. A
+///   `threshold` below `2` is rejected with `DEREC_CODE_INVALID_INPUT`.
 /// - `unpair_ack`: `0` / `"required"` = Required, `1` / `"not_required"` =
 ///   NotRequired; omitted means Required.
 ///   Any other value is rejected with `DEREC_CODE_FFI_INVALID_ENUM`.
@@ -534,7 +529,6 @@ pub unsafe extern "C" fn derec_protocol_new(
             secret_id,
             own_transports,
             config.threshold,
-            config.keep_versions_count,
             info,
             config.timeouts.to_timeouts(),
             unsafe_connection,
@@ -655,7 +649,6 @@ unsafe fn construct_protocol(
     secret_id: u64,
     own_transports: Vec<crate::transport::TransportProtocol>,
     threshold: u32,
-    keep_versions_count: u32,
     communication_info: HashMap<String, String>,
     timeouts: crate::protocol::types::Timeouts,
     unsafe_connection: bool,
@@ -714,7 +707,6 @@ unsafe fn construct_protocol(
         .with_transport(transport)
         .with_own_transports(own_transports)
         .with_threshold(threshold as usize)
-        .with_keep_versions_count(keep_versions_count as usize)
         .with_communication_info(communication_info)
         .with_timeouts(timeouts)
         .with_unsafe_connection(unsafe_connection)
@@ -762,12 +754,6 @@ unsafe fn construct_protocol(
 /// constant [`crate::protocol::DeRecProtocolBuilder::new`] uses.
 fn default_threshold() -> u32 {
     crate::protocol::DEFAULT_THRESHOLD as u32
-}
-
-/// See [`default_threshold`]; the [`crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT`]
-/// counterpart for [`ProtocolConfig::keep_versions_count`].
-fn default_keep_versions_count() -> u32 {
-    crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT as u32
 }
 
 /// The `unpair_ack` config value: either the discriminant (`0` = Required,
@@ -818,10 +804,6 @@ mod protocol_config_defaults_tests {
             serde_json::from_str(minimal).expect("minimal config must deserialize");
 
         assert_eq!(config.threshold, crate::protocol::DEFAULT_THRESHOLD as u32);
-        assert_eq!(
-            config.keep_versions_count,
-            crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT as u32
-        );
         assert!(!config.auto_respond_on_failure);
         assert!(config.unpair_ack.is_none());
         assert!(!config.auto_reply_to);

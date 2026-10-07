@@ -110,8 +110,37 @@ impl From<DeRecError> for DeRecProtocolEventsResult {
     }
 }
 
+/// Result of [`derec_protocol_process`].
+///
+/// A failed call still carries the events produced before the failure in
+/// `events_json`, and names the channel the failing message came from.
+#[repr(C)]
+pub struct DeRecProtocolProcessResult {
+    pub error: DeRecError,
+    /// UTF-8 JSON array of events, as on [`DeRecProtocolEventsResult`].
+    /// Filled on success and on failure.
+    pub events_json: DeRecBuffer,
+    /// Whether `channel_id` is set. False on success and when the bytes
+    /// were not a decodable envelope.
+    pub has_channel_id: bool,
+    /// The channel the failing message came from.
+    pub channel_id: u64,
+}
+
+impl From<DeRecError> for DeRecProtocolProcessResult {
+    fn from(error: DeRecError) -> Self {
+        Self {
+            error,
+            events_json: empty_buffer(),
+            has_channel_id: false,
+            channel_id: 0,
+        }
+    }
+}
+
 /// Process an inbound `DeRecMessage` envelope. See
-/// [`crate::protocol::DeRecProtocol::process`].
+/// [`crate::protocol::DeRecProtocol::process`]. On failure the result still
+/// carries the events produced before it and the failing channel.
 ///
 /// # Safety
 ///
@@ -123,7 +152,7 @@ pub unsafe extern "C" fn derec_protocol_process(
     handle: *mut DeRecProtocolHandle,
     message_ptr: *const u8,
     message_len: usize,
-) -> DeRecProtocolEventsResult {
+) -> DeRecProtocolProcessResult {
     if handle.is_null() {
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
     }
@@ -139,14 +168,18 @@ pub unsafe extern "C" fn derec_protocol_process(
     let h = unsafe { &*handle };
     let mut inner = h.lock_inner();
     match h.runtime.block_on(inner.process(&bytes)) {
-        Ok(events) => {
-            let json = encode_events(events);
-            DeRecProtocolEventsResult {
-                error: success(),
-                events_json: vec_into_buffer(json),
-            }
-        }
-        Err(e) => from_lib_error(e.source).into(),
+        Ok(events) => DeRecProtocolProcessResult {
+            error: success(),
+            events_json: vec_into_buffer(encode_events(events)),
+            has_channel_id: false,
+            channel_id: 0,
+        },
+        Err(e) => DeRecProtocolProcessResult {
+            error: from_lib_error(e.source),
+            events_json: vec_into_buffer(encode_events(e.events)),
+            has_channel_id: e.channel_id.is_some(),
+            channel_id: e.channel_id.map_or(0, |id| id.0),
+        },
     }
 }
 

@@ -220,6 +220,17 @@ public sealed record ReplicaDiscoveryParams;
 /// <c>ReplicaRemovedEvent</c> fires. A group with no secret to publish
 /// therefore cannot complete a removal.
 /// </para>
+/// <para>
+/// Any member may remove any member, the source included: a lost or stolen
+/// source must be removable by the devices that remain, and the library checks
+/// no role. Ask the user before starting this flow, above all when it names the
+/// source. Removing the source promotes the first remaining member in the order
+/// <c>IChannelStore.ListReplicas</c> returns. The removed member is not asked
+/// and gets no event when told to leave: when a roster excluding it arrives it
+/// drops its whole <c>secret_id</c> partition and emits
+/// <see cref="SelfRemovedFromGroupEvent"/>. The secret survives on the
+/// remaining members and the helpers.
+/// </para>
 /// </remarks>
 public sealed record UnpairReplicaParams
 {
@@ -416,6 +427,20 @@ public sealed record ShareVerifiedEvent : DeRecEvent
     public required uint Version { get; init; }
 }
 
+/// <summary>
+/// A helper refused a verification challenge: its response carried a non-OK
+/// <c>Status</c> instead of a proof. The challenge is spent; a new
+/// <c>VerifyShares</c> round challenges the helper again.
+/// </summary>
+public sealed record ShareVerifyRejectedEvent : DeRecEvent
+{
+    public override string EventType => "ShareVerifyRejected";
+    public required ulong ChannelId { get; init; }
+    public required uint Version { get; init; }
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
+    public required string Memo { get; init; }
+}
+
 public sealed record DiscoveredSecretVersion(uint Version, string Description);
 
 public sealed record DiscoveredSecret(ulong SecretId, IReadOnlyList<DiscoveredSecretVersion> Versions);
@@ -440,6 +465,64 @@ public sealed record RecoveryShareErrorEvent : DeRecEvent
     public required ulong ChannelId { get; init; }
     public required uint SharesReceived { get; init; }
     public required string Error { get; init; }
+}
+
+/// <summary>
+/// A helper refused a recovery share request: its response carried a non-OK
+/// <c>Status</c> (e.g. <c>UnknownShareVersion</c>) instead of a share. The
+/// refusal is not collected — it does not count towards
+/// <c>SharesReceived</c> and the recovery stays open for the other helpers'
+/// shares — but it does answer that helper's
+/// <see cref="RecoverSecretStartedEvent"/>.
+/// </summary>
+public sealed record RecoveryShareRefusedEvent : DeRecEvent
+{
+    public override string EventType => "RecoveryShareRefused";
+    public required ulong ChannelId { get; init; }
+    public required uint Version { get; init; }
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
+    public required string Memo { get; init; }
+}
+
+/// <summary>
+/// A helper answered a recovery share request with a share that cannot be
+/// part of the secret. <see cref="Reason"/> is one of the
+/// <see cref="CorruptionReason"/> constants.
+/// </summary>
+/// <remarks>
+/// The share is set aside: it does not count towards <c>SharesReceived</c>
+/// and never blocks the recovery — the other helpers' shares still complete
+/// it. <see cref="CorruptionReason.Malformed"/> and
+/// <see cref="CorruptionReason.InvalidProof"/> are reported as the share
+/// arrives; <see cref="CorruptionReason.Inconsistent"/> alongside
+/// <see cref="SecretRecoveredEvent"/>, once per helper. An honest helper never
+/// sends a corrupted share, so the application may treat this as a sign of a
+/// damaged or compromised helper — for example by offering to unpair it. It
+/// also answers that helper's <see cref="RecoverSecretStartedEvent"/>.
+/// </remarks>
+public sealed record RecoveryShareCorruptedEvent : DeRecEvent
+{
+    public override string EventType => "RecoveryShareCorrupted";
+    public required ulong ChannelId { get; init; }
+    public required uint Version { get; init; }
+    public required string Reason { get; init; }
+}
+
+/// <summary>
+/// The label vocabulary for <see cref="RecoveryShareCorruptedEvent.Reason"/>.
+/// Matches the Rust <c>CorruptionReason</c> discriminants one-for-one.
+/// </summary>
+public static class CorruptionReason
+{
+    /// <summary>The response carries no decodable share for the requested secret and version.</summary>
+    public const string Malformed = "Malformed";
+    /// <summary>The share fails its own Merkle proof, e.g. a value altered after it was split.</summary>
+    public const string InvalidProof = "InvalidProof";
+    /// <summary>
+    /// The share is valid on its own, but its commitment root or ciphertext
+    /// disagrees with the shares the secret was rebuilt from.
+    /// </summary>
+    public const string Inconsistent = "Inconsistent";
 }
 
 /// <summary>
@@ -569,7 +652,8 @@ public sealed record ReplicaSourceChangedEvent : DeRecEvent
 /// <summary>
 /// This device left the group and dropped its whole <c>SecretId</c>
 /// partition. Fires only once it was told to leave and has since seen a
-/// roster excluding it.
+/// roster excluding it. The teardown is automatic: this device is not asked
+/// first and gets no earlier event.
 /// </summary>
 public sealed record SelfRemovedFromGroupEvent : DeRecEvent
 {
@@ -631,6 +715,11 @@ public sealed record ReplicaSecretInstalledEvent : DeRecEvent
 /// state with <c>FlowKind.ProtectSecret</c> writes the next version, which
 /// supersedes both on every member and helper.
 /// </para>
+/// <para>
+/// Until then, do not publish from this device: any further
+/// <c>ProtectSecret</c> is a higher version that every other member applies
+/// over its own copy, losing the change it never merged.
+/// </para>
 /// </summary>
 public sealed record ReplicaVersionConflictEvent : DeRecEvent
 {
@@ -660,8 +749,11 @@ public sealed record ReplicaVersionConflictEvent : DeRecEvent
 /// <summary>
 /// A group member refused a secret sync. Keyed by <c>ReplicaId</c>, not
 /// <c>ChannelId</c>: every member answers on the one group channel.
-/// A <c>VERSION_CONFLICT</c> status means the round must be resolved and
-/// republished at a new version.
+/// A <c>VERSION_CONFLICT</c> status means another member holds a different
+/// copy of this version: do not publish from this device again until the
+/// conflict is resolved. Run <c>FlowKind.ReplicaDiscovery</c> to receive the
+/// group's copy as <see cref="ReplicaVersionConflictEvent"/>, merge, and
+/// publish the result once with <c>FlowKind.ProtectSecret</c>.
 /// </summary>
 public sealed record ReplicaSyncRejectedEvent : DeRecEvent
 {
@@ -1004,6 +1096,13 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
             },
+            "ShareVerifyRejected" => new ShareVerifyRejectedEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Version = root.GetProperty("version").GetUInt32(),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
+                Memo = root.GetProperty("memo").GetString() ?? string.Empty,
+            },
             "SecretsDiscovered" => ParseSecretsDiscovered(root),
             "RecoveryShareReceived" => new RecoveryShareReceivedEvent
             {
@@ -1015,6 +1114,19 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 SharesReceived = root.GetProperty("shares_received").GetUInt32(),
                 Error = root.GetProperty("error").GetString() ?? string.Empty,
+            },
+            "RecoveryShareRefused" => new RecoveryShareRefusedEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Version = root.GetProperty("version").GetUInt32(),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
+                Memo = root.GetProperty("memo").GetString() ?? string.Empty,
+            },
+            "RecoveryShareCorrupted" => new RecoveryShareCorruptedEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Version = root.GetProperty("version").GetUInt32(),
+                Reason = root.GetProperty("reason").GetString() ?? string.Empty,
             },
             "SecretRecovered" => new SecretRecoveredEvent
             {

@@ -395,10 +395,9 @@ func TestRestore_Conflict_ReportsConflictingChannelIDs(t *testing.T) {
 		}
 	}
 	p, err := New(channel, share, secretStore, userSecret, state, transport, Config{
-		SecretID:          secretID,
-		OwnTransports:     []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:         proto.Uint32(2),
-		KeepVersionsCount: proto.Uint32(3),
+		SecretID:      secretID,
+		OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:     proto.Uint32(2),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

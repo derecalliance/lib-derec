@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+import type { DeRecEvent } from './types';
+
 /**
  * Every category name `derec_error_category_name` can return, and no others.
  *
@@ -49,4 +51,12 @@ export interface DeRecError {
    * Clear exactly these and retry `restore`.
    */
   channel_ids?: string[];
+  /** The channel the failing inbound message arrived on, when `process()` could tell. */
+  channel_id?: string;
+  /**
+   * On a failed `process()`: the events it produced before failing, such as
+   * sharing-round and unpair timeouts. They are not reported again, so
+   * handle them as you would a successful call's events.
+   */
+  events?: DeRecEvent[];
 }

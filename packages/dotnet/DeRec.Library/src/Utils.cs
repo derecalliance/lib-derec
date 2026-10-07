@@ -19,6 +19,8 @@ namespace DeRec.Library;
 /// <see cref="Code"/> equals <see cref="DeRecCode.VersionMismatch"/>.</item>
 /// <item><see cref="ConflictingChannelIds"/> is populated when
 /// <see cref="Code"/> equals <see cref="DeRecCode.RestoreConflict"/>.</item>
+/// <item><see cref="ChannelId"/> / <see cref="Events"/> are populated by a
+/// failed <c>DeRecProtocol.ProcessAsync</c>.</item>
 /// </list>
 /// </summary>
 public sealed class DeRecException : Exception
@@ -38,6 +40,21 @@ public sealed class DeRecException : Exception
     /// </summary>
     public IReadOnlyList<ulong> ConflictingChannelIds { get; }
 
+    /// <summary>
+    /// The channel the failing inbound message arrived on, when
+    /// <c>DeRecProtocol.ProcessAsync</c> could tell. <c>null</c> when the bytes
+    /// were not a decodable envelope, and for every other call.
+    /// </summary>
+    public ulong? ChannelId { get; }
+
+    /// <summary>
+    /// The events a failed <c>DeRecProtocol.ProcessAsync</c> produced before
+    /// failing, such as sharing-round and unpair timeouts. They are not
+    /// reported again, so handle them as a successful call's events. Empty for
+    /// every other call.
+    /// </summary>
+    public IReadOnlyList<Orchestrator.DeRecEvent> Events { get; }
+
     /// <summary>Stable name of <see cref="Category"/>, e.g. <c>"pairing"</c>.</summary>
     public string CategoryName => DeRecCategory.Name(Category);
 
@@ -45,7 +62,8 @@ public sealed class DeRecException : Exception
     public string CodeName => DeRecCode.Name(Code);
 
     internal DeRecException(int category, int code, string message, int peerStatus, string? peerMemo, uint expected, uint got,
-        IReadOnlyList<ulong>? conflictingChannelIds = null)
+        IReadOnlyList<ulong>? conflictingChannelIds = null, ulong? channelId = null,
+        IReadOnlyList<Orchestrator.DeRecEvent>? events = null)
         : base(message)
     {
         Category = category;
@@ -55,6 +73,8 @@ public sealed class DeRecException : Exception
         Expected = expected;
         Got = got;
         ConflictingChannelIds = conflictingChannelIds ?? Array.Empty<ulong>();
+        ChannelId = channelId;
+        Events = events ?? Array.Empty<Orchestrator.DeRecEvent>();
     }
 
     public override string ToString()
@@ -102,14 +122,15 @@ internal static class Utils
     /// indicates failure. Always releases the error's owned strings before
     /// returning or throwing.
     /// </summary>
-    public static void ThrowIfError(Native.DeRecError error) =>
-        ThrowIfError(error, conflictingChannelIds: null);
-
-    /// <summary>
-    /// <see cref="ThrowIfError(Native.DeRecError)"/>, attaching
-    /// <paramref name="conflictingChannelIds"/> to the thrown exception.
-    /// </summary>
-    public static void ThrowIfError(Native.DeRecError error, IReadOnlyList<ulong>? conflictingChannelIds)
+    /// <remarks>
+    /// <paramref name="conflictingChannelIds"/>, <paramref name="channelId"/>
+    /// and <paramref name="events"/> are attached to the thrown exception.
+    /// </remarks>
+    public static void ThrowIfError(
+        Native.DeRecError error,
+        IReadOnlyList<ulong>? conflictingChannelIds = null,
+        ulong? channelId = null,
+        IReadOnlyList<Orchestrator.DeRecEvent>? events = null)
     {
         if (error.Category == DeRecCategory.Ok)
         {
@@ -134,7 +155,9 @@ internal static class Utils
             peerMemo: peerMemo,
             expected: error.Expected,
             got: error.Got,
-            conflictingChannelIds: conflictingChannelIds
+            conflictingChannelIds: conflictingChannelIds,
+            channelId: channelId,
+            events: events
         );
 
         Native.Utils.derec_free_error(ref error);

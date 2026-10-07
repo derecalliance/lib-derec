@@ -80,19 +80,23 @@ pub fn share<R: Rng>(
 ///
 /// # Returns
 ///
-/// * `[u8; λ]` - The recovered secret as a byte array of length λ.
+/// * `Some([u8; λ])` - The recovered secret as a byte array of length λ.
+/// * `None` - A coordinate is not a valid field element, or two shares carry
+///   the same x-coordinate, so the interpolation is undefined.
 ///
-pub fn recover(shares: Vec<(Vec<u8>, Vec<u8>)>) -> [u8; λ] {
-    // let us parse all Shamir shares as field elements
-    let xs: Vec<F> = shares
+pub fn recover(shares: Vec<(Vec<u8>, Vec<u8>)>) -> Option<[u8; λ]> {
+    let (xs, ys): (Vec<F>, Vec<F>) = shares
         .iter()
-        .map(|(x, _)| F::deserialize_compressed(&x[..]).unwrap())
-        .collect();
+        .map(|(x, y)| Some((decode_coordinate(x)?, decode_coordinate(y)?)))
+        .collect::<Option<Vec<(F, F)>>>()?
+        .into_iter()
+        .unzip();
 
-    let ys: Vec<F> = shares
-        .iter()
-        .map(|(_, y)| F::deserialize_compressed(&y[..]).unwrap())
-        .collect();
+    for (i, x_i) in xs.iter().enumerate() {
+        if xs[i + 1..].contains(x_i) {
+            return None;
+        }
+    }
 
     // compute lagrange coefficients w.r.t. x = 0.
     // we choose x = 0 because we encoded our secret at f(0)
@@ -109,7 +113,11 @@ pub fn recover(shares: Vec<(Vec<u8>, Vec<u8>)>) -> [u8; λ] {
 
     // our 256 bit key should be in the below slice
     let start = secret_bytes.len() - λ;
-    secret_bytes[start..start + λ].try_into().unwrap()
+    secret_bytes[start..start + λ].try_into().ok()
+}
+
+fn decode_coordinate(bytes: &[u8]) -> Option<F> {
+    F::deserialize_compressed(bytes).ok()
 }
 
 // Naive lagrange interpolation over the input x-coordinates.
@@ -224,9 +232,35 @@ mod tests {
         let mut rng = rand_chacha::ChaCha8Rng::from_seed(seed);
 
         let shares = share(&secret, 3, 5, &mut rng);
-        let recovered = recover(shares);
+        let recovered = recover(shares).expect("well-formed shares interpolate");
 
         assert_eq!(secret, recovered);
+    }
+
+    fn sample_shares() -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut rng = rand_chacha::ChaCha8Rng::from_seed([9u8; 32]);
+        share(&[7u8; λ], 2, 3, &mut rng)
+    }
+
+    #[test]
+    fn recover_rejects_a_coordinate_that_is_not_a_field_element() {
+        let mut shares = sample_shares();
+        shares[0].1 = vec![0xFF; shares[0].1.len()];
+        assert!(recover(shares).is_none());
+    }
+
+    #[test]
+    fn recover_rejects_a_truncated_coordinate() {
+        let mut shares = sample_shares();
+        shares[1].0.truncate(3);
+        assert!(recover(shares).is_none());
+    }
+
+    #[test]
+    fn recover_rejects_a_repeated_x_coordinate() {
+        let mut shares = sample_shares();
+        shares[1] = shares[0].clone();
+        assert!(recover(shares).is_none());
     }
 
     #[test]

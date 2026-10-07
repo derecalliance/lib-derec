@@ -839,15 +839,16 @@ pub struct ChannelShare {
 /// symmetric "group" key. The `shared_key` field carries that group key
 /// inside the encrypted payload **only** when the sender knows the
 /// receiver doesn't have it yet — i.e. on the first round to a newly
-/// paired Destination. Both sides swap their stored channel key
-/// (`(secret_id, channel_id)` in [`crate::protocol::DeRecSecretStore`])
-/// from the per-pair ephemeral handshake key to the group key:
+/// paired Destination. That round travels on the ephemeral pairing
+/// channel under the pairing key, and both sides then leave that channel
+/// for the group channel:
 ///
-/// - **Sender**: swap immediately after the request envelope is sent.
-///   The ack response from the new joiner will already be encrypted
-///   with the group key.
-/// - **Receiver**: swap before encrypting the ack response, so the
-///   ack uses the group key and matches what the sender expects.
+/// - **Sender**: moves the joiner's member row onto the group channel and
+///   drops the ephemeral channel's key as soon as the request is sent, so
+///   every later message to the joiner uses the group channel, whether or
+///   not its acknowledgement ever arrives.
+/// - **Receiver**: hydrates onto the group channel, acknowledges there
+///   under the group key, and drops the ephemeral channel's key.
 ///
 /// On the first-ever replica pair, the group key is implicitly the
 /// pair-handshake key — `shared_key` is left empty, no swap happens,
@@ -1222,6 +1223,11 @@ pub enum StateItem {
     /// 3. …repeat until threshold. On threshold met, library `remove`s
     ///    the accumulator.
     ///
+    /// Each entry names the channel its share arrived on, and a channel
+    /// holds at most one entry: a later share from the same channel
+    /// replaces the earlier one. A share that fails its own checks is never
+    /// written here (see [`crate::protocol::DeRecEvent::RecoveryShareCorrupted`]).
+    ///
     /// Implementations MUST accept `shares` vectors of any length,
     /// including one. Every `save` replaces the stored value in place
     /// with the caller-supplied Vec; no append primitive is required.
@@ -1241,7 +1247,7 @@ pub enum StateItem {
         /// may differ from the `secret_id` partitioning the row.
         secret_id: u64,
         version: u32,
-        shares: Vec<derec_proto::GetShareResponseMessage>,
+        shares: Vec<CollectedShare>,
     },
 
     /// Outstanding unpair acknowledgement window. `started_at` is the
@@ -1342,6 +1348,18 @@ impl StateItem {
             },
         }
     }
+}
+
+/// One share collected towards a recovery, with the channel it arrived on.
+///
+/// The channel is what lets a share that turns out to disagree with the
+/// rest be attributed to the helper that sent it.
+#[derive(Debug, Clone)]
+pub struct CollectedShare {
+    /// The helper channel the response arrived on.
+    pub channel_id: ChannelId,
+    /// The helper's response, carrying its committed share.
+    pub response: derec_proto::GetShareResponseMessage,
 }
 
 /// A single stored share entry, fully self-describing.
