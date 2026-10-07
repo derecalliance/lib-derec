@@ -9,7 +9,7 @@ all of them unless it names a specific binding.
 
 ### 0.0.7
 
-Nine defects found by the reference application's QA against 0.0.6.
+Fixes to replica admission, broadcast flows, share retention, recovery and `process()` error reporting found against 0.0.6.
 
 - **Fixed: admitting a second replica moved the group to the joiner's
   channel.** *(bug fix; every SDK)*
@@ -38,6 +38,18 @@ Nine defects found by the reference application's QA against 0.0.6.
   discovery or verification failed with `missing_shared_key`. They now target
   Paired channels only, as their documentation said; a Pending id named in a
   target is dropped.
+
+- **Fixed: a new replica member missed publishes sent during its admission.**
+  *(bug fix; every SDK)*
+
+  The admitter's first copy to a joiner travels on their pairing channel and
+  hands over the group channel and key; the joiner moves to the group channel
+  and drops the pairing channel at once. The admitter kept addressing the
+  joiner on the pairing channel until the joiner's acknowledgement came back,
+  so any publish sent in between was lost, and if that acknowledgement never
+  arrived every later publish from the admitter was lost too. The admitter
+  now moves the joiner onto the group channel as soon as it sends the
+  handover.
 
 - **Fixed: a replica reported an identical copy as a conflict when the
   version it held had no author.** *(bug fix; every SDK)*

@@ -839,15 +839,16 @@ pub struct ChannelShare {
 /// symmetric "group" key. The `shared_key` field carries that group key
 /// inside the encrypted payload **only** when the sender knows the
 /// receiver doesn't have it yet — i.e. on the first round to a newly
-/// paired Destination. Both sides swap their stored channel key
-/// (`(secret_id, channel_id)` in [`crate::protocol::DeRecSecretStore`])
-/// from the per-pair ephemeral handshake key to the group key:
+/// paired Destination. That round travels on the ephemeral pairing
+/// channel under the pairing key, and both sides then leave that channel
+/// for the group channel:
 ///
-/// - **Sender**: swap immediately after the request envelope is sent.
-///   The ack response from the new joiner will already be encrypted
-///   with the group key.
-/// - **Receiver**: swap before encrypting the ack response, so the
-///   ack uses the group key and matches what the sender expects.
+/// - **Sender**: moves the joiner's member row onto the group channel and
+///   drops the ephemeral channel's key as soon as the request is sent, so
+///   every later message to the joiner uses the group channel, whether or
+///   not its acknowledgement ever arrives.
+/// - **Receiver**: hydrates onto the group channel, acknowledges there
+///   under the group key, and drops the ephemeral channel's key.
 ///
 /// On the first-ever replica pair, the group key is implicitly the
 /// pair-handshake key — `shared_key` is left empty, no swap happens,

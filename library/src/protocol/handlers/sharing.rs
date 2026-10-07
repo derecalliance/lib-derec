@@ -197,13 +197,12 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     if !replicas.is_empty() {
         let composite =
             build_replica_composite(&secret, split_result.as_ref(), version, local.replica_id);
-        let k_group = group_key;
         let replica_results = distribute_composite_to_destinations(
             stores,
             local,
             &replicas,
             &composite,
-            k_group,
+            group_channel.zip(group_key),
             version,
             &description,
             round,
@@ -662,7 +661,7 @@ async fn load_all_paired_targets<S: StoreSet>(
 /// `roster` is every member of the group including this device — the dispatch
 /// list is the same set minus self, and during an admission handover also
 /// differs by channel, since a joiner sits on its ephemeral pairing channel
-/// until it hydrates.
+/// until its first copy is sent.
 pub(in crate::protocol) fn build_secret(
     paired_helpers: &[(crate::protocol::types::HelperChannel, SharedKey)],
     roster: &[crate::protocol::types::ReplicaMember],
@@ -925,7 +924,7 @@ async fn distribute_composite_to_destinations<S: StoreSet>(
     local: &Local<'_>,
     replicas: &[(crate::protocol::types::ReplicaMember, SharedKey)],
     composite: &crate::protocol::types::ReplicaSecretPayload,
-    k_group: Option<SharedKey>,
+    group: Option<(ChannelId, SharedKey)>,
     version: u32,
     description: &str,
     round: &Round<'_>,
@@ -939,7 +938,7 @@ async fn distribute_composite_to_destinations<S: StoreSet>(
             channel,
             channel_key,
             composite,
-            k_group.as_ref(),
+            group.as_ref(),
             version,
             description,
             round,
@@ -976,6 +975,18 @@ async fn distribute_composite_to_destinations<S: StoreSet>(
 
     results
 }
+/// Send one member its copy of a publish.
+///
+/// # Admission handover
+///
+/// A member this device admitted since the last round is still recorded on
+/// the ephemeral channel of that pairing, under the pairing key. Its copy
+/// carries the group key, and the member moves onto the group channel as
+/// soon as it is sent: the member hydrates onto the group channel and drops
+/// the ephemeral one when it receives the copy, so every later message must
+/// already use the group channel. Waiting for the member's acknowledgement
+/// instead would strand it on a channel it no longer holds, for any publish
+/// sent before that acknowledgement lands, and for good if it never does.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_composite_to_destination<S: StoreSet>(
     stores: &mut Stores<'_, S>,
@@ -983,19 +994,16 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
     channel: &crate::protocol::types::ReplicaMember,
     channel_key: &SharedKey,
     composite: &crate::protocol::types::ReplicaSecretPayload,
-    k_group: Option<&SharedKey>,
+    group: Option<&(ChannelId, SharedKey)>,
     version: u32,
     description: &str,
     round: &Round<'_>,
 ) -> Result<()> {
-    let needs_handover = match k_group {
-        Some(g) => channel_key != g,
-        None => false,
-    };
+    let handover = group.filter(|(_, group_key)| channel_key != group_key);
 
     let mut per_channel = composite.clone();
-    if needs_handover {
-        per_channel.shared_key = k_group.expect("handover implies k_group set").to_vec();
+    if let Some((_, group_key)) = handover {
+        per_channel.shared_key = group_key.to_vec();
     }
     let composite_bytes = per_channel.encode_to_vec();
 
@@ -1023,17 +1031,31 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
     let envelope = crate::derec_message::apply_trace_id(&envelope_bytes, round.trace_id)?;
     stores.transport.send(&channel.transports, envelope).await?;
 
-    if needs_handover {
-        let new_key = k_group.expect("handover implies k_group set");
+    if let Some((group_channel, _)) = handover {
         stores
-            .secrets
+            .channels
             .save(
                 local.secret_id,
-                channel.channel_id,
-                SecretValue::SharedKey(*new_key),
+                crate::protocol::types::ChannelRecord::Replica(
+                    crate::protocol::types::ReplicaMember {
+                        channel_id: *group_channel,
+                        ..channel.clone()
+                    },
+                ),
             )
-            .await
-            .map_err(crate::Error::SecretStore)?;
+            .await?;
+        let _ = stores
+            .secrets
+            .remove(local.secret_id, channel.channel_id, SecretKind::SharedKey)
+            .await;
+
+        #[cfg(feature = "logging")]
+        tracing::info!(
+            ephemeral_channel_id = channel.channel_id.0,
+            group_channel_id = group_channel.0,
+            replica_id = channel.replica_id.0,
+            "admitted member moved onto the group channel"
+        );
     }
     Ok(())
 }

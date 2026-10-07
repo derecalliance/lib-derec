@@ -44,6 +44,7 @@ pub async fn run_all() {
     run_auto_publish_on_pair_flow().await;
     run_replica_sync_version_progression_flow().await;
     run_replica_group_key_handover_flow().await;
+    run_replica_publish_before_handover_ack_flow().await;
     run_auto_accept_flow().await;
     run_start_pairing_rejects_already_paired_channel().await;
     run_pairing_rejects_incompatible_parameter_range().await;
@@ -4569,6 +4570,96 @@ async fn run_replica_group_key_handover_flow() {
     );
 
     println!("Protocol replica group-key handover flow test passed.");
+}
+
+/// A publish sent before the joiner's handover acknowledgement reaches the
+/// source still reaches the joiner, and so does every later one when that
+/// acknowledgement never arrives.
+///
+/// The joiner drops its ephemeral pairing channel as soon as it hydrates, so
+/// the source must already address it on the group channel: the handover
+/// acknowledgement here is lost in transit, and both following publishes
+/// must still land.
+async fn run_replica_publish_before_handover_ack_flow() {
+    println!("=== Protocol replica publish before handover ack flow ===");
+
+    let sid = 0xBEEFu64;
+    let mut source = Peer::with_secret_id_and_replica_id(
+        "source",
+        "https://source.example.com",
+        sid,
+        0xC0DE_C0DE_C0DE_C0DEu64,
+    );
+    let mut dest1 = Peer::with_options(
+        "dest1",
+        "https://dest1.example.com",
+        2,
+        false,
+        Some(0xD1D1_D1D1_D1D1_D1D1u64),
+        sid,
+    );
+    let mut dest2 = Peer::with_options(
+        "dest2",
+        "https://dest2.example.com",
+        2,
+        false,
+        Some(0xD2D2_D2D2_D2D2_D2D2u64),
+        sid,
+    );
+
+    let group_channel = pair_replica_handshake(&mut source, &mut dest1, ChannelId(1)).await;
+    cross_confirm_fingerprint(&mut source, &mut dest1, group_channel).await;
+    let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+
+    let ephemeral = pair_replica_handshake(&mut source, &mut dest2, ChannelId(2)).await;
+    cross_confirm_fingerprint(&mut source, &mut dest2, ephemeral).await;
+
+    for (tp, bytes) in source.drain() {
+        if tp.uri == dest1.uri {
+            deliver(&mut dest1, &bytes).await;
+        } else if tp.uri == dest2.uri {
+            deliver(&mut dest2, &bytes).await;
+        }
+    }
+    let lost_acks = dest2.drain();
+    assert!(
+        !lost_acks.is_empty(),
+        "Dest2 must have acknowledged the handover before it is dropped"
+    );
+    let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+    println!("  step 1: handover delivered, Dest2's acknowledgement lost  ✓");
+
+    for payload in [b"before the ack".as_slice(), b"after the ack".as_slice()] {
+        source
+            .protocol
+            .start(DeRecFlow::ProtectSecret {
+                secrets: vec![UserSecret {
+                    id: vec![0x42],
+                    name: "handover".to_owned(),
+                    data: payload.to_vec(),
+                }],
+                description: None,
+            })
+            .await
+            .expect("source start(ProtectSecret) failed");
+        let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+
+        let snapshot = dest2
+            .protocol
+            .user_secret_store
+            .load_latest(sid)
+            .await
+            .expect("load_latest")
+            .expect("Dest2 holds a snapshot");
+        assert!(
+            snapshot.secrets.iter().any(|us| us.data == payload),
+            "Dest2 must receive the publish carrying {:?}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+    println!("  step 2: both publishes reached Dest2 on the group channel  ✓");
+
+    println!("Protocol replica publish before handover ack flow test passed.");
 }
 
 /// Helper: read a channel's stored 32-byte `SharedKey`, or `None` when the

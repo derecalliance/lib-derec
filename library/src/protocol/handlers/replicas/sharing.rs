@@ -111,7 +111,7 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
             .await
         }
         MessageBody::StoreShareResponse(response) => {
-            on_response(stores, local, exchange.channel_id, &member, &response).await
+            on_response(exchange.channel_id, &member, &response)
         }
         _ => Err(Error::Invariant(
             "replica identity on a message that is not a store-share exchange",
@@ -295,11 +295,11 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
 ///
 /// If the payload carries a non-empty `shared_key` (32 bytes), the
 /// sender is asking us to adopt the replica-group key for this
-/// `secret_id`. We persist it as this channel's new `SharedKey` in
-/// [`crate::protocol::DeRecSecretStore`] **before** encrypting the ack
-/// — so the ack travels under the group key, matching the sender's
-/// secret store after its own swap. From this round forward, this
-/// channel's traffic uses the group key.
+/// `secret_id`. Hydration saves it as the group channel's key and moves
+/// every member onto the group channel, and the ack travels there under
+/// the group key. The ephemeral pairing channel the request arrived on is
+/// then dropped: the sender moved this device onto the group channel when
+/// it sent the request, so all later traffic arrives there.
 ///
 /// The embedded `shared_key` is delivered inside an already-decrypted
 /// authenticated envelope (the pair-handshake key authenticated the
@@ -483,7 +483,7 @@ async fn on_request<S: StoreSet>(
     // Admission handover: the sync arrived on the ephemeral channel minted
     // by the pairing with the admitter. Hydration has already moved every
     // member onto the group channel, so the only thing left at the ephemeral
-    // id is its key. The admitter drops its side when this ack lands.
+    // id is its key. The admitter dropped its side when it sent the sync.
     if ack_channel != channel.channel_id {
         let _ = stores
             .secrets
@@ -642,14 +642,11 @@ async fn answer<S: StoreSet>(
 /// violation, so a distinct out-of-range sentinel is reported rather
 /// than `StatusEnum::Ok`, which would mislead the application into
 /// believing the sync succeeded.
-async fn on_response<S: StoreSet>(
-    stores: &mut Stores<'_, S>,
-    local: &Local<'_>,
+fn on_response(
     arrived_on: ChannelId,
     channel: &crate::protocol::types::ReplicaMember,
     response: &StoreShareResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
-    let secret_id = local.secret_id;
     // Every member answers on the same channel, so the responder names
     // itself in the payload. Fall back to the channel's counterparty for
     // responders that predate the field.
@@ -659,42 +656,6 @@ async fn on_response<S: StoreSet>(
         .as_ref()
         .map(|r| (r.status, r.memo.clone()))
         .unwrap_or((-1, "response missing `result` field".to_owned()));
-
-    // Admission handover, admitter side. A member this device admitted was
-    // recorded against the ephemeral pairing channel; answering on the group
-    // channel is its proof of having hydrated, since the reply decrypted
-    // under the group key. Move the row and drop the ephemeral key.
-    //
-    // The row is *moved*, never removed and re-added: a member is keyed by
-    // `replica_id` alone, so removing it at the old channel would delete the
-    // member itself rather than the stale address.
-    if status == StatusEnum::Ok as i32 && channel.channel_id != arrived_on {
-        let ephemeral = channel.channel_id;
-        stores
-            .channels
-            .save(
-                secret_id,
-                crate::protocol::types::ChannelRecord::Replica(
-                    crate::protocol::types::ReplicaMember {
-                        channel_id: arrived_on,
-                        ..channel.clone()
-                    },
-                ),
-            )
-            .await?;
-        let _ = stores
-            .secrets
-            .remove(secret_id, ephemeral, SecretKind::SharedKey)
-            .await;
-
-        #[cfg(feature = "logging")]
-        tracing::info!(
-            ephemeral_channel_id = ephemeral.0,
-            group_channel_id = arrived_on.0,
-            from_replica_id,
-            "admitted member moved onto the group channel"
-        );
-    }
 
     // Acceptance and refusal are different events, mirroring the helper leg's
     // ShareConfirmed / ShareRejected split: the round accumulator moves a
@@ -903,7 +864,6 @@ mod tests {
     #[test]
     fn replica_ack_attributes_the_responder_from_the_payload() {
         run_async(async {
-            let lf = LocalFixture::new(SECRET_ID);
             const SECRET_ID: u64 = 0xA11CE;
             const CHANNEL_PEER: u64 = 1002;
             const ACTUAL_RESPONDER: u64 = 1003;
@@ -931,16 +891,8 @@ mod tests {
                 replica_id: Some(ACTUAL_RESPONDER),
             };
 
-            let mut rig = StoreRig::new();
-            let events = super::on_response(
-                &mut rig.stores(),
-                &lf.local(),
-                channel.channel_id,
-                &channel,
-                &response,
-            )
-            .await
-            .expect("ack is handled");
+            let events = super::on_response(channel.channel_id, &channel, &response)
+                .expect("ack is handled");
 
             match events.as_slice() {
                 [
