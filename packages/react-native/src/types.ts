@@ -261,6 +261,42 @@ export interface ShareStore {
   save(secretId: string, channelId: string, share: Share): Promise<void>;
   latestVersion(secretId: string): Promise<number | null>;
   removeChannel(secretId: string, channelId: string): Promise<void>;
+  /**
+   * Drop the shares stored under `(secretId, channelId)` at each of
+   * `versions`. Idempotent: a version that is not stored is skipped, and
+   * an empty array is a no-op.
+   *
+   * A helper calls this to apply `StoreShareRequestMessage.keepList`, the
+   * complete set of versions the owner wants retained: every stored
+   * version outside it is removed once the incoming share is persisted.
+   * Shares under other channels or partitions must be left untouched.
+   */
+  removeVersions(
+    secretId: string,
+    channelId: string,
+    versions: number[],
+  ): Promise<void>;
+  /**
+   * Owner only: the versions every helper keeps after the owner distributes
+   * `version`. Asked once per sharing round, before anything is sent,
+   * including the rounds the library starts itself; the answer becomes
+   * `keepList` for every helper.
+   *
+   * Return `null` or `undefined` to send no `keepList` (it goes out empty):
+   * helpers then keep every version they hold. An app that wants to cap how
+   * many versions helpers retain returns that cap here. A returned list is
+   * used as is, plus `version`, which the library always adds. Helpers
+   * delete every version that is not listed, so list every version that
+   * could still become the latest: those that committed (for example, whose
+   * `SharingComplete` reported `threshold_met`) and those whose round is
+   * still open. Leave out only versions whose round failed or that the user
+   * rolled back; a list that leaves out too much can make the secret
+   * unrecoverable.
+   */
+  keepList(
+    secretId: string,
+    version: number,
+  ): Promise<number[] | null | undefined>;
 }
 
 export interface UserSecretEntry {
@@ -653,6 +689,15 @@ export interface Timeouts {
  *  are both read from the stores. The argument may be omitted entirely. */
 export type ReplicaDiscoveryParams = Record<string, never>;
 
+/** Any member may remove any member, the source included: a lost or stolen
+ *  source must be removable by the devices that remain, and the library
+ *  checks no role. Ask the user before starting this flow, above all when it
+ *  names the source. Removing the source promotes the first remaining member
+ *  in the order the channel store's `listReplicas` returns. The removed
+ *  member is not asked and gets no event when told to leave: when a roster
+ *  excluding it arrives it drops its whole `secret_id` partition and emits
+ *  `SelfRemovedFromGroup`. The secret survives on the remaining members and
+ *  the helpers. */
 export interface UnpairReplicaParams {
   /** The member to remove, as a **decimal** `u64` string — the same form
    *  `ReplicaPaired.peer_replica_id` hands back. A value naming no current
@@ -724,8 +769,11 @@ export type DeRecEvent =
   | { type: "SharingComplete"; version: number; confirmed_count: number; failed_count: number; threshold_met: boolean }
   /** A group member refused a secret sync. Keyed by `replica_id`, not
    *  `channel_id`: every member answers on the one group channel. A
-   *  `VERSION_CONFLICT` status means the round must be resolved and
-   *  republished at a new version. */
+   *  `VERSION_CONFLICT` status means another member holds a different copy
+   *  of this version: do not publish from this device again until the
+   *  conflict is resolved. Run `start(FlowKind.ReplicaDiscovery)` to receive
+   *  the group's copy as `ReplicaVersionConflict`, merge, and publish the
+   *  result once with `start(FlowKind.ProtectSecret)`. */
   | {
       type: "ReplicaSyncRejected";
       replica_id: string;
@@ -748,7 +796,8 @@ export type DeRecEvent =
   /** This device left the group and dropped its whole `secret_id` partition —
    *  group channel, helper channels, shares, secrets and the snapshot. Fires
    *  only once it was told to leave *and* has since seen a roster excluding
-   *  it; absence alone never destroys a copy of the secret. */
+   *  it; absence alone never destroys a copy of the secret. The teardown is
+   *  automatic: this device is not asked first and gets no earlier event. */
   | { type: "SelfRemovedFromGroup"; version: number }
   /** A replica catch-up finished. `fetched_from` is absent when this device
    *  was already current, in which case no hydration event follows. */
@@ -764,6 +813,10 @@ export type DeRecEvent =
    *  library keeps no durable per-member sync state. */
   | { type: "ReplicaSyncComplete"; version: number; synced: string[]; behind: string[] }
   | { type: "ShareVerified"; channel_id: string; version: number }
+  /** A helper refused a verification challenge: its response carried a
+   *  non-OK `status` instead of a proof. The challenge is spent; a new
+   *  `VerifyShares` round challenges the helper again. */
+  | { type: "ShareVerifyRejected"; channel_id: string; version: number; status: StatusEnum; memo: string }
   | {
       type: "SecretsDiscovered";
       channel_id: string;
@@ -772,6 +825,22 @@ export type DeRecEvent =
     }
   | { type: "RecoveryShareReceived"; channel_id: string; shares_received: number }
   | { type: "RecoveryShareError"; channel_id: string; shares_received: number; error: string }
+  /** A helper refused a recovery share request: its response carried a
+   *  non-OK `status` (e.g. `UNKNOWN_SHARE_VERSION`) instead of a share. The
+   *  refusal is not collected — it does not count towards `shares_received`
+   *  and the recovery stays open for the other helpers' shares — but it does
+   *  answer that helper's `RecoverSecretStarted`. */
+  | { type: "RecoveryShareRefused"; channel_id: string; version: number; status: StatusEnum; memo: string }
+  /** A helper answered with a share that cannot be part of the secret;
+   *  `reason` says how it failed. `Malformed` and `InvalidProof` are judged
+   *  on arrival; `Inconsistent` (valid on its own but disagreeing with the
+   *  shares the secret was rebuilt from) is reported alongside
+   *  `SecretRecovered`, once per helper. The share is set aside — it does
+   *  not count towards `shares_received` and never blocks the recovery. An
+   *  honest helper never sends one, so the app may treat it as a sign of a
+   *  damaged or compromised helper, e.g. offer to unpair it. It also
+   *  answers that helper's `RecoverSecretStarted`. */
+  | { type: "RecoveryShareCorrupted"; channel_id: string; version: number; reason: CorruptionReason }
   /** Recovery completed — the typed `Secret` snapshot the owner
    *  originally protected. Mirrors `ReplicaSecretReceived.secret`:
    *  `secrets` is the user-facing `Vec<UserSecret>` the application
@@ -949,7 +1018,10 @@ export type DeRecEvent =
    *  `ReplicaSyncRejected`. Both copies are complete states — the held one
    *  is in the local stores, the incoming one is `secret`. Resolve by
    *  publishing the chosen state with `start(FlowKind.ProtectSecret)`; the
-   *  next version supersedes both on every member and helper.
+   *  next version supersedes both on every member and helper. Until then,
+   *  do not publish from this device: any further `ProtectSecret` is a
+   *  higher version that every other member applies over its own copy,
+   *  losing the change it never merged.
    *
    *  `held_author_replica_id` / `incoming_author_replica_id` are the
    *  decimal `replica_id` of each copy's publisher, or `null` when that
@@ -1231,6 +1303,14 @@ export type IgnoreReason = "PendingVerification" | "Expired";
 /** Why a `PeerNotRestored` event left a roster entry without a channel.
  *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */
 export type NotRestoredReason = "NoTransports";
+
+/** Why a `RecoveryShareCorrupted` event set a helper's share aside.
+ *  Matches the Rust `CorruptionReason` discriminants one-for-one:
+ *  `Malformed` — no decodable share for the requested secret and version;
+ *  `InvalidProof` — the share fails its own Merkle proof;
+ *  `Inconsistent` — valid on its own, but its commitment root or ciphertext
+ *  disagrees with the shares the secret was rebuilt from. */
+export type CorruptionReason = "Malformed" | "InvalidProof" | "Inconsistent";
 
 /**
  * The label vocabulary for `ActionRequired.action_kind` and

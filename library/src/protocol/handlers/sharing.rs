@@ -100,7 +100,6 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     secrets: Vec<UserSecret>,
     description: Option<String>,
     threshold: usize,
-    keep_versions_count: usize,
     round: &Round<'_>,
 ) -> Result<Option<SharingRoundResult>> {
     let secret_id = local.secret_id;
@@ -177,12 +176,13 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     let mut replica_outcomes: Vec<(crate::types::ReplicaId, Result<()>)> = Vec::new();
 
     if let Some(ref result) = split_result {
+        let keep_list = resolve_keep_list(stores, secret_id, version).await?;
         let helper_outcomes = distribute_shares(
             stores,
             local,
             &helpers,
             result,
-            keep_versions_count,
+            &keep_list,
             version,
             &description,
             &Round {
@@ -197,13 +197,12 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     if !replicas.is_empty() {
         let composite =
             build_replica_composite(&secret, split_result.as_ref(), version, local.replica_id);
-        let k_group = group_key;
         let replica_results = distribute_composite_to_destinations(
             stores,
             local,
             &replicas,
             &composite,
-            k_group,
+            group_channel.zip(group_key),
             version,
             &description,
             round,
@@ -261,6 +260,29 @@ pub(in crate::protocol) struct SharingRoundResult {
         )
     )
 )]
+/// Helper side of a `StoreShareRequestMessage`: persist the incoming
+/// share, apply the request's `keepList`, and acknowledge.
+///
+/// # Retention (`keepList`)
+///
+/// A non-empty `keepList` is the complete set of versions the Owner wants
+/// retained on this channel; every other version stored under
+/// `(secret_id, channel_id)` is removed via
+/// [`DeRecShareStore::remove_versions`](crate::protocol::DeRecShareStore::remove_versions)
+/// once the incoming share is persisted.
+///
+/// - An empty `keepList` retains every stored version plus the new one.
+/// - A request whose `version` is older than the latest version already
+///   stored on this channel has its `keepList` ignored, so a replayed or
+///   delayed request can never delete newer shares.
+/// - The version carried by the request is never removed, even when the
+///   `keepList` omits it: deleting the share this very request stores
+///   would acknowledge a share the Helper no longer holds.
+///
+/// "Latest" is scoped to this channel rather than to
+/// [`DeRecShareStore::latest_version`](crate::protocol::DeRecShareStore::latest_version),
+/// which spans every channel of the partition and would let one Owner's
+/// newer version suppress another Owner's `keepList`.
 pub(in crate::protocol) async fn accept<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -270,7 +292,20 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     let channel_id = exchange.channel_id;
     let secret_id = local.secret_id;
     let version = request.version;
+    let keep_list = &request.keep_list;
     let encoded_request = request.encode_to_vec();
+
+    // Applying a `keepList` needs every version stored on the channel;
+    // otherwise only the incoming version is needed for the check below.
+    let versions_to_load: &[u32] = if keep_list.is_empty() {
+        std::slice::from_ref(&version)
+    } else {
+        &[]
+    };
+    let stored_on_channel = stores
+        .shares
+        .load(secret_id, channel_id, versions_to_load)
+        .await?;
 
     // A version has exactly one writer, so an existing entry at this
     // version is either that writer re-sending the identical envelope —
@@ -284,11 +319,8 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     //
     // Enforced here rather than delegated to store implementations so
     // every binding inherits one rule.
-    let already_stored = stores
-        .shares
-        .load(secret_id, channel_id, &[version])
-        .await?
-        .into_iter()
+    let already_stored = stored_on_channel
+        .iter()
         .find(|stored| stored.version == version);
 
     match already_stored {
@@ -336,6 +368,32 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
                     },
                 )
                 .await?;
+        }
+    }
+
+    let is_latest = stored_on_channel
+        .iter()
+        .all(|stored| stored.version <= version);
+    if !keep_list.is_empty() && is_latest {
+        let stale: Vec<u32> = stored_on_channel
+            .iter()
+            .map(|stored| stored.version)
+            .filter(|v| *v != version && !keep_list.contains(v))
+            .collect();
+        if !stale.is_empty() {
+            stores
+                .shares
+                .remove_versions(secret_id, channel_id, &stale)
+                .await?;
+
+            #[cfg(feature = "logging")]
+            tracing::debug!(
+                channel_id = channel_id.0,
+                secret_id = secret_id,
+                version = version,
+                removed = ?stale,
+                "share versions outside keepList removed"
+            );
         }
     }
 
@@ -603,7 +661,7 @@ async fn load_all_paired_targets<S: StoreSet>(
 /// `roster` is every member of the group including this device — the dispatch
 /// list is the same set minus self, and during an admission handover also
 /// differs by channel, since a joiner sits on its ephemeral pairing channel
-/// until it hydrates.
+/// until its first copy is sent.
 pub(in crate::protocol) fn build_secret(
     paired_helpers: &[(crate::protocol::types::HelperChannel, SharedKey)],
     roster: &[crate::protocol::types::ReplicaMember],
@@ -739,6 +797,25 @@ fn wrap_for_helper_split(secret: &Secret, threshold: usize) -> Vec<u8> {
     derec_secret.encode_to_vec()
 }
 
+/// The `keepList` every Helper receives in the round distributing
+/// `version`: the share store's [`keep_list`](crate::protocol::DeRecShareStore::keep_list)
+/// plus `version`, deduplicated and ascending, or an empty list when the
+/// store returns `None`, which tells every Helper to keep every version it
+/// holds.
+async fn resolve_keep_list<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    secret_id: u64,
+    version: u32,
+) -> Result<Vec<u32>> {
+    let Some(mut keep_list) = stores.shares.keep_list(secret_id, version).await? else {
+        return Ok(Vec::new());
+    };
+    keep_list.push(version);
+    keep_list.sort_unstable();
+    keep_list.dedup();
+    Ok(keep_list)
+}
+
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(trace_id = round.trace_id, secret_id = local.secret_id)))]
 #[allow(clippy::too_many_arguments)]
 async fn distribute_shares<S: StoreSet>(
@@ -746,18 +823,11 @@ async fn distribute_shares<S: StoreSet>(
     local: &Local<'_>,
     paired_helpers: &[(crate::protocol::types::HelperChannel, SharedKey)],
     split_result: &crate::primitives::sharing::request::SplitResult,
-    keep_versions_count: usize,
+    keep_list: &[u32],
     version: u32,
     description: &str,
     round: &Round<'_>,
 ) -> Vec<(ChannelId, Result<()>)> {
-    let keep_list: Vec<u32> = {
-        let start = version
-            .saturating_sub(keep_versions_count as u32 - 1)
-            .max(1);
-        (start..=version).collect()
-    };
-
     let mut results: Vec<(ChannelId, Result<()>)> = Vec::with_capacity(paired_helpers.len());
     for (channel, shared_key) in paired_helpers {
         let Some(committed_share) = split_result.shares.get(&channel.channel_id) else {
@@ -770,7 +840,7 @@ async fn distribute_shares<S: StoreSet>(
             channel,
             shared_key,
             committed_share,
-            &keep_list,
+            keep_list,
             version,
             description,
             round,
@@ -854,7 +924,7 @@ async fn distribute_composite_to_destinations<S: StoreSet>(
     local: &Local<'_>,
     replicas: &[(crate::protocol::types::ReplicaMember, SharedKey)],
     composite: &crate::protocol::types::ReplicaSecretPayload,
-    k_group: Option<SharedKey>,
+    group: Option<(ChannelId, SharedKey)>,
     version: u32,
     description: &str,
     round: &Round<'_>,
@@ -868,7 +938,7 @@ async fn distribute_composite_to_destinations<S: StoreSet>(
             channel,
             channel_key,
             composite,
-            k_group.as_ref(),
+            group.as_ref(),
             version,
             description,
             round,
@@ -905,6 +975,18 @@ async fn distribute_composite_to_destinations<S: StoreSet>(
 
     results
 }
+/// Send one member its copy of a publish.
+///
+/// # Admission handover
+///
+/// A member this device admitted since the last round is still recorded on
+/// the ephemeral channel of that pairing, under the pairing key. Its copy
+/// carries the group key, and the member moves onto the group channel as
+/// soon as it is sent: the member hydrates onto the group channel and drops
+/// the ephemeral one when it receives the copy, so every later message must
+/// already use the group channel. Waiting for the member's acknowledgement
+/// instead would strand it on a channel it no longer holds, for any publish
+/// sent before that acknowledgement lands, and for good if it never does.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_composite_to_destination<S: StoreSet>(
     stores: &mut Stores<'_, S>,
@@ -912,19 +994,16 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
     channel: &crate::protocol::types::ReplicaMember,
     channel_key: &SharedKey,
     composite: &crate::protocol::types::ReplicaSecretPayload,
-    k_group: Option<&SharedKey>,
+    group: Option<&(ChannelId, SharedKey)>,
     version: u32,
     description: &str,
     round: &Round<'_>,
 ) -> Result<()> {
-    let needs_handover = match k_group {
-        Some(g) => channel_key != g,
-        None => false,
-    };
+    let handover = group.filter(|(_, group_key)| channel_key != group_key);
 
     let mut per_channel = composite.clone();
-    if needs_handover {
-        per_channel.shared_key = k_group.expect("handover implies k_group set").to_vec();
+    if let Some((_, group_key)) = handover {
+        per_channel.shared_key = group_key.to_vec();
     }
     let composite_bytes = per_channel.encode_to_vec();
 
@@ -952,17 +1031,31 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
     let envelope = crate::derec_message::apply_trace_id(&envelope_bytes, round.trace_id)?;
     stores.transport.send(&channel.transports, envelope).await?;
 
-    if needs_handover {
-        let new_key = k_group.expect("handover implies k_group set");
+    if let Some((group_channel, _)) = handover {
         stores
-            .secrets
+            .channels
             .save(
                 local.secret_id,
-                channel.channel_id,
-                SecretValue::SharedKey(*new_key),
+                crate::protocol::types::ChannelRecord::Replica(
+                    crate::protocol::types::ReplicaMember {
+                        channel_id: *group_channel,
+                        ..channel.clone()
+                    },
+                ),
             )
-            .await
-            .map_err(crate::Error::SecretStore)?;
+            .await?;
+        let _ = stores
+            .secrets
+            .remove(local.secret_id, channel.channel_id, SecretKind::SharedKey)
+            .await;
+
+        #[cfg(feature = "logging")]
+        tracing::info!(
+            ephemeral_channel_id = channel.channel_id.0,
+            group_channel_id = group_channel.0,
+            replica_id = channel.replica_id.0,
+            "admitted member moved onto the group channel"
+        );
     }
     Ok(())
 }
@@ -1218,6 +1311,161 @@ mod tests {
         });
     }
 
+    const KEEP_SECRET_ID: u64 = 0xA11CE;
+    const KEEP_CHANNEL: ChannelId = ChannelId(11);
+    const KEEP_KEY: SharedKey = [42u8; 32];
+
+    fn store_request(version: u32, keep_list: &[u32]) -> derec_proto::StoreShareRequestMessage {
+        let split = request::split(
+            &[KEEP_CHANNEL, ChannelId(12)],
+            KEEP_SECRET_ID,
+            version,
+            format!("secret at version {version}").as_bytes(),
+            2,
+        )
+        .expect("split secret");
+        let committed = split.shares.get(&KEEP_CHANNEL).expect("share");
+        let produced = request::produce(
+            KEEP_CHANNEL,
+            version,
+            KEEP_SECRET_ID,
+            committed,
+            keep_list,
+            "",
+            &KEEP_KEY,
+            &[],
+        )
+        .expect("produce request");
+        request::extract(&produced.envelope, &KEEP_KEY)
+            .expect("extract request")
+            .request
+    }
+
+    async fn accept_version(rig: &mut StoreRig, version: u32, keep_list: &[u32]) {
+        accept_request(rig, &store_request(version, keep_list)).await;
+    }
+
+    async fn accept_request(rig: &mut StoreRig, request: &derec_proto::StoreShareRequestMessage) {
+        let lf = LocalFixture::new(KEEP_SECRET_ID);
+        let events = super::accept(
+            &mut rig.stores(),
+            &lf.local(),
+            &Exchange {
+                channel_id: KEEP_CHANNEL,
+                shared_key: &KEEP_KEY,
+                trace_id: 1,
+            },
+            request,
+        )
+        .await
+        .expect("accept stores share");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [crate::protocol::DeRecEvent::ShareStored { .. }]
+            ),
+            "every request in these scenarios is acknowledged as stored"
+        );
+    }
+
+    async fn keep_rig_with_versions(versions: &[u32]) -> StoreRig {
+        let mut rig = StoreRig::new();
+        seed_owner_channel(&mut rig.channels, KEEP_SECRET_ID, KEEP_CHANNEL).await;
+        for v in versions {
+            accept_version(&mut rig, *v, &[]).await;
+        }
+        rig
+    }
+
+    fn stored_versions(rig: &StoreRig) -> Vec<u32> {
+        let mut versions: Vec<u32> = rig
+            .shares
+            .data
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(s, c, _)| *s == KEEP_SECRET_ID && *c == KEEP_CHANNEL.0)
+            .map(|(_, _, v)| *v)
+            .collect();
+        versions.sort_unstable();
+        versions
+    }
+
+    /// `keepList` is the complete set of versions to retain: every stored
+    /// version outside it is deleted once the new share is stored.
+    #[test]
+    fn accept_deletes_versions_outside_the_keep_list() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[1, 2, 3]).await;
+            accept_version(&mut rig, 4, &[3, 4]).await;
+            assert_eq!(stored_versions(&rig), vec![3, 4]);
+        });
+    }
+
+    /// An empty `keepList` retains every existing version plus the new one.
+    #[test]
+    fn accept_with_an_empty_keep_list_keeps_every_version() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[1, 2, 3]).await;
+            accept_version(&mut rig, 4, &[]).await;
+            assert_eq!(stored_versions(&rig), vec![1, 2, 3, 4]);
+        });
+    }
+
+    /// A request older than the latest stored version must have its
+    /// `keepList` ignored, so a replay cannot delete newer shares.
+    #[test]
+    fn accept_ignores_the_keep_list_of_an_older_version() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[1, 3, 4]).await;
+            accept_version(&mut rig, 2, &[2]).await;
+            assert_eq!(stored_versions(&rig), vec![1, 2, 3, 4]);
+        });
+    }
+
+    /// The share carried by the request is kept even when its own version
+    /// is missing from the `keepList`, including on an idempotent re-send
+    /// where that version is already stored.
+    #[test]
+    fn accept_never_deletes_the_incoming_version() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[1, 2, 3]).await;
+            let request = store_request(4, &[3]);
+            accept_request(&mut rig, &request).await;
+            assert_eq!(stored_versions(&rig), vec![3, 4]);
+            accept_request(&mut rig, &request).await;
+            assert_eq!(stored_versions(&rig), vec![3, 4]);
+        });
+    }
+
+    /// The `keepList` only governs the channel it arrived on.
+    #[test]
+    fn accept_keep_list_leaves_other_channels_untouched() {
+        run_async(async {
+            use crate::protocol::DeRecShareStore;
+            let mut rig = keep_rig_with_versions(&[1, 2]).await;
+            let other = crate::protocol::types::Share {
+                secret_id: KEEP_SECRET_ID,
+                version: 1,
+                bytes: vec![1, 2, 3],
+            };
+            rig.shares
+                .save(KEEP_SECRET_ID, ChannelId(99), other)
+                .await
+                .expect("seed other channel");
+            accept_version(&mut rig, 3, &[3]).await;
+            assert_eq!(stored_versions(&rig), vec![3]);
+            assert!(
+                rig.shares
+                    .data
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(KEEP_SECRET_ID, 99, 1)),
+                "a share on another channel must survive"
+            );
+        });
+    }
+
     /// Both conflict tests need a channel record so `accept` can resolve
     /// a response endpoint.
     async fn seed_owner_channel(
@@ -1245,6 +1493,307 @@ mod tests {
             )
             .await
             .expect("seed channel");
+    }
+}
+
+/// The Owner side of `keepList`: which versions the Helpers are told to
+/// keep, and the end-to-end effect once they apply it.
+#[cfg(test)]
+mod owner_keep_list_tests {
+    use crate::primitives::sharing::request;
+    use crate::protocol::context::{Exchange, Round};
+    use crate::protocol::test::{LocalFixture, StoreRig, run_async};
+    use crate::protocol::types::{
+        ChannelRecord, ChannelStatus, HelperChannel, SecretValue, UserSecret, UserSecrets,
+    };
+    use crate::protocol::{DeRecChannelStore, DeRecSecretStore, DeRecUserSecretStore};
+    use crate::types::{ChannelId, SharedKey};
+    use derec_proto::{Protocol, SenderKind, TransportProtocol};
+
+    const OWNER_SECRET_ID: u64 = 0x0E;
+    const HELPER_SECRET_ID: u64 = 0x4E;
+    const HELPERS: [u64; 3] = [21, 22, 23];
+    const THRESHOLD: usize = 2;
+
+    fn endpoint(channel: u64) -> TransportProtocol {
+        TransportProtocol {
+            uri: format!("https://helper-{channel}.example"),
+            protocol: Protocol::Https as i32,
+        }
+    }
+
+    fn key_of(channel: u64) -> SharedKey {
+        [channel as u8; 32]
+    }
+
+    fn channel_of(endpoints: &[TransportProtocol]) -> u64 {
+        HELPERS
+            .into_iter()
+            .find(|c| endpoints[0] == endpoint(*c))
+            .expect("every send goes to a seeded helper")
+    }
+
+    async fn owner_rig() -> StoreRig {
+        let mut rig = StoreRig::new();
+        for channel in HELPERS {
+            rig.channels
+                .save(
+                    OWNER_SECRET_ID,
+                    ChannelRecord::Helper(HelperChannel {
+                        channel_id: ChannelId(channel),
+                        transports: vec![endpoint(channel)],
+                        communication_info: std::collections::HashMap::new(),
+                        status: ChannelStatus::Paired,
+                        created_at: 0,
+                        peer_role: SenderKind::Helper,
+                    }),
+                )
+                .await
+                .expect("seed helper channel");
+            rig.secrets
+                .save(
+                    OWNER_SECRET_ID,
+                    ChannelId(channel),
+                    SecretValue::SharedKey(key_of(channel)),
+                )
+                .await
+                .expect("seed helper key");
+        }
+        rig
+    }
+
+    async fn seed_latest_version(rig: &mut StoreRig, version: u32) {
+        rig.user_secrets
+            .save_latest(
+                OWNER_SECRET_ID,
+                UserSecrets {
+                    version,
+                    secrets: Vec::new(),
+                    description: None,
+                    author_replica_id: None,
+                },
+            )
+            .await
+            .expect("seed snapshot");
+    }
+
+    async fn publish(rig: &mut StoreRig) -> u32 {
+        let lf = LocalFixture::new(OWNER_SECRET_ID);
+        rig.transport.sent.lock().unwrap().clear();
+        super::start(
+            &mut rig.stores(),
+            &lf.local(),
+            vec![UserSecret {
+                id: b"id".to_vec(),
+                name: "name".to_owned(),
+                data: b"data".to_vec(),
+            }],
+            None,
+            THRESHOLD,
+            &Round {
+                reply_to: &[],
+                trace_id: 1,
+            },
+        )
+        .await
+        .expect("sharing round runs")
+        .expect("helpers are paired")
+        .version
+    }
+
+    fn sent_requests(rig: &StoreRig) -> Vec<(u64, derec_proto::StoreShareRequestMessage)> {
+        rig.transport
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(endpoints, envelope)| {
+                let channel = channel_of(endpoints);
+                let request = request::extract(envelope, &key_of(channel))
+                    .expect("extract store-share request")
+                    .request;
+                (channel, request)
+            })
+            .collect()
+    }
+
+    fn sent_keep_lists(rig: &StoreRig) -> Vec<Vec<u32>> {
+        let requests = sent_requests(rig);
+        assert_eq!(requests.len(), HELPERS.len(), "one request per helper");
+        requests.into_iter().map(|(_, r)| r.keep_list).collect()
+    }
+
+    /// The application's list, plus the version being sent, reaches every
+    /// Helper in the round; the store is asked once, not once per Helper.
+    #[test]
+    fn the_app_list_plus_the_new_version_goes_to_every_helper() {
+        run_async(async {
+            let mut rig = owner_rig().await;
+            seed_latest_version(&mut rig, 4).await;
+            *rig.shares.keep.lock().unwrap() = Some(vec![2]);
+
+            assert_eq!(publish(&mut rig).await, 5);
+
+            assert_eq!(sent_keep_lists(&rig), vec![vec![2, 5]; HELPERS.len()]);
+            assert_eq!(
+                *rig.shares.keep_list_calls.lock().unwrap(),
+                vec![(OWNER_SECRET_ID, 5)]
+            );
+        });
+    }
+
+    /// The library normalizes the list: duplicates go, the order is
+    /// ascending, and the version being sent appears once.
+    #[test]
+    fn the_app_list_is_deduplicated_and_sorted() {
+        run_async(async {
+            let mut rig = owner_rig().await;
+            seed_latest_version(&mut rig, 4).await;
+            *rig.shares.keep.lock().unwrap() = Some(vec![5, 3, 1, 3]);
+
+            publish(&mut rig).await;
+
+            assert_eq!(sent_keep_lists(&rig), vec![vec![1, 3, 5]; HELPERS.len()]);
+        });
+    }
+
+    /// With no list from the application the owner sends an empty
+    /// `keepList`, after asking: no window of recent versions is imposed.
+    #[test]
+    fn no_app_list_sends_an_empty_keep_list() {
+        run_async(async {
+            let mut rig = owner_rig().await;
+            seed_latest_version(&mut rig, 4).await;
+
+            publish(&mut rig).await;
+
+            assert_eq!(
+                sent_keep_lists(&rig),
+                vec![Vec::<u32>::new(); HELPERS.len()]
+            );
+            assert_eq!(
+                *rig.shares.keep_list_calls.lock().unwrap(),
+                vec![(OWNER_SECRET_ID, 5)]
+            );
+        });
+    }
+
+    async fn helper_rig(channel: u64) -> StoreRig {
+        let mut rig = StoreRig::new();
+        rig.channels
+            .save(
+                HELPER_SECRET_ID,
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id: ChannelId(channel),
+                    transports: vec![TransportProtocol {
+                        uri: "https://owner.example".to_owned(),
+                        protocol: Protocol::Https as i32,
+                    }],
+                    communication_info: std::collections::HashMap::new(),
+                    status: ChannelStatus::Paired,
+                    created_at: 0,
+                    peer_role: SenderKind::Owner,
+                }),
+            )
+            .await
+            .expect("seed owner channel");
+        rig
+    }
+
+    async fn deliver(owner: &StoreRig, helpers: &mut [(u64, StoreRig)]) {
+        let lf = LocalFixture::new(HELPER_SECRET_ID);
+        for (channel, request) in sent_requests(owner) {
+            let (_, rig) = helpers
+                .iter_mut()
+                .find(|(c, _)| *c == channel)
+                .expect("helper rig");
+            super::accept(
+                &mut rig.stores(),
+                &lf.local(),
+                &Exchange {
+                    channel_id: ChannelId(channel),
+                    shared_key: &key_of(channel),
+                    trace_id: 1,
+                },
+                &request,
+            )
+            .await
+            .expect("helper accepts the share");
+        }
+    }
+
+    fn held_versions(rig: &StoreRig) -> Vec<u32> {
+        let mut versions: Vec<u32> = rig
+            .shares
+            .data
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|(_, _, v)| *v)
+            .collect();
+        versions.sort_unstable();
+        versions
+    }
+
+    /// The application rolls back v2: it never committed, so the list it
+    /// returns for v3 names only v1. Once the v3 round lands, every Helper
+    /// holds exactly v1 and v3.
+    #[test]
+    fn helpers_keep_exactly_the_versions_the_owner_lists() {
+        run_async(async {
+            let mut owner = owner_rig().await;
+            let mut helpers = Vec::new();
+            for channel in HELPERS {
+                helpers.push((channel, helper_rig(channel).await));
+            }
+
+            for _ in 0..2 {
+                publish(&mut owner).await;
+                deliver(&owner, &mut helpers).await;
+            }
+            for (_, rig) in &helpers {
+                assert_eq!(held_versions(rig), vec![1, 2]);
+            }
+
+            *owner.shares.keep.lock().unwrap() = Some(vec![1]);
+            assert_eq!(publish(&mut owner).await, 3);
+            deliver(&owner, &mut helpers).await;
+
+            for (channel, rig) in &helpers {
+                assert_eq!(
+                    held_versions(rig),
+                    vec![1, 3],
+                    "helper on channel {channel} must hold exactly the listed versions"
+                );
+            }
+        });
+    }
+
+    /// With no list from the application, Helpers keep every version they
+    /// were sent: five rounds leave all five versions on every Helper,
+    /// which a capped window would have pruned.
+    #[test]
+    fn no_app_list_leaves_every_version_on_the_helpers() {
+        run_async(async {
+            let mut owner = owner_rig().await;
+            let mut helpers = Vec::new();
+            for channel in HELPERS {
+                helpers.push((channel, helper_rig(channel).await));
+            }
+
+            for _ in 0..5 {
+                publish(&mut owner).await;
+                deliver(&owner, &mut helpers).await;
+            }
+
+            for (channel, rig) in &helpers {
+                assert_eq!(
+                    held_versions(rig),
+                    vec![1, 2, 3, 4, 5],
+                    "helper on channel {channel} must keep every version"
+                );
+            }
+        });
     }
 }
 
@@ -2013,25 +2562,26 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
     let author_replica_id = composite.author_replica_id;
     let channel_id = ChannelId(secret.replicas.as_ref().map_or(0, |g| g.channel_id));
 
-    let is_install = match replica::arrival(stores, local, version, author_replica_id).await? {
-        replica::Arrival::Apply { is_install } => is_install,
-        replica::Arrival::Resend | replica::Arrival::Stale => {
-            return Ok(vec![DeRecEvent::NoOp]);
-        }
-        replica::Arrival::Conflict {
-            held_author_replica_id,
-        } => {
-            return Ok(vec![DeRecEvent::ReplicaVersionConflict {
-                channel_id,
-                from_replica_id,
-                secret_id,
-                version,
+    let is_install =
+        match replica::arrival(stores, local, version, author_replica_id, &secret.secrets).await? {
+            replica::Arrival::Apply { is_install } => is_install,
+            replica::Arrival::Resend | replica::Arrival::Stale => {
+                return Ok(vec![DeRecEvent::NoOp]);
+            }
+            replica::Arrival::Conflict {
                 held_author_replica_id,
-                incoming_author_replica_id: author_replica_id,
-                secret,
-            }]);
-        }
-    };
+            } => {
+                return Ok(vec![DeRecEvent::ReplicaVersionConflict {
+                    channel_id,
+                    from_replica_id,
+                    secret_id,
+                    version,
+                    held_author_replica_id,
+                    incoming_author_replica_id: author_replica_id,
+                    secret,
+                }]);
+            }
+        };
 
     replica::hydrate(
         stores,

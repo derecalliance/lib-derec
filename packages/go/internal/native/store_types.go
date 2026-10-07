@@ -341,7 +341,9 @@ type StateKey struct {
 //   - PendingVerification: ChannelID, Bytes (prost-encoded
 //     VerifyShareRequestMessage).
 //   - PendingRecovery: SecretID (the secret being recovered), Version,
-//     Shares (each entry a prost-encoded GetShareResponseMessage).
+//     Shares (each entry a prost-encoded GetShareResponseMessage),
+//     ShareChannels (the channel each share arrived on, index-aligned with
+//     Shares).
 //   - PendingUnpair: ChannelID, StartedAt (unix seconds).
 //   - SharingRound: Version, Pending/Confirmed/Failed (channel-id sets),
 //     PendingReplicas/SyncedReplicas/BehindReplicas (replica-id sets),
@@ -362,9 +364,12 @@ type StateItem struct {
 	StartedAt *uint64
 	Bytes     []byte
 	Shares    [][]byte
-	Pending   []uint64
-	Confirmed []uint64
-	Failed    []uint64
+	// ShareChannels is the channel each entry of Shares arrived on,
+	// index-aligned with Shares.
+	ShareChannels []uint64
+	Pending       []uint64
+	Confirmed     []uint64
+	Failed        []uint64
 	// PendingReplicas are members written to that have not yet answered.
 	PendingReplicas []uint64
 	// SyncedReplicas are members that acknowledged.

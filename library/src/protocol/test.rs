@@ -185,13 +185,25 @@ impl DeRecSecretStore for InMemSecretStore {
         sid: u64,
         cids: &[ChannelId],
         kind: SecretKind,
-        _: MissingPolicy,
+        missing_policy: MissingPolicy,
     ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
+        let data = self.data.lock().unwrap();
         let mut out = Vec::new();
+        let mut missing = Vec::new();
         for c in cids {
-            if let Some(v) = self.data.lock().unwrap().get(&(sid, c.0, kind as u8)) {
-                out.push((*c, v.clone()));
+            match data.get(&(sid, c.0, kind as u8)) {
+                Some(v) => out.push((*c, v.clone())),
+                None => missing.push(c.0),
             }
+        }
+        drop(data);
+        if missing_policy == MissingPolicy::Fail && !missing.is_empty() {
+            return Box::pin(std::future::ready(Err(
+                crate::protocol::SecretStoreError::MissingEntries {
+                    kind,
+                    channel_ids: missing,
+                },
+            )));
         }
         Box::pin(std::future::ready(Ok(out)))
     }
@@ -214,6 +226,11 @@ impl DeRecSecretStore for InMemSecretStore {
 pub(crate) struct InMemShareStore {
     #[allow(clippy::type_complexity)]
     pub(crate) data: Arc<Mutex<HashMap<(u64, u64, u32), Share>>>,
+    /// What [`DeRecShareStore::keep_list`] answers on every call.
+    pub(crate) keep: Arc<Mutex<Option<Vec<u32>>>>,
+    /// Every `(secret_id, version)` [`DeRecShareStore::keep_list`] was asked
+    /// about, in call order.
+    pub(crate) keep_list_calls: Arc<Mutex<Vec<(u64, u32)>>>,
 }
 
 impl DeRecShareStore for InMemShareStore {
@@ -267,6 +284,23 @@ impl DeRecShareStore for InMemShareStore {
     }
     fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
         Box::pin(std::future::ready(Ok(())))
+    }
+    fn remove_versions(
+        &mut self,
+        sid: u64,
+        cid: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, ()> {
+        self.data
+            .lock()
+            .unwrap()
+            .retain(|(s, c, v), _| !(*s == sid && *c == cid.0 && versions.contains(v)));
+        Box::pin(std::future::ready(Ok(())))
+    }
+    fn keep_list(&self, sid: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+        self.keep_list_calls.lock().unwrap().push((sid, version));
+        let keep = self.keep.lock().unwrap().clone();
+        Box::pin(std::future::ready(Ok(keep)))
     }
 }
 

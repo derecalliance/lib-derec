@@ -19,6 +19,8 @@ type shareStore interface {
 	LatestVersion(secretID uint64) (uint32, bool, error)
 	Save(secretID, channelID uint64, share Share) error
 	RemoveChannel(secretID, channelID uint64) error
+	RemoveVersions(secretID, channelID uint64, versions []uint32) error
+	KeepList(secretID uint64, version uint32) ([]uint32, bool, error)
 }
 
 // ShareStoreCallbacks mirrors #[repr(C)] struct ShareStoreCallbacks in
@@ -26,14 +28,16 @@ type shareStore interface {
 // versions[] cross the FFI as JSON-array byte buffers, matching stores.rs's
 // doc comment on the struct.
 type ShareStoreCallbacks struct {
-	UserData      uintptr
-	Load          uintptr
-	LoadMany      uintptr
-	LoadAll       uintptr
-	LatestVersion uintptr
-	Save          uintptr
-	RemoveChannel uintptr
-	FreeBuffer    uintptr
+	UserData       uintptr
+	Load           uintptr
+	LoadMany       uintptr
+	LoadAll        uintptr
+	LatestVersion  uintptr
+	Save           uintptr
+	RemoveChannel  uintptr
+	RemoveVersions uintptr
+	KeepList       uintptr
+	FreeBuffer     uintptr
 }
 
 // --- Dispatch ---------------------------------------------------------------
@@ -124,6 +128,34 @@ func dispatchShareRemoveChannel(s *storeSet, secretID, channelID uint64) (status
 
 // --- C-facing callbacks ------------------------------------------------------
 
+func dispatchShareRemoveVersions(s *storeSet, secretID, channelID uint64, versionsJSON []byte) (status int32) {
+	defer recoverInto(&status)
+	versions, err := DecodeUint32Array(versionsJSON)
+	if err != nil {
+		return ffiStatusFailure
+	}
+	if err := s.share.RemoveVersions(secretID, channelID, versions); err != nil {
+		return ffiStatusFailure
+	}
+	return ffiStatusOK
+}
+
+func dispatchShareKeepList(s *storeSet, secretID uint64, version uint32) (status int32, out []byte) {
+	defer recoverInto(&status)
+	versions, ok, err := s.share.KeepList(secretID, version)
+	if err != nil {
+		return ffiStatusFailure, nil
+	}
+	if !ok {
+		return ffiStatusOK, []byte("null")
+	}
+	encoded, err := EncodeUint32Array(versions)
+	if err != nil {
+		return ffiStatusFailure, nil
+	}
+	return ffiStatusOK, encoded
+}
+
 func shareLoadCallback(userData uintptr, secretID, channelID uint64, versionsPtr *byte, versionsLen uintptr, outPtr, outLen *uintptr) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
@@ -204,10 +236,33 @@ func shareRemoveChannelCallback(userData uintptr, secretID, channelID uint64) (s
 // package-level funcs, so each needs exactly one registration total — see
 // registerChannelCallbacks in callbacks_channel.go for why per-call
 // registration would exhaust purego's 2000-slot callback table.
+func shareRemoveVersionsCallback(userData uintptr, secretID, channelID uint64, versionsPtr *byte, versionsLen uintptr) (status int32) {
+	defer recoverInto(&status)
+	s, ok := lookupStores(storeHandle(userData))
+	if !ok {
+		return ffiStatusFailure
+	}
+	return dispatchShareRemoveVersions(s, secretID, channelID, unsafe.Slice(versionsPtr, versionsLen))
+}
+
+func shareKeepListCallback(userData uintptr, secretID uint64, version uint32, outPtr, outLen *uintptr) (status int32) {
+	defer recoverInto(&status)
+	s, ok := lookupStores(storeHandle(userData))
+	if !ok {
+		return ffiStatusFailure
+	}
+	st, out := dispatchShareKeepList(s, secretID, version)
+	if st != ffiStatusOK {
+		return st
+	}
+	writeOutBuffer(out, outPtr, outLen)
+	return ffiStatusOK
+}
+
 var (
 	shareCallbacksOnce sync.Once
 	shareCallbackPtrs  struct {
-		load, loadMany, loadAll, latestVersion, save, removeChannel uintptr
+		load, loadMany, loadAll, latestVersion, save, removeChannel, removeVersions, keepList uintptr
 	}
 )
 
@@ -219,6 +274,8 @@ func registerShareCallbacks() {
 		shareCallbackPtrs.latestVersion = purego.NewCallback(shareLatestVersionCallback)
 		shareCallbackPtrs.save = purego.NewCallback(shareSaveCallback)
 		shareCallbackPtrs.removeChannel = purego.NewCallback(shareRemoveChannelCallback)
+		shareCallbackPtrs.removeVersions = purego.NewCallback(shareRemoveVersionsCallback)
+		shareCallbackPtrs.keepList = purego.NewCallback(shareKeepListCallback)
 	})
 }
 
@@ -228,13 +285,15 @@ func registerShareCallbacks() {
 func buildShareStoreCallbacks(h storeHandle) ShareStoreCallbacks {
 	registerShareCallbacks()
 	return ShareStoreCallbacks{
-		UserData:      uintptr(h),
-		Load:          shareCallbackPtrs.load,
-		LoadMany:      shareCallbackPtrs.loadMany,
-		LoadAll:       shareCallbackPtrs.loadAll,
-		LatestVersion: shareCallbackPtrs.latestVersion,
-		Save:          shareCallbackPtrs.save,
-		RemoveChannel: shareCallbackPtrs.removeChannel,
-		FreeBuffer:    sharedFreeBufferCallback(),
+		UserData:       uintptr(h),
+		Load:           shareCallbackPtrs.load,
+		LoadMany:       shareCallbackPtrs.loadMany,
+		LoadAll:        shareCallbackPtrs.loadAll,
+		LatestVersion:  shareCallbackPtrs.latestVersion,
+		Save:           shareCallbackPtrs.save,
+		RemoveChannel:  shareCallbackPtrs.removeChannel,
+		RemoveVersions: shareCallbackPtrs.removeVersions,
+		KeepList:       shareCallbackPtrs.keepList,
+		FreeBuffer:     sharedFreeBufferCallback(),
 	}
 }

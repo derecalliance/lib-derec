@@ -187,6 +187,15 @@ type ReplicaDiscoveryParams struct{}
 // UnpairReplicaParams are the parameters for FlowKindUnpairReplica.
 // ReplicaID names the member being removed — this device for a voluntary
 // departure, another for an eviction.
+//
+// Any member may remove any member, the source included: a lost or stolen
+// source must be removable by the devices that remain, and the library checks
+// no role. Ask the user before starting this flow, above all when it names the
+// source. Removing the source promotes the first remaining member in the order
+// ChannelStore.ListReplicas returns. The removed member is not asked and gets
+// no event when told to leave: when a roster excluding it arrives it drops its
+// whole secret_id partition and emits EventTypeSelfRemovedFromGroup. The
+// secret survives on the remaining members and the helpers.
 type UnpairReplicaParams struct {
 	ReplicaID uint64
 	Memo      *string
@@ -377,6 +386,10 @@ func (p *DeRecProtocol) Reject(action []byte, status derecpb.StatusEnum, memo st
 // Secret — the same typed snapshot carried by SecretRecoveredEvent.Secret
 // (and ReplicaSecretReceivedEvent.Secret); pass it verbatim along with the
 // version it was recovered at.
+//
+// Recovery and restore are separate steps on purpose: the SecretRecovered
+// event writes nothing. Show the user what was recovered, or ask them, before
+// calling Restore, which commits it to this device.
 //
 // A helper or member whose Transports is empty (or nil) gets no channel: it
 // is reported as an EventTypePeerNotRestored event in the returned slice and

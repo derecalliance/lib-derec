@@ -257,6 +257,13 @@ pub(super) fn on_request(
     Ok(vec![DeRecEvent::ActionRequired { channel_id, action }])
 }
 
+/// Completes a pairing this device initiated.
+///
+/// In a replica pairing, the rekeyed channel becomes the group's channel only
+/// when this device is joining its first group. A device already in a group
+/// keeps its own roster row on the group's channel: the new channel belongs to
+/// the joiner alone, and moving the row would change the group's channel, and
+/// with it the group key, on every admission.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -384,11 +391,7 @@ pub(super) async fn on_response<S: StoreSet>(
     )
     .await?;
 
-    // A replica initiator's own row was written under the contact-time id at
-    // `start`; point it at the rekeyed group channel. A member row is keyed by
-    // `replica_id` alone, so this is a field update — re-keying it would
-    // delete the row this save just wrote.
-    if let Some(mine) = own_member {
+    if let Some(mine) = own_member.filter(|m| m.channel_id == channel_id) {
         stores
             .channels
             .save(

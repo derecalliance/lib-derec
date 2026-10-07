@@ -21,27 +21,23 @@ func decodeConfigJSON(t *testing.T, cfg ProtocolConfig) map[string]json.RawMessa
 	return fields
 }
 
-// An explicit zero threshold and keep-versions count must reach the library,
-// which decides whether they are valid; only an unset value is omitted so
-// the library default applies.
+// An explicit zero threshold must reach the library, which decides whether
+// it is valid; only an unset value is omitted so the library default
+// applies.
 func TestMarshalProtocolConfig_ExplicitZeroCountsAreSent(t *testing.T) {
 	zero := uint32(0)
-	fields := decodeConfigJSON(t, ProtocolConfig{SecretID: 1, Threshold: &zero, KeepVersionsCount: &zero})
-	for _, key := range []string{"threshold", "keep_versions_count"} {
-		got, ok := fields[key]
-		if !ok {
-			t.Fatalf("%s: explicit 0 was dropped from the config JSON", key)
-		}
-		if string(got) != "0" {
-			t.Fatalf("%s: got %s, want 0", key, got)
-		}
+	fields := decodeConfigJSON(t, ProtocolConfig{SecretID: 1, Threshold: &zero})
+	got, ok := fields["threshold"]
+	if !ok {
+		t.Fatalf("threshold: explicit 0 was dropped from the config JSON")
+	}
+	if string(got) != "0" {
+		t.Fatalf("threshold: got %s, want 0", got)
 	}
 
 	fields = decodeConfigJSON(t, ProtocolConfig{SecretID: 1})
-	for _, key := range []string{"threshold", "keep_versions_count"} {
-		if _, ok := fields[key]; ok {
-			t.Fatalf("%s: unset value must be omitted so the library default applies", key)
-		}
+	if _, ok := fields["threshold"]; ok {
+		t.Fatalf("threshold: unset value must be omitted so the library default applies")
 	}
 }
 

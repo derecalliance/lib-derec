@@ -28,10 +28,14 @@ struct FfiFailure {
   explicit FfiFailure(DeRecError e) : error(e) {}
   FfiFailure(DeRecError e, std::vector<uint8_t> channelIdsJson)
       : error(e), conflictingChannelIdsJson(std::move(channelIdsJson)) {}
+  FfiFailure(DeRecError e, ProcessFailureDetails details)
+      : error(e), process(std::move(details)) {}
   DeRecError error;
   /// `restore`'s JSON array of colliding channel ids, empty for every other
   /// failure. Carried as raw bytes: parsing needs the runtime.
   std::vector<uint8_t> conflictingChannelIdsJson;
+  /// `process`'s events and failing channel, empty for every other failure.
+  ProcessFailureDetails process;
 };
 
 constexpr const char* kReentrancyMessage =
@@ -176,11 +180,13 @@ jsi::Value ProtocolHost::runAsync(
               bool unknownFailure = false;
               DeRecError capturedError{};
               std::vector<uint8_t> capturedChannelIdsJson;
+              ProcessFailureDetails capturedProcess;
               try {
                 bytes = body();
               } catch (FfiFailure& failure) {
                 capturedError = failure.error;
                 capturedChannelIdsJson = std::move(failure.conflictingChannelIdsJson);
+                capturedProcess = std::move(failure.process);
                 failed = true;
               } catch (...) {
                 // Anything other than `FfiFailure` — `std::bad_alloc` from
@@ -207,7 +213,9 @@ jsi::Value ProtocolHost::runAsync(
                                     bytes = std::move(bytes), failed,
                                     unknownFailure, capturedError,
                                     capturedChannelIdsJson =
-                                        std::move(capturedChannelIdsJson)]() mutable {
+                                        std::move(capturedChannelIdsJson),
+                                    capturedProcess =
+                                        std::move(capturedProcess)]() mutable {
                 if (state->runtimeInvalidated.load()) {
                   // Queued before the runtime was torn down, reached only
                   // afterwards. Every JSI call below — including the ones the
@@ -221,7 +229,8 @@ jsi::Value ProtocolHost::runAsync(
                     // Reuses the exact error shape every synchronous FFI
                     // wrapper throws, rather than inventing a second one for
                     // the asynchronous path.
-                    throwDeRecError(jsRt, capturedError, capturedChannelIdsJson);
+                    throwDeRecError(jsRt, capturedError, capturedChannelIdsJson,
+                                    capturedProcess);
                   }
                   if (unknownFailure) {
                     throw jsi::JSError(jsRt, "DeRec: an unexpected native error occurred");
@@ -407,12 +416,16 @@ jsi::Value ProtocolHost::get(jsi::Runtime& rt, const jsi::PropNameID& name) {
 
           auto body = [handle,
                       message = std::move(message)]() -> std::vector<uint8_t> {
-            DeRecProtocolEventsResult result =
+            DeRecProtocolProcessResult result =
                 derec_protocol_process(handle, message.data(), message.size());
+            std::vector<uint8_t> events = takeBuffer(result.events_json);
             if (result.error.code != DEREC_CODE_OK) {
-              throw FfiFailure(result.error);
+              throw FfiFailure(result.error,
+                               ProcessFailureDetails{std::move(events),
+                                                     result.has_channel_id,
+                                                     result.channel_id});
             }
-            return takeBuffer(result.events_json);
+            return events;
           };
           return runAsync(rt2, std::move(body), bytesToArrayBuffer);
         });

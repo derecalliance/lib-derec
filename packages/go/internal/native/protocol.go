@@ -39,6 +39,18 @@ type DeRecProtocolEventsResult struct {
 	EventsJSON DeRecBuffer
 }
 
+// DeRecProtocolProcessResult mirrors #[repr(C)] struct
+// DeRecProtocolProcessResult in library/src/interop/ffi/protocol/handle/flow.rs:
+// the standard DeRecError envelope, a UTF-8 JSON array of events filled on
+// success and on failure, and the channel a failing message came from when
+// HasChannelID is set.
+type DeRecProtocolProcessResult struct {
+	Error        DeRecError
+	EventsJSON   DeRecBuffer
+	HasChannelID bool
+	ChannelID    uint64
+}
+
 // DeRecProtocolRestoreResult mirrors #[repr(C)] struct
 // DeRecProtocolRestoreResult in library/src/interop/ffi/protocol/handle/flow.rs:
 // the standard DeRecError envelope, a UTF-8 JSON array of events, and a
@@ -133,11 +145,10 @@ type ProtocolConfig struct {
 	// Empty omits the key, which the library refuses.
 	OwnTransports []TransportOffer
 
-	// Threshold and KeepVersionsCount are omitted from the JSON config when
-	// nil, so the library default applies; any non-nil value, including 0,
-	// is sent for the library to accept or reject.
-	Threshold         *uint32
-	KeepVersionsCount *uint32
+	// Threshold is omitted from the JSON config when nil, so the library
+	// default applies; any non-nil value, including 0, is sent for the
+	// library to accept or reject.
+	Threshold *uint32
 
 	// CommunicationInfo is this node's communication_info map, sent as the
 	// JSON config's "communication_info" object. nil or empty omits the key.
@@ -197,9 +208,9 @@ type ParameterRangeConfig struct {
 // Every optional field is omitempty: the Rust struct carries a
 // `#[serde(default = ...)]` for each of them, reading the same constants
 // DeRecProtocolBuilder::new does, so an omitted key lets the library's
-// default apply instead of this shim inventing one. Threshold and
-// KeepVersionsCount are pointers so that only an unset value is omitted —
-// an explicit 0 reaches the library, which decides whether it is valid.
+// default apply instead of this shim inventing one. Threshold is a
+// pointer so that only an unset value is omitted — an explicit 0 reaches
+// the library, which decides whether it is valid.
 // AutoRespondOnFailure, UnpairAck and AutoReplyTo are plain values because
 // their zero value is the library default, so omitting it changes nothing.
 // AutoAccept is a pointer because a non-pointer struct is never "empty"
@@ -208,7 +219,6 @@ type protocolConfigJSON struct {
 	SecretID             string                `json:"secret_id"`
 	OwnTransports        []TransportOffer      `json:"own_transports,omitempty"`
 	Threshold            *uint32               `json:"threshold,omitempty"`
-	KeepVersionsCount    *uint32               `json:"keep_versions_count,omitempty"`
 	AutoRespondOnFailure bool                  `json:"auto_respond_on_failure,omitempty"`
 	UnpairAck            int32                 `json:"unpair_ack,omitempty"`
 	AutoReplyTo          bool                  `json:"auto_reply_to,omitempty"`
@@ -266,7 +276,7 @@ var (
 	protocolProcessFn   func(
 		handle uintptr,
 		messagePtr *byte, messageLen uintptr,
-	) DeRecProtocolEventsResult
+	) DeRecProtocolProcessResult
 
 	protocolTickOnce sync.Once
 	protocolTickFn   func(handle uintptr) DeRecProtocolEventsResult
@@ -313,7 +323,6 @@ func marshalProtocolConfig(cfg ProtocolConfig) ([]byte, error) {
 		SecretID:             strconv.FormatUint(cfg.SecretID, 10),
 		OwnTransports:        cfg.OwnTransports,
 		Threshold:            cfg.Threshold,
-		KeepVersionsCount:    cfg.KeepVersionsCount,
 		AutoRespondOnFailure: cfg.AutoRespondOnFailure,
 		UnpairAck:            cfg.UnpairAck,
 		AutoReplyTo:          cfg.AutoReplyTo,
@@ -550,15 +559,21 @@ func (p *ProtocolInstance) SetCommunicationInfo(info map[string]string) error {
 // zero-length body rather than a null-pointer error — but the protocol
 // core itself may still reject it (e.g. an unrecognized channel_id),
 // surfacing as a non-nil error same as any other rejected message.
-func (p *ProtocolInstance) Process(message []byte) ([]byte, error) {
+//
+// The events are returned on failure too: they are what the call produced
+// before failing. channelID is the channel the failing message came from,
+// nil on success and when the bytes were not a decodable envelope.
+func (p *ProtocolInstance) Process(message []byte) (events []byte, channelID *uint64, err error) {
 	protocolProcessOnce.Do(func() {
 		purego.RegisterFunc(&protocolProcessFn, symbol("derec_protocol_process"))
 	})
 	res := protocolProcessFn(p.handle, bytePtr(message), uintptr(len(message)))
-	if err := errorFrom(res.Error); err != nil {
-		return nil, err
+	events = bytesFromBuffer(res.EventsJSON)
+	if res.HasChannelID {
+		id := res.ChannelID
+		channelID = &id
 	}
-	return bytesFromBuffer(res.EventsJSON), nil
+	return events, channelID, errorFrom(res.Error)
 }
 
 // Tick wraps derec_protocol_tick: advances time-driven state without an
