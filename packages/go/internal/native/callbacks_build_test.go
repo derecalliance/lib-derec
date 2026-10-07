@@ -72,6 +72,8 @@ func TestBuildCallbacks_PopulatesAllSixStructs(t *testing.T) {
 	checkNonZero("Share.LatestVersion", built.Share.LatestVersion)
 	checkNonZero("Share.Save", built.Share.Save)
 	checkNonZero("Share.RemoveChannel", built.Share.RemoveChannel)
+	checkNonZero("Share.RemoveVersions", built.Share.RemoveVersions)
+	checkNonZero("Share.KeepList", built.Share.KeepList)
 	checkNonZero("Share.FreeBuffer", built.Share.FreeBuffer)
 
 	checkNonZero("UserSecret.UserData", built.UserSecret.UserData)
@@ -420,6 +422,8 @@ func TestBuildCallbacks_ManyInstancesDoNotExhaustCallbackTable(t *testing.T) {
 		checkNonZero("Share.LatestVersion", built.Share.LatestVersion)
 		checkNonZero("Share.Save", built.Share.Save)
 		checkNonZero("Share.RemoveChannel", built.Share.RemoveChannel)
+		checkNonZero("Share.RemoveVersions", built.Share.RemoveVersions)
+		checkNonZero("Share.KeepList", built.Share.KeepList)
 		checkNonZero("Share.FreeBuffer", built.Share.FreeBuffer)
 
 		checkNonZero("UserSecret.LoadLatest", built.UserSecret.LoadLatest)

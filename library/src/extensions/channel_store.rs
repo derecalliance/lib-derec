@@ -17,7 +17,8 @@ use crate::{
     Error, Result,
     derec_message::{DeRecMessageBuilder, current_timestamp},
     protocol::types::{
-        ChannelQuery, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember, Target,
+        ChannelQuery, ChannelStatus, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember,
+        Target,
     },
     types::{ChannelId, SharedKey},
 };
@@ -126,18 +127,20 @@ pub(crate) trait ChannelStoreExt: DeRecChannelStore {
         Ok(())
     }
 
-    /// Narrow a caller-supplied [`Target`] to the channels this `secret_id`
-    /// actually holds.
+    /// Narrow a caller-supplied [`Target`] to the paired channels this
+    /// `secret_id` holds.
     ///
-    /// Ids naming a channel that is not paired are dropped rather than
-    /// refused: a target is a request to reach whoever is reachable, and a
-    /// stale id in a list should not fail the whole fan-out.
+    /// Ids naming a channel that is unknown or not
+    /// [`Paired`](ChannelStatus::Paired) are dropped rather than refused: a
+    /// target is a request to reach whoever is reachable, and a stale id in a
+    /// list should not fail the whole fan-out.
     async fn resolve_target(&self, secret_id: u64, target: Target) -> Result<Vec<ChannelId>> {
         let known: Vec<ChannelId> = self
             .helpers_matching(
                 secret_id,
                 HelperFilter {
                     ids: target.ids(),
+                    status: vec![ChannelStatus::Paired],
                     ..Default::default()
                 },
             )

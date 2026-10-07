@@ -108,6 +108,10 @@ class EmptyShareStore implements ShareStore {
     return null;
   }
   async removeChannel(): Promise<void> {}
+  async removeVersions(): Promise<void> {}
+  async keepList(): Promise<null> {
+    return null;
+  }
 }
 
 class EmptyUserSecretStore implements UserSecretStore {

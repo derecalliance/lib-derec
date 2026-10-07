@@ -949,3 +949,189 @@ mod fingerprint_gate_tests {
         );
     }
 }
+
+/// Where the initiator's own roster row points once a replica handshake
+/// completes.
+#[cfg(test)]
+mod own_member_channel_tests {
+    use crate::primitives::pairing::{request, response};
+    use crate::protocol::context::PairingConfig;
+    use crate::protocol::test::{LocalFixture, StoreRig, run_async};
+    use crate::protocol::types::{
+        ChannelQuery, ChannelRecord, ChannelStatus, ReplicaMember, ReplicaRole,
+    };
+    use crate::protocol::{DeRecChannelStore, DeRecSecretStore, SecretKind, SecretValue};
+    use crate::types::{ChannelId, ReplicaId};
+    use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
+
+    const SECRET_ID: u64 = 0x0A11_CE00;
+    const OWN: u64 = 1001;
+    const GROUP: ChannelId = ChannelId(0x6E0_0001);
+
+    fn endpoint(host: &str) -> Vec<TransportProtocol> {
+        vec![TransportProtocol {
+            uri: format!("https://{host}.example/derec"),
+            protocol: Protocol::Https as i32,
+        }]
+    }
+
+    async fn own_channel(rig: &StoreRig) -> ChannelId {
+        rig.channels
+            .load(
+                SECRET_ID,
+                ChannelQuery::Replica {
+                    channel_id: GROUP,
+                    replica_id: ReplicaId(OWN),
+                },
+            )
+            .await
+            .expect("load")
+            .and_then(|r| r.as_replica().cloned())
+            .expect("own roster row present")
+            .channel_id
+    }
+
+    /// Drives a full handshake in which this device scans a joiner's contact:
+    /// `start`, the joiner's real `PairResponse`, then `on_response`. Returns
+    /// the rekeyed channel the joiner was admitted on.
+    async fn admit_joiner(
+        rig: &mut StoreRig,
+        lf: &LocalFixture,
+        contact_channel: ChannelId,
+        joiner_id: u64,
+    ) -> ChannelId {
+        let pairing_cfg = PairingConfig {
+            parameter_range: None,
+        };
+        let request::CreateContactResult {
+            contact_message,
+            secret_key,
+        } = request::create_contact(
+            contact_channel,
+            ContactMode::InlineKeys,
+            endpoint("joiner"),
+            None,
+        )
+        .expect("create_contact");
+        let joiner_secret = secret_key.expect("InlineKeys returns key material");
+
+        let sent_before = rig.transport.sent_envelopes().len();
+        super::super::start(
+            &mut rig.stores(),
+            &lf.local(),
+            &pairing_cfg,
+            SenderKind::ReplicaSource,
+            contact_message,
+            std::collections::HashMap::new(),
+            0,
+        )
+        .await
+        .expect("start");
+        let request_envelope = rig.transport.sent_envelopes()[sent_before].clone();
+
+        let request::ExtractResult {
+            request: pair_request,
+        } = request::extract(&request_envelope, joiner_secret.ecies_secret_key(), None)
+            .expect("joiner extracts the request");
+        let produced = response::produce(
+            contact_channel,
+            &pair_request,
+            &joiner_secret,
+            super::super::build_communication_info(
+                &std::collections::HashMap::new(),
+                Some(joiner_id),
+            ),
+            None,
+            lf.policy,
+        )
+        .expect("joiner produces the response");
+
+        let Some(SecretValue::PairingSecret(own_secret)) = rig
+            .secrets
+            .load(SECRET_ID, contact_channel, SecretKind::PairingSecret)
+            .await
+            .expect("load pairing secret")
+        else {
+            panic!("start stores the initiator's pairing secret");
+        };
+        let own_secret = own_secret.to_secret().expect("pairing secret");
+        let response::ExtractResult {
+            response: pair_response,
+        } = response::extract(&produced.envelope, own_secret.ecies_secret_key())
+            .expect("initiator extracts the response");
+
+        super::super::pair::on_response(
+            &mut rig.stores(),
+            &lf.local(),
+            &pairing_cfg,
+            contact_channel,
+            &pair_response,
+            &own_secret,
+        )
+        .await
+        .expect("on_response");
+        produced.channel_id
+    }
+
+    /// A member admitting a joiner keeps its row on the group channel: the
+    /// rekeyed channel belongs to the joiner alone.
+    #[test]
+    fn an_existing_member_keeps_its_row_on_the_group_channel() {
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, OWN);
+            let mut rig = StoreRig::new();
+            rig.channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Replica(ReplicaMember {
+                        channel_id: GROUP,
+                        replica_id: ReplicaId(OWN),
+                        transports: lf.own_transports.clone(),
+                        communication_info: std::collections::HashMap::new(),
+                        role: ReplicaRole::Source,
+                        status: ChannelStatus::Paired,
+                        created_at: 0,
+                    }),
+                )
+                .await
+                .expect("seed own row");
+
+            let joiner_channel = admit_joiner(&mut rig, &lf, ChannelId(0x0C0_0001), 2002).await;
+
+            assert_ne!(joiner_channel, GROUP);
+            assert_eq!(
+                own_channel(&rig).await,
+                GROUP,
+                "admitting a joiner must not move this device off the group channel"
+            );
+        });
+    }
+
+    /// A first-time initiator's row moves from the contact-time channel onto
+    /// the rekeyed one, which becomes the group's; a second admission leaves
+    /// it there.
+    #[test]
+    fn joiners_admitted_in_sequence_keep_the_first_group_channel() {
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, OWN);
+            let mut rig = StoreRig::new();
+
+            let first_contact = ChannelId(0x0C0_0002);
+            let group = admit_joiner(&mut rig, &lf, first_contact, 2002).await;
+            assert_ne!(group, first_contact);
+            assert_eq!(
+                own_channel(&rig).await,
+                group,
+                "a first-time initiator is re-pointed onto the rekeyed channel"
+            );
+
+            let second = admit_joiner(&mut rig, &lf, ChannelId(0x0C0_0003), 2003).await;
+            assert_ne!(second, group);
+            assert_eq!(
+                own_channel(&rig).await,
+                group,
+                "the second admission must keep the first group channel"
+            );
+        });
+    }
+}

@@ -427,7 +427,7 @@ fn read_committed_share(bytes: &[u8]) -> Result<(CommittedDeRecShare, DeRecShare
     Ok((committed, share))
 }
 
-fn extract_share_from_response(
+pub(crate) fn extract_share_from_response(
     response: &GetShareResponseMessage,
     secret_id: u64,
     version: u32,

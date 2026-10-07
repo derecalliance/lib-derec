@@ -96,4 +96,11 @@ func TestProcess_MalformedBytes_ReturnsAnError(t *testing.T) {
 	if !errors.As(err, &derecErr) {
 		t.Fatalf("expected a *derec.Error, got %T: %v", err, err)
 	}
+	var processErr *ProcessError
+	if !errors.As(err, &processErr) {
+		t.Fatalf("expected a *ProcessError, got %T: %v", err, err)
+	}
+	if processErr.ChannelID != nil {
+		t.Fatalf("undecodable bytes name no channel, got %d", *processErr.ChannelID)
+	}
 }

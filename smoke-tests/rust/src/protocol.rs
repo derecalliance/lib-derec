@@ -9,7 +9,7 @@ use derec_library::protocol::types::{
     ReplicaRole, Target, UserSecret, UserSecrets,
 };
 use derec_library::protocol::{
-    ChannelStoreFuture, DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol,
+    ChannelStoreFuture, CorruptionReason, DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol,
     DeRecProtocolBuilder, DeRecSecretStore, DeRecShareStore, DeRecTransport, DeRecUserSecretStore,
     ExpiredChannelCleanup, IgnoreReason, MissingPolicy, SecretKind, SecretStoreError,
     SecretStoreFuture, SecretValue, Share, ShareStoreFuture, TransportFuture,
@@ -36,12 +36,15 @@ pub async fn run_all() {
     run_unconfirmed_destination_ignores_the_copy_flow().await;
     run_replica_verifies_only_synced_versions_flow().await;
     run_discovery_and_recovery_flow().await;
+    run_helper_without_the_version_flow().await;
+    run_corrupted_share_flow().await;
     run_unpairing_flow().await;
     run_update_channel_info_flow().await;
     run_reply_to_flow().await;
     run_auto_publish_on_pair_flow().await;
     run_replica_sync_version_progression_flow().await;
     run_replica_group_key_handover_flow().await;
+    run_replica_publish_before_handover_ack_flow().await;
     run_auto_accept_flow().await;
     run_start_pairing_rejects_already_paired_channel().await;
     run_pairing_rejects_incompatible_parameter_range().await;
@@ -369,6 +372,22 @@ impl DeRecShareStore for InMemoryShareStore {
         self.data
             .retain(|(c, s, _), _| !(*c == cid && *s == secret_id));
         Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn remove_versions(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, ()> {
+        let cid = channel_id.0;
+        self.data
+            .retain(|(c, s, v), _| !(*c == cid && *s == secret_id && versions.contains(v)));
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+        Box::pin(std::future::ready(Ok(None)))
     }
 }
 
@@ -3318,6 +3337,273 @@ async fn run_discovery_and_recovery_flow() {
     println!("Protocol discovery & recovery flow test passed.");
 }
 
+/// One of three helpers no longer holds the version being asked for.
+///
+/// It answers both the verification challenge and the recovery request with
+/// `UNKNOWN_SHARE_VERSION` instead of failing and leaving the owner waiting.
+/// The owner reports the refusals — `ShareVerifyRejected` and
+/// `RecoveryShareRefused` — and recovers from the two helpers that still hold
+/// their shares. The refusing helper answers first, so a refusal that were
+/// collected as a share would poison every reconstruction attempt after it.
+async fn run_helper_without_the_version_flow() {
+    println!("=== Protocol helper without the version flow test ===");
+
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 42);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let mut helper_c = Peer::new("helper-c", "https://helper-c.example.com");
+
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(1)).await;
+    pair(&mut owner, &mut helper_b, ChannelId(2)).await;
+    pair(&mut owner, &mut helper_c, ChannelId(3)).await;
+
+    let secret_data = b"three helpers, one forgetful".to_vec();
+    let protect_events = owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![7],
+                name: "forgetful-helper secret".to_owned(),
+                data: secret_data.clone(),
+            }],
+            description: None,
+        })
+        .await
+        .expect("owner start(ProtectSecret) failed");
+    let version = protect_events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ProtectSecretStarted { version, .. } => Some(*version),
+            _ => None,
+        })
+        .expect("the round must report the version it published");
+    pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b, &mut helper_c]).await;
+
+    let helper_a_sid = helper_a.protocol.secret_id();
+    helper_a
+        .protocol
+        .share_store
+        .remove_versions(helper_a_sid, channel_a, &[version])
+        .await
+        .expect("helper-a drops its share");
+
+    let owner_sid = owner.protocol.secret_id();
+    owner
+        .protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id: owner_sid,
+            version,
+            target: Target::All,
+        })
+        .await
+        .expect("owner start(VerifyShares) failed");
+    let verify_events =
+        pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b, &mut helper_c]).await;
+    let rejected: Vec<_> = verify_events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ShareVerifyRejected {
+                channel_id, status, ..
+            } => Some((*channel_id, *status)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejected,
+        vec![(
+            channel_a,
+            derec_proto::StatusEnum::UnknownShareVersion as i32
+        )],
+        "helper-a must refuse the challenge with UNKNOWN_SHARE_VERSION"
+    );
+    let verified = verify_events
+        .iter()
+        .filter(|e| matches!(e, DeRecEvent::ShareVerified { .. }))
+        .count();
+    assert_eq!(verified, 2, "helper-b and helper-c still prove possession");
+
+    let started = owner
+        .protocol
+        .start(DeRecFlow::RecoverSecret {
+            secret_id: owner_sid,
+            version,
+        })
+        .await
+        .expect("owner start(RecoverSecret) failed");
+    let asked = started
+        .iter()
+        .filter(|e| matches!(e, DeRecEvent::RecoverSecretStarted { .. }))
+        .count();
+    assert_eq!(asked, 3, "every helper is asked for its share");
+
+    let recovery_events =
+        pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b, &mut helper_c]).await;
+    let refused: Vec<_> = recovery_events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::RecoveryShareRefused {
+                channel_id,
+                version: refused_version,
+                status,
+                ..
+            } => Some((*channel_id, *refused_version, *status)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        refused,
+        vec![(
+            channel_a,
+            version,
+            derec_proto::StatusEnum::UnknownShareVersion as i32
+        )],
+        "the app sees exactly one refusal, from helper-a"
+    );
+    assert!(
+        !recovery_events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::RecoveryShareError { .. })),
+        "a refusal must not cause a failed reconstruction: {recovery_events:?}"
+    );
+    let recovered = recovery_events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::SecretRecovered { secret } => Some(secret.clone()),
+            _ => None,
+        })
+        .expect("the two remaining helpers must complete the recovery");
+    assert!(
+        recovered
+            .secrets
+            .iter()
+            .any(|s| s.id == vec![7] && s.data == secret_data),
+        "recovered secret must carry the protected bytes"
+    );
+
+    println!("Protocol helper without the version flow test passed.");
+}
+
+/// One of three helpers holds a tampered share: one byte of its `y`
+/// coordinate flipped in storage, so it still answers OK.
+///
+/// The owner reports it as `RecoveryShareCorrupted` against that helper and
+/// recovers from the other two (threshold 2). The tampered helper answers
+/// first, so a corrupted share that were collected would fail every
+/// reconstruction attempt after it.
+async fn run_corrupted_share_flow() {
+    use prost::Message as _;
+
+    println!("=== Protocol corrupted share flow test ===");
+
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 43);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let mut helper_c = Peer::new("helper-c", "https://helper-c.example.com");
+
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(1)).await;
+    pair(&mut owner, &mut helper_b, ChannelId(2)).await;
+    pair(&mut owner, &mut helper_c, ChannelId(3)).await;
+
+    let secret_data = b"three helpers, one tampered".to_vec();
+    let protect_events = owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![8],
+                name: "tampered-helper secret".to_owned(),
+                data: secret_data.clone(),
+            }],
+            description: None,
+        })
+        .await
+        .expect("owner start(ProtectSecret) failed");
+    let version = protect_events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ProtectSecretStarted { version, .. } => Some(*version),
+            _ => None,
+        })
+        .expect("the round must report the version it published");
+    pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b, &mut helper_c]).await;
+
+    let helper_a_sid = helper_a.protocol.secret_id();
+    let mut stored = helper_a
+        .protocol
+        .share_store
+        .load(helper_a_sid, channel_a, &[version])
+        .await
+        .expect("helper-a loads its share")
+        .pop()
+        .expect("helper-a holds a share for the version");
+    let mut request = derec_proto::StoreShareRequestMessage::decode(stored.bytes.as_slice())
+        .expect("stored share request decodes");
+    let mut committed = derec_proto::CommittedDeRecShare::decode(request.share.as_slice())
+        .expect("committed share decodes");
+    let mut share =
+        derec_proto::DeRecShare::decode(committed.de_rec_share.as_slice()).expect("share decodes");
+    share.y[0] ^= 0x01;
+    committed.de_rec_share = share.encode_to_vec();
+    request.share = committed.encode_to_vec();
+    stored.bytes = request.encode_to_vec();
+    helper_a
+        .protocol
+        .share_store
+        .save(helper_a_sid, channel_a, stored)
+        .await
+        .expect("helper-a stores the tampered share");
+
+    let owner_sid = owner.protocol.secret_id();
+    owner
+        .protocol
+        .start(DeRecFlow::RecoverSecret {
+            secret_id: owner_sid,
+            version,
+        })
+        .await
+        .expect("owner start(RecoverSecret) failed");
+    let recovery_events =
+        pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b, &mut helper_c]).await;
+
+    let corrupted: Vec<_> = recovery_events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::RecoveryShareCorrupted {
+                channel_id,
+                version: corrupted_version,
+                reason,
+            } => Some((*channel_id, *corrupted_version, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        corrupted,
+        vec![(channel_a, version, CorruptionReason::InvalidProof)],
+        "the app sees exactly one corrupted share, from helper-a"
+    );
+    assert!(
+        !recovery_events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::RecoveryShareError { .. })),
+        "a corrupted share must not cause a failed reconstruction: {recovery_events:?}"
+    );
+    let recovered = recovery_events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::SecretRecovered { secret } => Some(secret.clone()),
+            _ => None,
+        })
+        .expect("the two untouched helpers must complete the recovery");
+    assert!(
+        recovered
+            .secrets
+            .iter()
+            .any(|s| s.id == vec![8] && s.data == secret_data),
+        "recovered secret must carry the protected bytes"
+    );
+
+    println!("Protocol corrupted share flow test passed.");
+}
+
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
@@ -4284,6 +4570,96 @@ async fn run_replica_group_key_handover_flow() {
     );
 
     println!("Protocol replica group-key handover flow test passed.");
+}
+
+/// A publish sent before the joiner's handover acknowledgement reaches the
+/// source still reaches the joiner, and so does every later one when that
+/// acknowledgement never arrives.
+///
+/// The joiner drops its ephemeral pairing channel as soon as it hydrates, so
+/// the source must already address it on the group channel: the handover
+/// acknowledgement here is lost in transit, and both following publishes
+/// must still land.
+async fn run_replica_publish_before_handover_ack_flow() {
+    println!("=== Protocol replica publish before handover ack flow ===");
+
+    let sid = 0xBEEFu64;
+    let mut source = Peer::with_secret_id_and_replica_id(
+        "source",
+        "https://source.example.com",
+        sid,
+        0xC0DE_C0DE_C0DE_C0DEu64,
+    );
+    let mut dest1 = Peer::with_options(
+        "dest1",
+        "https://dest1.example.com",
+        2,
+        false,
+        Some(0xD1D1_D1D1_D1D1_D1D1u64),
+        sid,
+    );
+    let mut dest2 = Peer::with_options(
+        "dest2",
+        "https://dest2.example.com",
+        2,
+        false,
+        Some(0xD2D2_D2D2_D2D2_D2D2u64),
+        sid,
+    );
+
+    let group_channel = pair_replica_handshake(&mut source, &mut dest1, ChannelId(1)).await;
+    cross_confirm_fingerprint(&mut source, &mut dest1, group_channel).await;
+    let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+
+    let ephemeral = pair_replica_handshake(&mut source, &mut dest2, ChannelId(2)).await;
+    cross_confirm_fingerprint(&mut source, &mut dest2, ephemeral).await;
+
+    for (tp, bytes) in source.drain() {
+        if tp.uri == dest1.uri {
+            deliver(&mut dest1, &bytes).await;
+        } else if tp.uri == dest2.uri {
+            deliver(&mut dest2, &bytes).await;
+        }
+    }
+    let lost_acks = dest2.drain();
+    assert!(
+        !lost_acks.is_empty(),
+        "Dest2 must have acknowledged the handover before it is dropped"
+    );
+    let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+    println!("  step 1: handover delivered, Dest2's acknowledgement lost  ✓");
+
+    for payload in [b"before the ack".as_slice(), b"after the ack".as_slice()] {
+        source
+            .protocol
+            .start(DeRecFlow::ProtectSecret {
+                secrets: vec![UserSecret {
+                    id: vec![0x42],
+                    name: "handover".to_owned(),
+                    data: payload.to_vec(),
+                }],
+                description: None,
+            })
+            .await
+            .expect("source start(ProtectSecret) failed");
+        let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+
+        let snapshot = dest2
+            .protocol
+            .user_secret_store
+            .load_latest(sid)
+            .await
+            .expect("load_latest")
+            .expect("Dest2 holds a snapshot");
+        assert!(
+            snapshot.secrets.iter().any(|us| us.data == payload),
+            "Dest2 must receive the publish carrying {:?}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+    println!("  step 2: both publishes reached Dest2 on the group channel  ✓");
+
+    println!("Protocol replica publish before handover ack flow test passed.");
 }
 
 /// Helper: read a channel's stored 32-byte `SharedKey`, or `None` when the

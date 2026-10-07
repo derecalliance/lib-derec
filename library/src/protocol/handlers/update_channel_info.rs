@@ -34,35 +34,17 @@ const EMPTY_UPDATE_ERROR: Error = Error::InvalidInput(
     tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
 )]
 pub(in crate::protocol) async fn handle<S: StoreSet>(
-    stores: &mut Stores<'_, S>,
-    local: &Local<'_>,
+    _stores: &mut Stores<'_, S>,
+    _local: &Local<'_>,
     exchange: &Exchange<'_>,
     inner: MessageBody,
 ) -> Result<Vec<DeRecEvent>> {
-    match decide(local, exchange, inner) {
-        // Unlike pairing, the channel is already established: this side
-        // still holds the peer's previous, working endpoint, so the refusal
-        // can be sent back over it instead of only surfacing as a local
-        // error the peer never learns about.
-        Err(Error::NoUsableEndpoint { offered }) => {
-            let memo = format!(
-                "peer announced no usable transport endpoint — all \
-                 {offered} offer(s) were refused by transport policy"
-            );
-            reject(
-                stores,
-                local,
-                exchange,
-                StatusEnum::UnsupportedTransportProtocol,
-                &memo,
-            )
-            .await?;
-            Ok(vec![DeRecEvent::UpdateChannelInfoFailed {
-                channel_id: exchange.channel_id,
-                error: memo,
-            }])
-        }
-        other => other,
+    match inner {
+        MessageBody::UpdateChannelInfoRequest(request) => on_request(exchange, request),
+        MessageBody::UpdateChannelInfoResponse(response) => on_response(exchange, &response),
+        _ => Err(Error::Invariant(
+            "unexpected MessageBody variant in update_channel_info handler",
+        )),
     }
 }
 
@@ -254,27 +236,12 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     Ok(())
 }
 
-fn decide(
-    local: &Local<'_>,
-    exchange: &Exchange<'_>,
-    inner: MessageBody,
-) -> Result<Vec<DeRecEvent>> {
-    match inner {
-        MessageBody::UpdateChannelInfoRequest(request) => {
-            let own = local
-                .own_transports
-                .iter()
-                .map(crate::transport::TransportProtocol::try_from)
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            on_request(exchange, request, &own)
-        }
-        MessageBody::UpdateChannelInfoResponse(response) => on_response(exchange, &response),
-        _ => Err(Error::Invariant(
-            "unexpected MessageBody variant in update_channel_info handler",
-        )),
-    }
-}
-
+/// Receives a peer's update and asks the application to accept it.
+///
+/// Every announced endpoint must be well-formed. Which of them this device
+/// records is decided on acceptance by the transport policy, as in pairing:
+/// a peer's endpoints say where the peer listens, not what this device must
+/// serve.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
@@ -282,37 +249,13 @@ fn decide(
 fn on_request(
     exchange: &Exchange<'_>,
     request: UpdateChannelInfoRequestMessage,
-    own_transports: &[crate::transport::TransportProtocol],
 ) -> Result<Vec<DeRecEvent>> {
     if request.communication_info.is_none() && request.supported_transports.is_empty() {
         return Err(EMPTY_UPDATE_ERROR);
     }
 
-    // Structure, then servability. An endpoint this side cannot serve is
-    // refused rather than recorded: following the switch would leave the
-    // peer unreachable with no way to discover that. Structural validation
-    // (scheme consistency, whose policy acceptability was already settled
-    // by `TransportPolicy` in `handlers::handle`) runs first, so a
-    // malformed endpoint is reported as malformed rather than unservable.
-    if !request.supported_transports.is_empty() {
-        let mut servable = false;
-        for tp in &request.supported_transports {
-            tp.validate()?;
-
-            let protocol = derec_proto::Protocol::try_from(tp.protocol).map_err(|_| {
-                crate::transport::TransportValidationError::UnsupportedProtocol {
-                    discriminant: tp.protocol,
-                }
-            })?;
-
-            servable |= own_transports.iter().any(|t| t.protocol == protocol);
-        }
-
-        if !servable {
-            return Err(crate::Error::NoUsableEndpoint {
-                offered: request.supported_transports.len(),
-            });
-        }
+    for tp in &request.supported_transports {
+        tp.validate()?;
     }
 
     Ok(vec![DeRecEvent::ActionRequired {
@@ -496,7 +439,6 @@ mod tests {
                 trace_id: 0,
             },
             request,
-            &[],
         );
 
         assert!(matches!(
@@ -507,70 +449,96 @@ mod tests {
         ));
     }
 
-    /// A peer announcing a switch to a transport this side cannot serve is
-    /// refused rather than followed. Unlike the pairing case, the refusal is
-    /// deliverable: the channel is up, so the peer's previous endpoint still
-    /// works.
+    /// Which transports this device serves has no bearing on where a peer
+    /// may listen. A node serving only gRPC accepts a peer's move to HTTPS,
+    /// as pairing would record it, and replies on the new endpoint once the
+    /// application accepts.
     #[test]
-    fn on_request_refuses_an_unservable_transport_change() {
-        let own = vec![crate::transport::TransportProtocol::new(
-            "https://me.example.com/derec",
-            derec_proto::Protocol::Https,
-        )];
-        let request = UpdateChannelInfoRequestMessage {
-            supported_transports: vec![derec_proto::TransportProtocol {
-                uri: "grpcs://peer.example.com:443".to_owned(),
-                protocol: derec_proto::Protocol::Grpc as i32,
-            }],
-            communication_info: None,
-            timestamp: None,
-        };
+    fn a_peer_may_move_to_a_transport_this_node_does_not_serve() {
+        use crate::protocol::test::{LocalFixture, StoreRig, run_async};
+        use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel};
 
-        let result = on_request(
-            &Exchange {
-                channel_id: ChannelId(1),
-                shared_key: &[0u8; 32],
+        run_async(async {
+            let channel_id = ChannelId(41);
+            let shared_key = [7u8; 32];
+            let lf = LocalFixture {
+                own_transports: vec![derec_proto::TransportProtocol {
+                    uri: "grpcs://me.example.com:443".to_owned(),
+                    protocol: derec_proto::Protocol::Grpc as i32,
+                }],
+                ..LocalFixture::new(0x0C1)
+            };
+            let mut rig = StoreRig::new();
+            rig.channels
+                .save(
+                    lf.secret_id,
+                    ChannelRecord::Helper(HelperChannel {
+                        channel_id,
+                        transports: vec![derec_proto::TransportProtocol {
+                            uri: "grpcs://peer.example.com:443".to_owned(),
+                            protocol: derec_proto::Protocol::Grpc as i32,
+                        }],
+                        communication_info: HashMap::new(),
+                        peer_role: derec_proto::SenderKind::Owner,
+                        status: ChannelStatus::Paired,
+                        created_at: 0,
+                    }),
+                )
+                .await
+                .expect("seed channel");
+            let moved_to = derec_proto::TransportProtocol {
+                uri: "https://peer.example.com/derec".to_owned(),
+                protocol: derec_proto::Protocol::Https as i32,
+            };
+            let request = UpdateChannelInfoRequestMessage {
+                supported_transports: vec![moved_to.clone()],
+                communication_info: None,
+                timestamp: Some(current_timestamp()),
+            };
+            let exchange = Exchange {
+                channel_id,
+                shared_key: &shared_key,
                 trace_id: 0,
-            },
-            request,
-            &own,
-        );
-        assert!(matches!(result, Err(crate::Error::NoUsableEndpoint { .. })));
-    }
+            };
 
-    /// A switch to a transport this side does serve is still accepted.
-    #[test]
-    fn on_request_accepts_a_servable_transport_change() {
-        let own = vec![
-            crate::transport::TransportProtocol::new(
-                "https://me.example.com/derec",
-                derec_proto::Protocol::Https,
-            ),
-            crate::transport::TransportProtocol::new(
-                "grpcs://me.example.com:443",
-                derec_proto::Protocol::Grpc,
-            ),
-        ];
-        let request = UpdateChannelInfoRequestMessage {
-            supported_transports: vec![derec_proto::TransportProtocol {
-                uri: "grpcs://peer.example.com:443".to_owned(),
-                protocol: derec_proto::Protocol::Grpc as i32,
-            }],
-            communication_info: None,
-            timestamp: None,
-        };
-
-        assert!(
-            on_request(
-                &Exchange {
-                    channel_id: ChannelId(1),
-                    shared_key: &[0u8; 32],
-                    trace_id: 0
-                },
-                request,
-                &own
+            let events = handle(
+                &mut rig.stores(),
+                &lf.local(),
+                &exchange,
+                MessageBody::UpdateChannelInfoRequest(request.clone()),
             )
-            .is_ok()
-        );
+            .await
+            .expect("handle");
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [DeRecEvent::ActionRequired {
+                        action: PendingAction::UpdateChannelInfo { .. },
+                        ..
+                    }]
+                ),
+                "the move must be surfaced for acceptance, not refused: {events:?}"
+            );
+            assert!(
+                rig.transport.sent_envelopes().is_empty(),
+                "no refusal is sent"
+            );
+
+            accept(&mut rig.stores(), &lf.local(), &exchange, &request)
+                .await
+                .expect("accept");
+            let stored = rig
+                .channels
+                .load(
+                    lf.secret_id,
+                    crate::protocol::types::ChannelQuery::Helper { channel_id },
+                )
+                .await
+                .expect("load")
+                .and_then(|r| r.as_helper().cloned())
+                .expect("channel present");
+            assert_eq!(stored.transports, vec![moved_to.clone()]);
+            assert_eq!(rig.transport.sent_endpoint_sets(), vec![vec![moved_to]]);
+        });
     }
 }

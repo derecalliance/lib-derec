@@ -12,6 +12,10 @@ use crate::types::ChannelId;
 ///
 /// `channel_id` is `None` only when the envelope itself could not be decoded
 /// (i.e. the raw bytes are not a valid protobuf `DeRecMessage`).
+///
+/// `events` holds what the call produced before it failed, such as sharing
+/// round and unpair timeouts. Their state changes are already saved and are
+/// not reported again, so handle them exactly as a successful call's events.
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
 pub struct ProcessError {
@@ -20,6 +24,8 @@ pub struct ProcessError {
     /// The underlying error.
     #[source]
     pub source: crate::Error,
+    /// Events produced before the failure.
+    pub events: Vec<super::events::DeRecEvent>,
 }
 
 impl ProcessError {

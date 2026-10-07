@@ -201,6 +201,38 @@ impl DeRecShareStore for SqliteShareStore {
         .expect("share remove_channel failed");
         Box::pin(std::future::ready(Ok(())))
     }
+
+    fn remove_versions(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, ()> {
+        if versions.is_empty() {
+            return Box::pin(std::future::ready(Ok(())));
+        }
+        let conn = lock(&self.connection);
+        let placeholders = vec!["?"; versions.len()].join(", ");
+        let sql = format!(
+            "DELETE FROM shares \
+             WHERE secret_id = ? AND channel_id = ? AND version IN ({placeholders})"
+        );
+        let mut params: Vec<i64> = Vec::with_capacity(2 + versions.len());
+        params.push(u64_to_sql(secret_id));
+        params.push(u64_to_sql(channel_id.0));
+        for v in versions {
+            params.push(*v as i64);
+        }
+        let bound: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+        conn.execute(&sql, bound.as_slice())
+            .expect("share remove_versions failed");
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+        Box::pin(std::future::ready(Ok(None)))
+    }
 }
 
 fn map_share_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Share> {

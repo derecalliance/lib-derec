@@ -280,9 +280,9 @@ function toBigInt(id: bigint | number): bigint {
  *
  * Every value the caller supplies is forwarded verbatim — defaults, clamping
  * and the meaning of a disabled cleanup policy are library decisions.
- * `threshold`, `keep_versions_count`, `auto_respond_on_failure`,
- * `unpair_ack`, `auto_reply_to` and `auto_accept` are omitted entirely from
- * the emitted config unless their setter was called: `ProtocolConfig` has a
+ * `threshold`, `auto_respond_on_failure`, `unpair_ack`, `auto_reply_to`
+ * and `auto_accept` are omitted entirely from the emitted config unless
+ * their setter was called: `ProtocolConfig` has a
  * `#[serde(default = "...")]` on each of them, reading the same constants
  * `DeRecProtocolBuilder::new` uses, so an absent key resolves to the
  * library's own default rather than one frozen into this shim.
@@ -349,12 +349,6 @@ export class DeRecProtocolBuilder {
   /** Default: 3. */
   withThreshold(threshold: number): this {
     this.config.threshold = threshold;
-    return this;
-  }
-
-  /** Default: 3. */
-  withKeepVersionsCount(count: number): this {
-    this.config.keep_versions_count = count;
     return this;
   }
 
@@ -579,7 +573,16 @@ export class DeRecProtocol {
   }
 
   async process(message: Uint8Array): Promise<DeRecEvent[]> {
-    const buffer = (await this.host.process(message)) as ArrayBuffer;
+    let buffer: ArrayBuffer;
+    try {
+      buffer = (await this.host.process(message)) as ArrayBuffer;
+    } catch (error) {
+      const failure = error as { events?: unknown };
+      if (Array.isArray(failure.events)) {
+        failure.events = reviveEventBytes(failure.events);
+      }
+      throw error;
+    }
     return decodeEvents(buffer);
   }
 
@@ -601,6 +604,16 @@ export class DeRecProtocol {
     return (await this.host.getFingerprint(toBigInt(channelId))) as string;
   }
 
+  /**
+   * Verify `fingerprint` against the channel's locally-derived one. On
+   * match, the channel transitions from `Pending` to `Paired`. Returns
+   * `true` on confirmation, `false` on mismatch.
+   *
+   * On a replica destination, confirming is also the decision to adopt the
+   * group's vault: the source's publish is then installed as it arrives,
+   * with no further prompt. Ask the user before calling this; to decline,
+   * never confirm.
+   */
   async verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<boolean> {
     return (await this.host.verifyFingerprint(toBigInt(channelId), fingerprint)) as boolean;
   }
@@ -613,6 +626,9 @@ export class DeRecProtocol {
   /**
    * Rebuild this protocol's `secret_id` namespace from a recovered `Secret`.
    * Pass the `secret` carried by the `SecretRecovered` event verbatim.
+   * Recovery and restore are separate steps on purpose: `SecretRecovered`
+   * writes nothing. Show the user what was recovered, or ask them, before
+   * calling `restore`, which commits it to this device.
    * A helper or member whose `transports` is empty gets no channel: it is
    * reported as a `PeerNotRestored` event in the returned array and the rest
    * of the roster is restored.

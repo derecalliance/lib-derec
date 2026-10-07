@@ -48,6 +48,29 @@ pub enum NotRestoredReason {
     NoTransports,
 }
 
+/// Why [`DeRecEvent::RecoveryShareCorrupted`] set a helper's share aside.
+///
+/// Every case means the helper answered with an OK status but a share that
+/// cannot be part of the recovered secret. An honest helper never sends one,
+/// so each is a sign of storage or transport damage on that helper — or of a
+/// compromised helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CorruptionReason {
+    /// The response carries no decodable share for the requested secret and
+    /// version: the share bytes are missing or undecodable, or the share is
+    /// bound to another secret or version. Judged on arrival.
+    Malformed,
+    /// The share decodes but its Merkle proof does not open to its own
+    /// commitment root — for example a share whose value was altered after it
+    /// was split. Judged on arrival.
+    InvalidProof,
+    /// The share verifies on its own, but its commitment root or ciphertext
+    /// disagrees with the shares the secret was reconstructed from — a share
+    /// of some other split, or one built from scratch. Only judgeable against
+    /// the other shares, so it is reported when the secret is recovered.
+    Inconsistent,
+}
+
 /// Lightweight discriminant of [`PendingAction`].
 ///
 /// Carries no payload — useful for the
@@ -412,6 +435,30 @@ pub enum DeRecFlow {
         version: u32,
         target: Target,
     },
+    /// Ask every paired Helper for its share of `(secret_id, version)` and
+    /// reconstruct the secret as the shares arrive.
+    ///
+    /// Each answer settles as one of [`DeRecEvent::RecoveryShareReceived`],
+    /// [`DeRecEvent::RecoveryShareRefused`],
+    /// [`DeRecEvent::RecoveryShareCorrupted`] or, once enough consistent
+    /// shares are in, [`DeRecEvent::SecretRecovered`].
+    ///
+    /// A corrupted share is reported per Helper and set aside, so it never
+    /// blocks recovery from the honest shares. A share that fails on its own
+    /// — it does not decode, or fails its Merkle proof — is reported as it
+    /// arrives and never collected. Shares that are each valid but disagree
+    /// (a different commitment root or ciphertext) are grouped by
+    /// `(root, ciphertext)`; groups are tried largest first, ties going to
+    /// the group whose first share arrived earliest, and the first that
+    /// reconstructs is the secret. Every share outside it is reported as
+    /// [`CorruptionReason::Inconsistent`] alongside `SecretRecovered`. The
+    /// shares a secret is rebuilt from therefore always share one root and
+    /// one ciphertext. No group is reconstructed from a single share.
+    ///
+    /// An honest Helper never sends a corrupted share, so the application
+    /// may treat [`DeRecEvent::RecoveryShareCorrupted`] as a sign that the
+    /// Helper is damaged or compromised — for example by offering to unpair
+    /// it.
     RecoverSecret {
         secret_id: u64,
         version: u32,
@@ -463,6 +510,27 @@ pub enum DeRecFlow {
     /// a newer roster excluding it. Absence alone never destroys a copy of the
     /// secret — a publisher that silently omitted a member would otherwise
     /// destroy that member's state instead of merely forgetting it.
+    ///
+    /// # Who may remove whom
+    ///
+    /// Any member may remove any member, the source included: a lost or
+    /// stolen source must be removable by the devices that remain. The library
+    /// checks no role, and could not enforce one, since every member holds the
+    /// same group key. Ask the user before starting this flow, above all when
+    /// it names the source.
+    ///
+    /// Removing the source promotes a successor: the first remaining member in
+    /// the order [`DeRecChannelStore::replicas`](crate::protocol::DeRecChannelStore::replicas)
+    /// returns, which is how the application chooses it. The device running
+    /// this flow decides, and every other member reads the result from the
+    /// roster. Removing a sole source dissolves the group.
+    ///
+    /// # What the removed member experiences
+    ///
+    /// It is not asked, and gets no event when it is told to leave. When a
+    /// roster excluding it arrives, it drops its whole `secret_id` partition
+    /// automatically and emits [`DeRecEvent::SelfRemovedFromGroup`]. The
+    /// secret survives on the remaining members and the helpers.
     UnpairReplica {
         replica_id: u64,
         memo: Option<String>,
@@ -691,6 +759,10 @@ pub enum DeRecEvent {
     /// one is `secret`. Publishing the resolved state with
     /// [`crate::protocol::DeRecFlow::ProtectSecret`] writes the next
     /// version, which supersedes both on every member and helper.
+    ///
+    /// Until then, the application must not publish from this device: any
+    /// further `ProtectSecret` is a higher version that every other member
+    /// applies over its own copy, losing the change it never merged.
     ReplicaVersionConflict {
         /// The channel the copy arrived on.
         channel_id: ChannelId,
@@ -750,8 +822,13 @@ pub enum DeRecEvent {
         /// `version` echoed from the response.
         version: u32,
         /// The `StatusEnum` value from the member's response.
-        /// `VERSION_CONFLICT` means the round must be resolved and
-        /// republished at a new version — see [`Self::ReplicaSyncComplete`].
+        /// `VERSION_CONFLICT` means another member holds a different copy of
+        /// this version. The application must not publish from this device
+        /// again until the conflict is resolved: run
+        /// [`crate::protocol::DeRecFlow::ReplicaDiscovery`] to receive the
+        /// group's copy as [`Self::ReplicaVersionConflict`], merge, and publish
+        /// the result once with
+        /// [`crate::protocol::DeRecFlow::ProtectSecret`].
         status: i32,
         /// Human-readable explanation from the member.
         memo: String,
@@ -799,6 +876,11 @@ pub enum DeRecEvent {
     ///
     /// Fires only after both halves of the safety rule hold: this device was
     /// told to leave, and has since seen a roster excluding it.
+    ///
+    /// The teardown is automatic: this device is not asked first, and gets no
+    /// earlier event. The secret survives on the remaining members and the
+    /// helpers. Any member may cause it, the source included — see
+    /// [`DeRecFlow::UnpairReplica`].
     SelfRemovedFromGroup {
         /// The version whose roster completed the removal.
         version: u32,
@@ -912,6 +994,21 @@ pub enum DeRecEvent {
     /// A Helper's verification proof checked out (Owner side).
     ShareVerified { channel_id: ChannelId, version: u32 },
 
+    /// A Helper refused a verification challenge (Owner side): its
+    /// `VerifyShareResponse` carried a non-OK status instead of a proof.
+    ///
+    /// The challenge is spent either way — a later response to it is dropped
+    /// — so checking this helper again takes a new
+    /// [`DeRecFlow::VerifyShares`] round.
+    ShareVerifyRejected {
+        channel_id: ChannelId,
+        version: u32,
+        /// The `StatusEnum` value from the Helper's response.
+        status: i32,
+        /// Human-readable reason from the Helper.
+        memo: String,
+    },
+
     /// A Helper reported all secrets it currently stores for this channel (Owner side).
     ///
     /// Emitted after the Owner calls [`super::DeRecProtocol::start`] with
@@ -932,16 +1029,19 @@ pub enum DeRecEvent {
     /// cannot succeed yet — more shares are needed to meet the threshold.
     ///
     /// - `channel_id` identifies the Helper that sent this share response.
-    /// - `shares_received` is the total number of share responses collected so far
-    ///   for this `(secret_id, version)` recovery context.
+    /// - `shares_received` is the number of Helpers whose shares are collected
+    ///   so far for this `(secret_id, version)` recovery context: one per
+    ///   channel, not counting refused or corrupted shares.
     RecoveryShareReceived {
         channel_id: ChannelId,
         shares_received: usize,
     },
 
-    /// A recovery share response was received but reconstruction failed for a
-    /// reason other than insufficient shares (e.g. corrupted share, version
-    /// mismatch, decode error).
+    /// A recovery share response was received and reconstruction succeeded,
+    /// but the reconstructed bytes did not decode as a secret.
+    ///
+    /// A corrupted share never causes this: it is set aside and reported as
+    /// [`Self::RecoveryShareCorrupted`] instead.
     ///
     /// - `channel_id` identifies the Helper that sent this share response.
     /// - `shares_received` is the total number of share responses collected so far.
@@ -950,6 +1050,46 @@ pub enum DeRecEvent {
         channel_id: ChannelId,
         shares_received: usize,
         error: String,
+    },
+
+    /// A Helper refused a recovery share request (Owner side): its
+    /// `GetShareResponse` carried a non-OK status instead of a share — for
+    /// example `UNKNOWN_SHARE_VERSION` when it holds no share for `version`.
+    ///
+    /// The refusal is not collected: it does not count towards
+    /// `shares_received`, triggers no reconstruction attempt, and leaves the
+    /// recovery open for the other Helpers' shares. It still answers the
+    /// [`Self::RecoverSecretStarted`] issued for `channel_id`, so an
+    /// application counting answers against those requests counts it.
+    RecoveryShareRefused {
+        channel_id: ChannelId,
+        version: u32,
+        /// The `StatusEnum` value from the Helper's response.
+        status: i32,
+        /// Human-readable reason from the Helper.
+        memo: String,
+    },
+
+    /// A Helper answered a recovery share request with a share that cannot
+    /// be part of the recovered secret (Owner side). `reason` says how it
+    /// failed; see [`CorruptionReason`].
+    ///
+    /// The share is set aside: it is never used for reconstruction, does not
+    /// count towards `shares_received`, and cannot block the recovery — the
+    /// other Helpers' shares still complete it. A share that fails on its
+    /// own ([`CorruptionReason::Malformed`],
+    /// [`CorruptionReason::InvalidProof`]) is reported as it arrives; one that
+    /// only disagrees with the rest ([`CorruptionReason::Inconsistent`]) is
+    /// reported alongside [`Self::SecretRecovered`], once per Helper.
+    ///
+    /// An honest Helper never sends a corrupted share, so the application may
+    /// treat this as a sign that the Helper's device or storage is damaged or
+    /// compromised — for example by offering to unpair it. It also answers
+    /// the [`Self::RecoverSecretStarted`] issued for `channel_id`.
+    RecoveryShareCorrupted {
+        channel_id: ChannelId,
+        version: u32,
+        reason: CorruptionReason,
     },
 
     /// Recovery completed — the reconstructed
@@ -1194,8 +1334,8 @@ pub enum DeRecEvent {
     },
 
     /// A verify-share challenge was dispatched to `channel_id` for
-    /// `version`. Followed by [`Self::ShareVerified`] once the helper
-    /// responds.
+    /// `version`. Followed by [`Self::ShareVerified`] or
+    /// [`Self::ShareVerifyRejected`] once the helper responds.
     VerifySharesStarted {
         channel_id: ChannelId,
         version: u32,
@@ -1216,8 +1356,9 @@ pub enum DeRecEvent {
 
     /// A recovery share request was dispatched to `channel_id` for
     /// `version`. Followed by [`Self::RecoveryShareReceived`] /
-    /// [`Self::RecoveryShareError`] / [`Self::SecretRecovered`] as
-    /// helper responses arrive.
+    /// [`Self::RecoveryShareError`] / [`Self::RecoveryShareRefused`] /
+    /// [`Self::RecoveryShareCorrupted`] / [`Self::SecretRecovered`] as helper
+    /// responses arrive.
     RecoverSecretStarted {
         channel_id: ChannelId,
         version: u32,
@@ -1273,10 +1414,8 @@ pub enum DeRecEvent {
         trace_id: u64,
     },
 
-    /// An update-channel-info exchange failed for `channel_id`: either an
-    /// outbound request could not be dispatched, or an inbound request
-    /// announcing an unservable transport switch was refused (see
-    /// [`crate::Error::NoUsableEndpoint`]).
+    /// An update-channel-info request could not be dispatched to
+    /// `channel_id`.
     UpdateChannelInfoFailed {
         channel_id: ChannelId,
         error: String,

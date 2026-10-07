@@ -217,8 +217,10 @@ loop {
                 for entry in &secret.secrets {
                     println!("recovered {} ({}B)", entry.name, entry.data.len());
                 }
-                // Commit the recovered Secret into this fresh protocol's
-                // stores. Wipes the throwaway recovery-mode channels and
+                // Nothing has been written yet: show the user what was
+                // recovered, or ask them, before committing it. `restore`
+                // commits the recovered Secret into this fresh protocol's
+                // stores, wipes the throwaway recovery-mode channels and
                 // reseats canonical helper / replica state at the recovered
                 // version. See `DeRecProtocol::restore`.
                 protocol.restore(&secret, recovered_version).await?;
@@ -279,7 +281,6 @@ Optional setters have defaults:
 | Setter | Default | Purpose |
 |--------|---------|---------|
 | `with_threshold(n)` | `3` | Minimum shares required to reconstruct the secret. |
-| `with_keep_versions_count(n)` | `3` | Number of recent versions each helper must retain. |
 | `with_timeouts(timeouts)` | see [Timeouts](#timeouts) | All four waiting periods in one call; unspecified fields keep their default. `inbound_message` 300s is the staleness/replay window, `sharing_round` and `unpair_ack` 60s are liveness budgets, `expired_channels` `Enabled { 300 }` sweeps channels awaiting fingerprint confirmation. |
 | `with_unsafe_connection(bool)` | `false` | Accept plaintext `http://` and `grpc://` endpoints. **Development only.** Loopback is accepted for your own endpoint regardless; see [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
@@ -320,13 +321,27 @@ before any target-level events are emitted.
 - `PairingCompleted { channel_id, kind, peer_communication_info }`
 - `ShareStored { channel_id, version }` / `ShareConfirmed { … }` /
   `ShareRejected { … }` / `SharingComplete { … }`
-- `ShareVerified { channel_id, version }`
+- `ShareVerified { channel_id, version }` /
+  `ShareVerifyRejected { channel_id, version, status, memo }`
 - `SecretsDiscovered { channel_id, secrets }`
 - `RecoveryShareReceived { … }` /
   `SecretRecovered { secret: Secret }` (typed; `secret.secrets` is the
   list of `UserSecret` the owner protected, alongside the captured
   helper/replica roster) /
-  `RecoveryShareError { … }`
+  `RecoveryShareError { … }` /
+  `RecoveryShareRefused { channel_id, version, status, memo }` — a helper
+  answered with a non-OK status (e.g. `UNKNOWN_SHARE_VERSION`) instead of a
+  share; it is not collected and the recovery stays open for the others
+- `RecoveryShareCorrupted { channel_id, version, reason }` — a helper
+  answered with a share that cannot be part of the secret. `reason` is a
+  `CorruptionReason`: `Malformed` (no decodable share for the requested
+  secret and version) or `InvalidProof` (the share fails its own Merkle
+  proof, e.g. a tampered value), both reported as the share arrives; or
+  `Inconsistent` (valid on its own, but its commitment root or ciphertext
+  disagrees with the shares the secret was rebuilt from), reported alongside
+  `SecretRecovered`. The share is set aside and never blocks the recovery.
+  An honest helper never sends one, so the app may treat it as a sign of a
+  damaged or compromised helper — e.g. offer to unpair it
 - `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }` /
   `UnpairFailed { channel_id, error }` — emitted by `restore` when an
   ephemeral recovery channel's teardown could not be delivered. The
@@ -357,6 +372,29 @@ before any target-level events are emitted.
 
 See [`DeRecEvent`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html)
 for the complete enum and per-variant docs.
+
+### When `process` fails
+
+Each `process` call first settles any expired deadlines (sharing-round
+and unpair timeouts) and saves the result, then handles the message. If
+the message then fails, the deadlines stay settled and are never reported
+again, so the error carries them: `ProcessError::events` holds every event
+the call produced before failing, and `ProcessError::channel_id` names the
+channel the message came from (`None` when the bytes were not a decodable
+envelope). Handle those events exactly as a successful call's events, then
+handle the error.
+
+```rust,ignore
+match protocol.process(&bytes).await {
+    Ok(events) => handle(events),
+    Err(error) => {
+        handle(error.events);
+        report(error.channel_id, error.source);
+    }
+}
+```
+
+Every SDK carries the same two fields on its `process` error.
 
 ### Channel roles
 
@@ -685,6 +723,13 @@ Confirmation is also the moment the peer becomes reachable, so the current
 snapshot is published to it then — a `NoKeys` helper was not an eligible
 target at handshake time, and the pairing-time auto-publish skipped it.
 
+On a replica **destination**, confirming is also the decision to adopt the
+group's vault. Once the channel is `Paired`, the source's publish is
+installed into this device's stores as it arrives, with no further prompt.
+Ask the user whether to adopt the vault before calling `verify_fingerprint`;
+to decline, never confirm, and the channel stays `Pending`, unused, until
+expired-channel cleanup removes it.
+
 ### Secret distribution
 
 Once the destination is paired (status `Paired`), the source includes it
@@ -743,6 +788,43 @@ Two things follow for application authors:
 
 A helpers-only round is unaffected and completes as soon as the helpers
 answer.
+
+#### Version conflicts: what the application must do
+
+Every member derives the next version from the one it holds, and a newer
+version replaces an older one wherever it lands. Two copies of the **same**
+version collide, and the library reports the collision instead of merging:
+
+- the member that received a rival copy emits `ReplicaVersionConflict`,
+  carrying the rival's full state in `secret`, and keeps its own copy;
+- the member whose copy was refused emits `ReplicaSyncRejected` with status
+  `VERSION_CONFLICT`.
+
+This does not need two devices to be edited at the same moment. A member
+that was offline while another published, and then protects a change of its
+own, publishes the same version as a rival copy.
+
+From either event until the conflict is resolved, the device's copy has
+diverged from the group's. **Do not publish from it again until the user has
+resolved the conflict.** A further `ProtectSecret` writes a higher version,
+which every other member applies over its own copy: the change it never
+merged is lost, from the members and, on that round, from the helpers.
+
+To resolve:
+
+1. Mark the vault as diverged and stop offering `ProtectSecret` on this
+   device.
+2. Get the rival copy. `ReplicaVersionConflict` already carries it in
+   `secret`. After `ReplicaSyncRejected`, run `ReplicaDiscovery`: the group's
+   copy arrives as a `ReplicaVersionConflict`.
+3. Show the user both copies — this device's, from its own stores, and the
+   rival's — and let them merge them or keep one.
+4. Publish the result once with `ProtectSecret`. It writes the next version,
+   which every member and helper takes, and the conflict is resolved. To keep
+   the rival's copy unchanged, publish its secrets.
+
+A member that changes its endpoint or `communication_info` announces it by
+publishing too; see [On a replica member](#on-a-replica-member).
 
 ---
 
@@ -849,6 +931,51 @@ data. Two ways to get this wrong, both of which have shipped:
 - **Asserting the two are equal** fires on the ordinary case of a helper
   holding someone else's share.
 
+### Share store: the owner's keep list
+
+Every `StoreShareRequestMessage` carries a `keepList`: the complete set of
+versions the helper keeps. A helper deletes every stored version not on it
+(through `remove_versions`) once the incoming share is stored. An empty
+`keepList` deletes nothing: the helper keeps every version it holds.
+
+The owner builds that list by asking its share store once per sharing round,
+before anything is sent, through
+[`DeRecShareStore::keep_list`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html#tymethod.keep_list)`(secret_id, version)`,
+where `version` is the version about to be distributed. Every round asks,
+whether the application started it with `ProtectSecret` or the library did
+(the pair-completion and fingerprint-confirmation publishes), and every
+helper in the round receives the same list.
+
+- `Some(list)`: helpers keep exactly `list` plus `version`. The library always
+  adds `version`, removes duplicates and sorts the list.
+- `None`: no `keepList` is sent (it goes out empty), so helpers keep every
+  version they hold. An application that wants to cap how many versions
+  helpers retain returns that cap from `keep_list` as a list.
+
+Only the application knows which versions committed: it learns that from
+`SharingComplete { threshold_met }` and `ShareConfirmed`, and nothing in the
+stores records it. The rule for a list is to keep every version that could
+still become the latest:
+
+- **List every version that committed**, such as those whose
+  `SharingComplete` reported `threshold_met`. The version being sent has not
+  committed yet when `keep_list` is asked, and its round may never reach
+  threshold, so the latest committed version must stay listed.
+- **List every version whose round is still open.** If the owner sends v5
+  while v4's round is open and leaves v4 out, helpers delete v4's share. If
+  v5 then fails and v4 commits, the version the owner considers latest is
+  gone from those helpers.
+- **Leave out only versions whose round failed, or that the user rolled
+  back.**
+
+A replica member publishing as the source cannot tell which versions it
+mirrored had committed on the previous source. Listing every mirrored version
+it holds is safe: at worst helpers keep a version that was rolled back.
+
+Helpers delete everything that is not listed, so a list that leaves out too
+much can make the secret unrecoverable. Replica pushes never consult `keep_list` and always
+send an empty `keepList`.
+
 ### Transport: implement `SendOne`, not `send`
 
 `DeRecTransport::send` receives *every* endpoint a peer advertised and leaves
@@ -946,7 +1073,7 @@ worth sharing, since it is typically a pooled client.
 Public errors are structured and typed:
 
 - [`Error`](https://docs.rs/derec-library/latest/derec_library/enum.Error.html) — the library-level error type returned by most calls.
-- [`ProcessError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/struct.ProcessError.html) — wraps `Error` with the `channel_id` an inbound message was processed against (if known).
+- [`ProcessError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/struct.ProcessError.html) — wraps `Error` with the `channel_id` an inbound message was processed against (if known) and the `events` the call produced before failing. See [When `process` fails](#when-process-fails).
 - [`ChannelStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.ChannelStoreError.html), [`ShareStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.ShareStoreError.html), [`SecretStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.SecretStoreError.html) — surfaced by storage trait implementations.
 
 The protocol never panics on malformed input. Inbound parsing or decryption
@@ -1127,28 +1254,30 @@ Every SDK exposes the same correlation primitive: `Envelope.ReadTraceId`
 
 ### Updating channel info post-pairing
 
-A peer's `communication_info` and transport endpoint are exchanged at pairing
-time. To propagate later changes, mutate local state with
-`DeRecProtocol::set_communication_info` / `set_own_transport` and then run
+A peer's `communication_info` and transport endpoints are exchanged at
+pairing time. To propagate later changes, mutate local state with
+`DeRecProtocol::set_communication_info` / `set_own_transports` and then run
 `start(DeRecFlow::UpdateChannelInfo { ... })` against the target channels.
 Per-field semantics:
 
 - `communication_info: Option<HashMap<String, String>>` — `None` leaves the
   peer's stored map untouched. `Some(_)` replaces it; an empty map clears it.
-- `transport_protocol: Option<TransportProtocol>` — `None` leaves it
-  untouched. `Some(_)` updates both URI and protocol.
+- `own_transports: Vec<TransportProtocol>` — empty leaves the peer's stored
+  endpoints untouched; otherwise it replaces them, in preference order.
+
+`UpdateChannelInfo` reaches helper channels only. A replica member announces
+a change by publishing instead — see
+[On a replica member](#on-a-replica-member) below.
 
 The flow is symmetric — either Owner or Helper may initiate it — and
 auto-applies on the receiver via the standard `ActionRequired` → `accept`
 path. Outcome surfaces as `DeRecEvent::ChannelInfoUpdated` (or
 `ChannelInfoUpdateRejected` if the peer refused).
 
-A switch to a transport the receiving side serves no endpoint for is
-**refused, not recorded**: the receiver answers
-`StatusEnum::UNSUPPORTED_TRANSPORT_PROTOCOL` over the previous — still
-working — endpoint, and the initiator sees `ChannelInfoUpdateRejected`.
-Recording it would have pointed every later message at an address the
-receiver cannot deliver to, with nothing to indicate it.
+The receiver filters the announced endpoints with its transport policy when
+it accepts the update, exactly as it filters a peer's endpoints at pairing.
+Which transports the receiver serves itself has no bearing on where the peer
+may listen.
 
 > [!WARNING]
 > **Endpoint changeover discipline.** When `transport_protocol` is updated,
@@ -1159,8 +1288,54 @@ receiver cannot deliver to, with nothing to indicate it.
 > `ChannelInfoUpdated` / `ChannelInfoUpdateRejected` (plus a grace window
 > for in-flight messages from peers not yet aware of the update). Failing
 > to keep both endpoints reachable during this window will cause messages
-> to be lost. See the rustdoc on `set_own_transport` / `set_own_transports`
-> for details.
+> to be lost. See the rustdoc on `set_own_transports` for details.
+
+#### On a replica member
+
+Replica members do not exchange `UpdateChannelInfo`. A member's endpoints and
+`communication_info` travel in the group roster, and a member's own row is
+refreshed from its current configuration each time it publishes. Every member
+that receives the publish takes the roster as authoritative and records the
+new values. A member that changes either one therefore announces it in two
+steps:
+
+1. **Publish a new version** with `ProtectSecret` — the same secrets are
+   fine. Every replica records the member's new row, so any of them can take
+   over immediately, and the helpers receive a roster that is recoverable with
+   the new values. The version is new, and so is the helper re-share round; a
+   roster that must be recoverable has to reach the helpers anyway.
+2. **Run `UpdateChannelInfo` against the helpers.** A helper cannot read the
+   roster — it holds an encrypted share — so it learns the new endpoint only
+   from this flow.
+
+The order is the application's choice: publishing first lets the replicas
+follow at once. Until enough peers have the update, keep the old endpoint
+serving:
+
+- **Advertise only the new endpoint, keep the old one serving.** A device
+  advertises at most one endpoint per protocol, so the old one is not listed;
+  it simply keeps answering until peers stop using it. A peer that already has
+  the update answers on the new endpoint and drops the old one.
+- **Switch endpoints before step 1.** Call `set_own_transports` with the new
+  endpoint before publishing: the member's roster row is taken from it. In
+  step 1, helpers still hold the old endpoint. To have their answers come
+  back on the new one, build the protocol with `with_auto_reply_to(true)`:
+  every round then carries `reply_to` set to the current own transports,
+  which `set_own_transports` has just changed. There is no per-round
+  `reply_to` on `ProtectSecret`; this flag is how every SDK sets it
+  (`withAutoReplyTo`, `WithAutoReplyTo`, Go's `Config.AutoReplyTo`).
+  Without it, helpers answer on the old endpoint, which is why it keeps
+  serving.
+- **Enough peers, not all.** Wait until enough helpers to recover the secret,
+  and the replicas the application relies on, have confirmed. Retry the rest,
+  or suggest a new round later; how long the old endpoint stays up is the
+  application's decision.
+- **A member that missed step 1 still holds the old row.** If it publishes
+  before catching up, its roster carries the old values back to everyone. Its
+  version collides with the new one, so the rule in
+  [Version conflicts](#version-conflicts-what-the-application-must-do)
+  applies: it must not publish until it has caught up, and the application
+  can retry the update once it has.
 
 ---
 
@@ -1542,8 +1717,30 @@ let response::ProduceResult { envelope: response_envelope } = response::produce(
 ).unwrap();
 ```
 
-Owner side — decrypt each helper response, reconstruct the secret once enough
-have arrived:
+Through the protocol layer, `start(DeRecFlow::RecoverSecret { .. })` asks
+every paired helper for its share and `process` tries to reconstruct as each
+one arrives. A corrupted share is reported per helper and set aside rather
+than allowed to block the recovery:
+
+- On arrival, each share is checked on its own: it must decode, belong to the
+  requested secret and version, and pass its Merkle proof. A share that fails
+  is reported as `RecoveryShareCorrupted` (`Malformed` / `InvalidProof`) and
+  never collected.
+- Shares that are each valid can still disagree, carrying different
+  commitment roots or ciphertexts. They are grouped by `(root, ciphertext)`
+  and the groups are tried largest first (ties go to the group whose first
+  share arrived earliest); the first that reconstructs is the secret, so the
+  shares used always agree. Every share outside it is reported as
+  `RecoveryShareCorrupted` (`Inconsistent`), once per helper, alongside
+  `SecretRecovered`. No group is ever reconstructed from a single share.
+
+Since an honest helper never sends a corrupted share, the application may
+take `RecoveryShareCorrupted` as a sign that the helper's device or storage is
+damaged or compromised, and offer to unpair it. A share that arrives after the
+recovery completed finds no open recovery and is dropped unreported.
+
+Owner side, at the primitive level — decrypt each helper response,
+reconstruct the secret once enough have arrived:
 
 ```rust,ignore
 use derec_library::primitives::recovery::response;

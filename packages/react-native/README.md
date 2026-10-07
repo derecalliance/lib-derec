@@ -125,6 +125,27 @@ longer needed (safe to call more than once).
 
 ---
 
+## When `process()` fails
+
+`process()` settles expired deadlines (sharing-round and unpair timeouts)
+before it handles the message, and those are never reported again. So when
+the message then fails, the thrown `DeRecError` carries them: `events` holds
+every event produced before the failure, and `channel_id` names the channel
+the message came from (absent when the bytes were not a decodable envelope).
+Handle the events as you would a successful call's, then the error:
+
+```ts
+try {
+  handle(await protocol.process(bytes));
+} catch (error) {
+  const failure = error as DeRecError;
+  handle(failure.events ?? []);
+  report(failure.channel_id, failure);
+}
+```
+
+---
+
 ## Store interfaces
 
 The application layer owns all persistence; the library never writes to disk
@@ -134,6 +155,9 @@ declared in `src/types.ts`:
 - **`ChannelStore`** — pairing state: helper channels and replica-group
   membership, keyed by `(channelId, replicaId)`.
 - **`ShareStore`** — versioned VSS shares this device holds as a helper.
+  On an owner, `keepList` chooses which versions helpers keep; returning
+  `null` sends no keepList, so helpers keep every version; see
+  [the owner's keep list](https://github.com/derecalliance/lib-derec/tree/main/library#share-store-the-owners-keep-list).
 - **`SecretStore`** — small per-channel key material (shared keys, etc.),
   distinct from share bytes.
 - **`UserSecretStore`** — the most recent user-facing secret snapshot per
