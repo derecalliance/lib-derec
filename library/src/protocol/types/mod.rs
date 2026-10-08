@@ -926,9 +926,11 @@ pub enum SecretKind {
     SharedKey = 0,
     /// The ephemeral ECIES / ML-KEM key material used during pairing.
     PairingSecret = 1,
-    /// The initiator's [`ContactMessage`] stored transiently between
-    /// `start` and pairing completion. Removed once the shared key
-    /// is derived.
+    /// The [`ContactMessage`] a pairing runs against, stored transiently
+    /// until pairing completes: by the party that scans a contact when it
+    /// starts pairing, and by the contact creator for a `NoKeys` contact,
+    /// which has no key material to store instead. Removed once the shared
+    /// key is derived.
     PairingContact = 2,
 }
 

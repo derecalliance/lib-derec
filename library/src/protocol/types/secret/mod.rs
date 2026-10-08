@@ -19,7 +19,7 @@
 //! The leading byte is the encoding **major version**; it is read *before*
 //! decompression, so a future version may change the compression as well as the
 //! JSON schema. The version for that byte selects the handler that owns both.
-//! Only breaking changes bump the major (currently `1`); backward-compatible
+//! Only breaking changes bump the major (currently `3`); backward-compatible
 //! additions are absorbed within a major by the decoder's field tolerance. A
 //! new major is minted only as part of a breaking DeRec protocol change that
 //! alters the secret, so it moves in lockstep with the protocol majors that
@@ -31,7 +31,10 @@
 //! never appears in the protobuf form used for the internal replica-sync message
 //! ([`ReplicaSecretPayload`](crate::protocol::types::ReplicaSecretPayload)).
 //!
-//! # v2 payload
+//! Encodes always write the latest major; the decoder accepts majors `3` and
+//! `2` and rejects every other value.
+//!
+//! # v3 payload
 //!
 //! `payload = gzip(json(secret))` (RFC 1952). Byte fields are standard-padded
 //! base64 (RFC 4648 §4), `u64` fields are decimal strings, keys are snake_case,
@@ -40,14 +43,28 @@
 //!
 //! ```text
 //! Secret      { helpers:[Helper], secrets:[UserSecret], replicas?:Replicas }
-//! Helper      { channel_id:str<u64>, transport_uri:str, shared_key:base64,
+//! Helper      { channel_id:str<u64>, transports:[Endpoint], shared_key:base64,
 //!               communication_info?:{str:str} }
 //! UserSecret  { id:base64, name:str, data:base64 }
 //! Replicas    { members:[ReplicaInfo], shared_key:base64,
 //!               channel_id:str<u64> }
-//! ReplicaInfo { replica_id:str<u64>, transport_uri:str, role:int,
+//! ReplicaInfo { replica_id:str<u64>, transports:[Endpoint],
+//!               role:"Source"|"Destination",
 //!               communication_info?:{str:str} }
+//! Endpoint    { uri:str, protocol:int }
 //! ```
+//!
+//! `transports` lists every endpoint the peer advertised, in its preference
+//! order; `protocol` is the `TransportProtocol` discriminant.
+//!
+//! ## What changed from v2
+//!
+//! v2 stored a single `transport_uri` string per roster entry, so a peer
+//! reachable on several transports could not be represented, and the protocol
+//! had to be inferred from the URI scheme. v3 stores every endpoint with its
+//! discriminant. A v2 payload still decodes: each URI becomes a one-element
+//! list with the protocol taken from its scheme, and a URI that names no known
+//! transport yields an entry with no endpoints.
 //!
 //! ## What changed from v1, and why v1 does not decode
 //!
@@ -70,8 +87,8 @@
 //!
 //! # Conformance
 //!
-//! Golden vectors (a canonical [`Secret`] paired with its exact v2 JSON) live
-//! under `library/tests/golden/`. gzip *decoding* is universal but *encoding*
+//! Golden vectors (a canonical [`Secret`] paired with its exact v3 JSON, plus v2
+//! vectors for the decode path) live under `library/tests/golden/`. gzip *decoding* is universal but *encoding*
 //! is not byte-stable, so conformance is defined on the JSON (pre-gzip).
 
 mod codec;

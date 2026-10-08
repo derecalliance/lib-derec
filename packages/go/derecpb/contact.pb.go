@@ -93,7 +93,7 @@ type ContactMessage struct {
 	// Selects how the public encryption material is delivered. Defaults to
 	// `INLINE_KEYS` (current behavior) when unset.
 	ContactMode ContactMode `protobuf:"varint,1,opt,name=contactMode,proto3,enum=org.derecalliance.derec.protobuf.ContactMode" json:"contactMode,omitempty"`
-	// Serialized ML-KEM-768 encapsulation key.
+	// Serialized ML-KEM-1024 encapsulation key.
 	//
 	// Present only when `contactMode == INLINE_KEYS`. Used by
 	// the recipient to construct the initial pairing message.

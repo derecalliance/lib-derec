@@ -127,7 +127,7 @@ message ContactMessage {
   // `INLINE_KEYS` (current behavior) when unset.
   ContactMode contactMode = 1;
 
-  // Serialized ML-KEM-768 encapsulation key.
+  // Serialized ML-KEM-1024 encapsulation key.
   //
   // Present only when `contactMode == INLINE_KEYS`. Used by
   // the recipient to construct the initial pairing message.

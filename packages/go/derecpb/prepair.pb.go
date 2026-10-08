@@ -198,7 +198,7 @@ type PrePairResponseMessage struct {
 	// key fields below are present. On any non-`Ok` status, the key fields
 	// MUST be absent.
 	Result *DeRecResult `protobuf:"bytes,1,opt,name=result,proto3" json:"result,omitempty"`
-	// Serialized ML-KEM-768 encapsulation key. Present only when
+	// Serialized ML-KEM-1024 encapsulation key. Present only when
 	// `result.status == OK`.
 	MlkemEncapsulationKey []byte `protobuf:"bytes,2,opt,name=mlkemEncapsulationKey,proto3,oneof" json:"mlkemEncapsulationKey,omitempty"`
 	// Serialized ECIES public key. Present only when

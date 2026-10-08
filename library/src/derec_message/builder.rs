@@ -396,8 +396,8 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
     /// Encrypts the encoded payload using channel encryption.
     ///
     /// This method is only available on builders created in [`ChannelMode`].
-    /// The nonce is derived from the channel ID by placing the big-endian
-    /// `u64` channel identifier into the last 8 bytes of a 32-byte nonce.
+    /// Every call draws a fresh random 96-bit AES-GCM nonce from the operating
+    /// system's random number generator; it is prepended to the ciphertext.
     ///
     /// After successful encryption, the builder transitions to the
     /// [`Encrypted`] state, enabling [`build`](DeRecMessageBuilder::build).

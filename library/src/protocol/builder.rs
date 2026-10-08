@@ -242,11 +242,19 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
 
     /// Whether the protocol replies to peers on inbound processing failures.
     ///
-    /// - `true`: on a failed inbound request (e.g. format errors, decryption
-    ///   failures), the protocol automatically sends a failure response to the
-    ///   peer.
-    /// - `false`: inbound processing errors are only surfaced as events and no
-    ///   response is sent — the application decides how to respond.
+    /// - `true`: when an inbound request fails after it was decrypted, the
+    ///   protocol also sends the peer a response with a non-`Ok` status
+    ///   (`FORMAT_ERROR` for a decode failure, `REJECTED` for a role mismatch,
+    ///   `UNSUPPORTED_TRANSPORT_PROTOCOL` when no endpoint is usable, `FAIL`
+    ///   otherwise). [`DeRecProtocol::process`] still returns the error.
+    /// - `false`: the failure is only returned from
+    ///   [`DeRecProtocol::process`] and nothing is sent — the application
+    ///   decides how to respond.
+    ///
+    /// A message that fails to decrypt is never answered: it carries no proof
+    /// of who sent it, and replying would make this device a decryption
+    /// oracle. The reply is best effort; failing to send it does not replace
+    /// the original error.
     ///
     /// Default: `false`.
     pub fn with_auto_respond_on_failure(mut self, enabled: bool) -> Self {
@@ -268,25 +276,25 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         self
     }
 
-    /// Whether outbound requests carry an ephemeral `replyTo` set to this
-    /// node's own transport endpoint.
+    /// Whether outbound requests carry `replyToTransports` set to this
+    /// node's own transport endpoints.
     ///
-    /// - `true`: every outbound request envelope stamps
-    ///   `request.replyTo = own_transport`. The responder routes its
-    ///   response to that endpoint, ignoring the channel's stored peer
-    ///   endpoint. Useful when two peers share a channel record but reach
-    ///   out from different endpoints (e.g. replicas talking to a helper
-    ///   that was paired with a sibling replica) — without this, the
-    ///   responder would reply to the sibling.
-    /// - `false`: outbound requests leave `replyTo` unset. The responder
-    ///   routes to the channel's stored endpoint, which is correct for the
-    ///   single-device case.
+    /// - `true`: every outbound request stamps `replyToTransports` with the
+    ///   current own transports (see [`Self::with_own_transports`]). The
+    ///   responder routes its response to those endpoints, ignoring the
+    ///   channel's stored peer endpoints. Useful when two peers share a
+    ///   channel record but reach out from different endpoints (e.g. replicas
+    ///   talking to a helper that was paired with a sibling replica) — without
+    ///   this, the responder would reply to the sibling.
+    /// - `false`: outbound requests leave `replyToTransports` empty. The
+    ///   responder routes to the channel's stored endpoints, which is correct
+    ///   for the single-device case.
     ///
     /// Only affects outbound requests originated through
     /// [`DeRecProtocol::start`], and only on channel-mode flows: pairing
-    /// carries its endpoints in its own `transportProtocol` field and is
-    /// unaffected. Responders always honour an inbound `replyTo` regardless
-    /// of this flag (it is purely a per-request hint on the wire).
+    /// carries its endpoints in its own `supportedTransports` field and is
+    /// unaffected. Responders always honour an inbound `replyToTransports`
+    /// regardless of this flag (it is purely a per-request hint on the wire).
     ///
     /// Default: `false`.
     pub fn with_auto_reply_to(mut self, enabled: bool) -> Self {
@@ -611,9 +619,12 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// Set every transport endpoint this application serves, in preference
     /// order.
     ///
-    /// The order is meaningful: it is what decides which of a peer's offered
-    /// endpoints gets used. The first entry is also this device's primary
-    /// endpoint.
+    /// The order is meaningful: peers record these endpoints in this order,
+    /// and their transport receives them in it, so it is the order in which
+    /// they try to reach this device (the default
+    /// [`SequentialFailover`](crate::protocol::SequentialFailover) tries them
+    /// in turn). The library itself does not rank endpoints. The first entry
+    /// is also this device's primary endpoint.
     ///
     /// Because delivery is push-only, an endpoint listed here is one this
     /// application must actually **serve** — a peer can only reply to an
@@ -644,9 +655,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         I: IntoIterator<Item = T>,
         T: crate::transport::IntoOwnTransport,
     {
-        // Same error-deferral shape as `with_own_transport`: stash the
-        // fallible conversion, surface failures from `.build()`, keep the
-        // setter chain infallible.
+        // Stash the fallible conversion, surface failures from `.build()`,
+        // keep the setter chain infallible.
         let own_transports: Result<Vec<_>, _> = transports
             .into_iter()
             .map(crate::transport::IntoOwnTransport::into_own_transport)

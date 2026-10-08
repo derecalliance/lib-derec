@@ -7,6 +7,43 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
+### Unreleased
+
+- **Added (Go): the gRPC transport service descriptor.** *(Go)*
+
+  `derecpb` now includes `derectransport.pb.go`, generated from the optional
+  `DeRecTransport` gRPC service, so the module carries generated code for every
+  `.proto` it ships. It exports `File_derectransport_proto` and registers the
+  service descriptor; it has no client or server code. A Go application that
+  serves the transport over gRPC generates only the stubs
+  (`protoc-gen-go-grpc`) with the messages mapped to `derecpb`, and must not
+  generate `derectransport.pb.go` into its own package as well.
+
+- **Docs: stale API and format descriptions corrected.** *(docs; every SDK)*
+  - **Recoverable secret format:** the `protocol::types::secret` module
+    documented major version 1 and the v2 schema; it now documents the
+    current v3 schema (`transports`, `role` as `"Source"` / `"Destination"`),
+    what changed from v2, and that majors 3 and 2 decode.
+  - **Builder setters:** `with_auto_respond_on_failure` now says only
+    failures after decryption are answered, with the status each maps to,
+    and that `process` still returns the error. `with_auto_reply_to` names
+    `replyToTransports`. `with_own_transports` says the library does not rank
+    endpoints; peers try them in the listed order.
+  - **`UpdateChannelInfo`:** reaches helper channels only, and replica
+    members announce changes by publishing a new version. Removed mentions of
+    the former `transport_protocol` field.
+  - **Channel encryption:** the nonce is random per message, not derived from
+    the channel id.
+  - **Sizes and algorithms:** an InlineKeys contact is about 1.7 KB, not
+    1.2 KB. The ML-KEM parameter set is ML-KEM-1024, not 768, in the
+    `.proto` comments and the TypeScript declarations. The commitment Merkle
+    tree uses SHA-256, not SHA-384, in `committedderecshare.proto`.
+  - **`UnpairRequestMessage.replicaId`:** names the member being removed,
+    not the sender.
+  - **`SecretKind::PairingContact`:** is written by the party that scans a
+    contact and by the creator of a `NoKeys` contact.
+  - **TypeScript `DeRecError.channel_ids`:** refers to `restore_conflict`.
+
 ### 0.0.8
 
 Every random value the library produces now comes straight from the operating

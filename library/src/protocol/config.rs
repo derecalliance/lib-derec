@@ -113,7 +113,7 @@ impl<
     ///
     /// - [`ContactMode::InlineKeys`] embeds the initiator's ML-KEM + ECIES
     ///   public keys directly in the contact. Simplest to use; the contact is
-    ///   ~1.2 KB.
+    ///   ~1.7 KB.
     /// - [`ContactMode::HashedKeys`] embeds only a SHA-384 binding hash over
     ///   the keys. The contact stays small enough for a QR code; the scanner
     ///   obtains the real keys via a `PrePair` round-trip and validates them
