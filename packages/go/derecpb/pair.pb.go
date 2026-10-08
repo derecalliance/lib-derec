@@ -155,7 +155,7 @@ type PairRequestMessage struct {
 	// Recovery mode has special semantics for how Helpers associate this
 	// pairing with existing stored secrets.
 	SenderKind SenderKind `protobuf:"varint,1,opt,name=senderKind,proto3,enum=org.derecalliance.derec.protobuf.SenderKind" json:"senderKind,omitempty"`
-	// ML-KEM-768 ciphertext.
+	// ML-KEM-1024 ciphertext.
 	//
 	// This ciphertext is generated using the responder's ML-KEM public key
 	// obtained from the ContactMessage. It is used to establish shared

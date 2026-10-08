@@ -32,7 +32,7 @@ const (
 //
 // The commitment uses a Merkle tree. The hash of the share given to each
 // helper forms a leaf in the tree. Each leaf and internal node hash is a
-// SHA-384 hash.
+// SHA-256 hash.
 //
 // The Merkle path from a leaf to the root (i.e., the sibling nodes along
 // that route) is called merklePath. The root hash is referred to as the

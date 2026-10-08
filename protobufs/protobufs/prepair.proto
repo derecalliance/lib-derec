@@ -136,7 +136,7 @@ message PrePairResponseMessage {
   // MUST be absent.
   DeRecResult result = 1;
 
-  // Serialized ML-KEM-768 encapsulation key. Present only when
+  // Serialized ML-KEM-1024 encapsulation key. Present only when
   // `result.status == OK`.
   optional bytes mlkemEncapsulationKey = 2;
 

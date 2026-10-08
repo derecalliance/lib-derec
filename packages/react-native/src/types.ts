@@ -1584,7 +1584,7 @@ export interface PrePairResponseExtractResult {
 
 export interface ProcessPrePairResult {
 
-  /** Initiator's ML-KEM-768 encapsulation key, validated against the
+  /** Initiator's ML-KEM-1024 encapsulation key, validated against the
    * contact's `contactBindingHash`. */
   mlkem_encapsulation_key: Uint8Array;
 

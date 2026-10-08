@@ -288,14 +288,14 @@ pub enum PendingAction {
         trace_id: u64,
     },
     /// The peer has announced an update to their communication info and/or
-    /// transport endpoint.
+    /// transport endpoints.
     ///
     /// Calling [`super::DeRecProtocol::accept`] on this action does the
     /// state mutation **for you**: the orchestrator writes the new fields
     /// onto the stored [`crate::protocol::types::HelperChannel`] and sends back
-    /// an `Ok` response. When `transport_protocol` is part of the update,
-    /// the response is routed to the **new** endpoint, so subsequent
-    /// outbound traffic on this channel already targets the new address.
+    /// an `Ok` response. When the update carries endpoints, the response is
+    /// routed to the **new** endpoints, so subsequent outbound traffic on this
+    /// channel already targets the new addresses.
     /// Applications do not need to call any setter themselves on the
     /// receiving side — receiving-side endpoint changeover is handled
     /// inside `accept`. The local-node endpoint setters
@@ -553,14 +553,19 @@ pub enum DeRecFlow {
         /// Pass `None` (or an empty string) to omit.
         memo: Option<String>,
     },
-    /// Broadcast updated communication info and/or transport endpoint to one
-    /// or more paired channels.
+    /// Broadcast updated communication info and/or transport endpoints to one
+    /// or more paired helper channels.
     ///
-    /// Either party may initiate. Either field may be `None` to leave it
-    /// unchanged; presence of `communication_info` (even with an empty map)
-    /// instructs the peer to replace its stored map for this channel with
-    /// the supplied one. Presence of `transport_protocol` instructs the peer
-    /// to use the new endpoint for the response and all subsequent messages.
+    /// Either party may initiate. `communication_info: None` and an empty
+    /// `own_transports` each leave that part unchanged; presence of
+    /// `communication_info` (even with an empty map) instructs the peer to
+    /// replace its stored map for this channel with the supplied one. A
+    /// non-empty `own_transports` instructs the peer to use the new endpoints
+    /// for the response and all subsequent messages.
+    ///
+    /// Replica members do not receive this flow: a member announces new values
+    /// to its group by publishing a new version, which carries its refreshed
+    /// roster row.
     ///
     /// The application is responsible for calling
     /// [`crate::protocol::DeRecProtocol::set_communication_info`] and/or
@@ -1200,7 +1205,7 @@ pub enum DeRecEvent {
     /// - Initiator: emitted by [`super::DeRecProtocol::process`] when the
     ///   peer's `Ok` response arrives.
     ///
-    /// The new `communication_info` / `transport_protocol` values are
+    /// The new `communication_info` / endpoint values are
     /// already on the local
     /// [`crate::protocol::types::HelperChannel`] by the time the event fires;
     /// applications that care about the post-update state read it from

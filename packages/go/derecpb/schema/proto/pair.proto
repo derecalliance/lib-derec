@@ -101,7 +101,7 @@ message PairRequestMessage {
   // pairing with existing stored secrets.
   SenderKind senderKind = 1;
 
-  // ML-KEM-768 ciphertext.
+  // ML-KEM-1024 ciphertext.
   //
   // This ciphertext is generated using the responder's ML-KEM public key
   // obtained from the ContactMessage. It is used to establish shared

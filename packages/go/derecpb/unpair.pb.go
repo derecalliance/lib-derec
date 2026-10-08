@@ -86,7 +86,9 @@ type UnpairRequestMessage struct {
 	//
 	// See `StoreShareRequestMessage.replyToTransports` for full semantics.
 	ReplyToTransports []*TransportProtocol `protobuf:"bytes,5,rep,name=replyToTransports,proto3" json:"replyToTransports,omitempty"`
-	// Identity of the replica-group member that initiated this unpair.
+	// Identity of the replica-group member being removed. It names the target,
+	// not the sender: a removal is announced to every member, and the target is
+	// the one value they all agree on.
 	//
 	// A replica-originated unpair MUST carry it; an owner-originated one MUST
 	// NOT. Its presence is what tells the receiver which path the message

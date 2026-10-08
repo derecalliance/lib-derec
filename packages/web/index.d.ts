@@ -1886,7 +1886,7 @@ export interface PrePairResponseExtractResult {
 
 export interface ProcessPrePairResult {
 
-  /** Initiator's ML-KEM-768 encapsulation key, validated against the
+  /** Initiator's ML-KEM-1024 encapsulation key, validated against the
    * contact's `contactBindingHash`. */
   mlkem_encapsulation_key: Uint8Array;
 
@@ -1948,7 +1948,7 @@ export interface DeRecError {
    * handle them as you would a successful call's events.
    */
   events?: DeRecEvent[];
-  /** On a `restore` `CONFLICT`: the pre-existing channels at canonical ids. */
+  /** On a `restore` `restore_conflict`: the pre-existing channels at canonical ids. */
   channel_ids?: string[];
 }
 

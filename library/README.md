@@ -594,7 +594,7 @@ travels in the `ContactMessage` and tells the scanner which handshake to run.
 
 | `ContactMode` | Contact carries | When to use |
 |---|---|---|
-| `InlineKeys` | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry ~1.2 KB (NFC, deep link, direct messaging). |
+| `InlineKeys` | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry ~1.7 KB (NFC, deep link, direct messaging). |
 | `HashedKeys` | Only a 48-byte SHA-384 commitment to the keys | Out-of-band channel is size-constrained (QR codes). The scanner fetches the real keys over the wire via a plaintext `PrePair` round-trip and verifies them against the commitment. |
 | `NoKeys` | `channel_id`, `nonce` and the transport endpoint — nothing else | Out-of-band channel is a human one: hand-typed, dictated over the phone, or an institutional email. Requires a caller-supplied `nonce`. **The channel stays unusable until the fingerprint is confirmed** — see below. |
 
