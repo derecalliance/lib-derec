@@ -57,8 +57,16 @@
 //!   // is still open; the library always adds `version`.
 //!   keepList(secretId: string, version: number): Promise<number[] | null | undefined>;
 //!   latestVersion(): Promise<number | null>;
+//!   // Called once per accepted verification challenge on a helper channel.
+//!   // Reject or throw a `shareStoreRefusal(reason)` `Error` to refuse the
+//!   // verification; any other rejection/throw is an ordinary backend
+//!   // failure.
+//!   recordVerification(secretId: string, channelId: string, version: number): Promise<void>;
 //! }
 //! ```
+//!
+//! `save` may likewise reject or throw a `shareStoreRefusal(reason)` `Error`
+//! to refuse a share update on a helper channel.
 //!
 //! ### `Transport`
 //! ```ts
@@ -76,7 +84,7 @@ use wasm_bindgen_futures::JsFuture;
 use crate::{
     Error,
     protocol::{
-        error::{ChannelStoreError, SecretStoreError, ShareStoreError, StateStoreError},
+        error::{ChannelStoreError, Refusal, SecretStoreError, ShareStoreError, StateStoreError},
         traits::{
             ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore,
             DeRecStateStore, DeRecTransport, DeRecUserSecretStore, SecretStoreFuture,
@@ -119,6 +127,55 @@ async fn resolve_promise(val: JsValue) -> Result<JsValue, String> {
     JsFuture::from(Promise::from(val))
         .await
         .map_err(|e| format!("promise rejected: {e:?}"))
+}
+
+/// Same as [`call_method`], but keeps the thrown value instead of
+/// stringifying it, so a caller can read a `refusal` property off it.
+fn call_method_value(obj: &JsValue, method: &str, args: &Array) -> Result<JsValue, JsValue> {
+    let func_val = js_sys::Reflect::get(obj, &JsValue::from_str(method))?;
+    Function::from(func_val).apply(obj, args)
+}
+
+/// Same as [`resolve_promise`], but keeps the rejection value instead of
+/// stringifying it, so a caller can read a `refusal` property off it.
+async fn resolve_promise_value(val: JsValue) -> Result<JsValue, JsValue> {
+    JsFuture::from(Promise::from(val)).await
+}
+
+/// Reads the `refusal` property a JS `ShareStore` tags its thrown/rejected
+/// value with — see [`crate::interop::wasm::ts_bindings_utils::share_store_refusal`]
+/// — and maps its wire string to a [`Refusal`]. `None` for any other shape,
+/// which callers treat as an ordinary backend failure.
+fn refusal_from_js(value: &JsValue) -> Option<Refusal> {
+    js_sys::Reflect::get(value, &JsValue::from_str("refusal"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .and_then(|reason| refusal_from_reason(&reason))
+}
+
+/// The wire-string-to-[`Refusal`] mapping [`refusal_from_js`] applies, pulled
+/// out as a pure function so it can be unit tested independently of
+/// `JsValue`.
+fn refusal_from_reason(reason: &str) -> Option<Refusal> {
+    match reason {
+        "too_frequent" => Some(Refusal::TooFrequent),
+        "size_limit_exceeded" => Some(Refusal::SizeLimitExceeded),
+        "rejected" => Some(Refusal::Rejected),
+        _ => None,
+    }
+}
+
+/// Maps a failed `save`/`recordVerification` call's thrown or rejected
+/// `JsValue` to a [`ShareStoreError`]: a recognised `refusal` tag becomes
+/// [`ShareStoreError::Refused`], anything else an ordinary
+/// [`ShareStoreError::Backend`].
+fn share_store_call_error(method: &str, value: &JsValue) -> ShareStoreError {
+    match refusal_from_js(value) {
+        Some(refusal) => ShareStoreError::Refused(refusal),
+        None => {
+            ShareStoreError::Backend(box_err(format!("share store {method} failed: {value:?}")))
+        }
+    }
 }
 
 fn decode_secret_value(kind: SecretKind, bytes: &[u8]) -> Result<SecretValue, SecretStoreError> {
@@ -689,11 +746,11 @@ impl DeRecShareStore for JsShareStore {
             args.push(&JsValue::from_str(&secret_str));
             args.push(&JsValue::from_str(&channel_str));
             args.push(&share_to_js(&share));
-            let promise_val = call_method(&obj, "save", &args)
-                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
-            resolve_promise(promise_val)
+            let promise_val = call_method_value(&obj, "save", &args)
+                .map_err(|e| share_store_call_error("save", &e))?;
+            resolve_promise_value(promise_val)
                 .await
-                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+                .map_err(|e| share_store_call_error("save", &e))?;
             Ok(())
         })
     }
@@ -848,6 +905,29 @@ impl DeRecShareStore for JsShareStore {
                 })
                 .collect::<Result<Vec<u32>, _>>()
                 .map(Some)
+        })
+    }
+
+    fn record_verification(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        version: u32,
+    ) -> ShareStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        let channel_str = channel_id.0.to_string();
+        Box::pin(async move {
+            let args = Array::new();
+            args.push(&JsValue::from_str(&secret_str));
+            args.push(&JsValue::from_str(&channel_str));
+            args.push(&JsValue::from_f64(f64::from(version)));
+            let promise_val = call_method_value(&obj, "recordVerification", &args)
+                .map_err(|e| share_store_call_error("recordVerification", &e))?;
+            resolve_promise_value(promise_val)
+                .await
+                .map_err(|e| share_store_call_error("recordVerification", &e))?;
+            Ok(())
         })
     }
 }

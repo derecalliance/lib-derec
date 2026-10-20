@@ -7,6 +7,17 @@ using System.Collections.Generic;
 namespace DeRec.Library.Orchestrator;
 
 /// <summary>
+/// The five stores <see cref="DeRecProtocolBuilder.Build"/> requires,
+/// bundled for <see cref="DeRecProtocolBuilder.WithStores"/>.
+/// </summary>
+public sealed record DeRecStores(
+    IChannelStore ChannelStore,
+    IShareStore ShareStore,
+    ISecretStore SecretStore,
+    IUserSecretStore UserSecretStore,
+    IStateStore StateStore);
+
+/// <summary>
 /// Fluent builder for <see cref="DeRecProtocol"/>. Mirrors the Rust
 /// <c>DeRecProtocolBuilder</c> method-for-method so a developer who
 /// already knows one SDK can move between them without reaching for
@@ -98,6 +109,23 @@ public sealed class DeRecProtocolBuilder
     {
         _stateStore = store ?? throw new ArgumentNullException(nameof(store));
         return this;
+    }
+
+    /// <summary>
+    /// Set every store in one call. Forwards to <see cref="WithChannelStore"/>,
+    /// <see cref="WithShareStore"/>, <see cref="WithSecretStore"/>,
+    /// <see cref="WithUserSecretStore"/> and <see cref="WithStateStore"/> in
+    /// turn, so calling one of them again afterwards replaces just that
+    /// store.
+    /// </summary>
+    public DeRecProtocolBuilder WithStores(DeRecStores stores)
+    {
+        if (stores is null) throw new ArgumentNullException(nameof(stores));
+        return WithChannelStore(stores.ChannelStore)
+            .WithShareStore(stores.ShareStore)
+            .WithSecretStore(stores.SecretStore)
+            .WithUserSecretStore(stores.UserSecretStore)
+            .WithStateStore(stores.StateStore);
     }
 
     /// <summary>Set the transport implementation. Required.</summary>
@@ -271,6 +299,12 @@ public sealed class DeRecProtocolBuilder
     /// fails to intersect rejects the pairing with
     /// <see cref="DeRecCode.IncompatibleParameterRange"/>. Default: unset —
     /// no constraints advertised, every peer range accepted.
+    /// </remarks>
+    /// <remarks>
+    /// Share size is enforced by the helper; frequency limits are enforced
+    /// by the app's share store (refuse from <c>Save</c>/
+    /// <c>RecordVerification</c>); the deletion and deactivation timeouts
+    /// are checked at pairing only.
     /// </remarks>
     public DeRecProtocolBuilder WithParameterRange(ParameterRange range)
     {

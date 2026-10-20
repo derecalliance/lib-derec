@@ -272,6 +272,32 @@ recovered, err := recovery.Response.Recover([]recovery.ShareResponse{
 > See the `derec-library` `protocol::types::secret` reference documentation
 > for the full field schema.
 
+### Helpers and shares
+
+- Each share goes to a **different** helper. Threshold security depends on it:
+  compromising one helper must yield at most one share.
+- The library hands out one share per channel per version, and every pairing
+  produces its own channel. It cannot tell whether two channels lead to the
+  same party; keeping helpers distinct is the application's job.
+- **Discouraged:** a single guardian acting as several helpers for the same
+  owner. It is against the protocol's recommendation, since one compromise
+  yields several shares. The library does not prevent it, but channel linking
+  then needs the application's help (below).
+- **Channel linking is expected to be one-to-one.** After an owner re-pairs in
+  recovery mode, the helper application links the new channel to the old one
+  with `ChannelStore.LinkChannel`. Linking assumes a helper holds **at most one share per owner
+  for a given `secretID` and version**, so each recovery channel is linked to the
+  single old channel it replaces. On `GetShare` the helper answers with
+  **one** share from the linked set: the first whose `secretID` matches the
+  request, in the order `ShareStore.LoadMany` returns. The library imposes no order. If
+  several channels holding shares for the same owner are linked to one
+  recovery channel and every recovery channel is answered from the same
+  share, the owner receives it more than once (it counts once) and can fall
+  below the threshold. An application that runs such a helper keeps each
+  recovery channel resolving to a distinct share: either links stay
+  one-to-one, or its share store returns, for each requesting channel, the
+  share intended for it first, in a deterministic order.
+
 ---
 
 ## Discovery Flow
@@ -303,7 +329,7 @@ For applications that don't want to drive the primitive produce/extract/process 
 
 ### Store interfaces
 
-`protocol.New` takes six application-supplied interfaces backing all persistence and transport:
+`protocol.New` takes six application-supplied interfaces backing all persistence and transport — the five stores bundled in a `protocol.Stores`, plus the transport:
 
 - `protocol.ChannelStore` — channel records, keyed by `(secretID, channelID, replicaID)`. A `replicaID` of `0` addresses the helper channel; any other value addresses that member of the replica group
 - `protocol.SecretStore` — pairing/session secret material
@@ -311,6 +337,8 @@ For applications that don't want to drive the primitive produce/extract/process 
 - `protocol.UserSecretStore` — the latest user-facing secret snapshot per `secretID`
 - `protocol.StateStore` — in-flight orchestrator state (pending verification/recovery/unpair/sharing rounds)
 - `protocol.Transport` — outbound delivery (`Send(endpoints []protocol.Endpoint, message []byte) error`). Implement `protocol.SendOne` for a single endpoint and wrap it in `protocol.SequentialFailover` (or `protocol.SingleEndpointTransport`); when every endpoint fails, the adapter returns the last dialer error unchanged, so `errors.Is` / `errors.As` against your own dialer errors keep working
+
+Delivery is push-only: a reply produced by `Process` is handed to `Transport.Send`, addressed to the peer's endpoint, and is never returned by `Process`, so every participant needs a reachable endpoint. Recommended HTTP conventions (not protocol requirements) are `POST`, an `application/octet-stream` body, `202 Accepted`, and `200 OK` with the reply body when answering an unreachable peer on the same connection. Only that `200 OK` same-connection answer needs matching: pick the reply that echoes the request's trace id with `envelope.ReadTraceID`. See [Transports](https://derec-alliance.gitbook.io/docs/protocol-specification/transports).
 
 #### Filtered listings
 
@@ -334,6 +362,36 @@ returns *fewer* rows than the filter selects is still wrong, in a way nothing
 in the library can detect — the protocol simply fails to act. Applying the
 filter faithfully is still your job.
 
+#### Refusing a share or a verification
+
+A helper enforces share size itself: with a parameter range configured, a
+share outside its own `MinShareSize`/`MaxShareSize` (inclusive; a max of `0` means
+unbounded) is answered with `SIZE_LIMIT_EXCEEDED` before any
+`ActionRequired` or auto-accept. Frequency limits on share updates and
+verifications are the application's to enforce, from its share store.
+
+On a helper channel, return a `*protocol.ShareStoreRefusedError` from
+`ShareStore.Save` (a genuinely new share version) or
+`ShareStore.RecordVerification` (an accepted verification challenge) to
+refuse it:
+
+```go
+func (s *store) RecordVerification(secretID, channelID uint64, version uint32) error {
+	if s.limiter.TooSoon(channelID) {
+		return &protocol.ShareStoreRefusedError{Refusal: protocol.RefusalTooFrequent}
+	}
+	return nil
+}
+```
+
+The library answers the owner with the mapped status (`RefusalTooFrequent` →
+`TOO_FREQUENT`, `RefusalSizeLimitExceeded` → `SIZE_LIMIT_EXCEEDED`,
+`RefusalRejected` → `REJECTED`), and the owner sees a `ShareRejected` or
+`ShareVerifyRejected` event with that `Status`. Any other error is an
+ordinary store failure. Every `ShareStore` implements `RecordVerification`;
+an app with no limit returns `nil`. See
+[Helper-side admission control](https://github.com/derecalliance/lib-derec/tree/main/library#helper-side-admission-control).
+
 ### Constructing an instance
 
 ```go
@@ -354,7 +412,13 @@ cfg := protocol.Config{
 	},
 }
 
-p, err := protocol.New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
+p, err := protocol.New(protocol.Stores{
+	Channel:    channelStore,
+	Share:      shareStore,
+	Secret:     secretStore,
+	UserSecret: userSecretStore,
+	State:      stateStore,
+}, transport, cfg)
 if err != nil {
 	panic(err)
 }
@@ -410,9 +474,20 @@ if errors.As(err, &processErr) {
 
 `Process` returns `[]protocol.Event`, decoded from the same JSON event stream the Rust core emits — compare `Event.Type` against the `protocol.EventType*` constants (`EventTypePairingCompleted`, `EventTypeShareStored`, `EventTypeShareConfirmed`, `EventTypeSecretRecovered`, `EventTypeActionRequired`, …) rather than hand-typing the string. Every u64 identifier on an event (`ChannelID`, `PairingChannelID`, `SecretID`, `TraceID`, the replica ids, `Synced` / `Behind`) and inside the recovered `Secret` (`Helper.ChannelID`, `Replicas.ChannelID`, `Replica.ReplicaID`) is a `uint64`, `Replica.Role` is a `protocol.ReplicaRole` (`ReplicaRoleSource` / `ReplicaRoleDestination`), and `Event.Kind` / `Event.SenderKind` are a `protocol.SenderKind` (`SenderKindOwner` / `SenderKindHelper` / `SenderKindReplicaSource` / `SenderKindReplicaDestination`) — the same type as `pairing.SenderKind` and `PairingParams.Kind`.
 
+`FlowKindVerifyShares` challenges each targeted helper, and every challenged channel ends with exactly one event:
+
+- `EventTypeShareVerified` — the helper proved it holds the exact share.
+- `EventTypeShareVerifyInvalid` (`ChannelID`, `Version`) — the helper's proof does not match the share this device stored. It is an event; `Process` returns no error.
+- `EventTypeShareVerifyRejected` — the helper refused the challenge; `Status` and `Memo` say why.
+- `EventTypeVerifySharesFailed` — no verdict could be reached on this device. `Reason` is one of `VerifyFailureReasonNoSharedKey`, `VerifyFailureReasonNoProof` or `VerifyFailureReasonDispatchFailed`, and `Error` carries the cause.
+
+A stored proof is either confirmed by its helper or part of a sharing round still open: when a round settles a channel as failed (a rejection or a timeout), that channel's proof is deleted. This guarantee holds on the publishing device; a replica Destination holds the proofs the Source mirrored at publish time and never sees `EventTypeSharingComplete`, so verifying there can return `EventTypeShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`) for a helper that failed the Source's round. Verify only versions whose round completed (`EventTypeSharingComplete`). Starting verification on a channel with no proof sends nothing and returns `EventTypeVerifySharesFailed` with `VerifyFailureReasonNoProof` at once. A late response to an earlier challenge is ignored as `EventTypeMessageIgnored` with `IgnoreReasonStaleResponse`, and the current challenge stays open; a response missing its `result` is still an error.
+
+Every channel message carries one timestamp, its send time, in both the envelope and the inner message. A message whose two timestamps differ, or where either or both are absent, is ignored as `EventTypeMessageIgnored` with `IgnoreReasonTimestampMismatch`; this includes replies from 0.0.8 peers.
+
 During recovery, a helper that answers with a share that cannot be part of the secret is reported as an event with `Type == EventTypeRecoveryShareCorrupted` and `Reason` one of `CorruptionReasonMalformed`, `CorruptionReasonInvalidProof` or `CorruptionReasonInconsistent`; the share is set aside and never blocks the recovery from the others. An honest helper never sends one, so treat it as a sign of a damaged or compromised helper — for example, offer to unpair it.
 
-When recovering a secret onto a fresh instance, pass the typed `Secret` from a `SecretRecovered` (or `ReplicaSecretReceived`) event to `p.Restore(secret, version)` to commit canonical helper state and wipe the throwaway recovery-mode channels. A helper or member with no endpoint in the recovered roster gets no channel; `Restore` returns an event with `Type == EventTypePeerNotRestored` and `Reason == NotRestoredReasonNoTransports` for it (`ReplicaID` is set for a replica member) and restores the rest. If channels already exist at ids `Restore` is about to write, `Restore` fails with a `*derec.Error` whose `Code` is `derec.CodeRestoreConflict` and whose `ConflictingChannelIDs` (`[]uint64`) lists exactly those ids — clear them and retry.
+After recovery, pass the typed `Secret` from a `SecretRecovered` (or `ReplicaSecretReceived`) event to `p.Restore(secret, version)` on the same `*protocol.DeRecProtocol` that ran recovery — it is the one holding the recovery-mode channels `Restore` unpairs — to commit canonical helper state and wipe the throwaway recovery-mode channels. A helper or member with no endpoint in the recovered roster gets no channel; `Restore` returns an event with `Type == EventTypePeerNotRestored` and `Reason == NotRestoredReasonNoTransports` for it (`ReplicaID` is set for a replica member) and restores the rest. If channels already exist at ids `Restore` is about to write, `Restore` fails with a `*derec.Error` whose `Code` is `derec.CodeRestoreConflict` and whose `ConflictingChannelIDs` (`[]uint64`) lists exactly those ids — clear them and retry.
 
 Reference: the repository's end-to-end tests drive a complete Owner + two Helpers pairing → protect-secret → recovery cycle — see [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 

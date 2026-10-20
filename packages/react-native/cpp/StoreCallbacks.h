@@ -82,8 +82,15 @@ class StoreBindings : public std::enable_shared_from_this<StoreBindings> {
   /// through `convert`, dispatching via `then` only when the value is
   /// actually thenable. `convert` runs on the JavaScript thread, with `rt`
   /// live, before `settle` is invoked — never after.
+  ///
+  /// `convertError`, when non-null, replaces the default "any rejection is a
+  /// backend failure" handling: it runs on the rejected value instead, so a
+  /// caller that needs to read something off that value (e.g.
+  /// `ShareStore.save`'s `refusal` tag) can. Left null, a rejection settles
+  /// with `kBackendFailure` exactly as before.
   void settleFromPromise(facebook::jsi::Runtime& rt, facebook::jsi::Value value,
-                          std::function<void(CallResult)> settle, ResultConverter convert);
+                          std::function<void(CallResult)> settle, ResultConverter convert,
+                          ResultConverter convertError = nullptr);
 
  private:
   StoreBindings(facebook::jsi::Runtime& rt, JsCallbackBridge& bridge,

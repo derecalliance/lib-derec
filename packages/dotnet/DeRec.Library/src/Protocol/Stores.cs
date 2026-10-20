@@ -440,6 +440,41 @@ public interface IShareStore
     /// </para>
     /// </summary>
     uint[]? KeepList(ulong secretId, uint version);
+    /// <summary>
+    /// Records that the helper has seen a verification challenge for the
+    /// share at <c>(secretId, channelId, version)</c>, called once per
+    /// accepted challenge, after the challenged share is found and before
+    /// the helper answers. Throw <see cref="ShareStoreRefusedException"/>
+    /// to refuse the verification; any other exception is an ordinary
+    /// backend failure.
+    /// </summary>
+    void RecordVerification(ulong secretId, ulong channelId, uint version);
+}
+
+/// <summary>
+/// The reason a <see cref="ShareStoreRefusedException"/> refuses a
+/// <see cref="IShareStore.Save"/> or <see cref="IShareStore.RecordVerification"/>
+/// call. The library maps each variant to the matching protocol status
+/// answered to the owner.
+/// </summary>
+public enum ShareStoreRefusal
+{
+    TooFrequent,
+    SizeLimitExceeded,
+    Rejected,
+}
+
+/// <summary>
+/// Thrown from <see cref="IShareStore.Save"/> or
+/// <see cref="IShareStore.RecordVerification"/> to refuse the write or
+/// verification with <see cref="Refusal"/>. The library turns this into the
+/// matching protocol status answered to the owner, rather than treating it
+/// as a backend failure.
+/// </summary>
+public sealed class ShareStoreRefusedException(ShareStoreRefusal refusal, string? message = null)
+    : Exception(message)
+{
+    public ShareStoreRefusal Refusal { get; } = refusal;
 }
 
 /// <summary>

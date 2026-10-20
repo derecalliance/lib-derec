@@ -505,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "derec-cryptography"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "aead",
  "aes",
@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "derec-library"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "ark-serialize",
  "base64 0.22.1",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "derec-proto"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "prost",
  "prost-build",

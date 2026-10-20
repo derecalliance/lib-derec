@@ -89,6 +89,18 @@ pub(crate) trait MessageBodyExt {
     /// application point for what remains, rather than a copy in each
     /// response path and each handler.
     fn peer_supplied_endpoints(&self) -> impl Iterator<Item = &TransportProtocol>;
+
+    /// The inner message's timestamp: the time it was sent.
+    ///
+    /// The envelope carries the same value, and a receiver rejects a message
+    /// whose two copies differ. `None` when the field is absent, and always
+    /// for `ErrorResponse`, which has no timestamp field.
+    fn timestamp(&self) -> Option<&prost_types::Timestamp>;
+
+    /// Stamp the inner message with the time it is being sent, so the
+    /// envelope can carry the same value. A no-op for `ErrorResponse`, which
+    /// has no timestamp field.
+    fn set_timestamp(&mut self, ts: prost_types::Timestamp);
 }
 
 impl MessageBodyExt for MessageBody {
@@ -132,6 +144,51 @@ impl MessageBodyExt for MessageBody {
         };
 
         listed.into_iter()
+    }
+
+    fn timestamp(&self) -> Option<&prost_types::Timestamp> {
+        match self {
+            MessageBody::PairRequest(m) => m.timestamp.as_ref(),
+            MessageBody::PairResponse(m) => m.timestamp.as_ref(),
+            MessageBody::UnpairRequest(m) => m.timestamp.as_ref(),
+            MessageBody::UnpairResponse(m) => m.timestamp.as_ref(),
+            MessageBody::StoreShareRequest(m) => m.timestamp.as_ref(),
+            MessageBody::StoreShareResponse(m) => m.timestamp.as_ref(),
+            MessageBody::VerifyShareRequest(m) => m.timestamp.as_ref(),
+            MessageBody::VerifyShareResponse(m) => m.timestamp.as_ref(),
+            MessageBody::GetSecretIdsVersionsRequest(m) => m.timestamp.as_ref(),
+            MessageBody::GetSecretIdsVersionsResponse(m) => m.timestamp.as_ref(),
+            MessageBody::GetShareRequest(m) => m.timestamp.as_ref(),
+            MessageBody::GetShareResponse(m) => m.timestamp.as_ref(),
+            MessageBody::ErrorResponse(_) => None,
+            MessageBody::UpdateChannelInfoRequest(m) => m.timestamp.as_ref(),
+            MessageBody::UpdateChannelInfoResponse(m) => m.timestamp.as_ref(),
+            MessageBody::PrePairRequest(m) => m.timestamp.as_ref(),
+            MessageBody::PrePairResponse(m) => m.timestamp.as_ref(),
+        }
+    }
+
+    fn set_timestamp(&mut self, ts: prost_types::Timestamp) {
+        let slot = match self {
+            MessageBody::PairRequest(m) => &mut m.timestamp,
+            MessageBody::PairResponse(m) => &mut m.timestamp,
+            MessageBody::UnpairRequest(m) => &mut m.timestamp,
+            MessageBody::UnpairResponse(m) => &mut m.timestamp,
+            MessageBody::StoreShareRequest(m) => &mut m.timestamp,
+            MessageBody::StoreShareResponse(m) => &mut m.timestamp,
+            MessageBody::VerifyShareRequest(m) => &mut m.timestamp,
+            MessageBody::VerifyShareResponse(m) => &mut m.timestamp,
+            MessageBody::GetSecretIdsVersionsRequest(m) => &mut m.timestamp,
+            MessageBody::GetSecretIdsVersionsResponse(m) => &mut m.timestamp,
+            MessageBody::GetShareRequest(m) => &mut m.timestamp,
+            MessageBody::GetShareResponse(m) => &mut m.timestamp,
+            MessageBody::ErrorResponse(_) => return,
+            MessageBody::UpdateChannelInfoRequest(m) => &mut m.timestamp,
+            MessageBody::UpdateChannelInfoResponse(m) => &mut m.timestamp,
+            MessageBody::PrePairRequest(m) => &mut m.timestamp,
+            MessageBody::PrePairResponse(m) => &mut m.timestamp,
+        };
+        *slot = Some(ts);
     }
 }
 

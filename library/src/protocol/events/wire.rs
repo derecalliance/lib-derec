@@ -151,6 +151,10 @@ pub(crate) enum Event {
         channel_id: String,
         version: u32,
     },
+    ShareVerifyInvalid {
+        channel_id: String,
+        version: u32,
+    },
     ShareVerifyRejected {
         channel_id: String,
         version: u32,
@@ -265,7 +269,8 @@ pub(crate) enum Event {
     NoOp,
     MessageIgnored {
         channel_id: String,
-        /// [`ignore_reason_label`] — `"PendingVerification"` or `"Expired"`.
+        /// [`ignore_reason_label`] — `"PendingVerification"`, `"Expired"`,
+        /// `"TimestampMismatch"` or `"StaleResponse"`.
         reason: String,
         trace_id: String,
     },
@@ -310,6 +315,9 @@ pub(crate) enum Event {
     VerifySharesFailed {
         channel_id: String,
         version: u32,
+        /// [`verify_failure_reason_label`] — `"NoSharedKey"`, `"NoProof"` or
+        /// `"DispatchFailed"`.
+        reason: String,
         error: String,
     },
     RecoverSecretStarted {
@@ -657,6 +665,13 @@ impl Event {
                 channel_id: channel_id.0.to_string(),
                 version,
             },
+            DeRecEvent::ShareVerifyInvalid {
+                channel_id,
+                version,
+            } => Self::ShareVerifyInvalid {
+                channel_id: channel_id.0.to_string(),
+                version,
+            },
             DeRecEvent::ShareVerifyRejected {
                 channel_id,
                 version,
@@ -882,10 +897,12 @@ impl Event {
             DeRecEvent::VerifySharesFailed {
                 channel_id,
                 version,
+                reason,
                 error,
             } => Self::VerifySharesFailed {
                 channel_id: channel_id.0.to_string(),
                 version,
+                reason: verify_failure_reason_label(reason).to_owned(),
                 error,
             },
             DeRecEvent::RecoverSecretStarted {
@@ -945,6 +962,21 @@ pub(crate) fn ignore_reason_label(reason: crate::protocol::IgnoreReason) -> &'st
     match reason {
         IgnoreReason::PendingVerification => "PendingVerification",
         IgnoreReason::Expired => "Expired",
+        IgnoreReason::TimestampMismatch => "TimestampMismatch",
+        IgnoreReason::StaleResponse => "StaleResponse",
+    }
+}
+
+/// Wire label for a [`VerifyFailureReason`](crate::protocol::VerifyFailureReason):
+/// the variant name, matching `library/tests/fixtures/enums.json`.
+pub(crate) fn verify_failure_reason_label(
+    reason: crate::protocol::VerifyFailureReason,
+) -> &'static str {
+    use crate::protocol::VerifyFailureReason;
+    match reason {
+        VerifyFailureReason::NoSharedKey => "NoSharedKey",
+        VerifyFailureReason::NoProof => "NoProof",
+        VerifyFailureReason::DispatchFailed => "DispatchFailed",
     }
 }
 
@@ -1182,6 +1214,63 @@ mod tests {
             derec_proto::StatusEnum::UnknownShareVersion as i32
         );
         assert_eq!(json["memo"], "no stored share");
+    }
+
+    #[test]
+    fn share_verify_invalid_maps_channel_and_version() {
+        let mapped = Event::from_event(DeRecEvent::ShareVerifyInvalid {
+            channel_id: ChannelId(u64::MAX),
+            version: 3,
+        })
+        .expect("ShareVerifyInvalid must map");
+
+        let json = serde_json::to_value(&mapped).expect("serializes");
+        assert_eq!(json["type"], "ShareVerifyInvalid");
+        assert_eq!(json["channel_id"], u64::MAX.to_string());
+        assert_eq!(json["version"], 3);
+    }
+
+    #[test]
+    fn verify_shares_failed_maps_reason_and_error() {
+        for (reason, label) in [
+            (
+                crate::protocol::VerifyFailureReason::NoSharedKey,
+                "NoSharedKey",
+            ),
+            (crate::protocol::VerifyFailureReason::NoProof, "NoProof"),
+            (
+                crate::protocol::VerifyFailureReason::DispatchFailed,
+                "DispatchFailed",
+            ),
+        ] {
+            let mapped = Event::from_event(DeRecEvent::VerifySharesFailed {
+                channel_id: ChannelId(u64::MAX),
+                version: 5,
+                reason,
+                error: "cause".to_owned(),
+            })
+            .expect("VerifySharesFailed must map");
+
+            let json = serde_json::to_value(&mapped).expect("serializes");
+            assert_eq!(json["type"], "VerifySharesFailed");
+            assert_eq!(json["channel_id"], u64::MAX.to_string());
+            assert_eq!(json["version"], 5);
+            assert_eq!(json["reason"], label);
+            assert_eq!(json["error"], "cause");
+        }
+    }
+
+    #[test]
+    fn message_ignored_maps_stale_response() {
+        let mapped = Event::from_event(DeRecEvent::MessageIgnored {
+            channel_id: ChannelId(7),
+            reason: crate::protocol::IgnoreReason::StaleResponse,
+            trace_id: 1,
+        })
+        .expect("MessageIgnored must map");
+
+        let json = serde_json::to_value(&mapped).expect("serializes");
+        assert_eq!(json["reason"], "StaleResponse");
     }
 
     #[test]

@@ -199,6 +199,15 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 
 /// Answer a `GetShareRequest` with the share stored for it.
 ///
+/// The share is looked up across every channel linked to the one the
+/// request arrived on (see
+/// [`DeRecChannelStore::link_channel`](crate::protocol::DeRecChannelStore::link_channel)),
+/// at the requested version, and the answer carries **one** share: the
+/// first whose `secret_id` matches the request, in the order the share
+/// store returns. With one-to-one links a helper holds at most one share
+/// per owner for a given `secret_id` and version, so there is only one
+/// candidate; otherwise the share store's order decides which is served.
+///
 /// A helper holding no share for the requested `(secret_id, version)` still
 /// answers: the response carries `UNKNOWN_SHARE_VERSION` and no share, the
 /// failure the protocol defines for a missing version, so the owner learns

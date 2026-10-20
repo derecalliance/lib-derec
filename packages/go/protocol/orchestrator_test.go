@@ -117,7 +117,7 @@ func newOrchestratorPeerWith(t *testing.T, label, uri string, threshold uint32, 
 	if configure != nil {
 		configure(&cfg)
 	}
-	p, err := New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
+	p, err := New(Stores{Channel: channelStore, Share: shareStore, Secret: secretStore, UserSecret: userSecretStore, State: stateStore}, transport, cfg)
 	if err != nil {
 		t.Fatalf("New(%s): %v", label, err)
 	}

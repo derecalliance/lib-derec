@@ -50,12 +50,16 @@ impl<
     ///
     /// # Helper-side admission control
     ///
-    /// This is where a helper enforces its own limits on inbound shares.
-    /// The protocol imposes none of its own: it does not bound share
-    /// size, storage per sharer, or update frequency, and the
-    /// `maxShareSize` negotiated from [`derec_proto::ParameterRange`] is
-    /// only checked for range overlap at pairing time, never against an
-    /// actual share.
+    /// This is where a helper enforces limits on inbound shares beyond
+    /// what the library already checks. This device's own configured
+    /// `minShareSize`/`maxShareSize` from [`derec_proto::ParameterRange`]
+    /// (see [`DeRecProtocolBuilder::with_parameter_range`](crate::protocol::DeRecProtocolBuilder::with_parameter_range))
+    /// is enforced by the library itself against every inbound share's
+    /// actual length, before `ActionRequired` is ever raised — a share
+    /// outside that range never reaches this gate at all. The protocol
+    /// still imposes no bound of its own on storage per sharer or update
+    /// frequency; an app with a *tighter or per-user* size limit, or any
+    /// other reason to decline a share, uses this gate for that.
     ///
     /// [`PendingAction::StoreShare`] carries the already-decrypted,
     /// already-parsed [`derec_proto::StoreShareRequestMessage`], so the

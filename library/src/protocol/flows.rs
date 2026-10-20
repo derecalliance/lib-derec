@@ -139,13 +139,22 @@ impl<
     ///
     /// # Caller flow
     ///
+    /// Call `restore` on the same `DeRecProtocol` instance that ran
+    /// recovery — it is the one holding the recovery-mode channels this
+    /// call unpairs:
+    ///
     /// ```text
-    /// fresh DeRecProtocol → empty stores
-    ///   → re-pair with helpers on a fresh channel-id namespace
+    /// re-pair with helpers on a fresh channel-id namespace
     ///   → start(RecoverSecret { secret_id, version })
     ///   → SecretRecovered { secret } event arrives
     ///   → DeRecProtocol::restore(&secret, version)
     /// ```
+    ///
+    /// What `restore` actually requires is a `secret_id` namespace with
+    /// no user-secret snapshot and no channels at the roster ids it is
+    /// about to write — i.e. a device that lost its state, not
+    /// necessarily a newly-constructed value. See the precondition
+    /// errors below for exactly what is checked.
     ///
     /// On success: canonical helper channels are persisted with their
     /// `SharedKey`; canonical replica channels are persisted
@@ -172,7 +181,10 @@ impl<
     ///
     /// No owner-side tracking share is written, so
     /// `start(`[`DeRecFlow::VerifyShares`]`)` at `recovered_version`
-    /// fails with [`crate::Error::InvalidInput`]: a `VerifyShare` proof
+    /// sends no challenge and reports each channel as
+    /// [`DeRecEvent::VerifySharesFailed`]
+    /// with [`VerifyFailureReason::NoProof`](crate::protocol::VerifyFailureReason::NoProof):
+    /// a `VerifyShare` proof
     /// is `SHA-384(share ‖ nonce)` over the exact bytes a Helper holds,
     /// and recovery cannot attribute a collected share to a canonical
     /// Helper channel, so this device has no reference bytes for that
@@ -484,7 +496,7 @@ mod tests {
         InMemUserSecretStore, StoreRig, run_async,
     };
     use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, SecretValue};
-    use crate::protocol::{DeRecChannelStore, DeRecSecretStore};
+    use crate::protocol::{DeRecChannelStore, DeRecSecretStore, DeRecShareStore};
 
     const SECRET_ID: u64 = 0x7E57;
 
@@ -657,9 +669,23 @@ mod tests {
                 .await
                 .expect("seed pending helper");
 
+            let mut shares = InMemShareStore::default();
+            shares
+                .save(
+                    SECRET_ID,
+                    ChannelId(11),
+                    crate::protocol::types::Share {
+                        secret_id: SECRET_ID,
+                        version: 1,
+                        bytes: vec![0x11; 8],
+                    },
+                )
+                .await
+                .expect("seed the proof VerifyShares checks the answer against");
+
             let mut protocol = DeRecProtocolBuilder::new(SECRET_ID)
                 .with_channel_store(channels)
-                .with_share_store(InMemShareStore::default())
+                .with_share_store(shares)
                 .with_secret_store(secrets)
                 .with_user_secret_store(InMemUserSecretStore::default())
                 .with_state_store(InMemPersistedStateStore::default())

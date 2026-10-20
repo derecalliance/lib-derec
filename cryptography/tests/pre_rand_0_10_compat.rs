@@ -1,6 +1,7 @@
 //! Material produced before the move to `rand` 0.10 and `ml-kem` 0.3 must
-//! keep working: decapsulation keys held in stored pairing secrets, pairings
-//! a peer started on the old release, and shares helpers already hold.
+//! keep working: decapsulation keys held in stored pairing secrets and
+//! pairings a peer started on the old release. Shares helpers already hold do
+//! not: their Merkle commitments predate the 0.0.9 leaf and node hashing.
 //!
 //! Those decapsulation keys are in the expanded form, accepted until 0.0.13;
 //! the expanded-key cases go when that support is removed.
@@ -70,7 +71,7 @@ fn a_pairing_started_on_the_old_release_completes_on_the_new_one() {
 }
 
 #[test]
-fn shares_split_on_the_old_release_still_recover() {
+fn shares_split_before_0_0_9_are_rejected() {
     let share = |x: &str, y: &str, ct: &str, root: &str, path: &str| VSSShare {
         x: bytes(x),
         y: bytes(y),
@@ -105,6 +106,7 @@ fn shares_split_on_the_old_release_still_recover() {
         ),
     ];
 
-    assert!(shares.iter().all(vss::verify));
-    assert_eq!(vss::recover(&shares).unwrap(), bytes(fixture::VSS_SECRET));
+    assert!(!shares.iter().any(vss::verify));
+    let err = vss::recover(&shares).expect_err("old commitments must not open");
+    assert!(matches!(err, vss::DerecVSSError::CorruptShares));
 }

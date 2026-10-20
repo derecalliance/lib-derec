@@ -371,7 +371,9 @@ damaged or compromised helper — for example, offer to unpair it.
 
 The recovering device receives a `SecretRecovered` event carrying the typed
 `secret`. Pass it
-to `protocol.restore(secret, version)` on a fresh `DeRecProtocol` instance to
+to `protocol.restore(secret, version)` — on the same `DeRecProtocol`
+instance that ran recovery, since it is the one holding the recovery-mode
+channels `restore` unpairs — to
 commit canonical helper / replica state and wipe the throwaway recovery-mode
 channels — at that point the device resumes normal operation as if the secret
 had been protected here originally.
@@ -383,7 +385,7 @@ and restores the rest.
 const events = await protocol.process(responseBytes);
 for (const ev of events) {
   if (ev.type === "SecretRecovered") {
-    await freshProtocol.restore(ev.secret, recoveredVersion);
+    await protocol.restore(ev.secret, recoveredVersion);
   }
 }
 ```
@@ -399,6 +401,32 @@ names the store).
 > base64 with padding (RFC 4648 §4)** and `u64` fields as decimal strings.
 > See the `derec-library` `protocol::types::secret` reference documentation
 > for the full field schema.
+
+### Helpers and shares
+
+- Each share goes to a **different** helper. Threshold security depends on it:
+  compromising one helper must yield at most one share.
+- The library hands out one share per channel per version, and every pairing
+  produces its own channel. It cannot tell whether two channels lead to the
+  same party; keeping helpers distinct is the application's job.
+- **Discouraged:** a single guardian acting as several helpers for the same
+  owner. It is against the protocol's recommendation, since one compromise
+  yields several shares. The library does not prevent it, but channel linking
+  then needs the application's help (below).
+- **Channel linking is expected to be one-to-one.** After an owner re-pairs in
+  recovery mode, the helper application links the new channel to the old one
+  with `ChannelStore.linkChannel`. Linking assumes a helper holds **at most one share per owner
+  for a given `secretId` and version**, so each recovery channel is linked to the
+  single old channel it replaces. On `GetShare` the helper answers with
+  **one** share from the linked set: the first whose `secretId` matches the
+  request, in the order `ShareStore.loadMany` returns. The library imposes no order. If
+  several channels holding shares for the same owner are linked to one
+  recovery channel and every recovery channel is answered from the same
+  share, the owner receives it more than once (it counts once) and can fall
+  below the threshold. An application that runs such a helper keeps each
+  recovery channel resolving to a distinct share: either links stay
+  one-to-one, or its share store returns, for each requesting channel, the
+  share intended for it first, in a deterministic order.
 
 ---
 
@@ -436,6 +464,39 @@ async function main() {
 main();
 ```
 
+### Verification outcomes with `DeRecProtocol`
+
+`protocol.start(FlowKind.VerifyShares, …)` challenges each targeted helper,
+and every challenged channel ends with exactly one event:
+
+- `ShareVerified` — the helper proved it holds the exact share.
+- `ShareVerifyInvalid { channel_id, version }` — the helper's proof does not
+  match the share this device stored. It is an event; `process()` does not
+  throw.
+- `ShareVerifyRejected { status, memo }` — the helper refused the challenge
+  with a non-OK status.
+- `VerifySharesFailed { reason, error }` — no verdict could be reached on
+  this device. `reason` is a `VerifyFailureReason`: `"NoSharedKey"`,
+  `"NoProof"` or `"DispatchFailed"`.
+
+A stored proof is either confirmed by its helper or part of a sharing round
+still open: when a round settles a channel as failed (a rejection or a
+timeout), that channel's proof is deleted. This guarantee holds on the
+publishing device; a replica Destination holds the proofs the Source
+mirrored at publish time and never sees `SharingComplete`, so verifying
+there can return `ShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`) for a
+helper that failed the Source's round. Verify only versions whose round
+completed (`SharingComplete`). Starting verification on a channel with no
+proof sends nothing and returns `VerifySharesFailed` with
+`reason: "NoProof"` at once. A late response to an earlier challenge is
+ignored as `MessageIgnored` with `reason: "StaleResponse"`, and the current
+challenge stays open; a response missing its `result` is still an error.
+
+Every channel message carries one timestamp, its send time, in both the
+envelope and the inner message. A message whose two timestamps differ, or
+where either or both are absent, is ignored as `MessageIgnored` with
+`reason: "TimestampMismatch"`; this includes replies from 0.0.8 peers.
+
 ---
 
 ## Usage with Bundlers
@@ -465,6 +526,37 @@ await init();
   await init();
 </script>
 ```
+
+---
+
+## Refusing a share or a verification
+
+A helper enforces share size itself: with a parameter range configured, a
+share outside its own `minShareSize`/`maxShareSize` (inclusive; a max of `0` means
+unbounded) is answered with `SIZE_LIMIT_EXCEEDED` before any
+`ActionRequired` or auto-accept. Frequency limits on share updates and
+verifications are the application's to enforce, from its share store.
+
+On a helper channel, throw (or reject with) `shareStoreRefusal(reason)` from
+`ShareStore.save` (a genuinely new share version) or
+`ShareStore.recordVerification` (an accepted verification challenge) to
+refuse it:
+
+```ts
+import { shareStoreRefusal } from "@derec-alliance/web";
+
+async recordVerification(secretId: string, channelId: string, version: number) {
+  if (limiter.tooSoon(channelId)) throw shareStoreRefusal("too_frequent");
+}
+```
+
+The library answers the owner with the mapped status (`"too_frequent"` →
+`TOO_FREQUENT`, `"size_limit_exceeded"` → `SIZE_LIMIT_EXCEEDED`,
+`"rejected"` → `REJECTED`), and the owner sees `ShareRejected` or
+`ShareVerifyRejected` with that `status`. Any other rejection is an ordinary
+store failure. Every `ShareStore` implements `recordVerification`; an app
+with no limit resolves it. See
+[Helper-side admission control](https://github.com/derecalliance/lib-derec/tree/main/library#helper-side-admission-control).
 
 ---
 
@@ -528,6 +620,20 @@ index.d.ts
 
 ---
 
+## Transport
+
+`Transport.send(endpoints, message)` is a mailbox, not a request/response
+call: a reply produced by `process()` is handed to `send`, addressed to the
+peer, and is never returned by `process()`, so every participant needs a
+reachable endpoint. Recommended HTTP conventions (not protocol requirements)
+are `POST`, an `application/octet-stream` body, `202 Accepted`, and `200 OK`
+with the reply body when answering an unreachable peer on the same
+connection. Only that `200 OK` same-connection answer needs matching: pick
+the reply that echoes the request's trace id with `envelope.read_trace_id`.
+See [Transports](https://derec-alliance.gitbook.io/docs/protocol-specification/transports).
+
+---
+
 ## Replica flows
 
 Replicas mirror an Owner's secret onto a second device so the same secrets
@@ -537,12 +643,10 @@ side runs as `SenderKind.ReplicaSource` (owns the secret), the other as
 with a stable `replicaId`:
 
 ```ts
+// withStores sets all five stores in one call. Each with*Store setter is
+// still available; the last call for a store wins.
 const owner = new DeRecProtocolBuilder(secretId)
-  .withChannelStore(channelStore)
-  .withShareStore(shareStore)
-  .withSecretStore(secretStore)
-  .withUserSecretStore(userSecretStore)
-  .withStateStore(stateStore)
+  .withStores({ channelStore, shareStore, secretStore, userSecretStore, stateStore })
   .withTransport(transport)
   .withOwnTransports([{ uri: "https://owner.example.com", protocol: "https" }])
   .withThreshold(2)

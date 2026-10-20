@@ -155,8 +155,14 @@ internal sealed class InMemoryShareStore : IShareStore
     public uint? LatestVersion(ulong secretId) =>
         _ownerVersions.TryGetValue(secretId, out var v) ? v : null;
 
+    /// <summary>Refuse with <c>TooFrequent</c>, the way an app's rate limit would.</summary>
+    public bool RefuseSaves { get; set; }
+
+    public bool RefuseVerifications { get; set; }
+
     public void Save(ulong secretId, ulong channelId, Share share)
     {
+        if (RefuseSaves) throw new ShareStoreRefusedException(ShareStoreRefusal.TooFrequent);
         _data[(secretId, channelId, share.Version)] = share;
     }
 
@@ -184,6 +190,11 @@ internal sealed class InMemoryShareStore : IShareStore
     {
         KeepListCalls.Add((secretId, version));
         return Keep;
+    }
+
+    public void RecordVerification(ulong secretId, ulong channelId, uint version)
+    {
+        if (RefuseVerifications) throw new ShareStoreRefusedException(ShareStoreRefusal.TooFrequent);
     }
 
     public uint[] StoredVersions(ulong secretId) =>

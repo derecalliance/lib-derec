@@ -57,8 +57,10 @@ const NO_SHARE_FOR_VERSION: &str = "no share stored for this secret and version"
 
 /// Route a decrypted channel message to the module that owns its flow.
 ///
-/// Does only the part that is identical for every message: the peer-supplied
-/// endpoint policy check, the role gate for bodies that name exactly one
+/// Does only the part that is identical for every message: the
+/// envelope-vs-inner timestamp binding (a mismatch is
+/// [`IgnoreReason::TimestampMismatch`](crate::protocol::IgnoreReason::TimestampMismatch)),
+/// the peer-supplied endpoint policy check, the role gate for bodies that name exactly one
 /// permitted sender (see [`MessageBodyExt::expected_sender_role`](crate::extensions::message_body::MessageBodyExt::expected_sender_role)),
 /// the hand-off, and
 /// the courtesy failure response. Which relationship a multi-valued body
@@ -80,6 +82,19 @@ pub(super) async fn handle<S: StoreSet>(
     auto_respond_on_failure: bool,
 ) -> Result<Vec<DeRecEvent>> {
     let inner_message = crate::derec_message::extract_inner_message(&message.message, shared_key)?;
+
+    // The sender stamps the envelope and the inner message with one value.
+    // A mismatch is dropped before any handler runs, so nothing is stored
+    // and nothing, not even a failure response, is sent.
+    if crate::utils::verify_timestamps(message.timestamp, inner_message.timestamp().copied())
+        .is_err()
+    {
+        return Ok(vec![DeRecEvent::MessageIgnored {
+            channel_id,
+            reason: super::IgnoreReason::TimestampMismatch,
+            trace_id: message.trace_id,
+        }]);
+    }
 
     let inbound_trace_id = message.trace_id;
     let exchange = &Exchange {
@@ -341,6 +356,194 @@ mod replica_id_discrimination_tests {
                 matches!(err, Error::InvalidInput(_)),
                 "expected an InvalidInput protocol error, got {err:?}"
             );
+        });
+    }
+}
+
+/// The envelope and the inner message carry one timestamp, the send time.
+/// A channel message whose two copies disagree is dropped before dispatch.
+#[cfg(test)]
+mod timestamp_binding_tests {
+    use crate::protocol::builder::DeRecProtocolBuilder;
+    use crate::protocol::test::{
+        InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+        InMemUserSecretStore, RecordingTransport, run_async,
+    };
+    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, SecretValue};
+    use crate::protocol::{
+        AutoAcceptPolicy, DeRecChannelStore as _, DeRecEvent, DeRecProtocol, DeRecSecretStore as _,
+        IgnoreReason,
+    };
+    use crate::types::ChannelId;
+    use prost::Message as _;
+
+    const SECRET_ID: u64 = 0x7153;
+    const CHANNEL: ChannelId = ChannelId(4242);
+    const SHARED_KEY: crate::types::SharedKey = [5u8; 32];
+    const TRACE: u64 = 99;
+    const ORIGINAL_URI: &str = "https://peer.example.com/derec";
+    const MOVED_URI: &str = "https://moved.example.com/derec";
+
+    fn endpoint(uri: &str) -> derec_proto::TransportProtocol {
+        derec_proto::TransportProtocol {
+            uri: uri.to_owned(),
+            protocol: derec_proto::Protocol::Https as i32,
+        }
+    }
+
+    async fn seed(channels: &mut InMemChannelStore, secrets: &mut InMemSecretStore) {
+        channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id: CHANNEL,
+                    transports: vec![endpoint(ORIGINAL_URI)],
+                    communication_info: std::collections::HashMap::new(),
+                    status: ChannelStatus::Paired,
+                    created_at: crate::utils::now_secs(),
+                    peer_role: derec_proto::SenderKind::Helper,
+                }),
+            )
+            .await
+            .expect("seed channel");
+        secrets
+            .save(SECRET_ID, CHANNEL, SecretValue::SharedKey(SHARED_KEY))
+            .await
+            .expect("seed shared key");
+    }
+
+    fn build(
+        channels: InMemChannelStore,
+        secrets: InMemSecretStore,
+        transport: RecordingTransport,
+    ) -> DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemStateStore,
+        RecordingTransport,
+    > {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(channels)
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(secrets)
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(transport)
+            .with_state_store(InMemStateStore)
+            .with_own_transports(["https://helper.example.com"])
+            .with_threshold(2)
+            .with_auto_accept(AutoAcceptPolicy::all())
+            .with_auto_respond_on_failure(true)
+            .build()
+            .expect("test protocol builds")
+    }
+
+    /// An update-channel-info request that, if processed, would rewrite the
+    /// stored endpoint and send a response.
+    fn update_request(
+        envelope_ts: prost_types::Timestamp,
+        inner_ts: prost_types::Timestamp,
+    ) -> Vec<u8> {
+        crate::derec_message::DeRecMessageBuilder::channel()
+            .channel_id(CHANNEL)
+            .timestamp(envelope_ts)
+            .trace_id(TRACE)
+            .message_body(derec_proto::MessageBody::UpdateChannelInfoRequest(
+                derec_proto::UpdateChannelInfoRequestMessage {
+                    communication_info: None,
+                    supported_transports: vec![endpoint(MOVED_URI)],
+                    timestamp: Some(inner_ts),
+                },
+            ))
+            .encrypt(&SHARED_KEY)
+            .expect("encrypt")
+            .build()
+            .expect("build")
+            .encode_to_vec()
+    }
+
+    fn stored_uris(channels: &InMemChannelStore) -> Vec<String> {
+        channels
+            .helper_rows
+            .lock()
+            .unwrap()
+            .get(&(SECRET_ID, CHANNEL.0))
+            .expect("channel row")
+            .transports
+            .iter()
+            .map(|t| t.uri.clone())
+            .collect()
+    }
+
+    #[test]
+    fn inbound_message_with_mismatched_timestamps_is_ignored() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let transport = RecordingTransport::default();
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed(&mut c, &mut s).await;
+            let secrets_before = secrets.data.lock().unwrap().len();
+
+            let envelope_ts = crate::derec_message::current_timestamp();
+            let inner_ts = prost_types::Timestamp {
+                seconds: envelope_ts.seconds - 1,
+                nanos: envelope_ts.nanos,
+            };
+            let mut protocol = build(channels.clone(), secrets.clone(), transport.clone());
+            let events = protocol
+                .process(&update_request(envelope_ts, inner_ts))
+                .await
+                .expect("an ignored message is not an error");
+
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [DeRecEvent::MessageIgnored {
+                        channel_id: CHANNEL,
+                        reason: IgnoreReason::TimestampMismatch,
+                        trace_id: TRACE,
+                    }]
+                ),
+                "expected one MessageIgnored(TimestampMismatch), got {events:?}"
+            );
+            assert!(transport.sent_envelopes().is_empty(), "nothing is sent");
+            assert_eq!(stored_uris(&channels), vec![ORIGINAL_URI.to_owned()]);
+            assert_eq!(secrets.data.lock().unwrap().len(), secrets_before);
+        });
+    }
+
+    #[test]
+    fn inbound_message_with_matching_timestamps_is_processed() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let transport = RecordingTransport::default();
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed(&mut c, &mut s).await;
+
+            let ts = crate::derec_message::current_timestamp();
+            let mut protocol = build(channels.clone(), secrets, transport.clone());
+            let events = protocol
+                .process(&update_request(ts, ts))
+                .await
+                .expect("processed");
+
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::ChannelInfoUpdated { channel_id } if *channel_id == CHANNEL)),
+                "expected ChannelInfoUpdated, got {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::MessageIgnored { .. })),
+                "{events:?}"
+            );
+            assert_eq!(transport.sent_envelopes().len(), 1);
+            assert_eq!(stored_uris(&channels), vec![MOVED_URI.to_owned()]);
         });
     }
 }

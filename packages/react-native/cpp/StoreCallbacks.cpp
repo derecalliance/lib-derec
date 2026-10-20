@@ -27,7 +27,7 @@ static_assert(sizeof(ChannelStoreCallbacks) == 9 * sizeof(void*),
               "ChannelStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(SecretStoreCallbacks) == 6 * sizeof(void*),
               "SecretStoreCallbacks layout changed; update the bindings");
-static_assert(sizeof(ShareStoreCallbacks) == 10 * sizeof(void*),
+static_assert(sizeof(ShareStoreCallbacks) == 11 * sizeof(void*),
               "ShareStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(UserSecretStoreCallbacks) == 5 * sizeof(void*),
               "UserSecretStoreCallbacks layout changed; update the bindings");
@@ -352,6 +352,38 @@ CallResult toKeepListResult(jsi::Runtime& rt, const jsi::Value& value) {
   }
   text += ']';
   return CallResult{0, std::vector<uint8_t>(text.begin(), text.end())};
+}
+
+/// Reads the `refusal` property a `ShareStore.save`/`recordVerification`
+/// throws, or rejects its promise with, to refuse the call — see
+/// `shareStoreRefusal` in `src/types.ts`. Maps the wire string to the FFI
+/// return code `library/src/interop/ffi/error.rs` names
+/// `DEREC_SHARE_STORE_REFUSED_*`; a missing or unknown property is an
+/// ordinary backend failure, never any other interpretation.
+int32_t shareRefusalCode(jsi::Runtime& rt, const jsi::Value& value) {
+  if (!value.isObject()) {
+    return kBackendFailure;
+  }
+  jsi::Object obj = value.asObject(rt);
+  if (!obj.hasProperty(rt, "refusal")) {
+    return kBackendFailure;
+  }
+  jsi::Value refusal = obj.getProperty(rt, "refusal");
+  if (!refusal.isString()) {
+    return kBackendFailure;
+  }
+  std::string reason = refusal.asString(rt).utf8(rt);
+  if (reason == "too_frequent") return 4;
+  if (reason == "size_limit_exceeded") return 3;
+  if (reason == "rejected") return 10;
+  return kBackendFailure;
+}
+
+/// `ResultConverter` form of `shareRefusalCode`, passed as `ShareStore.save`/
+/// `recordVerification`'s `settleFromPromise` error converter and used
+/// directly on a synchronous throw.
+CallResult toShareRefusalResult(jsi::Runtime& rt, const jsi::Value& value) {
+  return CallResult{shareRefusalCode(rt, value), {}};
 }
 
 /// `UserSecretStore.loadLatest(): Promise<UserSecrets | null | undefined>`.
@@ -811,10 +843,50 @@ extern "C" int32_t shareStoreSave(void* userData, uint64_t secretId, uint64_t ch
                          jsi::Value(rt, jsi::String::createFromUtf8(rt, decoded.secretId)));
     shareObj.setProperty(rt, "version", jsi::Value(static_cast<int>(decoded.version)));
     shareObj.setProperty(rt, "bytes", toUint8ArrayVal(rt, decoded.bytes));
-    jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId), idVal(rt, channelId),
-                                              jsi::Value(rt, shareObj));
-    keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
+    // A refusal thrown synchronously (rather than via a rejected promise)
+    // never reaches `settleFromPromise`'s `onErr`, so it is read here,
+    // before it would otherwise fall into `JsCallbackBridge::callSync`'s
+    // generic backend-failure catch.
+    try {
+      jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId), idVal(rt, channelId),
+                                                jsi::Value(rt, shareObj));
+      keepAlive->settleFromPromise(rt, std::move(promise), settle, toVoidResult, toShareRefusalResult);
+    } catch (jsi::JSError& e) {
+      settle(toShareRefusalResult(rt, e.value()));
+    }
   });
+  return result.code;
+}
+
+/// `ShareStore.recordVerification(secretId, channelId, version) -> void`
+///
+/// Called once per accepted verification challenge, after the challenged
+/// share is found and before the helper answers — see
+/// `DeRecShareStore::record_verification` on the Rust side. A refusal
+/// (thrown, or a rejected promise, tagged with `shareStoreRefusal`'s
+/// `refusal` property) maps to the matching FFI return code exactly as
+/// `ShareStore.save` does; any other failure is an ordinary backend failure.
+extern "C" int32_t shareStoreRecordVerification(void* userData, uint64_t secretId, uint64_t channelId,
+                                                 uint32_t version) {
+  auto* self = static_cast<StoreBindings*>(userData);
+  // Kept alive past this call so the lambda handed to `callSync` — which the
+  // JavaScript CallInvoker's queue may still be holding after this object's
+  // owner has released its own reference — has somewhere safe to run.
+  auto keepAlive = self->shared_from_this();
+  CallResult result = keepAlive->bridge().callSync(
+      [keepAlive, secretId, channelId, version](std::function<void(CallResult)> settle) {
+        jsi::Runtime& rt = keepAlive->runtime();
+        auto store = keepAlive->shareStore();
+        auto method = store->getPropertyAsFunction(rt, "recordVerification");
+        try {
+          jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId), idVal(rt, channelId),
+                                                    jsi::Value(static_cast<double>(version)));
+          keepAlive->settleFromPromise(rt, std::move(promise), settle, toVoidResult,
+                                       toShareRefusalResult);
+        } catch (jsi::JSError& e) {
+          settle(toShareRefusalResult(rt, e.value()));
+        }
+      });
   return result.code;
 }
 
@@ -1110,7 +1182,7 @@ StoreBindings::StoreBindings(jsi::Runtime& rt, JsCallbackBridge& bridge,
 
 void StoreBindings::settleFromPromise(jsi::Runtime& rt, jsi::Value value,
                                        std::function<void(CallResult)> settle,
-                                       ResultConverter convert) {
+                                       ResultConverter convert, ResultConverter convertError) {
   // A store may legitimately return a plain value; only route through
   // `then` when the result actually is a thenable.
   if (!value.isObject()) {
@@ -1150,13 +1222,16 @@ void StoreBindings::settleFromPromise(jsi::Runtime& rt, jsi::Value value,
 
   auto onErr = jsi::Function::createFromHostFunction(
       rt, jsi::PropNameID::forAscii(rt, "onErr"), 1,
-      [shared](jsi::Runtime&, const jsi::Value&, const jsi::Value*, size_t) -> jsi::Value {
+      [shared, convertError](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args,
+                              size_t count) -> jsi::Value {
         try {
-          (*shared)(CallResult{kBackendFailure, {}});
+          CallResult result = convertError != nullptr
+                                   ? (count > 0 ? convertError(rt, args[0])
+                                                : convertError(rt, jsi::Value::undefined()))
+                                   : CallResult{kBackendFailure, {}};
+          (*shared)(std::move(result));
         } catch (...) {
-          // `settle` on an already-resolved slot is a documented no-op, but
-          // guard uniformly with `onOk` in case a future `settle`
-          // implementation grows a fallible step.
+          (*shared)(CallResult{kBackendFailure, {}});
         }
         return jsi::Value::undefined();
       });
@@ -1198,16 +1273,17 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
       storeFreeBuffer,     // free_buffer
   };
   bindings->shareCallbacks_ = ShareStoreCallbacks{
-      self,                    // user_data
-      shareStoreLoad,          // load
-      shareStoreLoadMany,      // load_many
-      shareStoreLoadAll,       // load_all
-      shareStoreLatestVersion, // latest_version
-      shareStoreSave,          // save
-      shareStoreRemoveChannel,  // remove_channel
-      shareStoreRemoveVersions, // remove_versions
-      shareStoreKeepList,       // keep_list
-      storeFreeBuffer,          // free_buffer
+      self,                        // user_data
+      shareStoreLoad,               // load
+      shareStoreLoadMany,           // load_many
+      shareStoreLoadAll,            // load_all
+      shareStoreLatestVersion,      // latest_version
+      shareStoreSave,               // save
+      shareStoreRemoveChannel,      // remove_channel
+      shareStoreRemoveVersions,     // remove_versions
+      shareStoreKeepList,           // keep_list
+      shareStoreRecordVerification, // record_verification
+      storeFreeBuffer,              // free_buffer
   };
   bindings->userSecretCallbacks_ = UserSecretStoreCallbacks{
       self,                       // user_data
@@ -1255,6 +1331,8 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
   requireField(rt, bindings->shareCallbacks_.remove_channel, "ShareStoreCallbacks.remove_channel");
   requireField(rt, bindings->shareCallbacks_.remove_versions, "ShareStoreCallbacks.remove_versions");
   requireField(rt, bindings->shareCallbacks_.keep_list, "ShareStoreCallbacks.keep_list");
+  requireField(rt, bindings->shareCallbacks_.record_verification,
+               "ShareStoreCallbacks.record_verification");
   requireField(rt, bindings->shareCallbacks_.free_buffer, "ShareStoreCallbacks.free_buffer");
 
   requireField(rt, bindings->userSecretCallbacks_.user_data, "UserSecretStoreCallbacks.user_data");

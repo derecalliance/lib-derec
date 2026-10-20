@@ -145,6 +145,10 @@ internal static class Protocol
         IntPtr userData, ulong secretId, uint version,
         out IntPtr outPtr, out UIntPtr outLen);
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int ShareStoreRecordVerificationDelegate(
+        IntPtr userData, ulong secretId, ulong channelId, uint version);
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct ShareStoreCallbacks
     {
@@ -157,6 +161,7 @@ internal static class Protocol
         public IntPtr RemoveChannel;
         public IntPtr RemoveVersions;
         public IntPtr KeepList;
+        public IntPtr RecordVerification;
         public IntPtr FreeBuffer;
     }
 

@@ -19,7 +19,7 @@ use derec_proto::{
 
 /// Why [`DeRecEvent::MessageIgnored`] dropped an inbound message.
 ///
-/// Both cases leave every store untouched and send nothing back, so the
+/// Every case leaves every store untouched and sends nothing back, so the
 /// sender learns nothing from the drop and a retry is always safe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IgnoreReason {
@@ -37,6 +37,38 @@ pub enum IgnoreReason {
     /// The message is older than the configured inbound timeout
     /// ([`crate::protocol::types::Timeouts::inbound_message`]).
     Expired,
+    /// The envelope's timestamp and the encrypted inner message's timestamp
+    /// differ, or either or both are absent. A sender stamps both with the
+    /// one time the message was sent, so a mismatch means the envelope was
+    /// altered or built by a non-conforming peer. A body with no timestamp
+    /// field, such as `ErrorResponse`, always lands here. Checked after
+    /// decryption and before dispatch.
+    TimestampMismatch,
+    /// A `VerifyShareResponse` whose `(nonce, secret_id, version)` does not
+    /// match the challenge outstanding on its channel: an answer to an
+    /// earlier challenge that a newer one has replaced. The outstanding
+    /// challenge is kept, so its own answer still completes it.
+    StaleResponse,
+}
+
+/// Why [`DeRecEvent::VerifySharesFailed`] reached no verdict for a channel.
+///
+/// Every case is a condition on this device, not an answer from the helper:
+/// a helper's answer always ends as [`DeRecEvent::ShareVerified`],
+/// [`DeRecEvent::ShareVerifyInvalid`] or [`DeRecEvent::ShareVerifyRejected`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VerifyFailureReason {
+    /// The channel has no shared key, so no challenge can be encrypted to
+    /// the helper. Nothing is sent.
+    NoSharedKey,
+    /// This device holds no proof of the share for the channel at the
+    /// challenged version, so no answer could be checked. Reported when the
+    /// round starts, in which case nothing is sent, or when the answer
+    /// arrives after the proof was removed.
+    NoProof,
+    /// A local store or transport failure while preparing or sending the
+    /// challenge; `error` names the cause.
+    DispatchFailed,
 }
 
 /// Why [`DeRecEvent::PeerNotRestored`] left a roster entry without a channel.
@@ -118,20 +150,24 @@ pub enum PendingActionKind {
 ///   party that knows the contact's `nonce` + `channel_id` can elicit
 ///   a key-publish response. Prefer to keep this off unless you
 ///   control both ends of the transport (LAN, integration tests).
-/// - [`Self::store_share`] is the helper's only admission-control point
-///   for inbound shares. The protocol enforces no size, quota or rate
-///   limit of its own, and the negotiated `maxShareSize` from
-///   [`derec_proto::ParameterRange`] is checked for range overlap at
-///   pairing time only — never against an actual share. While this flag
-///   is `false`, the [`DeRecEvent::ActionRequired`] carrying
-///   [`PendingAction::StoreShare`] hands the application the decoded
-///   [`derec_proto::StoreShareRequestMessage`], which is where a size or
-///   quota decision belongs — see
-///   [`super::DeRecProtocol::reject`] for a worked example. Setting it
-///   `true` removes that opportunity entirely: every share from every
-///   paired Owner is stored unconditionally, at whatever size it
-///   arrives. Keep it `false` in any deployment with per-user storage
-///   limits.
+/// - [`Self::store_share`] is the helper's admission-control point for
+///   inbound shares *beyond* what the library already checks: this
+///   device's own configured `minShareSize`/`maxShareSize` from
+///   [`derec_proto::ParameterRange`] is enforced against every inbound
+///   share's actual length regardless of this flag, before
+///   [`DeRecEvent::ActionRequired`] is ever considered — an out-of-range
+///   share is refused with `SIZE_LIMIT_EXCEEDED` either way, and this flag
+///   has no say in it. While this flag is `false`, the
+///   [`DeRecEvent::ActionRequired`] carrying [`PendingAction::StoreShare`]
+///   hands the application the decoded
+///   [`derec_proto::StoreShareRequestMessage`], which is where a *tighter
+///   or per-user* size limit, storage quota, or any other app-specific
+///   decline belongs — see [`super::DeRecProtocol::reject`] for a worked
+///   example. Setting it `true` removes that opportunity: every
+///   in-range share from every paired Owner is stored unconditionally,
+///   unless the share store refuses it. Keep it `false` in any
+///   deployment with per-user storage limits tighter than this device's
+///   own configured range.
 /// - [`Self::unpair`] is destructive — accepting deletes the local
 ///   channel record and any shares/secrets associated with it. The
 ///   [`DeRecEvent::Unpaired`] event still fires (after the deletion),
@@ -999,6 +1035,14 @@ pub enum DeRecEvent {
     /// A Helper's verification proof checked out (Owner side).
     ShareVerified { channel_id: ChannelId, version: u32 },
 
+    /// A Helper answered a verification challenge with an OK status, but
+    /// its proof does not match the share this device committed to (Owner
+    /// side). The helper no longer holds the exact share bytes: its copy is
+    /// corrupted, or it is answering for a different share.
+    ///
+    /// The challenge is spent, as with [`Self::ShareVerifyRejected`].
+    ShareVerifyInvalid { channel_id: ChannelId, version: u32 },
+
     /// A Helper refused a verification challenge (Owner side): its
     /// `VerifyShareResponse` carried a non-OK status instead of a proof.
     ///
@@ -1116,9 +1160,10 @@ pub enum DeRecEvent {
     /// [`Self::RecoveryShareError`] for that final share, not as
     /// `SecretRecovered` with bogus contents.
     ///
-    /// Pass `secret` to [`super::DeRecProtocol::restore`] on a fresh
-    /// protocol instance to commit canonical helper / replica state
-    /// and wipe the throwaway recovery-mode channels.
+    /// Pass `secret` to [`super::DeRecProtocol::restore`] on the same
+    /// protocol instance that ran recovery — it holds the recovery-mode
+    /// channels `restore` unpairs — to commit canonical helper / replica
+    /// state and wipe those throwaway channels.
     SecretRecovered {
         secret: crate::protocol::types::Secret,
     },
@@ -1339,8 +1384,10 @@ pub enum DeRecEvent {
     },
 
     /// A verify-share challenge was dispatched to `channel_id` for
-    /// `version`. Followed by [`Self::ShareVerified`] or
-    /// [`Self::ShareVerifyRejected`] once the helper responds.
+    /// `version`. Followed by [`Self::ShareVerified`],
+    /// [`Self::ShareVerifyInvalid`] or [`Self::ShareVerifyRejected`] once the
+    /// helper responds, or by [`Self::VerifySharesFailed`] with
+    /// [`VerifyFailureReason::NoProof`] if the proof is removed first.
     VerifySharesStarted {
         channel_id: ChannelId,
         version: u32,
@@ -1351,11 +1398,13 @@ pub enum DeRecEvent {
         trace_id: u64,
     },
 
-    /// A verify-share challenge could not be dispatched to `channel_id`
-    /// for `version`.
+    /// No verdict could be reached for `channel_id` at `version` because of
+    /// a condition on this device; `reason` says which. Remaining fan-out
+    /// targets are unaffected.
     VerifySharesFailed {
         channel_id: ChannelId,
         version: u32,
+        reason: VerifyFailureReason,
         error: String,
     },
 

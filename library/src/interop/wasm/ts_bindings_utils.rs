@@ -77,6 +77,38 @@ pub fn wasm_start() {
     console_error_panic_hook::set_once();
 }
 
+/// Wire strings a `ShareStore`'s `save`/`recordVerification` may tag a
+/// thrown or rejected `Error`'s `refusal` property with. Read back into a
+/// [`crate::protocol::Refusal`] by
+/// [`crate::interop::wasm::protocol::stores::refusal_from_js`].
+const SHARE_STORE_REFUSAL_REASONS: [&str; 3] = ["too_frequent", "size_limit_exceeded", "rejected"];
+
+/// Build the `Error` a JS `ShareStore` throws, or rejects its promise with,
+/// to refuse a `save`/`recordVerification` call: `reason` tagged onto the
+/// error's `refusal` property, message `"share store refused: <reason>"`.
+///
+/// `reason` must be one of `"too_frequent"`, `"size_limit_exceeded"`,
+/// `"rejected"`; any other value is an error.
+#[wasm_bindgen(js_name = shareStoreRefusal)]
+pub fn share_store_refusal(reason: &str) -> Result<js_sys::Error, JsValue> {
+    if !SHARE_STORE_REFUSAL_REASONS.contains(&reason) {
+        return Err(js_error(
+            "invalid_refusal_reason",
+            format!(
+                "unknown share store refusal reason {reason:?}; expected one of {SHARE_STORE_REFUSAL_REASONS:?}"
+            ),
+        ));
+    }
+    let error = js_sys::Error::new(&format!("share store refused: {reason}"));
+    js_sys::Reflect::set(
+        &error,
+        &JsValue::from_str("refusal"),
+        &JsValue::from_str(reason),
+    )
+    .map_err(|_| js_error("internal", "failed to tag share store refusal error"))?;
+    Ok(error)
+}
+
 fn categorize(err: &crate::Error) -> (&'static str, &'static str) {
     let (category, code) = crate::interop::error_codes::classify(err);
     (category.name(), code.name())

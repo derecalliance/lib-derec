@@ -43,15 +43,20 @@ const (
 //   - PrePair turns the initiator into a request-amplification oracle —
 //     anyone knowing a HashedKeys contact's nonce can elicit a
 //     key-publish. Keep off unless you control both ends of the transport.
-//   - StoreShare is the helper's only admission-control point for inbound
-//     shares. The protocol enforces no size, quota or rate limit of its
-//     own, and maxShareSize is checked for range overlap at pairing time
-//     only, never against an actual share. While false, ActionRequired
-//     carries the decoded request, so the application can inspect the
-//     share and Reject with StatusEnum_SIZE_LIMIT_EXCEEDED. Setting it
-//     true removes that opportunity entirely: every share from every
-//     paired Owner is stored unconditionally, at whatever size it
-//     arrives. Keep off in any deployment with per-user storage limits.
+//   - StoreShare is the helper's admission-control point for inbound
+//     shares beyond what the library already checks: this device's own
+//     configured minShareSize/maxShareSize is enforced against every
+//     inbound share's actual length regardless of this flag, before
+//     ActionRequired is ever considered — an out-of-range share is
+//     refused with StatusEnum_SIZE_LIMIT_EXCEEDED either way, and this
+//     flag has no say in it. While false, ActionRequired carries the
+//     decoded request, which is where a tighter or per-user size limit,
+//     storage quota, or any other app-specific decline belongs — call
+//     Reject for that. Setting it true removes that opportunity: every
+//     in-range share from every paired Owner is stored unconditionally,
+//     unless the share store refuses it. Keep off in any deployment with
+//     per-user storage limits tighter than this device's own configured
+//     range.
 //   - Unpair is destructive — accepting deletes the local channel record
 //     before any UI confirmation.
 //   - UpdateChannelInfo silently overwrites the channel record with the
@@ -144,6 +149,10 @@ type Config struct {
 	// fails to intersect rejects the pairing with
 	// derec.CodeIncompatibleParameterRange. Default: unset — no constraints
 	// advertised, every peer range accepted.
+	//
+	// Share size is enforced by the helper; frequency limits are enforced by
+	// the app's share store (refuse from Save / RecordVerification); the
+	// deletion and deactivation timeouts are checked at pairing only.
 	ParameterRange *ParameterRange
 }
 
@@ -225,6 +234,16 @@ type RemoveExpiredChannelsPolicy struct {
 	TimeoutInSecs uint64
 }
 
+// Stores bundles the five store implementations New requires, mirroring the
+// Rust DeRecStores / dotnet DeRecStores field for field.
+type Stores struct {
+	Channel    ChannelStore
+	Share      ShareStore
+	Secret     SecretStore
+	UserSecret UserSecretStore
+	State      StateStore
+}
+
 // DeRecProtocol is the orchestrator instance bound to a set of
 // application-supplied store/transport implementations. Not safe for
 // concurrent use — callers must not invoke methods on the same instance
@@ -252,21 +271,23 @@ type DeRecProtocol struct {
 	closed bool
 }
 
-// New constructs a DeRecProtocol bound to the given store/transport
-// implementations and config. It assembles the C callback tables backing
+// New constructs a DeRecProtocol bound to the given stores, transport
+// implementation and config. It assembles the C callback tables backing
 // each store (internal/native's buildCallbacks) and then calls
 // derec_protocol_new — the first genuine C-ABI round trip a
 // protocol instance makes. On error the store registration is released before
 // returning; callers only need to call Close on success.
 func New(
-	channelStore ChannelStore,
-	shareStore ShareStore,
-	secretStore SecretStore,
-	userSecretStore UserSecretStore,
-	stateStore StateStore,
+	stores Stores,
 	transport Transport,
 	config Config,
 ) (*DeRecProtocol, error) {
+	channelStore := stores.Channel
+	shareStore := stores.Share
+	secretStore := stores.Secret
+	userSecretStore := stores.UserSecret
+	stateStore := stores.State
+
 	if channelStore == nil {
 		return nil, errors.New("protocol: New: channelStore is required")
 	}

@@ -44,6 +44,15 @@ pub(crate) struct Local<'a> {
     /// at pairing, and published as this device's own row in the replica
     /// roster.
     pub(crate) communication_info: &'a HashMap<String, String>,
+    /// The limits this device enforces as a helper.
+    ///
+    /// `None` means no check: every share size is accepted. `Some(range)`
+    /// is this device's own configured [`derec_proto::ParameterRange`];
+    /// only its `min_share_size`/`max_share_size` fields are enforced here,
+    /// against the bytes of an incoming `StoreShareRequest`. The frequency
+    /// fields are checked for overlap at pairing but enforced by the
+    /// application's share store, not read from this field.
+    pub(crate) parameter_range: Option<&'a derec_proto::ParameterRange>,
 }
 
 impl Local<'_> {
@@ -132,6 +141,7 @@ macro_rules! local {
             own_transports: &$protocol.own_transports,
             policy: $crate::transport::TransportPolicy::new($protocol.unsafe_connection),
             communication_info: &$protocol.communication_info,
+            parameter_range: $protocol.parameter_range.as_ref(),
         }
     };
 }

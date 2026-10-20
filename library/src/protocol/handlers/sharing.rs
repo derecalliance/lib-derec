@@ -3,7 +3,7 @@
 
 use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    MissingPolicy, PendingAction, SecretKind, SecretValue, Share,
+    MissingPolicy, PendingAction, SecretKind, SecretValue, Share, ShareStoreError,
 };
 use super::replicas::sharing as replica;
 use crate::derec_message::DeRecMessageBuilder;
@@ -56,7 +56,7 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
                 ))?;
             match (channel.peer_role, inner) {
                 (SenderKind::Owner, MessageBody::StoreShareRequest(request)) => {
-                    on_request(exchange, request)
+                    on_request(stores, local, exchange, request).await
                 }
                 (SenderKind::Helper, MessageBody::StoreShareResponse(response)) => {
                     on_response(channel_id, &response)
@@ -356,7 +356,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
             );
         }
         None => {
-            stores
+            let save_result = stores
                 .shares
                 .save(
                     secret_id,
@@ -367,7 +367,32 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
                         bytes: encoded_request,
                     },
                 )
-                .await?;
+                .await;
+            match save_result {
+                Ok(()) => {}
+                Err(ShareStoreError::Refused(refusal)) => {
+                    reject(
+                        stores,
+                        local,
+                        exchange,
+                        request,
+                        refusal.status(),
+                        refusal.memo(),
+                    )
+                    .await?;
+
+                    #[cfg(feature = "logging")]
+                    tracing::info!(
+                        channel_id = channel_id.0,
+                        secret_id = secret_id,
+                        version = version,
+                        "share update refused by the application's share store"
+                    );
+
+                    return Ok(vec![DeRecEvent::NoOp]);
+                }
+                Err(other) => return Err(other.into()),
+            }
         }
     }
 
@@ -491,10 +516,30 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         )
     )
 )]
-fn on_request(
+async fn on_request<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
     exchange: &Exchange<'_>,
     request: StoreShareRequestMessage,
 ) -> Result<Vec<DeRecEvent>> {
+    if let Some(range) = local.parameter_range {
+        let len = request.share.len() as i64;
+        let too_small = range.min_share_size > 0 && len < range.min_share_size;
+        let too_large = range.max_share_size != 0 && len > range.max_share_size;
+        if too_small || too_large {
+            reject(
+                stores,
+                local,
+                exchange,
+                &request,
+                StatusEnum::SizeLimitExceeded,
+                "share size is outside the helper's accepted range",
+            )
+            .await?;
+            return Ok(vec![DeRecEvent::NoOp]);
+        }
+    }
+
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id: exchange.channel_id,
         action: PendingAction::StoreShare {
@@ -876,6 +921,20 @@ async fn distribute_shares<S: StoreSet>(
 
     results
 }
+/// Send one Helper its share and save the owner's proof of what was sent.
+///
+/// The saved proof is retained only until the round settles that channel:
+/// [`DeRecProtocol::tick`](crate::protocol::DeRecProtocol::tick) and
+/// [`DeRecProtocol::process`](crate::protocol::DeRecProtocol::process) drop
+/// it the moment the channel is marked failed, whether by an inbound
+/// `ShareRejected` (any status) or by the round timing out. A stored proof
+/// is therefore always either confirmed by its Helper or still part of an
+/// open round — a late `ShareConfirmed` arriving after the failure is
+/// recorded but never recreates it. This guarantee holds on the publishing
+/// device; a replica Destination holds the proofs the Source mirrored at
+/// publish time and never sees `SharingComplete`, so verifying there can
+/// report `ShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`) for a helper that
+/// failed the Source's round.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_share_to_helper<S: StoreSet>(
     stores: &mut Stores<'_, S>,
@@ -1065,9 +1124,13 @@ mod tests {
     use crate::primitives::sharing::request;
     use crate::protocol::context::Exchange;
     use crate::protocol::test::LocalFixture;
-    use crate::protocol::test::{InMemChannelStore, NoopTransport, StoreRig, run_async};
+    use crate::protocol::test::{
+        InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemUserSecretStore,
+        NoopTransport, RecordingTransport, RefusingShareStore, StoreRig, run_async,
+    };
+    use crate::protocol::{Refusal, ShareStoreError};
     use crate::types::{ChannelId, SharedKey};
-    use derec_proto::{Protocol, TransportProtocol};
+    use derec_proto::{ParameterRange, Protocol, StatusEnum, TransportProtocol};
     use prost::Message as _;
 
     /// A Helper stores each incoming share partitioned under *its own*
@@ -1493,6 +1556,417 @@ mod tests {
             )
             .await
             .expect("seed channel");
+    }
+
+    const PARAM_SECRET_ID: u64 = 0xA11CE;
+    const PARAM_CHANNEL: ChannelId = ChannelId(41);
+    const PARAM_KEY: SharedKey = [5u8; 32];
+
+    fn param_reply_to() -> TransportProtocol {
+        TransportProtocol {
+            uri: "https://owner.example".to_owned(),
+            protocol: Protocol::Https as i32,
+        }
+    }
+
+    /// A real `StoreShareRequestMessage` whose `share` field is a VSS
+    /// committed-share encoding of `payload`, carrying an explicit
+    /// `reply_to` so these tests need no seeded channel record to resolve
+    /// a response endpoint.
+    fn param_request(payload: &[u8]) -> derec_proto::StoreShareRequestMessage {
+        let split = request::split(
+            &[PARAM_CHANNEL, ChannelId(42)],
+            PARAM_SECRET_ID,
+            1,
+            payload,
+            2,
+        )
+        .expect("split secret");
+        let committed = split.shares.get(&PARAM_CHANNEL).expect("share for channel");
+        let produced = request::produce(
+            PARAM_CHANNEL,
+            1,
+            PARAM_SECRET_ID,
+            committed,
+            &[],
+            "",
+            &PARAM_KEY,
+            std::slice::from_ref(&param_reply_to()),
+        )
+        .expect("produce request");
+        request::extract(&produced.envelope, &PARAM_KEY)
+            .expect("extract request")
+            .request
+    }
+
+    /// Decode a `StoreShareResponseMessage` sent by a Helper, using the same
+    /// decode path the orchestrator's `process()` uses
+    /// (`extract_inner_message`) rather than reimplementing it, since these
+    /// tests only inspect the response content.
+    fn decode_store_share_response(
+        envelope_bytes: &[u8],
+        shared_key: &SharedKey,
+    ) -> derec_proto::StoreShareResponseMessage {
+        let envelope =
+            derec_proto::DeRecMessage::decode(envelope_bytes).expect("decode response envelope");
+        match crate::derec_message::extract_inner_message(&envelope.message, shared_key)
+            .expect("decrypt response")
+        {
+            derec_proto::MessageBody::StoreShareResponse(resp) => resp,
+            other => panic!("expected a StoreShareResponse, got {other:?}"),
+        }
+    }
+
+    /// A share-size check refuses an oversized share before `ActionRequired`
+    /// is ever raised, so the application is never asked about it.
+    #[test]
+    fn helper_refuses_a_share_above_max_size() {
+        run_async(async {
+            let request = param_request(b"a plausible secret payload for the size gate tests");
+            let share_len = request.share.len() as i64;
+            let range = ParameterRange {
+                max_share_size: share_len - 1,
+                ..Default::default()
+            };
+            let lf = LocalFixture::with_parameter_range(PARAM_SECRET_ID, range);
+            let mut rig = StoreRig::with_transport(RecordingTransport::default());
+
+            let events = super::on_request(
+                &mut rig.stores(),
+                &lf.local(),
+                &Exchange {
+                    channel_id: PARAM_CHANNEL,
+                    shared_key: &PARAM_KEY,
+                    trace_id: 1,
+                },
+                request,
+            )
+            .await
+            .expect("an oversized share is refused, not raised as an error");
+
+            assert!(
+                matches!(events.as_slice(), [crate::protocol::DeRecEvent::NoOp]),
+                "a refused share reports no ActionRequired, only NoOp"
+            );
+            assert!(
+                rig.shares.data.lock().unwrap().is_empty(),
+                "nothing is stored once the size check refuses the share"
+            );
+
+            let sent = rig.transport.sent_envelopes();
+            assert_eq!(sent.len(), 1, "exactly one rejection is sent to the owner");
+            let response = decode_store_share_response(&sent[0], &PARAM_KEY);
+            let owner_events = super::on_response(PARAM_CHANNEL, &response)
+                .expect("owner processes the rejection");
+            assert!(
+                matches!(
+                    owner_events.as_slice(),
+                    [crate::protocol::DeRecEvent::ShareRejected { status, .. }]
+                        if *status == StatusEnum::SizeLimitExceeded as i32
+                ),
+                "the owner sees the mapped SIZE_LIMIT_EXCEEDED status"
+            );
+        });
+    }
+
+    /// Same gate, triggered from the other side of the range.
+    #[test]
+    fn helper_refuses_a_share_below_min_size() {
+        run_async(async {
+            let request = param_request(b"a plausible secret payload for the size gate tests");
+            let share_len = request.share.len() as i64;
+            let range = ParameterRange {
+                min_share_size: share_len + 1,
+                ..Default::default()
+            };
+            let lf = LocalFixture::with_parameter_range(PARAM_SECRET_ID, range);
+            let mut rig = StoreRig::with_transport(RecordingTransport::default());
+
+            let events = super::on_request(
+                &mut rig.stores(),
+                &lf.local(),
+                &Exchange {
+                    channel_id: PARAM_CHANNEL,
+                    shared_key: &PARAM_KEY,
+                    trace_id: 1,
+                },
+                request,
+            )
+            .await
+            .expect("an undersized share is refused, not raised as an error");
+
+            assert!(
+                matches!(events.as_slice(), [crate::protocol::DeRecEvent::NoOp]),
+                "a refused share reports no ActionRequired, only NoOp"
+            );
+            assert!(
+                rig.shares.data.lock().unwrap().is_empty(),
+                "nothing is stored once the size check refuses the share"
+            );
+
+            let sent = rig.transport.sent_envelopes();
+            assert_eq!(sent.len(), 1, "exactly one rejection is sent to the owner");
+            let response = decode_store_share_response(&sent[0], &PARAM_KEY);
+            let owner_events = super::on_response(PARAM_CHANNEL, &response)
+                .expect("owner processes the rejection");
+            assert!(
+                matches!(
+                    owner_events.as_slice(),
+                    [crate::protocol::DeRecEvent::ShareRejected { status, .. }]
+                        if *status == StatusEnum::SizeLimitExceeded as i32
+                ),
+                "the owner sees the mapped SIZE_LIMIT_EXCEEDED status"
+            );
+        });
+    }
+
+    /// Inclusive bounds: a share exactly at `min == max` is accepted,
+    /// stored, and acknowledged.
+    #[test]
+    fn helper_accepts_a_share_at_the_bounds() {
+        run_async(async {
+            let request = param_request(b"a payload whose encoded share sets the exact bound");
+            let share_len = request.share.len() as i64;
+            let range = ParameterRange {
+                min_share_size: share_len,
+                max_share_size: share_len,
+                ..Default::default()
+            };
+            let lf = LocalFixture::with_parameter_range(PARAM_SECRET_ID, range);
+            let mut rig = StoreRig::with_transport(RecordingTransport::default());
+
+            let events = super::on_request(
+                &mut rig.stores(),
+                &lf.local(),
+                &Exchange {
+                    channel_id: PARAM_CHANNEL,
+                    shared_key: &PARAM_KEY,
+                    trace_id: 1,
+                },
+                request.clone(),
+            )
+            .await
+            .expect("a share exactly at the bounds is let through");
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [crate::protocol::DeRecEvent::ActionRequired {
+                        action: crate::protocol::PendingAction::StoreShare { .. },
+                        ..
+                    }]
+                ),
+                "an in-bounds share raises ActionRequired like any other"
+            );
+
+            let accept_events = super::accept(
+                &mut rig.stores(),
+                &lf.local(),
+                &Exchange {
+                    channel_id: PARAM_CHANNEL,
+                    shared_key: &PARAM_KEY,
+                    trace_id: 1,
+                },
+                &request,
+            )
+            .await
+            .expect("accept stores the in-bounds share");
+            assert!(matches!(
+                accept_events.as_slice(),
+                [crate::protocol::DeRecEvent::ShareStored { .. }]
+            ));
+
+            let sent = rig.transport.sent_envelopes();
+            assert_eq!(sent.len(), 1);
+            let response = decode_store_share_response(&sent[0], &PARAM_KEY);
+            let owner_events =
+                super::on_response(PARAM_CHANNEL, &response).expect("owner processes the ack");
+            assert!(matches!(
+                owner_events.as_slice(),
+                [crate::protocol::DeRecEvent::ShareConfirmed { .. }]
+            ));
+        });
+    }
+
+    /// `max_share_size == 0` means unbounded, independent of `min`.
+    #[test]
+    fn helper_with_zero_max_accepts_any_size() {
+        run_async(async {
+            let request = param_request(b"a payload accepted under an explicit zero max bound");
+            let range = ParameterRange::default();
+            let lf = LocalFixture::with_parameter_range(PARAM_SECRET_ID, range);
+            let mut rig = StoreRig::with_transport(NoopTransport);
+
+            let events = super::on_request(
+                &mut rig.stores(),
+                &lf.local(),
+                &Exchange {
+                    channel_id: PARAM_CHANNEL,
+                    shared_key: &PARAM_KEY,
+                    trace_id: 1,
+                },
+                request,
+            )
+            .await
+            .expect("a zero max_share_size means unbounded");
+
+            assert!(matches!(
+                events.as_slice(),
+                [crate::protocol::DeRecEvent::ActionRequired { .. }]
+            ));
+        });
+    }
+
+    type ParamRig = StoreRig<
+        InMemChannelStore,
+        RefusingShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemPersistedStateStore,
+        RecordingTransport,
+    >;
+
+    fn param_rig() -> ParamRig {
+        StoreRig {
+            channels: InMemChannelStore::default(),
+            shares: RefusingShareStore::default(),
+            secrets: InMemSecretStore::default(),
+            user_secrets: InMemUserSecretStore::default(),
+            state: InMemPersistedStateStore::default(),
+            transport: RecordingTransport::default(),
+        }
+    }
+
+    /// A `save` refusal is answered to the owner with the mapped status
+    /// and memo, not raised as a local error.
+    #[test]
+    fn helper_save_refusal_answers_the_mapped_status() {
+        run_async(async {
+            let request = param_request(b"a share update the application's store refuses");
+            let lf = LocalFixture::new(PARAM_SECRET_ID);
+            let mut rig = param_rig();
+            rig.shares.set_refusal(Some(Refusal::TooFrequent));
+
+            let events = super::accept(
+                &mut rig.stores(),
+                &lf.local(),
+                &Exchange {
+                    channel_id: PARAM_CHANNEL,
+                    shared_key: &PARAM_KEY,
+                    trace_id: 1,
+                },
+                &request,
+            )
+            .await
+            .expect("a store refusal is answered, not raised as an error");
+
+            assert!(
+                matches!(events.as_slice(), [crate::protocol::DeRecEvent::NoOp]),
+                "the refusal is reported to the peer, not surfaced as a local ShareStored"
+            );
+
+            let sent = rig.transport.sent_envelopes();
+            assert_eq!(sent.len(), 1);
+            let response = decode_store_share_response(&sent[0], &PARAM_KEY);
+            let owner_events =
+                super::on_response(PARAM_CHANNEL, &response).expect("owner processes the refusal");
+            assert!(
+                matches!(
+                    owner_events.as_slice(),
+                    [crate::protocol::DeRecEvent::ShareRejected { status, memo, .. }]
+                        if *status == StatusEnum::TooFrequent as i32
+                            && memo == "refused by the helper: too frequent"
+                ),
+                "the owner sees the mapped TOO_FREQUENT status and memo"
+            );
+        });
+    }
+
+    /// An idempotent re-send of an already-stored version never calls
+    /// `save`, so a store that has started refusing writes still
+    /// acknowledges it.
+    #[test]
+    fn helper_save_refusal_is_not_reached_by_an_idempotent_resend() {
+        run_async(async {
+            let request =
+                param_request(b"a payload re-sent identically after the store starts refusing");
+            let lf = LocalFixture::new(PARAM_SECRET_ID);
+            let mut rig = param_rig();
+
+            let first = super::accept(
+                &mut rig.stores(),
+                &lf.local(),
+                &Exchange {
+                    channel_id: PARAM_CHANNEL,
+                    shared_key: &PARAM_KEY,
+                    trace_id: 1,
+                },
+                &request,
+            )
+            .await
+            .expect("the first write stores the share");
+            assert!(matches!(
+                first.as_slice(),
+                [crate::protocol::DeRecEvent::ShareStored { .. }]
+            ));
+
+            rig.shares.set_refusal(Some(Refusal::TooFrequent));
+
+            let second = super::accept(
+                &mut rig.stores(),
+                &lf.local(),
+                &Exchange {
+                    channel_id: PARAM_CHANNEL,
+                    shared_key: &PARAM_KEY,
+                    trace_id: 1,
+                },
+                &request,
+            )
+            .await
+            .expect("an identical resend never reaches save, so it cannot be refused");
+            assert!(
+                matches!(
+                    second.as_slice(),
+                    [crate::protocol::DeRecEvent::ShareStored { .. }]
+                ),
+                "the idempotent resend is still acknowledged as stored"
+            );
+        });
+    }
+
+    /// A non-refusal store failure propagates as an error rather than
+    /// being turned into a status response.
+    #[test]
+    fn helper_save_backend_error_still_propagates() {
+        run_async(async {
+            let request = param_request(b"a payload whose save backend fails outright");
+            let lf = LocalFixture::new(PARAM_SECRET_ID);
+            let mut rig = param_rig();
+            rig.shares.set_backend_error(true);
+
+            let result = super::accept(
+                &mut rig.stores(),
+                &lf.local(),
+                &Exchange {
+                    channel_id: PARAM_CHANNEL,
+                    shared_key: &PARAM_KEY,
+                    trace_id: 1,
+                },
+                &request,
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::Error::ShareStore(ShareStoreError::Backend(_)))
+                ),
+                "a non-refusal store failure propagates as an error, not a status response"
+            );
+            assert!(
+                rig.transport.sent_envelopes().is_empty(),
+                "no status response is sent on a backend failure"
+            );
+        });
     }
 }
 

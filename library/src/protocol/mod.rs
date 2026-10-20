@@ -35,9 +35,11 @@
 //! - **RecoverSecret** — collect enough Helper shares to reconstruct an
 //!   earlier secret version.
 //! - **Restore** — [`DeRecProtocol::restore`] commits a recovered
-//!   [`crate::protocol::types::Secret`] into a fresh protocol instance:
+//!   [`crate::protocol::types::Secret`] into this `secret_id`'s stores:
 //!   reseats canonical helper / replica channels at the recovered
-//!   version and wipes the throwaway recovery-mode channels. Not a
+//!   version and wipes the throwaway recovery-mode channels. Called on
+//!   the same instance that ran recovery — it still holds the
+//!   recovery-mode channels `restore` needs to unpair. Not a
 //!   [`DeRecFlow`] variant — called once, directly on the protocol,
 //!   after a `SecretRecovered` event surfaces.
 //! - **UpdateChannelInfo** — broadcast updated `communication_info`
@@ -91,10 +93,10 @@ pub(crate) mod sweeps;
 #[cfg(test)]
 pub(crate) mod test;
 
-pub use builder::{DEFAULT_THRESHOLD, DeRecProtocolBuilder};
+pub use builder::{DEFAULT_THRESHOLD, DeRecProtocolBuilder, DeRecStores};
 use derec_proto::TransportProtocol;
 pub use error::{
-    ChannelStoreError, ProcessError, SecretStoreError, ShareStoreError, StateStoreError,
+    ChannelStoreError, ProcessError, Refusal, SecretStoreError, ShareStoreError, StateStoreError,
 };
 use std::collections::HashMap;
 pub use traits::{
@@ -112,7 +114,7 @@ pub use types::{
 
 pub use events::{
     AutoAcceptPolicy, CorruptionReason, DeRecEvent, DeRecFlow, IgnoreReason, NotRestoredReason,
-    PendingAction, PendingActionKind, UnpairAck,
+    PendingAction, PendingActionKind, UnpairAck, VerifyFailureReason,
 };
 pub use handlers::restore::RestoreError;
 

@@ -82,6 +82,14 @@
         {
           "name": "Expired",
           "wire": "Expired"
+        },
+        {
+          "name": "TimestampMismatch",
+          "wire": "TimestampMismatch"
+        },
+        {
+          "name": "StaleResponse",
+          "wire": "StaleResponse"
         }
       ]
     },
@@ -92,6 +100,24 @@
         {
           "name": "NoTransports",
           "wire": "NoTransports"
+        }
+      ]
+    },
+    "VerifyFailureReason": {
+      "encoding": "name",
+      "note": "VerifySharesFailed.reason",
+      "variants": [
+        {
+          "name": "NoSharedKey",
+          "wire": "NoSharedKey"
+        },
+        {
+          "name": "NoProof",
+          "wire": "NoProof"
+        },
+        {
+          "name": "DispatchFailed",
+          "wire": "DispatchFailed"
         }
       ]
     },
@@ -264,6 +290,10 @@
         {
           "name": "ShareVerified",
           "wire": "ShareVerified"
+        },
+        {
+          "name": "ShareVerifyInvalid",
+          "wire": "ShareVerifyInvalid"
         },
         {
           "name": "ShareVerifyRejected",

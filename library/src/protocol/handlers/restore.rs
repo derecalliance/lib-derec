@@ -103,8 +103,10 @@ pub enum RestoreError {
 /// # Verification after a restore
 ///
 /// No owner-side tracking [`crate::protocol::types::Share`] is written,
-/// so `start(VerifyShares)` at `recovered_version` reports
-/// [`crate::Error::InvalidInput`] — this device holds no reference bytes
+/// so `start(VerifyShares)` at `recovered_version` sends no challenge and
+/// reports each channel as `VerifySharesFailed` with
+/// [`crate::protocol::VerifyFailureReason::NoProof`] — this device holds no
+/// reference bytes
 /// for that version and cannot check a proof against it. That is a
 /// property of recovery, not a defect: a `VerifyShare` proof is
 /// `SHA-384(share ‖ nonce)` over the *exact* bytes a Helper holds, and

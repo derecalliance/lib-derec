@@ -202,7 +202,8 @@ pub fn share(
 ///
 /// # Returns
 ///
-/// `true` if the recomputed root equals `share.commitment`, `false` otherwise.
+/// `true` if the recomputed root equals `share.commitment`, `false` otherwise,
+/// including when `share.merkle_path` does not span the full tree depth.
 ///
 /// # Example
 ///
@@ -214,6 +215,10 @@ pub fn share(
 /// ```
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
 pub fn verify(share: &VSSShare) -> bool {
+    if share.merkle_path.len() != MERKLE_TREE_DEPTH as usize {
+        return false;
+    }
+
     let mut on_path_hash = utils::leaf_hash_pub(&share.x, &share.y);
 
     for (is_left, node_hash) in &share.merkle_path {
@@ -410,6 +415,81 @@ mod tests {
         assert!(!verify(&shares[0]), "tampered y should fail Merkle proof");
     }
 
+    // An internal node is the hash of its two children, so its children can be
+    // passed off as a share's (x, y) with the shorter proof from that node to the root.
+    fn internal_node_as_share(genuine: &VSSShare) -> VSSShare {
+        let (sibling_is_left, sibling) = &genuine.merkle_path[0];
+        let leaf = utils::leaf_hash_pub(&genuine.x, &genuine.y);
+        let (left, right) = if *sibling_is_left {
+            (sibling.clone(), leaf)
+        } else {
+            (leaf, sibling.clone())
+        };
+        VSSShare {
+            x: left,
+            y: right,
+            encrypted_secret: genuine.encrypted_secret.clone(),
+            commitment: genuine.commitment.clone(),
+            merkle_path: genuine.merkle_path[1..].to_vec(),
+        }
+    }
+
+    #[test]
+    fn test_verify_rejects_an_internal_node_presented_as_a_leaf() {
+        let shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        let forged = internal_node_as_share(&shares[0]);
+
+        assert!(
+            !verify(&forged),
+            "an internal node must not verify as a share"
+        );
+    }
+
+    #[test]
+    fn test_internal_node_presented_as_a_leaf_does_not_open_to_the_root() {
+        let shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        let forged = internal_node_as_share(&shares[0]);
+
+        // Walk the forged proof without the depth check, so only the
+        // leaf/internal-node domain separation stands between it and the root.
+        let mut on_path_hash = utils::leaf_hash_pub(&forged.x, &forged.y);
+        for (is_left, node_hash) in &forged.merkle_path {
+            on_path_hash = if *is_left {
+                utils::intermediate_hash_pub(node_hash, &on_path_hash)
+            } else {
+                utils::intermediate_hash_pub(&on_path_hash, node_hash)
+            };
+        }
+
+        assert_ne!(on_path_hash, forged.commitment);
+    }
+
+    #[test]
+    fn test_verify_rejects_a_proof_that_is_not_the_tree_depth() {
+        let shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+
+        let mut short = shares[0].clone();
+        short.merkle_path.pop();
+        assert!(!verify(&short), "a truncated proof must not verify");
+
+        let mut long = shares[0].clone();
+        long.merkle_path.push((false, vec![0u8; 32]));
+        assert!(!verify(&long), "an extended proof must not verify");
+    }
+
+    #[test]
+    fn test_recover_rejects_an_internal_node_presented_as_a_leaf() {
+        let shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        let forged = vec![
+            internal_node_as_share(&shares[0]),
+            shares[2].clone(),
+            shares[3].clone(),
+        ];
+
+        let err = recover(&forged).expect_err("an internal node must not pass as a share");
+        assert!(matches!(err, DerecVSSError::CorruptShares));
+    }
+
     #[test]
     fn test_recover_exact_threshold() {
         let shares = share(3, 5, b"my secret", ENTROPY).unwrap();
@@ -482,14 +562,15 @@ mod tests {
     fn test_recover_rejects_a_proven_coordinate_that_is_not_a_field_element() {
         let mut shares = share(2, 2, b"my secret", ENTROPY).unwrap();
         shares[0].y = vec![0xFF; shares[0].y.len()];
-        let root = utils::intermediate_hash_pub(
-            &utils::leaf_hash_pub(&shares[0].x, &shares[0].y),
-            &utils::leaf_hash_pub(&shares[1].x, &shares[1].y),
-        );
-        shares[0].commitment = root.clone();
-        shares[0].merkle_path = vec![(false, utils::leaf_hash_pub(&shares[1].x, &shares[1].y))];
-        shares[1].commitment = root;
-        shares[1].merkle_path = vec![(true, utils::leaf_hash_pub(&shares[0].x, &shares[0].y))];
+        let points: Vec<(Vec<u8>, Vec<u8>)> =
+            shares.iter().map(|s| (s.x.clone(), s.y.clone())).collect();
+        let tree =
+            utils::build_merkle_tree(&points, MERKLE_TREE_DEPTH, &mut crate::random::os_rng());
+        let proofs = utils::extract_merkle_proofs(&tree, MERKLE_TREE_DEPTH, 2);
+        for (s, proof) in shares.iter_mut().zip(proofs) {
+            s.commitment = tree[0].clone();
+            s.merkle_path = proof;
+        }
 
         let err = recover(&shares).expect_err("an undecodable coordinate cannot interpolate");
         assert!(matches!(err, DerecVSSError::CorruptShares));

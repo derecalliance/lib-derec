@@ -6,7 +6,12 @@
 //! Each store/transport slot is tracked by its own type parameter, starting
 //! at [`BuilderSlotMissingMarker`] and transitioning to
 //! [`BuilderSlotSetMarker<T>`] when its `with_*` setter runs. Setters only
-//! touch their own slot, which is what makes call order irrelevant.
+//! touch their own slot, which is what makes call order irrelevant — and,
+//! for the five store slots, what makes a setter safe to call again later:
+//! it replaces whatever was in its own slot (whether that was still
+//! [`BuilderSlotMissingMarker`] or already a [`BuilderSlotSetMarker<_>`]
+//! from an earlier call, including [`DeRecProtocolBuilder::with_stores`])
+//! without disturbing the other four.
 //! [`DeRecProtocolBuilder::build`](crate::protocol::DeRecProtocolBuilder::build) is reachable only when every slot has
 //! reached [`BuilderSlotSetMarker<_>`].
 
@@ -22,6 +27,23 @@ use derec_proto::TransportProtocol;
 pub struct BuilderSlotMissingMarker;
 
 pub struct BuilderSlotSetMarker<T>(T);
+
+/// The five stores [`DeRecProtocolBuilder::build`] requires, bundled for
+/// [`DeRecProtocolBuilder::with_stores`].
+///
+/// Each field matches the store its corresponding `with_*_store` setter
+/// takes: `channels` is [`with_channel_store`](DeRecProtocolBuilder::with_channel_store),
+/// `shares` is [`with_share_store`](DeRecProtocolBuilder::with_share_store),
+/// `secrets` is [`with_secret_store`](DeRecProtocolBuilder::with_secret_store),
+/// `user_secrets` is [`with_user_secret_store`](DeRecProtocolBuilder::with_user_secret_store),
+/// and `state` is [`with_state_store`](DeRecProtocolBuilder::with_state_store).
+pub struct DeRecStores<Cs, Sh, Ss, Us, St> {
+    pub channels: Cs,
+    pub shares: Sh,
+    pub secrets: Ss,
+    pub user_secrets: Us,
+    pub state: St,
+}
 
 /// Minimum number of shares required to reconstruct the secret, absent an
 /// explicit [`DeRecProtocolBuilder::with_threshold`](crate::protocol::DeRecProtocolBuilder::with_threshold) call. This is the sole
@@ -54,6 +76,10 @@ pub const DEFAULT_THRESHOLD: usize = 3;
 ///     // Plus any optional with_* setters to override defaults.
 ///     .build()?;
 /// ```
+///
+/// The five store setters can be replaced by one
+/// [`with_stores`](DeRecProtocolBuilder::with_stores) call taking a
+/// [`DeRecStores`] bundle.
 pub struct DeRecProtocolBuilder<
     ChannelStore,
     ShareStore,
@@ -350,21 +376,111 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     ///
     /// Embedded in outbound `PairRequest` / `PairResponse` envelopes and
     /// checked against the peer's range on inbound ones: if any field's
-    /// range fails to intersect (e.g. local `minShareSize` exceeds peer
-    /// `maxShareSize`) the pairing is rejected with
+    /// range fails to intersect (e.g. local `minShareSize` exceeds a non-zero
+    /// peer `maxShareSize`), or the peer's range is malformed, the pairing is
+    /// rejected with
     /// [`Error::Pairing(PairingError::IncompatibleParameterRange { .. })`](crate::Error::Pairing).
+    ///
+    /// A field value of `0` means "no bound", on both sides: `min == 0` is no
+    /// minimum and `max == 0` is no maximum, so a `max` of `0` overlaps any
+    /// `min`. Each field's `min` and `max` must be `>= 0`, and when
+    /// `max != 0`, `min <= max`. A local range breaking either rule is
+    /// rejected by [`build`](DeRecProtocolBuilder::build) with
+    /// [`Error::InvalidInput`](crate::Error::InvalidInput) naming the field.
     ///
     /// Default: unset — the local side advertises no constraints and
     /// accepts any peer range.
+    ///
+    /// # Enforcement
+    ///
+    /// Negotiating a range is not the same as enforcing it; what happens
+    /// after pairing differs by field:
+    ///
+    /// - `minShareSize`/`maxShareSize`: enforced by the library itself, on
+    ///   helper channels only. Every inbound `StoreShareRequest` has its
+    ///   `share` length checked against this device's own range before
+    ///   `ActionRequired` is raised or auto-accept runs; an out-of-range
+    ///   share is refused with `SIZE_LIMIT_EXCEEDED` and never reaches the
+    ///   application.
+    /// - `minTimeBetweenShareUpdates`/`maxTimeBetweenShareUpdates` and
+    ///   `minTimeBetweenVerifications`/`maxTimeBetweenVerifications`: only
+    ///   negotiated here. Enforcing them is the application's
+    ///   responsibility, through its [`DeRecShareStore`](super::DeRecShareStore)
+    ///   — returning
+    ///   [`ShareStoreError::Refused`](super::error::ShareStoreError::Refused)
+    ///   from [`DeRecShareStore::save`](super::DeRecShareStore::save) or
+    ///   [`DeRecShareStore::record_verification`](super::DeRecShareStore::record_verification)
+    ///   turns the application's refusal into the matching status for the
+    ///   owner. The library never stores timestamps itself.
+    /// - the unresponsive deletion/deactivation timeout fields: negotiated
+    ///   only; the library enforces nothing from them.
     pub fn with_parameter_range(mut self, range: derec_proto::ParameterRange) -> Self {
         self.parameter_range = Some(range);
         self
     }
+
+    /// Set every store in one call.
+    ///
+    /// Equivalent to calling [`with_channel_store`](Self::with_channel_store),
+    /// [`with_share_store`](Self::with_share_store),
+    /// [`with_secret_store`](Self::with_secret_store),
+    /// [`with_user_secret_store`](Self::with_user_secret_store) and
+    /// [`with_state_store`](Self::with_state_store) in turn — it reuses them
+    /// rather than assigning the five slots itself, so the two paths can
+    /// never disagree about what a store setter does.
+    ///
+    /// Each of those setters only ever touches its own slot, so calling one
+    /// of them again afterwards — on the result of `with_stores` or of
+    /// another setter — replaces just that store and leaves the other four
+    /// as they were. Likewise, `with_stores` replaces any store set by an
+    /// earlier call:
+    ///
+    /// ```text
+    /// let protocol = DeRecProtocolBuilder::new(secret_id)
+    ///     .with_stores(DeRecStores {
+    ///         channels: my_channel_store,
+    ///         shares: my_share_store,
+    ///         secrets: my_secret_store,
+    ///         user_secrets: my_user_secret_store,
+    ///         state: my_state_store,
+    ///     })
+    ///     // Overrides only the share store set above.
+    ///     .with_share_store(a_different_share_store)
+    ///     .with_transport(my_transport)
+    ///     .with_own_transports(["https://me.example.com"])
+    ///     .build()?;
+    /// ```
+    #[allow(clippy::type_complexity)]
+    pub fn with_stores<Cs, Sh, Ss, Us, St>(
+        self,
+        stores: DeRecStores<Cs, Sh, Ss, Us, St>,
+    ) -> DeRecProtocolBuilder<
+        BuilderSlotSetMarker<Cs>,
+        BuilderSlotSetMarker<Sh>,
+        BuilderSlotSetMarker<Ss>,
+        BuilderSlotSetMarker<Us>,
+        BuilderSlotSetMarker<St>,
+        Transport,
+        OwnTransport,
+    >
+    where
+        Cs: DeRecChannelStore,
+        Sh: DeRecShareStore,
+        Ss: DeRecSecretStore,
+        Us: DeRecUserSecretStore,
+        St: DeRecStateStore,
+    {
+        self.with_channel_store(stores.channels)
+            .with_share_store(stores.shares)
+            .with_secret_store(stores.secrets)
+            .with_user_secret_store(stores.user_secrets)
+            .with_state_store(stores.state)
+    }
 }
 
-impl<ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTransport>
+impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTransport>
     DeRecProtocolBuilder<
-        BuilderSlotMissingMarker,
+        ChannelStore,
         ShareStore,
         SecretStore,
         UserSecretStore,
@@ -375,6 +491,10 @@ impl<ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTranspo
 {
     /// Set the [`DeRecChannelStore`] implementation responsible for persisting
     /// channel records.
+    ///
+    /// Calling this again later — including after
+    /// [`with_stores`](Self::with_stores) — replaces the channel store the
+    /// prior call set, without touching any other slot.
     pub fn with_channel_store<Cs: DeRecChannelStore>(
         self,
         store: Cs,
@@ -410,10 +530,10 @@ impl<ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTranspo
     }
 }
 
-impl<ChannelStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTransport>
+impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTransport>
     DeRecProtocolBuilder<
         ChannelStore,
-        BuilderSlotMissingMarker,
+        ShareStore,
         SecretStore,
         UserSecretStore,
         StateStore,
@@ -423,6 +543,10 @@ impl<ChannelStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTrans
 {
     /// Set the [`DeRecShareStore`] implementation responsible for persisting
     /// secret shares.
+    ///
+    /// Calling this again later — including after
+    /// [`with_stores`](Self::with_stores) — replaces the share store the
+    /// prior call set, without touching any other slot.
     pub fn with_share_store<Sh: DeRecShareStore>(
         self,
         store: Sh,
@@ -458,11 +582,11 @@ impl<ChannelStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTrans
     }
 }
 
-impl<ChannelStore, ShareStore, UserSecretStore, StateStore, Transport, OwnTransport>
+impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTransport>
     DeRecProtocolBuilder<
         ChannelStore,
         ShareStore,
-        BuilderSlotMissingMarker,
+        SecretStore,
         UserSecretStore,
         StateStore,
         Transport,
@@ -471,6 +595,10 @@ impl<ChannelStore, ShareStore, UserSecretStore, StateStore, Transport, OwnTransp
 {
     /// Set the [`DeRecSecretStore`] implementation responsible for persisting
     /// per-channel key material (pairing secrets, shared keys, pairing contacts).
+    ///
+    /// Calling this again later — including after
+    /// [`with_stores`](Self::with_stores) — replaces the secret store the
+    /// prior call set, without touching any other slot.
     pub fn with_secret_store<Ss: DeRecSecretStore>(
         self,
         store: Ss,
@@ -506,12 +634,12 @@ impl<ChannelStore, ShareStore, UserSecretStore, StateStore, Transport, OwnTransp
     }
 }
 
-impl<ChannelStore, ShareStore, SecretStore, StateStore, Transport, OwnTransport>
+impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTransport>
     DeRecProtocolBuilder<
         ChannelStore,
         ShareStore,
         SecretStore,
-        BuilderSlotMissingMarker,
+        UserSecretStore,
         StateStore,
         Transport,
         OwnTransport,
@@ -522,6 +650,10 @@ impl<ChannelStore, ShareStore, SecretStore, StateStore, Transport, OwnTransport>
     /// Written on every `start(FlowKind::ProtectSecret)`; read by the
     /// pair-completion auto-publish hook so freshly-paired peers
     /// receive the current secret without an explicit re-publish.
+    ///
+    /// Calling this again later — including after
+    /// [`with_stores`](Self::with_stores) — replaces the user-secret store
+    /// the prior call set, without touching any other slot.
     pub fn with_user_secret_store<Us: DeRecUserSecretStore>(
         self,
         store: Us,
@@ -684,13 +816,13 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     }
 }
 
-impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTransport>
+impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTransport>
     DeRecProtocolBuilder<
         ChannelStore,
         ShareStore,
         SecretStore,
         UserSecretStore,
-        BuilderSlotMissingMarker,
+        StateStore,
         Transport,
         OwnTransport,
     >
@@ -702,6 +834,10 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTrans
     /// deployments where the process may be recycled between an outbound
     /// request and its inbound response; see the trait documentation for
     /// the concurrency contract.
+    ///
+    /// Calling this again later — including after
+    /// [`with_stores`](Self::with_stores) — replaces the state store the
+    /// prior call set, without touching any other slot.
     pub fn with_state_store<St: DeRecStateStore>(
         self,
         store: St,
@@ -778,6 +914,10 @@ impl<
     ///   [`with_own_transports`](Self::with_own_transports) was given an
     ///   empty list. Delivery is push-only, so an application serving no
     ///   endpoint can never be replied to.
+    /// - [`crate::Error::InvalidInput`] naming the field if the range passed
+    ///   to [`with_parameter_range`](Self::with_parameter_range) has a
+    ///   negative `min` or `max`, or a `min` greater than a non-zero `max`.
+    ///   A value of `0` means "no bound", so `max == 0` accepts any `min >= 0`.
     /// - [`crate::Error::Transport`] if any endpoint passed to
     ///   [`with_own_transports`](Self::with_own_transports) failed
     ///   validation (malformed scheme, empty URI, …) — the first
@@ -801,6 +941,9 @@ impl<
                 "own transports must not be empty: this application needs at \
                  least one endpoint peers can reach it on",
             ));
+        }
+        if let Some(range) = &self.parameter_range {
+            crate::primitives::pairing::parameter_range::validate(range)?;
         }
         // One resolution feeds both the build-time `check_own` below and the
         // runtime policy stored on the protocol, so the two never disagree
@@ -1918,6 +2061,81 @@ mod tests {
         }
     }
 
+    fn build_with_parameter_range(
+        range: derec_proto::ParameterRange,
+    ) -> crate::Result<
+        DeRecProtocol<
+            crate::protocol::test::InMemChannelStore,
+            crate::protocol::test::InMemShareStore,
+            crate::protocol::test::InMemSecretStore,
+            crate::protocol::test::InMemUserSecretStore,
+            crate::protocol::test::InMemStateStore,
+            crate::protocol::test::NoopTransport,
+        >,
+    > {
+        use crate::protocol::test::{
+            InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+            InMemUserSecretStore, NoopTransport,
+        };
+
+        DeRecProtocolBuilder::new(0)
+            .with_channel_store(InMemChannelStore::default())
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(InMemSecretStore::default())
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(NoopTransport)
+            .with_state_store(InMemStateStore)
+            .with_own_transports(["https://owner.example/derec"])
+            .with_threshold(2)
+            .with_parameter_range(range)
+            .build()
+    }
+
+    #[test]
+    fn build_accepts_a_valid_parameter_range() {
+        let range = derec_proto::ParameterRange {
+            min_share_size: 1,
+            max_share_size: 1_000_000,
+            min_time_between_verifications: 60,
+            max_time_between_verifications: 0,
+            ..Default::default()
+        };
+        assert!(build_with_parameter_range(range).is_ok());
+    }
+
+    #[test]
+    fn build_accepts_an_all_zero_parameter_range() {
+        assert!(build_with_parameter_range(derec_proto::ParameterRange::default()).is_ok());
+    }
+
+    #[test]
+    fn build_rejects_an_invalid_parameter_range_naming_the_field() {
+        let cases = [
+            derec_proto::ParameterRange {
+                min_share_size: -1,
+                ..Default::default()
+            },
+            derec_proto::ParameterRange {
+                max_share_size: -1,
+                ..Default::default()
+            },
+            derec_proto::ParameterRange {
+                min_share_size: 11,
+                max_share_size: 10,
+                ..Default::default()
+            },
+        ];
+        for range in cases {
+            match build_with_parameter_range(range) {
+                Err(crate::Error::InvalidInput(msg)) => {
+                    assert!(msg.contains("shareSize"), "{msg}")
+                }
+                Err(other) => panic!("expected InvalidInput, got {other:?}"),
+                Ok(_) => panic!("an invalid parameter range must not build"),
+            }
+        }
+    }
+
     /// Normalization is the builder's single responsibility here: a zero
     /// arriving by any construction path is clamped to one second, because a
     /// zero would expire every `Pending` channel on the next `process()`
@@ -2023,5 +2241,187 @@ mod tests {
                 timeout_in_secs: 300
             }
         );
+    }
+
+    /// `with_stores` must drive [`DeRecProtocol::start`] to the same
+    /// observable outcome as the five individual setters: given the same
+    /// contact, both builds produce the same `PairingStarted` channel id,
+    /// dispatch to the same endpoint, and persist the same shape of channel
+    /// record and pairing secret.
+    #[test]
+    fn with_stores_builds_like_the_five_setters() {
+        use crate::protocol::test::{
+            InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+            InMemUserSecretStore, RecordingTransport, run_async,
+        };
+        use crate::protocol::types::{ChannelQuery, ChannelRecord, ChannelStatus, SecretKind};
+        use crate::types::ChannelId;
+        use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
+
+        const SECRET_ID: u64 = 0x0005_EC57;
+        const CHANNEL_ID: u64 = 99;
+
+        let contact = crate::primitives::pairing::request::create_contact(
+            ChannelId(CHANNEL_ID),
+            ContactMode::InlineKeys,
+            vec![TransportProtocol {
+                uri: "https://helper.example/derec".to_owned(),
+                protocol: Protocol::Https.into(),
+            }],
+            None,
+        )
+        .expect("contact creation")
+        .contact_message;
+
+        run_async(async {
+            let via_setters_transport = RecordingTransport::default();
+            let mut via_setters = DeRecProtocolBuilder::new(SECRET_ID)
+                .with_channel_store(InMemChannelStore::default())
+                .with_share_store(InMemShareStore::default())
+                .with_secret_store(InMemSecretStore::default())
+                .with_user_secret_store(InMemUserSecretStore::default())
+                .with_state_store(InMemStateStore)
+                .with_transport(via_setters_transport.clone())
+                .with_own_transports(["https://owner-a.example"])
+                .build()
+                .expect("five-setter build");
+
+            let via_stores_transport = RecordingTransport::default();
+            let mut via_stores = DeRecProtocolBuilder::new(SECRET_ID)
+                .with_stores(DeRecStores {
+                    channels: InMemChannelStore::default(),
+                    shares: InMemShareStore::default(),
+                    secrets: InMemSecretStore::default(),
+                    user_secrets: InMemUserSecretStore::default(),
+                    state: InMemStateStore,
+                })
+                .with_transport(via_stores_transport.clone())
+                .with_own_transports(["https://owner-b.example"])
+                .build()
+                .expect("with_stores build");
+
+            for (protocol, transport) in [
+                (&mut via_setters, &via_setters_transport),
+                (&mut via_stores, &via_stores_transport),
+            ] {
+                let events = protocol
+                    .start(crate::protocol::DeRecFlow::Pairing {
+                        kind: SenderKind::Owner,
+                        contact: contact.clone(),
+                        peer_communication_info: std::collections::HashMap::new(),
+                    })
+                    .await
+                    .expect("pairing starts");
+
+                assert_eq!(events.len(), 1, "exactly one PairingStarted: {events:?}");
+                match &events[0] {
+                    crate::protocol::DeRecEvent::PairingStarted {
+                        channel_id, kind, ..
+                    } => {
+                        assert_eq!(*channel_id, ChannelId(CHANNEL_ID));
+                        assert_eq!(*kind, SenderKind::Owner);
+                    }
+                    other => panic!("expected PairingStarted, got {other:?}"),
+                }
+
+                assert_eq!(
+                    transport.sent_uris(),
+                    vec!["https://helper.example/derec".to_owned()],
+                    "pairing dispatches one request to the contact's endpoint"
+                );
+
+                let saved = protocol
+                    .channel_store
+                    .load(
+                        SECRET_ID,
+                        ChannelQuery::Helper {
+                            channel_id: ChannelId(CHANNEL_ID),
+                        },
+                    )
+                    .await
+                    .expect("channel load")
+                    .expect("channel record persisted");
+                match saved {
+                    ChannelRecord::Helper(h) => {
+                        assert_eq!(h.status, ChannelStatus::Pending);
+                        assert_eq!(h.peer_role, SenderKind::Helper);
+                    }
+                    other => panic!("expected a Helper record, got {other:?}"),
+                }
+
+                let pairing_contact = protocol
+                    .secret_store
+                    .load(SECRET_ID, ChannelId(CHANNEL_ID), SecretKind::PairingContact)
+                    .await
+                    .expect("secret load")
+                    .expect("pairing contact persisted");
+                assert!(matches!(
+                    pairing_contact,
+                    crate::protocol::types::SecretValue::PairingContact(_)
+                ));
+            }
+        });
+    }
+
+    /// Calling `with_stores` and then an individual setter replaces only
+    /// that one slot — the protocol ends up writing through the setter's
+    /// store, not the one `with_stores` put there.
+    #[test]
+    fn with_stores_then_a_setter_replaces_that_store() {
+        use crate::protocol::test::{
+            InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+            InMemUserSecretStore, NoopTransport, run_async,
+        };
+        use crate::protocol::types::Share;
+        use crate::types::ChannelId;
+
+        run_async(async {
+            let discarded_shares = InMemShareStore::default();
+            let discarded_handle = discarded_shares.clone();
+            let kept_shares = InMemShareStore::default();
+            let kept_handle = kept_shares.clone();
+
+            let mut protocol = DeRecProtocolBuilder::new(0)
+                .with_stores(DeRecStores {
+                    channels: InMemChannelStore::default(),
+                    shares: discarded_shares,
+                    secrets: InMemSecretStore::default(),
+                    user_secrets: InMemUserSecretStore::default(),
+                    state: InMemStateStore,
+                })
+                // Overrides only the share store `with_stores` set above.
+                .with_share_store(kept_shares)
+                .with_transport(NoopTransport)
+                .with_own_transports(["https://owner.example"])
+                .build()
+                .expect("builder with an overridden store builds");
+
+            protocol
+                .share_store
+                .save(
+                    0,
+                    ChannelId(1),
+                    Share {
+                        secret_id: 0,
+                        version: 1,
+                        bytes: vec![0xAB],
+                    },
+                )
+                .await
+                .expect("save through the store the protocol is actually wired to");
+
+            let kept = kept_handle.load(0, ChannelId(1), &[1]).await.unwrap();
+            assert_eq!(
+                kept.len(),
+                1,
+                "the setter's store is the one the protocol writes through"
+            );
+
+            let discarded = discarded_handle.load(0, ChannelId(1), &[1]).await.unwrap();
+            assert!(
+                discarded.is_empty(),
+                "with_stores's share store must not have been written to"
+            );
+        });
     }
 }

@@ -39,6 +39,7 @@ package protocol
 import (
 	"errors"
 
+	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/internal/native"
 )
 
@@ -261,7 +262,33 @@ type ShareStore interface {
 	// or that the user rolled back; a list that leaves out too much can make
 	// the secret unrecoverable.
 	KeepList(secretID uint64, version uint32) (versions []uint32, ok bool, err error)
+	// RecordVerification records that the helper has seen a verification
+	// challenge for the share at (secretID, channelID, version), called
+	// once per accepted challenge, after the challenged share is found and
+	// before the helper answers. Return a *ShareStoreRefusedError to refuse
+	// the verification with the matching protocol status; any other error
+	// is an ordinary backend failure. An application that does not care
+	// about this hook returns nil.
+	RecordVerification(secretID, channelID uint64, version uint32) error
 }
+
+// ShareStoreRefusal is the reason a *ShareStoreRefusedError refuses a
+// ShareStore.Save or ShareStore.RecordVerification call. The library maps
+// each variant to the matching protocol status answered to the owner — the
+// application chooses the reason, never the wire status.
+type ShareStoreRefusal = derec.ShareStoreRefusal
+
+const (
+	RefusalTooFrequent       = derec.RefusalTooFrequent
+	RefusalSizeLimitExceeded = derec.RefusalSizeLimitExceeded
+	RefusalRejected          = derec.RefusalRejected
+)
+
+// ShareStoreRefusedError is returned from ShareStore.Save or
+// ShareStore.RecordVerification to refuse the write or verification with
+// Refusal. The library turns this into the matching protocol status
+// answered to the owner, rather than treating it as a backend failure.
+type ShareStoreRefusedError = derec.ShareStoreRefusedError
 
 // UserSecretStore persists the user-facing secret contents, keyed by
 // secretID; one secretID maps to at most one stored UserSecrets entry —

@@ -34,6 +34,7 @@ const (
 	EventTypeShareRejected             = "ShareRejected"
 	EventTypeSharingComplete           = "SharingComplete"
 	EventTypeShareVerified             = "ShareVerified"
+	EventTypeShareVerifyInvalid        = "ShareVerifyInvalid"
 	EventTypeShareVerifyRejected       = "ShareVerifyRejected"
 	EventTypeSecretsDiscovered         = "SecretsDiscovered"
 	EventTypeRecoveryShareReceived     = "RecoveryShareReceived"
@@ -177,6 +178,9 @@ type Event struct {
 	// after VerifyFingerprint succeeds to pull the copy itself. TraceID and
 	// ChannelID are set too.
 	//
+	// VerifySharesFailed — why no verdict was reached for the channel, one of
+	// the VerifyFailureReason* constants. Error carries the underlying cause.
+	//
 	// PeerNotRestored — why Restore wrote no channel for a roster entry, one
 	// of the NotRestoredReason* constants. Every other entry and the
 	// user-secret snapshot were restored. The peer itself is untouched — a
@@ -282,6 +286,8 @@ const (
 const (
 	IgnoreReasonPendingVerification = "PendingVerification"
 	IgnoreReasonExpired             = "Expired"
+	IgnoreReasonTimestampMismatch   = "TimestampMismatch"
+	IgnoreReasonStaleResponse       = "StaleResponse"
 )
 
 // The label vocabulary for Event.Reason on a PeerNotRestored event. Matches
@@ -305,6 +311,20 @@ const (
 	// commitment root or ciphertext disagrees with the shares the secret was
 	// rebuilt from.
 	CorruptionReasonInconsistent = "Inconsistent"
+)
+
+// The label vocabulary for Event.Reason on a VerifySharesFailed event.
+// Matches the Rust VerifyFailureReason discriminants one-for-one.
+const (
+	// VerifyFailureReasonNoSharedKey: the channel has no shared key to
+	// challenge the helper with.
+	VerifyFailureReasonNoSharedKey = "NoSharedKey"
+	// VerifyFailureReasonNoProof: no stored proof exists for the version
+	// being verified.
+	VerifyFailureReasonNoProof = "NoProof"
+	// VerifyFailureReasonDispatchFailed: the challenge could not be sent to
+	// the helper.
+	VerifyFailureReasonDispatchFailed = "DispatchFailed"
 )
 
 // Secret mirrors SecretWire in wire.rs — the typed secret snapshot carried

@@ -251,6 +251,38 @@ impl<
         events
     }
 
+    /// Drop the owner's stored proof for every helper channel in `channels`
+    /// that just settled round `version` as failed.
+    ///
+    /// Keeps the invariant in
+    /// [`dispatch_share_to_helper`](crate::protocol::handlers::sharing): a
+    /// stored proof is either confirmed by its helper or belongs to a round
+    /// that is still open. Once a channel is failed — by an inbound
+    /// rejection of any status, or by timing out — its proof for `version`
+    /// can never be confirmed, so it is removed. Replica legs of a round
+    /// have no proof and are never passed here.
+    ///
+    /// Per-channel store errors are swallowed: a cleanup failure must not
+    /// fail the sweep that found the failure, and a straggling proof is
+    /// retried the next time this channel fails a round.
+    async fn drop_failed_proofs(&mut self, version: u32, channels: &[ChannelId]) {
+        for &channel_id in channels {
+            if let Err(_error) = self
+                .share_store
+                .remove_versions(self.secret_id, channel_id, &[version])
+                .await
+            {
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    channel_id = channel_id.0,
+                    version,
+                    error = %_error,
+                    "failed-round proof cleanup failed; proof left in store"
+                );
+            }
+        }
+    }
+
     /// Update the active sharing round based on events produced by `process_inner`.
     ///
     /// Moves channels from `pending` to `confirmed` or `failed` as
@@ -347,7 +379,7 @@ impl<
                 continue;
             }
             let timed_out: Vec<ChannelId> = pending.drain().collect();
-            for channel_id in timed_out {
+            for &channel_id in &timed_out {
                 failed.insert(channel_id);
                 events.push(DeRecEvent::ShareRejected {
                     channel_id,
@@ -363,6 +395,7 @@ impl<
                     "sharing round: helper timed out"
                 );
             }
+            self.drop_failed_proofs(version, &timed_out).await;
             let timed_out_replicas: Vec<crate::types::ReplicaId> =
                 pending_replicas.drain().collect();
             for replica_id in timed_out_replicas {
@@ -476,22 +509,37 @@ impl<
         started_at: u64,
     ) {
         let events = inbound;
+        let mut newly_failed: Vec<ChannelId> = Vec::new();
         for event in events.iter() {
             match event {
                 DeRecEvent::ShareConfirmed {
                     channel_id,
                     version,
                 } if *version == round_version => {
-                    pending.remove(channel_id);
-                    confirmed.insert(*channel_id);
+                    // Only a channel still `pending` is newly confirmed here.
+                    // A channel already settled as `failed` — rejected or
+                    // timed out, its proof already dropped — must not also
+                    // land in `confirmed`: without this guard it is counted
+                    // in both sets and `threshold_met` can include a channel
+                    // whose proof no longer exists.
+                    if pending.remove(channel_id) {
+                        confirmed.insert(*channel_id);
+                    }
                 }
                 DeRecEvent::ShareRejected {
                     channel_id,
                     version,
                     ..
                 } if *version == round_version => {
-                    pending.remove(channel_id);
-                    failed.insert(*channel_id);
+                    // Only a channel still `pending` is newly failed here. A
+                    // timeout already drained it from `pending` and dropped
+                    // its proof before this event list was built; without
+                    // this guard the same `ShareRejected` — timeout-born or a
+                    // genuine duplicate — would drop it a second time.
+                    if pending.remove(channel_id) {
+                        failed.insert(*channel_id);
+                        newly_failed.push(*channel_id);
+                    }
                 }
                 DeRecEvent::ReplicaSecretAcked {
                     from_replica_id,
@@ -516,6 +564,8 @@ impl<
                 _ => {}
             }
         }
+
+        self.drop_failed_proofs(round_version, &newly_failed).await;
 
         let is_complete = pending.is_empty() && pending_replicas.is_empty();
         let confirmed_count = confirmed.len();
@@ -1922,6 +1972,486 @@ mod timeout_tests {
                     .iter()
                     .any(|e| matches!(e, DeRecEvent::SharingComplete { version: 1, .. })),
                 "the round times out on its own budget, not the replay window; got {events:?}"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod proof_cleanup_tests {
+    use super::*;
+    use crate::protocol::builder::DeRecProtocolBuilder;
+    use crate::protocol::test::{
+        InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
+        InMemUserSecretStore, NoopTransport, run_async,
+    };
+    use crate::protocol::traits::ShareStoreFuture;
+    use crate::protocol::types::Share;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    const SECRET_ID: u64 = 0xBEEF;
+
+    /// Wraps [`InMemShareStore`] and counts `remove_versions` calls per
+    /// `(channel_id, version)`, to catch a cleanup path invoked more than
+    /// once for the same channel failure.
+    #[derive(Default, Clone)]
+    struct CountingShareStore {
+        inner: InMemShareStore,
+        remove_versions_calls: Arc<Mutex<Vec<(ChannelId, u32)>>>,
+    }
+
+    impl CountingShareStore {
+        fn remove_versions_call_count(&self, channel_id: ChannelId, version: u32) -> usize {
+            self.remove_versions_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(c, v)| *c == channel_id && *v == version)
+                .count()
+        }
+    }
+
+    impl DeRecShareStore for CountingShareStore {
+        fn load(
+            &self,
+            secret_id: u64,
+            channel_id: ChannelId,
+            versions: &[u32],
+        ) -> ShareStoreFuture<'_, Vec<Share>> {
+            self.inner.load(secret_id, channel_id, versions)
+        }
+        fn load_many(
+            &self,
+            secret_id: u64,
+            channel_ids: &[ChannelId],
+            versions: &[u32],
+        ) -> ShareStoreFuture<'_, Vec<Share>> {
+            self.inner.load_many(secret_id, channel_ids, versions)
+        }
+        fn load_all(
+            &self,
+            secret_id: u64,
+            channel_ids: &[ChannelId],
+        ) -> ShareStoreFuture<'_, Vec<Share>> {
+            self.inner.load_all(secret_id, channel_ids)
+        }
+        fn latest_version(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<u32>> {
+            self.inner.latest_version(secret_id)
+        }
+        fn save(
+            &mut self,
+            secret_id: u64,
+            channel_id: ChannelId,
+            share: Share,
+        ) -> ShareStoreFuture<'_, ()> {
+            self.inner.save(secret_id, channel_id, share)
+        }
+        fn remove_channel(
+            &mut self,
+            secret_id: u64,
+            channel_id: ChannelId,
+        ) -> ShareStoreFuture<'_, ()> {
+            self.inner.remove_channel(secret_id, channel_id)
+        }
+        fn remove_versions(
+            &mut self,
+            secret_id: u64,
+            channel_id: ChannelId,
+            versions: &[u32],
+        ) -> ShareStoreFuture<'_, ()> {
+            {
+                let mut calls = self.remove_versions_calls.lock().unwrap();
+                for v in versions {
+                    calls.push((channel_id, *v));
+                }
+            }
+            self.inner.remove_versions(secret_id, channel_id, versions)
+        }
+        fn keep_list(
+            &self,
+            secret_id: u64,
+            version: u32,
+        ) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+            self.inner.keep_list(secret_id, version)
+        }
+    }
+
+    type CountingTestProtocol = DeRecProtocol<
+        InMemChannelStore,
+        CountingShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemPersistedStateStore,
+        NoopTransport,
+    >;
+
+    fn build_counting(threshold: usize, shares: CountingShareStore) -> CountingTestProtocol {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(InMemChannelStore::default())
+            .with_share_store(shares)
+            .with_secret_store(InMemSecretStore::default())
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(NoopTransport)
+            .with_state_store(InMemPersistedStateStore::default())
+            .with_own_transports(["https://owner.example.com"])
+            .with_threshold(threshold)
+            .build()
+            .expect("test protocol builds")
+    }
+
+    type TestProtocol = DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemPersistedStateStore,
+        NoopTransport,
+    >;
+
+    fn build(threshold: usize, shares: InMemShareStore) -> TestProtocol {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(InMemChannelStore::default())
+            .with_share_store(shares)
+            .with_secret_store(InMemSecretStore::default())
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(NoopTransport)
+            .with_state_store(InMemPersistedStateStore::default())
+            .with_own_transports(["https://owner.example.com"])
+            .with_threshold(threshold)
+            .build()
+            .expect("test protocol builds")
+    }
+
+    async fn seed_round(protocol: &mut TestProtocol, version: u32, helpers: &[u64]) {
+        protocol
+            .state_store
+            .save(
+                SECRET_ID,
+                StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    version,
+                    pending: helpers.iter().copied().map(ChannelId).collect(),
+                    confirmed: HashSet::new(),
+                    failed: HashSet::new(),
+                    pending_replicas: HashSet::new(),
+                    synced_replicas: HashSet::new(),
+                    behind_replicas: HashSet::new(),
+                    started_at: now_secs(),
+                })),
+            )
+            .await
+            .expect("seed round");
+    }
+
+    /// Seed the owner's proof for `channel_id` at `version`.
+    fn seed_proof(shares: &InMemShareStore, channel_id: u64, version: u32) {
+        shares.data.lock().unwrap().insert(
+            (SECRET_ID, channel_id, version),
+            Share {
+                secret_id: SECRET_ID,
+                version,
+                bytes: vec![0xAB],
+            },
+        );
+    }
+
+    fn has_proof(shares: &InMemShareStore, channel_id: u64, version: u32) -> bool {
+        shares
+            .data
+            .lock()
+            .unwrap()
+            .contains_key(&(SECRET_ID, channel_id, version))
+    }
+
+    /// An inbound rejection removes the failed channel's proof; the
+    /// confirmed channel's proof is untouched.
+    #[test]
+    fn rejected_channel_proof_is_removed_and_confirmed_kept() {
+        run_async(async {
+            let shares = InMemShareStore::default();
+            seed_proof(&shares, 9001, 4);
+            seed_proof(&shares, 9002, 4);
+            let mut protocol = build(2, shares.clone());
+            seed_round(&mut protocol, 4, &[9001, 9002]).await;
+
+            let mut events = vec![
+                DeRecEvent::ShareConfirmed {
+                    channel_id: ChannelId(9001),
+                    version: 4,
+                },
+                DeRecEvent::ShareRejected {
+                    channel_id: ChannelId(9002),
+                    version: 4,
+                    status: StatusEnum::Fail as i32,
+                    memo: "rejected".to_owned(),
+                },
+            ];
+            protocol.update_sharing_round(&mut events).await;
+
+            assert!(
+                has_proof(&shares, 9001, 4),
+                "the confirmed channel's proof survives"
+            );
+            assert!(
+                !has_proof(&shares, 9002, 4),
+                "the rejected channel's proof is removed"
+            );
+        });
+    }
+
+    /// A channel that times out loses its proof exactly like an explicit
+    /// rejection does.
+    #[test]
+    fn timed_out_channel_proof_is_removed() {
+        run_async(async {
+            let shares = InMemShareStore::default();
+            seed_proof(&shares, 9001, 4);
+            let mut protocol = build(2, shares.clone());
+            protocol.timeouts.sharing_round = std::time::Duration::from_secs(60);
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                        version: 4,
+                        pending: [ChannelId(9001)].into_iter().collect(),
+                        confirmed: HashSet::new(),
+                        failed: HashSet::new(),
+                        pending_replicas: HashSet::new(),
+                        synced_replicas: HashSet::new(),
+                        behind_replicas: HashSet::new(),
+                        started_at: now_secs().saturating_sub(600),
+                    })),
+                )
+                .await
+                .expect("seed round");
+
+            let _events = protocol.tick().await;
+
+            assert!(
+                !has_proof(&shares, 9001, 4),
+                "the timed-out channel's proof is removed"
+            );
+        });
+    }
+
+    /// Any rejection status removes the proof, not only `Fail` — a store
+    /// rate limit (`TooFrequent`) is just as final for the owner's proof
+    /// as an explicit failure, and only the round's version is touched.
+    #[test]
+    fn store_refusal_rejection_removes_the_proof() {
+        run_async(async {
+            let shares = InMemShareStore::default();
+            seed_proof(&shares, 9002, 4);
+            seed_proof(&shares, 9002, 3);
+            let mut protocol = build(2, shares.clone());
+            seed_round(&mut protocol, 4, &[9001, 9002]).await;
+
+            let mut events = vec![DeRecEvent::ShareRejected {
+                channel_id: ChannelId(9002),
+                version: 4,
+                status: StatusEnum::TooFrequent as i32,
+                memo: "too frequent".to_owned(),
+            }];
+            protocol.update_sharing_round(&mut events).await;
+
+            assert!(
+                !has_proof(&shares, 9002, 4),
+                "a TooFrequent rejection removes the proof just like Fail does"
+            );
+            assert!(
+                has_proof(&shares, 9002, 3),
+                "an older version's proof is untouched by this round settling"
+            );
+        });
+    }
+
+    /// A late `ShareConfirmed` for a channel whose round already settled as
+    /// failed must not bring its proof back.
+    #[test]
+    fn late_confirmation_after_failure_does_not_restore_a_proof() {
+        run_async(async {
+            let shares = InMemShareStore::default();
+            seed_proof(&shares, 9001, 4);
+            seed_proof(&shares, 9002, 4);
+            let mut protocol = build(2, shares.clone());
+            seed_round(&mut protocol, 4, &[9001, 9002]).await;
+
+            let mut events = vec![
+                DeRecEvent::ShareConfirmed {
+                    channel_id: ChannelId(9001),
+                    version: 4,
+                },
+                DeRecEvent::ShareRejected {
+                    channel_id: ChannelId(9002),
+                    version: 4,
+                    status: StatusEnum::Fail as i32,
+                    memo: "rejected".to_owned(),
+                },
+            ];
+            protocol.update_sharing_round(&mut events).await;
+            assert!(
+                protocol
+                    .state_store
+                    .load(SECRET_ID, StateKey::SharingRound { version: 4 })
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "the round closed: both channels are settled"
+            );
+            assert!(!has_proof(&shares, 9002, 4));
+
+            // The round row is gone, so this reply is late: nothing matches
+            // it, and it must not resurrect the proof that was just removed.
+            let mut late = vec![DeRecEvent::ShareConfirmed {
+                channel_id: ChannelId(9002),
+                version: 4,
+            }];
+            protocol.update_sharing_round(&mut late).await;
+
+            assert!(
+                !has_proof(&shares, 9002, 4),
+                "a late confirmation after the failure must not re-create the proof"
+            );
+        });
+    }
+
+    /// A channel rejected and then confirmed in the same batch, while the
+    /// round is still open (other channels still pending), must count only
+    /// as failed — not in both `failed` and `confirmed`, which would let
+    /// `threshold_met` include a channel whose proof was just removed.
+    #[test]
+    fn rejected_then_confirmed_within_open_round_counts_only_as_failed() {
+        run_async(async {
+            let shares = InMemShareStore::default();
+            seed_proof(&shares, 9002, 4);
+            let mut protocol = build(2, shares.clone());
+            seed_round(&mut protocol, 4, &[9001, 9002, 9003]).await;
+
+            let mut events = vec![
+                DeRecEvent::ShareRejected {
+                    channel_id: ChannelId(9002),
+                    version: 4,
+                    status: StatusEnum::Fail as i32,
+                    memo: "rejected".to_owned(),
+                },
+                DeRecEvent::ShareConfirmed {
+                    channel_id: ChannelId(9002),
+                    version: 4,
+                },
+            ];
+            protocol.update_sharing_round(&mut events).await;
+
+            assert!(
+                !has_proof(&shares, 9002, 4),
+                "the rejection still removes the proof"
+            );
+
+            let round = protocol
+                .state_store
+                .load(SECRET_ID, StateKey::SharingRound { version: 4 })
+                .await
+                .expect("load")
+                .expect("round still open: 9001 and 9003 have not answered");
+            let StateItem::SharingRound(round) = round else {
+                panic!("expected a SharingRound state item");
+            };
+            assert!(
+                round.failed.contains(&ChannelId(9002)),
+                "the channel is recorded as failed"
+            );
+            assert!(
+                !round.confirmed.contains(&ChannelId(9002)),
+                "the later confirmation must not also count it as confirmed"
+            );
+        });
+    }
+
+    /// A `tick()` first fails a timed-out channel in the timeout sweep, then
+    /// hands the very `ShareRejected` it just produced to round settlement.
+    /// The channel must be dropped from the store exactly once, not once by
+    /// each stage.
+    #[test]
+    fn timed_out_channel_proof_is_removed_once() {
+        run_async(async {
+            let shares = CountingShareStore::default();
+            let mut protocol = build_counting(2, shares.clone());
+            protocol.timeouts.sharing_round = std::time::Duration::from_secs(60);
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                        version: 4,
+                        pending: [ChannelId(9001)].into_iter().collect(),
+                        confirmed: HashSet::new(),
+                        failed: HashSet::new(),
+                        pending_replicas: HashSet::new(),
+                        synced_replicas: HashSet::new(),
+                        behind_replicas: HashSet::new(),
+                        started_at: now_secs().saturating_sub(600),
+                    })),
+                )
+                .await
+                .expect("seed round");
+
+            let _events = protocol.tick().await;
+
+            assert_eq!(
+                shares.remove_versions_call_count(ChannelId(9001), 4),
+                1,
+                "the timeout sweep and round settlement must not both drop the same proof"
+            );
+        });
+    }
+
+    /// Two `ShareRejected` events for the same channel and version in one
+    /// batch — a genuine duplicate, not a timeout echo — must still only
+    /// remove the proof once: the second one finds the channel already out
+    /// of `pending`.
+    #[test]
+    fn duplicate_share_rejected_does_not_double_remove_the_proof() {
+        run_async(async {
+            let shares = CountingShareStore::default();
+            let mut protocol = build_counting(2, shares.clone());
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                        version: 4,
+                        pending: [ChannelId(9001)].into_iter().collect(),
+                        confirmed: HashSet::new(),
+                        failed: HashSet::new(),
+                        pending_replicas: HashSet::new(),
+                        synced_replicas: HashSet::new(),
+                        behind_replicas: HashSet::new(),
+                        started_at: now_secs(),
+                    })),
+                )
+                .await
+                .expect("seed round");
+
+            let mut events = vec![
+                DeRecEvent::ShareRejected {
+                    channel_id: ChannelId(9001),
+                    version: 4,
+                    status: StatusEnum::Fail as i32,
+                    memo: "rejected".to_owned(),
+                },
+                DeRecEvent::ShareRejected {
+                    channel_id: ChannelId(9001),
+                    version: 4,
+                    status: StatusEnum::Fail as i32,
+                    memo: "duplicate".to_owned(),
+                },
+            ];
+            protocol.update_sharing_round(&mut events).await;
+
+            assert_eq!(
+                shares.remove_versions_call_count(ChannelId(9001), 4),
+                1,
+                "a duplicated inbound rejection must not remove the proof twice"
             );
         });
     }

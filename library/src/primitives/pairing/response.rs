@@ -133,8 +133,9 @@ pub struct ProcessPrePairResult {
 /// Returns [`crate::Error`] (specifically `Error::Pairing(...)`) in the following cases:
 ///
 /// - [`PairingError::InvalidPairRequestMessage`] if the request is malformed or missing fields
-/// - [`PairingError::IncompatibleParameterRange`] if the requester's advertised range and
-///   `parameter_range` do not overlap on some field; no shared key is derived
+/// - [`PairingError::IncompatibleParameterRange`] if the requester's advertised range is
+///   malformed or does not overlap `parameter_range` on some field (a `max` of `0` means
+///   no upper bound); no shared key is derived
 /// - [`PairingError::EmptyTransportUri`] if the request transport information is missing or empty
 /// - [`PairingError::Invariant`] if `pairing_secret_key_material` is not the `Initiator` variant
 /// - [`PairingError::FinishPairingInitiator`] if pairing finalization fails
@@ -747,8 +748,8 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 ///
 /// Returns [`crate::Error`] (specifically `Error::Pairing(...)`) in the following cases:
 ///
-/// - [`PairingError::IncompatibleParameterRange`] if the advertised range and
-///   `parameter_range` do not overlap on some field
+/// - [`PairingError::IncompatibleParameterRange`] if the advertised range is malformed or
+///   does not overlap `parameter_range` on some field (a `max` of `0` means no upper bound)
 /// - [`PairingError::NonOkStatus`] if `result.status != Ok`, carrying the peer's status code
 ///   and memo string
 /// - [`PairingError::InvalidPairResponseMessage`] if the response is malformed (e.g. missing result)

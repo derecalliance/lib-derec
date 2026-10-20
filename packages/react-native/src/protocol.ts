@@ -31,6 +31,7 @@ import type {
   UpdateChannelInfoParams,
   UserSecretStore,
   VerifySharesParams,
+  StoresInit,
 } from './types';
 
 /** Shape of the `__DeRec` host object as seen from this file: every member is
@@ -321,6 +322,20 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
+  /**
+   * Set every store in one call. Forwards to {@link withChannelStore},
+   * {@link withShareStore}, {@link withSecretStore},
+   * {@link withUserSecretStore} and {@link withStateStore} in turn, so
+   * calling one of them again afterwards replaces just that store.
+   */
+  withStores(stores: StoresInit): this {
+    return this.withChannelStore(stores.channelStore)
+      .withShareStore(stores.shareStore)
+      .withSecretStore(stores.secretStore)
+      .withUserSecretStore(stores.userSecretStore)
+      .withStateStore(stores.stateStore);
+  }
+
   withTransport(transport: Transport): this {
     this.stores.transport = transport;
     return this;
@@ -436,6 +451,10 @@ export class DeRecProtocolBuilder {
    * applies its default.
    *
    * Default: unset — no constraints advertised, every peer range accepted.
+   *
+   * Share size is enforced by the helper; frequency limits are enforced by
+   * the app's share store (refuse from `save`/`recordVerification`); the
+   * deletion and deactivation timeouts are checked at pairing only.
    */
   withParameterRange(range: Partial<ParameterRange>): this {
     this.config.parameter_range = {

@@ -272,6 +272,36 @@ impl DeRecProtocolBuilderWasm {
         self
     }
 
+    /// Set every store in one call. `stores` is `{ channelStore, shareStore,
+    /// secretStore, userSecretStore, stateStore }`. Forwards to the five
+    /// per-store setters above, so calling one of them again afterwards
+    /// replaces just that store.
+    #[wasm_bindgen(js_name = withStores)]
+    pub fn with_stores(mut self, stores: JsValue) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        // `Reflect::get` returns `undefined` for an absent key rather than
+        // erroring, so a missing or explicit `null`/`undefined` store must
+        // be rejected here with the same message `build()` gives an unset
+        // store — otherwise it is stored as `Some(undefined)` and survives
+        // to construct a store wrapper over a value that isn't one.
+        let get = |key: &str, setter_name: &str| -> Result<JsValue, JsValue> {
+            let value = js_sys::Reflect::get(&stores, &JsValue::from_str(key))
+                .map_err(|e| js_error("decode_error", format!("missing {key}: {e:?}")))?;
+            if value.is_undefined() || value.is_null() {
+                return Err(js_error(
+                    "builder_missing",
+                    format!("{setter_name} is required"),
+                ));
+            }
+            Ok(value)
+        };
+        self.channel_store = Some(get("channelStore", "withChannelStore")?);
+        self.share_store = Some(get("shareStore", "withShareStore")?);
+        self.secret_store = Some(get("secretStore", "withSecretStore")?);
+        self.user_secret_store = Some(get("userSecretStore", "withUserSecretStore")?);
+        self.state_store = Some(get("stateStore", "withStateStore")?);
+        Ok(self)
+    }
+
     #[wasm_bindgen(js_name = withTransport)]
     pub fn with_transport(mut self, transport: JsValue) -> DeRecProtocolBuilderWasm {
         self.transport = Some(transport);

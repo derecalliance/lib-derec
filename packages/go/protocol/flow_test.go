@@ -394,7 +394,7 @@ func TestRestore_Conflict_ReportsConflictingChannelIDs(t *testing.T) {
 			t.Fatalf("seed channel %d: %v", id, err)
 		}
 	}
-	p, err := New(channel, share, secretStore, userSecret, state, transport, Config{
+	p, err := New(Stores{Channel: channel, Share: share, Secret: secretStore, UserSecret: userSecret, State: state}, transport, Config{
 		SecretID:      secretID,
 		OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
 		Threshold:     proto.Uint32(2),

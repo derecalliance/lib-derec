@@ -143,31 +143,37 @@ build a `DeRecProtocol`, drive it with `start` / `process`.
 
 ```rust,ignore
 use derec_library::protocol::{
-    DeRecEvent, DeRecFlow, DeRecProtocolBuilder, PendingAction,
+    DeRecEvent, DeRecFlow, DeRecProtocolBuilder, DeRecStores, PendingAction,
 };
-use derec_proto::{Protocol, TransportProtocol};
 
-// 1. Implement the four storage/transport traits for your environment.
+// 1. Implement the storage and transport traits for your environment.
 //    See the trait docs:
-//    - DeRecChannelStore  — helper channels + replica-group members
-//    - DeRecShareStore    — secret shares
-//    - DeRecSecretStore   — per-channel key material (sensitive)
-//    - DeRecTransport     — outbound message delivery
-let my_channel_store = /* ... */;
-let my_share_store   = /* ... */;
-let my_secret_store  = /* ... */;
-let my_transport     = /* ... */;
+//    - DeRecChannelStore    — helper channels + replica-group members
+//    - DeRecShareStore      — secret shares
+//    - DeRecSecretStore     — per-channel key material (sensitive)
+//    - DeRecUserSecretStore — latest user-facing secret snapshot
+//    - DeRecStateStore      — in-flight orchestrator state (durable)
+//    - DeRecTransport       — outbound message delivery
+let my_channel_store     = /* ... */;
+let my_share_store       = /* ... */;
+let my_secret_store      = /* ... */;
+let my_user_secret_store = /* ... */;
+let my_state_store       = /* ... */;
+let my_transport         = /* ... */;
 
-// 2. Build a protocol instance.
-let mut protocol = DeRecProtocolBuilder::new()
-    .with_channel_store(my_channel_store)
-    .with_share_store(my_share_store)
-    .with_secret_store(my_secret_store)
-    .with_transport(my_transport)
-    .with_own_transport(TransportProtocol {
-        uri: "https://my-node.example/derec".to_owned(),
-        protocol: Protocol::Https.into(),
+// 2. Build a protocol instance for one secret. `with_stores` sets all five
+//    stores at once; each `with_*_store` setter is still available, and the
+//    last call for a store wins.
+let mut protocol = DeRecProtocolBuilder::new(secret_id)
+    .with_stores(DeRecStores {
+        channels: my_channel_store,
+        shares: my_share_store,
+        secrets: my_secret_store,
+        user_secrets: my_user_secret_store,
+        state: my_state_store,
     })
+    .with_transport(my_transport)
+    .with_own_transports(["https://my-node.example/derec"])
     // Optional setters — see "Builder configuration" below.
     .build()?;
 
@@ -218,11 +224,13 @@ loop {
                     println!("recovered {} ({}B)", entry.name, entry.data.len());
                 }
                 // Nothing has been written yet: show the user what was
-                // recovered, or ask them, before committing it. `restore`
-                // commits the recovered Secret into this fresh protocol's
-                // stores, wipes the throwaway recovery-mode channels and
-                // reseats canonical helper / replica state at the recovered
-                // version. See `DeRecProtocol::restore`.
+                // recovered, or ask them, before committing it. Call
+                // `restore` on this same `protocol` — the one that ran
+                // recovery and still holds the recovery-mode channels it
+                // unpairs. `restore` commits the recovered Secret into this
+                // `secret_id`'s stores, wipes the throwaway recovery-mode
+                // channels and reseats canonical helper / replica state at
+                // the recovered version. See `DeRecProtocol::restore`.
                 protocol.restore(&secret, recovered_version).await?;
             }
             // ... handle other events the application cares about.
@@ -238,8 +246,9 @@ A complete working example lives in the repository's end-to-end tests; see
 ### After a restore
 
 `restore` writes no owner-side tracking shares, so `VerifyShares` at the
-recovered version fails with `Error::InvalidInput` — this device holds no
-reference bytes for it. It cannot: a `VerifyShare` proof is
+recovered version sends no challenge and reports every channel as
+`VerifySharesFailed { reason: VerifyFailureReason::NoProof, .. }` — this
+device holds no reference bytes for it. It cannot: a `VerifyShare` proof is
 `SHA-384(share ‖ nonce)` over the exact bytes a helper holds, and recovery
 cannot attribute a collected share to a canonical helper channel (the VSS
 x-coordinate is a random field element and `GetShareResponseMessage`
@@ -286,7 +295,7 @@ Optional setters have defaults:
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
 | `with_replica_id(id)` | unset | This device's replica identity. Required for any replica-mode pairing; application-assigned and rejected if `0`. |
 | `with_auto_accept(policy)` | every flow off | Per-flow opt-in to auto-accepting inbound requests instead of surfacing `ActionRequired`. Read the per-flow caveats before enabling — several are state-changing. |
-| `with_parameter_range(range)` | unset | Advertised protocol parameter bounds, checked for overlap at pairing time. |
+| `with_parameter_range(range)` | unset | Advertised protocol parameter bounds, checked for overlap at pairing time. A helper also enforces its own `minShareSize`/`maxShareSize` on every inbound share (see [Helper-side admission control](#helper-side-admission-control)). |
 | `with_auto_respond_on_failure(bool)` | `false` | If `true`, the protocol replies to the peer on inbound processing failures; if `false`, errors only surface as events. |
 | `with_unpair_ack(ack)` | `UnpairAck::Required` | Whether the unpair initiator waits for the peer's `Ok` before dropping local state. |
 | `with_auto_reply_to(bool)` | `false` | If `true`, every outbound request stamps `replyTo = own_transport` so the responder routes the reply back to this node — even if the channel's stored peer endpoint points elsewhere. Useful for replica scenarios. See [Correlation and routing on the wire](#correlation-and-routing-on-the-wire). |
@@ -321,8 +330,25 @@ before any target-level events are emitted.
 - `PairingCompleted { channel_id, kind, peer_communication_info }`
 - `ShareStored { channel_id, version }` / `ShareConfirmed { … }` /
   `ShareRejected { … }` / `SharingComplete { … }`
-- `ShareVerified { channel_id, version }` /
-  `ShareVerifyRejected { channel_id, version, status, memo }`
+- Verification verdicts — every challenged channel ends with exactly one of:
+  - `ShareVerified { channel_id, version }` — the helper proved it holds the
+    exact share;
+  - `ShareVerifyInvalid { channel_id, version }` — the helper answered with a
+    proof that does not match the share this device stored (a damaged or
+    dishonest helper). It is an event, not an error from `process`;
+  - `ShareVerifyRejected { channel_id, version, status, memo }` — the helper
+    refused the challenge with a non-OK status (e.g. `UNKNOWN_SHARE_VERSION`);
+  - `VerifySharesFailed { channel_id, version, reason, error }` — no verdict
+    could be reached on this device. `reason` is a `VerifyFailureReason`:
+    `NoSharedKey`, `NoProof` (this device holds no proof of that channel's
+    share at that version) or `DispatchFailed`. `start(VerifyShares)` emits it
+    for a channel with no proof without sending a challenge.
+
+  A response to an earlier challenge that a newer one replaced is ignored
+  (`MessageIgnored` with `IgnoreReason::StaleResponse`) and the current
+  challenge stays open. A response missing its `result` is malformed and is
+  still an error from `process`. See
+  [Which versions to verify](#which-versions-to-verify).
 - `SecretsDiscovered { channel_id, secrets }`
 - `RecoveryShareReceived { … }` /
   `SecretRecovered { secret: Secret }` (typed; `secret.secrets` is the
@@ -365,13 +391,44 @@ before any target-level events are emitted.
   dropped without touching any store or sending anything back. `reason` is
   `IgnoreReason::PendingVerification` (the channel's fingerprint is not
   confirmed on this device yet; see
-  [Replica fingerprint verification is mandatory](#replica-fingerprint-verification-is-mandatory))
-  or `IgnoreReason::Expired` (older than the inbound timeout).
+  [Replica fingerprint verification is mandatory](#replica-fingerprint-verification-is-mandatory)),
+  `IgnoreReason::Expired` (older than the inbound timeout),
+  `IgnoreReason::TimestampMismatch` (the envelope and inner-message
+  timestamps differ, or either or both are absent) or
+  `IgnoreReason::StaleResponse` (a verification response to a replaced
+  challenge).
 - `NoOp` — emitted when an inbound message was processed but had no
   application-visible consequence.
 
 See [`DeRecEvent`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html)
 for the complete enum and per-variant docs.
+
+### Which versions to verify
+
+This device keeps a proof of each helper's share (the exact bytes it sent)
+so it can check that helper's answers later. A stored proof is always one
+of two things: confirmed by its helper (`ShareConfirmed`), or part of a
+sharing round still open. When a round settles a channel as failed — the
+helper rejected the share (`ShareRejected`) or the round timed out — that
+channel's proof for the round's version is deleted, and a late
+`ShareConfirmed` for it is still emitted but stores nothing. This guarantee
+holds on the publishing device; a replica Destination holds the proofs the
+Source mirrored at publish time and never sees `SharingComplete`, so
+verifying there can report `ShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`)
+for a helper that failed the Source's round.
+
+So verify only versions whose round completed (`SharingComplete`). A channel
+with no proof at the requested version gets `VerifySharesFailed` with
+`NoProof`, and no challenge is sent to it.
+
+### Timestamps
+
+Every channel message carries one timestamp, its send time, in both the
+outer envelope and the encrypted inner message. After decrypting, the
+receiver ignores a message whose two timestamps differ, or where either or
+both are absent, as `MessageIgnored` with `IgnoreReason::TimestampMismatch`.
+A peer on 0.0.8 or earlier stamps its replies separately, so they are
+ignored this way.
 
 ### When `process` fails
 
@@ -430,16 +487,18 @@ A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
 
 ## Helper-side admission control
 
-**The protocol enforces no limits of its own on inbound shares.** It does
-not bound share size, storage consumed per sharer, or how often an owner
-may push updates. A helper that needs those limits enforces them itself,
-and this section is how.
+**The protocol enforces one limit of its own on inbound shares: size.** A
+helper configured with `with_parameter_range(range)` checks every
+`StoreShareRequest` against its own `minShareSize`/`maxShareSize` (both
+inclusive; `maxShareSize == 0` means unbounded) and answers a share outside
+that range with `SIZE_LIMIT_EXCEEDED` before any `ActionRequired` or
+auto-accept, so the user is never asked about it. Without a configured range
+there is no check.
 
-`ParameterRange.maxShareSize` does not do this for you. It is exchanged
-during pairing and checked for *range overlap* between the two peers'
-advertised ranges; the negotiated value is never compared against an
-actual share afterwards. Treat it as a compatibility handshake, not an
-enforced ceiling.
+Everything else — storage consumed per sharer, how often an owner may push
+updates or challenge the helper — is the application's to enforce, either
+per request as below or from its share store (see
+[Refusing from the share store](#refusing-from-the-share-store)).
 
 ### Where the decision belongs
 
@@ -492,14 +551,27 @@ Status codes for the common cases:
 | `Rejected` | a user or operator declined the request |
 | `Fail` | anything else; put the detail in `memo` |
 
+### Refusing from the share store
+
+Frequency limits belong in the share store, which already sees every write.
+On a helper channel, `DeRecShareStore::save` (a genuinely new share version;
+an idempotent re-send never reaches it) and `DeRecShareStore::record_verification`
+(an accepted verification challenge, after the challenged share is found) may
+return `Err(ShareStoreError::Refused(Refusal::TooFrequent))`. The library
+answers the owner with the mapped status — `TooFrequent` → `TOO_FREQUENT`,
+`SizeLimitExceeded` → `SIZE_LIMIT_EXCEEDED`, `Rejected` → `REJECTED` — and the
+helper's call returns `Ok([NoOp])`; the owner sees `ShareRejected` or
+`ShareVerifyRejected` with that status. `record_verification` defaults to
+`Ok(())`. Any other store error still propagates as an error.
+
 ### `auto_accept.store_share` removes this gate
 
 > [!IMPORTANT]
 > Setting `AutoAcceptPolicy::store_share = true` means `process()`
 > accepts and stores every inbound share internally. No `ActionRequired`
 > is emitted, so **there is no opportunity to reject** — every share from
-> every paired Owner is stored unconditionally, at whatever size it
-> arrives.
+> every paired Owner that passes the size check is stored, unless the
+> share store refuses it.
 
 Keep it `false` in any deployment with per-user storage limits. It is
 `false` by default; only an explicit
@@ -1250,6 +1322,17 @@ Every SDK exposes the same correlation primitive: `Envelope.ReadTraceId`
 (.NET), `envelope.ReadTraceID` (Go), `envelope_read_trace_id`
 (TypeScript/WASM), `read_trace_id_from_envelope` (C FFI).
 
+> [!NOTE]
+> The HTTP details above — `POST` to the peer's URI, the raw `DeRecMessage`
+> bytes as the body with `Content-Type: application/octet-stream`,
+> `202 Accepted` with an empty body on a push, `200 OK` with the reply as the
+> body on a same-connection answer — are recommended HTTP conventions, not
+> protocol requirements. Matching by `trace_id` applies to the `200 OK`
+> same-connection answer only: a push carries no reply to match. The protocol fixes only the envelope bytes and push
+> delivery. See
+> [Transports](https://derec-alliance.gitbook.io/docs/protocol-specification/transports)
+> in the DeRec documentation.
+
 [transport-doc]: https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecTransport.html
 
 ### Updating channel info post-pairing
@@ -1738,6 +1821,32 @@ Since an honest helper never sends a corrupted share, the application may
 take `RecoveryShareCorrupted` as a sign that the helper's device or storage is
 damaged or compromised, and offer to unpair it. A share that arrives after the
 recovery completed finds no open recovery and is dropped unreported.
+
+#### Helpers and shares
+
+- Each share goes to a **different** helper. Threshold security depends on it:
+  compromising one helper must yield at most one share.
+- The library hands out one share per channel per version, and every pairing
+  produces its own channel. It cannot tell whether two channels lead to the
+  same party; keeping helpers distinct is the application's job.
+- **Discouraged:** a single guardian acting as several helpers for the same
+  owner. It is against the protocol's recommendation, since one compromise
+  yields several shares. The library does not prevent it, but channel linking
+  then needs the application's help (below).
+- **Channel linking is expected to be one-to-one.** After an owner re-pairs in
+  recovery mode, the helper application links the new channel to the old one
+  with `DeRecChannelStore::link_channel`. Linking assumes a helper holds **at most one share per owner
+  for a given `secret_id` and version**, so each recovery channel is linked to the
+  single old channel it replaces. On `GetShare` the helper answers with
+  **one** share from the linked set: the first whose `secret_id` matches the
+  request, in the order `DeRecShareStore::load_many` returns. The library imposes no order. If
+  several channels holding shares for the same owner are linked to one
+  recovery channel and every recovery channel is answered from the same
+  share, the owner receives it more than once (it counts once) and can fall
+  below the threshold. An application that runs such a helper keeps each
+  recovery channel resolving to a distinct share: either links stay
+  one-to-one, or its share store returns, for each requesting channel, the
+  share intended for it first, in a deterministic order.
 
 Owner side, at the primitive level — decrypt each helper response,
 reconstruct the secret once enough have arrived:

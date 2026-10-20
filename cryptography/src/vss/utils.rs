@@ -4,7 +4,7 @@
 use rand::CryptoRng;
 use sha2::{Digest, Sha256};
 
-use super::{DerecVSSError, VSSShare, λ};
+use super::{DerecVSSError, MERKLE_TREE_DEPTH, VSSShare, λ};
 
 // this function will be used to detect one of several possible errors:
 // 1. inconsistent ciphertexts; 2. inconsistent commitments; 3. corrupted shares
@@ -23,7 +23,11 @@ pub fn detect_error(shares: &Vec<VSSShare>) -> Option<DerecVSSError> {
             return Some(DerecVSSError::InconsistentCiphertexts);
         }
 
-        // now verify the Merkle path
+        // now verify the Merkle path; it must reach from a leaf to the root
+        if share.merkle_path.len() != MERKLE_TREE_DEPTH as usize {
+            return Some(DerecVSSError::CorruptShares);
+        }
+
         // first compute hash of this share
         let mut on_path_hash = leaf_hash((&share.x, &share.y));
 
@@ -73,11 +77,11 @@ pub fn build_merkle_tree<R: CryptoRng + ?Sized>(
             // hash the share's (x,y); node root's label starts at 1
             merkle_nodes[node_label - 1] = leaf_hash((&shares[i].0, &shares[i].1));
         } else {
-            // generate a garbage values for non-existent leaf nodes
+            // fill unused slots with leaf hashes of random bytes
             let mut rand = [0u8; 32];
             rng.fill_bytes(&mut rand);
 
-            merkle_nodes[node_label - 1] = rand.to_vec();
+            merkle_nodes[node_label - 1] = leaf_hash_pub(&rand, &[]);
         }
     }
 
@@ -158,33 +162,41 @@ pub fn random_oracle(msg: &[u8], rand: &[u8], tag: &[u8]) -> [u8; 4 * λ] {
     output
 }
 
-// A share's hash is SHA256(x || y).
-fn leaf_hash(share: (&Vec<u8>, &Vec<u8>)) -> Vec<u8> {
-    leaf_hash_pub(share.0, share.1)
-}
-
 /// Public entry point for leaf hashing used by [`super::verify`].
+///
+/// A leaf is `SHA-256(0x00 ‖ u64_be(len(x)) ‖ x ‖ y)`. The `0x00` tag keeps
+/// leaf hashes apart from internal-node hashes, so an internal node cannot be
+/// presented as a share, and the length of `x` fixes where `x` ends and `y`
+/// begins.
 pub fn leaf_hash_pub(x: &[u8], y: &[u8]) -> Vec<u8> {
-    let mut hasher_input = Vec::new();
+    let mut hasher_input = Vec::with_capacity(1 + 8 + x.len() + y.len());
+    hasher_input.push(0x00);
+    hasher_input.extend_from_slice(&(x.len() as u64).to_be_bytes());
     hasher_input.extend_from_slice(x);
     hasher_input.extend_from_slice(y);
     compute_sha256_hash(&hasher_input)
 }
 
-// computes the intermediate hash of two Merkle nodes
-fn intermediate_hash(left: &[u8], right: &[u8]) -> Vec<u8> {
-    intermediate_hash_pub(left, right)
-}
-
 /// Public entry point for intermediate hashing used by [`super::verify`].
+///
+/// An internal node is `SHA-256(0x02 ‖ left ‖ right)`; the `0x02` tag keeps it
+/// apart from leaf hashes.
 pub fn intermediate_hash_pub(left: &[u8], right: &[u8]) -> Vec<u8> {
-    let mut hasher_input = Vec::new();
+    let mut hasher_input = Vec::with_capacity(1 + left.len() + right.len());
+    hasher_input.push(0x02);
     hasher_input.extend_from_slice(left);
     hasher_input.extend_from_slice(right);
     compute_sha256_hash(&hasher_input)
 }
 
-// Computes the SHA-256 hash of the input data.
+fn leaf_hash(share: (&Vec<u8>, &Vec<u8>)) -> Vec<u8> {
+    leaf_hash_pub(share.0, share.1)
+}
+
+fn intermediate_hash(left: &[u8], right: &[u8]) -> Vec<u8> {
+    intermediate_hash_pub(left, right)
+}
+
 fn compute_sha256_hash(input: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(input);
@@ -233,6 +245,39 @@ mod tests {
             shares.iter().map(|s| (s.x.clone(), s.y.clone())).collect();
         let merkle_tree = build_merkle_tree(&share_points, 3, &mut crate::random::os_rng());
         assert_merkle_tree_wff(&merkle_tree);
+    }
+
+    #[test]
+    fn test_padding_leaves_are_leaf_hashes() {
+        use rand::SeedableRng as _;
+        use rand::rngs::ChaCha20Rng;
+
+        let depth = 2;
+        let points = vec![(vec![1u8; 32], vec![2u8; 32])];
+        let tree = build_merkle_tree(&points, depth, &mut ChaCha20Rng::from_seed([7u8; 32]));
+
+        let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
+        let num_leaf_nodes = 2_usize.pow(depth);
+        for i in points.len()..num_leaf_nodes {
+            let mut rand = [0u8; 32];
+            rng.fill_bytes(&mut rand);
+            assert_eq!(tree[num_leaf_nodes + i - 1], leaf_hash_pub(&rand, &[]));
+        }
+    }
+
+    #[test]
+    fn test_leaf_and_intermediate_hashes_are_domain_separated() {
+        let left = [0x11u8; 32];
+        let right = [0x22u8; 32];
+        assert_ne!(
+            leaf_hash_pub(&left, &right),
+            intermediate_hash_pub(&left, &right)
+        );
+    }
+
+    #[test]
+    fn test_leaf_hash_binds_the_split_between_x_and_y() {
+        assert_ne!(leaf_hash_pub(b"ab", b"c"), leaf_hash_pub(b"a", b"bc"));
     }
 
     fn assert_merkle_tree_wff(tree: &[Vec<u8>]) {

@@ -2686,6 +2686,57 @@ fn test_contact_creator_refuses_an_incompatible_parameter_range() {
     .expect("an overlapping range is accepted");
 }
 
+/// A requester advertising `maxShareSize = 0` (no maximum) overlaps any
+/// creator minimum, and a requester range whose `min` exceeds its non-zero
+/// `max` is refused as incompatible on that field.
+#[test]
+fn test_contact_creator_reads_zero_max_as_unbounded_and_refuses_a_malformed_range() {
+    let creator_range = share_size_range(1_000_000_000, 5_000_000_000);
+
+    let CreateContactMessageResult {
+        contact_message,
+        secret_key,
+    } = create_contact_message(
+        ChannelId(42),
+        ContactMode::InlineKeys,
+        vec![endpoint("https://relay.example/alice")],
+        None,
+    )
+    .expect("failed to create contact message");
+    let secret_key = secret_key.expect("InlineKeys contact carries key material");
+
+    let request_with = |range| {
+        produce_pairing_request_message(
+            SenderKind::Helper,
+            vec![endpoint("https://relay.example/bob")],
+            &contact_message,
+            None,
+            Some(range),
+        )
+        .expect("producing a request is not where ranges are compared")
+        .envelope
+    };
+
+    let unbounded = request_with(share_size_range(10_000_000, 0));
+    extract_pairing_request(
+        &unbounded,
+        secret_key.ecies_secret_key(),
+        Some(&creator_range),
+    )
+    .expect("a peer max of 0 is no upper bound");
+
+    let malformed = request_with(share_size_range(500_000_000, 10_000_000));
+    let refused = extract_pairing_request(
+        &malformed,
+        secret_key.ecies_secret_key(),
+        Some(&creator_range),
+    );
+    assert!(
+        is_incompatible_share_size(&refused),
+        "extract must refuse a malformed peer range"
+    );
+}
+
 /// The scanner refuses a response whose advertised range cannot overlap its
 /// own before deriving any key.
 #[test]

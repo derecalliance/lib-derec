@@ -31,6 +31,25 @@ import "github.com/derecalliance/lib-derec/packages/go/internal/native"
 // import the binding without an import cycle.
 type Error = native.Error
 
+// ShareStoreRefusal is the reason a ShareStoreRefusedError refuses a
+// protocol.ShareStore Save or RecordVerification call. Declared in the
+// internal binding (alongside Error, for the same reason) so this package
+// can alias it without an import cycle; package protocol re-aliases it in
+// turn.
+type ShareStoreRefusal = native.ShareStoreRefusal
+
+const (
+	RefusalTooFrequent       = native.RefusalTooFrequent
+	RefusalSizeLimitExceeded = native.RefusalSizeLimitExceeded
+	RefusalRejected          = native.RefusalRejected
+)
+
+// ShareStoreRefusedError is returned from a protocol.ShareStore's Save or
+// RecordVerification method to refuse the write or verification with
+// Refusal, rather than reporting an ordinary backend failure. The library
+// maps each Refusal to the matching protocol status answered to the owner.
+type ShareStoreRefusedError = native.ShareStoreRefusedError
+
 // Categories identify the protocol phase or layer that produced an [Error].
 // They mirror the DEREC_CATEGORY_* constants in library/src/interop/ffi/error.rs.
 const (

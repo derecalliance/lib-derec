@@ -11,8 +11,8 @@ use derec_library::protocol::types::{
 use derec_library::protocol::{
     ChannelStoreFuture, CorruptionReason, DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol,
     DeRecProtocolBuilder, DeRecSecretStore, DeRecShareStore, DeRecTransport, DeRecUserSecretStore,
-    ExpiredChannelCleanup, IgnoreReason, MissingPolicy, SecretKind, SecretStoreError,
-    SecretStoreFuture, SecretValue, Share, ShareStoreFuture, TransportFuture,
+    ExpiredChannelCleanup, IgnoreReason, MissingPolicy, Refusal, SecretKind, SecretStoreError,
+    SecretStoreFuture, SecretValue, Share, ShareStoreError, ShareStoreFuture, TransportFuture,
 };
 use derec_library::types::{ChannelId, ReplicaId};
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
@@ -37,6 +37,7 @@ pub async fn run_all() {
     run_replica_verifies_only_synced_versions_flow().await;
     run_discovery_and_recovery_flow().await;
     run_helper_without_the_version_flow().await;
+    run_share_store_refusal_flow().await;
     run_corrupted_share_flow().await;
     run_unpairing_flow().await;
     run_update_channel_info_flow().await;
@@ -267,9 +268,14 @@ fn clone_secret_value(v: &SecretValue) -> SecretValue {
 /// store — channel linking lives in [`InMemoryChannelStore`]; `load_many`
 /// is fed the resolved channel set by the recovery handler (and `load_all`
 /// by the discovery handler).
+///
+/// `refuse_saves` / `refuse_verifications` make the store refuse with
+/// [`Refusal::TooFrequent`], the way an application's rate limit would.
 #[derive(Default)]
 struct InMemoryShareStore {
     data: HashMap<(u64, u64, u32), Share>,
+    refuse_saves: bool,
+    refuse_verifications: bool,
 }
 
 impl DeRecShareStore for InMemoryShareStore {
@@ -354,6 +360,11 @@ impl DeRecShareStore for InMemoryShareStore {
         channel_id: ChannelId,
         share: Share,
     ) -> ShareStoreFuture<'_, ()> {
+        if self.refuse_saves {
+            return Box::pin(std::future::ready(Err(ShareStoreError::Refused(
+                Refusal::TooFrequent,
+            ))));
+        }
         // Keyed by the partition, which is what every read here filters by.
         // `share.secret_id` names the Owner's secret and differs from the
         // partition whenever this peer is a Helper, so keying on it would put
@@ -388,6 +399,15 @@ impl DeRecShareStore for InMemoryShareStore {
 
     fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
         Box::pin(std::future::ready(Ok(None)))
+    }
+
+    fn record_verification(&mut self, _: u64, _: ChannelId, _: u32) -> ShareStoreFuture<'_, ()> {
+        let result = if self.refuse_verifications {
+            Err(ShareStoreError::Refused(Refusal::TooFrequent))
+        } else {
+            Ok(())
+        };
+        Box::pin(std::future::ready(result))
     }
 }
 
@@ -698,13 +718,18 @@ impl Peer {
         auto_accept: derec_library::protocol::AutoAcceptPolicy,
     ) -> Self {
         let transport = InProcessTransport::new();
+        // Exercises `with_stores`, the one-call store bundle: every other
+        // `Peer` constructor in this file still wires the five stores
+        // individually, so both paths stay exercised.
         let mut builder = DeRecProtocolBuilder::new(secret_id)
-            .with_channel_store(InMemoryChannelStore::default())
-            .with_share_store(InMemoryShareStore::default())
-            .with_secret_store(InMemorySecretStore::default())
-            .with_user_secret_store(InMemoryUserSecretStore::default())
+            .with_stores(derec_library::protocol::DeRecStores {
+                channels: InMemoryChannelStore::default(),
+                shares: InMemoryShareStore::default(),
+                secrets: InMemorySecretStore::default(),
+                user_secrets: InMemoryUserSecretStore::default(),
+                state: InMemoryStateStore::default(),
+            })
             .with_transport(transport.clone())
-            .with_state_store(InMemoryStateStore::default())
             .with_own_transports([uri])
             .with_threshold(threshold)
             .with_auto_reply_to(auto_reply_to)
@@ -2987,8 +3012,8 @@ async fn run_replica_verifies_only_synced_versions_flow() {
         );
     }
 
-    // Alice verifies v1; Bob cannot, and the refusal names the missing bytes
-    // rather than blaming the helper.
+    // Alice verifies v1; Bob cannot, and the failure names the missing local
+    // proof rather than blaming the helper.
     alice
         .protocol
         .start(DeRecFlow::VerifyShares {
@@ -3011,49 +3036,38 @@ async fn run_replica_verifies_only_synced_versions_flow() {
         "alice must verify v1 against all three helpers; verified {verified:?}"
     );
 
-    // Driven by hand: `pump_many` panics on a process() error, and the error
-    // is the assertion here.
-    bob.protocol
+    // Bob holds no v1 bytes, so there is nothing to check an answer against:
+    // each channel fails locally with `NoProof` and no challenge is sent.
+    let events = bob
+        .protocol
         .start(DeRecFlow::VerifyShares {
             secret_id: bob_sid,
             version: v1,
             target: Target::All,
         })
         .await
-        .expect("the challenge itself dispatches — bob holds the channels and keys");
-    let mut refusals = 0;
-    for (tp, bytes) in bob.drain() {
-        let helper: &mut Peer = if tp.uri == h1.uri {
-            &mut h1
-        } else if tp.uri == h2.uri {
-            &mut h2
-        } else if tp.uri == h3.uri {
-            &mut h3
-        } else {
-            panic!("bob addressed an unknown endpoint {}", tp.uri)
-        };
-        deliver(helper, &bytes).await;
-        for (_, reply) in helper.drain() {
-            let err = bob
-                .protocol
-                .process(&reply)
-                .await
-                .expect_err("bob holds no v1 bytes, so the proof cannot be checked");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("no committed share stored"),
-                "the refusal must name the missing local bytes, not the helper's \
-                 share; got {msg}"
-            );
-            refusals += 1;
-        }
-    }
-    assert_eq!(
-        refusals, 3,
-        "all three helpers answered bob's v1 challenge; each answer is refused locally"
+        .expect("a missing proof fails its channel, not the round");
+    let no_proof: HashSet<ChannelId> = events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::VerifySharesFailed {
+                channel_id,
+                reason: derec_library::protocol::VerifyFailureReason::NoProof,
+                ..
+            } => Some(*channel_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        helper_channels.iter().all(|c| no_proof.contains(c)),
+        "bob holds no v1 bytes, so every helper channel fails with NoProof; got {events:?}"
+    );
+    assert!(
+        bob.drain().is_empty(),
+        "no v1 challenge is sent without a proof to check the answer against"
     );
 
-    println!("  alice: v{v1} ✓ v{v2} ✓   bob: v{v1} refused (never synced) v{v2} ✓  ✓");
+    println!("  alice: v{v1} ✓ v{v2} ✓   bob: v{v1} NoProof (never synced) v{v2} ✓  ✓");
     println!("Protocol replica verifies only synced versions flow test passed.");
 }
 
@@ -3481,6 +3495,120 @@ async fn run_helper_without_the_version_flow() {
     );
 
     println!("Protocol helper without the version flow test passed.");
+}
+
+/// A helper's share store refuses first a share, then a verification, with
+/// `TooFrequent`, as an application rate limit would.
+///
+/// The helper answers each refusal with `TOO_FREQUENT` instead of failing,
+/// and the owner reports `ShareRejected` and `ShareVerifyRejected` with that
+/// status. `deliver` panics on a `process`/`accept` error, so reaching the
+/// assertions also proves the helper's calls returned `Ok`.
+async fn run_share_store_refusal_flow() {
+    println!("=== Protocol share store refusal flow test ===");
+
+    let too_frequent = derec_proto::StatusEnum::TooFrequent as i32;
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 42);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(1)).await;
+    pair(&mut owner, &mut helper_b, ChannelId(2)).await;
+
+    let protect = |data: &[u8]| DeRecFlow::ProtectSecret {
+        secrets: vec![UserSecret {
+            id: vec![9],
+            name: "rate-limited secret".to_owned(),
+            data: data.to_vec(),
+        }],
+        description: None,
+    };
+    let started_version = |events: &[DeRecEvent]| {
+        events
+            .iter()
+            .find_map(|e| match e {
+                DeRecEvent::ProtectSecretStarted { version, .. } => Some(*version),
+                _ => None,
+            })
+            .expect("the round must report the version it published")
+    };
+
+    let version = started_version(
+        &owner
+            .protocol
+            .start(protect(b"first version"))
+            .await
+            .expect("owner start(ProtectSecret) failed"),
+    );
+    pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+
+    helper_a.protocol.share_store.refuse_saves = true;
+    let next_version = started_version(
+        &owner
+            .protocol
+            .start(protect(b"second version"))
+            .await
+            .expect("owner start(ProtectSecret) failed"),
+    );
+    let share_events = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+    let share_rejected: Vec<_> = share_events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ShareRejected {
+                channel_id,
+                version,
+                status,
+                ..
+            } => Some((*channel_id, *version, *status)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        share_rejected,
+        vec![(channel_a, next_version, too_frequent)],
+        "helper-a's store refusal must reach the owner as TOO_FREQUENT"
+    );
+    println!(
+        "  helper-a save → Refused(TooFrequent); owner ShareRejected {{ status: TOO_FREQUENT }}  ✓"
+    );
+
+    helper_a.protocol.share_store.refuse_saves = false;
+    helper_a.protocol.share_store.refuse_verifications = true;
+    let owner_sid = owner.protocol.secret_id();
+    owner
+        .protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id: owner_sid,
+            version,
+            target: Target::All,
+        })
+        .await
+        .expect("owner start(VerifyShares) failed");
+    let verify_events = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+    let verify_rejected: Vec<_> = verify_events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ShareVerifyRejected {
+                channel_id, status, ..
+            } => Some((*channel_id, *status)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        verify_rejected,
+        vec![(channel_a, too_frequent)],
+        "helper-a's verification refusal must reach the owner as TOO_FREQUENT"
+    );
+    let verified = verify_events
+        .iter()
+        .filter(|e| matches!(e, DeRecEvent::ShareVerified { .. }))
+        .count();
+    assert_eq!(verified, 1, "helper-b still proves possession");
+    println!(
+        "  helper-a record_verification → Refused(TooFrequent); owner ShareVerifyRejected {{ status: TOO_FREQUENT }}  ✓"
+    );
+
+    println!("Protocol share store refusal flow test passed.");
 }
 
 /// One of three helpers holds a tampered share: one byte of its `y`

@@ -22,6 +22,7 @@ func main() {
 	fmt.Println()
 	fmt.Println("── Protocol smoke tests ────────────────────────────────────")
 	runProtocol()
+	runShareStoreRefusal()
 	runEveryContactModePairs()
 	runUnconfirmedDestination()
 	runUnsafeConnection()

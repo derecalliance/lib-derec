@@ -112,6 +112,7 @@ class EmptyShareStore implements ShareStore {
   async keepList(): Promise<null> {
     return null;
   }
+  async recordVerification(): Promise<void> {}
 }
 
 class EmptyUserSecretStore implements UserSecretStore {

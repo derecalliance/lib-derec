@@ -426,9 +426,37 @@ never blocks the recovery from the others. An honest helper never sends one,
 so treat it as a sign of a damaged or compromised helper — for example, offer
 to unpair it.
 
+### Helpers and shares
+
+- Each share goes to a **different** helper. Threshold security depends on it:
+  compromising one helper must yield at most one share.
+- The library hands out one share per channel per version, and every pairing
+  produces its own channel. It cannot tell whether two channels lead to the
+  same party; keeping helpers distinct is the application's job.
+- **Discouraged:** a single guardian acting as several helpers for the same
+  owner. It is against the protocol's recommendation, since one compromise
+  yields several shares. The library does not prevent it, but channel linking
+  then needs the application's help (below).
+- **Channel linking is expected to be one-to-one.** After an owner re-pairs in
+  recovery mode, the helper application links the new channel to the old one
+  with `IChannelStore.LinkChannel`. Linking assumes a helper holds **at most one share per owner
+  for a given `secretId` and version**, so each recovery channel is linked to the
+  single old channel it replaces. On `GetShare` the helper answers with
+  **one** share from the linked set: the first whose `secretId` matches the
+  request, in the order `IShareStore.LoadMany` returns. The library imposes no order. If
+  several channels holding shares for the same owner are linked to one
+  recovery channel and every recovery channel is answered from the same
+  share, the owner receives it more than once (it counts once) and can fall
+  below the threshold. An application that runs such a helper keeps each
+  recovery channel resolving to a distinct share: either links stay
+  one-to-one, or its share store returns, for each requesting channel, the
+  share intended for it first, in a deterministic order.
+
 The recovering device receives a `SecretRecoveredEvent` carrying the typed
 `Secret`. Pass it
-to `protocol.RestoreAsync(secret, version)` on a fresh `DeRecProtocol` to
+to `protocol.RestoreAsync(secret, version)` — on the same `DeRecProtocol`
+that ran recovery, since it is the one holding the recovery-mode channels
+`RestoreAsync` unpairs — to
 commit canonical helper / replica state and wipe the throwaway recovery-mode
 channels. A helper or member with no endpoint in the recovered roster gets no
 channel; `RestoreAsync` returns a `PeerNotRestoredEvent` for it (`Reason` is
@@ -516,12 +544,15 @@ var shareStore   = new InMemoryShareStore();
 var secretStore  = new InMemorySecretStore();
 var transport    = new RecordingTransport();
 
+// WithStores sets all five stores in one call. Each With*Store setter is
+// still available; the last call for a store wins.
 using var owner = new DeRecProtocolBuilder(secretId)
-    .WithChannelStore(channelStore)
-    .WithShareStore(shareStore)
-    .WithSecretStore(secretStore)
-    .WithUserSecretStore(new InMemoryUserSecretStore())
-    .WithStateStore(new InMemoryStateStore())
+    .WithStores(new DeRecStores(
+        channelStore,
+        shareStore,
+        secretStore,
+        new InMemoryUserSecretStore(),
+        new InMemoryStateStore()))
     .WithTransport(transport)
     .WithOwnTransports(new[] { new TransportProtocol("https://owner.example.com") })
     .Build();
@@ -561,6 +592,41 @@ var protectEvents = await owner.StartAsync(FlowKind.ProtectSecret, new ProtectSe
 // closes.
 ```
 
+#### Verification outcomes
+
+`StartAsync(FlowKind.VerifyShares, …)` challenges each targeted helper, and
+every challenged channel ends with exactly one of:
+
+- `ShareVerifiedEvent` — the helper proved it holds the exact share.
+- `ShareVerifyInvalidEvent { ChannelId, Version }` — the helper's proof does
+  not match the share this device stored. It is an event; `ProcessAsync`
+  does not throw.
+- `ShareVerifyRejectedEvent { Status, Memo }` — the helper refused the
+  challenge with a non-OK status.
+- `VerifySharesFailedEvent { Reason, Error }` — no verdict could be reached
+  on this device. `Reason` is a `VerifyFailureReason` constant:
+  `NoSharedKey`, `NoProof` or `DispatchFailed`.
+
+A stored proof is either confirmed by its helper or part of a sharing round
+still open: when a round settles a channel as failed (a rejection or a
+timeout), that channel's proof is deleted. This guarantee holds on the
+publishing device; a replica Destination holds the proofs the Source
+mirrored at publish time and never sees `SharingCompleteEvent`, so
+verifying there can return `ShareVerifyRejectedEvent` (`UNKNOWN_SHARE_VERSION`)
+for a helper that failed the Source's round. Verify only versions whose round
+completed (`SharingCompleteEvent`). Starting verification on a channel with
+no proof sends nothing and returns `VerifySharesFailedEvent` with
+`VerifyFailureReason.NoProof` at once.
+
+A late response to an earlier challenge is ignored as `MessageIgnoredEvent`
+with `IgnoreReason.StaleResponse`, and the current challenge stays open. A
+response missing its `result` is still an error.
+
+Every channel message carries one timestamp, its send time, in both the
+envelope and the inner message. A message whose two timestamps differ, or
+where either or both are absent, is ignored as `MessageIgnoredEvent` with
+`IgnoreReason.TimestampMismatch`; this includes replies from 0.0.8 peers.
+
 #### Filtered listings
 
 `ListHelpers` and `ListReplicas` take a filter — `ids`, `status`, `role` and
@@ -588,12 +654,51 @@ App-side responsibilities (mirrors the other SDKs):
 - Implement `IChannelStore`, `IShareStore`, `ISecretStore`, `ITransport`
   with persistent backends. `InMemoryChannelStore` / `InMemoryShareStore`
   / `InMemorySecretStore` / `RecordingTransport` ship for tests.
+- Run a reachable endpoint. Delivery is push-only: a reply produced by
+  `ProcessAsync` goes out through `ITransport`, addressed to the peer, and
+  is never returned to the caller. Recommended HTTP conventions (not
+  protocol requirements) are `POST`, an `application/octet-stream` body,
+  `202 Accepted`, and `200 OK` with the reply body when answering an
+  unreachable peer on the same connection. Only that `200 OK`
+  same-connection answer needs matching: pick the reply that echoes the
+  request's trace id with `Envelope.ReadTraceId`. See
+  [Transports](https://derec-alliance.gitbook.io/docs/protocol-specification/transports).
 - On an owner, `IShareStore.KeepList` chooses which versions helpers keep;
   returning `null` sends no keepList, so helpers keep every version;
   see [the owner's keep list](https://github.com/derecalliance/lib-derec/tree/main/library#share-store-the-owners-keep-list).
 - After pairing, link old↔new channel IDs on the helper side
-  (`channelStore.LinkChannel(oldId, newId)`) so recovery can fan out on
-  the new pair while still surfacing shares stored under the old one.
+  (`channelStore.LinkChannel(secretId, oldId, newId)`) so recovery can fan
+  out on the new pair while still surfacing shares stored under the old one.
+  Links are one-to-one; see [Helpers and shares](#helpers-and-shares).
+
+### Refusing a share or a verification
+
+A helper enforces share size itself: with a parameter range configured, a
+share outside its own `MinShareSize`/`MaxShareSize` (inclusive; a max of `0` means
+unbounded) is answered with `SIZE_LIMIT_EXCEEDED` before any
+`ActionRequired` or auto-accept. Frequency limits on share updates and
+verifications are the application's to enforce, from its share store.
+
+On a helper channel, throw `ShareStoreRefusedException` from
+`IShareStore.Save` (a genuinely new share version) or
+`IShareStore.RecordVerification` (an accepted verification challenge) to
+refuse it:
+
+```csharp
+public void RecordVerification(ulong secretId, ulong channelId, uint version)
+{
+    if (rateLimiter.TooSoon(channelId))
+        throw new ShareStoreRefusedException(ShareStoreRefusal.TooFrequent);
+}
+```
+
+The library answers the owner with the mapped status (`TooFrequent` →
+`TOO_FREQUENT`, `SizeLimitExceeded` → `SIZE_LIMIT_EXCEEDED`, `Rejected` →
+`REJECTED`), and the owner sees `ShareRejectedEvent` or
+`ShareVerifyRejectedEvent` with that status. Any other exception is an
+ordinary store failure. Every `IShareStore` implements `RecordVerification`;
+an app with no limit leaves it empty. See
+[Helper-side admission control](https://github.com/derecalliance/lib-derec/tree/main/library#helper-side-admission-control).
 
 End-to-end coverage: see [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 

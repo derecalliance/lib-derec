@@ -74,14 +74,15 @@ func (m *mockSecretStore) Remove(secretID, channelID uint64, kind SecretKind) er
 var _ secretStore = (*mockSecretStore)(nil)
 
 type mockShareStore struct {
-	loadFn           func(secretID, channelID uint64, versions []uint32) ([]Share, error)
-	loadManyFn       func(secretID uint64, channelIDs []uint64, versions []uint32) ([]Share, error)
-	loadAllFn        func(secretID uint64, channelIDs []uint64) ([]Share, error)
-	latestVersionFn  func(secretID uint64) (uint32, bool, error)
-	saveFn           func(secretID, channelID uint64, share Share) error
-	removeChannelFn  func(secretID, channelID uint64) error
-	removeVersionsFn func(secretID, channelID uint64, versions []uint32) error
-	keepListFn       func(secretID uint64, version uint32) ([]uint32, bool, error)
+	loadFn               func(secretID, channelID uint64, versions []uint32) ([]Share, error)
+	loadManyFn           func(secretID uint64, channelIDs []uint64, versions []uint32) ([]Share, error)
+	loadAllFn            func(secretID uint64, channelIDs []uint64) ([]Share, error)
+	latestVersionFn      func(secretID uint64) (uint32, bool, error)
+	saveFn               func(secretID, channelID uint64, share Share) error
+	removeChannelFn      func(secretID, channelID uint64) error
+	removeVersionsFn     func(secretID, channelID uint64, versions []uint32) error
+	keepListFn           func(secretID uint64, version uint32) ([]uint32, bool, error)
+	recordVerificationFn func(secretID, channelID uint64, version uint32) error
 }
 
 func (m *mockShareStore) Load(secretID, channelID uint64, versions []uint32) ([]Share, error) {
@@ -107,6 +108,9 @@ func (m *mockShareStore) RemoveVersions(secretID, channelID uint64, versions []u
 }
 func (m *mockShareStore) KeepList(secretID uint64, version uint32) ([]uint32, bool, error) {
 	return m.keepListFn(secretID, version)
+}
+func (m *mockShareStore) RecordVerification(secretID, channelID uint64, version uint32) error {
+	return m.recordVerificationFn(secretID, channelID, version)
 }
 
 var _ shareStore = (*mockShareStore)(nil)
@@ -590,6 +594,79 @@ func TestDispatchShareSave(t *testing.T) {
 	status := dispatchShareSave(s, 5, 6, payload)
 	if status != ffiStatusOK || savedChannelID != 6 || savedShare.Version != 4 {
 		t.Fatalf("status=%d savedChannelID=%d savedShare=%+v", status, savedChannelID, savedShare)
+	}
+}
+
+// TestShareSaveRefusalReturnsStatusCode proves dispatchShareSave and
+// dispatchShareRecordVerification map a *ShareStoreRefusedError to the FFI
+// return code documented on ShareStoreCallbacks.Save/RecordVerification in
+// stores.rs (3/4/10, the StatusEnum numbers), and fall back to the existing
+// backend-failure code for a plain error that is not a refusal.
+func TestShareSaveRefusalReturnsStatusCode(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int32
+	}{
+		{"TooFrequent", &ShareStoreRefusedError{Refusal: RefusalTooFrequent}, 4},
+		{"SizeLimitExceeded", &ShareStoreRefusedError{Refusal: RefusalSizeLimitExceeded}, 3},
+		{"Rejected", &ShareStoreRefusedError{Refusal: RefusalRejected}, 10},
+		{"PlainError", errors.New("backend down"), ffiStatusFailure},
+	}
+
+	for _, c := range cases {
+		t.Run("Save/"+c.name, func(t *testing.T) {
+			payload, err := EncodeShare(Share{SecretID: 5, Version: 4, Bytes: []byte{1, 2}})
+			if err != nil {
+				t.Fatalf("EncodeShare: %v", err)
+			}
+			s := &storeSet{share: &mockShareStore{
+				saveFn: func(secretID, channelID uint64, share Share) error {
+					return c.err
+				},
+			}}
+			if status := dispatchShareSave(s, 5, 6, payload); status != c.want {
+				t.Fatalf("status = %d, want %d", status, c.want)
+			}
+		})
+
+		t.Run("RecordVerification/"+c.name, func(t *testing.T) {
+			s := &storeSet{share: &mockShareStore{
+				recordVerificationFn: func(secretID, channelID uint64, version uint32) error {
+					return c.err
+				},
+			}}
+			if status := dispatchShareRecordVerification(s, 5, 6, 4); status != c.want {
+				t.Fatalf("status = %d, want %d", status, c.want)
+			}
+		})
+	}
+}
+
+func TestDispatchShareRecordVerification_Success(t *testing.T) {
+	var gotSecretID, gotChannelID uint64
+	var gotVersion uint32
+	s := &storeSet{share: &mockShareStore{
+		recordVerificationFn: func(secretID, channelID uint64, version uint32) error {
+			gotSecretID, gotChannelID, gotVersion = secretID, channelID, version
+			return nil
+		},
+	}}
+	status := dispatchShareRecordVerification(s, 5, 6, 4)
+	if status != ffiStatusOK || gotSecretID != 5 || gotChannelID != 6 || gotVersion != 4 {
+		t.Fatalf("status=%d secretID=%d channelID=%d version=%d", status, gotSecretID, gotChannelID, gotVersion)
+	}
+}
+
+func TestDispatchShareRecordVerification_PanicRecovered(t *testing.T) {
+	s := &storeSet{share: &mockShareStore{
+		recordVerificationFn: func(secretID, channelID uint64, version uint32) error {
+			panic("share store blew up")
+		},
+	}}
+	status := dispatchShareRecordVerification(s, 1, 2, 3)
+	if status != ffiStatusFailure {
+		t.Fatalf("status = %d, want ffiStatusFailure after recovered panic", status)
 	}
 }
 

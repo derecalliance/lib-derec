@@ -428,6 +428,18 @@ public sealed record ShareVerifiedEvent : DeRecEvent
 }
 
 /// <summary>
+/// A helper answered a verification challenge, but its proof does not match
+/// the share this device stored. The challenge is spent; a new
+/// <c>VerifyShares</c> round challenges the helper again.
+/// </summary>
+public sealed record ShareVerifyInvalidEvent : DeRecEvent
+{
+    public override string EventType => "ShareVerifyInvalid";
+    public required ulong ChannelId { get; init; }
+    public required uint Version { get; init; }
+}
+
+/// <summary>
 /// A helper refused a verification challenge: its response carried a non-OK
 /// <c>Status</c> instead of a proof. The challenge is spent; a new
 /// <c>VerifyShares</c> round challenges the helper again.
@@ -852,6 +864,8 @@ public static class IgnoreReason
 {
     public const string PendingVerification = "PendingVerification";
     public const string Expired = "Expired";
+    public const string TimestampMismatch = "TimestampMismatch";
+    public const string StaleResponse = "StaleResponse";
 }
 
 /// <summary>
@@ -958,7 +972,19 @@ public sealed record VerifySharesFailedEvent : DeRecEvent
     public override string EventType => "VerifySharesFailed";
     public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
+    public required string Reason { get; init; }
     public required string Error { get; init; }
+}
+
+/// <summary>
+/// The label vocabulary for <see cref="VerifySharesFailedEvent.Reason"/>.
+/// Matches the Rust <c>VerifyFailureReason</c> discriminants one-for-one.
+/// </summary>
+public static class VerifyFailureReason
+{
+    public const string NoSharedKey = "NoSharedKey";
+    public const string NoProof = "NoProof";
+    public const string DispatchFailed = "DispatchFailed";
 }
 
 public sealed record RecoverSecretStartedEvent : DeRecEvent
@@ -1092,6 +1118,11 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ThresholdMet = root.GetProperty("threshold_met").GetBoolean(),
             },
             "ShareVerified" => new ShareVerifiedEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Version = root.GetProperty("version").GetUInt32(),
+            },
+            "ShareVerifyInvalid" => new ShareVerifyInvalidEvent
             {
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
@@ -1277,6 +1308,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
+                Reason = root.GetProperty("reason").GetString() ?? string.Empty,
                 Error = root.GetProperty("error").GetString() ?? string.Empty,
             },
             "RecoverSecretStarted" => new RecoverSecretStartedEvent

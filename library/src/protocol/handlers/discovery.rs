@@ -107,11 +107,15 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 /// Answer a peer's discovery request with the catalog of secrets held
 /// for it across every linked channel.
 ///
-/// Entries are grouped by `secret_id`, then keyed by `version`. A helper
+/// Entries are grouped by `secret_id`, then keyed by `version`. A channel
 /// holds exactly one share per `(secret_id, version)` — a second write
 /// carrying different content is refused with `VERSION_CONFLICT` rather
 /// than stored alongside — so a version identifies a share unambiguously
-/// and needs no writer to disambiguate it.
+/// and needs no writer to disambiguate it. Across the linked set the same
+/// holds only by assumption: links are expected to be one-to-one (see
+/// [`DeRecChannelStore::link_channel`](crate::protocol::DeRecChannelStore::link_channel)),
+/// and a `(secret_id, version)` found on more than one linked channel is
+/// reported once.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))

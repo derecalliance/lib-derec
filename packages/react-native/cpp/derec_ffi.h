@@ -290,6 +290,20 @@
 #define DEREC_CODE_NO_USABLE_ENDPOINT 121
 
 /**
+ * Return codes for [`crate::interop::ffi::protocol::stores::ShareStoreCallbacks::save`]
+ * and `ShareStoreCallbacks::record_verification`: `0` is success, each of
+ * these three refuses the write/verification with the matching
+ * [`crate::protocol::Refusal`] variant, and any other non-zero value is an
+ * ordinary backend failure. The values are the `StatusEnum` numbers the
+ * helper answers the owner with, not FFI-local codes.
+ */
+#define DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED 3
+
+#define DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT 4
+
+#define DEREC_SHARE_STORE_REFUSED_REJECTED 10
+
+/**
  * Discriminants selecting which message [`derec_decode_message_json`] and
  * [`derec_encode_message_json`] operate on.
  *
@@ -842,6 +856,18 @@ typedef struct SecretStoreCallbacks {
  * `null` for no list (the owner sends an empty `keepList` and helpers keep
  * every version) or an array of version numbers. An empty buffer or return code `1` also
  * means `null`.
+ *
+ * `save` and `record_verification` share a return-code convention: `0` is
+ * success; `3`/`4`/`10` (the
+ * [`DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED) /
+ * [`DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT) /
+ * [`DEREC_SHARE_STORE_REFUSED_REJECTED`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_REJECTED)
+ * constants) refuse the call with the matching
+ * [`crate::protocol::Refusal`] variant; any other non-zero value is an
+ * ordinary backend failure. `record_verification` is called once per
+ * accepted verification challenge, after the challenged share is found and
+ * before the helper answers — see
+ * [`crate::protocol::DeRecShareStore::record_verification`].
  */
 typedef struct ShareStoreCallbacks {
   void *user_data;
@@ -886,6 +912,10 @@ typedef struct ShareStoreCallbacks {
                        uint32_t version,
                        uint8_t **out_ptr,
                        size_t *out_len);
+  int32_t (*record_verification)(void *user_data,
+                                 uint64_t secret_id,
+                                 uint64_t channel_id,
+                                 uint32_t version);
   void (*free_buffer)(void *user_data, uint8_t *ptr, size_t len);
 } ShareStoreCallbacks;
 

@@ -1,5 +1,5 @@
 {
-  "$schema_note": "The API surface every SDK must expose, with each SDK's spelling. `api_surface_parity.rs` derives the expected surface from the Rust source and holds this file to it, then holds every SDK to this file, reading each SDK declaration as a block and comparing its members as a set. `protocol_methods` are the public methods of `DeRecProtocol`; `builder_options` and `builder_wiring` the public methods of `DeRecProtocolBuilder` (options are `with_<rust>`). `stores` lists each store trait with its methods: `rust_params` must equal the trait's parameters, `params` the parameters every SDK declares, modulo casing. `primitives` maps each public primitive to the FFI and WASM exports that carry it and to each SDK's path. `records` pairs a Rust struct with the type each SDK mirrors it as; fields are compared, not listed. Lifecycle entry points are not rows: each SDK expresses them idiomatically (Rust Drop, .NET Dispose, Go Close, JS free and Symbol.dispose) and the test spells them per language. `secret_id` is absent from `builder_options`: every SDK takes it as the builder's constructor argument. `sdk_helpers` covers conveniences every SDK must offer that have no counterpart in the core; .NET and Go entries name `Owner.Member` where the helper is a member.",
+  "$schema_note": "The API surface every SDK must expose, with each SDK's spelling. `api_surface_parity.rs` derives the expected surface from the Rust source and holds this file to it, then holds every SDK to this file, reading each SDK declaration as a block and comparing its members as a set. `protocol_methods` are the public methods of `DeRecProtocol`; `builder_options` and `builder_wiring` the public methods of `DeRecProtocolBuilder` (options are `with_<rust>`). `builder_bundles` names a setter that bundles several `builder_wiring` setters into one call and forwards to them (no Go column: Go bundles the same stores into its `Stores` struct instead); it has no FFI callback of its own, so it is excluded from the FFI wiring check. `stores` lists each store trait with its methods: `rust_params` must equal the trait's parameters, `params` the parameters every SDK declares, modulo casing. `primitives` maps each public primitive to the FFI and WASM exports that carry it and to each SDK's path. `records` pairs a Rust struct with the type each SDK mirrors it as; fields are compared, not listed. Lifecycle entry points are not rows: each SDK expresses them idiomatically (Rust Drop, .NET Dispose, Go Close, JS free and Symbol.dispose) and the test spells them per language. `secret_id` is absent from `builder_options`: every SDK takes it as the builder's constructor argument. `sdk_helpers` covers conveniences every SDK must offer that have no counterpart in the core; .NET and Go entries name `Owner.Member` where the helper is a member.",
   "protocol_methods": [
     {
       "rust": "accept",
@@ -184,6 +184,13 @@
       "dotnet": "WithTransport",
       "go": "transport",
       "ts": "withTransport"
+    }
+  ],
+  "builder_bundles": [
+    {
+      "rust": "with_stores",
+      "dotnet": "WithStores",
+      "ts": "withStores"
     }
   ],
   "flow_params": [
@@ -547,6 +554,22 @@
           ],
           "params": [
             "secret_id",
+            "version"
+          ]
+        },
+        {
+          "rust": "record_verification",
+          "dotnet": "RecordVerification",
+          "go": "RecordVerification",
+          "ts": "recordVerification",
+          "rust_params": [
+            "secret_id",
+            "channel_id",
+            "version"
+          ],
+          "params": [
+            "secret_id",
+            "channel_id",
             "version"
           ]
         }

@@ -336,6 +336,13 @@ func TestDecodeEvents_ShareVerified(t *testing.T) {
 	}
 }
 
+func TestDecodeEvents_ShareVerifyInvalid(t *testing.T) {
+	ev := decodeOne(t, `{"type": "ShareVerifyInvalid", "channel_id": "11", "version": 2}`)
+	if ev.Type != EventTypeShareVerifyInvalid || ev.ChannelID != 11 || ev.Version == nil || *ev.Version != 2 {
+		t.Fatalf("got %+v", ev)
+	}
+}
+
 func TestDecodeEvents_ShareVerifyRejected(t *testing.T) {
 	ev := decodeOne(t, `{
 		"type": "ShareVerifyRejected",
@@ -764,8 +771,8 @@ func TestDecodeEvents_VerifySharesStarted(t *testing.T) {
 }
 
 func TestDecodeEvents_VerifySharesFailed(t *testing.T) {
-	ev := decodeOne(t, `{"type": "VerifySharesFailed", "channel_id": "11", "version": 1, "error": "timeout"}`)
-	if ev.Type != EventTypeVerifySharesFailed || ev.Error != "timeout" {
+	ev := decodeOne(t, `{"type": "VerifySharesFailed", "channel_id": "11", "version": 1, "reason": "NoProof", "error": "timeout"}`)
+	if ev.Type != EventTypeVerifySharesFailed || ev.Reason != VerifyFailureReasonNoProof || ev.Error != "timeout" {
 		t.Fatalf("got %+v", ev)
 	}
 }

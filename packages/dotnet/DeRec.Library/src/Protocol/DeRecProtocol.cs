@@ -51,6 +51,7 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.ShareStoreRemoveChannelDelegate _shareRemoveChannel;
     private readonly NP.ShareStoreRemoveVersionsDelegate _shareRemoveVersions;
     private readonly NP.ShareStoreKeepListDelegate _shareKeepList;
+    private readonly NP.ShareStoreRecordVerificationDelegate _shareRecordVerification;
     private readonly NP.FreeBufferDelegate _shareFreeBuffer;
     private readonly NP.UserSecretStoreLoadLatestDelegate _userSecretLoadLatest;
     private readonly NP.UserSecretStoreSaveLatestDelegate _userSecretSaveLatest;
@@ -138,6 +139,7 @@ public sealed class DeRecProtocol : IDisposable
         _shareRemoveChannel = ShareRemoveChannelImpl;
         _shareRemoveVersions = ShareRemoveVersionsImpl;
         _shareKeepList = ShareKeepListImpl;
+        _shareRecordVerification = ShareRecordVerificationImpl;
         _shareFreeBuffer = FreeBufferImpl;
 
         _userSecretLoadLatest = UserSecretLoadLatestImpl;
@@ -185,6 +187,7 @@ public sealed class DeRecProtocol : IDisposable
             RemoveChannel = Marshal.GetFunctionPointerForDelegate(_shareRemoveChannel),
             RemoveVersions = Marshal.GetFunctionPointerForDelegate(_shareRemoveVersions),
             KeepList = Marshal.GetFunctionPointerForDelegate(_shareKeepList),
+            RecordVerification = Marshal.GetFunctionPointerForDelegate(_shareRecordVerification),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_shareFreeBuffer),
         };
         var userSecretCb = new NP.UserSecretStoreCallbacks
@@ -1042,8 +1045,33 @@ public sealed class DeRecProtocol : IDisposable
             _shareStore.Save(secretId, channelId, new Share(ulong.Parse(rec.secret_id), rec.version, rec.bytes));
             return 0;
         }
+        catch (ShareStoreRefusedException ex) { return RefusalCode(ex.Refusal); }
         catch { return -1; }
     }
+
+    private int ShareRecordVerificationImpl(IntPtr userData, ulong secretId, ulong channelId, uint version)
+    {
+        try
+        {
+            _shareStore.RecordVerification(secretId, channelId, version);
+            return 0;
+        }
+        catch (ShareStoreRefusedException ex) { return RefusalCode(ex.Refusal); }
+        catch { return -1; }
+    }
+
+    /// <summary>
+    /// Maps a <see cref="ShareStoreRefusal"/> to the FFI return code the
+    /// Rust core reads as a <c>StatusEnum</c> number — see
+    /// <c>DEREC_SHARE_STORE_REFUSED_*</c> in <c>library/src/interop/ffi/error.rs</c>.
+    /// </summary>
+    private static int RefusalCode(ShareStoreRefusal refusal) => refusal switch
+    {
+        ShareStoreRefusal.SizeLimitExceeded => 3,
+        ShareStoreRefusal.TooFrequent => 4,
+        ShareStoreRefusal.Rejected => 10,
+        _ => -1,
+    };
 
     private int ShareRemoveChannelImpl(IntPtr userData, ulong secretId, ulong channelId)
     {
@@ -1549,17 +1577,22 @@ public enum UnpairAck
 /// request-amplification oracle (anyone with the contact's nonce can
 /// elicit a key-publish). Keep off unless you control both ends of
 /// the transport.</item>
-/// <item><see cref="StoreShare"/> is the helper's only admission-control
-/// point for inbound shares. The protocol enforces no size, quota or
-/// rate limit of its own, and <c>maxShareSize</c> is checked for range
-/// overlap at pairing time only, never against an actual share. While
-/// this is <c>false</c>, the <see cref="ActionRequiredEvent"/> carries
-/// the decoded request, so the application can inspect the share and
-/// call <see cref="DeRecProtocol.RejectAsync"/> with
-/// <c>StatusEnum.SizeLimitExceeded</c>. Setting it <c>true</c> removes
-/// that opportunity entirely: every share from every paired Owner is
-/// stored unconditionally, at whatever size it arrives. Keep off in any
-/// deployment with per-user storage limits.</item>
+/// <item><see cref="StoreShare"/> is the helper's admission-control point
+/// for inbound shares beyond what the library already checks: this
+/// device's own configured <c>minShareSize</c>/<c>maxShareSize</c> is
+/// enforced against every inbound share's actual length regardless of
+/// this flag, before <see cref="ActionRequiredEvent"/> is ever
+/// considered — an out-of-range share is refused with
+/// <c>StatusEnum.SizeLimitExceeded</c> either way, and this flag has no
+/// say in it. While this is <c>false</c>, the
+/// <see cref="ActionRequiredEvent"/> carries the decoded request, which
+/// is where a tighter or per-user size limit, storage quota, or any
+/// other app-specific decline belongs — call
+/// <see cref="DeRecProtocol.RejectAsync"/> for that. Setting it
+/// <c>true</c> removes that opportunity: every in-range share from
+/// every paired Owner is stored unconditionally, unless the share store
+/// refuses it. Keep off in any deployment with per-user storage limits
+/// tighter than this device's own configured range.</item>
 /// <item><see cref="Unpair"/> is destructive — accepting deletes the
 /// local channel record before any UI confirmation.</item>
 /// <item><see cref="UpdateChannelInfo"/> silently overwrites the

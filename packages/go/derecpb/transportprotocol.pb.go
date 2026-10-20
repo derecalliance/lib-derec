@@ -33,9 +33,20 @@ type Protocol int32
 const (
 	// / HTTPS-based transport.
 	// /
-	// / Messages are delivered via HTTP(S) requests, typically using a
-	// / request/response pattern where the Owner acts as client and the
-	// / Helper acts as server.
+	// / Delivery is push-only. Each delivery to the peer's `uri` carries
+	// / exactly one serialized `DeRecMessage`. A response is never returned
+	// / on the delivery that carried the request: it is a separate delivery
+	// / to the sender's own advertised endpoint, so both parties must run a
+	// / reachable endpoint.
+	// /
+	// / The HTTP method, headers, status codes and size limits are not part
+	// / of the protocol. Recommended conventions are in the Transports
+	// / section of the DeRec documentation.
+	// /
+	// / URI forms:
+	// /
+	// / - `https://host[:port]/path` — HTTP over TLS
+	// / - `http://host[:port]/path` — plaintext, development only
 	// /
 	// / This is the default transport.
 	Protocol_HTTPS Protocol = 0
@@ -127,8 +138,10 @@ func (Protocol) EnumDescriptor() ([]byte, []int) {
 // /
 // / # Reliability
 // /
-// / Transport protocols may be:
-// / - request/response (e.g., HTTPS)
+// / Every transport delivers one `DeRecMessage` per delivery and is push:
+// / a response travels as a separate delivery to the requester's own
+// / endpoint. Transports may be:
+// / - direct (e.g., HTTPS, gRPC)
 // / - store-and-forward (e.g., message queues)
 // /
 // / Implementations MUST handle retries and idempotency at the protocol layer,
@@ -151,7 +164,6 @@ type TransportProtocol struct {
 	// / This determines:
 	// / - how the `uri` should be interpreted
 	// / - how messages are serialized and delivered
-	// / - what communication pattern is expected (e.g., synchronous vs async)
 	// /
 	// / Implementations MUST support all mandatory protocol types defined here.
 	Protocol      Protocol `protobuf:"varint,2,opt,name=protocol,proto3,enum=org.derecalliance.derec.protobuf.Protocol" json:"protocol,omitempty"`

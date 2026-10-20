@@ -185,6 +185,16 @@ pub const DEREC_CODE_NO_USABLE_ENDPOINT: i32 = 121;
 
 // 122 is retired (formerly the conflicting plaintext opt-in); never reassign it.
 
+/// Return codes for [`crate::interop::ffi::protocol::stores::ShareStoreCallbacks::save`]
+/// and `ShareStoreCallbacks::record_verification`: `0` is success, each of
+/// these three refuses the write/verification with the matching
+/// [`crate::protocol::Refusal`] variant, and any other non-zero value is an
+/// ordinary backend failure. The values are the `StatusEnum` numbers the
+/// helper answers the owner with, not FFI-local codes.
+pub const DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED: i32 = 3;
+pub const DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT: i32 = 4;
+pub const DEREC_SHARE_STORE_REFUSED_REJECTED: i32 = 10;
+
 pub(crate) fn success() -> DeRecError {
     DeRecError {
         category: DEREC_CATEGORY_OK,

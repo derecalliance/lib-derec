@@ -44,6 +44,8 @@ func TestIgnoreReasonConstantsMatchTheFixture(t *testing.T) {
 	constants := map[string]bool{
 		IgnoreReasonPendingVerification: true,
 		IgnoreReasonExpired:             true,
+		IgnoreReasonTimestampMismatch:   true,
+		IgnoreReasonStaleResponse:       true,
 	}
 	variants := reasons.Variants
 	for _, v := range variants {
@@ -119,6 +121,43 @@ func TestCorruptionReasonConstantsMatchTheFixture(t *testing.T) {
 	for _, v := range variants {
 		if !constants[v.Wire] {
 			t.Errorf("fixture reason %q has no CorruptionReason constant", v.Wire)
+		}
+	}
+	if len(variants) != len(constants) {
+		t.Errorf("fixture lists %d reasons, Go declares %d", len(variants), len(constants))
+	}
+}
+
+func TestVerifyFailureReasonConstantsMatchTheFixture(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "library", "tests", "fixtures", "enums.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var doc struct {
+		Enums map[string]json.RawMessage `json:"enums"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+	var reasons struct {
+		Variants []struct {
+			Wire string `json:"wire"`
+		} `json:"variants"`
+	}
+	if err := json.Unmarshal(doc.Enums["VerifyFailureReason"], &reasons); err != nil {
+		t.Fatalf("parsing VerifyFailureReason: %v", err)
+	}
+
+	constants := map[string]bool{
+		VerifyFailureReasonNoSharedKey:    true,
+		VerifyFailureReasonNoProof:        true,
+		VerifyFailureReasonDispatchFailed: true,
+	}
+	variants := reasons.Variants
+	for _, v := range variants {
+		if !constants[v.Wire] {
+			t.Errorf("fixture reason %q has no VerifyFailureReason constant", v.Wire)
 		}
 	}
 	if len(variants) != len(constants) {

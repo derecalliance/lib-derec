@@ -304,6 +304,14 @@ const INFRASTRUCTURE_EXPORTS: &[Allow] = &[
         "decodes a transport callback's endpoint buffer for FFI SDKs",
     ),
     ("wasm", "", "wasm_start", "module initialisation hook"),
+    (
+        "wasm",
+        "",
+        "shareStoreRefusal",
+        "builds the tagged Error a JS ShareStore throws from save/recordVerification to \
+         signal a Refusal; the FFI SDKs signal the same thing through save/record_verification's \
+         return code instead, so there is no FFI counterpart to name",
+    ),
 ];
 
 /// Store methods whose parameters an SDK spells differently from the
@@ -977,8 +985,17 @@ fn rust_builder_methods_are_named_and_exported() {
         .iter()
         .map(|e| field(e, "rust"))
         .collect();
+    let bundles: BTreeSet<String> = entries("builder_bundles")
+        .iter()
+        .map(|e| field(e, "rust"))
+        .collect();
     let lifecycle: BTreeSet<String> = ["new", "build"].iter().map(|s| (*s).to_owned()).collect();
-    let named: BTreeSet<String> = options.union(&wiring).cloned().chain(lifecycle).collect();
+    let named: BTreeSet<String> = options
+        .union(&wiring)
+        .cloned()
+        .chain(bundles)
+        .chain(lifecycle)
+        .collect();
 
     let mut problems = Vec::new();
     for m in rust.difference(&named) {
@@ -1416,6 +1433,7 @@ fn every_sdk_protocol_class_matches_the_core() {
 fn every_sdk_builder_matches_the_core() {
     let options = entries("builder_options");
     let wiring = entries("builder_wiring");
+    let bundles = entries("builder_bundles");
     let mut problems = Vec::new();
     for sdk in SDKS {
         if *sdk == "go" {
@@ -1431,16 +1449,48 @@ fn every_sdk_builder_matches_the_core() {
                 .chain(["SecretID".to_owned()])
                 .collect();
             compare_members(&mut problems, "go", "Config", &config, &expected);
+
+            // The five stores are bundled into a `Stores` struct rather than
+            // passed to `New` individually; each field is the matching store
+            // trait's Go interface name with its `Store` suffix dropped
+            // (`ChannelStore` -> `Channel`).
+            let store_traits = entries("stores");
+            let expected_store_fields: BTreeSet<String> = store_traits
+                .iter()
+                .filter(|s| field(s, "trait") != "DeRecTransport")
+                .map(|s| {
+                    field(s, "go")
+                        .strip_suffix("Store")
+                        .expect("store trait's go name ends in Store")
+                        .to_owned()
+                })
+                .collect();
+            let store_fields: BTreeSet<String> = decl::go_fields(&files, "Stores")
+                .expect("go declares Stores")
+                .into_iter()
+                .collect();
+            compare_members(
+                &mut problems,
+                "go",
+                "Stores",
+                &store_fields,
+                &expected_store_fields,
+            );
+
             let new = decl::go_funcs(&files)
                 .into_iter()
                 .find(|f| f.name == "New")
                 .expect("go declares func New");
             let got: BTreeSet<String> = new.params.into_iter().collect();
-            let want: BTreeSet<String> = wiring
+            let transport_param = wiring
                 .iter()
+                .find(|w| field(w, "rust") == "with_transport")
                 .map(|w| field(w, "go"))
-                .chain(["config".to_owned()])
-                .collect();
+                .expect("builder_wiring has with_transport");
+            let want: BTreeSet<String> =
+                [transport_param, "stores".to_owned(), "config".to_owned()]
+                    .into_iter()
+                    .collect();
             compare_members(&mut problems, "go", "New", &got, &want);
             continue;
         }
@@ -1456,6 +1506,7 @@ fn every_sdk_builder_matches_the_core() {
         let expected: BTreeSet<String> = options
             .iter()
             .chain(wiring.iter())
+            .chain(bundles.iter())
             .map(|o| field(o, key(sdk)))
             .chain([build.to_owned()])
             .chain(

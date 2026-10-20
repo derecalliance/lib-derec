@@ -252,6 +252,11 @@ export interface ShareStore {
     versions: number[],
   ): Promise<Share[]>;
   loadAll(secretId: string, channelIds: string[]): Promise<Share[]>;
+  /**
+   * Reject, or throw, a {@link shareStoreRefusal} `Error` to refuse a share
+   * update on a helper channel; any other rejection is an ordinary backend
+   * failure.
+   */
   save(secretId: string, channelId: string, share: Share): Promise<void>;
   latestVersion(secretId: string): Promise<number | null>;
   removeChannel(secretId: string, channelId: string): Promise<void>;
@@ -284,6 +289,17 @@ export interface ShareStore {
    * unrecoverable.
    */
   keepList(secretId: string, version: number): Promise<number[] | null | undefined>;
+  /**
+   * Record a verification challenge the helper is about to answer for
+   * `(secretId, channelId, version)`. Called once per accepted challenge,
+   * after the challenged share is found and before the helper answers.
+   *
+   * Reject, or throw, a {@link shareStoreRefusal} `Error` to refuse the
+   * verification on a helper channel; the library answers the owner with
+   * the mapped status instead of the verification result. Any other
+   * rejection is an ordinary backend failure.
+   */
+  recordVerification(secretId: string, channelId: string, version: number): Promise<void>;
 }
 
 export interface UserSecretEntry {
@@ -438,6 +454,19 @@ export declare function protocol_version(): { major: number; minor: number };
  * group.
  */
 export declare function generate_replica_id(): bigint;
+
+/** Reason a `ShareStore` gives for refusing a `save` or `recordVerification`
+ *  call, carried on the `refusal` property of the `Error` {@link
+ *  shareStoreRefusal} builds. The app picks the reason; the library alone
+ *  decides the status and memo that reach the peer. */
+export type ShareStoreRefusalReason = "too_frequent" | "size_limit_exceeded" | "rejected";
+
+/**
+ * Builds the `Error` a `ShareStore`'s `save`/`recordVerification` throws, or
+ * rejects its promise with, to refuse the call: `reason` tagged onto the
+ * error's `refusal` property.
+ */
+export declare function shareStoreRefusal(reason: ShareStoreRefusalReason): Error;
 
 /**
  * Builds a {@link Transport} that tries each endpoint in the order the peer
@@ -770,6 +799,10 @@ export type DeRecEvent =
    *  library keeps no durable per-member sync state. */
   | { type: "ReplicaSyncComplete"; version: number; synced: string[]; behind: string[] }
   | { type: "ShareVerified"; channel_id: string; version: number }
+  /** A helper answered a verification challenge, but its proof does not
+   *  match the share this device stored. The challenge is spent; a new
+   *  `VerifyShares` round challenges the helper again. */
+  | { type: "ShareVerifyInvalid"; channel_id: string; version: number }
   /** A helper refused a verification challenge: its response carried a
    *  non-OK `status` instead of a proof. The challenge is spent; a new
    *  `VerifyShares` round challenges the helper again. */
@@ -1113,11 +1146,12 @@ export type DeRecEvent =
     }
   /** A verify-share challenge was dispatched to `channel_id`. */
   | { type: "VerifySharesStarted"; channel_id: string; version: number; trace_id: string }
-  /** A verify-share challenge could not be dispatched to `channel_id`. */
+  /** Verification reached no verdict for `channel_id`. `reason` says why. */
   | {
       type: "VerifySharesFailed";
       channel_id: string;
       version: number;
+      reason: VerifyFailureReason;
       error: string;
     }
   /** A recovery share request was dispatched to `channel_id`. */
@@ -1155,16 +1189,20 @@ export type DeRecEvent =
  *   oracle. Anyone who knows a HashedKeys contact's nonce can elicit a
  *   key-publish response. Keep off unless you control both ends of
  *   the transport.
- * - `storeShare` — the helper's only admission-control point for
- *   inbound shares. The protocol enforces no size, quota or rate limit
- *   of its own, and `maxShareSize` is checked for range overlap at
- *   pairing time only, never against an actual share. While this is
- *   `false`, `ActionRequired` carries `share_size`, so the application
- *   can compare it to its quota and call `reject()` with
- *   `StatusEnum.SizeLimitExceeded`. Setting it `true` removes that
- *   opportunity entirely: every share from every paired Owner is stored
- *   unconditionally, at whatever size it arrives. Keep off in any
- *   deployment with per-user storage limits.
+ * - `storeShare` — the helper's admission-control point for inbound
+ *   shares beyond what the library already checks: this device's own
+ *   configured `minShareSize`/`maxShareSize` is enforced against every
+ *   inbound share's actual length regardless of this flag, before
+ *   `ActionRequired` is ever considered — an out-of-range share is
+ *   refused with `StatusEnum.SizeLimitExceeded` either way, and this
+ *   flag has no say in it. While this is `false`, `ActionRequired`
+ *   carries the decoded request, which is where a tighter or per-user
+ *   size limit, storage quota, or any other app-specific decline
+ *   belongs — call `reject()` for that. Setting it `true` removes that
+ *   opportunity: every in-range share from every paired Owner is stored
+ *   unconditionally, unless the share store refuses it. Keep off in any
+ *   deployment with per-user storage limits tighter than this device's
+ *   own configured range.
  * - `unpair` — destructive. Accepting deletes the local channel
  *   record before any UI confirmation.
  * - `updateChannelInfo` — silently overwrites the channel record with
@@ -1179,6 +1217,18 @@ export interface AutoAcceptPolicy {
   getShare?: boolean;
   unpair?: boolean;
   updateChannelInfo?: boolean;
+}
+
+/**
+ * The five stores {@link DeRecProtocolBuilder.build} requires, bundled for
+ * {@link DeRecProtocolBuilder.withStores}.
+ */
+export interface StoresInit {
+  channelStore: ChannelStore;
+  shareStore: ShareStore;
+  secretStore: SecretStore;
+  userSecretStore: UserSecretStore;
+  stateStore: StateStore;
 }
 
 /**
@@ -1218,6 +1268,13 @@ export declare class DeRecProtocolBuilder {
   withSecretStore(store: SecretStore): DeRecProtocolBuilder;
   withUserSecretStore(store: UserSecretStore): DeRecProtocolBuilder;
   withStateStore(store: StateStore): DeRecProtocolBuilder;
+  /**
+   * Set every store in one call. Forwards to {@link DeRecProtocolBuilder.withChannelStore},
+   * {@link DeRecProtocolBuilder.withShareStore}, {@link DeRecProtocolBuilder.withSecretStore},
+   * {@link DeRecProtocolBuilder.withUserSecretStore} and {@link DeRecProtocolBuilder.withStateStore}
+   * in turn, so calling one of them again afterwards replaces just that store.
+   */
+  withStores(stores: StoresInit): DeRecProtocolBuilder;
   withTransport(transport: Transport): DeRecProtocolBuilder;
   /**
    * Set every transport endpoint this application serves, in preference
@@ -1310,6 +1367,10 @@ export declare class DeRecProtocolBuilder {
    * protocol reads as no constraint on that dimension.
    *
    * Default: unset — no constraints advertised, every peer range accepted.
+   *
+   * Share size is enforced by the helper; frequency limits are enforced by
+   * the app's share store (refuse from `save`/`recordVerification`); the
+   * deletion and deactivation timeouts are checked at pairing only.
    */
   withParameterRange(range: Partial<ParameterRange>): DeRecProtocolBuilder;
 
@@ -1606,11 +1667,16 @@ export interface CommunicationInfo {
  */
 /** Why a `MessageIgnored` event dropped a message. Matches the Rust
  *  `IgnoreReason` discriminants one-for-one. */
-export type IgnoreReason = "PendingVerification" | "Expired";
+export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse";
 
 /** Why a `PeerNotRestored` event left a roster entry without a channel.
  *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */
 export type NotRestoredReason = "NoTransports";
+
+/** Why a `VerifySharesFailed` event reached no verdict for a channel.
+ *  Matches the Rust `VerifyFailureReason` discriminants
+ *  one-for-one. */
+export type VerifyFailureReason = "NoSharedKey" | "NoProof" | "DispatchFailed";
 
 /** Why a `RecoveryShareCorrupted` event set a helper's share aside.
  *  Matches the Rust `CorruptionReason` discriminants one-for-one:

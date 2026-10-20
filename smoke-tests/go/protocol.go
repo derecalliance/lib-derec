@@ -16,6 +16,8 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/derecalliance/lib-derec/packages/go/derec"
@@ -222,6 +224,11 @@ type shareStoreKey struct {
 type memShareStore struct {
 	mu   sync.Mutex
 	data map[shareStoreKey]protocol.Share
+
+	// refuseSaves / refuseVerifications refuse with RefusalTooFrequent, the
+	// way an application's rate limit would.
+	refuseSaves         bool
+	refuseVerifications bool
 }
 
 func newMemShareStore() *memShareStore {
@@ -298,6 +305,9 @@ func (s *memShareStore) LatestVersion(secretID uint64) (uint32, bool, error) {
 func (s *memShareStore) Save(secretID, channelID uint64, share protocol.Share) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.refuseSaves {
+		return &protocol.ShareStoreRefusedError{Refusal: protocol.RefusalTooFrequent}
+	}
 	s.data[shareStoreKey{channelID, share.SecretID, share.Version}] = share
 	return nil
 }
@@ -324,6 +334,15 @@ func (s *memShareStore) RemoveVersions(secretID, channelID uint64, versions []ui
 
 func (s *memShareStore) KeepList(secretID uint64, version uint32) ([]uint32, bool, error) {
 	return nil, false, nil
+}
+
+func (s *memShareStore) RecordVerification(secretID, channelID uint64, version uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.refuseVerifications {
+		return &protocol.ShareStoreRefusedError{Refusal: protocol.RefusalTooFrequent}
+	}
+	return nil
 }
 
 var _ protocol.ShareStore = (*memShareStore)(nil)
@@ -362,35 +381,61 @@ var _ protocol.UserSecretStore = (*memUserSecretStore)(nil)
 
 type memStateStore struct {
 	mu   sync.Mutex
-	data map[uint64]map[protocol.StateKey]protocol.StateItem
+	data map[uint64]map[string]protocol.StateItem
+}
+
+// stateKeyID renders a StateKey as a comparable value. StateKey cannot key a
+// map directly: its ChannelID/SecretID/Version fields are pointers, which Go
+// compares by address, so a key rebuilt for Load would never match the one
+// Save derived from item.Key().
+func stateKeyID(k protocol.StateKey) string {
+	optU64 := func(v *uint64) string {
+		if v == nil {
+			return ""
+		}
+		return strconv.FormatUint(*v, 10)
+	}
+	optU32 := func(v *uint32) string {
+		if v == nil {
+			return ""
+		}
+		return strconv.FormatUint(uint64(*v), 10)
+	}
+	return strings.Join([]string{
+		strconv.FormatUint(uint64(k.Kind), 10),
+		optU64(k.ChannelID),
+		optU64(k.SecretID),
+		optU32(k.Version),
+	}, ":")
 }
 
 func newMemStateStore() *memStateStore {
-	return &memStateStore{data: make(map[uint64]map[protocol.StateKey]protocol.StateItem)}
+	return &memStateStore{data: make(map[uint64]map[string]protocol.StateItem)}
 }
 
 func (s *memStateStore) Save(secretID uint64, item protocol.StateItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.data[secretID] == nil {
-		s.data[secretID] = make(map[protocol.StateKey]protocol.StateItem)
+		s.data[secretID] = make(map[string]protocol.StateItem)
 	}
-	s.data[secretID][item.Key()] = item
+	s.data[secretID][stateKeyID(item.Key())] = item
 	return nil
 }
 
 func (s *memStateStore) Load(secretID uint64, key protocol.StateKey) (protocol.StateItem, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	item, ok := s.data[secretID][key]
+	item, ok := s.data[secretID][stateKeyID(key)]
 	return item, ok, nil
 }
 
 func (s *memStateStore) Remove(secretID uint64, key protocol.StateKey) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, existed := s.data[secretID][key]
-	delete(s.data[secretID], key)
+	id := stateKeyID(key)
+	_, existed := s.data[secretID][id]
+	delete(s.data[secretID], id)
 	return existed, nil
 }
 
@@ -398,8 +443,8 @@ func (s *memStateStore) LoadAll(secretID uint64, kind protocol.StateKind) ([]pro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []protocol.StateItem
-	for key, item := range s.data[secretID] {
-		if key.Kind == kind {
+	for _, item := range s.data[secretID] {
+		if item.Kind == kind {
 			out = append(out, item)
 		}
 	}
@@ -483,7 +528,7 @@ func newPeerWithReplicaID(label, uri string, threshold uint32, replicaID *uint64
 		Threshold:     proto.Uint32(threshold),
 		ReplicaID:     replicaID,
 	}
-	p, err := protocol.New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
+	p, err := protocol.New(protocol.Stores{Channel: channelStore, Share: shareStore, Secret: secretStore, UserSecret: userSecretStore, State: stateStore}, transport, cfg)
 	must(err, fmt.Sprintf("protocol.New(%s)", label))
 
 	return &peer{
@@ -881,6 +926,87 @@ func runProtocol() {
 	runExpiredChannelCleanup()
 }
 
+// runShareStoreRefusal has a helper's share store refuse with
+// RefusalTooFrequent, first from Save and then from RecordVerification. The
+// helper still answers, so the owner observes ShareRejected and
+// ShareVerifyRejected with status TOO_FREQUENT, and deliver's Process/Accept
+// calls succeed on the helper.
+func runShareStoreRefusal() {
+	fmt.Println("=== Protocol share store refusal test ===")
+
+	owner := newPeer("owner", "https://owner.example.com", 2)
+	helperA := newPeer("helper-a", "https://helper-a.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b.example.com", 2)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+	peers := []*peer{owner, helperA, helperB}
+
+	channelA := pairPeers(owner, helperA, 1)
+	pairPeers(owner, helperB, 2)
+
+	protect := func(data string) uint32 {
+		events, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+			Secrets: []protocol.UserSecret{{ID: []byte{9}, Name: "rate-limited", Data: []byte(data)}},
+		})
+		must(err, "owner.Start(ProtectSecret)")
+		for _, ev := range events {
+			if ev.Type == protocol.EventTypeProtectSecretStarted && ev.Version != nil {
+				return *ev.Version
+			}
+		}
+		fail("Start(ProtectSecret) must emit ProtectSecretStarted, got %+v", events)
+		return 0
+	}
+
+	version := protect("first version")
+	pumpMany(peers)
+
+	helperA.shareStore.mu.Lock()
+	helperA.shareStore.refuseSaves = true
+	helperA.shareStore.mu.Unlock()
+	nextVersion := protect("second version")
+	var shareRejected []protocol.Event
+	for _, ev := range pumpMany(peers) {
+		if ev.Type == protocol.EventTypeShareRejected {
+			shareRejected = append(shareRejected, ev)
+		}
+	}
+	assertTrue(len(shareRejected) == 1 && shareRejected[0].ChannelID == channelA &&
+		shareRejected[0].Version != nil && *shareRejected[0].Version == nextVersion &&
+		shareRejected[0].Status == derecpb.StatusEnum_TOO_FREQUENT,
+		"expected one ShareRejected(TOO_FREQUENT) from helper-a, got %+v", shareRejected)
+	fmt.Println("  helper-a Save → RefusalTooFrequent; owner ShareRejected(status=TOO_FREQUENT)  ✓")
+
+	helperA.shareStore.mu.Lock()
+	helperA.shareStore.refuseSaves = false
+	helperA.shareStore.refuseVerifications = true
+	helperA.shareStore.mu.Unlock()
+	_, err := owner.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+		SecretID: protocolSecretID,
+		Version:  version,
+		Target:   protocol.TargetAll(),
+	})
+	must(err, "owner.Start(VerifyShares)")
+	var verifyRejected []protocol.Event
+	verified := 0
+	for _, ev := range pumpMany(peers) {
+		switch ev.Type {
+		case protocol.EventTypeShareVerifyRejected:
+			verifyRejected = append(verifyRejected, ev)
+		case protocol.EventTypeShareVerified:
+			verified++
+		}
+	}
+	assertTrue(len(verifyRejected) == 1 && verifyRejected[0].ChannelID == channelA &&
+		verifyRejected[0].Status == derecpb.StatusEnum_TOO_FREQUENT,
+		"expected one ShareVerifyRejected(TOO_FREQUENT) from helper-a, got %+v", verifyRejected)
+	assertTrue(verified == 1, "helper-b must still prove possession, got %d ShareVerified", verified)
+	fmt.Println("  helper-a RecordVerification → RefusalTooFrequent; owner ShareVerifyRejected(status=TOO_FREQUENT)  ✓")
+
+	fmt.Println("Protocol share store refusal test passed.")
+}
+
 // runExpiredChannelCleanup exercises the expired-channel cleanup surface
 // through the Go SDK.
 //
@@ -911,7 +1037,7 @@ func runExpiredChannelCleanup() {
 			},
 		},
 	}
-	p, err := protocol.New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
+	p, err := protocol.New(protocol.Stores{Channel: channelStore, Share: shareStore, Secret: secretStore, UserSecret: userSecretStore, State: stateStore}, transport, cfg)
 	must(err, "protocol.New(cleanup)")
 	defer p.Close()
 
@@ -945,8 +1071,14 @@ func runUnsafeConnection() {
 			UnsafeConnection: &allow,
 		}
 		p, err := protocol.New(
-			newMemChannelStore(), newMemShareStore(), newMemSecretStore(),
-			newMemUserSecretStore(), newMemStateStore(), newMemTransport(), cfg,
+			protocol.Stores{
+				Channel:    newMemChannelStore(),
+				Share:      newMemShareStore(),
+				Secret:     newMemSecretStore(),
+				UserSecret: newMemUserSecretStore(),
+				State:      newMemStateStore(),
+			},
+			newMemTransport(), cfg,
 		)
 		if err != nil {
 			return err
@@ -990,8 +1122,14 @@ func runConfigSurface() {
 	}
 	build := func(cfg protocol.Config) (*protocol.DeRecProtocol, error) {
 		return protocol.New(
-			newMemChannelStore(), newMemShareStore(), newMemSecretStore(),
-			newMemUserSecretStore(), newMemStateStore(), newMemTransport(), cfg,
+			protocol.Stores{
+				Channel:    newMemChannelStore(),
+				Share:      newMemShareStore(),
+				Secret:     newMemSecretStore(),
+				UserSecret: newMemUserSecretStore(),
+				State:      newMemStateStore(),
+			},
+			newMemTransport(), cfg,
 		)
 	}
 

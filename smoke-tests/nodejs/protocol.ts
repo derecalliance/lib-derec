@@ -8,12 +8,11 @@
 // specifier: `@derec-alliance/nodejs` loads the wasm module synchronously on
 // `require`, so there is no `init` to import or await.
 // No UI: every `ActionRequired` event a peer receives is auto-accepted via
-// `processAll`. The store implementations mirror the reference app's
-// `stores.ts` algorithms exactly (channel-link graph + BFS closure, keyed
-// share store, recording transport), but are Map-backed instead of
-// localStorage-backed.
+// `processAll`. The store implementations track channel links as a graph and
+// resolve them by BFS closure, key shares for lookup, and record transport
+// calls for assertions; they are Map-backed instead of localStorage-backed.
 
-import { channelFilterMatches, ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, generate_replica_id, primitives } from "@derec-alliance/nodejs";
+import { channelFilterMatches, ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, StatusEnum, generate_replica_id, primitives, shareStoreRefusal } from "@derec-alliance/nodejs";
 import type {
   ChannelStatusName,
   ChannelStore,
@@ -264,6 +263,7 @@ class InMemoryShareStore implements ShareStore {
     channelId: string,
     share: Share,
   ): Promise<void> {
+    if (this.refuseSaves) throw shareStoreRefusal("too_frequent");
     const k = this.key(secretId, channelId);
     let byVersion = this.data.get(k);
     if (!byVersion) {
@@ -328,6 +328,14 @@ class InMemoryShareStore implements ShareStore {
 
   setOwnerVersion(secretId: string, version: number): void {
     this.ownerVersions.set(secretId, version);
+  }
+
+  /** Refuse with `too_frequent`, the way an app's rate limit would. */
+  refuseSaves = false;
+  refuseVerifications = false;
+
+  async recordVerification(): Promise<void> {
+    if (this.refuseVerifications) throw shareStoreRefusal("too_frequent");
   }
 }
 
@@ -477,12 +485,11 @@ function makeNode(
   const userSecretStore = new InMemoryUserSecretStore();
   const stateStore = new InMemoryStateStore();
   const transport = new RecordingTransport();
+  // Exercises withStores, the one-call store bundle: every other builder
+  // construction in this file still wires the five stores individually, so
+  // both paths stay exercised.
   let builder = new DeRecProtocolBuilder(options.secretId ?? DEFAULT_TEST_SECRET_ID)
-    .withChannelStore(channelStore)
-    .withShareStore(shareStore)
-    .withSecretStore(secretStore)
-    .withUserSecretStore(userSecretStore)
-    .withStateStore(stateStore)
+    .withStores({ channelStore, shareStore, secretStore, userSecretStore, stateStore })
     .withTransport(transport)
     .withOwnTransports([{ uri: endpointUri, protocol: "https" }])
     .withCommunicationInfo({ name });
@@ -2217,6 +2224,83 @@ async function runReplicaIdWiringSadPathsFlow(): Promise<void> {
 
 
 
+/**
+ * A helper's share store refuses with `shareStoreRefusal("too_frequent")`,
+ * first a share and then a verification. The helper still answers, so the
+ * owner observes `ShareRejected` and `ShareVerifyRejected` with status
+ * TOO_FREQUENT, and the helper's `process`/`accept` calls resolve.
+ */
+async function runShareStoreRefusalFlow(): Promise<void> {
+  console.log("=== [Protocol] Share store refusal Flow ===\n");
+
+  const secretId = 45n;
+  const owner = makeNode("Owner", "https://owner.example.com", { secretId });
+  const helperA = makeNode("HelperA", "https://helper-a.example.com", { secretId });
+  const helperB = makeNode("HelperB", "https://helper-b.example.com", { secretId });
+  const pairedA = await doPair(helperA, owner, 51n, "Owner↔HelperA");
+  await doPair(helperB, owner, 52n, "Owner↔HelperB");
+
+  const helpersByUri = new Map<string, [Node, string]>([
+    ["https://helper-a.example.com", [helperA, "HelperA"]],
+    ["https://helper-b.example.com", [helperB, "HelperB"]],
+  ]);
+  const roundTrip = async (): Promise<DeRecEvent[]> => {
+    const ownerEvents: DeRecEvent[] = [];
+    for (const { endpoint, message } of owner.transport.drain()) {
+      const [helper, label] = helpersByUri.get(endpoint.uri)!;
+      await processAll(helper, message);
+      ownerEvents.push(...(await owner.protocol.process(drainOne(helper, label))));
+    }
+    return ownerEvents;
+  };
+  const protect = async (data: string): Promise<number> => {
+    const events = await owner.protocol.start(FlowKind.ProtectSecret, {
+      secrets: [{ id: new Uint8Array([9]), name: "rate-limited", data: new TextEncoder().encode(data) }],
+      description: data,
+    });
+    return requireEvent(events, "ProtectSecretStarted", "Owner").version;
+  };
+
+  const version = await protect("first version");
+  await roundTrip();
+
+  helperA.shareStore.refuseSaves = true;
+  const nextVersion = await protect("second version");
+  const shareRejected = (await roundTrip()).filter(
+    (e): e is Extract<DeRecEvent, { type: "ShareRejected" }> => e.type === "ShareRejected",
+  );
+  if (
+    shareRejected.length !== 1 ||
+    shareRejected[0]!.channel_id !== pairedA.longTermChannelId ||
+    shareRejected[0]!.version !== nextVersion ||
+    shareRejected[0]!.status !== StatusEnum.TooFrequent
+  ) {
+    throw new Error(`expected one ShareRejected(TOO_FREQUENT) from HelperA, got ${JSON.stringify(shareRejected)}`);
+  }
+  console.log("  [HelperA] save → too_frequent; [Owner] ShareRejected(status=TOO_FREQUENT)  ✓");
+
+  helperA.shareStore.refuseSaves = false;
+  helperA.shareStore.refuseVerifications = true;
+  await owner.protocol.start(FlowKind.VerifyShares, { secretId, version });
+  const verifyEvents = await roundTrip();
+  const verifyRejected = verifyEvents.filter(
+    (e): e is Extract<DeRecEvent, { type: "ShareVerifyRejected" }> => e.type === "ShareVerifyRejected",
+  );
+  if (
+    verifyRejected.length !== 1 ||
+    verifyRejected[0]!.channel_id !== pairedA.longTermChannelId ||
+    verifyRejected[0]!.status !== StatusEnum.TooFrequent
+  ) {
+    throw new Error(`expected one ShareVerifyRejected(TOO_FREQUENT) from HelperA, got ${JSON.stringify(verifyRejected)}`);
+  }
+  if (verifyEvents.filter((e) => e.type === "ShareVerified").length !== 1) {
+    throw new Error("HelperB must still prove possession");
+  }
+  console.log("  [HelperA] recordVerification → too_frequent; [Owner] ShareVerifyRejected(status=TOO_FREQUENT)  ✓");
+
+  console.log("\n✓ Share store refusal flow passed.\n");
+}
+
 export async function runProtocolSmoke(): Promise<void> {
   console.log("━━━ [Protocol] Starting ━━━\n");
 
@@ -2229,6 +2313,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runConfigSurfaceFlow();
   await runOverlappingCallsFlow();
   await runSharingFlow();
+  await runShareStoreRefusalFlow();
   await runHelperKeepListFlow();
   await runOwnerKeepListFlow();
   await runDiscoveryAndRecoveryFlow();

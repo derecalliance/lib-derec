@@ -72,6 +72,7 @@ internal static class Protocol
         RunOrchestratorSharingRoundKeyTest();
         RunHelperKeepListPrunesShareStoreTest();
         RunOwnerKeepListReachesHelpersTest();
+        RunShareStoreRefusalTest();
         RunLibraryDefaultThresholdTest();
         RunOrchestratorHashedKeysPairFlowTest();
         RunOrchestratorNoKeysPairFlowTest();
@@ -132,6 +133,7 @@ internal static class Protocol
         AssertLabelConstants(typeof(IgnoreReason), enums, "IgnoreReason");
         AssertLabelConstants(typeof(NotRestoredReason), enums, "NotRestoredReason");
         AssertLabelConstants(typeof(CorruptionReason), enums, "CorruptionReason");
+        AssertLabelConstants(typeof(VerifyFailureReason), enums, "VerifyFailureReason");
         AssertLabelConstants(typeof(PendingActionKind), enums, "PendingActionKind");
 
         Console.WriteLine("  every fixture variant is known to this SDK  ✓");
@@ -749,6 +751,86 @@ internal static class Protocol
         Console.WriteLine("  both helpers hold exactly [1, 3] after the v3 round  ✓");
 
         Console.WriteLine("Owner keepList test passed.\n");
+    }
+
+    /// <summary>
+    /// A helper's share store throws
+    /// <see cref="ShareStoreRefusedException"/> with
+    /// <see cref="ShareStoreRefusal.TooFrequent"/>, first from
+    /// <see cref="IShareStore.Save"/> and then from
+    /// <see cref="IShareStore.RecordVerification"/>. The helper still
+    /// answers, so the owner observes <see cref="ShareRejectedEvent"/> and
+    /// <see cref="ShareVerifyRejectedEvent"/> with status <c>TooFrequent</c>.
+    /// </summary>
+    private static void RunShareStoreRefusalTest()
+    {
+        Console.WriteLine("=== Share store refusal reaches the owner as TOO_FREQUENT ===");
+
+        const ulong secretId = 0x6464UL;
+        const Org.Derecalliance.Derec.Protobuf.StatusEnum tooFrequent =
+            Org.Derecalliance.Derec.Protobuf.StatusEnum.TooFrequent;
+        using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions(SecretId: secretId));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com", new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com", new NodeOptions(SecretId: secretId));
+        var channelA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 41UL);
+        DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 42UL);
+
+        var helpersByUri = new Dictionary<string, Node>
+        {
+            ["https://helper-a.example.com"] = helperA,
+            ["https://helper-b.example.com"] = helperB,
+        };
+        List<DeRecEvent> RoundTrip()
+        {
+            var ownerEvents = new List<DeRecEvent>();
+            foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
+            {
+                var h = helpersByUri[uri];
+                h.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+                ownerEvents.AddRange(owner.Protocol.ProcessAndAcceptAllAsync(h.Transport.DrainOne()).GetAwaiter().GetResult());
+            }
+            return ownerEvents;
+        }
+        uint Protect(string data) =>
+            owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+            {
+                Secrets = new[]
+                {
+                    new UserSecret { Id = new byte[] { 0x09 }, Name = "rate-limited", Data = Encoding.UTF8.GetBytes(data) },
+                },
+                Description = data,
+            }).GetAwaiter().GetResult().OfType<ProtectSecretStartedEvent>().First().Version;
+
+        var version = Protect("first version");
+        RoundTrip();
+
+        helperA.ShareStore.RefuseSaves = true;
+        var nextVersion = Protect("second version");
+        var shareRejected = RoundTrip().OfType<ShareRejectedEvent>().ToList();
+        if (shareRejected.Count != 1 || shareRejected[0].ChannelId != channelA ||
+            shareRejected[0].Version != nextVersion || shareRejected[0].Status != tooFrequent)
+            throw new InvalidOperationException(
+                $"expected one ShareRejected(TooFrequent) from HelperA; got [{string.Join(", ", shareRejected)}]");
+        Console.WriteLine("  [HelperA] Save → TooFrequent; [Owner] ShareRejected(status=TooFrequent)  ✓");
+
+        helperA.ShareStore.RefuseSaves = false;
+        helperA.ShareStore.RefuseVerifications = true;
+        owner.Protocol.StartAsync(FlowKind.VerifyShares, new VerifySharesParams
+        {
+            SecretId = secretId,
+            Version = version,
+        }).GetAwaiter().GetResult();
+        var verifyEvents = RoundTrip();
+        var verifyRejected = verifyEvents.OfType<ShareVerifyRejectedEvent>().ToList();
+        if (verifyRejected.Count != 1 || verifyRejected[0].ChannelId != channelA ||
+            verifyRejected[0].Status != tooFrequent)
+            throw new InvalidOperationException(
+                $"expected one ShareVerifyRejected(TooFrequent) from HelperA; got [{string.Join(", ", verifyRejected)}]");
+        if (verifyEvents.OfType<ShareVerifiedEvent>().Count() != 1)
+            throw new InvalidOperationException("HelperB must still prove possession");
+        Console.WriteLine("  [HelperA] RecordVerification → TooFrequent; [Owner] ShareVerifyRejected(status=TooFrequent)  ✓");
+
+        Console.WriteLine("Share store refusal test passed.\n");
     }
 
     /// <summary>
@@ -2965,12 +3047,11 @@ internal static class Protocol
         var stateStore = new InMemoryStateStore();
         var transport = new RecordingTransport();
 
+        // Exercises WithStores, the one-call store bundle: every other
+        // builder construction in this file still wires the five stores
+        // individually, so both paths stay exercised.
         var builder = new DeRecProtocolBuilder(options.SecretId ?? DefaultTestSecretId)
-            .WithChannelStore(channelStore)
-            .WithShareStore(shareStore)
-            .WithSecretStore(secretStore)
-            .WithUserSecretStore(userSecretStore)
-            .WithStateStore(stateStore)
+            .WithStores(new DeRecStores(channelStore, shareStore, secretStore, userSecretStore, stateStore))
             .WithTransport(transport)
             .WithOwnTransports(new[] { new TransportProtocol(endpointUri) })
             .WithUnsafeConnection(options.UnsafeConnection)

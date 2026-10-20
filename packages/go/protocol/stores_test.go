@@ -133,6 +133,9 @@ func (m *mockShareStore) RemoveVersions(secretID, channelID uint64, versions []u
 func (m *mockShareStore) KeepList(secretID uint64, version uint32) ([]uint32, bool, error) {
 	return nil, false, nil
 }
+func (m *mockShareStore) RecordVerification(secretID, channelID uint64, version uint32) error {
+	return nil
+}
 
 var _ ShareStore = (*mockShareStore)(nil)
 

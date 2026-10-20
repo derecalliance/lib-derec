@@ -555,7 +555,8 @@ pub fn produce_pre_pair_request(
 /// - `envelope.timestamp != request.timestamp`
 /// - the inner message is not a [`derec_proto::PairRequestMessage`]
 /// - [`PairingError::IncompatibleParameterRange`] if the requester's advertised range
-///   and `parameter_range` do not overlap on some field
+///   is malformed or does not overlap `parameter_range` on some field (a `max` of `0`
+///   means no upper bound)
 ///
 /// # Security: no freshness or replay protection
 ///

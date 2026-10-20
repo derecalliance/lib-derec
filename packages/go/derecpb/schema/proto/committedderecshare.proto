@@ -14,7 +14,11 @@ package org.derecalliance.derec.protobuf;
 //
 // The commitment uses a Merkle tree. The hash of the share given to each
 // helper forms a leaf in the tree. Each leaf and internal node hash is a
-// SHA-256 hash.
+// SHA-256 hash: a leaf is SHA-256(0x00 || len(x) || x || y), with len(x) as
+// an 8-byte big-endian integer, and an internal node is
+// SHA-256(0x02 || left || right). The tree has a fixed depth of 7, unused
+// leaf slots are leaf hashes of random bytes, and every merklePath has
+// exactly 7 entries.
 //
 // The Merkle path from a leaf to the root (i.e., the sibling nodes along
 // that route) is called merklePath. The root hash is referred to as the

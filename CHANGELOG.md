@@ -7,7 +7,242 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
-### Unreleased
+### 0.0.9
+
+Share commitments use a domain-separated Merkle hash, so one malicious helper
+can no longer block a recovery without being identified. Verification ends
+every challenged channel in exactly one verdict event, the owner keeps proofs
+only for shares that are confirmed or still in an open round, one builder call
+sets every store, and the envelope and inner-message timestamps are one
+value, checked on receipt.
+
+- **Fixed (security): a forged share could pass verification.**
+  *(bug fix; every SDK)*
+
+  Leaf and internal-node hashes had the same form, the split between a
+  share's `x` and `y` was not bound, and a Merkle path of any length was
+  accepted. A helper could return the two children of an internal node as a
+  share's `(x, y)`, with the shorter path from that node to the root: it
+  passed verification, recovery used it, reconstruction failed, and nothing
+  named the helper. Leaves are now `SHA-256(0x00 ‖ u64_be(len(x)) ‖ x ‖ y)`,
+  internal nodes `SHA-256(0x02 ‖ left ‖ right)`, unused leaf slots are leaf
+  hashes of random bytes, and a share verifies only with a path of exactly
+  the tree depth (7). A forged share now fails verification and is reported
+  as an invalid proof.
+
+  **Breaking — shares made before 0.0.9 no longer verify.** Their commitments
+  use the old hashing, so recovery from them fails as corrupt shares. After
+  upgrading, an owner must share again (publish a new version) so every
+  helper holds a share with the new commitment, before relying on recovery.
+
+- **Changed: `build()` validates the configured parameter range.**
+  *(behavior change; every SDK)*
+
+  A value of `0` in a `ParameterRange` field means "no bound". For each of
+  `shareSize`, `timeBetweenVerifications`, `timeBetweenShareUpdates`,
+  `unresponsiveDeletionTimeout` and `unresponsiveDeactivationTimeout`, `min`
+  and `max` must be `>= 0`, and `min <= max` unless `max` is `0` (no upper
+  bound). A range that breaks either rule now fails `build()` with an
+  `InvalidInput` error naming the field.
+
+  **Behavior change — some ranges accepted before now fail.** A range with a
+  negative value, or with `min` greater than a non-zero `max`, used to build
+  and is now rejected; correct the range before upgrading.
+
+- **Changed: pairing treats `0` as no bound and rejects a malformed peer range.**
+  *(behavior change; every SDK)*
+
+  The parameter-range overlap check now follows the same convention as
+  `build()`: a `max` of `0` means no upper bound, so it overlaps any `min` on
+  the other side (a `min` of `0` already meant no lower bound). A peer range
+  that is malformed under the `build()` rules (a negative value, or `min`
+  greater than a non-zero `max`) now fails pairing as
+  `IncompatibleParameterRange` naming the field, with both sides' raw values.
+
+  **Behavior change — some pairings flip.** A pairing that used to fail now
+  succeeds when the only conflict was a `max` of `0`, e.g. a peer advertising
+  `maxShareSize = 0` against a local `minShareSize > 0`. A pairing that used to
+  pass now fails when the peer's range is malformed.
+
+- **Added: helpers enforce share size, and the share store can refuse a share or a verification.**
+  *(feature; every SDK)*
+
+  A helper configured with a parameter range now checks each inbound
+  `StoreShareRequest` against its own `minShareSize`/`maxShareSize` (inclusive;
+  a `max` of `0` means no upper bound) and answers a share outside it with
+  `SIZE_LIMIT_EXCEEDED`, memo `"share size is outside the helper's accepted
+  range"`. The check runs before `ActionRequired` and before auto-accept, so
+  the user is never asked. No configured range means no check.
+
+  Frequency limits stay with the application, enforced through its share
+  store. On a helper channel, `save` (reached only for a new share version; an
+  idempotent re-send never calls it) and the new `record_verification` (called
+  once per accepted verification challenge, after the challenged share is
+  found) may refuse with a `Refusal`. The library answers the owner with the
+  mapped status, and the helper's call returns `[NoOp]`:
+
+  | `Refusal` | Status | Memo |
+  |---|---|---|
+  | `TooFrequent` | `TOO_FREQUENT` | `"refused by the helper: too frequent"` |
+  | `SizeLimitExceeded` | `SIZE_LIMIT_EXCEEDED` | `"refused by the helper: size limit exceeded"` |
+  | `Rejected` | `REJECTED` | `"refused by the helper"` |
+
+  The owner sees `ShareRejected` or `ShareVerifyRejected` with that status. Any
+  other store error still propagates as an error. How each SDK refuses:
+  - **Rust:** return `Err(ShareStoreError::Refused(Refusal::TooFrequent))`.
+  - **.NET:** throw `new ShareStoreRefusedException(ShareStoreRefusal.TooFrequent)`.
+  - **Go:** return `&protocol.ShareStoreRefusedError{Refusal: protocol.RefusalTooFrequent}`.
+  - **TypeScript (Node.js, web) and React Native:** throw or reject with
+    `shareStoreRefusal("too_frequent")` (also `"size_limit_exceeded"`,
+    `"rejected"`).
+  - **FFI:** `save` and `record_verification` return `3`
+    (`SizeLimitExceeded`), `4` (`TooFrequent`) or `10` (`Rejected`) to refuse;
+    `0` is success and any other non-zero value a backend failure.
+
+- **Breaking: share stores implement `record_verification`.**
+  *(breaking; .NET, Go, TypeScript, React Native, FFI)*
+
+  - **Rust:** `DeRecShareStore::record_verification` has a default body that
+    accepts every verification; nothing to change.
+  - **.NET:** add `void RecordVerification(ulong secretId, ulong channelId, uint version)`
+    to every `IShareStore`.
+  - **Go:** add `RecordVerification(secretID, channelID uint64, version uint32) error`
+    to every `protocol.ShareStore`.
+  - **TypeScript (Node.js, web) and React Native:** add
+    `recordVerification(secretId: string, channelId: string, version: number): Promise<void>`
+    to every `ShareStore`. In a plain-JS (non-TypeScript) app, nothing enforces
+    this at compile time: a `ShareStore` without `recordVerification` makes
+    every verification a store failure, and with the default
+    `auto_respond_on_failure = false`, the owner sees its challenges time out
+    rather than an error.
+  - **FFI:** `ShareStoreCallbacks` gains a `record_verification` slot right
+    after `keep_list`; every later field moves. `save`'s return codes `3`,
+    `4` and `10` now mean a refusal (`SizeLimitExceeded`/`TooFrequent`/
+    `Rejected`) rather than a backend failure; an FFI application that
+    returned one of those values for a backend failure must change it.
+
+  An application with no verification limit returns success.
+
+- **Changed: one timestamp per message, checked on receipt.**
+  *(behavior change; every SDK)*
+
+  Every channel message now carries one timestamp, its send time, in both the
+  outer envelope and the encrypted inner message; replies included. After
+  decrypting, the receiver ignores a message whose two timestamps differ, or
+  where either or both are absent, as `MessageIgnored` with the new reason
+  `TimestampMismatch` (`IgnoreReason::TimestampMismatch` in Rust,
+  `IgnoreReason.TimestampMismatch` in .NET, `IgnoreReasonTimestampMismatch`
+  in Go, `"TimestampMismatch"` in TypeScript and React Native). Nothing is
+  stored and nothing is sent back. A body with no timestamp field, such as
+  `ErrorResponse`, always lands here.
+
+  **Breaking — 0.0.8 peers' replies are ignored.** A 0.0.8 peer stamps the
+  inner message of its replies separately from the envelope, so a 0.0.9 peer
+  ignores them as `TimestampMismatch` and the flow they answer never
+  completes. Upgrade both sides together. An application matching
+  `IgnoreReason` exhaustively must handle the new value.
+
+- **Fixed: the owner kept proofs of shares its helpers never confirmed.**
+  *(bug fix; every SDK)*
+
+  The owner stores a proof of each helper's share (the exact bytes it sent)
+  to check that helper's verification answers. When a sharing round settled
+  a channel as failed, the helper rejected the share (`ShareRejected`) or the
+  round timed out, the proof stayed, so a later verification challenged a
+  helper for a share it never held. The owner now deletes that channel's
+  proof for the round's version when the round settles it as failed. A
+  stored proof is now either confirmed by its helper or part of a round still
+  open, and a late `ShareConfirmed` after the round settled is still emitted
+  but stores nothing. This guarantee holds on the publishing device; a
+  replica Destination holds the proofs the Source mirrored at publish time
+  and never sees `SharingComplete`, so verifying there can report
+  `ShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`) for a helper that failed
+  the Source's round.
+
+  **What an application must do:** verify only versions whose round
+  completed (`SharingComplete`). A channel with no proof at the requested
+  version now reports `VerifySharesFailed` with `NoProof` (next entry).
+
+- **Changed: every verification challenge ends in exactly one verdict event.**
+  *(breaking; every SDK)*
+
+  Each challenged channel now ends with exactly one of:
+
+  | Event | Meaning |
+  |---|---|
+  | `ShareVerified { channel_id, version }` | The helper proved it holds the exact share. |
+  | `ShareVerifyInvalid { channel_id, version }` | **New.** The helper's proof does not match the share this device stored. |
+  | `ShareVerifyRejected { channel_id, version, status, memo }` | The helper refused the challenge with a non-OK status. |
+  | `VerifySharesFailed { channel_id, version, reason, error }` | No verdict could be reached on this device. |
+
+  `VerifySharesFailed` gains `reason`, one of `"NoSharedKey"` (the channel
+  has no shared key), `"NoProof"` (this device holds no proof of that
+  channel's share at that version) or `"DispatchFailed"` (the challenge could
+  not be sent, or the proof could not be loaded). Starting verification on a
+  channel with no proof sends nothing and emits `VerifySharesFailed` with
+  `NoProof` immediately; so does a response that arrives after the proof was
+  removed. A non-OK response is `ShareVerifyRejected` whether or not a proof
+  is held. A late response to an earlier challenge that a newer one replaced
+  is ignored as `MessageIgnored` with the new reason `StaleResponse`, and the
+  current challenge stays open, so its own answer still completes it. A
+  response missing its `result` is still an error.
+
+  **Breaking — a stale response used to be an error.** A response that did
+  not bind to the outstanding challenge used to return `ProtocolViolation`
+  (code 7) and consume the challenge; it is now `MessageIgnored { reason:
+  StaleResponse }` and the challenge is kept.
+
+  **Breaking — an invalid proof is an event, not an error.** `process()`
+  used to fail on a proof that did not match; it now returns
+  `ShareVerifyInvalid`. Treat it as a sign of a damaged or dishonest helper,
+  where the old error handler did.
+
+  **Breaking — `VerifySharesFailed.reason`.** The new field is
+  `VerifyFailureReason` in Rust, a `VerifyFailureReason` string constant on
+  `VerifySharesFailedEvent.Reason` in .NET, a `VerifyFailureReason*`
+  constant on `Event.Reason` in Go, and the `VerifyFailureReason` union in
+  TypeScript and React Native. A Rust application that destructures
+  `VerifySharesFailed` must add `reason` or `..`, and an application
+  matching `IgnoreReason` exhaustively must handle `StaleResponse`.
+
+- **Added: one builder call sets every store.** *(feature; every SDK)*
+
+  The five stores `build()` requires can be set in one call. Each individual
+  store setter remains, and may be called again: the last call for a store
+  wins, including one made after the bundle.
+  - **Rust:** `with_stores(DeRecStores { channels, shares, secrets,
+    user_secrets, state })`.
+  - **.NET:** `WithStores(new DeRecStores(channelStore, shareStore,
+    secretStore, userSecretStore, stateStore))`.
+  - **TypeScript (Node.js, web) and React Native:** `withStores({
+    channelStore, shareStore, secretStore, userSecretStore, stateStore })`,
+    typed as the new `StoresInit` interface.
+  - **Go:** see the next entry.
+
+- **Breaking (Go): `protocol.New` takes a `protocol.Stores`.** *(breaking; Go)*
+
+  `protocol.New(channelStore, shareStore, secretStore, userSecretStore,
+  stateStore, transport, cfg)` is now `protocol.New(stores, transport, cfg)`.
+  Migrate by bundling the five stores:
+
+  ```go
+  p, err := protocol.New(protocol.Stores{
+  	Channel:    channelStore,
+  	Share:      shareStore,
+  	Secret:     secretStore,
+  	UserSecret: userSecretStore,
+  	State:      stateStore,
+  }, transport, cfg)
+  ```
+
+- **Docs: the transport callouts say which answer is matched by trace id.**
+  *(docs; every SDK)*
+
+  The README transport notes now say that matching a reply by `trace_id`
+  applies only to the `200 OK` answer on the same connection; a push carries
+  no reply to match. `derecmessage.proto` now states the timestamp check, and
+  `VerifyShares` after `restore` is documented as reporting `NoProof` per
+  channel, not `InvalidInput`.
 
 - **Added (Go): the gRPC transport service descriptor.** *(Go)*
 
@@ -1097,7 +1332,7 @@ helpers of holding corrupt data. Nothing here changes an API.
   and web packages shipped none at all. Anyone writing a gRPC transport, or
   generating types for a language with no DeRec SDK, had to copy the files
   out of a `lib-derec` checkout and keep them in step by hand — which is what
-  the reference application ended up doing with fifteen of them.
+  consuming applications ended up doing, one of them with fifteen files.
 
   **Rust.** A default-off `descriptor` feature on `derec-proto` exposes the
   schema as a compiled file descriptor set: `descriptor::FILE_DESCRIPTOR_SET`
