@@ -4,7 +4,7 @@
 use rand::CryptoRng;
 use sha2::{Digest, Sha256};
 
-use super::{DerecVSSError, MERKLE_TREE_DEPTH, VSSShare, λ};
+use super::{DerecVSSError, MERKLE_TREE_DEPTH, ShamirPoint, VSSShare, points_are_well_formed, λ};
 
 // this function will be used to detect one of several possible errors:
 // 1. inconsistent ciphertexts; 2. inconsistent commitments; 3. corrupted shares
@@ -28,8 +28,12 @@ pub fn detect_error(shares: &Vec<VSSShare>) -> Option<DerecVSSError> {
             return Some(DerecVSSError::CorruptShares);
         }
 
+        if !points_are_well_formed(&share.points) {
+            return Some(DerecVSSError::CorruptShares);
+        }
+
         // first compute hash of this share
-        let mut on_path_hash = leaf_hash((&share.x, &share.y));
+        let mut on_path_hash = leaf_hash_pub(&share.points);
 
         for (is_left, node_hash) in share.merkle_path.iter() {
             on_path_hash = if *is_left {
@@ -50,12 +54,12 @@ pub fn detect_error(shares: &Vec<VSSShare>) -> Option<DerecVSSError> {
     None
 }
 
-// builds a 2-ary merkle tree over shares
-// we will specify a depth of the tree, even though
-// we may not have that many shares. This is to
-// avoid leaking the number of shares to the attacker.
+// builds a 2-ary merkle tree with one leaf per share, each leaf
+// committing to that share's point list. We will specify a depth
+// of the tree, even though we may not have that many shares. This
+// is to avoid leaking the number of shares to the attacker.
 pub fn build_merkle_tree<R: CryptoRng + ?Sized>(
-    shares: &[(Vec<u8>, Vec<u8>)],
+    shares: &[Vec<ShamirPoint>],
     depth: u32,
     rng: &mut R,
 ) -> Vec<Vec<u8>> {
@@ -74,14 +78,17 @@ pub fn build_merkle_tree<R: CryptoRng + ?Sized>(
         // root node is labelled 1; so, node labels go from 1 to 2^(depth + 1) - 1
         let node_label = num_leaf_nodes + i;
         if i < shares.len() {
-            // hash the share's (x,y); node root's label starts at 1
-            merkle_nodes[node_label - 1] = leaf_hash((&shares[i].0, &shares[i].1));
+            // hash the share's points; node root's label starts at 1
+            merkle_nodes[node_label - 1] = leaf_hash_pub(&shares[i]);
         } else {
             // fill unused slots with leaf hashes of random bytes
             let mut rand = [0u8; 32];
             rng.fill_bytes(&mut rand);
 
-            merkle_nodes[node_label - 1] = leaf_hash_pub(&rand, &[]);
+            merkle_nodes[node_label - 1] = leaf_hash_pub(&[ShamirPoint {
+                x: rand.to_vec(),
+                y: Vec::new(),
+            }]);
         }
     }
 
@@ -164,16 +171,26 @@ pub fn random_oracle(msg: &[u8], rand: &[u8], tag: &[u8]) -> [u8; 4 * λ] {
 
 /// Public entry point for leaf hashing used by [`super::verify`].
 ///
-/// A leaf is `SHA-256(0x00 ‖ u64_be(len(x)) ‖ x ‖ y)`. The `0x00` tag keeps
-/// leaf hashes apart from internal-node hashes, so an internal node cannot be
-/// presented as a share, and the length of `x` fixes where `x` ends and `y`
-/// begins.
-pub fn leaf_hash_pub(x: &[u8], y: &[u8]) -> Vec<u8> {
-    let mut hasher_input = Vec::with_capacity(1 + 8 + x.len() + y.len());
+/// A leaf commits to a share's points, in order:
+///
+/// ```text
+/// SHA-256(0x00 ‖ u64_be(k) ‖ for each point: u64_be(len(x)) ‖ x ‖ u64_be(len(y)) ‖ y)
+/// ```
+///
+/// where `k` is the number of points. The `0x00` tag keeps leaf hashes apart
+/// from internal-node hashes, so an internal node cannot be presented as a
+/// share, and the count and lengths fix where every coordinate begins and ends.
+pub fn leaf_hash_pub(points: &[ShamirPoint]) -> Vec<u8> {
+    let len: usize = points.iter().map(|p| 16 + p.x.len() + p.y.len()).sum();
+    let mut hasher_input = Vec::with_capacity(1 + 8 + len);
     hasher_input.push(0x00);
-    hasher_input.extend_from_slice(&(x.len() as u64).to_be_bytes());
-    hasher_input.extend_from_slice(x);
-    hasher_input.extend_from_slice(y);
+    hasher_input.extend_from_slice(&(points.len() as u64).to_be_bytes());
+    for point in points {
+        hasher_input.extend_from_slice(&(point.x.len() as u64).to_be_bytes());
+        hasher_input.extend_from_slice(&point.x);
+        hasher_input.extend_from_slice(&(point.y.len() as u64).to_be_bytes());
+        hasher_input.extend_from_slice(&point.y);
+    }
     compute_sha256_hash(&hasher_input)
 }
 
@@ -187,10 +204,6 @@ pub fn intermediate_hash_pub(left: &[u8], right: &[u8]) -> Vec<u8> {
     hasher_input.extend_from_slice(left);
     hasher_input.extend_from_slice(right);
     compute_sha256_hash(&hasher_input)
-}
-
-fn leaf_hash(share: (&Vec<u8>, &Vec<u8>)) -> Vec<u8> {
-    leaf_hash_pub(share.0, share.1)
 }
 
 fn intermediate_hash(left: &[u8], right: &[u8]) -> Vec<u8> {
@@ -221,7 +234,7 @@ mod tests {
         let mut msg: [u8; 1024] = [0u8; 1024];
         rng.fill_bytes(&mut msg);
 
-        let shares = vss::share(3, 5, &msg, &rand).unwrap();
+        let shares = vss::share(3, &[1; 5], &msg, &rand).unwrap();
         let recovered = vss::recover(&shares).unwrap();
 
         assert_eq!(msg, recovered[..]);
@@ -240,10 +253,9 @@ mod tests {
         let mut msg: [u8; 1024] = [0u8; 1024];
         rng.fill_bytes(&mut msg);
 
-        let shares = vss::share(5, 7, &msg, &seed1).unwrap();
-        let share_points: Vec<(Vec<u8>, Vec<u8>)> =
-            shares.iter().map(|s| (s.x.clone(), s.y.clone())).collect();
-        let merkle_tree = build_merkle_tree(&share_points, 3, &mut crate::random::os_rng());
+        let shares = vss::share(5, &[1; 7], &msg, &seed1).unwrap();
+        let leaves: Vec<Vec<ShamirPoint>> = shares.iter().map(|s| s.points.clone()).collect();
+        let merkle_tree = build_merkle_tree(&leaves, 3, &mut crate::random::os_rng());
         assert_merkle_tree_wff(&merkle_tree);
     }
 
@@ -253,15 +265,18 @@ mod tests {
         use rand::rngs::ChaCha20Rng;
 
         let depth = 2;
-        let points = vec![(vec![1u8; 32], vec![2u8; 32])];
-        let tree = build_merkle_tree(&points, depth, &mut ChaCha20Rng::from_seed([7u8; 32]));
+        let leaves = vec![vec![point(&[1u8; 32], &[2u8; 32])]];
+        let tree = build_merkle_tree(&leaves, depth, &mut ChaCha20Rng::from_seed([7u8; 32]));
 
         let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
         let num_leaf_nodes = 2_usize.pow(depth);
-        for i in points.len()..num_leaf_nodes {
+        for i in leaves.len()..num_leaf_nodes {
             let mut rand = [0u8; 32];
             rng.fill_bytes(&mut rand);
-            assert_eq!(tree[num_leaf_nodes + i - 1], leaf_hash_pub(&rand, &[]));
+            assert_eq!(
+                tree[num_leaf_nodes + i - 1],
+                leaf_hash_pub(&[point(&rand, &[])])
+            );
         }
     }
 
@@ -270,14 +285,56 @@ mod tests {
         let left = [0x11u8; 32];
         let right = [0x22u8; 32];
         assert_ne!(
-            leaf_hash_pub(&left, &right),
+            leaf_hash_pub(&[point(&left, &right)]),
             intermediate_hash_pub(&left, &right)
         );
     }
 
     #[test]
     fn test_leaf_hash_binds_the_split_between_x_and_y() {
-        assert_ne!(leaf_hash_pub(b"ab", b"c"), leaf_hash_pub(b"a", b"bc"));
+        assert_ne!(
+            leaf_hash_pub(&[point(b"ab", b"c")]),
+            leaf_hash_pub(&[point(b"a", b"bc")])
+        );
+    }
+
+    #[test]
+    fn test_leaf_hash_binds_the_split_between_points() {
+        assert_ne!(
+            leaf_hash_pub(&[point(b"a", b"bc"), point(b"d", b"e")]),
+            leaf_hash_pub(&[point(b"a", b"b"), point(b"cd", b"e")])
+        );
+    }
+
+    #[test]
+    fn test_leaf_hash_binds_point_order() {
+        assert_ne!(
+            leaf_hash_pub(&[point(b"a", b"b"), point(b"c", b"d")]),
+            leaf_hash_pub(&[point(b"c", b"d"), point(b"a", b"b")])
+        );
+    }
+
+    #[test]
+    fn test_leaf_hash_encoding() {
+        let mut expected = vec![0x00];
+        expected.extend_from_slice(&2u64.to_be_bytes());
+        for (x, y) in [(&b"ab"[..], &b"c"[..]), (&b"d"[..], &b""[..])] {
+            expected.extend_from_slice(&(x.len() as u64).to_be_bytes());
+            expected.extend_from_slice(x);
+            expected.extend_from_slice(&(y.len() as u64).to_be_bytes());
+            expected.extend_from_slice(y);
+        }
+        assert_eq!(
+            leaf_hash_pub(&[point(b"ab", b"c"), point(b"d", b"")]),
+            compute_sha256_hash(&expected)
+        );
+    }
+
+    fn point(x: &[u8], y: &[u8]) -> ShamirPoint {
+        ShamirPoint {
+            x: x.to_vec(),
+            y: y.to_vec(),
+        }
     }
 
     fn assert_merkle_tree_wff(tree: &[Vec<u8>]) {

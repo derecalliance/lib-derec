@@ -13,10 +13,11 @@ package org.derecalliance.derec.protobuf;
 // During recovery, this protobuf message is returned.
 //
 // The commitment uses a Merkle tree. The hash of the share given to each
-// helper forms a leaf in the tree. Each leaf and internal node hash is a
-// SHA-256 hash: a leaf is SHA-256(0x00 || len(x) || x || y), with len(x) as
-// an 8-byte big-endian integer, and an internal node is
-// SHA-256(0x02 || left || right). The tree has a fixed depth of 7, unused
+// helper forms a leaf in the tree, committing to that share's points in
+// order. Each leaf and internal node hash is a SHA-256 hash: a leaf is
+// SHA-256(0x00 || k || for each point: len(x) || x || len(y) || y), with k
+// (the number of points) and every length as an 8-byte big-endian integer,
+// and an internal node is SHA-256(0x02 || left || right). The tree has a fixed depth of 7, unused
 // leaf slots are leaf hashes of random bytes, and every merklePath has
 // exactly 7 entries.
 //
@@ -47,37 +48,46 @@ message CommittedDeRecShare {
 //
 // The sharer first generates a random AES-256 key k and uses it to
 // AES-GCM encrypt the secret. A random polynomial f is generated such
-// that f(0) = k. The polynomial is then evaluated at a random x value
-// for the intended helper, and the share contains the value y where
-// f(x) = y.
+// that f(0) = k. The polynomial is evaluated at random non-zero x values,
+// and each helper receives one or more of the resulting points (x, f(x)).
+// The number of points a helper holds is its weight; a weight is always
+// below the threshold, so no single helper can reconstruct on its own.
 //
-// The computation should be done in GF(p), where p is the smallest
-// 256-bit prime. The degree of the polynomial determines the threshold
-// number of helpers required to reconstruct the secret.
+// The computation is done in the scalar field of the BW6-761 curve. The
+// degree of the polynomial determines the threshold: t distinct points,
+// from any combination of helpers, reconstruct k at x = 0.
 //
 // The message also includes the secretId and the share version number,
 // because they must be serialized together with the share so that they
 // are covered by the same signature.
 message DeRecShare {
 
+  // One Shamir point f(x) = y.
+  message ShamirPoint {
+    // A random non-zero field element, in arkworks compressed
+    // serialization (48 bytes, little-endian).
+    bytes x = 1;
+
+    // The value y = f(x), in the same encoding.
+    bytes y = 2;
+  }
+
   // The result of serializing the secret to be shared and encrypting it
   // with a randomly generated AES-256 key.
   bytes encryptedSecret = 1;
 
-  // Random 256-bit integer encoded as two's complement, big-endian.
-  bytes x = 2;
-
-  // The value y = f(x).
-  bytes y = 3;
+  // The Shamir points this helper holds, in the order the Merkle leaf
+  // commits to. At least one.
+  repeated ShamirPoint points = 2;
 
   // Numeric identifier of the secret associated with the share.
   //
   // Must be unique for each secret created by a sharer.
-  uint64 secretId = 4;
+  uint64 secretId = 3;
 
   // Version number of the share.
   //
   // A helper is entitled to ignore any StoreShareRequestMessage whose
   // version is less than or equal to the last seen version.
-  uint32 version = 5;
+  uint32 version = 4;
 }

@@ -385,9 +385,9 @@ fn generate_vss_shares(
 ) -> Result<Vec<derec_cryptography::vss::VSSShare>, SharingError> {
     let entropy = generate_seed::<32>();
     let t = threshold as u64;
-    let n = channels_len as u64;
+    let weights = vec![1u64; channels_len];
 
-    vss::share(t, n, secret_data, &entropy)
+    vss::share(t, &weights, secret_data, &entropy)
         .map_err(|source| SharingError::VssShareFailed { source })
 }
 
@@ -402,8 +402,7 @@ fn build_shares(
     for (channel_id, share) in ordered_channels.into_iter().zip(vss_shares) {
         let derec_share = DeRecShare {
             encrypted_secret: share.encrypted_secret.clone(),
-            x: share.x.clone(),
-            y: share.y.clone(),
+            points: crate::extensions::derec_share::to_wire_points(&share.points),
             secret_id,
             version,
         };

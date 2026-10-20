@@ -704,9 +704,10 @@ fn inspect(
     Ok(share)
 }
 
-/// The smallest set VSS reconstructs from: [`vss::share`] refuses a
-/// threshold below two, so a single share is never a complete set.
-const MIN_RECONSTRUCTION_SHARES: usize = 2;
+/// The fewest points VSS reconstructs from: [`vss::share`] refuses a
+/// threshold below two, and a share always carries fewer points than the
+/// threshold, so a single share is never a complete set.
+const MIN_RECONSTRUCTION_POINTS: usize = 2;
 
 /// A secret reconstructed from the consistent part of a collected set.
 struct ConsistentRecovery {
@@ -731,9 +732,9 @@ struct ConsistentRecovery {
 /// Reconstruction is the arbiter because it is what proves a group whole: a
 /// key interpolated from fewer than the threshold of genuine shares fails the
 /// ciphertext's authentication, so a group can only succeed by holding a
-/// complete set of one split. A group needs at least two distinct
-/// x-coordinates to be tried, and a share repeated across channels counts
-/// once.
+/// complete set of one split. A group needs at least two points to be
+/// tried, and a share repeated across channels counts once: a share whose
+/// points equal those of a share already taken is skipped.
 ///
 /// No threshold is known before reconstruction, so a set that reconstructs
 /// from no group is not an error of any share: it fails with
@@ -773,16 +774,17 @@ fn recover_consistent(
     groups.sort_by_key(|group| std::cmp::Reverse(group.len()));
 
     for group in &groups {
-        let mut points: Vec<vss::VSSShare> = Vec::with_capacity(group.len());
+        let mut distinct: Vec<vss::VSSShare> = Vec::with_capacity(group.len());
         for &i in group {
-            if !points.iter().any(|p| p.x == shares[i].x) {
-                points.push(shares[i].clone());
+            if !distinct.iter().any(|s| s.points == shares[i].points) {
+                distinct.push(shares[i].clone());
             }
         }
-        if points.len() < MIN_RECONSTRUCTION_SHARES {
+        let points: usize = distinct.iter().map(|s| s.points.len()).sum();
+        if points < MIN_RECONSTRUCTION_POINTS {
             continue;
         }
-        if let Ok(secret_data) = vss::recover(&points) {
+        if let Ok(secret_data) = vss::recover(&distinct) {
             let outliers = (0..shares.len()).filter(|i| !group.contains(i)).collect();
             #[cfg(feature = "logging")]
             tracing::info!(
@@ -1572,7 +1574,7 @@ mod recovery_ids_tests {
         }
 
         fn with_flipped_y(response: &GetShareResponseMessage) -> GetShareResponseMessage {
-            rewrite_share(response, |share| share.y[0] ^= 0x01)
+            rewrite_share(response, |share| share.points[0].y[0] ^= 0x01)
         }
 
         fn with_flipped_ciphertext(response: &GetShareResponseMessage) -> GetShareResponseMessage {
@@ -2318,8 +2320,10 @@ mod recovery_ids_tests {
         fn stored_share(secret_id: u64, version: u32) -> Vec<u8> {
             let share = derec_proto::DeRecShare {
                 encrypted_secret: vec![0xAB; 4],
-                x: vec![0x01],
-                y: vec![0x02],
+                points: vec![derec_proto::de_rec_share::ShamirPoint {
+                    x: vec![0x01],
+                    y: vec![0x02],
+                }],
                 secret_id,
                 version,
             };
@@ -2614,7 +2618,7 @@ mod share_judging_tests {
         let mut committed =
             CommittedDeRecShare::decode(response.committed_de_rec_share.as_slice()).unwrap();
         let mut share = DeRecShare::decode(committed.de_rec_share.as_slice()).unwrap();
-        share.y[0] ^= 0x01;
+        share.points[0].y[0] ^= 0x01;
         committed.de_rec_share = share.encode_to_vec();
         GetShareResponseMessage {
             committed_de_rec_share: committed.encode_to_vec(),
@@ -2658,6 +2662,22 @@ mod share_judging_tests {
         };
         assert!(matches!(
             inspect(SECRET_ID, VERSION, &no_result),
+            Err(ShareFault::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn inspect_rejects_a_pre_0_0_9_layout_share_as_malformed() {
+        let good = responses(b"payload", 2, 3);
+        let mut committed =
+            CommittedDeRecShare::decode(good[0].committed_de_rec_share.as_slice()).unwrap();
+        committed.de_rec_share = crate::protocol::test::pre_0_0_9_derec_share(SECRET_ID, VERSION);
+        let old = GetShareResponseMessage {
+            committed_de_rec_share: committed.encode_to_vec(),
+            ..good[0].clone()
+        };
+        assert!(matches!(
+            inspect(SECRET_ID, VERSION, &old),
             Err(ShareFault::Malformed(_))
         ));
     }

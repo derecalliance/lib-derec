@@ -3669,7 +3669,7 @@ async fn run_corrupted_share_flow() {
         .expect("committed share decodes");
     let mut share =
         derec_proto::DeRecShare::decode(committed.de_rec_share.as_slice()).expect("share decodes");
-    share.y[0] ^= 0x01;
+    share.points[0].y[0] ^= 0x01;
     committed.de_rec_share = share.encode_to_vec();
     request.share = committed.encode_to_vec();
     stored.bytes = request.encode_to_vec();

@@ -24,16 +24,41 @@ value, checked on receipt.
   accepted. A helper could return the two children of an internal node as a
   share's `(x, y)`, with the shorter path from that node to the root: it
   passed verification, recovery used it, reconstruction failed, and nothing
-  named the helper. Leaves are now `SHA-256(0x00 ‖ u64_be(len(x)) ‖ x ‖ y)`,
-  internal nodes `SHA-256(0x02 ‖ left ‖ right)`, unused leaf slots are leaf
+  named the helper. Leaves are now tagged `0x00` and length-prefix every
+  coordinate (exact encoding in the next entry), internal nodes are
+  `SHA-256(0x02 ‖ left ‖ right)`, unused leaf slots are leaf
   hashes of random bytes, and a share verifies only with a path of exactly
   the tree depth (7). A forged share now fails verification and is reported
   as an invalid proof.
 
-  **Breaking — shares made before 0.0.9 no longer verify.** Their commitments
-  use the old hashing, so recovery from them fails as corrupt shares. After
-  upgrading, an owner must share again (publish a new version) so every
-  helper holds a share with the new commitment, before relying on recovery.
+  **Breaking — shares made before 0.0.9 are no longer readable.** The
+  `DeRecShare` wire format changed (see the next entry), so an old share no
+  longer decodes: a helper still holding one cannot answer a recovery
+  request for that version, and an old share that reaches an owner is
+  reported as malformed. After upgrading, an owner must share again
+  (publish a new version) so every helper holds a share in the new format,
+  before relying on recovery.
+
+- **Changed: a share carries a list of Shamir points.**
+  *(breaking wire and `derec-cryptography` API change; no behavior change)*
+
+  This prepares weighted helpers: an owner who trusts one helper more can
+  give it more points, so it and fewer others can recover, while no single
+  helper ever holds enough points to recover alone. The library still gives
+  every helper exactly one point; choosing weights is not yet exposed.
+
+  - Wire: `DeRecShare.x` and `DeRecShare.y` are replaced by
+    `repeated ShamirPoint points = 2` (`ShamirPoint { bytes x = 1; bytes y = 2; }`),
+    and `secretId` and `version` move to 3 and 4.
+  - Merkle leaf: one leaf per share, committing to its points in order:
+    `SHA-256(0x00 ‖ u64_be(k) ‖ for each point: u64_be(len(x)) ‖ x ‖ u64_be(len(y)) ‖ y)`,
+    with `k` the number of points. Internal nodes are unchanged.
+  - `derec-cryptography`: `vss::share(threshold, weights: &[u64], msg, entropy)`
+    returns one `VSSShare` per weight; `VSSShare` carries
+    `points: Vec<ShamirPoint>` in place of `x` and `y`. Every weight must be
+    in `1..threshold`, there are at most 128 shares, and the weights must
+    sum to between `threshold` and 128. `verify` also rejects a share with
+    no points, more than 127 points, or a repeated x-coordinate.
 
 - **Changed: `build()` validates the configured parameter range.**
   *(behavior change; every SDK)*

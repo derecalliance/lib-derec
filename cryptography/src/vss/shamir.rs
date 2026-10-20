@@ -295,4 +295,18 @@ mod tests {
             assert!(!x.is_zero());
         }
     }
+
+    #[test]
+    fn points_encode_as_48_byte_little_endian_field_elements() {
+        for (x, y) in sample_shares() {
+            assert_eq!(x.len(), 48);
+            assert_eq!(y.len(), 48);
+        }
+
+        let mut one = Vec::new();
+        F::from(1u64).serialize_compressed(&mut one).unwrap();
+        let mut expected = vec![0u8; 48];
+        expected[0] = 1;
+        assert_eq!(one, expected);
+    }
 }

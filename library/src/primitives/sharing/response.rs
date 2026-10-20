@@ -377,8 +377,7 @@ fn validate_produce_inputs(
     let secret_id = inner_share.secret_id;
 
     let vss_share = vss::VSSShare {
-        x: inner_share.x,
-        y: inner_share.y,
+        points: crate::extensions::derec_share::into_vss_points(inner_share.points),
         encrypted_secret: inner_share.encrypted_secret,
         commitment: committed_share.commitment.clone(),
         merkle_path: committed_share

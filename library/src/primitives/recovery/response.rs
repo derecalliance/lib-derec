@@ -443,8 +443,7 @@ pub(crate) fn extract_share_from_response(
     derec_share.validate(secret_id, version)?;
 
     Ok(vss::VSSShare {
-        x: derec_share.x,
-        y: derec_share.y,
+        points: crate::extensions::derec_share::into_vss_points(derec_share.points),
         encrypted_secret: derec_share.encrypted_secret,
         commitment: committed_derec_share.commitment,
         merkle_path: committed_derec_share

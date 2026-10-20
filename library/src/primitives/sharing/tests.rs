@@ -185,8 +185,19 @@ fn test_split_valid_sharing() {
             !inner.encrypted_secret.is_empty(),
             "encrypted_secret must not be empty"
         );
-        assert!(!inner.x.is_empty(), "share x coordinate must not be empty");
-        assert!(!inner.y.is_empty(), "share y coordinate must not be empty");
+        assert_eq!(
+            inner.points.len(),
+            1,
+            "every helper holds exactly one point"
+        );
+        assert!(
+            !inner.points[0].x.is_empty(),
+            "x coordinate must not be empty"
+        );
+        assert!(
+            !inner.points[0].y.is_empty(),
+            "y coordinate must not be empty"
+        );
     }
 }
 

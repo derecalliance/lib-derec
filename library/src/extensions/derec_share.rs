@@ -41,3 +41,30 @@ impl DeRecShareExt for derec_proto::DeRecShare {
         Ok(())
     }
 }
+
+/// A wire `DeRecShare`'s points as the [`vss`] points they encode.
+///
+/// [`vss`]: derec_cryptography::vss
+pub(crate) fn into_vss_points(
+    points: Vec<derec_proto::de_rec_share::ShamirPoint>,
+) -> Vec<derec_cryptography::vss::ShamirPoint> {
+    points
+        .into_iter()
+        .map(|p| derec_cryptography::vss::ShamirPoint { x: p.x, y: p.y })
+        .collect()
+}
+
+/// [`vss`] points as the points of a wire `DeRecShare`.
+///
+/// [`vss`]: derec_cryptography::vss
+pub(crate) fn to_wire_points(
+    points: &[derec_cryptography::vss::ShamirPoint],
+) -> Vec<derec_proto::de_rec_share::ShamirPoint> {
+    points
+        .iter()
+        .map(|p| derec_proto::de_rec_share::ShamirPoint {
+            x: p.x.clone(),
+            y: p.y.clone(),
+        })
+        .collect()
+}
