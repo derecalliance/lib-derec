@@ -202,8 +202,8 @@ fn typescript_surfaces_declare_every_dto_field() {
 
 /// `withUnsafeConnection` and the `grpc` transport protocol have no
 /// `dto::` struct behind them to destructure exhaustively: `unsafe_connection`
-/// lives on the private FFI `ProtocolConfig`
-/// (`library/src/interop/ffi/protocol/handle/mod.rs`), and the transport
+/// lives on `DeRecProtocolConfig`
+/// (`library/src/protocol/protocol_config.rs`), and the transport
 /// `Protocol` enum is declared in `protobufs/transportprotocol.proto` — both
 /// unreachable from this external test crate the way `dto::` is. The check
 /// is therefore textual, the same trick `enum_fixture.rs` uses for the

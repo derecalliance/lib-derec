@@ -206,12 +206,30 @@ import "github.com/derecalliance/lib-derec/packages/go/primitives/sharing"
 
 secretID := uint64(42)
 secretData := []byte("super-secret")
-channelIDs := []uint64{1, 2, 3}
-const threshold = 2 // must satisfy 2 <= threshold <= len(channelIDs)
+// Every channel is listed with its weight — the number of subshares its
+// committed share carries. An ordinary helper carries weight 1.
+channels := []sharing.WeightedChannel{
+	{ChannelID: 1, Weight: 1},
+	{ChannelID: 2, Weight: 1},
+	{ChannelID: 3, Weight: 1},
+}
+const threshold = 2 // the number of subshares that reconstruct the secret
 const version = uint32(1)
 
-shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold, version)
+shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
 // shares: map[uint64][]byte — channel id -> one CommittedDeRecShare per helper.
+```
+
+`threshold` counts **subshares**, not helpers: with every weight 1, threshold is also the number of helpers needed to recover. Giving a channel a weight greater than 1 gives it that many subshares instead — a device the owner trusts more than the others. A channel's weight must fall within `1..threshold`; Split returns a `*derec.Error` with `Code == derec.CodeInvalidWeight` otherwise.
+
+```go
+// channel 1 holds 2 of the threshold's subshares
+weighted := []sharing.WeightedChannel{
+	{ChannelID: 1, Weight: 2},
+	{ChannelID: 2, Weight: 1},
+	{ChannelID: 3, Weight: 1},
+}
+shares, err := sharing.Request.Split(secretID, secretData, weighted, threshold, version)
 
 for channelID, committedShare := range shares {
 	envelope, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", sharedKeys[channelID], nil)
@@ -403,12 +421,14 @@ import (
 
 cfg := protocol.Config{
 	SecretID: secretID,
-	OwnTransports: []protocol.TransportProtocolParam{
-		{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)},
-	},
-	Threshold: proto.Uint32(2), // nil: library default (3)
-	Timeouts: &protocol.Timeouts{
-		SharingRoundSecs: proto.Uint64(30), // whole seconds; nil: library default
+	DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+		OwnTransports: []protocol.TransportProtocolParam{
+			{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)},
+		},
+		Threshold: proto.Uint32(2), // nil: library default (3)
+		Timeouts: &protocol.Timeouts{
+			SharingRoundSecs: proto.Uint64(30), // whole seconds; nil: library default
+		},
 	},
 }
 
@@ -425,7 +445,59 @@ if err != nil {
 defer p.Close()
 ```
 
-Numeric settings are pointers so that "unset" and `0` stay distinct: `nil` takes the library default, and any value you set — `0` included — is passed to the library unchanged, which accepts or rejects it (a `Threshold` below 2 fails `protocol.New` with `derec.CodeInvalidInput`). `proto.Uint32` / `proto.Uint64` build the pointer inline. `Timeouts` fields are whole seconds, the unit the library takes.
+`Config` is the per-instance `SecretID` plus an embedded `DeRecProtocolConfig` holding every data setting. Its fields are promoted, so `cfg.Threshold` reads and writes `cfg.DeRecProtocolConfig.Threshold`; only a composite literal has to name the embedded struct.
+
+Every setting is optional and a pointer, so that "unset" and `0` (or `false`) stay distinct: `nil` takes the library default, and any value you set — `0` included — is passed to the library unchanged, which accepts or rejects it (a `Threshold` below 2 fails `protocol.New` with `derec.CodeInvalidInput`). `proto.Uint32` / `proto.Uint64` / `proto.Bool` build the pointer inline. `Timeouts` fields are whole seconds, the unit the library takes.
+
+#### Configuration from a file or record
+
+Applications usually load settings as a whole: general settings from the environment or a config file, per-user settings from a user record. `DeRecProtocolConfig` carries json tags for the canonical config JSON shared by every DeRec SDK, so each source is one `json.Unmarshal`. Go has no builder and no `WithConfig`; layering is one `json.Unmarshal` per layer into the same value, then plain assignments:
+
+```go
+cfg := protocol.Config{SecretID: secretID}
+if err := json.Unmarshal(generalJSON, &cfg.DeRecProtocolConfig); err != nil { // 1. general settings
+	return err
+}
+if err := json.Unmarshal(userRecordJSON, &cfg.DeRecProtocolConfig); err != nil { // 2. per-user settings
+	return err
+}
+cfg.Threshold = proto.Uint32(4) // 3. individual settings
+
+p, err := protocol.New(stores, transport, cfg)
+```
+
+- **Only the keys a layer carries are assigned.** An absent key, or `null`, leaves the value already held.
+- **Last write wins, per setting**, exactly as the Rust `with_config` and the .NET / TypeScript `WithConfig` / `withConfig` layer. Nested values are replaced as a whole, except `timeouts`: each of its fields is merged separately, so a per-user record that sets only `inbound_message_secs` keeps the `sharing_round_secs` the general config set.
+- **Validation happens in `protocol.New`**, with the same rules as setting the field directly. A `threshold` of `1` from a config file fails exactly as `cfg.Threshold = proto.Uint32(1)` does.
+- **An unknown key fails `json.Unmarshal`** with an error naming it (`json: unknown field "treshold"`), at every level, so a misspelled setting is never silently dropped.
+- **Marshal and unmarshal `cfg.DeRecProtocolConfig`, not `cfg`.** `json.Marshal(cfg)` writes `SecretID` beside the settings, and reading that back fails on `SecretID` as an unknown key: the secret id is per instance and is not part of the config JSON.
+- **`encoding/json` matches keys case-insensitively.** A config with a wrong-case key (`"Threshold"` instead of `"threshold"`) still loads in Go — it matches the `Threshold` field — while every other SDK rejects it as an unknown key. Write the canonical `snake_case` keys even though Go would accept the wrong case.
+
+The canonical JSON (`library/tests/fixtures/protocol_config.json` holds a full example):
+
+```json
+{
+  "threshold": 3,
+  "max_subshares": "12",
+  "timeouts": {
+    "inbound_message_secs": 300,
+    "sharing_round_secs": 60,
+    "unpair_ack_secs": 60,
+    "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
+  },
+  "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
+  "auto_accept": { "pairing": true, "store_share": true },
+  "auto_respond_on_failure": false,
+  "auto_reply_to": false,
+  "unpair_ack": "required",
+  "unsafe_connection": false,
+  "communication_info": { "name": "alice" },
+  "own_transports": [{ "uri": "https://me.example.com/derec", "protocol": "https" }],
+  "replica_id": "9007199254740993"
+}
+```
+
+Keys are `snake_case` and every key is optional. `replica_id` and `max_subshares` are decimal strings, so values above 2^53 survive. `json.Marshal` of a `DeRecProtocolConfig` writes the same shape, which is exactly what `protocol.New` sends to the library beside `secret_id`.
 
 `channelStore`/`shareStore`/`secretStore`/`userSecretStore`/`stateStore`/`transport` are your application's implementations of the six interfaces above. The repository's end-to-end tests carry complete in-memory implementations of all six — see [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
@@ -471,6 +543,10 @@ if errors.As(err, &processErr) {
 ```
 
 `Start` accepts a `FlowKind` plus the matching params struct: `protocol.PairingParams`, `protocol.DiscoveryParams`, `protocol.ProtectSecretParams`, `protocol.VerifySharesParams`, `protocol.RecoverSecretParams`, `protocol.UnpairParams`, or `protocol.UpdateChannelInfoParams`. Fan-out flows (`FlowKindDiscovery`, `FlowKindVerifyShares`, `FlowKindUpdateChannelInfo`) take a `protocol.Target`, built with `protocol.TargetAll()`, `protocol.TargetOne(channelID)`, or `protocol.TargetMany(channelIDs...)`.
+
+`ProtectSecretParams.Weights` (`map[uint64]uint32`, nil by default) gives chosen paired channels more than one subshare — key by the long-term channel id (what `pairPeers`/pairing returns), never the transient pairing/contact id. Each resulting `EventTypeProtectSecretStarted` and `EventTypeProtectSecretFailed` carries that channel's subshare count on `Event.Weight` (`*uint32`): the `Weights` entry for it, or `1` when absent.
+
+`Config.MaxSubshares` (`*uint64`, nil by default: no cap) caps the total subshares one round splits the secret into — the sum of every helper's weight. Recovery time grows quadratically with that total (about 0.2 s at 200, 5.5 s at 1,000 and 87 s at 4,000 subshares per attempt) while splitting stays cheap, so this is the place to bound it. A round over the cap fails `Start(ProtectSecret)` with a `*derec.Error` whose `Code` is `derec.CodeTooManySubshares` (66) before anything is sent; publishes the library starts itself respect it too. A cap below `Threshold` makes `New` fail with `derec.CodeInvalidInput`. The cap applies at sharing only, never at recovery: a recovering device cannot know the cap the shares were made under.
 
 `Process` returns `[]protocol.Event`, decoded from the same JSON event stream the Rust core emits — compare `Event.Type` against the `protocol.EventType*` constants (`EventTypePairingCompleted`, `EventTypeShareStored`, `EventTypeShareConfirmed`, `EventTypeSecretRecovered`, `EventTypeActionRequired`, …) rather than hand-typing the string. Every u64 identifier on an event (`ChannelID`, `PairingChannelID`, `SecretID`, `TraceID`, the replica ids, `Synced` / `Behind`) and inside the recovered `Secret` (`Helper.ChannelID`, `Replicas.ChannelID`, `Replica.ReplicaID`) is a `uint64`, `Replica.Role` is a `protocol.ReplicaRole` (`ReplicaRoleSource` / `ReplicaRoleDestination`), and `Event.Kind` / `Event.SenderKind` are a `protocol.SenderKind` (`SenderKindOwner` / `SenderKindHelper` / `SenderKindReplicaSource` / `SenderKindReplicaDestination`) — the same type as `pairing.SenderKind` and `PairingParams.Kind`.
 

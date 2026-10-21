@@ -34,8 +34,11 @@ mod ffi;
 #[cfg(any(target_arch = "wasm32", feature = "ffi"))]
 mod error_codes;
 
-#[cfg(any(target_arch = "wasm32", feature = "ffi"))]
+#[cfg(any(target_arch = "wasm32", feature = "serde"))]
 pub(crate) mod protocol_names;
+
+#[cfg(any(target_arch = "wasm32", all(test, feature = "serde")))]
+mod strict_json;
 
 #[cfg(any(target_arch = "wasm32", feature = "ffi"))]
 mod recovered_secret;

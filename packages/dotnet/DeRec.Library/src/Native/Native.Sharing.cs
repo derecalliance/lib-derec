@@ -64,7 +64,8 @@ internal static class Sharing
         ulong secretId,
         byte[] secretData,
         UIntPtr secretDataLen,
-        ulong[] channelIds,
+        ulong[] channels,
+        uint[] weights,
         UIntPtr channelsLen,
         UIntPtr threshold,
         uint version

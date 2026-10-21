@@ -126,11 +126,20 @@ type ProtectSecretParams struct {
 	// Option<String> None), a non-nil pointer — including one to an
 	// empty string — sets it explicitly.
 	Description *string
+	// Weights maps a paired channel id to how many subshares that
+	// channel should hold. A channel absent from the map, or a nil/empty
+	// map, holds one subshare — the same roster that would be sent with no
+	// weights at all. nil omits the field entirely.
+	Weights map[uint64]uint32
 }
 
 type protectSecretParamsWire struct {
 	Secrets     []UserSecret `json:"secrets"`
 	Description *string      `json:"description,omitempty"`
+	// Weights marshals a map[uint64]uint32 directly: encoding/json renders
+	// integer map keys as decimal-string JSON object keys, matching the
+	// wire's `HashMap<String, u32>` shape without a separate wire type.
+	Weights map[uint64]uint32 `json:"weights,omitempty"`
 }
 
 // VerifySharesParams are the parameters for FlowKindVerifyShares.
@@ -169,8 +178,10 @@ type unpairParamsWire struct {
 	Memo      *string `json:"memo,omitempty"`
 }
 
-// TransportProtocolParam is the transport endpoint carried by
-// UpdateChannelInfoParams.
+// TransportProtocolParam is a transport endpoint: an entry of
+// DeRecProtocolConfig.OwnTransports, of SetOwnTransports, and of
+// UpdateChannelInfoParams. In the canonical config JSON it is
+// {"uri": ..., "protocol": ...}, protocol written as its lowercase name.
 type TransportProtocolParam struct {
 	URI      string
 	Protocol int32
@@ -267,6 +278,7 @@ func marshalFlowParams(flowKind FlowKind, params any) ([]byte, error) {
 		return json.Marshal(protectSecretParamsWire{
 			Secrets:     secrets,
 			Description: psp.Description,
+			Weights:     psp.Weights,
 		})
 	case FlowKindVerifyShares:
 		vsp, ok := params.(VerifySharesParams)

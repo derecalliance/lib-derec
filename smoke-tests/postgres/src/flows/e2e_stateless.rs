@@ -1195,6 +1195,7 @@ async fn protect(
         .start(DeRecFlow::ProtectSecret {
             secrets,
             description: Some(description.to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .expect("owner.start(ProtectSecret) failed");
@@ -1471,6 +1472,7 @@ async fn step_10_a_silent_helper_is_resolved_by_a_scheduled_tick(
         .start(DeRecFlow::ProtectSecret {
             secrets: secrets.to_vec(),
             description: Some("published while one helper is offline".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .expect("owner.start(ProtectSecret)");

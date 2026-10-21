@@ -70,6 +70,8 @@ internal static class Protocol
         RunOrchestratorCommunicationInfoPairTest();
         RunStateKeyVersionTest();
         RunOrchestratorSharingRoundKeyTest();
+        RunOrchestratorProtectSecretWeightTest();
+        RunOrchestratorMaxSubsharesTest();
         RunHelperKeepListPrunesShareStoreTest();
         RunOwnerKeepListReachesHelpersTest();
         RunShareStoreRefusalTest();
@@ -101,6 +103,7 @@ internal static class Protocol
         RunOrchestratorTickTest();
         RunEnumFixtureTest();
         RunConfigSurfaceTest();
+        RunProtocolConfigTest();
         RunErrorNamesTest();
         RunContactMessageCodecTest();
     }
@@ -635,6 +638,127 @@ internal static class Protocol
         Console.WriteLine("  round completes after both confirmations  ✓");
 
         Console.WriteLine("Orchestrator SharingRound key round-trip test passed.\n");
+    }
+
+    /// <summary>
+    /// A channel named in <c>ProtectSecretParams.Weights</c> gets that many
+    /// subshares and the <c>ProtectSecretStartedEvent</c> dispatched for
+    /// it carries the same number back; a channel absent from the map
+    /// defaults to weight 1. Threshold 3 against one weight-2 helper and one
+    /// unweighted helper (2 + 1 = 3 subshares) must still complete the round.
+    /// </summary>
+    private static void RunOrchestratorProtectSecretWeightTest()
+    {
+        Console.WriteLine("=== Orchestrator ProtectSecret weight test ===");
+
+        const ulong secretId = 0x7777UL;
+        using var owner = MakeNode("Owner", "https://owner.example.com",
+            new NodeOptions(SecretId: secretId, Threshold: 3));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com", new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com", new NodeOptions(SecretId: secretId));
+        // The pairing handshake rekeys onto a long-term channel id neither
+        // side picks, so the weights map below is keyed by the id the
+        // handshake actually settled on, not the transient pairing id.
+        ulong channelA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 11UL);
+        ulong channelB = DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 12UL);
+
+        var startEvents = owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret { Id = new byte[] { 0x04 }, Name = "weighted", Data = Encoding.UTF8.GetBytes("weighted-secret") },
+            },
+            Description = "weighted round",
+            Weights = new Dictionary<ulong, uint> { [channelA] = 2 },
+        }).GetAwaiter().GetResult();
+
+        var started = startEvents.OfType<ProtectSecretStartedEvent>().ToDictionary(e => e.ChannelId);
+        if (started[channelA].Weight != 2)
+            throw new InvalidOperationException($"channel A must carry weight 2, got {started[channelA].Weight}");
+        if (started[channelB].Weight != 1)
+            throw new InvalidOperationException($"channel B with no weights entry must default to weight 1, got {started[channelB].Weight}");
+        Console.WriteLine("  ProtectSecretStartedEvent.Weight matches the requested map, defaulting to 1  ✓");
+
+        var helpersByUri = new Dictionary<string, Node>
+        {
+            ["https://helper-a.example.com"] = helperA,
+            ["https://helper-b.example.com"] = helperB,
+        };
+        var completed = new List<DeRecEvent>();
+        foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
+        {
+            var h = helpersByUri[uri];
+            h.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+            completed.AddRange(owner.Protocol.ProcessAndAcceptAllAsync(h.Transport.DrainOne())
+                .GetAwaiter().GetResult());
+        }
+        if (!completed.OfType<SharingCompleteEvent>().Any(e => e.ThresholdMet))
+            throw new InvalidOperationException(
+                "a weight-2 helper plus an unweighted helper (3 subshares) must meet a threshold of 3");
+        Console.WriteLine("  round with weighted helper (2 + 1 = 3 subshares) meets threshold 3  ✓");
+
+        Console.WriteLine("Orchestrator ProtectSecret weight test passed.\n");
+    }
+
+    /// <summary>
+    /// <see cref="DeRecProtocolBuilder.WithMaxSubshares"/> caps a sharing
+    /// round's total subshares. A cap below the threshold is refused at
+    /// <see cref="DeRecProtocolBuilder.Build"/> with <c>InvalidInput</c>; a
+    /// round whose weights total more than the cap fails at
+    /// <c>start(ProtectSecret)</c> with <see cref="DeRecCode.TooManySubshares"/>
+    /// before anything is sent.
+    /// </summary>
+    private static void RunOrchestratorMaxSubsharesTest()
+    {
+        Console.WriteLine("=== Orchestrator max-subshares cap test ===");
+
+        const ulong secretId = 0x7878UL;
+        int buildCode = 0;
+        try
+        {
+            using var _ = MakeNode("Owner", "https://owner.example.com",
+                new NodeOptions(SecretId: secretId, Threshold: 3, MaxSubshares: 2));
+        }
+        catch (DeRecException e)
+        {
+            buildCode = e.Code;
+        }
+        if (buildCode != DeRecCode.InvalidInput)
+            throw new InvalidOperationException($"a cap below the threshold must fail Build with InvalidInput, got code {buildCode}");
+        Console.WriteLine("  Build refuses a cap below the threshold (InvalidInput)  ✓");
+
+        using var owner = MakeNode("Owner", "https://owner.example.com",
+            new NodeOptions(SecretId: secretId, Threshold: 3, MaxSubshares: 3));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com", new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com", new NodeOptions(SecretId: secretId));
+        ulong channelA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 31UL);
+        ulong channelB = DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 32UL);
+        owner.Transport.DrainAll();
+
+        int startCode = 0;
+        try
+        {
+            owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+            {
+                Secrets = new[]
+                {
+                    new UserSecret { Id = new byte[] { 0x05 }, Name = "capped", Data = Encoding.UTF8.GetBytes("capped-secret") },
+                },
+                Description = "over the cap",
+                Weights = new Dictionary<ulong, uint> { [channelA] = 2, [channelB] = 2 },
+            }).GetAwaiter().GetResult();
+        }
+        catch (DeRecException e)
+        {
+            startCode = e.Code;
+        }
+        if (startCode != DeRecCode.TooManySubshares)
+            throw new InvalidOperationException($"4 subshares over a cap of 3 must fail with TooManySubshares, got code {startCode}");
+        if (owner.Transport.DrainAll().Count != 0)
+            throw new InvalidOperationException("a round over the cap must send nothing");
+        Console.WriteLine("  start(ProtectSecret) over the cap fails with TooManySubshares and sends nothing  ✓");
+
+        Console.WriteLine("Orchestrator max-subshares cap test passed.\n");
     }
 
     /// <summary>
@@ -1436,7 +1560,7 @@ internal static class Protocol
         string path = Path.Combine("..", "..", "library", "tests", "fixtures", "wire_golden.json");
         var fixture = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!.AsObject();
 
-        var covered = new[] { "protect_secret", "restore" };
+        var covered = new[] { "protect_secret", "protect_secret_weighted", "restore" };
         var sections = fixture.Select(kv => kv.Key).Where(k => !k.StartsWith('$')).OrderBy(k => k, StringComparer.Ordinal).ToArray();
         if (!sections.SequenceEqual(covered))
             throw new InvalidOperationException(
@@ -1460,6 +1584,17 @@ internal static class Protocol
         // StartAsync serializes its `object` params with the wire options.
         object protect = new ProtectSecretParams { Secrets = userSecrets, Description = "capture description" };
         AssertSection(fixture, "protect_secret", JsonSerializer.Serialize(protect, DeRecJsonOptions.Wire));
+
+        // The same params, with a weights map, must serialize under "weights"
+        // with decimal-string channel ids — absent from the unweighted section
+        // above, proving the field is genuinely optional.
+        object protectWeighted = new ProtectSecretParams
+        {
+            Secrets = userSecrets,
+            Description = "capture description",
+            Weights = new Dictionary<ulong, uint> { [7UL] = 2, [12UL] = 3 },
+        };
+        AssertSection(fixture, "protect_secret_weighted", JsonSerializer.Serialize(protectWeighted, DeRecJsonOptions.Wire));
 
         static byte[] Key(Func<int, int> at) => Enumerable.Range(0, 32).Select(i => (byte)at(i)).ToArray();
         var https = DeRec.Library.Protocol.Https;
@@ -2906,7 +3041,8 @@ internal static class Protocol
         ulong? SecretId = null,
         AutoAcceptPolicy? AutoAccept = null,
         bool UnsafeConnection = false,
-        bool OmitThreshold = false);
+        bool OmitThreshold = false,
+        ulong? MaxSubshares = null);
 
     private const int DefaultThreshold = 2;
 
@@ -3064,6 +3200,8 @@ internal static class Protocol
             builder = builder.WithAutoAccept(policy);
         if (options.ReplicaId is ulong replicaId)
             builder = builder.WithReplicaId(replicaId);
+        if (options.MaxSubshares is ulong maxSubshares)
+            builder = builder.WithMaxSubshares(maxSubshares);
 
         return new Node(builder.Build(), transport, channelStore, shareStore, secretStore, userSecretStore, stateStore);
     }
@@ -3110,7 +3248,7 @@ internal static class Protocol
     /// <summary>
     /// The config knobs and validation rules an application reaches through
     /// this SDK, each of which crosses the FFI as a JSON field. A mismatch
-    /// between the DTO's field names and the Rust <c>ProtocolConfig</c> would
+    /// between the record's field names and the Rust <c>DeRecProtocolConfig</c> would
     /// silently drop the setting rather than fail, so each assertion here is
     /// checking that the value actually arrived.
     /// </summary>
@@ -3147,24 +3285,11 @@ internal static class Protocol
         }
 
         // CommunicationInfo crosses as the config JSON's communication_info
-        // object, omitted when absent or empty. The record built here is the
-        // one the DeRecProtocol constructor serializes.
-        var configType = typeof(DeRecProtocol).GetNestedType("ProtocolConfigDto", System.Reflection.BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("DeRecProtocol.ProtocolConfigDto not found: point this check at the type the constructor serializes");
-        var configCtor = configType.GetConstructors().Single();
-        System.Text.Json.Nodes.JsonObject ConfigJson(Dictionary<string, string>? info)
-        {
-            object?[] args = configCtor.GetParameters()
-                .Select(p => p.Name switch
-                {
-                    "SecretId" => (object?)"1",
-                    "CommunicationInfo" => info,
-                    _ => null,
-                })
-                .ToArray();
-            return System.Text.Json.Nodes.JsonNode.Parse(
-                JsonSerializer.Serialize(configCtor.Invoke(args), configType, DeRecJsonOptions.Wire))!.AsObject();
-        }
+        // object, omitted when absent or empty. DeRecProtocolConfig is the
+        // record the DeRecProtocol constructor serializes.
+        System.Text.Json.Nodes.JsonObject ConfigJson(Dictionary<string, string>? info) =>
+            System.Text.Json.Nodes.JsonNode.Parse(
+                JsonSerializer.Serialize(new DeRecProtocolConfig { CommunicationInfo = info }, DeRecJsonOptions.Wire))!.AsObject();
         var withInfo = ConfigJson(new Dictionary<string, string> { ["name"] = "alice", ["email"] = "a@example.com" });
         if (!System.Text.Json.Nodes.JsonNode.DeepEquals(
                 withInfo["communication_info"],
@@ -3354,6 +3479,8 @@ internal static class Protocol
             || DeRecCode.RoleMismatch != 11
             || DeRecCode.MalformedRecoveredSecret != 86
             || DeRecCode.TransportInvalid != 120
+            || DeRecCode.InvalidWeight != 65
+            || DeRecCode.TooManySubshares != 66
             || DeRecCategory.StateStore != 15)
         {
             throw new Exception("error code/category values drifted from the FFI");
@@ -3361,6 +3488,218 @@ internal static class Protocol
         Console.WriteLine("  error code/category values match the FFI  ✓");
 
         Console.WriteLine("Protocol config surface test passed.\n");
+    }
+
+    /// <summary>
+    /// <see cref="DeRecProtocolConfig"/> reads and writes the canonical
+    /// config JSON that <c>library/tests/fixtures/protocol_config.json</c>
+    /// pins, builds a working node, layers last-write-wins, and refuses a
+    /// misspelled key instead of dropping it.
+    /// </summary>
+    private static void RunProtocolConfigTest()
+    {
+        Console.WriteLine("=== Protocol config record test ===");
+
+        string path = Path.Combine("..", "..", "library", "tests", "fixtures", "protocol_config.json");
+        if (!File.Exists(path))
+            throw new Exception($"protocol config fixture not found at {Path.GetFullPath(path)}");
+        var fixture = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!.AsObject();
+
+        DeRecProtocolConfig Parse(string json) =>
+            JsonSerializer.Deserialize<DeRecProtocolConfig>(json, DeRecJsonOptions.Wire)
+            ?? throw new InvalidOperationException("config JSON deserialized to null");
+
+        // Every fixture round-trips to itself. The one parameter_range bound
+        // written as a decimal string comes back as a number, which is the
+        // form the library writes.
+        foreach (var name in new[] { "full", "minimal" })
+        {
+            var expected = fixture[name]!.DeepClone().AsObject();
+            if (expected["parameter_range"] is System.Text.Json.Nodes.JsonObject range)
+            {
+                foreach (var key in range.Select(kv => kv.Key).ToList())
+                {
+                    if (range[key]!.GetValueKind() == JsonValueKind.String)
+                        range[key] = ulong.Parse(range[key]!.GetValue<string>());
+                }
+            }
+            var written = System.Text.Json.Nodes.JsonNode.Parse(
+                JsonSerializer.Serialize(Parse(fixture[name]!.ToJsonString()), DeRecJsonOptions.Wire));
+            if (!System.Text.Json.Nodes.JsonNode.DeepEquals(written, expected))
+                throw new InvalidOperationException(
+                    $"fixture `{name}` did not round-trip:\n  expected {expected.ToJsonString()}\n  written  {written!.ToJsonString()}");
+            Console.WriteLine($"  fixture `{name}` round-trips through DeRecProtocolConfig  ✓");
+        }
+
+        var full = Parse(fixture["full"]!.ToJsonString());
+        if (full.Threshold != 3
+            || full.MaxSubshares != 12
+            || full.ReplicaId != 9007199254740993UL
+            || full.Timeouts?.InboundMessage != TimeSpan.FromSeconds(120)
+            || full.Timeouts?.SharingRound != TimeSpan.FromSeconds(30)
+            || full.Timeouts?.UnpairAck != TimeSpan.FromSeconds(45)
+            || full.Timeouts?.ExpiredChannels != new RemoveExpiredChannelsPolicy(true, 600)
+            || full.ParameterRange?.MaxUnresponsiveDeletionTimeout != 9007199254740993L
+            || full.AutoAccept is not { Pairing: true, PrePair: false, StoreShare: true, Unpair: true }
+            || full.AutoRespondOnFailure != true
+            || full.AutoReplyTo != true
+            || full.UnpairAck != UnpairAck.NotRequired
+            || full.UnsafeConnection != false
+            || full.CommunicationInfo?["device"] != "laptop"
+            || full.OwnTransports is not { Count: 2 }
+            || full.OwnTransports[1] != new TransportProtocol("grpcs://me.example.com:443", DeRec.Library.Protocol.Grpc))
+            throw new InvalidOperationException("fixture `full` did not deserialize into every field");
+        Console.WriteLine("  fixture `full` sets every field  ✓");
+
+        // A node built from the fixture pairs like any other.
+        using (var helper = MakeConfigNode(full))
+        using (var owner = MakeNode("Owner", "https://owner.example.com"))
+        {
+            ulong channel = DoOrchestratorPair(helper, helper.Transport, owner, owner.Transport, 7UL);
+            Console.WriteLine($"  node built WithConfig(full) pairs (channel {channel})  ✓");
+        }
+
+        // A misspelled key fails loudly, at the top level and nested.
+        foreach (var bad in new[]
+        {
+            """{ "treshold": 3 }""",
+            """{ "timeouts": { "sharing_round": 30 } }""",
+            """{ "own_transports": [ { "uri": "https://a.example", "protocl": "https" } ] }""",
+            """{ "auto_accept": { "pair": true } }""",
+            """{ "parameter_range": { "min_size": 1 } }""",
+            """{ "timeouts": { "expired_channels": { "enabled": true, "timeout": 5 } } }""",
+        })
+        {
+            var refused = false;
+            try
+            {
+                Parse(bad);
+            }
+            catch (JsonException e)
+            {
+                refused = true;
+                Console.WriteLine($"  {bad} refused: {e.Message.Split('.')[0]}  ✓");
+            }
+            if (!refused)
+                throw new Exception($"a misspelled key must be refused, not ignored: {bad}");
+        }
+
+        // A whole-second value too large for a TimeSpan must still read as a
+        // JsonException, like every other malformed config value, not leak
+        // the OverflowException TimeSpan.FromSeconds throws internally.
+        foreach (var huge in new[]
+        {
+            """{ "timeouts": { "inbound_message_secs": 1e300 } }""",
+            """{ "timeouts": { "sharing_round_secs": 1e300 } }""",
+            """{ "timeouts": { "unpair_ack_secs": 1e300 } }""",
+        })
+        {
+            var refused = false;
+            try
+            {
+                Parse(huge);
+            }
+            catch (JsonException)
+            {
+                refused = true;
+            }
+            if (!refused)
+                throw new Exception($"an out-of-range timeout must be refused as JsonException: {huge}");
+        }
+        Console.WriteLine("  an out-of-range timeout value refuses as JsonException, not OverflowException  ✓");
+
+        // unpair_ack takes exactly the names the library takes, or a number.
+        foreach (var (json, expected) in new[]
+        {
+            ("""{ "unpair_ack": "required" }""", UnpairAck.Required),
+            ("""{ "unpair_ack": "not_required" }""", UnpairAck.NotRequired),
+            ("""{ "unpair_ack": 1 }""", UnpairAck.NotRequired),
+        })
+        {
+            if (Parse(json).UnpairAck != expected)
+                throw new Exception($"{json} must read as {expected}");
+        }
+        foreach (var bad in new[] { "NotRequired", "Not_Required", "REQUIRED", "notrequired", "1" })
+        {
+            var refused = false;
+            try
+            {
+                Parse($$"""{ "unpair_ack": "{{bad}}" }""");
+            }
+            catch (JsonException)
+            {
+                refused = true;
+            }
+            if (!refused)
+                throw new Exception($"unpair_ack \"{bad}\" is not a name the library takes and must be refused");
+        }
+        Console.WriteLine("  unpair_ack reads exactly \"required\", \"not_required\" or a number  ✓");
+
+        int BuildCode(Func<DeRecProtocolBuilder, DeRecProtocolBuilder> configure)
+        {
+            try
+            {
+                using var _ = configure(new DeRecProtocolBuilder(DefaultTestSecretId)
+                    .WithStores(new DeRecStores(new InMemoryChannelStore(), new InMemoryShareStore(),
+                        new InMemorySecretStore(), new InMemoryUserSecretStore(), new InMemoryStateStore()))
+                    .WithTransport(new RecordingTransport())
+                    .WithConfig(Parse(fixture["minimal"]!.ToJsonString())))
+                    .Build();
+                return 0;
+            }
+            catch (DeRecException e)
+            {
+                return e.Code;
+            }
+        }
+        void Expect(string label, int expected, Func<DeRecProtocolBuilder, DeRecProtocolBuilder> configure)
+        {
+            int code = BuildCode(configure);
+            if (code != expected)
+                throw new Exception($"{label}: expected code {expected}, got {code}");
+            Console.WriteLine($"  {label}  ✓");
+        }
+
+        // Last write wins, field by field; a WithX after the configs is one
+        // more write. Validation is the library's, at Build.
+        Expect("threshold 1 then 3 builds", 0,
+            b => b.WithConfig(Parse("""{ "threshold": 1 }""")).WithConfig(Parse("""{ "threshold": 3 }""")));
+        Expect("threshold 3 then 1 is refused", DeRecCode.InvalidInput,
+            b => b.WithConfig(Parse("""{ "threshold": 3 }""")).WithConfig(Parse("""{ "threshold": 1 }""")));
+        Expect("a later config keeps an earlier threshold", DeRecCode.InvalidInput,
+            b => b.WithConfig(Parse("""{ "threshold": 3 }""")).WithConfig(Parse("""{ "max_subshares": "2" }""")));
+        Expect("WithThreshold after the configs wins", 0,
+            b => b.WithConfig(Parse("""{ "threshold": 3 }""")).WithConfig(Parse("""{ "max_subshares": "2" }"""))
+                .WithThreshold(2));
+        Expect("a later config overrides a WithX", DeRecCode.InvalidInput,
+            b => b.WithThreshold(3).WithConfig(Parse("""{ "threshold": 1 }""")));
+
+        // Timeouts layer per field: a later config that sets only one
+        // timeout keeps the one an earlier config set.
+        Expect("timeouts: an earlier sharing_round survives a later inbound_message", DeRecCode.FfiBadProto,
+            b => b.WithConfig(Parse("""{ "timeouts": { "sharing_round_secs": -1 } }"""))
+                .WithConfig(Parse("""{ "timeouts": { "inbound_message_secs": 120 } }""")));
+        Expect("timeouts: a later sharing_round replaces it", 0,
+            b => b.WithConfig(Parse("""{ "timeouts": { "sharing_round_secs": -1 } }"""))
+                .WithConfig(Parse("""{ "timeouts": { "sharing_round_secs": 30 } }""")));
+
+        Console.WriteLine("Protocol config record test passed.\n");
+    }
+
+    private static Node MakeConfigNode(DeRecProtocolConfig config)
+    {
+        var channelStore = new InMemoryChannelStore();
+        var shareStore = new InMemoryShareStore();
+        var secretStore = new InMemorySecretStore();
+        var userSecretStore = new InMemoryUserSecretStore();
+        var stateStore = new InMemoryStateStore();
+        var transport = new RecordingTransport();
+        var protocol = new DeRecProtocolBuilder(DefaultTestSecretId)
+            .WithStores(new DeRecStores(channelStore, shareStore, secretStore, userSecretStore, stateStore))
+            .WithTransport(transport)
+            .WithConfig(config)
+            .Build();
+        return new Node(protocol, transport, channelStore, shareStore, secretStore, userSecretStore, stateStore);
     }
 
     /// <summary>
@@ -3380,6 +3719,8 @@ internal static class Protocol
         Expect(DeRecCode.Name(DeRecCode.NoUsableEndpoint), "no_usable_endpoint", "code 121");
         Expect(DeRecCode.Name(DeRecCode.TransportInvalid), "transport_invalid", "code 120");
         Expect(DeRecCode.Name(DeRecCode.InvalidContactMessage), "invalid_contact_message", "code 41");
+        Expect(DeRecCode.Name(DeRecCode.InvalidWeight), "invalid_weight", "code 65");
+        Expect(DeRecCode.Name(DeRecCode.TooManySubshares), "too_many_subshares", "code 66");
         Expect(DeRecCode.Name(9999), "unknown", "unknown code");
         Expect(DeRecCategory.Name(DeRecCategory.Pairing), "pairing", "category 2");
         Expect(DeRecCategory.Name(DeRecCategory.InvalidInput), "input", "category 12");

@@ -579,6 +579,7 @@ fn type_files(sdk: &str) -> Vec<(String, String)> {
             "packages/dotnet/DeRec.Library/src/Protocol/Stores.cs",
             "packages/dotnet/DeRec.Library/src/Protocol/DeRecProtocol.cs",
             "packages/dotnet/DeRec.Library/src/Protocol/DeRecProtocolBuilder.cs",
+            "packages/dotnet/DeRec.Library/src/Protocol/DeRecProtocolConfig.cs",
             "packages/dotnet/DeRec.Library/src/Protocol/ParameterRange.cs",
             "packages/dotnet/DeRec.Library/src/TransportProtocol.cs",
             "packages/dotnet/DeRec.Library/src/ContactMessage.cs",
@@ -938,33 +939,28 @@ fn fixture_covers_every_ffi_protocol_export() {
 #[test]
 fn fixture_covers_every_config_option() {
     let fields = rust_struct_fields(
-        "library/src/interop/ffi/protocol/handle/mod.rs",
-        "ProtocolConfig",
+        "library/src/protocol/protocol_config.rs",
+        "DeRecProtocolConfig",
     );
-
-    // Taken as the builder's constructor argument in every SDK rather than as
-    // a setter, so it has no `builder_options` row.
-    const CONSTRUCTOR_ARGS: &[&str] = &["secret_id"];
 
     let named: BTreeSet<String> = entries("builder_options")
         .iter()
         .map(|e| field(e, "rust"))
-        .chain(CONSTRUCTOR_ARGS.iter().map(|s| (*s).to_owned()))
         .collect();
     let fields: BTreeSet<String> = fields.into_iter().collect();
     assert!(
         fields.contains("threshold"),
-        "ProtocolConfig walk found {fields:?}"
+        "DeRecProtocolConfig walk found {fields:?}"
     );
     assert_eq!(
         fields.difference(&named).collect::<Vec<_>>(),
         Vec::<&String>::new(),
-        "ProtocolConfig has these fields and api_surface.json does not name them"
+        "DeRecProtocolConfig has these fields and api_surface.json does not name them"
     );
     assert_eq!(
         named.difference(&fields).collect::<Vec<_>>(),
         Vec::<&String>::new(),
-        "api_surface.json names builder options ProtocolConfig no longer carries"
+        "api_surface.json names builder options DeRecProtocolConfig no longer carries"
     );
 }
 
@@ -1019,8 +1015,8 @@ fn rust_builder_methods_are_named_and_exported() {
             }
         ));
     }
-    // The FFI builder takes options as ProtocolConfig fields (checked above)
-    // and stores as callback tables on derec_protocol_new.
+    // The FFI builder takes options as DeRecProtocolConfig fields (checked
+    // above) and stores as callback tables on derec_protocol_new.
     let handle = read("library/src/interop/ffi/protocol/handle/mod.rs");
     for w in &wiring {
         let cb = format!("{}_cb", w.trim_start_matches("with_"));
@@ -1449,6 +1445,26 @@ fn every_sdk_builder_matches_the_core() {
                 .chain(["SecretID".to_owned()])
                 .collect();
             compare_members(&mut problems, "go", "Config", &config, &expected);
+
+            // A bundle with a Go column names the struct `Config` embeds to
+            // carry it, so a config file unmarshals straight into it.
+            let (src, masked, block) =
+                decl::go_type_block(&files, "Config", "struct").expect("go declares Config");
+            let embedded: BTreeSet<String> =
+                decl::members(&src, &masked, block.body, Lang::Go, "Config", false, false)
+                    .into_iter()
+                    .filter_map(|m| m.name.strip_prefix("embedded:").map(str::to_owned))
+                    .collect();
+            for b in &bundles {
+                if let Some(go) = opt_field(b, "go")
+                    && !embedded.contains(&go)
+                {
+                    problems.push(format!(
+                        "go: Config does not embed {go}, which carries DeRecProtocolBuilder::{}",
+                        field(b, "rust")
+                    ));
+                }
+            }
 
             // The five stores are bundled into a `Stores` struct rather than
             // passed to `New` individually; each field is the matching store

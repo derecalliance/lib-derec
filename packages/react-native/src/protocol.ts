@@ -11,6 +11,7 @@ import type {
   ContactMessage,
   ContactMode,
   DeRecEvent,
+  DeRecProtocolConfig,
   Endpoint,
   DiscoveryParams,
   PairingParams,
@@ -113,6 +114,13 @@ export function buildProtectSecretParams(params: ProtectSecretParams): Record<st
   };
   if (params.description !== undefined) {
     out.description = params.description;
+  }
+  if (params.weights != null && params.weights.size > 0) {
+    const weights: Record<string, number> = {};
+    for (const [id, weight] of params.weights) {
+      weights[id.toString()] = weight;
+    }
+    out.weights = weights;
   }
   return out;
 }
@@ -361,7 +369,12 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
-  /** Default: 3. */
+  /**
+   * Minimum number of subshares required to reconstruct the secret. A
+   * helper holds one subshare unless `ProtectSecretParams.weights` gives it a
+   * weight, so with no weights this is the number of helpers, as before.
+   * Default: 3.
+   */
   withThreshold(threshold: number): this {
     this.config.threshold = threshold;
     return this;
@@ -474,11 +487,89 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
+  /**
+   * Cap the total number of subshares one sharing round may split the
+   * secret into — the sum of every helper's weight. Crosses to the library
+   * as a decimal string. Default: unset, no cap.
+   *
+   * Checked only by `start(ProtectSecret)`, including the publishes the
+   * library starts itself: a round over the cap fails with
+   * `too_many_subshares` before anything is sent. Recovery applies no cap.
+   * Recovering costs time that grows quadratically with the total number of
+   * subshares, so the cap bounds what a later recovery must do. A cap below
+   * the threshold makes `build()` throw.
+   */
+  withMaxSubshares(max: bigint | number): this {
+    this.config.max_subshares = BigInt(max).toString();
+    return this;
+  }
+
+  /**
+   * Layer a {@link DeRecProtocolConfig} onto the builder: a field the config
+   * sets (present and not `null`) replaces what the builder currently
+   * holds, a field it leaves unset is untouched, and `timeouts` merges per
+   * field against the builder's current timeouts rather than resetting the
+   * other three. Every other nested object replaces as a whole. Apply a
+   * general config, then a per-user one, then any individual `with*` call —
+   * the last write wins per field, same as two `withConfig` calls in a row.
+   *
+   * Every key is assigned verbatim into the same `snake_case` config JSON
+   * `build()` sends to `protocol_new`, whatever it is spelled as: nothing
+   * here validates, defaults, or recognizes field names. Rust does both —
+   * `deny_unknown_fields` is what turns a misspelled key into an error.
+   *
+   * `secret_id` is not a config field — it is the constructor argument —
+   * and `build()` always sends the constructor's value last, so a config
+   * (e.g. loaded from a per-user record) can never redirect which secret
+   * this instance manages even if it carries a `secret_id` key.
+   *
+   * A config parsed from JSON can carry an own `__proto__` key. Assigning
+   * it through plain bracket notation would hit the accessor
+   * `Object.prototype` defines for that name and replace this builder's
+   * config object's prototype instead of setting a field on it — the value
+   * would then vanish from the JSON payload instead of reaching Rust to be
+   * rejected as an unknown key. `Object.defineProperty` makes it a genuine
+   * own property, the same as every other key here.
+   */
+  withConfig(config: DeRecProtocolConfig): this {
+    for (const [key, value] of Object.entries(config as Record<string, unknown>)) {
+      if (value === undefined || value === null) {
+        continue;
+      }
+      if (key === 'timeouts') {
+        const held = (this.config.timeouts as Record<string, unknown> | undefined) ?? {};
+        const merged: Record<string, unknown> = { ...held };
+        for (const [timeoutKey, timeoutValue] of Object.entries(
+          value as Record<string, unknown>,
+        )) {
+          if (timeoutValue !== undefined && timeoutValue !== null) {
+            merged[timeoutKey] = timeoutValue;
+          }
+        }
+        this.config.timeouts = merged;
+        continue;
+      }
+      if (key === '__proto__') {
+        Object.defineProperty(this.config, key, {
+          value,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+        continue;
+      }
+      this.config[key] = value;
+    }
+    return this;
+  }
+
   build(): DeRecProtocol {
     const config = {
-      secret_id: this.secretIdValue.toString(),
       replica_id: null,
       ...this.config,
+      // Last, so a config's own `secret_id` key (it is not a config field;
+      // see `withConfig`) can never override the constructor's.
+      secret_id: this.secretIdValue.toString(),
     };
     const host = (getNative() as unknown as NativeHost).protocol_new(
       JSON.stringify(config),

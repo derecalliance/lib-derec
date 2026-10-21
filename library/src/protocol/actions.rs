@@ -321,6 +321,11 @@ impl<
     /// snapshot still reaches every Destination — that's how a
     /// multi-device sync stays consistent before the application has
     /// added any user secrets.
+    ///
+    /// The publish carries no weights: every Helper receives one
+    /// subshare. An application that wants weights calls `start` with
+    /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret)
+    /// again, which publishes the next version.
     pub(super) async fn maybe_auto_publish_after_pair(
         &mut self,
         events: &[DeRecEvent],
@@ -373,6 +378,7 @@ impl<
         self.start_protect_secret(
             secrets,
             description,
+            std::collections::HashMap::new(),
             &Round {
                 reply_to: &reply_to,
                 trace_id: crate::derec_message::fresh_trace_id(),

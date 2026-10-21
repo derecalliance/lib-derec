@@ -83,6 +83,7 @@ pub(crate) mod fingerprint;
 pub(crate) mod flows;
 mod handlers;
 pub(crate) mod process;
+pub(crate) mod protocol_config;
 pub(crate) mod stores;
 pub(crate) mod sweeps;
 
@@ -98,6 +99,7 @@ use derec_proto::TransportProtocol;
 pub use error::{
     ChannelStoreError, ProcessError, Refusal, SecretStoreError, ShareStoreError, StateStoreError,
 };
+pub use protocol_config::{DeRecProtocolConfig, ExpiredChannelsConfig, TimeoutsConfig};
 use std::collections::HashMap;
 pub use traits::{
     ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
@@ -191,8 +193,7 @@ pub struct DeRecProtocol<
     /// Set via [`DeRecProtocolBuilder::with_transport`](crate::protocol::DeRecProtocolBuilder::with_transport).
     pub transport: Transport,
     /// Set via [`DeRecProtocolBuilder::with_own_transports`](crate::protocol::DeRecProtocolBuilder::with_own_transports), in preference order.
-    /// Never empty — the typestate builder cannot reach `build()` without
-    /// this slot filled. The order is the application's and is never
+    /// Never empty — `build()` refuses a builder with none set. The order is the application's and is never
     /// reinterpreted; the first entry is this device's primary endpoint.
     pub own_transports: Vec<TransportProtocol>,
     /// Configured via [`DeRecProtocolBuilder::with_unpair_ack`](crate::protocol::DeRecProtocolBuilder::with_unpair_ack).
@@ -242,6 +243,11 @@ pub struct DeRecProtocol<
     /// constraints — every peer range is accepted and outbound
     /// envelopes omit the field.
     pub(crate) parameter_range: Option<derec_proto::ParameterRange>,
+    /// Configured via [`DeRecProtocolBuilder::with_max_subshares`](crate::protocol::DeRecProtocolBuilder::with_max_subshares).
+    ///
+    /// `Some(max)` bounds the total subshares of every sharing round;
+    /// `None` applies no bound.
+    pub(crate) max_subshares: Option<u64>,
     /// Identifier of the single secret this protocol instance manages.
     ///
     /// Set at construction (`DeRecProtocolBuilder::new(secret_id)`) and

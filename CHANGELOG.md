@@ -39,26 +39,103 @@ value, checked on receipt.
   (publish a new version) so every helper holds a share in the new format,
   before relying on recovery.
 
-- **Changed: a share carries a list of Shamir points.**
+- **Changed: a share carries a list of subshares.**
   *(breaking wire and `derec-cryptography` API change; no behavior change)*
 
+  A share is what one helper holds; a subshare is one Shamir `(x, y)` pair,
+  `y = f(x)`. A share now carries one or more subshares instead of exactly
+  one pair, and the threshold `t` counts subshares.
+
   This prepares weighted helpers: an owner who trusts one helper more can
-  give it more points, so it and fewer others can recover, while no single
-  helper ever holds enough points to recover alone. The library still gives
-  every helper exactly one point; choosing weights is not yet exposed.
+  give it more subshares, so it and fewer others can recover, while no single
+  helper ever holds enough subshares to recover alone. This format change on
+  its own gives every helper exactly one subshare; choosing weights is
+  described in "Added: weighted helpers" below.
 
   - Wire: `DeRecShare.x` and `DeRecShare.y` are replaced by
-    `repeated ShamirPoint points = 2` (`ShamirPoint { bytes x = 1; bytes y = 2; }`),
+    `repeated Subshare subshares = 2` (`Subshare { bytes x = 1; bytes y = 2; }`),
     and `secretId` and `version` move to 3 and 4.
-  - Merkle leaf: one leaf per share, committing to its points in order:
-    `SHA-256(0x00 ‖ u64_be(k) ‖ for each point: u64_be(len(x)) ‖ x ‖ u64_be(len(y)) ‖ y)`,
-    with `k` the number of points. Internal nodes are unchanged.
+  - Merkle leaf: one leaf per share, committing to its subshares in order:
+    `SHA-256(0x00 ‖ u64_be(k) ‖ for each subshare: u64_be(len(x)) ‖ x ‖ u64_be(len(y)) ‖ y)`,
+    with `k` the number of subshares. Internal nodes are unchanged.
   - `derec-cryptography`: `vss::share(threshold, weights: &[u64], msg, entropy)`
     returns one `VSSShare` per weight; `VSSShare` carries
-    `points: Vec<ShamirPoint>` in place of `x` and `y`. Every weight must be
-    in `1..threshold`, there are at most 128 shares, and the weights must
-    sum to between `threshold` and 128. `verify` also rejects a share with
-    no points, more than 127 points, or a repeated x-coordinate.
+    `subshares: Vec<Subshare>` in place of `x` and `y`. Every weight must be
+    in `1..threshold`. There are at most 128 shares (one Merkle leaf each,
+    tree depth 7); the weights' sum and the threshold are not themselves
+    capped, so `2 <= threshold <= sum(weights)`. `verify` rejects a share
+    with no subshares or a repeated x-coordinate.
+
+- **Added: weighted helpers.** *(feature; every SDK)*
+
+  `DeRecFlow::ProtectSecret` gains `weights`, a map from channel id to the
+  number of subshares that helper receives this round. A paired helper
+  not named in the map still gets one subshare, so an empty (or absent) map is
+  unchanged behavior. Weights apply only to the `start` call that names
+  them — nothing is persisted per helper, and the roster does not carry
+  them; an application that wants the same weights next time passes them
+  again. Publishes the library starts on its own (after pairing completes,
+  after a fingerprint is confirmed) always give every helper one subshare;
+  restore does not publish at all.
+
+  `with_threshold` (`t`) now counts subshares, not helpers — with no
+  weights the two are the same, as before. The split runs when the paired
+  helpers' total weight is `>= t`; below that, helpers get nothing and
+  replicas still get the secret-only composite, exactly as before.
+  `SharingComplete.threshold_met` is `true` when the confirmed helpers'
+  combined weight (not their count) is `>= t`; `confirmed_count` and
+  `failed_count` keep counting helpers.
+
+  Validation runs in `start`, before anything is sent or a version is
+  consumed: every key must be a currently paired helper channel of this
+  secret, and every weight must satisfy `1 <= weight < threshold`. An
+  invalid entry fails the call as `SharingError::InvalidWeight { channel_id,
+  weight }` (FFI/error code 65, `invalid_weight`), run even when the
+  weights sum to less than the threshold.
+
+  Recovery cost grows quadratically with the total number of subshares
+  (measured in release mode on a laptop: about 0.2 s at 200, 5.5 s at 1,000
+  and 87 s at 4,000 subshares per attempt), while splitting stays cheap, so
+  nothing at sharing time reveals it. The new builder option
+  `with_max_subshares(max)` caps a round's total: a `ProtectSecret` round
+  above it — library-initiated publishes included, at one subshare per
+  helper — fails in `start`, before anything is sent or a version is
+  consumed, as `SharingError::TooManySubshares { subshares, max }`
+  (FFI/error code 66, `too_many_subshares`). Unset means no cap, as before;
+  a cap below the threshold fails `build()` with `InvalidInput`. Recovery
+  applies no cap, since a recovering device cannot know the one the secret
+  was shared under. The `vss::share` / `recover` and `request::split`
+  primitives apply none either; callers bound the total themselves. Each SDK
+  exposes the option as `WithMaxSubshares(ulong)` in .NET,
+  `Config.MaxSubshares` (`*uint64`) in Go and `withMaxSubshares(bigint |
+  number)` in Node/web/React Native, and the code as
+  `DeRecCode.TooManySubshares` / `derec.CodeTooManySubshares`. The FFI
+  `derec_protocol_new` config JSON carries it as `max_subshares`, a
+  decimal-string `u64`; absent or `null` means no cap.
+
+  `ProtectSecretStarted` and `ProtectSecretFailed` gain `weight`: the number
+  of subshares sent (or meant to be sent) to that channel this round, `1` for
+  an unlisted helper and for every library-initiated publish.
+
+  The stateless `request::split` primitive takes its channels as
+  `&[WeightedChannel]`, where `WeightedChannel = (ChannelId, u32)` pairs each
+  channel with its weight; the caller lists every channel, an ordinary
+  helper at weight `1`. Every weight must be in `1..threshold`. The FFI
+  `protect_secret` export takes the same list as aligned `channels_ptr` /
+  `weights_ptr` arrays of `channels_len` entries, and the WASM `split`
+  export as an array of `[channelId, weight]` tuples. Each SDK carries the
+  same pairing under a `WeightedChannel` type: a `[channelId, weight]`
+  tuple in Node/web/React Native, a `WeightedChannel(ChannelId, Weight)`
+  record struct in .NET, a `WeightedChannel{ChannelID, Weight}` struct in
+  Go. `split`'s `threshold > channel_count` check is now
+  `threshold > total subshares`.
+
+  At recovery, the owner now applies its own configured `max_share_size` to
+  each received share before decoding it, exactly as a helper already does
+  for an inbound `StoreShareRequest`. An oversized share is reported as
+  `RecoveryShareCorrupted { reason: Malformed }` and set aside; recovery
+  still completes from the shares that fit. No configured limit means no
+  cap, as before.
 
 - **Changed: `build()` validates the configured parameter range.**
   *(behavior change; every SDK)*
@@ -303,6 +380,79 @@ value, checked on receipt.
   - **`SecretKind::PairingContact`:** is written by the party that scans a
     contact and by the creator of a `NoKeys` contact.
   - **TypeScript `DeRecError.channel_ids`:** refers to `restore_conflict`.
+
+- **Added: `DeRecProtocolConfig` and `with_config`.** *(feature; every SDK)*
+
+  Applications load settings as a whole: general settings from the
+  environment or a config file, per-user settings from a user record.
+  `DeRecProtocolConfig` is one serializable struct holding every builder
+  data setting (threshold, max subshares, timeouts, parameter range,
+  auto-accept, auto-respond-on-failure, auto-reply-to, unpair-ack,
+  unsafe-connection, communication info, own transports, replica id), with
+  every field optional. `with_config(config)` applies only the fields that
+  are set; the per-option setters (`with_threshold`, `with_timeouts`, …)
+  stay and still work one value at a time.
+
+  **Canonical JSON**, shared by every SDK — the shape the FFI's
+  `derec_protocol_new` already accepted, minus `secret_id`: keys are
+  `snake_case`; `replica_id` and `max_subshares` (`u64`) are decimal
+  strings; `timeouts` fields are whole seconds, each independently
+  optional; nested objects (`timeouts`, `parameter_range`, `auto_accept`,
+  `own_transports` entries) use their existing shapes. **Unknown keys are
+  rejected at every nesting level**, so a misspelled key fails to parse
+  instead of being silently ignored — Rust and WASM reject it where the
+  config is parsed (`with_config`/`withConfig`, and the FFI's
+  `derec_protocol_new`); .NET and Go reject it in their own JSON readers
+  (`JsonException` / `json: unknown field`); React Native forwards every
+  key as given and relies on the library's rejection at `build()`. `null`
+  now means "unset" for every key, where the FFI's `derec_protocol_new`
+  previously treated `null` as a parse error for some of them.
+
+  **Layering:** a general config, then a per-user config, then individual
+  setter calls — last write wins, per field. A nested object (e.g.
+  `auto_accept`) is replaced as a whole unit by a later config that sets
+  it, except `timeouts`, whose per-field seconds merge individually, so a
+  later config that sets only `inbound_message_secs` keeps the
+  `sharing_round_secs` an earlier config set.
+
+  **Validation happens in `build()`**, with the same rules as the
+  per-option setters — a `threshold` of `1` from a config fails exactly as
+  `with_threshold(1)` does.
+
+  Per SDK: Rust `DeRecProtocolBuilder::with_config(DeRecProtocolConfig)`;
+  WASM, Node, web and React Native `withConfig(config)`; .NET
+  `WithConfig(DeRecProtocolConfig)`; Go has no builder — `protocol.Config`
+  embeds `DeRecProtocolConfig` (`Config{SecretID, DeRecProtocolConfig}`),
+  and layering is `json.Unmarshal` of each layer into
+  `cfg.DeRecProtocolConfig` in turn (not `Config`, which also carries
+  `SecretID`), last write wins per field through a custom
+  `UnmarshalJSON`.
+
+- **Changed (breaking, Rust): `own_transports` leaves the builder's
+  typestate.** *(breaking; Rust)*
+
+  `DeRecProtocolBuilder` now has 6 type parameters, down from 7 — the
+  `OwnTransport` slot is gone. `with_own_transports` is now an ordinary
+  setter, callable repeatedly (the last call wins) and reachable from
+  `with_config`. `build()` enforces the requirement at run time instead of
+  compile time: no own transports set, or an empty list, now returns
+  `InvalidInput("own transports must not be empty: …")` (the message is
+  unchanged) rather than failing to compile. This matches what .NET, Go,
+  TypeScript and React Native already did at run time. No code, rustdoc or
+  README named the builder's type parameters, so this needs no source
+  change beyond updating a build that names them explicitly.
+
+- **Changed (breaking, Go): `Config`'s optional fields are now
+  pointers.** *(breaking; Go)*
+
+  The data fields of `protocol.Config` moved into an embedded
+  `DeRecProtocolConfig`, so a struct literal must name it:
+  `Config{SecretID: id, DeRecProtocolConfig: DeRecProtocolConfig{…}}`;
+  promoted fields (`cfg.Threshold`, …) still read the same. `AutoAccept`,
+  `UnpairAck`, `AutoRespondOnFailure`, `AutoReplyTo` and `UnsafeConnection`
+  are now `*AutoAcceptPolicy` / `*UnpairAck` / `*bool`, so a layer can
+  express "unset" — a config that used to set one of these to its
+  zero value must now take its address.
 
 ### 0.0.8
 

@@ -515,6 +515,27 @@ func newPeer(label, uri string, threshold uint32) *peer {
 }
 
 func newPeerWithReplicaID(label, uri string, threshold uint32, replicaID *uint64) *peer {
+	p, err := newPeerWithConfig(label, uri, protocol.Config{
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold: proto.Uint32(threshold),
+			ReplicaID: replicaID,
+		},
+	})
+	must(err, fmt.Sprintf("protocol.New(%s)", label))
+	return p
+}
+
+// newPeerWithConfig builds a peer from cfg, filling in the shared secret id
+// and an HTTPS own transport at uri, and returns protocol.New's error as is.
+func newPeerWithConfig(label, uri string, cfg protocol.Config) (*peer, error) {
+	cfg.SecretID = protocolSecretID
+	cfg.OwnTransports = []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}}
+	return newPeerFromConfig(label, cfg)
+}
+
+// newPeerFromConfig builds a peer from cfg as given, addressed by its first
+// own transport, and returns protocol.New's error as is.
+func newPeerFromConfig(label string, cfg protocol.Config) (*peer, error) {
 	channelStore := newMemChannelStore()
 	shareStore := newMemShareStore()
 	secretStore := newMemSecretStore()
@@ -522,14 +543,14 @@ func newPeerWithReplicaID(label, uri string, threshold uint32, replicaID *uint64
 	stateStore := newMemStateStore()
 	transport := newMemTransport()
 
-	cfg := protocol.Config{
-		SecretID:      protocolSecretID,
-		OwnTransports: []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(threshold),
-		ReplicaID:     replicaID,
+	uri := ""
+	if len(cfg.OwnTransports) > 0 {
+		uri = cfg.OwnTransports[0].URI
 	}
 	p, err := protocol.New(protocol.Stores{Channel: channelStore, Share: shareStore, Secret: secretStore, UserSecret: userSecretStore, State: stateStore}, transport, cfg)
-	must(err, fmt.Sprintf("protocol.New(%s)", label))
+	if err != nil {
+		return nil, err
+	}
 
 	return &peer{
 		label:        label,
@@ -540,7 +561,7 @@ func newPeerWithReplicaID(label, uri string, threshold uint32, replicaID *uint64
 		channelStore: channelStore,
 		secretStore:  secretStore,
 		userSecrets:  userSecretStore,
-	}
+	}, nil
 }
 
 func (p *peer) drain() []outboxEntry {
@@ -705,9 +726,10 @@ func pairPeersWithMode(owner, helper *peer, pairingChannelID uint64, mode protoc
 // (Owner + two Helpers), each with its own in-memory stores and an
 // in-process transport, driven through a genuine pairing ->
 // protect-secret -> share-stored flow. Two Helpers, not one: the builder
-// rejects Threshold < 2, and the sharing handler only VSS-splits shares to
-// Helpers once helpers.len() >= threshold — a single Helper would never
-// observe a real ShareStored event.
+// rejects Threshold < 2, and the sharing handler only VSS-splits shares
+// once the Helpers' total subshares reach the threshold — with no
+// weighted Helper that means helpers.len() >= threshold, so a single
+// Helper would never observe a real ShareStored event.
 // runEveryContactModePairs proves this SDK can pair over all three contact
 // modes. It only ever exercised InlineKeys, so the two modes with a PrePair
 // leg — the ones where the wire choreography actually differs — were never
@@ -926,6 +948,100 @@ func runProtocol() {
 	runExpiredChannelCleanup()
 }
 
+// runProtocolWeightedProtectSecret pairs an owner with two helpers, gives one
+// of them a weight of 2 via ProtectSecretParams.Weights, and asserts the
+// resulting ProtectSecretStarted events carry that weight — keyed by the
+// long-term channel id pairing returns, not the transient pairing id (an
+// invalid key there surfaces as InvalidWeight from the core, not a silently
+// ignored weight).
+func runProtocolWeightedProtectSecret() {
+	fmt.Println("=== Protocol weighted protect-secret test ===")
+
+	const threshold = 3
+
+	owner := newPeer("owner", "https://owner-weighted.example.com", threshold)
+	helperA := newPeer("helper-a", "https://helper-a-weighted.example.com", threshold)
+	helperB := newPeer("helper-b", "https://helper-b-weighted.example.com", threshold)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+
+	channelA := pairPeers(owner, helperA, 1)
+	channelB := pairPeers(owner, helperB, 2)
+
+	secretData := []byte("weighted-helpers-secret")
+	events, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{7}, Name: "weighted secret", Data: secretData}},
+		Weights: map[uint64]uint32{channelA: 2},
+	})
+	must(err, "owner.Start(ProtectSecret, weighted)")
+
+	gotWeight := map[uint64]uint32{}
+	for _, ev := range events {
+		assertTrue(ev.Type != protocol.EventTypeProtectSecretFailed, "weighted Start(ProtectSecret) emitted ProtectSecretFailed: %+v", ev)
+		if ev.Type == protocol.EventTypeProtectSecretStarted {
+			assertTrue(ev.Weight != nil, "ProtectSecretStarted must carry Weight, got %+v", ev)
+			gotWeight[ev.ChannelID] = *ev.Weight
+		}
+	}
+	assertTrue(gotWeight[channelA] == 2, "channel-a weight: want 2, got %d", gotWeight[channelA])
+	assertTrue(gotWeight[channelB] == 1, "channel-b (unweighted) weight: want 1, got %d", gotWeight[channelB])
+
+	pumpMany([]*peer{owner, helperA, helperB})
+
+	fmt.Println("  ProtectSecretStarted carries Weight=2 for the weighted channel, Weight=1 for the unweighted one  ✓")
+	fmt.Println("Protocol weighted protect-secret test passed.")
+}
+
+// runProtocolMaxSubshares exercises Config.MaxSubshares: a cap below the
+// threshold is refused by New with CodeInvalidInput, and a round whose
+// weights total more than the cap fails Start(ProtectSecret) with
+// CodeTooManySubshares before anything is sent.
+func runProtocolMaxSubshares() {
+	fmt.Println("=== Protocol max-subshares cap test ===")
+
+	const threshold = 3
+
+	var buildErr *derec.Error
+	_, err := newPeerWithConfig("owner", "https://owner-capped.example.com", protocol.Config{
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold:    proto.Uint32(threshold),
+			MaxSubshares: proto.Uint64(threshold - 1),
+		},
+	})
+	assertTrue(errors.As(err, &buildErr) && buildErr.Code == derec.CodeInvalidInput,
+		"a cap below the threshold must fail New with CodeInvalidInput, got %v", err)
+	fmt.Println("  New refuses a cap below the threshold (CodeInvalidInput)  ✓")
+
+	owner, err := newPeerWithConfig("owner", "https://owner-capped.example.com", protocol.Config{
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold:    proto.Uint32(threshold),
+			MaxSubshares: proto.Uint64(threshold),
+		},
+	})
+	must(err, "protocol.New(owner, capped)")
+	helperA := newPeer("helper-a", "https://helper-a-capped.example.com", threshold)
+	helperB := newPeer("helper-b", "https://helper-b-capped.example.com", threshold)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+
+	channelA := pairPeers(owner, helperA, 1)
+	channelB := pairPeers(owner, helperB, 2)
+	owner.drain()
+
+	var startErr *derec.Error
+	_, err = owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{8}, Name: "capped secret", Data: []byte("capped-secret")}},
+		Weights: map[uint64]uint32{channelA: 2, channelB: 2},
+	})
+	assertTrue(errors.As(err, &startErr) && startErr.Code == derec.CodeTooManySubshares,
+		"4 subshares over a cap of 3 must fail with CodeTooManySubshares, got %v", err)
+	assertTrue(len(owner.drain()) == 0, "a round over the cap must send nothing")
+	fmt.Println("  Start(ProtectSecret) over the cap fails with CodeTooManySubshares and sends nothing  ✓")
+	fmt.Println("Protocol max-subshares cap test passed.")
+}
+
 // runShareStoreRefusal has a helper's share store refuse with
 // RefusalTooFrequent, first from Save and then from RecordVerification. The
 // helper still answers, so the owner observes ShareRejected and
@@ -1027,13 +1143,15 @@ func runExpiredChannelCleanup() {
 	transport := newMemTransport()
 
 	cfg := protocol.Config{
-		SecretID:      protocolSecretID,
-		OwnTransports: []protocol.TransportProtocolParam{{URI: "https://cleanup.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(2),
-		Timeouts: &protocol.Timeouts{
-			ExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{
-				Enabled:       false,
-				TimeoutInSecs: 900,
+		SecretID: protocolSecretID,
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			OwnTransports: []protocol.TransportProtocolParam{{URI: "https://cleanup.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(2),
+			Timeouts: &protocol.Timeouts{
+				ExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{
+					Enabled:       false,
+					TimeoutInSecs: 900,
+				},
 			},
 		},
 	}
@@ -1065,10 +1183,12 @@ func runUnsafeConnection() {
 
 	build := func(uri string, allow bool) error {
 		cfg := protocol.Config{
-			SecretID:         protocolSecretID,
-			OwnTransports:    []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
-			Threshold:        proto.Uint32(2),
-			UnsafeConnection: &allow,
+			SecretID: protocolSecretID,
+			DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+				OwnTransports:    []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
+				Threshold:        proto.Uint32(2),
+				UnsafeConnection: &allow,
+			},
 		}
 		p, err := protocol.New(
 			protocol.Stores{
@@ -1108,16 +1228,18 @@ func runUnsafeConnection() {
 // runConfigSurface exercises the config knobs and validation rules an
 // application reaches through the Go SDK, each of which crosses the FFI as a
 // JSON field. A mismatch between this shim's field names and the Rust
-// ProtocolConfig would silently drop the setting rather than fail, so each
+// DeRecProtocolConfig would fail the build rather than apply, so each
 // assertion here is checking that the value actually arrived.
 func runConfigSurface() {
 	fmt.Println("=== Protocol config surface test ===")
 
 	base := func() protocol.Config {
 		return protocol.Config{
-			SecretID:      protocolSecretID,
-			OwnTransports: []protocol.TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-			Threshold:     proto.Uint32(2),
+			SecretID: protocolSecretID,
+			DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+				OwnTransports: []protocol.TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+				Threshold:     proto.Uint32(2),
+			},
 		}
 	}
 	build := func(cfg protocol.Config) (*protocol.DeRecProtocol, error) {
@@ -1203,6 +1325,8 @@ func runConfigSurface() {
 		"CodeReplicaIDConflict must be 16, got %d", derec.CodeReplicaIDConflict)
 	assertTrue(derec.CodeNoUsableEndpoint == 121,
 		"CodeNoUsableEndpoint must be 121, got %d", derec.CodeNoUsableEndpoint)
+	assertTrue(derec.CodeTooManySubshares == 66,
+		"CodeTooManySubshares must be 66, got %d", derec.CodeTooManySubshares)
 	assertTrue(derec.CategoryStateStore == 15,
 		"CategoryStateStore must be 15, got %d", derec.CategoryStateStore)
 	fmt.Println("  error code/category values match the FFI  ✓")

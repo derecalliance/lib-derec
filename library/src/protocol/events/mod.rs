@@ -91,6 +91,11 @@ pub enum CorruptionReason {
     /// The response carries no decodable share for the requested secret and
     /// version: the share bytes are missing or undecodable, or the share is
     /// bound to another secret or version. Judged on arrival.
+    ///
+    /// Also covers a share whose committed bytes exceed this device's own
+    /// configured `parameter_range.max_share_size` (`0` or no range means
+    /// unbounded): it is set aside on size alone, before being parsed, since
+    /// the owner holds no proofs to validate it against during recovery.
     Malformed,
     /// The share decodes but its Merkle proof does not open to its own
     /// commitment root — for example a share whose value was altered after it
@@ -448,13 +453,52 @@ pub enum DeRecFlow {
     /// peer should pair just that peer; the protocol no longer accepts
     /// a per-call subset.
     ///
-    /// When the count of paired Helpers is below
+    /// When the total subshares across paired Helpers (each Helper's
+    /// weight, `1` when unlisted) is below
     /// [`crate::protocol::DeRecProtocolBuilder::with_threshold`], no VSS
     /// split runs and Helpers receive nothing — the secret still lands on
     /// any paired Replica destinations in "secret-only" form.
+    ///
+    /// Publishes the library starts on its own (after pairing completes,
+    /// after a fingerprint is confirmed) pass no weights, so every Helper
+    /// receives one subshare. That publish is still a new version, so for an
+    /// application using weights it can:
+    ///
+    /// - drop the total below the threshold: with `threshold = 4` and
+    ///   Helpers `A` (weight 3) and `B` (weight 1), pairing a third Helper
+    ///   publishes 3 subshares, so no split runs and Helpers receive nothing,
+    ///   yet the version is consumed and the newest version carries no
+    ///   Helper shares;
+    /// - change who can recover, even when the total still meets the
+    ///   threshold, since every Helper now counts for one subshare.
+    ///
+    /// An application using weights therefore calls `start` with
+    /// `ProtectSecret` and its weights again after `PairingCompleted` or a
+    /// confirmed fingerprint. The library's publish has already been
+    /// dispatched by then: its events arrive in the same `process` result
+    /// as `PairingCompleted`, and it runs inside
+    /// [`super::DeRecProtocol::verify_fingerprint`] before that returns
+    /// `true`. The application's call publishes the next version.
     ProtectSecret {
         secrets: Vec<UserSecret>,
         description: Option<String>,
+        /// Helpers that receive more than one subshare, by channel. A
+        /// paired Helper not listed receives one. Applies to this round only.
+        ///
+        /// Every key must be a paired Helper channel of this secret, and every
+        /// weight must satisfy `1 <= weight < threshold`, so no Helper can
+        /// recover alone. Any invalid entry fails the call with
+        /// [`crate::Error::Sharing`] before anything is sent or a version is
+        /// consumed.
+        ///
+        /// Large totals are costly to recover: reconstruction time grows
+        /// quadratically with the total number of subshares. A cap set with
+        /// [`crate::protocol::DeRecProtocolBuilder::with_max_subshares`]
+        /// bounds the total; a round above it fails with
+        /// [`SharingError::TooManySubshares`](crate::primitives::sharing::SharingError::TooManySubshares)
+        /// under the same guarantees. Publishes the library starts on its own
+        /// count one subshare per Helper against the same cap.
+        weights: HashMap<ChannelId, u32>,
     },
     VerifyShares {
         /// Must equal this instance's own `secret_id`.
@@ -1028,7 +1072,11 @@ pub enum DeRecEvent {
         version: u32,
         confirmed_count: usize,
         failed_count: usize,
-        /// `true` when `confirmed_count >= threshold`.
+        /// `true` when the confirmed weight `>= threshold`: the subshares
+        /// held by the confirmed Helpers, counting each Helper's weight from
+        /// the share this device dispatched to it (`1` when that share is
+        /// missing or does not decode). `confirmed_count` and `failed_count`
+        /// count Helpers.
         threshold_met: bool,
     },
 
@@ -1135,6 +1183,11 @@ pub enum DeRecEvent {
     /// treat this as a sign that the Helper's device or storage is damaged or
     /// compromised — for example by offering to unpair it. It also answers
     /// the [`Self::RecoverSecretStarted`] issued for `channel_id`.
+    ///
+    /// A share bigger than this device's own configured `max_share_size` is
+    /// also reported here, as [`CorruptionReason::Malformed`] — the owner
+    /// has no proof to check an unsolicited share against during recovery,
+    /// so a byte limit is the only bound it can enforce before parsing.
     RecoveryShareCorrupted {
         channel_id: ChannelId,
         version: u32,
@@ -1373,6 +1426,10 @@ pub enum DeRecEvent {
         /// call dispatched. One token is drawn per round, so a fan-out shares
         /// it across all of its targets.
         trace_id: u64,
+        /// The number of subshares sent to `channel_id` this round: the
+        /// weight given in [`DeRecFlow::ProtectSecret`], or `1` for a Helper
+        /// not listed and for every publish the library starts on its own.
+        weight: u32,
     },
 
     /// A share-storage request could not be dispatched to `channel_id`
@@ -1381,6 +1438,9 @@ pub enum DeRecEvent {
         channel_id: ChannelId,
         version: u32,
         error: String,
+        /// The number of subshares that were meant for `channel_id` this
+        /// round, with the same meaning as on [`Self::ProtectSecretStarted`].
+        weight: u32,
     },
 
     /// A verify-share challenge was dispatched to `channel_id` for

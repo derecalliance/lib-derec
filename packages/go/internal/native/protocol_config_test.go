@@ -8,94 +8,44 @@ import (
 	"testing"
 )
 
-func decodeConfigJSON(t *testing.T, cfg ProtocolConfig) map[string]json.RawMessage {
-	t.Helper()
-	raw, err := marshalProtocolConfig(cfg)
-	if err != nil {
-		t.Fatalf("marshalProtocolConfig: %v", err)
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		t.Fatalf("config JSON is not an object: %v", err)
-	}
-	return fields
-}
-
-// An explicit zero threshold must reach the library, which decides whether
-// it is valid; only an unset value is omitted so the library default
-// applies.
-func TestMarshalProtocolConfig_ExplicitZeroCountsAreSent(t *testing.T) {
-	zero := uint32(0)
-	fields := decodeConfigJSON(t, ProtocolConfig{SecretID: 1, Threshold: &zero})
-	got, ok := fields["threshold"]
-	if !ok {
-		t.Fatalf("threshold: explicit 0 was dropped from the config JSON")
-	}
-	if string(got) != "0" {
-		t.Fatalf("threshold: got %s, want 0", got)
-	}
-
-	fields = decodeConfigJSON(t, ProtocolConfig{SecretID: 1})
-	if _, ok := fields["threshold"]; ok {
-		t.Fatalf("threshold: unset value must be omitted so the library default applies")
-	}
-}
-
-// Timeouts cross in whole seconds, verbatim: an explicit 0 is sent, and an
-// unset field is omitted.
-func TestMarshalProtocolConfig_TimeoutsForwardedVerbatim(t *testing.T) {
-	zero, inbound := uint64(0), uint64(1)
-	fields := decodeConfigJSON(t, ProtocolConfig{
-		SecretID: 1,
-		Timeouts: &TimeoutsConfig{
-			InboundMessageSecs: &inbound,
-			SharingRoundSecs:   &zero,
-			ExpiredChannels:    &RemoveExpiredChannelsPolicy{Enabled: false, TimeoutInSecs: 900},
+// The buffer derec_protocol_new reads is the canonical config object as
+// given, with secret_id added as a decimal string so a u64 above 2^53
+// survives.
+func TestMarshalProtocolConfig_AddsSecretIDBesideTheConfig(t *testing.T) {
+	for _, tc := range []struct{ config, want string }{
+		{`{}`, `{"secret_id":"18446744073709551615"}`},
+		{`null`, `{"secret_id":"18446744073709551615"}`},
+		{
+			`{"threshold":0,"timeouts":{"sharing_round_secs":0}}`,
+			`{"secret_id":"18446744073709551615","threshold":0,"timeouts":{"sharing_round_secs":0}}`,
 		},
-	})
-	var timeouts map[string]json.RawMessage
-	if err := json.Unmarshal(fields["timeouts"], &timeouts); err != nil {
-		t.Fatalf("timeouts is not an object: %v", err)
-	}
-	want := map[string]string{
-		"inbound_message_secs": "1",
-		"sharing_round_secs":   "0",
-		"expired_channels":     `{"enabled":false,"timeout_in_secs":900}`,
-	}
-	for key, w := range want {
-		if got := string(timeouts[key]); got != w {
-			t.Fatalf("timeouts.%s: got %q, want %q", key, got, w)
+	} {
+		raw, err := marshalProtocolConfig(^uint64(0), []byte(tc.config))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.config, err)
+		}
+		var got, want any
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("%s: config JSON is not valid: %v", tc.config, err)
+		}
+		if err := json.Unmarshal([]byte(tc.want), &want); err != nil {
+			t.Fatal(err)
+		}
+		if string(mustMarshal(t, got)) != string(mustMarshal(t, want)) {
+			t.Fatalf("%s: got %s, want %s", tc.config, raw, tc.want)
 		}
 	}
-	if _, ok := timeouts["unpair_ack_secs"]; ok {
-		t.Fatal("timeouts.unpair_ack_secs: unset value must be omitted")
+
+	if _, err := marshalProtocolConfig(1, []byte(`[1]`)); err == nil {
+		t.Fatal("a config that is not a JSON object must be refused")
 	}
 }
 
-// CommunicationInfo crosses as the config JSON's "communication_info" object,
-// so derec_protocol_new's proto buffer argument stays empty; a nil or empty
-// map omits the key.
-func TestMarshalProtocolConfig_CommunicationInfoIsAJSONObject(t *testing.T) {
-	fields := decodeConfigJSON(t, ProtocolConfig{
-		SecretID:          1,
-		CommunicationInfo: map[string]string{"name": "alice", "email": "a@example.com"},
-	})
-	raw, ok := fields["communication_info"]
-	if !ok {
-		t.Fatalf("communication_info missing from config JSON: %v", fields)
+func mustMarshal(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
 	}
-	var info map[string]string
-	if err := json.Unmarshal(raw, &info); err != nil {
-		t.Fatalf("communication_info is not a string->string object: %s", raw)
-	}
-	if len(info) != 2 || info["name"] != "alice" || info["email"] != "a@example.com" {
-		t.Fatalf("communication_info: got %v", info)
-	}
-
-	for _, empty := range []map[string]string{nil, {}} {
-		fields = decodeConfigJSON(t, ProtocolConfig{SecretID: 1, CommunicationInfo: empty})
-		if _, ok := fields["communication_info"]; ok {
-			t.Fatalf("communication_info: an empty map must omit the key, got %s", fields["communication_info"])
-		}
-	}
+	return b
 }

@@ -283,6 +283,34 @@ impl<
         }
     }
 
+    /// The number of subshares this device dispatched to `channel_id` at
+    /// `version`, read from the tracking share it kept: the length of `subshares` in
+    /// the `DeRecShare` inside the stored `CommittedDeRecShare`.
+    ///
+    /// A tracking share that is missing, fails to load, does not decode or
+    /// holds no subshare (no valid share does) counts as one subshare, the weight
+    /// every Helper holds by default.
+    async fn tracked_weight(&self, channel_id: ChannelId, version: u32) -> u64 {
+        use prost::Message as _;
+        let Ok(shares) = self
+            .share_store
+            .load(self.secret_id, channel_id, &[version])
+            .await
+        else {
+            return 1;
+        };
+        shares
+            .iter()
+            .find(|share| share.version == version)
+            .and_then(|share| derec_proto::CommittedDeRecShare::decode(share.bytes.as_slice()).ok())
+            .and_then(|committed| {
+                derec_proto::DeRecShare::decode(committed.de_rec_share.as_slice()).ok()
+            })
+            .map(|share| share.subshares.len() as u64)
+            .filter(|&subshares| subshares > 0)
+            .unwrap_or(1)
+    }
+
     /// Update the active sharing round based on events produced by `process_inner`.
     ///
     /// Moves channels from `pending` to `confirmed` or `failed` as
@@ -572,7 +600,11 @@ impl<
         let failed_count = failed.len();
 
         if is_complete {
-            let threshold_met = confirmed_count >= self.threshold;
+            let mut confirmed_weight: u64 = 0;
+            for channel_id in confirmed.iter() {
+                confirmed_weight += self.tracked_weight(*channel_id, round_version).await;
+            }
+            let threshold_met = confirmed_weight >= self.threshold as u64;
             let _ = self
                 .state_store
                 .remove(
@@ -2452,6 +2484,177 @@ mod proof_cleanup_tests {
                 shares.remove_versions_call_count(ChannelId(9001), 4),
                 1,
                 "a duplicated inbound rejection must not remove the proof twice"
+            );
+        });
+    }
+}
+
+/// `SharingComplete.threshold_met` counts the subshares the confirmed
+/// helpers hold, not the helpers themselves.
+#[cfg(test)]
+mod weighted_tally_tests {
+    use super::*;
+    use crate::protocol::builder::DeRecProtocolBuilder;
+    use crate::protocol::test::{
+        InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
+        InMemUserSecretStore, NoopTransport, run_async,
+    };
+    use crate::protocol::types::Share;
+    use prost::Message as _;
+    use std::collections::HashSet;
+
+    const SECRET_ID: u64 = 0x5EED;
+    const VERSION: u32 = 3;
+    const THRESHOLD: usize = 3;
+    const A: u64 = 31;
+    const B: u64 = 32;
+    const C: u64 = 33;
+    const D: u64 = 34;
+
+    type TestProtocol = DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemPersistedStateStore,
+        NoopTransport,
+    >;
+
+    /// A protocol whose share store holds the owner's tracking share for each
+    /// of `A`..`D` at [`VERSION`], split with `A` at weight 2, and an open
+    /// round awaiting all four.
+    async fn rig() -> (TestProtocol, InMemShareStore) {
+        let channels = [
+            (ChannelId(A), 2),
+            (ChannelId(B), 1),
+            (ChannelId(C), 1),
+            (ChannelId(D), 1),
+        ];
+        let split = crate::primitives::sharing::request::split(
+            &channels,
+            SECRET_ID,
+            VERSION,
+            b"weighted tally secret",
+            THRESHOLD,
+        )
+        .expect("weighted split");
+        let shares = InMemShareStore::default();
+        for (channel_id, committed) in &split.shares {
+            shares.data.lock().unwrap().insert(
+                (SECRET_ID, channel_id.0, VERSION),
+                Share {
+                    secret_id: SECRET_ID,
+                    version: VERSION,
+                    bytes: committed.encode_to_vec(),
+                },
+            );
+        }
+
+        let mut protocol = DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(InMemChannelStore::default())
+            .with_share_store(shares.clone())
+            .with_secret_store(InMemSecretStore::default())
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(NoopTransport)
+            .with_state_store(InMemPersistedStateStore::default())
+            .with_own_transports(["https://owner.example.com"])
+            .with_threshold(THRESHOLD)
+            .build()
+            .expect("test protocol builds");
+        protocol
+            .state_store
+            .save(
+                SECRET_ID,
+                StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    version: VERSION,
+                    pending: channels.iter().map(|&(c, _)| c).collect(),
+                    confirmed: HashSet::new(),
+                    failed: HashSet::new(),
+                    pending_replicas: HashSet::new(),
+                    synced_replicas: HashSet::new(),
+                    behind_replicas: HashSet::new(),
+                    started_at: now_secs(),
+                })),
+            )
+            .await
+            .expect("seed round");
+        (protocol, shares)
+    }
+
+    fn answers(confirmed: &[u64], rejected: &[u64]) -> Vec<DeRecEvent> {
+        let mut events: Vec<DeRecEvent> = confirmed
+            .iter()
+            .map(|&c| DeRecEvent::ShareConfirmed {
+                channel_id: ChannelId(c),
+                version: VERSION,
+            })
+            .collect();
+        events.extend(rejected.iter().map(|&c| DeRecEvent::ShareRejected {
+            channel_id: ChannelId(c),
+            version: VERSION,
+            status: StatusEnum::Fail as i32,
+            memo: "rejected".to_owned(),
+        }));
+        events
+    }
+
+    fn threshold_met(events: &[DeRecEvent]) -> bool {
+        events
+            .iter()
+            .find_map(|e| match e {
+                DeRecEvent::SharingComplete {
+                    version: VERSION,
+                    threshold_met,
+                    ..
+                } => Some(*threshold_met),
+                _ => None,
+            })
+            .expect("the round completes once every helper has answered")
+    }
+
+    #[test]
+    fn threshold_met_counts_confirmed_weight() {
+        run_async(async {
+            // A (2 subshares) plus B (1 subshare) reach t = 3 with two helpers.
+            let (mut protocol, _) = rig().await;
+            let mut events = answers(&[A, B], &[C, D]);
+            protocol.update_sharing_round(&mut events).await;
+            assert!(
+                threshold_met(&events),
+                "A + B hold 3 subshares; got {events:?}"
+            );
+
+            // Three weight-1 helpers reach t = 3 without A.
+            let (mut protocol, _) = rig().await;
+            let mut events = answers(&[B, C, D], &[A]);
+            protocol.update_sharing_round(&mut events).await;
+            assert!(
+                threshold_met(&events),
+                "B + C + D hold 3 subshares; got {events:?}"
+            );
+
+            // Two weight-1 helpers hold 2 subshares, below t = 3.
+            let (mut protocol, _) = rig().await;
+            let mut events = answers(&[B, C], &[A, D]);
+            protocol.update_sharing_round(&mut events).await;
+            assert!(
+                !threshold_met(&events),
+                "B + C hold 2 subshares; got {events:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn threshold_met_counts_a_missing_tracking_share_as_one() {
+        run_async(async {
+            let (mut protocol, shares) = rig().await;
+            shares.data.lock().unwrap().remove(&(SECRET_ID, A, VERSION));
+
+            let mut events = answers(&[A, B, C], &[D]);
+            protocol.update_sharing_round(&mut events).await;
+            assert!(
+                threshold_met(&events),
+                "A's weight is unknown without its tracking share and counts as 1, so A + B + C hold 3 subshares; got {events:?}"
             );
         });
     }

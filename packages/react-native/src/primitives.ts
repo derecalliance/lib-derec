@@ -71,6 +71,7 @@ import type {
   UnpairingProcessResult,
   VerifyShareRequestMessage,
   VerifyShareResponseMessage,
+  WeightedChannel,
 } from './types';
 
 /** Shape of the `__DeRec` host object: every member is a plain callable, since
@@ -593,13 +594,23 @@ const recovery = {
 const sharing = {
   request: {
     split(
-      channels: bigint[],
+      channels: WeightedChannel[],
       secret_id: bigint,
       version: number,
       secret_data: Uint8Array,
       threshold: number,
     ): SplitResult {
-      const packed = call('protect_secret', secret_id, secret_data, channels, threshold, version);
+      const ids = channels.map(([channelId]) => channelId);
+      const weights = channels.map(([, weight]) => weight);
+      const packed = call(
+        'protect_secret',
+        secret_id,
+        secret_data,
+        ids,
+        weights,
+        threshold,
+        version,
+      );
       const shares = new Map<bigint, CommittedDeRecShare>();
       for (const entry of decodeCommittedShareEntries(packed as ArrayBuffer)) {
         shares.set(

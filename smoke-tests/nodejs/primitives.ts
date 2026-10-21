@@ -19,6 +19,7 @@ import {
   type PrePairResponseMessage,
   type SecretVersionEntry,
   type StoreShareRequestMessage,
+  type WeightedChannel,
 } from "@derec-alliance/nodejs";
 
 function sharedKey(byte: number): Uint8Array {
@@ -45,8 +46,10 @@ export function runPrimitivesSmoke(): void {
 
   console.log("=== [Primitives] Sharing Flow ===");
 
+  const channels: WeightedChannel[] = channelIds.map((id) => [id, 1]);
+
   const { shares } = primitives.sharing.request.split(
-    channelIds,
+    channels,
     secretId,
     version,
     secretData,
@@ -95,6 +98,95 @@ export function runPrimitivesSmoke(): void {
   }
 
   console.log("✓ Sharing flow passed.\n");
+
+
+  console.log("=== [Primitives] Weighted Sharing Flow ===");
+
+  // Channel 12 holds 3 subshares (weight 3); channels 11 and 13 hold
+  // one each (unweighted). Threshold 4 means channel 12 alone is one subshare
+  // short, but channel 12 + channel 11 reach it exactly (3 + 1 = 4).
+  //
+  // This package has no protobuf decoder, so the per-channel subshare count
+  // is proven structurally — through what `recovery.response.recover` can
+  // and cannot reconstruct — rather than by decoding the committed share's
+  // `de_rec_share` bytes.
+  const weightedChannelIds: bigint[] = [11n, 12n, 13n];
+  const weightedThreshold = 4;
+  const weightedSecretId = 0x0102_0304_05fen;
+  const weightedVersion = 1;
+  const weightedSecretData = new Uint8Array([9, 8, 7, 6, 5]);
+  const weightedChannels: WeightedChannel[] = [[11n, 1], [12n, 3], [13n, 1]];
+
+  const weightedKeys = new Map<bigint, Uint8Array>();
+  for (const id of weightedChannelIds) weightedKeys.set(id, sharedKey(Number(id)));
+
+  const { shares: weightedShares } = primitives.sharing.request.split(
+    weightedChannels,
+    weightedSecretId,
+    weightedVersion,
+    weightedSecretData,
+    weightedThreshold,
+  );
+  if (weightedShares.size !== weightedChannelIds.length) {
+    throw new Error(
+      `Weighted split: expected ${weightedChannelIds.length} shares, got ${weightedShares.size}`,
+    );
+  }
+
+  const weightedStoredRequests = new Map<bigint, StoreShareRequestMessage>();
+  for (const id of weightedChannelIds) {
+    const key = weightedKeys.get(id)!;
+    const committedShare = weightedShares.get(id)!;
+    const requestEnvelope = primitives.sharing.request.produce(
+      id, weightedVersion, weightedSecretId, committedShare, [], "", key,
+    );
+    const { request } = primitives.sharing.request.extract(requestEnvelope.envelope, key);
+    weightedStoredRequests.set(id, request);
+  }
+  console.log(`  [request.split] weights={channel 12: 3} → ${weightedShares.size} committed shares`);
+
+  const recoverFromWeighted = (ids: bigint[]): Uint8Array => {
+    const responses: GetShareResponseMessage[] = [];
+    for (const id of ids) {
+      const key = weightedKeys.get(id)!;
+      const stored = weightedStoredRequests.get(id)!;
+      const reqEnvelope = primitives.recovery.request.produce(id, weightedSecretId, weightedVersion, key);
+      const { request } = primitives.recovery.request.extract(reqEnvelope.envelope, key);
+      const respEnvelope = primitives.recovery.response.produce(id, request, stored, key);
+      const { response } = primitives.recovery.response.extract(respEnvelope.envelope, key);
+      responses.push(response);
+    }
+    return primitives.recovery.response.recover(weightedSecretId, weightedVersion, responses).secret_data;
+  };
+
+  // Channel 12 alone carries 3 subshares — one short of threshold 4 — so
+  // reconstruction must fail.
+  let insufficientWeightRejected = false;
+  try {
+    recoverFromWeighted([12n]);
+  } catch (e) {
+    const code = String((e as { code: unknown }).code);
+    if (code !== "reconstruction_failed") {
+      throw new Error(`weighted recovery(channel 12 alone): expected reconstruction_failed, got ${code}`);
+    }
+    insufficientWeightRejected = true;
+  }
+  if (!insufficientWeightRejected) {
+    throw new Error("weighted recovery: channel 12 alone (3 subshares) must not meet threshold 4");
+  }
+  console.log("  [recover] channel 12 alone (3 subshares < 4) refused (reconstruction_failed)  ✓");
+
+  // Channel 12 (3 subshares) + channel 11 (1 subshare) reach the threshold exactly.
+  const recoveredWeighted = recoverFromWeighted([11n, 12n]);
+  if (
+    recoveredWeighted.length !== weightedSecretData.length ||
+    !recoveredWeighted.every((b, i) => b === weightedSecretData[i])
+  ) {
+    throw new Error("weighted recovery: reconstructed bytes do not match the original secret");
+  }
+  console.log("  [recover] channel 11 + channel 12 (1 + 3 = 4 subshares) recovered the secret  ✓");
+
+  console.log("✓ Weighted sharing flow passed.\n");
 
 
   console.log("=== [Primitives] Verification Flow ===");

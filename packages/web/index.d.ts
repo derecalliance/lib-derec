@@ -615,6 +615,12 @@ export interface DiscoveryParams {
 export interface ProtectSecretParams {
   secrets: UserSecret[];
   description?: string;
+  /**
+   * Channel ID to how many subshares that channel should hold. A
+   * channel absent from the map, or an absent/null map, holds one subshare —
+   * the same roster that would be sent with no weights at all.
+   */
+  weights?: Map<bigint, number>;
 }
 export interface VerifySharesParams {
   secretId: bigint | string;
@@ -1135,14 +1141,19 @@ export type DeRecEvent =
    *  targeted channels are unaffected. */
   | { type: "DiscoveryFailed"; channel_id: string; error: string }
   /** A share-storage request was dispatched to `channel_id`. Emitted per
-   *  targeted peer by `start(ProtectSecret)`. */
-  | { type: "ProtectSecretStarted"; channel_id: string; version: number; trace_id: string }
+   *  targeted peer by `start(ProtectSecret)`. `weight` is the number of
+   *  subshares sent: the `ProtectSecretParams.weights` entry for this
+   *  channel, or 1 when absent. */
+  | { type: "ProtectSecretStarted"; channel_id: string; version: number; trace_id: string; weight: number }
   /** A share-storage request could not be dispatched to `channel_id`. */
   | {
       type: "ProtectSecretFailed";
       channel_id: string;
       version: number;
       error: string;
+      /** Number of subshares that were to be sent to this channel; see
+       *  `ProtectSecretStarted.weight`. */
+      weight: number;
     }
   /** A verify-share challenge was dispatched to `channel_id`. */
   | { type: "VerifySharesStarted"; channel_id: string; version: number; trace_id: string }
@@ -1232,15 +1243,111 @@ export interface StoresInit {
 }
 
 /**
+ * `parameter_range` bounds inside {@link DeRecProtocolConfig}. Each bound is
+ * a JSON number or a decimal string — the string form carries a bound past
+ * `Number.MAX_SAFE_INTEGER` through a config file or a JSON encoder whose
+ * numbers are `f64`. An absent bound is `0` ("no bound"), the same as
+ * {@link DeRecProtocolBuilder.withParameterRange}.
+ */
+export interface DeRecParameterRangeConfig {
+  min_share_size?: number | string;
+  max_share_size?: number | string;
+  min_time_between_verifications?: number | string;
+  max_time_between_verifications?: number | string;
+  min_time_between_share_updates?: number | string;
+  max_time_between_share_updates?: number | string;
+  min_unresponsive_deletion_timeout?: number | string;
+  max_unresponsive_deletion_timeout?: number | string;
+  min_unresponsive_deactivation_timeout?: number | string;
+  max_unresponsive_deactivation_timeout?: number | string;
+}
+
+/**
+ * `auto_accept` inside {@link DeRecProtocolConfig}: the same eight flows as
+ * {@link AutoAcceptPolicy}, named as the canonical JSON spells them rather
+ * than in `camelCase`. An absent flow is `false`. See {@link AutoAcceptPolicy}
+ * for per-field caveats.
+ */
+export interface DeRecAutoAcceptConfig {
+  pairing?: boolean;
+  pre_pair?: boolean;
+  store_share?: boolean;
+  verify_share?: boolean;
+  discovery?: boolean;
+  get_share?: boolean;
+  unpair?: boolean;
+  update_channel_info?: boolean;
+}
+
+/**
+ * Every data setting of {@link DeRecProtocolBuilder} in one serializable
+ * value, in the canonical `snake_case` JSON shape every SDK accepts — the
+ * format for a config file or a user record. Passed to
+ * {@link DeRecProtocolBuilder.withConfig}.
+ *
+ * Every field is optional: an absent or `null` field leaves that setting
+ * unset. Stores, the delivery transport and the constructor's `secretId` are
+ * not settings and are not carried here.
+ *
+ * Configs layer: apply a general config, then a per-user one, then any
+ * individual `with*` call, and the last write wins per field —
+ * `timeouts` merges per field too, so a config that sets only
+ * `inbound_message_secs` keeps whatever `sharing_round_secs` an earlier
+ * config or call set. Every other nested object (`parameter_range`,
+ * `auto_accept`, `own_transports`) replaces as a whole.
+ *
+ * Values set through a field here are validated by `build()` exactly as the
+ * matching `with*` setter's value would be: there is one rule set.
+ *
+ * ```json
+ * {
+ *   "threshold": 3,
+ *   "max_subshares": "12",
+ *   "timeouts": { "inbound_message_secs": 120, "sharing_round_secs": 30 },
+ *   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
+ *   "auto_accept": { "pairing": true, "store_share": true },
+ *   "auto_respond_on_failure": false,
+ *   "auto_reply_to": false,
+ *   "unpair_ack": "required",
+ *   "unsafe_connection": false,
+ *   "communication_info": { "name": "alice" },
+ *   "own_transports": [{ "uri": "https://me.example.com/derec", "protocol": "https" }],
+ *   "replica_id": "9007199254740993"
+ * }
+ * ```
+ */
+export interface DeRecProtocolConfig {
+  threshold?: number;
+  /** Decimal string. A `bigint` throws `decode_error`; call
+   *  {@link DeRecProtocolBuilder.withMaxSubshares} directly for a `bigint`. */
+  max_subshares?: string;
+  timeouts?: Timeouts;
+  parameter_range?: DeRecParameterRangeConfig;
+  auto_accept?: DeRecAutoAcceptConfig;
+  auto_respond_on_failure?: boolean;
+  auto_reply_to?: boolean;
+  /** Its name, or the discriminant `0` (`"required"`) / `1`
+   *  (`"not_required"`). */
+  unpair_ack?: UnpairAck | 0 | 1;
+  unsafe_connection?: boolean;
+  communication_info?: Record<string, string>;
+  own_transports?: Endpoint[];
+  /** Decimal string. A `bigint` throws `decode_error`; call
+   *  {@link DeRecProtocolBuilder.withReplicaId} directly for a `bigint`. */
+  replica_id?: string;
+}
+
+/**
  * Fluent builder for {@link DeRecProtocol}. Mirrors the Rust
  * `DeRecProtocolBuilder` and the dotnet `DeRecProtocolBuilder`
  * method-for-method so a developer who already knows one SDK can move
  * between them without reaching for reference docs.
  *
  * Required setters: `withChannelStore`, `withShareStore`,
- * `withSecretStore`, `withUserSecretStore`, `withStateStore`,
- * `withTransport`, and `withOwnTransports`. Calling `build()` without all
- * seven throws.
+ * `withSecretStore`, `withUserSecretStore`, `withStateStore`, and
+ * `withTransport`. Calling `build()` without all six throws. Own transports
+ * come from `withOwnTransports` or a config applied with `withConfig`;
+ * `build()` fails with `InvalidInput` if none are set.
  *
  * An optional setter that is never called leaves the library's default in
  * force.
@@ -1289,7 +1396,14 @@ export declare class DeRecProtocolBuilder {
    */
   withOwnTransports(transports: Endpoint[]): DeRecProtocolBuilder;
 
-  /** Minimum number of shares required to reconstruct the secret. Default: 3. */
+  /**
+   * Minimum number of subshares required to reconstruct the secret.
+   *
+   * A Helper holds one subshare unless `ProtectSecretParams.weights` gives it
+   * a weight, so with no weights this is the number of Helpers, as before.
+   * Every weight must be below this threshold, so no single Helper can
+   * recover alone. Default: 3.
+   */
   withThreshold(threshold: number): DeRecProtocolBuilder;
   /**
    * Configure how long the protocol waits on each thing that can keep it
@@ -1373,6 +1487,36 @@ export declare class DeRecProtocolBuilder {
    * deletion and deactivation timeouts are checked at pairing only.
    */
   withParameterRange(range: Partial<ParameterRange>): DeRecProtocolBuilder;
+  /**
+   * Cap the total number of subshares one sharing round may split the
+   * secret into — the sum of every helper's weight. Default: unset, no
+   * cap.
+   *
+   * Checked only by `start(ProtectSecret)`, including the publishes the
+   * library starts itself: a round over the cap fails with
+   * `too_many_subshares` before anything is sent. Recovery applies no cap.
+   * Recovering costs time that grows quadratically with the total number of
+   * subshares, so the cap bounds what a later recovery must do. A cap below
+   * the threshold makes `build()` throw.
+   */
+  withMaxSubshares(max: bigint | number): DeRecProtocolBuilder;
+
+  /**
+   * Layer a {@link DeRecProtocolConfig} onto the builder: a field the config
+   * sets replaces what the builder currently holds, a field it leaves unset
+   * is untouched, and `timeouts` merges per field against the builder's
+   * current timeouts rather than resetting the other three. Every other
+   * nested object replaces as a whole. Apply a general config, then a
+   * per-user one, then any individual `with*` call — the last write wins
+   * per field, same as two `withConfig` calls in a row.
+   *
+   * Applies the fields; does not validate them. `build()` runs exactly the
+   * rules the matching `with*` setter documents.
+   *
+   * Throws `decode_error` if `config` is not a plain object in the
+   * canonical shape, or if it (or a nested object) has an unknown key.
+   */
+  withConfig(config: DeRecProtocolConfig): DeRecProtocolBuilder;
 
   /**
    * Finalize the configuration. Throws if any of the required setters
@@ -1964,6 +2108,12 @@ export interface ProcessPrePairResult {
   nonce: bigint;
 }
 
+/**
+ * A channel paired with how many subshares it holds. A weight of `1` is an
+ * ordinary helper; every weight must satisfy `1 <= weight < threshold`.
+ */
+export type WeightedChannel = [channelId: bigint, weight: number];
+
 export interface SplitResult {
   /** Map keyed by channel id (`bigint`). */
   shares: Map<bigint, CommittedDeRecShare>;
@@ -2239,7 +2389,9 @@ export declare const primitives: {
   sharing: {
     request: {
       split(
-        channels: bigint[],
+        /** Every channel the secret is split to, each with its own weight
+         *  (`1` for an ordinary helper). See {@link WeightedChannel}. */
+        channels: WeightedChannel[],
         secret_id: bigint,
         version: number,
         secret_data: Uint8Array,

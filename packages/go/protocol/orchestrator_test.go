@@ -110,9 +110,11 @@ func newOrchestratorPeerWith(t *testing.T, label, uri string, threshold uint32, 
 	transport := newInProcessTransport()
 
 	cfg := Config{
-		SecretID:      orchestratorSecretID,
-		OwnTransports: []TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(threshold),
+		SecretID: orchestratorSecretID,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(threshold),
+		},
 	}
 	if configure != nil {
 		configure(&cfg)

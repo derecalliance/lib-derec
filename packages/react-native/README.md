@@ -324,6 +324,26 @@ for its duration. Applications that need this work off the JS thread should
 drive it through `DeRecProtocol` (e.g. `start(FlowKind.ProtectSecret, ...)`)
 instead of calling the primitive directly.
 
+`split`'s `channels` argument is a `WeightedChannel[]` — `[channelId,
+weight]` tuples, one per channel, letting a chosen channel hold more than
+one subshare (e.g. a device the owner trusts more than the others). A
+weight of `1` is an ordinary helper holding a single subshare, so with every
+weight at `1`, `threshold` counts helpers as before. `ProtectSecretParams`
+accepts an equivalent `weights: Map<bigint, number>` when driving the flow
+through `DeRecProtocol`; `ProtectSecretStarted` and `ProtectSecretFailed`
+report the resulting `weight` for the channel they name.
+
+`withMaxSubshares(max)` on the builder caps the total subshares one round
+splits the secret into — the sum of every helper's weight. Unset means no
+cap. Recovery time grows quadratically with that total (about 0.2 s at 200,
+5.5 s at 1,000 and 87 s at 4,000 subshares per attempt) while splitting stays
+cheap, so this is the place to bound it. A round over the cap fails
+`start(FlowKind.ProtectSecret, ...)` with code `too_many_subshares` before
+anything is sent; publishes the library starts itself respect it too. A cap
+below the threshold makes `build()` throw `invalid_input`. The cap applies at
+sharing only, never at recovery: a recovering device cannot know the cap the
+shares were made under.
+
 **Do not call protocol methods from inside a store callback.** A store
 method (`load`, `save`, `remove`, ...) is invoked as a callback into
 JavaScript, with the protocol's worker blocked waiting for the promise that
@@ -358,6 +378,85 @@ call sites hand the id straight to the native layer rather than round-
 tripping it through storage. Both conventions are deliberate; keep track of
 which side of the boundary an id is on rather than assuming one form
 everywhere.
+
+---
+
+## Configuration from a file or record
+
+Applications usually load settings as a whole: general settings from the
+environment or a config file, per-user settings from a user record.
+`DeRecProtocolConfig` holds every data setting of the builder, each one
+optional, and `withConfig` applies it in one call:
+
+```ts
+import { DeRecProtocolBuilder } from "@derec-alliance/react-native";
+import type { DeRecProtocolConfig } from "@derec-alliance/react-native";
+
+const general: DeRecProtocolConfig = JSON.parse(generalJson);
+const perUser: DeRecProtocolConfig = JSON.parse(userRecordJson);
+
+const protocol = new DeRecProtocolBuilder(secretId)
+  .withChannelStore(channelStore)
+  .withShareStore(shareStore)
+  .withSecretStore(secretStore)
+  .withUserSecretStore(userSecretStore)
+  .withStateStore(stateStore)
+  .withTransport(myTransport)
+  .withConfig(general)   // 1. general settings
+  .withConfig(perUser)   // 2. per-user settings
+  .withThreshold(4)      // 3. individual setters
+  .build();
+```
+
+- **Only set (present and non-`null`) fields are applied.** An absent or
+  `null` field leaves whatever the builder already holds.
+- **Last write wins, per field.** Nested objects replace the builder's value
+  as a whole, except `timeouts`: each of its fields is merged separately, so
+  a per-user config that sets only `inbound_message_secs` keeps the
+  `sharing_round_secs` the general config set.
+- **This binding assigns; it validates nothing.** Every key is forwarded
+  verbatim, under its own spelling, into the same `snake_case` config JSON
+  `build()` sends over the FFI. Rust applies the same rules a matching
+  `with*` setter's value would and rejects an unknown key at any level — a
+  misspelled key, or a value that fails validation, throws from `build()`
+  rather than being silently ignored.
+- **Stores, the transport and the constructor's `secretId` are not settings**
+  and are not carried in the config.
+- **A `secret_id` key in a config is ignored, not rejected.** `build()`
+  assigns the constructor's `secretId` last, so a config carrying a
+  `secret_id` key (for example a per-user record that includes it by
+  mistake) never changes which secret this instance manages. Every other
+  SDK rejects that key outright, since `DeRecProtocolConfig` has no
+  `secret_id` field there and unknown keys fail.
+
+The canonical JSON, shared by every SDK, is:
+
+```json
+{
+  "threshold": 3,
+  "max_subshares": "12",
+  "timeouts": {
+    "inbound_message_secs": 300,
+    "sharing_round_secs": 60,
+    "unpair_ack_secs": 60,
+    "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
+  },
+  "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
+  "auto_accept": { "pairing": true, "store_share": true },
+  "auto_respond_on_failure": false,
+  "auto_reply_to": false,
+  "unpair_ack": "required",
+  "unsafe_connection": false,
+  "communication_info": { "name": "alice" },
+  "own_transports": [{ "uri": "https://me.example.com/derec", "protocol": "https" }],
+  "replica_id": "9007199254740993"
+}
+```
+
+Keys are `snake_case` and every key is optional. `replica_id` and
+`max_subshares` are `u64` values written as decimal strings. Timeouts are
+whole seconds. See the `DeRecProtocolConfig` doc comment in `src/types.ts` for
+every field's accepted forms.
 
 ---
 

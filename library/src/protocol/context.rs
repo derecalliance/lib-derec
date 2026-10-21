@@ -35,8 +35,8 @@ pub(crate) struct Local<'a> {
     /// `DeRecProtocol::replica_id`.
     pub(crate) replica_id: Option<u64>,
     /// Every endpoint this device advertises, in preference order. Never
-    /// empty — the typestate builder cannot reach `build()` with the slot
-    /// unfilled.
+    /// empty — `build()` refuses a builder with none, and
+    /// `set_own_transports` refuses an empty list.
     pub(crate) own_transports: &'a [TransportProtocol],
     /// Which peer-supplied endpoint schemes this device will accept.
     pub(crate) policy: TransportPolicy,

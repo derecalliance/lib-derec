@@ -94,6 +94,12 @@ fn parse_protect_secret_flow(params_json: &[u8]) -> Result<DeRecFlow, String> {
     Ok(DeRecFlow::ProtectSecret {
         secrets,
         description: raw.description,
+        weights: raw
+            .weights
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(channel_id, weight)| (ChannelId(channel_id), weight))
+            .collect(),
     })
 }
 
@@ -207,6 +213,11 @@ struct ProtectSecretParamsJson {
     secrets: Vec<UserSecretJson>,
     #[serde(default)]
     description: Option<String>,
+    /// Channel ID (a decimal string, as JSON object keys are) to how many
+    /// subshares that channel holds. Absent, `null` or empty means every
+    /// channel holds one subshare.
+    #[serde(default)]
+    weights: Option<HashMap<u64, u32>>,
 }
 
 #[derive(Deserialize)]
@@ -278,4 +289,36 @@ fn parse_unpair_replica_flow(params_json: &[u8]) -> Result<DeRecFlow, String> {
         replica_id,
         memo: p.memo,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn protect_secret_weights(params_json: &[u8]) -> Result<HashMap<ChannelId, u32>, String> {
+        match parse_flow(FLOW_KIND_PROTECT_SECRET, params_json)? {
+            DeRecFlow::ProtectSecret { weights, .. } => Ok(weights),
+            _ => panic!("FLOW_KIND_PROTECT_SECRET parsed to another flow"),
+        }
+    }
+
+    #[test]
+    fn protect_secret_weights_are_keyed_by_decimal_channel_id() {
+        let weights = protect_secret_weights(br#"{"secrets":[],"weights":{"7":2}}"#)
+            .expect("weights should parse");
+        assert_eq!(weights, HashMap::from([(ChannelId(7), 2)]));
+    }
+
+    #[test]
+    fn protect_secret_weights_absent_means_none() {
+        let weights =
+            protect_secret_weights(br#"{"secrets":[]}"#).expect("absent weights should parse");
+        assert!(weights.is_empty());
+    }
+
+    #[test]
+    fn protect_secret_weights_reject_a_non_numeric_key() {
+        let result = protect_secret_weights(br#"{"secrets":[],"weights":{"seven":2}}"#);
+        assert!(result.is_err(), "a non-numeric channel id must be rejected");
+    }
 }

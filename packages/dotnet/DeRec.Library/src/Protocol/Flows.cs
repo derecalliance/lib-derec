@@ -144,6 +144,15 @@ public sealed record ProtectSecretParams
     [JsonPropertyName("description")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Description { get; init; }
+
+    /// <summary>
+    /// Channel ID to how many subshares that channel should hold. A
+    /// channel absent from the map, or an absent/null map, holds one subshare —
+    /// the same roster that would be sent with no weights at all.
+    /// </summary>
+    [JsonPropertyName("weights")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyDictionary<ulong, uint>? Weights { get; init; }
 }
 
 /// <summary>Params for <see cref="FlowKind.VerifyShares"/>.</summary>
@@ -945,6 +954,11 @@ public sealed record ProtectSecretStartedEvent : DeRecEvent
     /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
     /// of its targets, and the peer echoes it on the response.</summary>
     public required ulong TraceId { get; init; }
+
+    /// <summary>Number of subshares sent to this channel: the
+    /// <see cref="ProtectSecretParams.Weights"/> entry for it, or 1 when
+    /// absent.</summary>
+    public required uint Weight { get; init; }
 }
 
 public sealed record ProtectSecretFailedEvent : DeRecEvent
@@ -953,6 +967,10 @@ public sealed record ProtectSecretFailedEvent : DeRecEvent
     public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
     public required string Error { get; init; }
+
+    /// <summary>Number of subshares that were to be sent to this
+    /// channel; see <see cref="ProtectSecretStartedEvent.Weight"/>.</summary>
+    public required uint Weight { get; init; }
 }
 
 public sealed record VerifySharesStartedEvent : DeRecEvent
@@ -1291,12 +1309,14 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
                 TraceId = ReadId(root.GetProperty("trace_id")),
+                Weight = root.GetProperty("weight").GetUInt32(),
             },
             "ProtectSecretFailed" => new ProtectSecretFailedEvent
             {
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
                 Error = root.GetProperty("error").GetString() ?? string.Empty,
+                Weight = root.GetProperty("weight").GetUInt32(),
             },
             "VerifySharesStarted" => new VerifySharesStartedEvent
             {

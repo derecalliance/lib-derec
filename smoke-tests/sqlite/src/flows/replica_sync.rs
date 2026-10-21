@@ -165,6 +165,7 @@ pub async fn run() {
         .start(DeRecFlow::ProtectSecret {
             secrets: vec![s1.clone()],
             description: Some("v=2 explicit publish".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .unwrap();
@@ -260,6 +261,7 @@ pub async fn run() {
         .start(DeRecFlow::ProtectSecret {
             secrets: vec![s1.clone(), s2.clone()],
             description: Some("v=6 explicit publish".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .unwrap();

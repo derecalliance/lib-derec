@@ -5,7 +5,7 @@ use crate::extensions::request_message::RequestMessageExt as _;
 use crate::primitives::sharing::SharingError;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
-    types::{ChannelId, SharedKey},
+    types::{ChannelId, SharedKey, WeightedChannel},
     utils::{generate_seed, verify_timestamps},
 };
 use derec_cryptography::vss;
@@ -59,23 +59,39 @@ pub struct ExtractResult {
 /// [`produce`] together with the Helper's shared key to produce the encrypted
 /// delivery envelope.
 ///
+/// # Weighted channels
+///
+/// Each entry of `channels` is a [`WeightedChannel`]: a Helper's [`ChannelId`]
+/// together with its weight, the number of subshares (Shamir points) its share
+/// carries. The caller lists **every** channel the secret is shared with,
+/// giving an ordinary Helper weight `1`; there is no implicit default. Any
+/// `threshold` subshares reconstruct the secret, so a Helper of weight `w`
+/// counts as `w` Helpers toward the threshold.
+///
 /// # Deterministic channel/share assignment
 ///
 /// The input `channels` slice is sorted by [`ChannelId`] before shares are assigned.
 /// Generated VSS shares are assigned in that sorted order. Duplicate channel IDs are
-/// rejected with [`SharingError::DuplicateChannelId`].
+/// rejected with [`SharingError::DuplicateChannelId`], whatever weights they carry.
+/// Each channel's weight travels with its ID, so the subshare count a channel
+/// receives is independent of the order `channels` is given in; sort order only
+/// affects which subshares a channel is handed.
 ///
 /// # Arguments
 ///
-/// * `channels` - Slice of Helper [`ChannelId`] values. Each entry receives exactly
-///   one committed share. Must not be empty. Duplicate entries are rejected.
+/// * `channels` - Slice of [`WeightedChannel`] entries, one per Helper. Each entry
+///   receives a committed share holding `weight` subshares. Must not be empty.
+///   Duplicate channel IDs are rejected. Every weight must satisfy
+///   `1 <= weight < threshold`: a weight of `threshold` or more would let a single
+///   Helper reconstruct the secret alone.
 /// * `secret_id` - Identifier of the secret being protected. Embedded into each
 ///   generated share. Must not be empty.
 /// * `version` - Logical version of this secret distribution. Embedded into each
 ///   generated share.
 /// * `secret_data` - Raw secret bytes to split using VSS. Must not be empty.
-/// * `threshold` - Minimum number of shares required to reconstruct the secret.
-///   Must satisfy `2 <= threshold <= channels.len()`.
+/// * `threshold` - Minimum number of subshares required to reconstruct the secret.
+///   Must satisfy `2 <= threshold <= total subshares`, where total subshares is the
+///   sum of every channel's weight.
 ///
 /// # Returns
 ///
@@ -90,9 +106,24 @@ pub struct ExtractResult {
 /// - [`SharingError::EmptyChannels`] if `channels` is empty
 /// - [`SharingError::EmptySecretData`] if `secret_data` is empty
 /// - [`SharingError::DuplicateChannelId`] if `channels` contains any repeated ID
-/// - [`SharingError::InvalidThreshold`] if `threshold` does not satisfy
-///   `2 <= threshold <= channels.len()`
+/// - [`SharingError::InvalidThreshold`] if `threshold < 2`, checked before any
+///   weight is judged against it — a threshold below `2` admits no valid
+///   weight, so this is reported as the threshold's fault
+/// - [`SharingError::InvalidWeight`] if a weight is not in `1..threshold`; the
+///   lowest such channel ID is reported
+/// - [`SharingError::InvalidThreshold`] if `threshold > total subshares`,
+///   checked only once every weight has passed
 /// - [`SharingError::VssShareFailed`] if the underlying VSS algorithm fails
+///
+/// # Cost
+///
+/// Splitting stays cheap at any total, but reconstructing the secret does not:
+/// reconstruction time grows quadratically with the total number of subshares.
+/// Measured in release mode on a laptop, one recovery attempt takes about
+/// 0.2 s at 200 subshares, 5.5 s at 1,000 and 87 s at 4,000. This function
+/// applies no cap and nothing here signals the cost, so callers should bound
+/// the total themselves — or use the orchestrator, which bounds it with
+/// [`DeRecProtocolBuilder::with_max_subshares`](crate::protocol::DeRecProtocolBuilder::with_max_subshares).
 ///
 /// # Security Notes
 ///
@@ -102,16 +133,17 @@ pub struct ExtractResult {
 ///
 /// ```
 /// use derec_library::primitives::sharing::request::{split, SplitResult};
-/// use derec_library::types::ChannelId;
+/// use derec_library::types::{ChannelId, WeightedChannel};
 ///
-/// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
+/// // Channel 3 holds two subshares; the others hold one each.
+/// let channels: [WeightedChannel; 3] = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 2)];
 ///
 /// let SplitResult { shares } = split(
 ///     &channels,
 ///     1,
 ///     1,
 ///     b"super_secret_value",
-///     2,
+///     3,
 /// ).expect("split failed");
 ///
 /// assert_eq!(shares.len(), 3);
@@ -129,7 +161,7 @@ pub struct ExtractResult {
     )
 )]
 pub fn split(
-    channels: &[ChannelId],
+    channels: &[WeightedChannel],
     secret_id: u64,
     version: u32,
     secret_data: impl AsRef<[u8]>,
@@ -138,9 +170,8 @@ pub fn split(
     let secret_data = secret_data.as_ref();
 
     let ordered_channels = validate_split_inputs(channels, secret_data, threshold)?;
-    let channel_count = ordered_channels.len();
 
-    let vss_shares = generate_vss_shares(secret_data, threshold, channel_count)?;
+    let vss_shares = generate_vss_shares(secret_data, threshold, &ordered_channels)?;
 
     let shares = build_shares(ordered_channels, vss_shares, secret_id, version);
 
@@ -189,7 +220,7 @@ pub fn split(
 /// use derec_library::primitives::sharing::request::{split, produce, SplitResult, ProduceResult};
 /// use derec_library::types::ChannelId;
 ///
-/// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
+/// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
 /// let SplitResult { shares } = split(&channels, 1, 1, b"super_secret_value", 2)
 ///     .expect("split failed");
 ///
@@ -319,7 +350,7 @@ pub fn produce(
 /// use derec_library::primitives::sharing::request::{split, produce, extract, SplitResult, ProduceResult, ExtractResult};
 /// use derec_library::types::ChannelId;
 ///
-/// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
+/// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
 /// let SplitResult { shares } = split(&channels, 1, 1, b"super_secret_value", 2)
 ///     .expect("split failed");
 ///
@@ -381,28 +412,31 @@ pub fn extract(
 fn generate_vss_shares(
     secret_data: &[u8],
     threshold: usize,
-    channels_len: usize,
+    ordered_channels: &[WeightedChannel],
 ) -> Result<Vec<derec_cryptography::vss::VSSShare>, SharingError> {
     let entropy = generate_seed::<32>();
     let t = threshold as u64;
-    let weights = vec![1u64; channels_len];
+    let weights: Vec<u64> = ordered_channels
+        .iter()
+        .map(|&(_, weight)| weight as u64)
+        .collect();
 
     vss::share(t, &weights, secret_data, &entropy)
         .map_err(|source| SharingError::VssShareFailed { source })
 }
 
 fn build_shares(
-    ordered_channels: Vec<ChannelId>,
+    ordered_channels: Vec<WeightedChannel>,
     vss_shares: Vec<derec_cryptography::vss::VSSShare>,
     secret_id: u64,
     version: u32,
 ) -> HashMap<ChannelId, CommittedDeRecShare> {
     let mut shares = HashMap::with_capacity(ordered_channels.len());
 
-    for (channel_id, share) in ordered_channels.into_iter().zip(vss_shares) {
+    for ((channel_id, _), share) in ordered_channels.into_iter().zip(vss_shares) {
         let derec_share = DeRecShare {
             encrypted_secret: share.encrypted_secret.clone(),
-            points: crate::extensions::derec_share::to_wire_points(&share.points),
+            subshares: crate::extensions::derec_share::to_wire_subshares(&share.subshares),
             secret_id,
             version,
         };
@@ -427,10 +461,10 @@ fn build_shares(
 }
 
 fn validate_split_inputs(
-    channels: &[ChannelId],
+    channels: &[WeightedChannel],
     secret_data: &[u8],
     threshold: usize,
-) -> Result<Vec<ChannelId>, crate::Error> {
+) -> Result<Vec<WeightedChannel>, crate::Error> {
     if channels.is_empty() {
         #[cfg(feature = "logging")]
         tracing::warn!("channels list is empty");
@@ -443,31 +477,71 @@ fn validate_split_inputs(
         return Err(SharingError::EmptySecretData.into());
     }
 
-    let mut ordered_channels: Vec<ChannelId> = channels.to_vec();
-    ordered_channels.sort();
+    let mut ordered_channels: Vec<WeightedChannel> = channels.to_vec();
+    ordered_channels.sort_by_key(|&(channel_id, _)| channel_id);
     for pair in ordered_channels.windows(2) {
-        if pair[0] == pair[1] {
+        if pair[0].0 == pair[1].0 {
             #[cfg(feature = "logging")]
             tracing::warn!("duplicate channel ID detected");
-            return Err(SharingError::DuplicateChannelId(pair[0].into()).into());
+            return Err(SharingError::DuplicateChannelId(pair[0].0.into()).into());
         }
     }
 
     let channel_count = ordered_channels.len();
-
-    if threshold < 2 || threshold > channel_count {
+    let subshares = total_subshares(&ordered_channels);
+    let invalid_threshold = || {
         #[cfg(feature = "logging")]
         tracing::warn!(
             threshold = threshold,
             channels = channel_count,
+            subshares = subshares,
             "threshold out of valid range"
         );
-        return Err(SharingError::InvalidThreshold {
+        SharingError::InvalidThreshold {
             threshold,
             channels: channel_count,
+            subshares,
         }
-        .into());
+    };
+
+    // A threshold below 2 admits no valid weight, so it is reported as the
+    // threshold's fault before any weight is judged against it.
+    if threshold < 2 {
+        return Err(invalid_threshold().into());
+    }
+
+    for &(channel_id, weight) in &ordered_channels {
+        validate_weight(channel_id, weight, threshold)?;
+    }
+
+    if threshold as u64 > subshares {
+        return Err(invalid_threshold().into());
     }
 
     Ok(ordered_channels)
+}
+
+/// Checks that a channel's weight is in `1..threshold` — the same
+/// `1 <= w < threshold` constraint [`derec_cryptography::vss::share`] enforces
+/// per subshare-holder. A weight of `threshold` or more would let one Helper
+/// reconstruct the secret alone; a weight of `0` would leave it holding no
+/// subshare.
+pub(crate) fn validate_weight(
+    channel_id: ChannelId,
+    weight: u32,
+    threshold: usize,
+) -> Result<(), SharingError> {
+    if weight == 0 || weight as u64 >= threshold as u64 {
+        return Err(SharingError::InvalidWeight {
+            channel_id: channel_id.into(),
+            weight,
+        });
+    }
+    Ok(())
+}
+
+/// The total number of subshares `channels` will hold: the sum of every
+/// channel's weight.
+pub(crate) fn total_subshares(channels: &[WeightedChannel]) -> u64 {
+    channels.iter().map(|&(_, weight)| weight as u64).sum()
 }

@@ -326,11 +326,32 @@ using DeRec.Library.Primitives;
 
 ulong secretId = 42;
 byte[] secretData = System.Text.Encoding.UTF8.GetBytes("super-secret");
-ulong[] channelIds = { 1, 2, 3 };
-ulong threshold = 2;  // must satisfy 2 <= threshold <= channelIds.Length
+// Every channel is listed with its weight — the number of subshares its
+// committed share carries. An ordinary Helper carries weight 1.
+var channels = new[]
+{
+    new Sharing.WeightedChannel(1UL, 1),
+    new Sharing.WeightedChannel(2UL, 1),
+    new Sharing.WeightedChannel(3UL, 1),
+};
+// threshold counts subshares, not channels: with every weight 1 this must
+// satisfy 2 <= threshold <= channels.Length.
+ulong threshold = 2;
 uint version = 1;
 
-var splitResult = Sharing.Request.Split(secretId, secretData, channelIds, threshold, version);
+var splitResult = Sharing.Request.Split(secretId, secretData, channels, threshold, version);
+
+// Optionally hand a chosen channel more than one subshare — e.g. a device the
+// owner trusts more than the others. Every weight must satisfy
+// 1 <= weight < threshold.
+var weighted = Sharing.Request.Split(secretId, secretData,
+    new[]
+    {
+        new Sharing.WeightedChannel(1UL, 2),
+        new Sharing.WeightedChannel(2UL, 1),
+        new Sharing.WeightedChannel(3UL, 1),
+    },
+    threshold: 3, version);
 
 // channel ID → committed share bytes
 var shares = splitResult.DeserializeShares();
@@ -574,7 +595,9 @@ Console.WriteLine($"dispatched pair on channel {started.ChannelId}");
 
 // Protect a secret. The secret id is the one the protocol was built with,
 // and the round targets every paired helper and confirmed replica
-// destination.
+// destination. Threshold (set via WithThreshold) counts subshares, not
+// helpers: with no Weights every helper gets one subshare, so the threshold is
+// the number of helpers needed, as before.
 var protectEvents = await owner.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
 {
     Secrets = new[]
@@ -582,15 +605,32 @@ var protectEvents = await owner.StartAsync(FlowKind.ProtectSecret, new ProtectSe
         new UserSecret { Id = new byte[] { 1 }, Name = "secret", Data = secretBytes },
     },
     Description = "initial backup",
+    // Optional: give a chosen helper's channel more than one subshare so it
+    // alone can cover more of the threshold. Absent/null means every
+    // targeted channel holds one subshare. Every value must satisfy
+    // 1 <= weight < threshold.
+    // Weights = new Dictionary<ulong, uint> { [helperChannelId] = 2 },
 });
 // One ProtectSecretStartedEvent per targeted channel (helper + replica);
-// any ProtectSecretFailedEvent { ChannelId, Version, Error } here means
-// that specific target's request could not be dispatched — the rest are
-// still in flight.
+// its Weight is that channel's subshare count — the Weights entry, or 1 when
+// absent. Any ProtectSecretFailedEvent { ChannelId, Version, Weight, Error }
+// here means that specific target's request could not be dispatched — the
+// rest are still in flight.
 // Peer responses arrive via ProcessAsync as ShareStoredEvent /
 // ShareConfirmedEvent per helper + SharingCompleteEvent once the round
 // closes.
 ```
+
+`WithMaxSubshares(max)` on the builder caps the total subshares one round
+splits the secret into — the sum of every helper's weight. Unset means no cap.
+Recovery time grows quadratically with that total (about 0.2 s at 200, 5.5 s
+at 1,000 and 87 s at 4,000 subshares per attempt) while splitting stays cheap,
+so this is the place to bound it. A round over the cap fails `StartAsync`
+with a `DeRecException` whose `Code` is `DeRecCode.TooManySubshares` (66)
+before anything is sent; publishes the library starts itself respect it too.
+A cap below the threshold makes `Build()` throw (`InvalidInput`). The cap
+applies at sharing only, never at recovery: a recovering device cannot know
+the cap the shares were made under.
 
 #### Verification outcomes
 
@@ -670,6 +710,74 @@ App-side responsibilities (mirrors the other SDKs):
   (`channelStore.LinkChannel(secretId, oldId, newId)`) so recovery can fan
   out on the new pair while still surfacing shares stored under the old one.
   Links are one-to-one; see [Helpers and shares](#helpers-and-shares).
+
+### Configuration from a file or record
+
+Applications usually load settings as a whole: general settings from the
+environment or a config file, per-user settings from a user record.
+`DeRecProtocolConfig` holds every data setting of the builder, each one
+optional, and `WithConfig` applies it in one call:
+
+```csharp
+using System.Text.Json;
+using DeRec.Library;
+using DeRec.Library.Orchestrator;
+
+var general = JsonSerializer.Deserialize<DeRecProtocolConfig>(generalJson, DeRecJsonOptions.Wire)!;
+var perUser = JsonSerializer.Deserialize<DeRecProtocolConfig>(userRecordJson, DeRecJsonOptions.Wire)!;
+
+using var protocol = new DeRecProtocolBuilder(secretId)
+    .WithStores(stores)
+    .WithTransport(transport)
+    .WithConfig(general)  // 1. general settings
+    .WithConfig(perUser)  // 2. per-user settings
+    .WithThreshold(4)     // 3. individual setters
+    .Build();
+```
+
+- **Only set properties are applied.** A `null` property leaves whatever the
+  builder already holds.
+- **Last write wins, per setting.** Nested values replace the builder's value
+  as a whole, except `Timeouts`: each timeout is merged separately, so a
+  per-user config that sets only `inbound_message_secs` keeps the
+  `sharing_round_secs` the general config set.
+- **Validation happens in `Build()`**, with the same rules as the setters. A
+  `threshold` of `1` from a config file fails exactly as `WithThreshold(1)`
+  does.
+- **Stores, the transport and the secret id are not settings** and are not
+  carried in the config.
+
+The record reads and writes the canonical JSON shared by every SDK
+(`library/tests/fixtures/protocol_config.json` holds a full example):
+
+```json
+{
+  "threshold": 3,
+  "max_subshares": "12",
+  "timeouts": {
+    "inbound_message_secs": 300,
+    "sharing_round_secs": 60,
+    "unpair_ack_secs": 60,
+    "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
+  },
+  "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
+  "auto_accept": { "pairing": true, "store_share": true },
+  "auto_respond_on_failure": false,
+  "auto_reply_to": false,
+  "unpair_ack": "required",
+  "unsafe_connection": false,
+  "communication_info": { "name": "alice" },
+  "own_transports": [{ "uri": "https://me.example.com/derec", "protocol": "https" }],
+  "replica_id": "9007199254740993"
+}
+```
+
+Keys are `snake_case` and every key is optional. `replica_id` and
+`max_subshares` are decimal strings, so values above 2^53 survive. Timeouts
+are whole seconds. **An unknown key fails the read** with a `JsonException`
+naming it, at every level, so a misspelled setting is never silently dropped.
+Serializing a `DeRecProtocolConfig` writes the same shape, which is also what
+`Build()` sends to the library.
 
 ### Refusing a share or a verification
 

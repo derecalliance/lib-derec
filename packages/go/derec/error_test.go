@@ -27,6 +27,8 @@ func TestCodeName(t *testing.T) {
 		derec.CodeFFIBadSharedKey:  "ffi_bad_shared_key",
 		derec.CodeTransportInvalid: "transport_invalid",
 		derec.CodeNoUsableEndpoint: "no_usable_endpoint",
+		derec.CodeInvalidWeight:    "invalid_weight",
+		derec.CodeTooManySubshares: "too_many_subshares",
 		122:                        "unknown",
 		9999:                       "unknown",
 	}

@@ -58,13 +58,15 @@ const HELPER_B_ADDR: &str = "127.0.0.1:50053";
 
 /// Why this run needs two helpers rather than one.
 ///
-/// The trap is the silent clause, so take it first: **fewer than
-/// `threshold` paired helpers means no split runs and nothing is stored,
-/// and no error is raised.** `start(ProtectSecret)` returns `Ok`, the
-/// helper is never contacted, and no `ShareStored` / `ShareConfirmed`
-/// event ever arrives — the flow simply does nothing. The gate is
-/// `helpers.len() >= threshold` in the library's sharing handler; the
-/// `else` branch skips distribution entirely.
+/// The trap is the silent clause, so take it first: **fewer total
+/// subshares among the paired helpers than `threshold` means no split runs
+/// and nothing is stored, and no error is raised.** `start(ProtectSecret)`
+/// returns `Ok`, the helper is never contacted, and no `ShareStored` /
+/// `ShareConfirmed` event ever arrives — the flow simply does nothing. The
+/// gate is the paired helpers' total subshares reaching `threshold` in the
+/// library's sharing handler — with no weighted helper that is
+/// `helpers.len() >= threshold`; the `else` branch skips distribution
+/// entirely.
 ///
 /// The loud clause is the one you meet first: `build()` rejects any
 /// `threshold` below 2, because a lone helper who can reconstruct the
@@ -871,6 +873,7 @@ async fn protect_secret(owner: &Node, bus: &mut Bus) -> u32 {
                 data: b"super-secret-value".to_vec(),
             }],
             description: Some("grpc smoke-test distribution".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .expect("owner start(ProtectSecret) failed");

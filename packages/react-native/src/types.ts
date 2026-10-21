@@ -685,6 +685,12 @@ export interface DiscoveryParams {
 export interface ProtectSecretParams {
   secrets: UserSecret[];
   description?: string;
+  /**
+   * Channel ID to how many subshares that channel should hold. A
+   * channel absent from the map, or an absent/empty map, holds one subshare —
+   * the same roster that would be sent with no weights at all.
+   */
+  weights?: Map<bigint, number>;
 }
 export interface VerifySharesParams {
   secretId: bigint | string;
@@ -1205,14 +1211,19 @@ export type DeRecEvent =
    *  targeted channels are unaffected. */
   | { type: "DiscoveryFailed"; channel_id: string; error: string }
   /** A share-storage request was dispatched to `channel_id`. Emitted per
-   *  targeted peer by `start(ProtectSecret)`. */
-  | { type: "ProtectSecretStarted"; channel_id: string; version: number; trace_id: string }
+   *  targeted peer by `start(ProtectSecret)`. `weight` is the number of
+   *  subshares sent: the `ProtectSecretParams.weights` entry for this
+   *  channel, or 1 when absent. */
+  | { type: "ProtectSecretStarted"; channel_id: string; version: number; trace_id: string; weight: number }
   /** A share-storage request could not be dispatched to `channel_id`. */
   | {
       type: "ProtectSecretFailed";
       channel_id: string;
       version: number;
       error: string;
+      /** Number of subshares that were to be sent to this channel; see
+       *  `ProtectSecretStarted.weight`. */
+      weight: number;
     }
   /** A verify-share challenge was dispatched to `channel_id`. */
   | { type: "VerifySharesStarted"; channel_id: string; version: number; trace_id: string }
@@ -1409,6 +1420,100 @@ export interface ParameterRange {
   max_unresponsive_deletion_timeout: bigint;
   min_unresponsive_deactivation_timeout: bigint;
   max_unresponsive_deactivation_timeout: bigint;
+}
+
+/**
+ * `parameter_range` bounds inside `DeRecProtocolConfig`. Each bound is a
+ * JSON number or a decimal string — the string form carries a bound past
+ * `Number.MAX_SAFE_INTEGER` through a config file or a JSON encoder whose
+ * numbers are `f64`. An absent bound is `0` ("no bound"), the same as
+ * `DeRecProtocolBuilder.withParameterRange`.
+ */
+export interface DeRecParameterRangeConfig {
+  min_share_size?: number | string;
+  max_share_size?: number | string;
+  min_time_between_verifications?: number | string;
+  max_time_between_verifications?: number | string;
+  min_time_between_share_updates?: number | string;
+  max_time_between_share_updates?: number | string;
+  min_unresponsive_deletion_timeout?: number | string;
+  max_unresponsive_deletion_timeout?: number | string;
+  min_unresponsive_deactivation_timeout?: number | string;
+  max_unresponsive_deactivation_timeout?: number | string;
+}
+
+/**
+ * `auto_accept` inside `DeRecProtocolConfig`: the same eight flows as
+ * {@link AutoAcceptPolicy}, named as the canonical JSON spells them rather
+ * than in `camelCase`. An absent flow is `false`. See {@link AutoAcceptPolicy}
+ * for per-field caveats.
+ */
+export interface DeRecAutoAcceptConfig {
+  pairing?: boolean;
+  pre_pair?: boolean;
+  store_share?: boolean;
+  verify_share?: boolean;
+  discovery?: boolean;
+  get_share?: boolean;
+  unpair?: boolean;
+  update_channel_info?: boolean;
+}
+
+/**
+ * Every data setting of `DeRecProtocolBuilder` in one serializable value, in
+ * the canonical `snake_case` JSON shape every SDK accepts — the format for a
+ * config file or a user record. Passed to `DeRecProtocolBuilder.withConfig`.
+ *
+ * Every field is optional: an absent or `null` field leaves that setting
+ * unset. Stores, the delivery transport and the constructor's `secretId` are
+ * not settings and are not carried here.
+ *
+ * Configs layer: apply a general config, then a per-user one, then any
+ * individual `with*` call, and the last write wins per field —
+ * `timeouts` merges per field too, so a config that sets only
+ * `inbound_message_secs` keeps whatever `sharing_round_secs` an earlier
+ * config or call set. Every other nested object (`parameter_range`,
+ * `auto_accept`, `own_transports`) replaces as a whole.
+ *
+ * Values set through a field here are validated by `build()` exactly as the
+ * matching `with*` setter's value would be: there is one rule set.
+ *
+ * ```json
+ * {
+ *   "threshold": 3,
+ *   "max_subshares": "12",
+ *   "timeouts": { "inbound_message_secs": 120, "sharing_round_secs": 30 },
+ *   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
+ *   "auto_accept": { "pairing": true, "store_share": true },
+ *   "auto_respond_on_failure": false,
+ *   "auto_reply_to": false,
+ *   "unpair_ack": "required",
+ *   "unsafe_connection": false,
+ *   "communication_info": { "name": "alice" },
+ *   "own_transports": [{ "uri": "https://me.example.com/derec", "protocol": "https" }],
+ *   "replica_id": "9007199254740993"
+ * }
+ * ```
+ */
+export interface DeRecProtocolConfig {
+  threshold?: number;
+  /** Decimal string. A `bigint` is rejected; call
+   *  `DeRecProtocolBuilder.withMaxSubshares` directly for a `bigint`. */
+  max_subshares?: string;
+  timeouts?: Timeouts;
+  parameter_range?: DeRecParameterRangeConfig;
+  auto_accept?: DeRecAutoAcceptConfig;
+  auto_respond_on_failure?: boolean;
+  auto_reply_to?: boolean;
+  /** Its name, or the discriminant `0` (`"required"`) / `1`
+   *  (`"not_required"`). */
+  unpair_ack?: UnpairAck | 0 | 1;
+  unsafe_connection?: boolean;
+  communication_info?: Record<string, string>;
+  own_transports?: Endpoint[];
+  /** Decimal string. A `bigint` is rejected; call
+   *  `DeRecProtocolBuilder.withReplicaId` directly for a `bigint`. */
+  replica_id?: string;
 }
 
 export interface PairRequestMessage {
@@ -1665,6 +1770,12 @@ export interface ProcessPrePairResult {
   /** Nonce echoed from the original `ContactMessage`. */
   nonce: bigint;
 }
+
+/**
+ * A channel paired with how many subshares it holds. A weight of `1` is an
+ * ordinary helper; every weight must satisfy `1 <= weight < threshold`.
+ */
+export type WeightedChannel = [channelId: bigint, weight: number];
 
 export interface SplitResult {
   /** Map keyed by channel id (`bigint`). */

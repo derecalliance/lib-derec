@@ -86,6 +86,7 @@ impl<
             auto_accept: AutoAcceptPolicy::default(),
             replica_id: None,
             parameter_range: None,
+            max_subshares: None,
             secret_id,
         })
     }

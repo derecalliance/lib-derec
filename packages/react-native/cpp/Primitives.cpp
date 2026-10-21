@@ -3,7 +3,9 @@
 
 #include "Primitives.h"
 
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -126,9 +128,40 @@ uint64_t asU64(jsi::Runtime& rt, const jsi::Value& value) {
 
 namespace {
 
+/// Read one element of an integer array losslessly: a `bigint` or `number`
+/// holding an integer in `0..=max`. Anything else throws, so a value is never
+/// truncated, rounded, or wrapped on its way to the core.
+uint64_t asArrayInteger(jsi::Runtime& rt,
+                        const char* name,
+                        const jsi::Value& element,
+                        uint64_t max,
+                        const char* range) {
+  auto reject = [&]() -> uint64_t {
+    throw jsi::JSError(rt, std::string(name) + " expects an array of integers in " + range);
+  };
+  if (element.isBigInt()) {
+    jsi::BigInt big = element.getBigInt(rt);
+    if (!big.isUint64(rt)) {
+      return reject();
+    }
+    uint64_t number = big.getUint64(rt);
+    return number <= max ? number : reject();
+  }
+  if (!element.isNumber()) {
+    return reject();
+  }
+  double number = element.getNumber();
+  // 18446744073709551616.0 is 2^64, the first double above `uint64_t`'s range.
+  if (!(number >= 0.0) || number >= 18446744073709551616.0 || std::trunc(number) != number) {
+    return reject();
+  }
+  auto integer = static_cast<uint64_t>(number);
+  return integer <= max ? integer : reject();
+}
+
 /// Read a JS array of `bigint`/`number` elements as a `uint64_t` vector.
 /// Used for `protect_secret`'s `channels` argument.
-std::vector<uint64_t> asU64Array(jsi::Runtime& rt, const jsi::Value& value) {
+std::vector<uint64_t> asU64Array(jsi::Runtime& rt, const char* name, const jsi::Value& value) {
   std::vector<uint64_t> out;
   if (value.isNull() || value.isUndefined()) {
     return out;
@@ -137,14 +170,17 @@ std::vector<uint64_t> asU64Array(jsi::Runtime& rt, const jsi::Value& value) {
   size_t length = array.size(rt);
   out.reserve(length);
   for (size_t i = 0; i < length; ++i) {
-    out.push_back(asU64(rt, array.getValueAtIndex(rt, i)));
+    out.push_back(asArrayInteger(rt, name, array.getValueAtIndex(rt, i),
+                                 std::numeric_limits<uint64_t>::max(),
+                                 "0..=18446744073709551615"));
   }
   return out;
 }
 
 /// Read a JS array of `number` elements as a `uint32_t` vector. Used for
-/// `produce_store_share_request_message`'s `keep_list` argument.
-std::vector<uint32_t> asU32Array(jsi::Runtime& rt, const jsi::Value& value) {
+/// `protect_secret`'s `weights` and
+/// `produce_store_share_request_message`'s `keep_list` arguments.
+std::vector<uint32_t> asU32Array(jsi::Runtime& rt, const char* name, const jsi::Value& value) {
   std::vector<uint32_t> out;
   if (value.isNull() || value.isUndefined()) {
     return out;
@@ -153,7 +189,9 @@ std::vector<uint32_t> asU32Array(jsi::Runtime& rt, const jsi::Value& value) {
   size_t length = array.size(rt);
   out.reserve(length);
   for (size_t i = 0; i < length; ++i) {
-    out.push_back(static_cast<uint32_t>(array.getValueAtIndex(rt, i).asNumber()));
+    out.push_back(static_cast<uint32_t>(
+        asArrayInteger(rt, name, array.getValueAtIndex(rt, i),
+                       std::numeric_limits<uint32_t>::max(), "0..=4294967295")));
   }
   return out;
 }
@@ -897,20 +935,27 @@ jsi::Value recoverFromShareResponses(jsi::Runtime& rt,
 }
 
 /// `protect_secret(secretId: bigint, secretData: ArrayBuffer, channels:
-///   (bigint|number)[], threshold: number, version: number) -> ArrayBuffer`
+///   (bigint|number)[], weights: number[], threshold: number, version:
+///   number) -> ArrayBuffer`
 jsi::Value protectSecret(jsi::Runtime& rt,
                          const jsi::Value&,
                          const jsi::Value* args,
                          size_t count) {
-  requireArgs(rt, "protect_secret", count, 5);
+  requireArgs(rt, "protect_secret", count, 6);
   uint64_t secretId = asU64(rt, args[0]);
   ByteView secretData = asBytes(rt, args[1]);
-  std::vector<uint64_t> channels = asU64Array(rt, args[2]);
-  auto threshold = static_cast<size_t>(args[3].asNumber());
-  auto version = static_cast<uint32_t>(args[4].asNumber());
+  std::vector<uint64_t> channels = asU64Array(rt, "protect_secret", args[2]);
+  std::vector<uint32_t> weights = asU32Array(rt, "protect_secret", args[3]);
+  if (channels.size() != weights.size()) {
+    throw jsi::JSError(rt,
+                       "protect_secret: channels and weights must have "
+                       "the same length");
+  }
+  auto threshold = static_cast<size_t>(args[4].asNumber());
+  auto version = static_cast<uint32_t>(args[5].asNumber());
   ProtectSecretResult result = protect_secret(
       secretId, secretData.ptr, secretData.len, channels.data(),
-      channels.size(), threshold, version);
+      weights.data(), channels.size(), threshold, version);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
@@ -931,7 +976,7 @@ jsi::Value produceStoreShareRequestMessage(jsi::Runtime& rt,
   auto version = static_cast<uint32_t>(args[1].asNumber());
   uint64_t secretId = asU64(rt, args[2]);
   ByteView committedShare = asBytes(rt, args[3]);
-  std::vector<uint32_t> keepList = asU32Array(rt, args[4]);
+  std::vector<uint32_t> keepList = asU32Array(rt, "produce_store_share_request_message", args[4]);
   ByteView description = asBytes(rt, args[5]);
   ByteView sharedKey = asBytes(rt, args[6]);
   ByteView replyTo = asBytes(rt, args[7]);
@@ -1321,7 +1366,7 @@ void installPrimitives(jsi::Runtime& rt, jsi::Object& host) {
        produceGetShareResponseMessage);
   bind(rt, host, "extract_get_share_response", 2, extractGetShareResponse);
   bind(rt, host, "recover_from_share_responses", 3, recoverFromShareResponses);
-  bind(rt, host, "protect_secret", 5, protectSecret);
+  bind(rt, host, "protect_secret", 6, protectSecret);
   bind(rt, host, "produce_store_share_request_message", 8,
        produceStoreShareRequestMessage);
   bind(rt, host, "extract_store_share_request", 2, extractStoreShareRequest);

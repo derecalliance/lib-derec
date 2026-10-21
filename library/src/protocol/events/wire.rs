@@ -301,11 +301,13 @@ pub(crate) enum Event {
         channel_id: String,
         version: u32,
         trace_id: String,
+        weight: u32,
     },
     ProtectSecretFailed {
         channel_id: String,
         version: u32,
         error: String,
+        weight: u32,
     },
     VerifySharesStarted {
         channel_id: String,
@@ -871,19 +873,23 @@ impl Event {
                 channel_id,
                 version,
                 trace_id,
+                weight,
             } => Self::ProtectSecretStarted {
                 channel_id: channel_id.0.to_string(),
                 version,
                 trace_id: trace_id.to_string(),
+                weight,
             },
             DeRecEvent::ProtectSecretFailed {
                 channel_id,
                 version,
                 error,
+                weight,
             } => Self::ProtectSecretFailed {
                 channel_id: channel_id.0.to_string(),
                 version,
                 error,
+                weight,
             },
             DeRecEvent::VerifySharesStarted {
                 channel_id,

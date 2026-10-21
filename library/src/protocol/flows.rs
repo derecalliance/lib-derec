@@ -84,7 +84,11 @@ impl<
             DeRecFlow::ProtectSecret {
                 secrets,
                 description,
-            } => self.start_protect_secret(secrets, description, round).await,
+                weights,
+            } => {
+                self.start_protect_secret(secrets, description, weights, round)
+                    .await
+            }
             DeRecFlow::VerifyShares {
                 secret_id,
                 version,
@@ -244,18 +248,27 @@ impl<
     /// hold the round open until its timeout. Such a peer is reported once
     /// here, where the transport error is still in hand, and settles as
     /// `behind`.
+    ///
+    /// `weights` names the Helpers receiving more than one subshare this
+    /// round; each Helper's dispatch event reports the weight it was given,
+    /// `1` when unlisted. Publishes the library starts on its own pass an
+    /// empty map.
     pub(super) async fn start_protect_secret(
         &mut self,
         secrets: Vec<crate::protocol::types::UserSecret>,
         description: Option<String>,
+        weights: HashMap<ChannelId, u32>,
         round: &Round<'_>,
     ) -> Result<Vec<DeRecEvent>> {
+        let event_weights = weights.clone();
         let Some(result) = handlers::sharing::start(
             &mut borrow_stores!(self),
             &local!(self),
             secrets,
             description,
+            weights,
             self.threshold,
+            self.max_subshares,
             round,
         )
         .await?
@@ -313,17 +326,22 @@ impl<
         let mut started: Vec<DeRecEvent> = result
             .outcomes
             .into_iter()
-            .map(|(channel_id, res)| match res {
-                Ok(()) => DeRecEvent::ProtectSecretStarted {
-                    channel_id,
-                    version,
-                    trace_id: round.trace_id,
-                },
-                Err(e) => DeRecEvent::ProtectSecretFailed {
-                    channel_id,
-                    version,
-                    error: e.to_string(),
-                },
+            .map(|(channel_id, res)| {
+                let weight = event_weights.get(&channel_id).copied().unwrap_or(1);
+                match res {
+                    Ok(()) => DeRecEvent::ProtectSecretStarted {
+                        channel_id,
+                        version,
+                        trace_id: round.trace_id,
+                        weight,
+                    },
+                    Err(e) => DeRecEvent::ProtectSecretFailed {
+                        channel_id,
+                        version,
+                        error: e.to_string(),
+                        weight,
+                    },
+                }
             })
             .collect();
         started.append(&mut undeliverable);

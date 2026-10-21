@@ -42,27 +42,27 @@ impl DeRecShareExt for derec_proto::DeRecShare {
     }
 }
 
-/// A wire `DeRecShare`'s points as the [`vss`] points they encode.
+/// A wire `DeRecShare`'s subshares as the [`vss`] subshares they encode.
 ///
 /// [`vss`]: derec_cryptography::vss
-pub(crate) fn into_vss_points(
-    points: Vec<derec_proto::de_rec_share::ShamirPoint>,
-) -> Vec<derec_cryptography::vss::ShamirPoint> {
-    points
+pub(crate) fn into_vss_subshares(
+    subshares: Vec<derec_proto::de_rec_share::Subshare>,
+) -> Vec<derec_cryptography::vss::Subshare> {
+    subshares
         .into_iter()
-        .map(|p| derec_cryptography::vss::ShamirPoint { x: p.x, y: p.y })
+        .map(|p| derec_cryptography::vss::Subshare { x: p.x, y: p.y })
         .collect()
 }
 
-/// [`vss`] points as the points of a wire `DeRecShare`.
+/// [`vss`] subshares as the subshares of a wire `DeRecShare`.
 ///
 /// [`vss`]: derec_cryptography::vss
-pub(crate) fn to_wire_points(
-    points: &[derec_cryptography::vss::ShamirPoint],
-) -> Vec<derec_proto::de_rec_share::ShamirPoint> {
-    points
+pub(crate) fn to_wire_subshares(
+    subshares: &[derec_cryptography::vss::Subshare],
+) -> Vec<derec_proto::de_rec_share::Subshare> {
+    subshares
         .iter()
-        .map(|p| derec_proto::de_rec_share::ShamirPoint {
+        .map(|p| derec_proto::de_rec_share::Subshare {
             x: p.x.clone(),
             y: p.y.clone(),
         })

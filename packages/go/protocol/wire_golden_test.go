@@ -137,11 +137,29 @@ func TestWireGolden_ProtectSecret(t *testing.T) {
 	assertJSONEqual(t, string(got), goldenJSON(t, "protect_secret"))
 }
 
+// TestWireGolden_ProtectSecretWeighted asserts ProtectSecretParams.Weights
+// marshals to the decimal-string-keyed object the Rust decoder expects (see
+// marshalFlowParams in flow.go) against the shared golden fixture's weighted
+// section.
+func TestWireGolden_ProtectSecretWeighted(t *testing.T) {
+	secret := goldenRestoreSecret()
+	desc := "capture description"
+	got, err := marshalFlowParams(FlowKindProtectSecret, ProtectSecretParams{
+		Secrets:     secret.Secrets,
+		Description: &desc,
+		Weights:     map[uint64]uint32{7: 2, 12: 3},
+	})
+	if err != nil {
+		t.Fatalf("marshal protect secret weighted params: %v", err)
+	}
+	assertJSONEqual(t, string(got), goldenJSON(t, "protect_secret_weighted"))
+}
+
 // TestWireGolden_CoversEverySection fails when wire_golden.json gains a
 // section no test above asserts against, so a params shape added to the
 // fixture cannot go unchecked in this SDK.
 func TestWireGolden_CoversEverySection(t *testing.T) {
-	covered := map[string]bool{"restore": true, "protect_secret": true}
+	covered := map[string]bool{"restore": true, "protect_secret": true, "protect_secret_weighted": true}
 	raw, err := os.ReadFile("../../../library/tests/fixtures/wire_golden.json")
 	if err != nil {
 		t.Fatalf("read wire_golden.json: %v", err)

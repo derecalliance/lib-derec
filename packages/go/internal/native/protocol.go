@@ -83,153 +83,6 @@ type DeRecRemovedChannelsResult struct {
 	Channels DeRecBuffer
 }
 
-// AutoAcceptPolicy is the per-flow auto-accept toggle set carried by the
-// JSON config's "auto_accept" object, field for field matching
-// AutoAcceptConfig in library/src/interop/ffi/protocol/handle/mod.rs (booleans,
-// since JSON has a native boolean type).
-type AutoAcceptPolicy struct {
-	Pairing           bool `json:"pairing"`
-	PrePair           bool `json:"pre_pair"`
-	StoreShare        bool `json:"store_share"`
-	VerifyShare       bool `json:"verify_share"`
-	Discovery         bool `json:"discovery"`
-	GetShare          bool `json:"get_share"`
-	Unpair            bool `json:"unpair"`
-	UpdateChannelInfo bool `json:"update_channel_info"`
-}
-
-// RemoveExpiredChannelsPolicy is the automatic expired-channel cleanup
-// setting carried by the JSON config's "timeouts.expired_channels" object,
-// field for field matching RemoveExpiredChannelsConfig in
-// library/src/interop/ffi/protocol/handle/mod.rs.
-//
-// Both fields are always marshalled, including when Enabled is false. The
-// library decides that a disabled policy ignores its timeout — see
-// ExpiredChannelCleanup::new.
-type RemoveExpiredChannelsPolicy struct {
-	Enabled       bool   `json:"enabled"`
-	TimeoutInSecs uint64 `json:"timeout_in_secs"`
-}
-
-// TimeoutsConfig is the JSON config's "timeouts" object, field for field
-// matching TimeoutsConfig in library/src/interop/ffi/protocol/handle/mod.rs.
-//
-// Every field is optional and omitted when nil: absent means "use the library
-// default". The defaults live in the Rust Timeouts type, so a value omitted
-// here follows the protocol rather than a constant frozen into this shim.
-type TimeoutsConfig struct {
-	InboundMessageSecs *uint64                      `json:"inbound_message_secs,omitempty"`
-	SharingRoundSecs   *uint64                      `json:"sharing_round_secs,omitempty"`
-	UnpairAckSecs      *uint64                      `json:"unpair_ack_secs,omitempty"`
-	ExpiredChannels    *RemoveExpiredChannelsPolicy `json:"expired_channels,omitempty"`
-}
-
-// TransportOffer is one entry of the JSON config's "own_transports" array,
-// field for field matching OwnTransportConfig in
-// library/src/interop/ffi/protocol/handle/mod.rs — Protocol is the
-// derec_proto.Protocol i32 discriminant, not a URI scheme.
-type TransportOffer struct {
-	URI      string `json:"uri"`
-	Protocol int32  `json:"protocol"`
-}
-
-// ProtocolConfig carries every derec_protocol_new argument beyond
-// the six callback structs, in idiomatic Go form. protocolNew renders it
-// into the JSON config buffer the FFI expects — package protocol is responsible for converting its
-// own idiomatic Config into this shape.
-type ProtocolConfig struct {
-	SecretID uint64
-
-	// OwnTransports mirrors the "own_transports" JSON array documented on
-	// ProtocolConfig in library/src/interop/ffi/protocol/handle/mod.rs.
-	// Empty omits the key, which the library refuses.
-	OwnTransports []TransportOffer
-
-	// Threshold is omitted from the JSON config when nil, so the library
-	// default applies; any non-nil value, including 0, is sent for the
-	// library to accept or reject.
-	Threshold *uint32
-
-	// CommunicationInfo is this node's communication_info map, sent as the
-	// JSON config's "communication_info" object. nil or empty omits the key.
-	CommunicationInfo map[string]string
-
-	// Timeouts configures the four waiting periods. nil omits the key so
-	// every library default applies; individual fields inside may also be
-	// omitted for the same effect.
-	Timeouts *TimeoutsConfig
-	// UnsafeConnection accepts plaintext http:// and grpc:// transport
-	// endpoints. Development only; nil (unset) is the production posture.
-	UnsafeConnection     *bool
-	AutoRespondOnFailure bool
-	// UnpairAck: 0 = Required, 1 = NotRequired.
-	UnpairAck   int32
-	AutoReplyTo bool
-	AutoAccept  AutoAcceptPolicy
-
-	// ReplicaID configures this node's local replica_id. nil leaves it
-	// unset (omitted from the JSON config, matching the "absent or null
-	// means no replica id" convention documented on ProtocolConfig in
-	// library/src/interop/ffi/protocol/handle/mod.rs).
-	ReplicaID *uint64
-
-	// ParameterRange declares the bounds this node advertises during pair
-	// negotiation. An inbound pairing whose range fails to intersect is
-	// rejected with CodeIncompatibleParameterRange. nil advertises no
-	// constraints and accepts any peer range.
-	ParameterRange *ParameterRangeConfig
-}
-
-// ParameterRangeConfig declares the bounds this node advertises during pair
-// negotiation, mirroring the ParameterRange proto field for field. Each bound
-// is optional and defaults to 0, which the proto reads as "no constraint on
-// this dimension". Omitting the whole struct advertises no constraints and
-// accepts any peer range.
-type ParameterRangeConfig struct {
-	MinShareSize                       int64 `json:"min_share_size,omitempty"`
-	MaxShareSize                       int64 `json:"max_share_size,omitempty"`
-	MinTimeBetweenVerifications        int64 `json:"min_time_between_verifications,omitempty"`
-	MaxTimeBetweenVerifications        int64 `json:"max_time_between_verifications,omitempty"`
-	MinTimeBetweenShareUpdates         int64 `json:"min_time_between_share_updates,omitempty"`
-	MaxTimeBetweenShareUpdates         int64 `json:"max_time_between_share_updates,omitempty"`
-	MinUnresponsiveDeletionTimeout     int64 `json:"min_unresponsive_deletion_timeout,omitempty"`
-	MaxUnresponsiveDeletionTimeout     int64 `json:"max_unresponsive_deletion_timeout,omitempty"`
-	MinUnresponsiveDeactivationTimeout int64 `json:"min_unresponsive_deactivation_timeout,omitempty"`
-	MaxUnresponsiveDeactivationTimeout int64 `json:"max_unresponsive_deactivation_timeout,omitempty"`
-}
-
-// protocolConfigJSON is the JSON shape derec_protocol_new expects,
-// field-for-field matching ProtocolConfig in
-// library/src/interop/ffi/protocol/handle/mod.rs. secret_id/replica_id are decimal
-// strings rather than JSON numbers: u64 values above 2^53 lose precision
-// once round-tripped through JSON's float64-backed number type in common
-// encoders, including Go's encoding/json.
-//
-// Every optional field is omitempty: the Rust struct carries a
-// `#[serde(default = ...)]` for each of them, reading the same constants
-// DeRecProtocolBuilder::new does, so an omitted key lets the library's
-// default apply instead of this shim inventing one. Threshold is a
-// pointer so that only an unset value is omitted — an explicit 0 reaches
-// the library, which decides whether it is valid.
-// AutoRespondOnFailure, UnpairAck and AutoReplyTo are plain values because
-// their zero value is the library default, so omitting it changes nothing.
-// AutoAccept is a pointer because a non-pointer struct is never "empty"
-// under encoding/json's omitempty rules.
-type protocolConfigJSON struct {
-	SecretID             string                `json:"secret_id"`
-	OwnTransports        []TransportOffer      `json:"own_transports,omitempty"`
-	Threshold            *uint32               `json:"threshold,omitempty"`
-	AutoRespondOnFailure bool                  `json:"auto_respond_on_failure,omitempty"`
-	UnpairAck            int32                 `json:"unpair_ack,omitempty"`
-	AutoReplyTo          bool                  `json:"auto_reply_to,omitempty"`
-	AutoAccept           *AutoAcceptPolicy     `json:"auto_accept,omitempty"`
-	Timeouts             *TimeoutsConfig       `json:"timeouts,omitempty"`
-	UnsafeConnection     *bool                 `json:"unsafe_connection,omitempty"`
-	ReplicaID            *string               `json:"replica_id,omitempty"`
-	ParameterRange       *ParameterRangeConfig `json:"parameter_range,omitempty"`
-	CommunicationInfo    map[string]string     `json:"communication_info,omitempty"`
-}
-
 var (
 	protocolNewOnce sync.Once
 	protocolNewFn   func(
@@ -316,61 +169,45 @@ var (
 	) DeRecProtocolCreateContactResult
 )
 
-// marshalProtocolConfig renders cfg into the JSON config buffer
-// derec_protocol_new reads.
-func marshalProtocolConfig(cfg ProtocolConfig) ([]byte, error) {
-	cfgJSON := protocolConfigJSON{
-		SecretID:             strconv.FormatUint(cfg.SecretID, 10),
-		OwnTransports:        cfg.OwnTransports,
-		Threshold:            cfg.Threshold,
-		AutoRespondOnFailure: cfg.AutoRespondOnFailure,
-		UnpairAck:            cfg.UnpairAck,
-		AutoReplyTo:          cfg.AutoReplyTo,
-
-		Timeouts:          cfg.Timeouts,
-		UnsafeConnection:  cfg.UnsafeConnection,
-		CommunicationInfo: cfg.CommunicationInfo,
+// marshalProtocolConfig renders the JSON config buffer derec_protocol_new
+// reads: configJSON, the canonical DeRecProtocolConfig object package protocol
+// marshals, with secret_id added beside it. secret_id is a decimal string, so
+// a u64 above 2^53 survives JSON number handling.
+func marshalProtocolConfig(secretID uint64, configJSON []byte) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(configJSON, &fields); err != nil {
+		return nil, fmt.Errorf("native: protocol config is not a JSON object: %w", err)
 	}
-	// The zero value of AutoAcceptPolicy (every flow false) is
-	// indistinguishable from "the caller never set it" — and is also
-	// exactly crate::protocol::AutoAcceptPolicy's own default, so
-	// omitting the key in that case changes nothing observable.
-	if cfg.AutoAccept != (AutoAcceptPolicy{}) {
-		autoAccept := cfg.AutoAccept
-		cfgJSON.AutoAccept = &autoAccept
+	if fields == nil {
+		fields = map[string]json.RawMessage{}
 	}
-	if cfg.ReplicaID != nil {
-		id := strconv.FormatUint(*cfg.ReplicaID, 10)
-		cfgJSON.ReplicaID = &id
-	}
-	cfgJSON.ParameterRange = cfg.ParameterRange
-
-	configJSON, err := json.Marshal(cfgJSON)
+	id, err := json.Marshal(strconv.FormatUint(secretID, 10))
 	if err != nil {
-		return nil, fmt.Errorf("native: marshal protocol config: %w", err)
+		return nil, err
 	}
-	return configJSON, nil
+	fields["secret_id"] = id
+	return json.Marshal(fields)
 }
 
-// protocolNew wraps derec_protocol_new: the scalar configuration in
-// cfg is rendered into a single JSON buffer, since purego cannot marshal
+// protocolNew wraps derec_protocol_new: the scalar configuration is
+// rendered into a single JSON buffer, since purego cannot marshal
 // many native arguments in a single call — it panics with "too many stack
 // arguments" past a handful of parameters. The six callback structs are
 // still passed as individual pointers into cb, which must outlive the
 // returned handle — see builtCallbacks' doc comment.
-func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
+func protocolNew(secretID uint64, configJSON []byte, cb *builtCallbacks) (uintptr, error) {
 	protocolNewOnce.Do(func() {
 		purego.RegisterFunc(&protocolNewFn, symbol("derec_protocol_new"))
 	})
 
-	configJSON, err := marshalProtocolConfig(cfg)
+	buf, err := marshalProtocolConfig(secretID, configJSON)
 	if err != nil {
 		return 0, err
 	}
 
 	res := protocolNewFn(
-		bytePtr(configJSON), uintptr(len(configJSON)),
-		// communication_info travels in configJSON; the proto buffer stays empty.
+		bytePtr(buf), uintptr(len(buf)),
+		// communication_info travels in buf; the proto buffer stays empty.
 		nil, 0,
 		&cb.Channel, &cb.Secret, &cb.Share, &cb.UserSecret, &cb.State, &cb.Transport,
 	)
@@ -415,7 +252,8 @@ func NewProtocolInstance(
 	userSecret userSecretStore,
 	state stateStore,
 	transport transportSender,
-	cfg ProtocolConfig,
+	secretID uint64,
+	configJSON []byte,
 ) (*ProtocolInstance, error) {
 	s := &storeSet{
 		channel:    channel,
@@ -429,7 +267,7 @@ func NewProtocolInstance(
 	if err != nil {
 		return nil, err
 	}
-	handle, err := protocolNew(cfg, built)
+	handle, err := protocolNew(secretID, configJSON, built)
 	if err != nil {
 		built.release()
 		return nil, err

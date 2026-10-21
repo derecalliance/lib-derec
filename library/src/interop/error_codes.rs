@@ -120,6 +120,8 @@ vocabulary! {
         InvalidThreshold = 62 => "invalid_threshold",
         EmptySecretData = 63 => "empty_secret_data",
         VssShareFailed = 64 => "vss_share_failed",
+        InvalidWeight = 65 => "invalid_weight",
+        TooManySubshares = 66 => "too_many_subshares",
         EmptyResponses = 80 => "empty_responses",
         EmptyCommittedDeRecShare = 81 => "empty_committed_derec_share",
         DecodeCommittedDeRecShare = 82 => "decode_committed_derec_share",
@@ -233,6 +235,8 @@ fn sharing_code(e: &SharingError) -> Code {
         SharingError::InvalidThreshold { .. } => Code::InvalidThreshold,
         SharingError::EmptySecretData => Code::EmptySecretData,
         SharingError::VssShareFailed { .. } => Code::VssShareFailed,
+        SharingError::InvalidWeight { .. } => Code::InvalidWeight,
+        SharingError::TooManySubshares { .. } => Code::TooManySubshares,
         SharingError::NonOkStatus { .. } => Code::NonOkStatus,
         SharingError::VersionMismatch { .. } => Code::VersionMismatch,
     }

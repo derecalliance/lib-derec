@@ -1399,6 +1399,7 @@ mod tests {
                 .start(crate::protocol::DeRecFlow::ProtectSecret {
                     secrets: secret.secrets.clone(),
                     description: None,
+                    weights: std::collections::HashMap::new(),
                 })
                 .await
                 .expect("a restored owner must be able to publish again");

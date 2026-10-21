@@ -61,134 +61,55 @@ const (
 //     before any UI confirmation.
 //   - UpdateChannelInfo silently overwrites the channel record with the
 //     peer's announced transport / communication info.
+//
+// In the canonical config JSON every flow is written, and a flow absent from
+// a read is false, the library's default for it.
 type AutoAcceptPolicy struct {
-	Pairing           bool
-	PrePair           bool
-	StoreShare        bool
-	VerifyShare       bool
-	Discovery         bool
-	GetShare          bool
-	Unpair            bool
-	UpdateChannelInfo bool
+	Pairing           bool `json:"pairing"`
+	PrePair           bool `json:"pre_pair"`
+	StoreShare        bool `json:"store_share"`
+	VerifyShare       bool `json:"verify_share"`
+	Discovery         bool `json:"discovery"`
+	GetShare          bool `json:"get_share"`
+	Unpair            bool `json:"unpair"`
+	UpdateChannelInfo bool `json:"update_channel_info"`
 }
 
-// Config configures a DeRecProtocol instance. Mirrors the Rust
-// DeRecProtocolBuilder / dotnet DeRecProtocolBuilder field for field. An
-// unset field falls back to the default the library uses, documented per
-// field below. Numeric settings whose zero value the library must be able to
-// see — and accept or reject — are pointers, where nil means unset; build one
-// inline with proto.Uint32 / proto.Uint64 from google.golang.org/protobuf/proto.
+// Config configures a DeRecProtocol instance: the secret it manages plus every
+// data setting, carried by the embedded DeRecProtocolConfig. Mirrors the Rust
+// DeRecProtocolBuilder / dotnet DeRecProtocolBuilder field for field. The
+// settings are promoted, so cfg.Threshold reads and writes
+// cfg.DeRecProtocolConfig.Threshold; a composite literal names the embedded
+// struct: Config{SecretID: id, DeRecProtocolConfig: DeRecProtocolConfig{...}}.
+//
+// Config itself is not a config-file shape: json.Marshal(cfg) writes SecretID
+// beside the settings, and reading that back is refused, SecretID being an
+// unknown key. Marshal and unmarshal cfg.DeRecProtocolConfig.
 type Config struct {
 	// SecretID identifies the single secret this protocol instance
-	// manages.
+	// manages. It is per instance, so it is not part of the
+	// DeRecProtocolConfig a config file carries.
 	SecretID uint64
 
-	// OwnTransports is every transport endpoint this application serves,
-	// in preference order. Each entry's Protocol is 0 = HTTPS
-	// (derecpb.Protocol_HTTPS) or 1 = gRPC (derecpb.Protocol_GRPC).
-	// Required: New returns a *derec.Error (CodeInvalidInput) when it is
-	// empty, since a node with no endpoint cannot be reached by any peer.
-	//
-	// The order given is the order forwarded to the library — it is not
-	// sorted, deduplicated, or reordered here. It is this application's
-	// own preference and decides which of a peer's offered endpoints is
-	// used. Every listed transport must actually be served, because
-	// delivery is push-only: listing an endpoint this application does not
-	// serve makes pairing succeed and replies vanish.
-	OwnTransports []TransportProtocolParam
-
-	// Threshold is the minimum number of shares required to reconstruct
-	// the secret. nil uses the library default (3). Every non-nil value,
-	// including 0, is forwarded as given: the library rejects a threshold
-	// below 2 with a *derec.Error, because a threshold of 0 or 1 lets a
-	// single helper reconstruct the secret.
-	Threshold *uint32
-	// CommunicationInfo carries key/value pairs included in
-	// pairing-request and pairing-response CommunicationInfo. Default:
-	// empty.
-	CommunicationInfo map[string]string
-	// Timeouts configures how long the protocol waits on each thing that
-	// can keep it waiting. nil, or a nil field inside it, leaves the
-	// library's own default in force. See Timeouts.
-	Timeouts *Timeouts
-	// UnsafeConnection accepts plaintext http:// and grpc:// transport
-	// endpoints. Development only. nil (unset) is the production posture.
-	//
-	// With it unset or false, plaintext is accepted only for an endpoint
-	// this device configured for itself that names loopback (localhost,
-	// 127.0.0.1, ::1), so a local dev server needs no configuration. With it
-	// true, plaintext is accepted for any host on any path, including
-	// endpoints a peer supplies — which is what makes the LAN case work (a
-	// phone against a laptop), and why the name is blunt.
-	//
-	// This is a guardrail, not transport security: the SDK opens no sockets,
-	// so nothing here stops an application sending plaintext. It governs
-	// which endpoints the protocol will record, propagate and reply to.
-	UnsafeConnection *bool
-	// AutoRespondOnFailure controls whether the protocol auto-replies on
-	// failed inbound processing. Default: false.
-	AutoRespondOnFailure bool
-	// UnpairAck controls whether the unpair initiator waits for the
-	// peer's acknowledgement. Default: UnpairAckRequired.
-	UnpairAck UnpairAck
-	// AutoReplyTo controls whether outbound requests carry an ephemeral
-	// replyTo pointing at OwnTransports. Default: false.
-	AutoReplyTo bool
-	// AutoAccept is the per-flow auto-accept policy. Default: every flow
-	// off.
-	AutoAccept AutoAcceptPolicy
-	// ReplicaID configures this node's local replica_id, required for
-	// any replica-mode pairing. Obtain it once per device from
-	// derec.GenerateReplicaID, persist it, and pass the same value on
-	// every init. Default: unset.
-	ReplicaID *uint64
-
-	// ParameterRange declares the bounds this node advertises during pair
-	// negotiation. Embedded in outbound PairRequest/PairResponse envelopes
-	// and checked against the peer's range on inbound ones: a range that
-	// fails to intersect rejects the pairing with
-	// derec.CodeIncompatibleParameterRange. Default: unset — no constraints
-	// advertised, every peer range accepted.
-	//
-	// Share size is enforced by the helper; frequency limits are enforced by
-	// the app's share store (refuse from Save / RecordVerification); the
-	// deletion and deactivation timeouts are checked at pairing only.
-	ParameterRange *ParameterRange
+	DeRecProtocolConfig
 }
 
 // ParameterRange declares the bounds this node advertises during pair
 // negotiation, mirroring the ParameterRange proto field for field. Each bound
 // is optional and defaults to 0, which the proto reads as "no constraint on
-// this dimension".
+// this dimension". In the canonical config JSON every bound is written, and a
+// bound may be read from a number or a decimal string.
 type ParameterRange struct {
-	MinShareSize                       int64
-	MaxShareSize                       int64
-	MinTimeBetweenVerifications        int64
-	MaxTimeBetweenVerifications        int64
-	MinTimeBetweenShareUpdates         int64
-	MaxTimeBetweenShareUpdates         int64
-	MinUnresponsiveDeletionTimeout     int64
-	MaxUnresponsiveDeletionTimeout     int64
-	MinUnresponsiveDeactivationTimeout int64
-	MaxUnresponsiveDeactivationTimeout int64
-}
-
-func nativeParameterRange(r *ParameterRange) *native.ParameterRangeConfig {
-	if r == nil {
-		return nil
-	}
-	return &native.ParameterRangeConfig{
-		MinShareSize:                       r.MinShareSize,
-		MaxShareSize:                       r.MaxShareSize,
-		MinTimeBetweenVerifications:        r.MinTimeBetweenVerifications,
-		MaxTimeBetweenVerifications:        r.MaxTimeBetweenVerifications,
-		MinTimeBetweenShareUpdates:         r.MinTimeBetweenShareUpdates,
-		MaxTimeBetweenShareUpdates:         r.MaxTimeBetweenShareUpdates,
-		MinUnresponsiveDeletionTimeout:     r.MinUnresponsiveDeletionTimeout,
-		MaxUnresponsiveDeletionTimeout:     r.MaxUnresponsiveDeletionTimeout,
-		MinUnresponsiveDeactivationTimeout: r.MinUnresponsiveDeactivationTimeout,
-		MaxUnresponsiveDeactivationTimeout: r.MaxUnresponsiveDeactivationTimeout,
-	}
+	MinShareSize                       int64 `json:"min_share_size"`
+	MaxShareSize                       int64 `json:"max_share_size"`
+	MinTimeBetweenVerifications        int64 `json:"min_time_between_verifications"`
+	MaxTimeBetweenVerifications        int64 `json:"max_time_between_verifications"`
+	MinTimeBetweenShareUpdates         int64 `json:"min_time_between_share_updates"`
+	MaxTimeBetweenShareUpdates         int64 `json:"max_time_between_share_updates"`
+	MinUnresponsiveDeletionTimeout     int64 `json:"min_unresponsive_deletion_timeout"`
+	MaxUnresponsiveDeletionTimeout     int64 `json:"max_unresponsive_deletion_timeout"`
+	MinUnresponsiveDeactivationTimeout int64 `json:"min_unresponsive_deactivation_timeout"`
+	MaxUnresponsiveDeactivationTimeout int64 `json:"max_unresponsive_deactivation_timeout"`
 }
 
 // Timeouts configures how long the protocol waits on each thing that can keep
@@ -208,21 +129,21 @@ type Timeouts struct {
 	// flow. This is the replay-defence window, and lowering it starts
 	// refusing legitimately old messages from slow transports or skewed
 	// clocks. Default: 300.
-	InboundMessageSecs *uint64
+	InboundMessageSecs *uint64 `json:"inbound_message_secs,omitempty"`
 	// SharingRoundSecs bounds how long a publishing round waits on a peer
 	// that has not answered. It is what limits how long SharingComplete can
 	// be delayed by one unreachable peer. Default: 60.
-	SharingRoundSecs *uint64
+	SharingRoundSecs *uint64 `json:"sharing_round_secs,omitempty"`
 	// UnpairAckSecs bounds the wait for an unpair acknowledgement before
 	// local channel state is dropped anyway. Default: 60.
-	UnpairAckSecs *uint64
+	UnpairAckSecs *uint64 `json:"unpair_ack_secs,omitempty"`
 	// ExpiredChannels governs removal of channels still awaiting out-of-band
 	// fingerprint confirmation — every replica pairing, and every NoKeys
 	// pairing. Unlike the others it can be disabled, leaving the sweep to
 	// the application. The budget is a human one: someone comparing a
 	// fingerprint, possibly over the phone. nil leaves the default
 	// (enabled, 300 seconds) in force.
-	ExpiredChannels *RemoveExpiredChannelsPolicy
+	ExpiredChannels *RemoveExpiredChannelsPolicy `json:"expired_channels,omitempty"`
 }
 
 // RemoveExpiredChannelsPolicy configures the automatic expired-channel
@@ -230,8 +151,8 @@ type Timeouts struct {
 // Enabled is false — the library decides that a disabled policy ignores
 // its timeout.
 type RemoveExpiredChannelsPolicy struct {
-	Enabled       bool
-	TimeoutInSecs uint64
+	Enabled       bool   `json:"enabled"`
+	TimeoutInSecs uint64 `json:"timeout_in_secs"`
 }
 
 // Stores bundles the five store implementations New requires, mirroring the
@@ -307,57 +228,13 @@ func New(
 		return nil, errors.New("protocol: New: transport is required")
 	}
 
-	var nativeTimeouts *native.TimeoutsConfig
-	if config.Timeouts != nil {
-		nativeTimeouts = &native.TimeoutsConfig{
-			InboundMessageSecs: config.Timeouts.InboundMessageSecs,
-			SharingRoundSecs:   config.Timeouts.SharingRoundSecs,
-			UnpairAckSecs:      config.Timeouts.UnpairAckSecs,
-		}
-		if p := config.Timeouts.ExpiredChannels; p != nil {
-			nativeTimeouts.ExpiredChannels = &native.RemoveExpiredChannelsPolicy{
-				Enabled:       p.Enabled,
-				TimeoutInSecs: p.TimeoutInSecs,
-			}
-		}
-	}
-
-	// Order preserved verbatim — it is the application's own preference
-	// and decides which of a peer's offered endpoints the library picks.
-	var nativeOwnTransports []native.TransportOffer
-	if len(config.OwnTransports) > 0 {
-		nativeOwnTransports = make([]native.TransportOffer, len(config.OwnTransports))
-		for i, t := range config.OwnTransports {
-			nativeOwnTransports[i] = native.TransportOffer{URI: t.URI, Protocol: t.Protocol}
-		}
-	}
-
-	nativeCfg := native.ProtocolConfig{
-		SecretID:             config.SecretID,
-		OwnTransports:        nativeOwnTransports,
-		Threshold:            config.Threshold,
-		CommunicationInfo:    config.CommunicationInfo,
-		Timeouts:             nativeTimeouts,
-		UnsafeConnection:     config.UnsafeConnection,
-		AutoRespondOnFailure: config.AutoRespondOnFailure,
-		UnpairAck:            int32(config.UnpairAck),
-		AutoReplyTo:          config.AutoReplyTo,
-		AutoAccept: native.AutoAcceptPolicy{
-			Pairing:           config.AutoAccept.Pairing,
-			PrePair:           config.AutoAccept.PrePair,
-			StoreShare:        config.AutoAccept.StoreShare,
-			VerifyShare:       config.AutoAccept.VerifyShare,
-			Discovery:         config.AutoAccept.Discovery,
-			GetShare:          config.AutoAccept.GetShare,
-			Unpair:            config.AutoAccept.Unpair,
-			UpdateChannelInfo: config.AutoAccept.UpdateChannelInfo,
-		},
-		ReplicaID:      config.ReplicaID,
-		ParameterRange: nativeParameterRange(config.ParameterRange),
+	configJSON, err := json.Marshal(config.DeRecProtocolConfig)
+	if err != nil {
+		return nil, fmt.Errorf("protocol: New: marshal config: %w", err)
 	}
 	instance, err := native.NewProtocolInstance(
 		channelStore, secretStore, shareStore, userSecretStore, stateStore, transport,
-		nativeCfg,
+		config.SecretID, configJSON,
 	)
 	if err != nil {
 		return nil, err

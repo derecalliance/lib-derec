@@ -284,7 +284,7 @@ SDK. See [End-to-end test coverage](https://github.com/derecalliance/lib-derec#e
 ## Share Distribution (Sharing Flow)
 
 ```ts
-import { init, primitives } from "@derec-alliance/web";
+import { init, primitives, type WeightedChannel } from "@derec-alliance/web";
 
 async function main() {
   await init();
@@ -292,21 +292,38 @@ async function main() {
   const secretId = 42n;             // u64
   const secretData = new TextEncoder().encode("super-secret");
   const channelIds = [1n, 2n, 3n];
-  const threshold = 2;              // must be 2 <= threshold <= channelIds.length
+  // Every channel is listed with its own weight (how many subshares it
+  // holds); 1 is an ordinary helper. threshold counts subshares, not
+  // channels: with every weight at 1 this must satisfy
+  // 2 <= threshold <= channelIds.length.
+  const channels: WeightedChannel[] = channelIds.map((id) => [id, 1]);
+  const threshold = 2;
   const version = 1;
   // sharedKeys: Map<bigint, Uint8Array> with the 32-byte channel keys
 
-  const splitResult = primitives.sharing.request.split(
+  const { shares } = primitives.sharing.request.split(
+    channels,
     secretId,
-    secretData,
-    channelIds,
-    threshold,
     version,
+    secretData,
+    threshold,
   );
-  // splitResult.value: Map<bigint, Uint8Array> — one CommittedDeRecShare per helper.
+  // shares: Map<bigint, CommittedDeRecShare> — one committed share per helper.
+
+  // Optionally hand a chosen channel more than one subshare — e.g. a device the
+  // owner trusts more than the others. Every weight must satisfy
+  // 1 <= weight < threshold.
+  const weightedChannels: WeightedChannel[] = [[channelIds[0]!, 2], [channelIds[1]!, 1], [channelIds[2]!, 1]];
+  const { shares: weighted } = primitives.sharing.request.split(
+    weightedChannels,
+    secretId,
+    version,
+    secretData,
+    3,                               // threshold
+  );
 
   // Wrap each share into an encrypted delivery envelope.
-  for (const [channelId, committedShare] of splitResult.value) {
+  for (const [channelId, committedShare] of shares) {
     const envelope = primitives.sharing.request.produce(
       channelId, version, secretId, committedShare, [], "", sharedKeys.get(channelId)!,
     );
@@ -317,6 +334,20 @@ main();
 ```
 
 ---
+
+### Capping the total subshares
+
+`DeRecProtocolBuilder.withMaxSubshares(max)` caps the total subshares one
+`start(FlowKind.ProtectSecret, ...)` round splits the secret into — the sum of
+every helper's weight (`ProtectSecretParams.weights`). Unset means no cap.
+Recovery time grows quadratically with that total (about 0.2 s at 200, 5.5 s
+at 1,000 and 87 s at 4,000 subshares per attempt) while splitting stays cheap,
+so this is the place to bound it. A round over the cap fails with code
+`too_many_subshares` before anything is sent; publishes the library starts
+itself respect it too. A cap below the threshold makes `build()` throw
+`invalid_input`. The cap applies at sharing only, never at recovery: a
+recovering device cannot know the cap the shares were made under. The
+`split` primitive applies no cap.
 
 ## Recovery Flow
 
@@ -586,6 +617,83 @@ filter faithfully is still your job.
 The backstop matters here in particular: TypeScript accepts a function of fewer
 parameters where more are declared, so a store written before the filter
 existed still satisfies this interface and compiles without a diagnostic.
+
+---
+
+## Configuration from a file or record
+
+Applications usually load settings as a whole: general settings from the
+environment or a config file, per-user settings from a user record.
+`DeRecProtocolConfig` holds every data setting of the builder, each one
+optional, and `withConfig` applies it in one call:
+
+```ts
+import { DeRecProtocolBuilder } from "@derec-alliance/web";
+import type { DeRecProtocolConfig } from "@derec-alliance/web";
+
+const general: DeRecProtocolConfig = JSON.parse(generalJson);
+const perUser: DeRecProtocolConfig = JSON.parse(userRecordJson);
+
+const protocol = new DeRecProtocolBuilder(secretId)
+  .withStores(stores)
+  .withTransport(myTransport)
+  .withConfig(general)   // 1. general settings
+  .withConfig(perUser)   // 2. per-user settings
+  .withThreshold(4)      // 3. individual setters
+  .build();
+```
+
+- **Only set fields are applied.** An absent or `null` field leaves whatever
+  the builder already holds.
+- **Last write wins, per field.** WASM holds one config and layers every
+  `withConfig` and per-option setter call into it field by field, so the
+  later call always wins regardless of which form it took. Nested objects
+  replace the builder's value as a whole, except `timeouts`: each of its
+  fields is merged separately, so a per-user config that sets only
+  `inbound_message_secs` keeps the `sharing_round_secs` the general config
+  set.
+- **Most rules are checked in `build()`**, with the same result whether the
+  value came from `withConfig` or its own setter. A `threshold` of `1` from
+  a config file fails exactly as `withThreshold(1)` does. A value that
+  needs parsing rather than range-checking — the protocol name in an
+  `own_transports` entry, the `unpair_ack` string — is resolved as soon as
+  it is supplied, so `withOwnTransports`/`withUnpairAck` can throw straight
+  from the call, and the same `own_transports`/`unpair_ack` key inside a
+  `withConfig` argument can throw from that call instead.
+- **Stores, the transport and the constructor's `secretId` are not settings**
+  and are not carried in the config.
+- **Unknown keys throw**, at any level — `decode_error` — instead of being
+  silently ignored, so a misspelled key in a config file fails loudly.
+
+The canonical JSON, shared by every SDK, is:
+
+```json
+{
+  "threshold": 3,
+  "max_subshares": "12",
+  "timeouts": {
+    "inbound_message_secs": 300,
+    "sharing_round_secs": 60,
+    "unpair_ack_secs": 60,
+    "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
+  },
+  "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
+  "auto_accept": { "pairing": true, "store_share": true },
+  "auto_respond_on_failure": false,
+  "auto_reply_to": false,
+  "unpair_ack": "required",
+  "unsafe_connection": false,
+  "communication_info": { "name": "alice" },
+  "own_transports": [{ "uri": "https://me.example.com/derec", "protocol": "https" }],
+  "replica_id": "9007199254740993"
+}
+```
+
+Keys are `snake_case` and every key is optional. `replica_id` and
+`max_subshares` are `u64` values written as decimal strings — a `bigint`
+throws `decode_error`; call `withReplicaId`/`withMaxSubshares` directly for a
+`bigint`. Timeouts are whole seconds. See the `DeRecProtocolConfig` doc comment
+in `index.d.ts` for every field's accepted forms.
 
 ---
 

@@ -14,7 +14,7 @@ use derec_cryptography::pairing::{
     self, InitiatorSecretKeyMaterial, PairingContactMessageMaterial, PairingRequestMessageMaterial,
     ResponderSecretKeyMaterial, pairing_mlkem,
 };
-use derec_cryptography::vss::{self, ShamirPoint, VSSShare};
+use derec_cryptography::vss::{self, Subshare, VSSShare};
 use rand::rand_core::UnwrapErr;
 use rand::rngs::SysRng;
 
@@ -73,7 +73,7 @@ fn a_pairing_started_on_the_old_release_completes_on_the_new_one() {
 #[test]
 fn shares_split_before_0_0_9_are_rejected() {
     let share = |x: &str, y: &str, ct: &str, root: &str, path: &str| VSSShare {
-        points: vec![ShamirPoint {
+        subshares: vec![Subshare {
             x: bytes(x),
             y: bytes(y),
         }],

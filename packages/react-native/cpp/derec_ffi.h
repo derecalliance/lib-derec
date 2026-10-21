@@ -239,6 +239,10 @@
 
 #define DEREC_CODE_VSS_SHARE_FAILED 64
 
+#define DEREC_CODE_INVALID_WEIGHT 65
+
+#define DEREC_CODE_TOO_MANY_SUBSHARES 66
+
 #define DEREC_CODE_EMPTY_RESPONSES 80
 
 #define DEREC_CODE_EMPTY_COMMITTED_DEREC_SHARE 81
@@ -1734,13 +1738,15 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  * are still passed as individual pointers, since purego marshals
  * pointer-sized arguments natively.
  *
- * `config_json` must deserialize to [`ProtocolConfig`] — all field names
- * `snake_case`. `secret_id` is the only required field. Every other field
- * may be omitted, in which case the value matches
- * [`crate::protocol::DeRecProtocolBuilder::new`]'s own default for that
- * setting: [`ProtocolConfig`]'s field-level `#[serde(default)]` attributes
- * read the same constants the builder does. A field that is present is
- * used as given, including `0`, and validated by the builder.
+ * `config_json` is a JSON object holding `secret_id` plus the canonical
+ * [`DeRecProtocolConfig`] JSON, all field names `snake_case`. `secret_id`
+ * is the only required field. The rest is parsed as a
+ * [`DeRecProtocolConfig`] and applied with
+ * [`crate::protocol::DeRecProtocolBuilder::with_config`]: an omitted field
+ * keeps [`crate::protocol::DeRecProtocolBuilder::new`]'s own default for
+ * that setting, and a field that is present is used as given, including
+ * `0`, and validated by the builder. A key the config does not define is
+ * rejected with `DEREC_CODE_FFI_BAD_PROTO` rather than ignored.
  *
  * ```json
  * {
@@ -1779,7 +1785,8 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *     "max_unresponsive_deletion_timeout": 0,
  *     "min_unresponsive_deactivation_timeout": 0,
  *     "max_unresponsive_deactivation_timeout": 0
- *   }
+ *   },
+ *   "max_subshares": null
  * }
  * ```
  *
@@ -1788,9 +1795,10 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *   preference order — the order decides which of a peer's offered
  *   endpoints is used. `protocol` is its name (`"https"`, `"grpc"`) or
  *   its `derec_proto::Protocol` discriminant (`0`, `1`). Each entry is validated, and
- *   two entries of the same protocol are rejected. Required: an absent or
- *   empty list is refused, since a node with no endpoint cannot be reached
- *   by any peer.
+ *   two entries of the same protocol are rejected. An unknown discriminant
+ *   or an invalid URI is rejected with `DEREC_CODE_TRANSPORT_INVALID`.
+ *   Required: an absent or empty list is refused, since a node with no
+ *   endpoint cannot be reached by any peer.
  * - `threshold`: omitted means [`crate::protocol::DEFAULT_THRESHOLD`]. A
  *   `threshold` below `2` is rejected with `DEREC_CODE_INVALID_INPUT`.
  * - `unpair_ack`: `0` / `"required"` = Required, `1` / `"not_required"` =
@@ -1816,6 +1824,11 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *   string values. Mutually exclusive with a non-empty
  *   `communication_info_ptr` buffer; omitted with an empty buffer means
  *   no entries.
+ * - `max_subshares`: decimal-string `u64` capping the total subshares one
+ *   sharing round may split the secret into, or absent/`null` for no cap.
+ *   A cap below `threshold` is rejected by the builder with
+ *   `DEREC_CODE_INVALID_INPUT`; a round over the cap fails with
+ *   `DEREC_CODE_TOO_MANY_SUBSHARES`.
  *
  * # Safety
  *
@@ -2250,14 +2263,23 @@ struct RecoverFromShareResponsesResult recover_from_share_responses(const uint8_
 uint64_t derec_generate_replica_id(void);
 
 /**
+ * Splits `secret_data` into one committed share per weighted channel; see
+ * [`crate::primitives::sharing::request::split`] for the weight and threshold
+ * rules. Channels are given as the aligned `channels_ptr` / `weights_ptr`
+ * arrays described in the module-level "Weighted channels" section; the
+ * result does not depend on the order they are listed in.
+ *
  * # Safety
  *
- * Non-null input pointers must point to the corresponding readable byte ranges.
+ * Non-null input pointers must point to the corresponding readable ranges:
+ * `secret_data_len` bytes, and `channels_len` entries for each of
+ * `channels_ptr` and `weights_ptr`.
  */
 struct ProtectSecretResult protect_secret(uint64_t secret_id,
                                           const uint8_t *secret_data_ptr,
                                           size_t secret_data_len,
                                           const uint64_t *channels_ptr,
+                                          const uint32_t *weights_ptr,
                                           size_t channels_len,
                                           size_t threshold,
                                           uint32_t version);

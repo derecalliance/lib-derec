@@ -18,11 +18,13 @@ use crate::{
     Error, Result,
     derec_message::current_timestamp,
     primitives::sharing::{
-        request::{produce as produce_store_share_request_message, split},
+        request::{
+            produce as produce_store_share_request_message, split, total_subshares, validate_weight,
+        },
         response::{self as sharing_response},
     },
     protocol::types::{HelperInfo, Secret, UserSecret},
-    types::{ChannelId, SharedKey},
+    types::{ChannelId, SharedKey, WeightedChannel},
 };
 use derec_proto::{
     DeRecResult, DeRecSecret, MessageBody, SenderKind, StatusEnum, StoreShareRequestMessage,
@@ -83,10 +85,25 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 /// that never write to `stores.shares`. The snapshot written at the end of
 /// this function is the source of truth the next round reads.
 ///
+/// `weights` names the Helpers that receive more than one subshare;
+/// every other paired Helper receives one. It is validated against the
+/// paired Helper channels before a version is chosen: a key that is not a
+/// paired Helper channel (a replica channel included), a weight of `0`, or
+/// a weight `>= threshold` fails the call with
+/// [`crate::Error::Sharing`] — nothing is sent, no version is consumed and
+/// no snapshot is written, even when the round would not have split.
+///
+/// `max_subshares`, when set, bounds the round's total subshares. It is
+/// checked right after the weights, with the same guarantees: a total above
+/// it fails the call with
+/// [`SharingError::TooManySubshares`](crate::primitives::sharing::SharingError::TooManySubshares)
+/// before a version is chosen or anything is sent.
+///
 /// The split runs once and feeds both the helper-distribution path and
-/// the Destination composite. Below `threshold` no split runs at all:
-/// Helpers receive nothing this round and any paired Replicas receive a
-/// secret-only composite carrying no share material.
+/// the Destination composite. Below `threshold` total subshares (the sum of
+/// every paired Helper's weight) no split runs at all: Helpers receive
+/// nothing this round and any paired Replicas receive a secret-only
+/// composite carrying no share material.
 ///
 /// The snapshot is persisted only *after* distribution attempts
 /// complete, so an interrupted round never leaves the version ahead of
@@ -94,16 +111,30 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 /// `ProtectSecretFailed` and do not block the snapshot — the round stays
 /// addressable and failed peers retry on the next one.
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(trace_id = round.trace_id, secret_id = local.secret_id)))]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn start<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     secrets: Vec<UserSecret>,
     description: Option<String>,
+    weights: std::collections::HashMap<ChannelId, u32>,
     threshold: usize,
+    max_subshares: Option<u64>,
     round: &Round<'_>,
 ) -> Result<Option<SharingRoundResult>> {
     let secret_id = local.secret_id;
     let (helpers, replicas) = load_all_paired_targets(stores, local).await?;
+
+    let helper_channel_ids: Vec<ChannelId> = helpers.iter().map(|(ch, _)| ch.channel_id).collect();
+    let weighted_channels = weighted_helper_channels(&helper_channel_ids, &weights, threshold)?;
+    let subshares = total_subshares(&weighted_channels);
+    if let Some(max) = max_subshares
+        && subshares > max
+    {
+        return Err(
+            crate::primitives::sharing::SharingError::TooManySubshares { subshares, max }.into(),
+        );
+    }
 
     if helpers.is_empty() && replicas.is_empty() {
         return Ok(None);
@@ -159,10 +190,9 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         .unwrap_or(1);
     let description = description.as_deref().unwrap_or("").to_owned();
 
-    let helper_channel_ids: Vec<ChannelId> = helpers.iter().map(|(ch, _)| ch.channel_id).collect();
-    let split_result = if helpers.len() >= threshold {
+    let split_result = if subshares >= threshold as u64 {
         Some(split(
-            &helper_channel_ids,
+            &weighted_channels,
             secret_id,
             version,
             &derec_secret_bytes,
@@ -229,6 +259,38 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         outcomes,
         replica_outcomes,
     }))
+}
+
+/// Pairs every paired Helper channel with its subshare weight: its `weights`
+/// entry, or `1` when it has none.
+///
+/// Every `weights` key must be a paired Helper channel — a replica channel
+/// carries no subshares — and every weight must be in `1..threshold`. Entries
+/// are judged in ascending channel-ID order, so the first offending entry
+/// reported as [`crate::primitives::sharing::SharingError::InvalidWeight`] does
+/// not depend on the map's iteration order.
+fn weighted_helper_channels(
+    helper_channel_ids: &[ChannelId],
+    weights: &std::collections::HashMap<ChannelId, u32>,
+    threshold: usize,
+) -> Result<Vec<WeightedChannel>> {
+    let mut entries: Vec<(ChannelId, u32)> = weights.iter().map(|(&c, &w)| (c, w)).collect();
+    entries.sort_by_key(|&(channel_id, _)| channel_id);
+    for (channel_id, weight) in entries {
+        if !helper_channel_ids.contains(&channel_id) {
+            return Err(crate::primitives::sharing::SharingError::InvalidWeight {
+                channel_id: channel_id.into(),
+                weight,
+            }
+            .into());
+        }
+        validate_weight(channel_id, weight, threshold)?;
+    }
+
+    Ok(helper_channel_ids
+        .iter()
+        .map(|&channel_id| (channel_id, weights.get(&channel_id).copied().unwrap_or(1)))
+        .collect())
 }
 
 /// The output of [`start`] on a round with at least one targeted peer.
@@ -1153,7 +1215,7 @@ mod tests {
             // Owner: split a secret across two channels and build the
             // store-share request bound to OWNER_SECRET_ID.
             let split = request::split(
-                &[channel_id, ChannelId(12)],
+                &[(channel_id, 1), (ChannelId(12), 1)],
                 OWNER_SECRET_ID,
                 1,
                 b"correct horse battery staple",
@@ -1228,7 +1290,7 @@ mod tests {
             let shared_key: SharedKey = [42u8; 32];
 
             let split = request::split(
-                &[channel_id, ChannelId(12)],
+                &[(channel_id, 1), (ChannelId(12), 1)],
                 SECRET_ID,
                 1,
                 b"correct horse battery staple",
@@ -1298,8 +1360,14 @@ mod tests {
             let shared_key: SharedKey = [42u8; 32];
 
             let build = |payload: &[u8]| {
-                let split = request::split(&[channel_id, ChannelId(12)], SECRET_ID, 1, payload, 2)
-                    .expect("split secret");
+                let split = request::split(
+                    &[(channel_id, 1), (ChannelId(12), 1)],
+                    SECRET_ID,
+                    1,
+                    payload,
+                    2,
+                )
+                .expect("split secret");
                 let committed = split.shares.get(&channel_id).expect("share").clone();
                 let produced = request::produce(
                     channel_id,
@@ -1380,7 +1448,7 @@ mod tests {
 
     fn store_request(version: u32, keep_list: &[u32]) -> derec_proto::StoreShareRequestMessage {
         let split = request::split(
-            &[KEEP_CHANNEL, ChannelId(12)],
+            &[(KEEP_CHANNEL, 1), (ChannelId(12), 1)],
             KEEP_SECRET_ID,
             version,
             format!("secret at version {version}").as_bytes(),
@@ -1575,7 +1643,7 @@ mod tests {
     /// a response endpoint.
     fn param_request(payload: &[u8]) -> derec_proto::StoreShareRequestMessage {
         let split = request::split(
-            &[PARAM_CHANNEL, ChannelId(42)],
+            &[(PARAM_CHANNEL, 1), (ChannelId(42), 1)],
             PARAM_SECRET_ID,
             1,
             payload,
@@ -2063,7 +2131,9 @@ mod owner_keep_list_tests {
                 data: b"data".to_vec(),
             }],
             None,
+            std::collections::HashMap::new(),
             THRESHOLD,
+            None,
             &Round {
                 reply_to: &[],
                 trace_id: 1,
@@ -3090,4 +3160,670 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
         }
     };
     Ok(vec![event])
+}
+
+/// `start(ProtectSecret)` with per-helper weights: validation, the gate, the
+/// split, and the `weight` reported on each dispatch event.
+#[cfg(test)]
+mod weighted_round_tests {
+    use crate::primitives::sharing::SharingError;
+    use crate::protocol::builder::DeRecProtocolBuilder;
+    use crate::protocol::context::Round;
+    use crate::protocol::test::{
+        InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
+        InMemUserSecretStore, LocalFixture, RecordingTransport, StoreRig, run_async,
+    };
+    use crate::protocol::types::{
+        ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole, SecretValue,
+        UserSecret, UserSecrets,
+    };
+    use crate::protocol::{
+        DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol, DeRecSecretStore,
+        DeRecUserSecretStore,
+    };
+    use crate::types::{ChannelId, ReplicaId};
+    use derec_proto::{Protocol, SenderKind, TransportProtocol};
+    use prost::Message as _;
+    use std::collections::HashMap;
+
+    const SECRET_ID: u64 = 0x7E16;
+
+    fn endpoint(channel: u64) -> TransportProtocol {
+        TransportProtocol {
+            uri: format!("https://helper-{channel}.example"),
+            protocol: Protocol::Https as i32,
+        }
+    }
+
+    async fn seed_helper(
+        channels: &mut InMemChannelStore,
+        secrets: &mut InMemSecretStore,
+        ch: u64,
+    ) {
+        channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id: ChannelId(ch),
+                    transports: vec![endpoint(ch)],
+                    communication_info: HashMap::new(),
+                    status: ChannelStatus::Paired,
+                    created_at: 0,
+                    peer_role: SenderKind::Helper,
+                }),
+            )
+            .await
+            .expect("seed helper channel");
+        secrets
+            .save(
+                SECRET_ID,
+                ChannelId(ch),
+                SecretValue::SharedKey([ch as u8; 32]),
+            )
+            .await
+            .expect("seed helper key");
+    }
+
+    fn secrets() -> Vec<UserSecret> {
+        vec![UserSecret {
+            id: b"id".to_vec(),
+            name: "name".to_owned(),
+            data: b"weighted data".to_vec(),
+        }]
+    }
+
+    async fn seed_latest_version(rig: &mut StoreRig, version: u32) {
+        rig.user_secrets
+            .save_latest(
+                SECRET_ID,
+                UserSecrets {
+                    version,
+                    secrets: Vec::new(),
+                    description: None,
+                    author_replica_id: None,
+                },
+            )
+            .await
+            .expect("seed snapshot");
+    }
+
+    async fn latest_version(rig: &StoreRig) -> Option<u32> {
+        rig.user_secrets
+            .load_latest(SECRET_ID)
+            .await
+            .expect("load snapshot")
+            .map(|s| s.version)
+    }
+
+    #[test]
+    fn protect_secret_rejects_invalid_weights_even_below_threshold() {
+        run_async(async {
+            let mut rig = StoreRig::new();
+            for ch in [41, 42] {
+                seed_helper(&mut rig.channels, &mut rig.secrets, ch).await;
+            }
+            seed_latest_version(&mut rig, 4).await;
+            let lf = LocalFixture::new(SECRET_ID);
+
+            let result = super::start(
+                &mut rig.stores(),
+                &lf.local(),
+                secrets(),
+                None,
+                HashMap::from([(ChannelId(999), 2)]),
+                5,
+                None,
+                &Round {
+                    reply_to: &[],
+                    trace_id: 1,
+                },
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::Error::Sharing(SharingError::InvalidWeight {
+                        channel_id: 999,
+                        weight: 2
+                    }))
+                ),
+                "an unknown channel's weight fails the call, though 2 helpers never reach t = 5"
+            );
+            assert!(
+                rig.transport.sent_envelopes().is_empty(),
+                "nothing is dispatched"
+            );
+            assert_eq!(
+                latest_version(&rig).await,
+                Some(4),
+                "no version is consumed"
+            );
+        });
+    }
+
+    #[test]
+    fn protect_secret_rejects_a_replica_channel_weight() {
+        run_async(async {
+            const GROUP_CHANNEL: u64 = 5101;
+            let mut rig = StoreRig::new();
+            for ch in [41, 42] {
+                seed_helper(&mut rig.channels, &mut rig.secrets, ch).await;
+            }
+            rig.channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Replica(ReplicaMember {
+                        channel_id: ChannelId(GROUP_CHANNEL),
+                        replica_id: ReplicaId(1002),
+                        transports: vec![endpoint(GROUP_CHANNEL)],
+                        communication_info: HashMap::new(),
+                        role: ReplicaRole::Destination,
+                        status: ChannelStatus::Paired,
+                        created_at: 0,
+                    }),
+                )
+                .await
+                .expect("seed member");
+            rig.secrets
+                .save(
+                    SECRET_ID,
+                    ChannelId(GROUP_CHANNEL),
+                    SecretValue::SharedKey([0x42; 32]),
+                )
+                .await
+                .expect("seed group key");
+            let lf = LocalFixture::with_replica(SECRET_ID, 1001);
+
+            let result = super::start(
+                &mut rig.stores(),
+                &lf.local(),
+                secrets(),
+                None,
+                HashMap::from([(ChannelId(GROUP_CHANNEL), 1)]),
+                2,
+                None,
+                &Round {
+                    reply_to: &[],
+                    trace_id: 1,
+                },
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::Error::Sharing(SharingError::InvalidWeight {
+                        channel_id: GROUP_CHANNEL,
+                        ..
+                    }))
+                ),
+                "a replica channel carries no subshares and cannot be weighted"
+            );
+            assert!(rig.transport.sent_envelopes().is_empty());
+        });
+    }
+
+    /// A paired Helper's weight outside `1..threshold` fails the call even
+    /// when the round would not split, and entries are judged in ascending
+    /// channel-ID order whichever rule they break.
+    #[test]
+    fn protect_secret_rejects_an_out_of_range_helper_weight_even_below_threshold() {
+        run_async(async {
+            let mut rig = StoreRig::new();
+            for ch in [41, 42] {
+                seed_helper(&mut rig.channels, &mut rig.secrets, ch).await;
+            }
+            seed_latest_version(&mut rig, 4).await;
+            let lf = LocalFixture::new(SECRET_ID);
+
+            let result = super::start(
+                &mut rig.stores(),
+                &lf.local(),
+                secrets(),
+                None,
+                HashMap::from([(ChannelId(999), 2), (ChannelId(41), 0)]),
+                5,
+                None,
+                &Round {
+                    reply_to: &[],
+                    trace_id: 1,
+                },
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::Error::Sharing(SharingError::InvalidWeight {
+                        channel_id: 41,
+                        weight: 0
+                    }))
+                ),
+                "the lowest offending channel is reported; got {:?}",
+                result.as_ref().map(|_| ())
+            );
+            assert!(rig.transport.sent_envelopes().is_empty());
+            assert_eq!(latest_version(&rig).await, Some(4));
+        });
+    }
+
+    type TestProtocol = DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemPersistedStateStore,
+        RecordingTransport,
+    >;
+
+    struct ProtocolRig {
+        protocol: TestProtocol,
+        channels: InMemChannelStore,
+        secrets: InMemSecretStore,
+        shares: InMemShareStore,
+    }
+
+    async fn protocol_rig(helpers: &[u64], threshold: usize) -> ProtocolRig {
+        let mut channels = InMemChannelStore::default();
+        let mut secrets = InMemSecretStore::default();
+        let shares = InMemShareStore::default();
+        for &ch in helpers {
+            seed_helper(&mut channels, &mut secrets, ch).await;
+        }
+        let protocol = DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(channels.clone())
+            .with_share_store(shares.clone())
+            .with_secret_store(secrets.clone())
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(RecordingTransport::default())
+            .with_state_store(InMemPersistedStateStore::default())
+            .with_own_transports(["https://owner.example.com"])
+            .with_threshold(threshold)
+            .build()
+            .expect("test protocol builds");
+        ProtocolRig {
+            protocol,
+            channels,
+            secrets,
+            shares,
+        }
+    }
+
+    /// `(channel, weight)` of every `ProtectSecretStarted`, sorted by channel.
+    fn started_weights(events: &[DeRecEvent]) -> Vec<(u64, u32)> {
+        let mut out: Vec<(u64, u32)> = events
+            .iter()
+            .filter_map(|e| match e {
+                DeRecEvent::ProtectSecretStarted {
+                    channel_id, weight, ..
+                } => Some((channel_id.0, *weight)),
+                _ => None,
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    fn stored_subshares(shares: &InMemShareStore, channel: u64, version: u32) -> usize {
+        let bytes = shares
+            .data
+            .lock()
+            .unwrap()
+            .get(&(SECRET_ID, channel, version))
+            .expect("the owner keeps a tracking share per dispatched helper")
+            .bytes
+            .clone();
+        let committed =
+            derec_proto::CommittedDeRecShare::decode(bytes.as_slice()).expect("committed share");
+        derec_proto::DeRecShare::decode(committed.de_rec_share.as_slice())
+            .expect("derec share")
+            .subshares
+            .len()
+    }
+
+    #[test]
+    fn weighted_round_splits_with_fewer_helpers_than_threshold() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 3).await;
+            let events = rig
+                .protocol
+                .start(DeRecFlow::ProtectSecret {
+                    secrets: secrets(),
+                    description: None,
+                    weights: HashMap::from([(ChannelId(51), 2)]),
+                })
+                .await
+                .expect("a weighted round over 3 subshares meets t = 3");
+
+            assert_eq!(started_weights(&events), vec![(51, 2), (52, 1)]);
+            assert_eq!(stored_subshares(&rig.shares, 51, 1), 2);
+            assert_eq!(stored_subshares(&rig.shares, 52, 1), 1);
+        });
+    }
+
+    #[test]
+    fn protect_secret_without_weights_is_unchanged() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52, 53], 2).await;
+            let events = rig
+                .protocol
+                .start(DeRecFlow::ProtectSecret {
+                    secrets: secrets(),
+                    description: None,
+                    weights: HashMap::new(),
+                })
+                .await
+                .expect("an unweighted round runs");
+
+            assert_eq!(events.len(), 3, "one event per helper; got {events:?}");
+            assert_eq!(started_weights(&events), vec![(51, 1), (52, 1), (53, 1)]);
+            for ch in [51, 52, 53] {
+                assert_eq!(stored_subshares(&rig.shares, ch, 1), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn unweighted_round_below_threshold_still_does_not_split() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 3).await;
+            let events = rig
+                .protocol
+                .start(DeRecFlow::ProtectSecret {
+                    secrets: secrets(),
+                    description: None,
+                    weights: HashMap::new(),
+                })
+                .await
+                .expect("a round below threshold is not an error");
+
+            assert!(started_weights(&events).is_empty(), "got {events:?}");
+            assert!(rig.protocol.transport.sent_envelopes().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_failed_dispatch_reports_the_intended_weight() {
+        run_async(async {
+            let mut channels = InMemChannelStore::default();
+            let mut secrets_store = InMemSecretStore::default();
+            for ch in [51, 52] {
+                seed_helper(&mut channels, &mut secrets_store, ch).await;
+            }
+            let mut protocol = DeRecProtocolBuilder::new(SECRET_ID)
+                .with_channel_store(channels)
+                .with_share_store(InMemShareStore::default())
+                .with_secret_store(secrets_store)
+                .with_user_secret_store(InMemUserSecretStore::default())
+                .with_transport(crate::protocol::test::FailingTransport)
+                .with_state_store(InMemPersistedStateStore::default())
+                .with_own_transports(["https://owner.example.com"])
+                .with_threshold(3)
+                .build()
+                .expect("test protocol builds");
+
+            let events = protocol
+                .start(DeRecFlow::ProtectSecret {
+                    secrets: secrets(),
+                    description: None,
+                    weights: HashMap::from([(ChannelId(51), 2)]),
+                })
+                .await
+                .expect("per-channel failures do not fail the round");
+
+            let mut failed: Vec<(u64, u32)> = events
+                .iter()
+                .filter_map(|e| match e {
+                    DeRecEvent::ProtectSecretFailed {
+                        channel_id, weight, ..
+                    } => Some((channel_id.0, *weight)),
+                    _ => None,
+                })
+                .collect();
+            failed.sort_unstable();
+            assert_eq!(failed, vec![(51, 2), (52, 1)]);
+        });
+    }
+
+    #[test]
+    fn pair_completion_auto_publish_reports_weight_one() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 3).await;
+            rig.protocol
+                .start(DeRecFlow::ProtectSecret {
+                    secrets: secrets(),
+                    description: None,
+                    weights: HashMap::from([(ChannelId(51), 2)]),
+                })
+                .await
+                .expect("weighted round");
+
+            seed_helper(&mut rig.channels, &mut rig.secrets, 53).await;
+            let events = rig
+                .protocol
+                .maybe_auto_publish_after_pair(&[DeRecEvent::PairingCompleted {
+                    channel_id: ChannelId(53),
+                    pairing_channel_id: ChannelId(53),
+                    kind: SenderKind::Owner,
+                    peer_communication_info: HashMap::new(),
+                }])
+                .await
+                .expect("auto-publish runs");
+
+            assert_eq!(
+                started_weights(&events),
+                vec![(51, 1), (52, 1), (53, 1)],
+                "a library-initiated publish gives every helper one subshare"
+            );
+            for ch in [51, 52, 53] {
+                assert_eq!(stored_subshares(&rig.shares, ch, 2), 1);
+            }
+        });
+    }
+
+    /// The cap is checked against the round's total subshares before a version
+    /// is chosen, so an over-cap round fails without dispatching anything or
+    /// consuming a version.
+    #[test]
+    fn protect_secret_over_the_subshare_cap_fails_before_dispatch() {
+        run_async(async {
+            let mut rig = StoreRig::new();
+            for ch in [41, 42] {
+                seed_helper(&mut rig.channels, &mut rig.secrets, ch).await;
+            }
+            seed_latest_version(&mut rig, 4).await;
+            let lf = LocalFixture::new(SECRET_ID);
+
+            let result = super::start(
+                &mut rig.stores(),
+                &lf.local(),
+                secrets(),
+                None,
+                HashMap::from([(ChannelId(41), 2), (ChannelId(42), 2)]),
+                3,
+                Some(3),
+                &Round {
+                    reply_to: &[],
+                    trace_id: 1,
+                },
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::Error::Sharing(SharingError::TooManySubshares {
+                        subshares: 4,
+                        max: 3
+                    }))
+                ),
+                "4 subshares exceed a cap of 3; got {:?}",
+                result.as_ref().map(|_| ())
+            );
+            assert!(
+                rig.transport.sent_envelopes().is_empty(),
+                "nothing is dispatched"
+            );
+            assert_eq!(
+                latest_version(&rig).await,
+                Some(4),
+                "no version is consumed"
+            );
+        });
+    }
+
+    async fn protocol_rig_with_cap(
+        helpers: &[u64],
+        threshold: usize,
+        max_subshares: u64,
+    ) -> ProtocolRig {
+        let mut channels = InMemChannelStore::default();
+        let mut secrets = InMemSecretStore::default();
+        let shares = InMemShareStore::default();
+        for &ch in helpers {
+            seed_helper(&mut channels, &mut secrets, ch).await;
+        }
+        let protocol = DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(channels.clone())
+            .with_share_store(shares.clone())
+            .with_secret_store(secrets.clone())
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(RecordingTransport::default())
+            .with_state_store(InMemPersistedStateStore::default())
+            .with_own_transports(["https://owner.example.com"])
+            .with_threshold(threshold)
+            .with_max_subshares(max_subshares)
+            .build()
+            .expect("test protocol builds");
+        ProtocolRig {
+            protocol,
+            channels,
+            secrets,
+            shares,
+        }
+    }
+
+    #[test]
+    fn protect_secret_at_the_subshare_cap_runs() {
+        run_async(async {
+            let mut rig = protocol_rig_with_cap(&[51, 52], 3, 3).await;
+            let events = rig
+                .protocol
+                .start(DeRecFlow::ProtectSecret {
+                    secrets: secrets(),
+                    description: None,
+                    weights: HashMap::from([(ChannelId(51), 2)]),
+                })
+                .await
+                .expect("3 subshares fit a cap of 3");
+
+            assert_eq!(started_weights(&events), vec![(51, 2), (52, 1)]);
+            assert_eq!(stored_subshares(&rig.shares, 51, 1), 2);
+        });
+    }
+
+    #[test]
+    fn protect_secret_over_the_subshare_cap_surfaces_from_start() {
+        run_async(async {
+            let mut rig = protocol_rig_with_cap(&[51, 52], 3, 3).await;
+            let result = rig
+                .protocol
+                .start(DeRecFlow::ProtectSecret {
+                    secrets: secrets(),
+                    description: None,
+                    weights: HashMap::from([(ChannelId(51), 2), (ChannelId(52), 2)]),
+                })
+                .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::Error::Sharing(SharingError::TooManySubshares {
+                        subshares: 4,
+                        max: 3
+                    }))
+                ),
+                "got {:?}",
+                result.as_ref().map(|_| ())
+            );
+            assert!(rig.protocol.transport.sent_envelopes().is_empty());
+        });
+    }
+
+    /// With no cap configured a round of any total runs as before.
+    #[test]
+    fn protect_secret_without_a_cap_accepts_any_total() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 3).await;
+            let events = rig
+                .protocol
+                .start(DeRecFlow::ProtectSecret {
+                    secrets: secrets(),
+                    description: None,
+                    weights: HashMap::from([(ChannelId(51), 2), (ChannelId(52), 2)]),
+                })
+                .await
+                .expect("no cap is configured");
+
+            assert_eq!(started_weights(&events), vec![(51, 2), (52, 2)]);
+        });
+    }
+
+    /// A library-initiated publish gives every Helper one subshare, so its
+    /// total is the Helper count; once that exceeds the cap the publish fails
+    /// the same way `start` does, and nothing reaches any Helper.
+    #[test]
+    fn pair_completion_auto_publish_respects_the_subshare_cap() {
+        run_async(async {
+            let mut rig = protocol_rig_with_cap(&[51, 52], 2, 2).await;
+            rig.protocol
+                .start(DeRecFlow::ProtectSecret {
+                    secrets: secrets(),
+                    description: None,
+                    weights: HashMap::new(),
+                })
+                .await
+                .expect("2 subshares fit a cap of 2");
+            let sent_before = rig.protocol.transport.sent_envelopes().len();
+
+            seed_helper(&mut rig.channels, &mut rig.secrets, 53).await;
+            let result = rig
+                .protocol
+                .maybe_auto_publish_after_pair(&[DeRecEvent::PairingCompleted {
+                    channel_id: ChannelId(53),
+                    pairing_channel_id: ChannelId(53),
+                    kind: SenderKind::Owner,
+                    peer_communication_info: HashMap::new(),
+                }])
+                .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::Error::Sharing(SharingError::TooManySubshares {
+                        subshares: 3,
+                        max: 2
+                    }))
+                ),
+                "got {:?}",
+                result.as_ref().map(|_| ())
+            );
+            assert_eq!(
+                rig.protocol.transport.sent_envelopes().len(),
+                sent_before,
+                "nothing is dispatched"
+            );
+            assert_eq!(
+                rig.protocol
+                    .user_secret_store
+                    .load_latest(SECRET_ID)
+                    .await
+                    .expect("load snapshot")
+                    .map(|s| s.version),
+                Some(1),
+                "no version is consumed"
+            );
+        });
+    }
 }

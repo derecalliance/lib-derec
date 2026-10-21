@@ -49,12 +49,20 @@ public static partial class Sharing
         public static SplitResult Split(
             ulong secretId,
             byte[] secretData,
-            ulong[] channelIds,
+            IReadOnlyList<WeightedChannel> channels,
             ulong threshold,
             uint version
         )
         {
-            ArgumentNullException.ThrowIfNull(channelIds);
+            ArgumentNullException.ThrowIfNull(channels);
+
+            ulong[] channelIds = new ulong[channels.Count];
+            uint[] weights = new uint[channels.Count];
+            for (int i = 0; i < channels.Count; i++)
+            {
+                channelIds[i] = channels[i].ChannelId;
+                weights[i] = channels[i].Weight;
+            }
 
             Native.Sharing.ProtectSecretResult nativeResult =
                 Native.Sharing.protect_secret(
@@ -62,6 +70,7 @@ public static partial class Sharing
                     secretData,
                     (UIntPtr)secretData.Length,
                     channelIds,
+                    weights,
                     (UIntPtr)channelIds.Length,
                     (UIntPtr)threshold,
                     version

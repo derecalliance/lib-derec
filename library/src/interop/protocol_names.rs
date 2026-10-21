@@ -39,7 +39,6 @@ pub(crate) fn protocol_discriminant_to_name(discriminant: i32) -> Option<&'stati
 /// app-facing surface uses; the discriminant stays accepted so a binding's
 /// own marshalling of a typed enum needs no name lookup. A discriminant is
 /// passed through unchanged and validated where the endpoint is built.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn protocol_from_name_or_discriminant<'de, D>(de: D) -> Result<i32, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -59,6 +58,7 @@ where
 }
 
 /// Reads a transport `protocol` field written as its name only.
+#[cfg_attr(not(any(target_arch = "wasm32", feature = "ffi")), allow(dead_code))]
 pub(crate) fn protocol_from_name<'de, D>(de: D) -> Result<i32, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -78,6 +78,15 @@ pub(crate) fn unpair_ack_from_name(name: &str) -> Option<crate::protocol::Unpair
         "required" => Some(crate::protocol::UnpairAck::Required),
         "not_required" => Some(crate::protocol::UnpairAck::NotRequired),
         _ => None,
+    }
+}
+
+/// Inverse of [`unpair_ack_from_name`]: the name every binding exposes for
+/// an unpair-ack variant.
+pub(crate) fn unpair_ack_to_name(ack: crate::protocol::UnpairAck) -> &'static str {
+    match ack {
+        crate::protocol::UnpairAck::Required => "required",
+        crate::protocol::UnpairAck::NotRequired => "not_required",
     }
 }
 
@@ -112,6 +121,16 @@ mod tests {
         );
         for alias in ["Required", "notrequired", "fire_and_forget", ""] {
             assert_eq!(unpair_ack_from_name(alias), None, "{alias:?}");
+        }
+    }
+
+    #[test]
+    fn every_unpair_ack_round_trips_through_its_name() {
+        for ack in [
+            crate::protocol::UnpairAck::Required,
+            crate::protocol::UnpairAck::NotRequired,
+        ] {
+            assert_eq!(unpair_ack_from_name(unpair_ack_to_name(ack)), Some(ack));
         }
     }
 

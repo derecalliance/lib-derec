@@ -25,6 +25,7 @@ import type {
   ContactMessage,
   DeRecError,
   DeRecEvent,
+  DeRecProtocolConfig,
   HelperFilter,
   ReplicaFilter,
   ReplicaRoleName,
@@ -37,6 +38,7 @@ import type {
   UserSecretStore,
   UserSecrets,
 } from "@derec-alliance/react-native";
+import protocolConfigFixtures from "../../../library/tests/fixtures/protocol_config.json";
 
 /**
  * The unrestricted filters, for assertions that want the whole listing.
@@ -481,6 +483,7 @@ function makeNode(
     secretId?: bigint;
     threshold?: number;
     unsafeConnection?: boolean;
+    maxSubshares?: bigint;
   } = {},
 ): Node {
   const channelStore = options.channelStore ?? new InMemoryChannelStore();
@@ -509,6 +512,9 @@ function makeNode(
   }
   if (options.unsafeConnection !== undefined) {
     builder = builder.withUnsafeConnection(options.unsafeConnection);
+  }
+  if (options.maxSubshares !== undefined) {
+    builder = builder.withMaxSubshares(options.maxSubshares);
   }
   const protocol = builder.build();
   return { protocol, transport, channelStore, shareStore, secretStore, userSecretStore, stateStore };
@@ -1149,6 +1155,200 @@ async function runSharingFlow(): Promise<void> {
   }
 
   console.log("\n✓ Sharing flow passed.\n");
+}
+
+
+/**
+ * `withMaxSubshares` caps a sharing round's total subshares. A cap below the
+ * threshold makes `build()` throw `invalid_input`; a round whose weights
+ * total more than the cap fails `start(ProtectSecret)` with
+ * `too_many_subshares` before anything is sent.
+ */
+async function runMaxSubsharesFlow(): Promise<void> {
+  console.log("=== [Protocol] Max Subshares Cap ===\n");
+
+  const ownerSecretId = 45n;
+  let buildCode: string | undefined;
+  try {
+    makeNode("Owner", "https://owner.example.com", {
+      secretId: ownerSecretId,
+      threshold: 3,
+      maxSubshares: 2n,
+    });
+  } catch (e) {
+    buildCode = (e as { code?: string }).code;
+  }
+  if (buildCode !== "invalid_input") {
+    throw new Error(`a cap below the threshold must fail build() with invalid_input, got ${buildCode ?? "no error"}`);
+  }
+  console.log("  [Owner]  build() refuses a cap below the threshold (invalid_input)  ✓");
+
+  const owner = makeNode("Owner", "https://owner.example.com", {
+    secretId: ownerSecretId,
+    threshold: 3,
+    maxSubshares: 3n,
+  });
+  const helperA = makeNode("HelperA", "https://helper-a.example.com");
+  const helperB = makeNode("HelperB", "https://helper-b.example.com");
+  const { longTermChannelId: channelA } = await doPair(helperA, owner, 1n, "Owner↔HelperA");
+  const { longTermChannelId: channelB } = await doPair(helperB, owner, 2n, "Owner↔HelperB");
+  owner.transport.drain();
+
+  let startCode: string | undefined;
+  try {
+    await owner.protocol.start(FlowKind.ProtectSecret, {
+      secrets: [{ id: new Uint8Array([5]), name: "capped secret", data: new Uint8Array([1, 2, 3]) }],
+      description: "over the cap",
+      weights: new Map([
+        [BigInt(channelA), 2],
+        [BigInt(channelB), 2],
+      ]),
+    });
+  } catch (e) {
+    startCode = (e as { code?: string }).code;
+  }
+  if (startCode !== "too_many_subshares") {
+    throw new Error(`4 subshares over a cap of 3 must fail with too_many_subshares, got ${startCode ?? "no error"}`);
+  }
+  if (owner.transport.drain().length !== 0) {
+    throw new Error("a round over the cap must send nothing");
+  }
+  console.log("  [Owner]  start(ProtectSecret) over the cap fails with too_many_subshares and sends nothing  ✓");
+  console.log("\n✓ Max subshares cap passed.\n");
+}
+
+/**
+ * A weighted round: four helpers, threshold 3, helper-0 at weight 2.
+ *
+ * Helper-0 receives two subshares and every other helper one, as the
+ * dispatch events report. Once every helper confirms, the round meets the
+ * threshold, and the secret is then recovered from helper-0 and helper-1
+ * alone: two helpers holding three subshares. The protocol library has no
+ * protobuf decoder in TypeScript, so the weight is proven structurally —
+ * through what it lets `RecoverSecret` reconstruct — rather than by
+ * decoding the committed share bytes.
+ */
+async function runWeightedHelpersFlow(): Promise<void> {
+  console.log("=== [Protocol] Weighted Helpers Flow ===\n");
+
+  const ownerSecretId = 44n;
+  const owner = makeNode("Owner", "https://owner.example.com", {
+    secretId: ownerSecretId,
+    threshold: 3,
+  });
+  const helper0 = makeNode("Helper0", "https://helper-0.example.com");
+  const helper1 = makeNode("Helper1", "https://helper-1.example.com");
+  const helper2 = makeNode("Helper2", "https://helper-2.example.com");
+  const helper3 = makeNode("Helper3", "https://helper-3.example.com");
+
+  const { longTermChannelId: channel0 } = await doPair(helper0, owner, 1n, "Owner↔Helper0");
+  const { longTermChannelId: channel1 } = await doPair(helper1, owner, 2n, "Owner↔Helper1");
+  const { longTermChannelId: channel2 } = await doPair(helper2, owner, 3n, "Owner↔Helper2");
+  const { longTermChannelId: channel3 } = await doPair(helper3, owner, 4n, "Owner↔Helper3");
+  console.log();
+
+  // Weights are keyed by the long-term channel id pairing rekeys onto, not
+  // the transient pairing id passed to `doPair`.
+  const secretData = utf8Encode("two helpers, three subshares");
+  const protectEvents = await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([3]), name: "weighted secret", data: secretData }],
+    description: "weighted round",
+    weights: new Map([[BigInt(channel0), 2]]),
+  });
+
+  const weightByChannel = new Map<string, number>();
+  let version: number | undefined;
+  for (const ev of protectEvents) {
+    if (ev.type === "ProtectSecretStarted") {
+      weightByChannel.set(ev.channel_id, ev.weight);
+      version = ev.version;
+    }
+  }
+  const expectedWeight: Record<string, number> = {
+    [channel0]: 2,
+    [channel1]: 1,
+    [channel2]: 1,
+    [channel3]: 1,
+  };
+  for (const [channelId, weight] of Object.entries(expectedWeight)) {
+    if (weightByChannel.get(channelId) !== weight) {
+      throw new Error(
+        `ProtectSecretStarted: expected weight ${weight} for channel ${channelId}, got ${weightByChannel.get(channelId)}`,
+      );
+    }
+  }
+  if (version === undefined) {
+    throw new Error("the round must report the version it published");
+  }
+  console.log(
+    `  [Owner]  start(ProtectSecret, weights={helper0: 2}) → weight(helper0)=2, weight(others)=1  ✓`,
+  );
+
+  const helpersByChannel: Array<[string, Node, string]> = [
+    [channel0, helper0, "Helper0"],
+    [channel1, helper1, "Helper1"],
+    [channel2, helper2, "Helper2"],
+    [channel3, helper3, "Helper3"],
+  ];
+  let sharingComplete: Extract<DeRecEvent, { type: "SharingComplete" }> | undefined;
+  for (const outbound of owner.transport.drain()) {
+    const helperIndex = Number(outbound.endpoint.uri.match(/helper-(\d)/)?.[1]);
+    const [, helper, label] = helpersByChannel[helperIndex]!;
+    const helperEvents = await processAll(helper, outbound.message);
+    requireEvent(helperEvents, "ShareStored", label);
+    const response = drainOne(helper, label);
+    const ownerEvents = await owner.protocol.process(response);
+    const complete = ownerEvents.find((e) => e.type === "SharingComplete") as
+      | Extract<DeRecEvent, { type: "SharingComplete" }>
+      | undefined;
+    if (complete) sharingComplete = complete;
+  }
+  if (!sharingComplete || !sharingComplete.threshold_met) {
+    throw new Error("five confirmed subshares across 4 helpers must meet threshold 3");
+  }
+  console.log(`  [Owner]  SharingComplete(threshold_met=true) — 2+1+1+1 subshares ≥ 3  ✓`);
+
+  // Drop helper-2 and helper-3 from the Owner's roster so RecoverSecret
+  // fans out only to helper-0 (2 subshares) and helper-1 (1 subshare): three
+  // subshares total, exactly the threshold.
+  const ownerSid = String(owner.protocol.secretId());
+  await owner.channelStore.remove(ownerSid, channel2, "0");
+  await owner.channelStore.remove(ownerSid, channel3, "0");
+
+  await owner.protocol.start(FlowKind.RecoverSecret, {
+    secretId: ownerSecretId,
+    version,
+  });
+  const recoverRequests = owner.transport.drain();
+  if (recoverRequests.length !== 2) {
+    throw new Error(`expected 2 GetShareRequests (helper0 + helper1 only), got ${recoverRequests.length}`);
+  }
+
+  let recovered: Extract<DeRecEvent, { type: "SecretRecovered" }>["secret"] | undefined;
+  for (const outbound of recoverRequests) {
+    const isHelper0 = outbound.endpoint.uri.includes("helper-0");
+    const helper = isHelper0 ? helper0 : helper1;
+    const label = isHelper0 ? "Helper0" : "Helper1";
+    await processAll(helper, outbound.message);
+    const response = drainOne(helper, label);
+    const ownerEvents = await owner.protocol.process(response);
+    const recoveredEvent = ownerEvents.find((e) => e.type === "SecretRecovered") as
+      | Extract<DeRecEvent, { type: "SecretRecovered" }>
+      | undefined;
+    if (recoveredEvent) recovered = recoveredEvent.secret;
+  }
+  if (!recovered) {
+    throw new Error("helper-0 (2 subshares) and helper-1 (1 subshare) must recover the secret");
+  }
+  const recoveredSecret = recovered.secrets.find((s) => s.id.length === 1 && s.id[0] === 3);
+  if (!recoveredSecret || !byteArraysEqual(recoveredSecret.data, secretData)) {
+    throw new Error("recovered secret must carry the protected bytes");
+  }
+  console.log(
+    `  [Owner]  RecoverSecret from helper0+helper1 alone (2+1=3 subshares) → recovered "${recoveredSecret.name}"  ✓`,
+  );
+
+  console.log("\n✓ Weighted helpers flow passed.\n");
 }
 
 
@@ -2171,7 +2371,10 @@ export async function runProtocolSmoke(): Promise<void> {
   await runNoKeysPairingFlow();
   runUnsafeConnectionConfigFlow();
   runConfigSurfaceFlow();
+  await runWithConfigFlow();
   await runSharingFlow();
+  await runWeightedHelpersFlow();
+  await runMaxSubsharesFlow();
   await runShareStoreRefusalFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();
@@ -2928,6 +3131,62 @@ export function runConfigSurfaceFlow(): void {
   console.log("  distinct protocols accepted  ✓");
 
   console.log("\n✓ config surface passed.\n");
+}
+
+/**
+ * `withConfig` end to end: the shared fixture's full config builds a
+ * protocol that runs an existing flow. This binding validates nothing of
+ * its own — a misspelled key, or an array (whose entries surface as
+ * unrecognized numeric-string keys), is forwarded into the same config JSON
+ * `build()` sends to `protocol_new`, and the library's `deny_unknown_fields`
+ * is what refuses it.
+ */
+async function runWithConfigFlow(): Promise<void> {
+  console.log("=== [Protocol] withConfig ===\n");
+
+  const base = () =>
+    new DeRecProtocolBuilder(DEFAULT_TEST_SECRET_ID)
+      .withChannelStore(new InMemoryChannelStore())
+      .withShareStore(new InMemoryShareStore())
+      .withSecretStore(new InMemorySecretStore())
+      .withUserSecretStore(new InMemoryUserSecretStore())
+      .withStateStore(new InMemoryStateStore())
+      .withTransport(new RecordingTransport());
+
+  const protocol = base().withConfig(protocolConfigFixtures.full as DeRecProtocolConfig).build();
+  const events = await protocol.start(FlowKind.Discovery, {});
+  if (!Array.isArray(events)) {
+    throw new Error("start(Discovery) on a withConfig-built protocol must return an event array");
+  }
+  console.log("  the fixture's full config builds and runs Discovery  ✓");
+
+  let misspelled: { code?: string; message?: string } | null = null;
+  try {
+    base().withConfig({ treshold: 3 } as unknown as DeRecProtocolConfig).build();
+  } catch (e) {
+    misspelled = e as { code?: string; message?: string };
+  }
+  if (!misspelled?.message?.includes("unknown field")) {
+    throw new Error(
+      `a misspelled withConfig key must reach the library and be refused, got code=${misspelled?.code} message=${misspelled?.message}`,
+    );
+  }
+  console.log("  a misspelled withConfig key reaches the library and is refused  ✓");
+
+  let arrayError: { code?: string; message?: string } | null = null;
+  try {
+    base().withConfig([1, 2, 3] as unknown as DeRecProtocolConfig).build();
+  } catch (e) {
+    arrayError = e as { code?: string; message?: string };
+  }
+  if (!arrayError?.message?.includes("unknown field")) {
+    throw new Error(
+      `an array passed to withConfig must be refused by the library, got code=${arrayError?.code} message=${arrayError?.message}`,
+    );
+  }
+  console.log("  an array passed to withConfig is refused  ✓");
+
+  console.log("\n✓ withConfig passed.\n");
 }
 
 /**

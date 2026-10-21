@@ -30,7 +30,7 @@ use crate::{
 };
 use derec_proto::{
     CommittedDeRecShare, DeRecResult, DeRecShare, GetShareResponseMessage, MessageBody, StatusEnum,
-    StoreShareRequestMessage, de_rec_share::ShamirPoint,
+    StoreShareRequestMessage, de_rec_share::Subshare,
 };
 use prost::Message;
 
@@ -42,7 +42,7 @@ fn create_committed_share_bytes(secret_id: u64, version: u32) -> Vec<u8> {
     let derec_share = DeRecShare {
         secret_id,
         version,
-        points: vec![ShamirPoint {
+        subshares: vec![Subshare {
             x: vec![1, 2, 3],
             y: vec![4, 5, 6],
         }],
@@ -718,7 +718,8 @@ fn test_recovery_end_to_end() {
     let threshold = 2;
     let version = 2;
 
-    let SplitResult { shares } = sharing_split(&channel_ids, secret_id, version, secret, threshold)
+    let weighted: Vec<_> = channel_ids.iter().map(|&c| (c, 1)).collect();
+    let SplitResult { shares } = sharing_split(&weighted, secret_id, version, secret, threshold)
         .expect("split should succeed");
 
     let mut response_messages: Vec<GetShareResponseMessage> = Vec::new();

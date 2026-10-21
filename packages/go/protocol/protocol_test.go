@@ -556,9 +556,11 @@ func TestNew_ConstructsRealProtocolHandleAndCloses(t *testing.T) {
 	channel, share, secret, userSecret, state, transport := newTestStores()
 
 	cfg := Config{
-		SecretID:      1,
-		OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(2),
+		SecretID: 1,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(2),
+		},
 	}
 
 	p, err := New(Stores{Channel: channel, Share: share, Secret: secret, UserSecret: userSecret, State: state}, transport, cfg)
@@ -588,14 +590,18 @@ func TestNew_TwoInstancesBothConstructAndClose(t *testing.T) {
 	channel2, share2, secret2, userSecret2, state2, transport2 := newTestStores()
 
 	cfg1 := Config{
-		SecretID:      1,
-		OwnTransports: []TransportProtocolParam{{URI: "https://owner-a.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(2),
+		SecretID: 1,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner-a.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(2),
+		},
 	}
 	cfg2 := Config{
-		SecretID:      2,
-		OwnTransports: []TransportProtocolParam{{URI: "https://owner-b.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(2),
+		SecretID: 2,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner-b.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(2),
+		},
 	}
 
 	p1, err := New(Stores{Channel: channel1, Share: share1, Secret: secret1, UserSecret: userSecret1, State: state1}, transport1, cfg1)
@@ -620,7 +626,12 @@ func TestNew_TwoInstancesBothConstructAndClose(t *testing.T) {
 
 func TestNew_RequiresEveryStoreAndTransport(t *testing.T) {
 	channel, share, secret, userSecret, state, transport := newTestStores()
-	cfg := Config{SecretID: 1, OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com"}}}
+	cfg := Config{
+		SecretID: 1,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com"}},
+		},
+	}
 
 	cases := []struct {
 		name string
@@ -660,9 +671,11 @@ func TestNew_ThresholdIsDecidedByTheLibrary(t *testing.T) {
 	build := func(threshold *uint32) error {
 		channel, share, secret, userSecret, state, transport := newTestStores()
 		p, err := New(Stores{Channel: channel, Share: share, Secret: secret, UserSecret: userSecret, State: state}, transport, Config{
-			SecretID:      1,
-			OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-			Threshold:     threshold,
+			SecretID: 1,
+			DeRecProtocolConfig: DeRecProtocolConfig{
+				OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+				Threshold:     threshold,
+			},
 		})
 		if err == nil {
 			p.Close()
@@ -695,8 +708,10 @@ func TestNew_EmptyOwnTransportsAreRefusedByTheLibrary(t *testing.T) {
 	for _, own := range [][]TransportProtocolParam{nil, {}} {
 		channel, share, secret, userSecret, state, transport := newTestStores()
 		p, err := New(Stores{Channel: channel, Share: share, Secret: secret, UserSecret: userSecret, State: state}, transport, Config{
-			SecretID:      1,
-			OwnTransports: own,
+			SecretID: 1,
+			DeRecProtocolConfig: DeRecProtocolConfig{
+				OwnTransports: own,
+			},
 		})
 		if err == nil {
 			p.Close()
@@ -718,8 +733,10 @@ func TestSecretStore_SharedKeyLengthIsCheckedByTheLibrary(t *testing.T) {
 	channel, share, _, userSecret, state, transport := newTestStores()
 	secrets := newInMemorySecretStore()
 	p, err := New(Stores{Channel: channel, Share: share, Secret: secrets, UserSecret: userSecret, State: state}, transport, Config{
-		SecretID:      1,
-		OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		SecretID: 1,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -752,9 +769,11 @@ func newTestProtocol(t *testing.T) *DeRecProtocol {
 	t.Helper()
 	channel, share, secret, userSecret, state, transport := newTestStores()
 	cfg := Config{
-		SecretID:      1,
-		OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(2),
+		SecretID: 1,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(2),
+		},
 	}
 	p, err := New(Stores{Channel: channel, Share: share, Secret: secret, UserSecret: userSecret, State: state}, transport, cfg)
 	if err != nil {
@@ -884,10 +903,12 @@ func TestNew_WithGeneratedReplicaID(t *testing.T) {
 	channel, share, secret, userSecret, state, transport := newTestStores()
 	replicaID := derec.GenerateReplicaID()
 	p, err := New(Stores{Channel: channel, Share: share, Secret: secret, UserSecret: userSecret, State: state}, transport, Config{
-		SecretID:      1,
-		OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(2),
-		ReplicaID:     &replicaID,
+		SecretID: 1,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(2),
+			ReplicaID:     &replicaID,
+		},
 	})
 	if err != nil {
 		t.Fatalf("New with generated ReplicaID %d: %v", replicaID, err)

@@ -31,10 +31,10 @@ const (
 // During recovery, this protobuf message is returned.
 //
 // The commitment uses a Merkle tree. The hash of the share given to each
-// helper forms a leaf in the tree, committing to that share's points in
+// helper forms a leaf in the tree, committing to that share's subshares in
 // order. Each leaf and internal node hash is a SHA-256 hash: a leaf is
-// SHA-256(0x00 || k || for each point: len(x) || x || len(y) || y), with k
-// (the number of points) and every length as an 8-byte big-endian integer,
+// SHA-256(0x00 || k || for each subshare: len(x) || x || len(y) || y), with k
+// (the number of subshares) and every length as an 8-byte big-endian integer,
 // and an internal node is SHA-256(0x02 || left || right). The tree has a fixed depth of 7, unused
 // leaf slots are leaf hashes of random bytes, and every merklePath has
 // exactly 7 entries.
@@ -110,12 +110,12 @@ func (x *CommittedDeRecShare) GetMerklePath() []*CommittedDeRecShare_SiblingHash
 // The sharer first generates a random AES-256 key k and uses it to
 // AES-GCM encrypt the secret. A random polynomial f is generated such
 // that f(0) = k. The polynomial is evaluated at random non-zero x values,
-// and each helper receives one or more of the resulting points (x, f(x)).
-// The number of points a helper holds is its weight; a weight is always
+// and each helper receives one or more of the resulting subshares (x, f(x)).
+// The number of subshares a helper holds is its weight; a weight is always
 // below the threshold, so no single helper can reconstruct on its own.
 //
 // The computation is done in the scalar field of the BW6-761 curve. The
-// degree of the polynomial determines the threshold: t distinct points,
+// degree of the polynomial determines the threshold: t distinct subshares,
 // from any combination of helpers, reconstruct k at x = 0.
 //
 // The message also includes the secretId and the share version number,
@@ -126,9 +126,9 @@ type DeRecShare struct {
 	// The result of serializing the secret to be shared and encrypting it
 	// with a randomly generated AES-256 key.
 	EncryptedSecret []byte `protobuf:"bytes,1,opt,name=encryptedSecret,proto3" json:"encryptedSecret,omitempty"`
-	// The Shamir points this helper holds, in the order the Merkle leaf
+	// The subshares this helper holds, in the order the Merkle leaf
 	// commits to. At least one.
-	Points []*DeRecShare_ShamirPoint `protobuf:"bytes,2,rep,name=points,proto3" json:"points,omitempty"`
+	Subshares []*DeRecShare_Subshare `protobuf:"bytes,2,rep,name=subshares,proto3" json:"subshares,omitempty"`
 	// Numeric identifier of the secret associated with the share.
 	//
 	// Must be unique for each secret created by a sharer.
@@ -179,9 +179,9 @@ func (x *DeRecShare) GetEncryptedSecret() []byte {
 	return nil
 }
 
-func (x *DeRecShare) GetPoints() []*DeRecShare_ShamirPoint {
+func (x *DeRecShare) GetSubshares() []*DeRecShare_Subshare {
 	if x != nil {
-		return x.Points
+		return x.Subshares
 	}
 	return nil
 }
@@ -254,8 +254,8 @@ func (x *CommittedDeRecShare_SiblingHash) GetHash() []byte {
 	return nil
 }
 
-// One Shamir point f(x) = y.
-type DeRecShare_ShamirPoint struct {
+// One subshare: a Shamir (x, y) pair with y = f(x).
+type DeRecShare_Subshare struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// A random non-zero field element, in arkworks compressed
 	// serialization (48 bytes, little-endian).
@@ -266,20 +266,20 @@ type DeRecShare_ShamirPoint struct {
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *DeRecShare_ShamirPoint) Reset() {
-	*x = DeRecShare_ShamirPoint{}
+func (x *DeRecShare_Subshare) Reset() {
+	*x = DeRecShare_Subshare{}
 	mi := &file_committedderecshare_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *DeRecShare_ShamirPoint) String() string {
+func (x *DeRecShare_Subshare) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*DeRecShare_ShamirPoint) ProtoMessage() {}
+func (*DeRecShare_Subshare) ProtoMessage() {}
 
-func (x *DeRecShare_ShamirPoint) ProtoReflect() protoreflect.Message {
+func (x *DeRecShare_Subshare) ProtoReflect() protoreflect.Message {
 	mi := &file_committedderecshare_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -291,19 +291,19 @@ func (x *DeRecShare_ShamirPoint) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use DeRecShare_ShamirPoint.ProtoReflect.Descriptor instead.
-func (*DeRecShare_ShamirPoint) Descriptor() ([]byte, []int) {
+// Deprecated: Use DeRecShare_Subshare.ProtoReflect.Descriptor instead.
+func (*DeRecShare_Subshare) Descriptor() ([]byte, []int) {
 	return file_committedderecshare_proto_rawDescGZIP(), []int{1, 0}
 }
 
-func (x *DeRecShare_ShamirPoint) GetX() []byte {
+func (x *DeRecShare_Subshare) GetX() []byte {
 	if x != nil {
 		return x.X
 	}
 	return nil
 }
 
-func (x *DeRecShare_ShamirPoint) GetY() []byte {
+func (x *DeRecShare_Subshare) GetY() []byte {
 	if x != nil {
 		return x.Y
 	}
@@ -330,11 +330,11 @@ const file_committedderecshare_proto_rawDesc = "" +
 	"\x04hash\x18\x02 \x01(\fR\x04hash\"\xe9\x01\n" +
 	"\n" +
 	"DeRecShare\x12(\n" +
-	"\x0fencryptedSecret\x18\x01 \x01(\fR\x0fencryptedSecret\x12P\n" +
-	"\x06points\x18\x02 \x03(\v28.org.derecalliance.derec.protobuf.DeRecShare.ShamirPointR\x06points\x12\x1a\n" +
+	"\x0fencryptedSecret\x18\x01 \x01(\fR\x0fencryptedSecret\x12S\n" +
+	"\tsubshares\x18\x02 \x03(\v25.org.derecalliance.derec.protobuf.DeRecShare.SubshareR\tsubshares\x12\x1a\n" +
 	"\bsecretId\x18\x03 \x01(\x04R\bsecretId\x12\x18\n" +
-	"\aversion\x18\x04 \x01(\rR\aversion\x1a)\n" +
-	"\vShamirPoint\x12\f\n" +
+	"\aversion\x18\x04 \x01(\rR\aversion\x1a&\n" +
+	"\bSubshare\x12\f\n" +
 	"\x01x\x18\x01 \x01(\fR\x01x\x12\f\n" +
 	"\x01y\x18\x02 \x01(\fR\x01yb\x06proto3"
 
@@ -355,11 +355,11 @@ var file_committedderecshare_proto_goTypes = []any{
 	(*CommittedDeRecShare)(nil),             // 0: org.derecalliance.derec.protobuf.CommittedDeRecShare
 	(*DeRecShare)(nil),                      // 1: org.derecalliance.derec.protobuf.DeRecShare
 	(*CommittedDeRecShare_SiblingHash)(nil), // 2: org.derecalliance.derec.protobuf.CommittedDeRecShare.SiblingHash
-	(*DeRecShare_ShamirPoint)(nil),          // 3: org.derecalliance.derec.protobuf.DeRecShare.ShamirPoint
+	(*DeRecShare_Subshare)(nil),             // 3: org.derecalliance.derec.protobuf.DeRecShare.Subshare
 }
 var file_committedderecshare_proto_depIdxs = []int32{
 	2, // 0: org.derecalliance.derec.protobuf.CommittedDeRecShare.merklePath:type_name -> org.derecalliance.derec.protobuf.CommittedDeRecShare.SiblingHash
-	3, // 1: org.derecalliance.derec.protobuf.DeRecShare.points:type_name -> org.derecalliance.derec.protobuf.DeRecShare.ShamirPoint
+	3, // 1: org.derecalliance.derec.protobuf.DeRecShare.subshares:type_name -> org.derecalliance.derec.protobuf.DeRecShare.Subshare
 	2, // [2:2] is the sub-list for method output_type
 	2, // [2:2] is the sub-list for method input_type
 	2, // [2:2] is the sub-list for extension type_name

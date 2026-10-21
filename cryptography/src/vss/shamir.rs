@@ -192,7 +192,7 @@ where
         buffer
     };
 
-    // Shamir shares are just evaluations of our polynomial above
+    // Subshares are just evaluations of our polynomial above
     (0..n)
         .map(|_| {
             // If x == 0, then (0, P(0)) = (0, secret). This check ensures that x is never zero.
@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn points_encode_as_48_byte_little_endian_field_elements() {
+    fn subshares_encode_as_48_byte_little_endian_field_elements() {
         for (x, y) in sample_shares() {
             assert_eq!(x.len(), 48);
             assert_eq!(y.len(), 48);

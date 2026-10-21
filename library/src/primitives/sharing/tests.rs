@@ -19,13 +19,14 @@ use crate::{
             produce as produce_store_share_response_message,
         },
     },
-    types::ChannelId,
+    types::{ChannelId, WeightedChannel},
 };
 use derec_proto::{CommittedDeRecShare, DeRecShare};
 use prost::Message;
 
-fn make_channel_ids(ids: &[u64]) -> Vec<ChannelId> {
-    ids.iter().map(|&id| ChannelId(id)).collect()
+/// Every channel at weight 1: one subshare each.
+fn make_channel_ids(ids: &[u64]) -> Vec<WeightedChannel> {
+    ids.iter().map(|&id| (ChannelId(id), 1)).collect()
 }
 
 /// Build a valid `StoreShareRequestMessage` with a `CommittedDeRecShare`
@@ -113,7 +114,8 @@ fn test_split_invalid_threshold_too_low() {
         result,
         Err(Error::Sharing(SharingError::InvalidThreshold {
             threshold: 1,
-            channels: 3
+            channels: 3,
+            subshares: 3
         }))
     ));
 }
@@ -138,7 +140,8 @@ fn test_split_invalid_threshold_too_high() {
         result,
         Err(Error::Sharing(SharingError::InvalidThreshold {
             threshold: 4,
-            channels: 3
+            channels: 3,
+            subshares: 3
         }))
     ));
 }
@@ -160,7 +163,7 @@ fn test_split_valid_sharing() {
         "invalid number of shares given the number of channels"
     );
 
-    for channel_id in &channels {
+    for (channel_id, _) in &channels {
         let committed = shares
             .get(channel_id)
             .expect("missing CommittedDeRecShare for channel");
@@ -186,16 +189,16 @@ fn test_split_valid_sharing() {
             "encrypted_secret must not be empty"
         );
         assert_eq!(
-            inner.points.len(),
+            inner.subshares.len(),
             1,
-            "every helper holds exactly one point"
+            "every helper holds exactly one subshare"
         );
         assert!(
-            !inner.points[0].x.is_empty(),
+            !inner.subshares[0].x.is_empty(),
             "x coordinate must not be empty"
         );
         assert!(
-            !inner.points[0].y.is_empty(),
+            !inner.subshares[0].y.is_empty(),
             "y coordinate must not be empty"
         );
     }
@@ -696,4 +699,171 @@ fn helper_bound_request_never_carries_a_replica_id() {
         crate::primitives::sharing::request::SHARE_ALGORITHM_VSS
     );
     assert_eq!(extracted.request.replica_id, None);
+}
+
+/// A channel's subshares follow its own weight, not its position in the
+/// slice: the input is sorted by channel ID before subshares are assigned, so
+/// a weighted channel gets its extra subshares regardless of where it sorts
+/// among the others. Channel 3 is the largest ID here, which exercises the
+/// sort-ordering risk directly.
+#[test]
+fn test_split_gives_a_weighted_channel_its_subshares() {
+    let secret_id: u64 = 1;
+    let secret_data = b"super_secret_value";
+    let channels: Vec<WeightedChannel> =
+        vec![(ChannelId(3), 2), (ChannelId(1), 1), (ChannelId(2), 1)];
+    let threshold = 3;
+    let version = 1;
+
+    let SplitResult { shares } =
+        split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
+
+    for (channel_id, expected_subshares) in
+        [(ChannelId(3), 2), (ChannelId(1), 1), (ChannelId(2), 1)]
+    {
+        let committed = shares.get(&channel_id).expect("missing share for channel");
+        let inner = DeRecShare::decode(&committed.de_rec_share[..])
+            .expect("failed to decode inner DeRecShare");
+        assert_eq!(
+            inner.subshares.len(),
+            expected_subshares,
+            "unexpected subshare count for channel {:?}",
+            channel_id
+        );
+    }
+}
+
+#[test]
+fn test_split_rejects_a_zero_weight() {
+    let channels: Vec<WeightedChannel> =
+        vec![(ChannelId(1), 0), (ChannelId(2), 1), (ChannelId(3), 1)];
+
+    let result = split(&channels, 1, 1, b"secret-data", 2);
+
+    assert!(matches!(
+        result,
+        Err(Error::Sharing(SharingError::InvalidWeight {
+            channel_id: 1,
+            weight: 0
+        }))
+    ));
+}
+
+#[test]
+fn test_split_rejects_a_weight_at_the_threshold() {
+    let channels: Vec<WeightedChannel> =
+        vec![(ChannelId(1), 3), (ChannelId(2), 1), (ChannelId(3), 1)];
+
+    let result = split(&channels, 1, 1, b"secret-data", 3);
+
+    assert!(matches!(
+        result,
+        Err(Error::Sharing(SharingError::InvalidWeight {
+            channel_id: 1,
+            weight: 3
+        }))
+    ));
+}
+
+/// Weights are checked in ascending channel-ID order, so the reported
+/// offender does not depend on the order the slice is given in.
+#[test]
+fn test_split_reports_the_lowest_invalid_weight_first() {
+    let channels: Vec<WeightedChannel> =
+        vec![(ChannelId(5), 0), (ChannelId(2), 9), (ChannelId(3), 1)];
+
+    let result = split(&channels, 1, 1, b"secret-data", 3);
+
+    assert!(matches!(
+        result,
+        Err(Error::Sharing(SharingError::InvalidWeight {
+            channel_id: 2,
+            weight: 9
+        }))
+    ));
+}
+
+/// A channel ID listed twice is a duplicate even when the two entries carry
+/// different weights.
+#[test]
+fn test_split_rejects_a_duplicate_channel_with_different_weights() {
+    let channels: Vec<WeightedChannel> =
+        vec![(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(1), 2)];
+
+    let result = split(&channels, 1, 1, b"secret-data", 3);
+
+    assert!(matches!(
+        result,
+        Err(Error::Sharing(SharingError::DuplicateChannelId(1)))
+    ));
+}
+
+/// Threshold validity is judged against the total subshare count (the sum of
+/// weights), not the channel count: two channels can satisfy a threshold of 3
+/// once one of them is weighted.
+#[test]
+fn test_split_threshold_counts_subshares() {
+    let secret_id: u64 = 1;
+    let secret_data = b"secret-data";
+    let threshold = 3;
+    let version = 1;
+
+    let weighted: Vec<WeightedChannel> = vec![(ChannelId(1), 2), (ChannelId(2), 1)];
+    let result = split(&weighted, secret_id, version, secret_data, threshold);
+    assert!(result.is_ok(), "2 + 1 subshares should satisfy threshold 3");
+
+    let unweighted = make_channel_ids(&[1, 2]);
+    let result = split(&unweighted, secret_id, version, secret_data, threshold);
+    assert!(matches!(
+        result,
+        Err(Error::Sharing(SharingError::InvalidThreshold {
+            threshold: 3,
+            channels: 2,
+            subshares: 2
+        }))
+    ));
+}
+
+/// A weighted channel raises the subshare total but can still fall short of
+/// the threshold; the error must report the subshare total actually reached,
+/// not the channel count.
+#[test]
+fn test_split_invalid_threshold_reports_subshares_not_channel_count() {
+    let channels: Vec<WeightedChannel> = vec![(ChannelId(1), 2), (ChannelId(2), 1)];
+
+    let result = split(&channels, 1, 1, b"secret-data", 4);
+
+    assert!(matches!(
+        result,
+        Err(Error::Sharing(SharingError::InvalidThreshold {
+            threshold: 4,
+            channels: 2,
+            subshares: 3
+        }))
+    ));
+}
+
+/// Every channel at weight 1 is the unweighted case: each channel gets
+/// exactly one subshare.
+#[test]
+fn test_split_without_weights_is_unchanged() {
+    let secret_id: u64 = 1;
+    let secret_data = b"super_secret_value";
+    let channels = make_channel_ids(&[1, 2, 3]);
+    let threshold = 2;
+    let version = 1;
+
+    let SplitResult { shares } =
+        split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
+
+    for (channel_id, _) in &channels {
+        let committed = shares.get(channel_id).expect("missing share for channel");
+        let inner = DeRecShare::decode(&committed.de_rec_share[..])
+            .expect("failed to decode inner DeRecShare");
+        assert_eq!(
+            inner.subshares.len(),
+            1,
+            "every channel should hold exactly one subshare without weights"
+        );
+    }
 }

@@ -4,7 +4,7 @@
 use rand::CryptoRng;
 use sha2::{Digest, Sha256};
 
-use super::{DerecVSSError, MERKLE_TREE_DEPTH, ShamirPoint, VSSShare, points_are_well_formed, λ};
+use super::{DerecVSSError, MERKLE_TREE_DEPTH, Subshare, VSSShare, subshares_are_well_formed, λ};
 
 // this function will be used to detect one of several possible errors:
 // 1. inconsistent ciphertexts; 2. inconsistent commitments; 3. corrupted shares
@@ -28,12 +28,12 @@ pub fn detect_error(shares: &Vec<VSSShare>) -> Option<DerecVSSError> {
             return Some(DerecVSSError::CorruptShares);
         }
 
-        if !points_are_well_formed(&share.points) {
+        if !subshares_are_well_formed(&share.subshares) {
             return Some(DerecVSSError::CorruptShares);
         }
 
         // first compute hash of this share
-        let mut on_path_hash = leaf_hash_pub(&share.points);
+        let mut on_path_hash = leaf_hash_pub(&share.subshares);
 
         for (is_left, node_hash) in share.merkle_path.iter() {
             on_path_hash = if *is_left {
@@ -55,11 +55,11 @@ pub fn detect_error(shares: &Vec<VSSShare>) -> Option<DerecVSSError> {
 }
 
 // builds a 2-ary merkle tree with one leaf per share, each leaf
-// committing to that share's point list. We will specify a depth
+// committing to that share's subshare list. We will specify a depth
 // of the tree, even though we may not have that many shares. This
 // is to avoid leaking the number of shares to the attacker.
 pub fn build_merkle_tree<R: CryptoRng + ?Sized>(
-    shares: &[Vec<ShamirPoint>],
+    shares: &[Vec<Subshare>],
     depth: u32,
     rng: &mut R,
 ) -> Vec<Vec<u8>> {
@@ -78,14 +78,14 @@ pub fn build_merkle_tree<R: CryptoRng + ?Sized>(
         // root node is labelled 1; so, node labels go from 1 to 2^(depth + 1) - 1
         let node_label = num_leaf_nodes + i;
         if i < shares.len() {
-            // hash the share's points; node root's label starts at 1
+            // hash the share's subshares; node root's label starts at 1
             merkle_nodes[node_label - 1] = leaf_hash_pub(&shares[i]);
         } else {
             // fill unused slots with leaf hashes of random bytes
             let mut rand = [0u8; 32];
             rng.fill_bytes(&mut rand);
 
-            merkle_nodes[node_label - 1] = leaf_hash_pub(&[ShamirPoint {
+            merkle_nodes[node_label - 1] = leaf_hash_pub(&[Subshare {
                 x: rand.to_vec(),
                 y: Vec::new(),
             }]);
@@ -171,25 +171,25 @@ pub fn random_oracle(msg: &[u8], rand: &[u8], tag: &[u8]) -> [u8; 4 * λ] {
 
 /// Public entry point for leaf hashing used by [`super::verify`].
 ///
-/// A leaf commits to a share's points, in order:
+/// A leaf commits to a share's subshares, in order:
 ///
 /// ```text
-/// SHA-256(0x00 ‖ u64_be(k) ‖ for each point: u64_be(len(x)) ‖ x ‖ u64_be(len(y)) ‖ y)
+/// SHA-256(0x00 ‖ u64_be(k) ‖ for each subshare: u64_be(len(x)) ‖ x ‖ u64_be(len(y)) ‖ y)
 /// ```
 ///
-/// where `k` is the number of points. The `0x00` tag keeps leaf hashes apart
+/// where `k` is the number of subshares. The `0x00` tag keeps leaf hashes apart
 /// from internal-node hashes, so an internal node cannot be presented as a
 /// share, and the count and lengths fix where every coordinate begins and ends.
-pub fn leaf_hash_pub(points: &[ShamirPoint]) -> Vec<u8> {
-    let len: usize = points.iter().map(|p| 16 + p.x.len() + p.y.len()).sum();
+pub fn leaf_hash_pub(subshares: &[Subshare]) -> Vec<u8> {
+    let len: usize = subshares.iter().map(|p| 16 + p.x.len() + p.y.len()).sum();
     let mut hasher_input = Vec::with_capacity(1 + 8 + len);
     hasher_input.push(0x00);
-    hasher_input.extend_from_slice(&(points.len() as u64).to_be_bytes());
-    for point in points {
-        hasher_input.extend_from_slice(&(point.x.len() as u64).to_be_bytes());
-        hasher_input.extend_from_slice(&point.x);
-        hasher_input.extend_from_slice(&(point.y.len() as u64).to_be_bytes());
-        hasher_input.extend_from_slice(&point.y);
+    hasher_input.extend_from_slice(&(subshares.len() as u64).to_be_bytes());
+    for subshare in subshares {
+        hasher_input.extend_from_slice(&(subshare.x.len() as u64).to_be_bytes());
+        hasher_input.extend_from_slice(&subshare.x);
+        hasher_input.extend_from_slice(&(subshare.y.len() as u64).to_be_bytes());
+        hasher_input.extend_from_slice(&subshare.y);
     }
     compute_sha256_hash(&hasher_input)
 }
@@ -254,7 +254,7 @@ mod tests {
         rng.fill_bytes(&mut msg);
 
         let shares = vss::share(5, &[1; 7], &msg, &seed1).unwrap();
-        let leaves: Vec<Vec<ShamirPoint>> = shares.iter().map(|s| s.points.clone()).collect();
+        let leaves: Vec<Vec<Subshare>> = shares.iter().map(|s| s.subshares.clone()).collect();
         let merkle_tree = build_merkle_tree(&leaves, 3, &mut crate::random::os_rng());
         assert_merkle_tree_wff(&merkle_tree);
     }
@@ -265,7 +265,7 @@ mod tests {
         use rand::rngs::ChaCha20Rng;
 
         let depth = 2;
-        let leaves = vec![vec![point(&[1u8; 32], &[2u8; 32])]];
+        let leaves = vec![vec![subshare(&[1u8; 32], &[2u8; 32])]];
         let tree = build_merkle_tree(&leaves, depth, &mut ChaCha20Rng::from_seed([7u8; 32]));
 
         let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
@@ -275,7 +275,7 @@ mod tests {
             rng.fill_bytes(&mut rand);
             assert_eq!(
                 tree[num_leaf_nodes + i - 1],
-                leaf_hash_pub(&[point(&rand, &[])])
+                leaf_hash_pub(&[subshare(&rand, &[])])
             );
         }
     }
@@ -285,7 +285,7 @@ mod tests {
         let left = [0x11u8; 32];
         let right = [0x22u8; 32];
         assert_ne!(
-            leaf_hash_pub(&[point(&left, &right)]),
+            leaf_hash_pub(&[subshare(&left, &right)]),
             intermediate_hash_pub(&left, &right)
         );
     }
@@ -293,24 +293,24 @@ mod tests {
     #[test]
     fn test_leaf_hash_binds_the_split_between_x_and_y() {
         assert_ne!(
-            leaf_hash_pub(&[point(b"ab", b"c")]),
-            leaf_hash_pub(&[point(b"a", b"bc")])
+            leaf_hash_pub(&[subshare(b"ab", b"c")]),
+            leaf_hash_pub(&[subshare(b"a", b"bc")])
         );
     }
 
     #[test]
-    fn test_leaf_hash_binds_the_split_between_points() {
+    fn test_leaf_hash_binds_the_split_between_subshares() {
         assert_ne!(
-            leaf_hash_pub(&[point(b"a", b"bc"), point(b"d", b"e")]),
-            leaf_hash_pub(&[point(b"a", b"b"), point(b"cd", b"e")])
+            leaf_hash_pub(&[subshare(b"a", b"bc"), subshare(b"d", b"e")]),
+            leaf_hash_pub(&[subshare(b"a", b"b"), subshare(b"cd", b"e")])
         );
     }
 
     #[test]
-    fn test_leaf_hash_binds_point_order() {
+    fn test_leaf_hash_binds_subshare_order() {
         assert_ne!(
-            leaf_hash_pub(&[point(b"a", b"b"), point(b"c", b"d")]),
-            leaf_hash_pub(&[point(b"c", b"d"), point(b"a", b"b")])
+            leaf_hash_pub(&[subshare(b"a", b"b"), subshare(b"c", b"d")]),
+            leaf_hash_pub(&[subshare(b"c", b"d"), subshare(b"a", b"b")])
         );
     }
 
@@ -325,13 +325,13 @@ mod tests {
             expected.extend_from_slice(y);
         }
         assert_eq!(
-            leaf_hash_pub(&[point(b"ab", b"c"), point(b"d", b"")]),
+            leaf_hash_pub(&[subshare(b"ab", b"c"), subshare(b"d", b"")]),
             compute_sha256_hash(&expected)
         );
     }
 
-    fn point(x: &[u8], y: &[u8]) -> ShamirPoint {
-        ShamirPoint {
+    fn subshare(x: &[u8], y: &[u8]) -> Subshare {
+        Subshare {
             x: x.to_vec(),
             y: y.to_vec(),
         }

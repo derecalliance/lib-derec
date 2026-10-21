@@ -116,6 +116,15 @@ const (
 	CodeInvalidThreshold   int32 = 62
 	CodeEmptySecretData    int32 = 63
 	CodeVSSShareFailed     int32 = 64
+	// CodeInvalidWeight: a weight given to start(ProtectSecret) or
+	// Sharing.Request.Split is invalid. Every weight must satisfy
+	// 1 <= weight < threshold and name a channel the secret is being
+	// shared with.
+	CodeInvalidWeight int32 = 65
+	// CodeTooManySubshares: a sharing round's weights total more subshares
+	// than the cap set with protocol.Config.MaxSubshares. Raised by
+	// Start(ProtectSecret) before anything is sent.
+	CodeTooManySubshares int32 = 66
 
 	CodeEmptyResponses            int32 = 80
 	CodeEmptyCommittedDeRecShare  int32 = 81

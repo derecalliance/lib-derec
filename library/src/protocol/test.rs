@@ -792,13 +792,13 @@ pub(crate) fn pre_0_0_9_derec_share(secret_id: u64, version: u32) -> Vec<u8> {
 }
 
 /// Fields 1 and 2 of [`pre_0_0_9_derec_share`]. The old `x` (field 2) holds
-/// bytes that also parse as a current `ShamirPoint`, so the only field that
+/// bytes that also parse as a current `Subshare`, so the only field that
 /// can fail to decode is the old `y` (field 3).
 pub(crate) fn pre_0_0_9_fields_before_y() -> Vec<u8> {
     use prost::encoding::bytes;
     let mut buf = Vec::new();
     bytes::encode(1, &vec![0xAB_u8; 4], &mut buf);
-    let x = derec_proto::de_rec_share::ShamirPoint {
+    let x = derec_proto::de_rec_share::Subshare {
         x: vec![0x01; 48],
         y: vec![0x03; 48],
     };

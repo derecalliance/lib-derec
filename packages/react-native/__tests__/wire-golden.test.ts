@@ -31,6 +31,17 @@ function goldenProtectSecretInput(): ProtectSecretParams {
   };
 }
 
+function goldenProtectSecretWeightedInput(): ProtectSecretParams {
+  return {
+    secrets: goldenUserSecrets(),
+    description: 'capture description',
+    weights: new Map([
+      [7n, 2],
+      [12n, 3],
+    ]),
+  };
+}
+
 // The two 32-byte shared keys are filled with `i` and `31 - i` respectively,
 // matching goldenRestoreSecret()'s sharedKey1/sharedKey2. helpers[1] and
 // replicas.members[1] carry an empty communication_info map (the field is
@@ -83,6 +94,17 @@ describe('wire golden vectors', () => {
     expect(buildProtectSecretParams(goldenProtectSecretInput())).toEqual(golden.protect_secret);
   });
 
+  it('protect_secret_weighted params match the shared fixture', () => {
+    expect(buildProtectSecretParams(goldenProtectSecretWeightedInput())).toEqual(
+      golden.protect_secret_weighted,
+    );
+  });
+
+  it('protect_secret params treat null weights as no weights', () => {
+    const input = { ...goldenProtectSecretInput(), weights: null as unknown as Map<bigint, number> };
+    expect(buildProtectSecretParams(input)).toEqual(golden.protect_secret);
+  });
+
   it('restore params match the shared fixture', () => {
     expect(buildRestoreParams(goldenRestoreInput(), 7)).toEqual(golden.restore);
   });
@@ -90,7 +112,7 @@ describe('wire golden vectors', () => {
   // A section added to the fixture with no assertion here would leave this
   // SDK's params builder for it unchecked.
   it('covers every fixture section', () => {
-    const covered = ['protect_secret', 'restore'];
+    const covered = ['protect_secret', 'protect_secret_weighted', 'restore'];
     const sections = Object.keys(golden).filter((k) => !k.startsWith('$')).sort();
     expect(sections).toEqual(covered);
   });

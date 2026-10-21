@@ -597,6 +597,8 @@
         { "name": "InvalidThreshold", "wire": 62, "text": "invalid_threshold" },
         { "name": "EmptySecretData", "wire": 63, "text": "empty_secret_data" },
         { "name": "VssShareFailed", "wire": 64, "text": "vss_share_failed" },
+        { "name": "InvalidWeight", "wire": 65, "text": "invalid_weight" },
+        { "name": "TooManySubshares", "wire": 66, "text": "too_many_subshares" },
         { "name": "EmptyResponses", "wire": 80, "text": "empty_responses" },
         { "name": "EmptyCommittedDeRecShare", "wire": 81, "text": "empty_committed_derec_share" },
         { "name": "DecodeCommittedDeRecShare", "wire": 82, "text": "decode_committed_derec_share" },

@@ -47,7 +47,7 @@ var (
 	protectSecretOnce sync.Once
 	protectSecretFn   func(secretID uint64,
 		secretData *byte, secretDataLen uintptr,
-		channels *uint64, channelsLen uintptr,
+		channels *uint64, weights *uint32, channelsLen uintptr,
 		threshold uintptr, version uint32) protectSecretResult
 
 	produceStoreShareReqOnce sync.Once
@@ -98,13 +98,17 @@ func u32Ptr(s []uint32) *uint32 {
 // returning the committed shares in the wire format documented at
 // library/src/interop/ffi/sharing.rs: a length-prefixed sequence of (channel_id,
 // serialized CommittedDeRecShare) entries sorted by channel id.
-func ProtectSecret(secretID uint64, secretData []byte, channelIDs []uint64, threshold uintptr, version uint32) ([]byte, error) {
+//
+// channelIDs and weights are two aligned slices: weights[i] is the number of
+// subshares channelIDs[i]'s committed share carries (1 for an ordinary
+// helper). Every channel the secret is shared with must appear.
+func ProtectSecret(secretID uint64, secretData []byte, channelIDs []uint64, weights []uint32, threshold uintptr, version uint32) ([]byte, error) {
 	protectSecretOnce.Do(func() {
 		purego.RegisterFunc(&protectSecretFn, symbol("protect_secret"))
 	})
 	res := protectSecretFn(secretID,
 		bytePtr(secretData), uintptr(len(secretData)),
-		u64Ptr(channelIDs), uintptr(len(channelIDs)),
+		u64Ptr(channelIDs), u32Ptr(weights), uintptr(len(channelIDs)),
 		threshold, version)
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err

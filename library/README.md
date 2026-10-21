@@ -24,6 +24,7 @@ Alliance**.
 - [Two API layers](#two-api-layers)
 - [Quick start (Protocol layer)](#quick-start-protocol-layer)
 - [Builder configuration](#builder-configuration)
+- [Configuration from a file or record](#configuration-from-a-file-or-record)
 - [Event-driven model](#event-driven-model)
 - [Helper-side admission control](#helper-side-admission-control)
 - [Protocol flows](#protocol-flows)
@@ -99,7 +100,7 @@ FFI layer, and no logging, so a pure-Rust consumer pays for none of them.
 
 | Feature | Enables |
 | --- | --- |
-| `serde` | `serde::Serialize` / `Deserialize` on the public store and channel types (`SecretValue`, `PairingKeyMaterial`, `ChannelRecord`, `HelperChannel`, `ReplicaMember`, `ChannelStatus`, `TransportProtocol`), so a store implementation can persist them with any serde format. Without it, use the byte-level accessors (e.g. `PairingKeyMaterial::as_bytes` / `from_bytes`) or your own codec. Also pulls the matching `derec-proto/serde`. The serde wire format is not part of the public API and may change. |
+| `serde` | `serde::Serialize` / `Deserialize` on the public store and channel types (`SecretValue`, `PairingKeyMaterial`, `ChannelRecord`, `HelperChannel`, `ReplicaMember`, `ChannelStatus`, `TransportProtocol`), so a store implementation can persist them with any serde format. Without it, use the byte-level accessors (e.g. `PairingKeyMaterial::as_bytes` / `from_bytes`) or your own codec. Also pulls the matching `derec-proto/serde`. The serde wire format of those types is not part of the public API and may change. Also enables the canonical JSON of `DeRecProtocolConfig` (see [Configuration from a file or record](#configuration-from-a-file-or-record)), which **is** a stable, documented format. |
 | `logging` | `tracing` spans and events across the protocol and primitives layers. Adds no overhead when no subscriber is installed. |
 | `ffi` | The native C-ABI bridge for host languages that link the shared library. Implies `serde` + `serde_json`. Pure-Rust consumers do not need this. |
 
@@ -265,6 +266,7 @@ protocol.restore(&secret, recovered_version).await?;
 protocol.start(DeRecFlow::ProtectSecret {
     secrets: secret.secrets.clone(),
     description: None,
+    weights: Default::default(), // every Helper gets one subshare
 }).await?;
 // Now verifiable, at recovered_version + 1.
 ```
@@ -279,9 +281,10 @@ convergence rules. Without it the publish fails with
 
 ## Builder configuration
 
-`DeRecProtocolBuilder` enforces required-slot completion at compile time
-(missing a required setter is a type error, not a runtime panic). Runtime
-invariants — currently `threshold >= 2` — are checked inside
+`DeRecProtocolBuilder` enforces that every store and the transport are set at
+compile time (missing one is a type error, not a runtime panic). Every data
+setting — including the required `with_own_transports` — is checked at run
+time inside
 [`build()`](https://docs.rs/derec-library/latest/derec_library/protocol/struct.DeRecProtocolBuilder.html#method.build),
 which returns `Result<DeRecProtocol, crate::Error>` so invalid
 configurations surface as `Error::InvalidInput` instead of panicking.
@@ -289,19 +292,93 @@ Optional setters have defaults:
 
 | Setter | Default | Purpose |
 |--------|---------|---------|
-| `with_threshold(n)` | `3` | Minimum shares required to reconstruct the secret. |
+| `with_threshold(n)` | `3` | Minimum subshares required to reconstruct the secret (`t`). Each paired Helper contributes one subshare unless `ProtectSecret` gives it more weight; see [Weighted helpers](#weighted-helpers). |
 | `with_timeouts(timeouts)` | see [Timeouts](#timeouts) | All four waiting periods in one call; unspecified fields keep their default. `inbound_message` 300s is the staleness/replay window, `sharing_round` and `unpair_ack` 60s are liveness budgets, `expired_channels` `Enabled { 300 }` sweeps channels awaiting fingerprint confirmation. |
 | `with_unsafe_connection(bool)` | `false` | Accept plaintext `http://` and `grpc://` endpoints. **Development only.** Loopback is accepted for your own endpoint regardless; see [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
 | `with_replica_id(id)` | unset | This device's replica identity. Required for any replica-mode pairing; application-assigned and rejected if `0`. |
 | `with_auto_accept(policy)` | every flow off | Per-flow opt-in to auto-accepting inbound requests instead of surfacing `ActionRequired`. Read the per-flow caveats before enabling — several are state-changing. |
 | `with_parameter_range(range)` | unset | Advertised protocol parameter bounds, checked for overlap at pairing time. A helper also enforces its own `minShareSize`/`maxShareSize` on every inbound share (see [Helper-side admission control](#helper-side-admission-control)). |
+| `with_max_subshares(max)` | unset (no cap) | Cap on a sharing round's total subshares (the sum of the Helpers' weights). Checked at sharing only, never at recovery; must be `>= threshold`. See [Weighted helpers](#weighted-helpers). |
 | `with_auto_respond_on_failure(bool)` | `false` | If `true`, the protocol replies to the peer on inbound processing failures; if `false`, errors only surface as events. |
 | `with_unpair_ack(ack)` | `UnpairAck::Required` | Whether the unpair initiator waits for the peer's `Ok` before dropping local state. |
 | `with_auto_reply_to(bool)` | `false` | If `true`, every outbound request stamps `replyTo = own_transport` so the responder routes the reply back to this node — even if the channel's stored peer endpoint points elsewhere. Useful for replica scenarios. See [Correlation and routing on the wire](#correlation-and-routing-on-the-wire). |
 
 See the [builder rustdoc](https://docs.rs/derec-library/latest/derec_library/protocol/struct.DeRecProtocolBuilder.html)
 for the full per-setter contract.
+
+`with_own_transports(endpoints)` has no default: `build()` returns
+`Error::InvalidInput` when no endpoint was set, or the list is empty.
+
+---
+
+## Configuration from a file or record
+
+Applications usually load settings as a whole: general settings from the
+environment or a config file, per-user settings from a user record.
+`DeRecProtocolConfig` holds every data setting of the builder, each one
+optional, and `with_config` applies it in one call:
+
+```rust,ignore
+use derec_library::protocol::{DeRecProtocolBuilder, DeRecProtocolConfig};
+
+let general: DeRecProtocolConfig = serde_json::from_str(&general_json)?;
+let per_user: DeRecProtocolConfig = serde_json::from_str(&user_record_json)?;
+
+let protocol = DeRecProtocolBuilder::new(secret_id)
+    .with_stores(stores)
+    .with_transport(my_transport)
+    .with_config(general)  // 1. general settings
+    .with_config(per_user) // 2. per-user settings
+    .with_threshold(4)     // 3. individual setters
+    .build()?;
+```
+
+- **Only set fields are applied.** An absent field leaves whatever the
+  builder already holds.
+- **Last write wins, per field.** Each set field goes through its own
+  `with_*` setter, in call order. Nested objects replace the builder's value
+  as a whole, except `timeouts`: each of its fields is merged separately, so
+  a per-user config that sets only `inbound_message_secs` keeps the
+  `sharing_round_secs` the general config set.
+- **Validation happens in `build()`**, with the same rules as the setters. A
+  `threshold` of `1` from a config file fails exactly as `with_threshold(1)`
+  does.
+- **Stores, the transport and `secret_id` are not settings** and are not
+  carried in the config.
+
+Serialization needs the `serde` feature. The canonical JSON, shared by every
+SDK, is:
+
+```json
+{
+  "threshold": 3,
+  "max_subshares": "12",
+  "timeouts": {
+    "inbound_message_secs": 300,
+    "sharing_round_secs": 60,
+    "unpair_ack_secs": 60,
+    "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
+  },
+  "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
+  "auto_accept": { "pairing": true, "store_share": true },
+  "auto_respond_on_failure": false,
+  "auto_reply_to": false,
+  "unpair_ack": "required",
+  "unsafe_connection": false,
+  "communication_info": { "name": "alice" },
+  "own_transports": [{ "uri": "https://me.example.com/derec", "protocol": "https" }],
+  "replica_id": "9007199254740993"
+}
+```
+
+Keys are `snake_case` and every key is optional. `replica_id` and
+`max_subshares` are `u64` values written as decimal strings, so they survive
+JSON encoders whose numbers are `f64`. Timeouts are whole seconds.
+**Unknown keys are rejected** at every level, so a misspelled key fails to
+parse instead of being silently ignored. See the
+[`DeRecProtocolConfig` rustdoc](https://docs.rs/derec-library/latest/derec_library/protocol/struct.DeRecProtocolConfig.html)
+for every field's accepted forms.
 
 ---
 
@@ -361,11 +438,13 @@ before any target-level events are emitted.
 - `RecoveryShareCorrupted { channel_id, version, reason }` — a helper
   answered with a share that cannot be part of the secret. `reason` is a
   `CorruptionReason`: `Malformed` (no decodable share for the requested
-  secret and version) or `InvalidProof` (the share fails its own Merkle
-  proof, e.g. a tampered value), both reported as the share arrives; or
-  `Inconsistent` (valid on its own, but its commitment root or ciphertext
-  disagrees with the shares the secret was rebuilt from), reported alongside
-  `SecretRecovered`. The share is set aside and never blocks the recovery.
+  secret and version, or a share bigger than this device's own configured
+  `max_share_size`, rejected before it is even parsed) or `InvalidProof`
+  (the share fails its own Merkle proof, e.g. a tampered value), both
+  reported as the share arrives; or `Inconsistent` (valid on its own, but
+  its commitment root or ciphertext disagrees with the shares the secret
+  was rebuilt from), reported alongside `SecretRecovered`. The share is set
+  aside and never blocks the recovery.
   An honest helper never sends one, so the app may treat it as a sign of a
   damaged or compromised helper — e.g. offer to unpair it
 - `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }` /
@@ -607,6 +686,70 @@ transport cap protects resources, `reject` enforces policy.
 | Restore | Commit a recovered [`Secret`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.Secret.html) into an empty protocol — reseats canonical helper / replica channels at the recovered version and wipes the throwaway recovery-mode channels. Called once, after `Recovery`, via [`DeRecProtocol::restore`](https://docs.rs/derec-library/latest/derec_library/protocol/struct.DeRecProtocol.html#method.restore). Verification needs one publish first — see [After a restore](#after-a-restore). |
 | Unpairing | Tear down a paired channel and drop local state. |
 | Update channel info | Propagate post-pairing changes to communication info and/or transport endpoint. |
+
+### Weighted helpers
+
+`DeRecFlow::ProtectSecret` takes an optional `weights: HashMap<ChannelId, u32>`
+naming the paired Helpers that should receive more than one subshare. A
+Helper not listed receives one subshare, so an empty map is today's behavior —
+one subshare per Helper. `with_threshold` counts subshares, not Helpers: with no
+weights the two coincide, but an owner who gives one Helper 2 subshares and
+sets `threshold = 3` lets that Helper plus any one other recover, while any
+two of the remaining Helpers still cannot.
+
+Validation runs in `start` before anything is sent: every key must be a
+currently paired Helper channel of this secret, and every weight must satisfy
+`1 <= weight < threshold`, so no single Helper ever holds enough subshares to
+recover alone. An invalid entry fails the call with no share sent and no
+version consumed.
+
+**Weights are not sticky.** They apply only to the `start` call that names
+them — nothing is persisted per Helper, and the roster (`Secret.helpers`)
+does not carry them. A later `ProtectSecret` with no weights publishes with
+one subshare per Helper again; remembering a choice across calls is the
+application's job. The weight actually sent to each channel is reported back
+on `ProtectSecretStarted` / `ProtectSecretFailed` so the application can
+persist or display it.
+
+**Library-initiated publishes ignore weights.** Publishes the library starts
+on its own — after pairing completes, after a fingerprint is confirmed —
+always use one subshare per Helper, and each one is a new version. For an
+application using weights that has two consequences:
+
+- The total can fall below the threshold. With `threshold = 4` and Helpers
+  `A` (weight 3) and `B` (weight 1), pairing a third Helper `C` publishes
+  `1 + 1 + 1 = 3` subshares: no split runs and Helpers receive nothing, but the
+  version is still consumed, so the newest version carries no Helper shares.
+- Even when the total still meets the threshold, the set of Helpers that can
+  recover changes, since every Helper now counts for one subshare.
+
+An application using weights should call `start(ProtectSecret)` with its
+weights again after `PairingCompleted` or a confirmed fingerprint. The
+library's publish has already been dispatched by then — its events arrive in
+the same `process` result as `PairingCompleted`, and it runs inside
+`verify_fingerprint` before that returns `true` — so the application can
+follow it immediately; its call publishes the next version.
+
+`SharingComplete.threshold_met` is `true` when the confirmed Helpers'
+combined weight is `>= threshold`, not when a threshold-sized *count* of
+Helpers has confirmed.
+
+**Capping the total.** Recovery time grows quadratically with the total
+number of subshares a round splits the secret into — measured in release mode
+on a laptop, about 0.2 s at 200, 5.5 s at 1,000 and 87 s at 4,000 subshares
+per attempt — while splitting stays cheap, so nothing warns at sharing time.
+`with_max_subshares(max)` caps that total: a round whose weights sum above it
+fails `start(ProtectSecret)` with `SharingError::TooManySubshares` (FFI code
+`66`, `too_many_subshares`) before anything is sent and before a version is
+consumed. Unset means no cap. Publishes the library starts itself count one
+subshare per Helper and respect the cap too. A cap below the threshold fails
+`build()` with `Error::InvalidInput`. The cap applies at sharing only, never
+at recovery: a recovering device cannot know the cap the shares were made
+under, and refusing there could make a secret unrecoverable.
+
+The stateless `request::split` primitive takes the same weights, with the
+same rules, for callers working below the protocol layer — see
+[Share Distribution](#share-distribution).
 
 ### Transport endpoints and plaintext
 
@@ -1669,12 +1812,14 @@ after pairing.
 
 ```rust,ignore
 use derec_library::primitives::sharing::request;
-use derec_library::types::ChannelId;
+use derec_library::types::{ChannelId, WeightedChannel};
 
 let secret_id: u64 = 42;
 let secret_data = b"super_secret_value";
-let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
-let threshold = 2; // 2 <= threshold <= channels.len()
+// Every channel is listed with its weight: the number of subshares its share
+// carries. An ordinary helper has weight 1; each weight must be < threshold.
+let channels: [WeightedChannel; 3] = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 2)];
+let threshold = 3; // 2 <= threshold <= total subshares (the sum of the weights)
 let version: u32 = 1;
 
 let request::SplitResult { shares } = request::split(
@@ -1805,9 +1950,11 @@ every paired helper for its share and `process` tries to reconstruct as each
 one arrives. A corrupted share is reported per helper and set aside rather
 than allowed to block the recovery:
 
-- On arrival, each share is checked on its own: it must decode, belong to the
-  requested secret and version, and pass its Merkle proof. A share that fails
-  is reported as `RecoveryShareCorrupted` (`Malformed` / `InvalidProof`) and
+- On arrival, each share is checked on its own: if a `max_share_size` is
+  configured and the share exceeds it, it is set aside as `Malformed` before
+  being parsed at all; otherwise it must decode, belong to the requested
+  secret and version, and pass its Merkle proof. A share that fails is
+  reported as `RecoveryShareCorrupted` (`Malformed` / `InvalidProof`) and
   never collected.
 - Shares that are each valid can still disagree, carrying different
   commitment roots or ciphertexts. They are grouped by `(root, ciphertext)`

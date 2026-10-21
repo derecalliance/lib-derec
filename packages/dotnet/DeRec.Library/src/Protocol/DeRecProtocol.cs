@@ -96,17 +96,7 @@ public sealed class DeRecProtocol : IDisposable
         IUserSecretStore userSecretStore,
         IStateStore stateStore,
         ITransport transport,
-        IReadOnlyList<TransportProtocol> ownTransports,
-        int? threshold = null,
-        Dictionary<string, string>? communicationInfo = null,
-        bool? autoRespondOnFailure = null,
-        UnpairAck? unpairAck = null,
-        bool? autoReplyTo = null,
-        AutoAcceptPolicy? autoAccept = null,
-        ulong? replicaId = null,
-        Timeouts? timeouts = null,
-        bool? unsafeConnection = null,
-        ParameterRange? parameterRange = null)
+        DeRecProtocolConfig config)
     {
         SecretId = secretId;
         _channelStore = channelStore;
@@ -213,56 +203,11 @@ public sealed class DeRecProtocol : IDisposable
             Send = Marshal.GetFunctionPointerForDelegate(_transportSend),
         };
 
-        // Order is preserved verbatim: it is this node's preference order.
-        List<TransportOfferDto> ownTransportsDto =
-            ownTransports.Select(t => new TransportOfferDto(t.Uri, (int)t.Protocol)).ToList();
-
-        var config = new ProtocolConfigDto(
-            SecretId: secretId.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            OwnTransports: ownTransportsDto,
-            Threshold: (uint?)threshold,
-            AutoRespondOnFailure: autoRespondOnFailure,
-            UnpairAck: (int?)unpairAck,
-            AutoReplyTo: autoReplyTo,
-            AutoAccept: autoAccept is null
-                ? null
-                : new AutoAcceptConfigDto(
-                    Pairing: autoAccept.Pairing,
-                    PrePair: autoAccept.PrePair,
-                    StoreShare: autoAccept.StoreShare,
-                    VerifyShare: autoAccept.VerifyShare,
-                    Discovery: autoAccept.Discovery,
-                    GetShare: autoAccept.GetShare,
-                    Unpair: autoAccept.Unpair,
-                    UpdateChannelInfo: autoAccept.UpdateChannelInfo),
-            Timeouts: timeouts is null
-                ? null
-                : new TimeoutsConfigDto(
-                    InboundMessageSecs: ToSecs(timeouts.InboundMessage),
-                    SharingRoundSecs: ToSecs(timeouts.SharingRound),
-                    UnpairAckSecs: ToSecs(timeouts.UnpairAck),
-                    ExpiredChannels: timeouts.ExpiredChannels is null
-                        ? null
-                        : new RemoveExpiredChannelsConfigDto(
-                            Enabled: timeouts.ExpiredChannels.Enabled,
-                            TimeoutInSecs: timeouts.ExpiredChannels.TimeoutInSecs)),
-            UnsafeConnection: unsafeConnection,
-            ReplicaId: replicaId?.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            ParameterRange: parameterRange is null
-                ? null
-                : new ParameterRangeDto(
-                    MinShareSize: parameterRange.MinShareSize,
-                    MaxShareSize: parameterRange.MaxShareSize,
-                    MinTimeBetweenVerifications: parameterRange.MinTimeBetweenVerifications,
-                    MaxTimeBetweenVerifications: parameterRange.MaxTimeBetweenVerifications,
-                    MinTimeBetweenShareUpdates: parameterRange.MinTimeBetweenShareUpdates,
-                    MaxTimeBetweenShareUpdates: parameterRange.MaxTimeBetweenShareUpdates,
-                    MinUnresponsiveDeletionTimeout: parameterRange.MinUnresponsiveDeletionTimeout,
-                    MaxUnresponsiveDeletionTimeout: parameterRange.MaxUnresponsiveDeletionTimeout,
-                    MinUnresponsiveDeactivationTimeout: parameterRange.MinUnresponsiveDeactivationTimeout,
-                    MaxUnresponsiveDeactivationTimeout: parameterRange.MaxUnresponsiveDeactivationTimeout),
-            CommunicationInfo: communicationInfo);
-        byte[] configJsonBytes = JsonSerializer.SerializeToUtf8Bytes(config, JsonOpts);
+        // The canonical config JSON plus `secret_id`, which is per instance
+        // and travels beside the config rather than inside it.
+        var configJson = JsonSerializer.SerializeToNode(config, JsonOpts)!.AsObject();
+        configJson["secret_id"] = secretId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        byte[] configJsonBytes = JsonSerializer.SerializeToUtf8Bytes(configJson, JsonOpts);
 
         var result = NP.derec_protocol_new(
             configJsonBytes, (UIntPtr)configJsonBytes.Length,
@@ -1461,83 +1406,13 @@ public sealed class DeRecProtocol : IDisposable
 
     private sealed record SecretValueDto(uint kind, byte[] bytes);
 
-    // Wire shape for `derec_protocol_new`'s `config_json` argument.
-    // Field names match Rust `ProtocolConfig` exactly (see
-    // library/src/interop/ffi/protocol/handle/mod.rs). `SecretId`/`ReplicaId` are
-    // decimal strings, not JSON numbers, so u64 values above 2^53 survive
-    // the round trip through System.Text.Json without precision loss.
-    // Every nullable field is omitted entirely (not `null`) when unset, per
-    // `JsonOpts`'s `WhenWritingNull` ignore condition, so Rust applies its
-    // own default for each.
-    private sealed record ProtocolConfigDto(
-        [property: JsonPropertyName("secret_id")] string SecretId,
-        [property: JsonPropertyName("own_transports")] List<TransportOfferDto> OwnTransports,
-        [property: JsonPropertyName("threshold")] uint? Threshold,
-        [property: JsonPropertyName("auto_respond_on_failure")] bool? AutoRespondOnFailure,
-        [property: JsonPropertyName("unpair_ack")] int? UnpairAck,
-        [property: JsonPropertyName("auto_reply_to")] bool? AutoReplyTo,
-        [property: JsonPropertyName("auto_accept")] AutoAcceptConfigDto? AutoAccept,
-        [property: JsonPropertyName("timeouts")] TimeoutsConfigDto? Timeouts,
-        [property: JsonPropertyName("unsafe_connection")] bool? UnsafeConnection,
-        [property: JsonPropertyName("replica_id")] string? ReplicaId,
-        [property: JsonPropertyName("parameter_range")] ParameterRangeDto? ParameterRange,
-        [property: JsonPropertyName("communication_info"), OmitWhenEmpty] Dictionary<string, string>? CommunicationInfo);
-
-    // Field-for-field equivalent of Rust `ParameterRangeConfig`. Every bound
-    // is optional and defaults to 0, which the proto reads as "no constraint
-    // on this dimension".
-    private sealed record ParameterRangeDto(
-        [property: JsonPropertyName("min_share_size")] long MinShareSize,
-        [property: JsonPropertyName("max_share_size")] long MaxShareSize,
-        [property: JsonPropertyName("min_time_between_verifications")] long MinTimeBetweenVerifications,
-        [property: JsonPropertyName("max_time_between_verifications")] long MaxTimeBetweenVerifications,
-        [property: JsonPropertyName("min_time_between_share_updates")] long MinTimeBetweenShareUpdates,
-        [property: JsonPropertyName("max_time_between_share_updates")] long MaxTimeBetweenShareUpdates,
-        [property: JsonPropertyName("min_unresponsive_deletion_timeout")] long MinUnresponsiveDeletionTimeout,
-        [property: JsonPropertyName("max_unresponsive_deletion_timeout")] long MaxUnresponsiveDeletionTimeout,
-        [property: JsonPropertyName("min_unresponsive_deactivation_timeout")] long MinUnresponsiveDeactivationTimeout,
-        [property: JsonPropertyName("max_unresponsive_deactivation_timeout")] long MaxUnresponsiveDeactivationTimeout);
-
-    // One entry of `ProtocolConfigDto.OwnTransports`. Field-for-field
-    // equivalent of Rust `OwnTransportConfig` — `Protocol` is the
-    // `derec_proto::Protocol` `i32` discriminant, not a URI scheme.
+    // One entry of `derec_protocol_set_own_transports`' JSON array, the same
+    // `{uri, protocol}` shape as an `own_transports` entry of the canonical
+    // config JSON. `Protocol` is the `derec_proto::Protocol` `i32`
+    // discriminant.
     private sealed record TransportOfferDto(
         [property: JsonPropertyName("uri")] string Uri,
         [property: JsonPropertyName("protocol")] int Protocol);
-
-    // Field-for-field equivalent of Rust `RemoveExpiredChannelsConfig`.
-    // Both fields are always serialized, including when Enabled is false —
-    // the library decides that a disabled policy ignores its timeout.
-    // The whole object is omitted (not `null`) when the caller did not
-    // configure a policy, so Rust's `#[serde(default)]` supplies the
-    // default rather than this wrapper restating it.
-    private sealed record RemoveExpiredChannelsConfigDto(
-        [property: JsonPropertyName("enabled")] bool Enabled,
-        [property: JsonPropertyName("timeout_in_secs")] ulong TimeoutInSecs);
-
-    // Field-for-field equivalent of Rust `TimeoutsConfig`. Every field is
-    // omitted when null so Rust's `#[serde(default)]` supplies the default —
-    // the values live there, not in this wrapper. The seconds are forwarded
-    // as the caller gave them; the library accepts only a whole,
-    // non-negative number of seconds and refuses anything else.
-    private sealed record TimeoutsConfigDto(
-        [property: JsonPropertyName("inbound_message_secs")] double? InboundMessageSecs,
-        [property: JsonPropertyName("sharing_round_secs")] double? SharingRoundSecs,
-        [property: JsonPropertyName("unpair_ack_secs")] double? UnpairAckSecs,
-        [property: JsonPropertyName("expired_channels")] RemoveExpiredChannelsConfigDto? ExpiredChannels);
-
-    private static double? ToSecs(TimeSpan? span) => span?.TotalSeconds;
-
-    // Field-for-field equivalent of Rust `AutoAcceptConfig`.
-    private sealed record AutoAcceptConfigDto(
-        [property: JsonPropertyName("pairing")] bool Pairing,
-        [property: JsonPropertyName("pre_pair")] bool PrePair,
-        [property: JsonPropertyName("store_share")] bool StoreShare,
-        [property: JsonPropertyName("verify_share")] bool VerifyShare,
-        [property: JsonPropertyName("discovery")] bool Discovery,
-        [property: JsonPropertyName("get_share")] bool GetShare,
-        [property: JsonPropertyName("unpair")] bool Unpair,
-        [property: JsonPropertyName("update_channel_info")] bool UpdateChannelInfo);
 }
 
 /// <summary>

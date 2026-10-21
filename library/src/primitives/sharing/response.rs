@@ -93,9 +93,10 @@ pub struct ExtractResult {
 /// use derec_library::primitives::sharing::{request, response};
 /// use derec_library::types::ChannelId;
 ///
-/// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
-/// let request::SplitResult { shares } = request::split(&channels, 1, 1, b"super_secret_value", 2)
-///     .expect("split failed");
+/// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
+/// let request::SplitResult { shares } =
+///     request::split(&channels, 1, 1, b"super_secret_value", 2)
+///         .expect("split failed");
 ///
 /// let channel_id = ChannelId(1);
 /// let shared_key = [42u8; 32];
@@ -211,9 +212,10 @@ pub fn produce(
 /// use derec_library::primitives::sharing::{request, response};
 /// use derec_library::types::ChannelId;
 ///
-/// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
-/// let request::SplitResult { shares } = request::split(&channels, 1, 1, b"super_secret_value", 2)
-///     .expect("split failed");
+/// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
+/// let request::SplitResult { shares } =
+///     request::split(&channels, 1, 1, b"super_secret_value", 2)
+///         .expect("split failed");
 ///
 /// let channel_id = ChannelId(1);
 /// let shared_key = [42u8; 32];
@@ -301,9 +303,10 @@ pub fn extract(
 /// use derec_library::primitives::sharing::{request, response};
 /// use derec_library::types::ChannelId;
 ///
-/// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
-/// let request::SplitResult { shares } = request::split(&channels, 1, 1, b"super_secret_value", 2)
-///     .expect("split failed");
+/// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
+/// let request::SplitResult { shares } =
+///     request::split(&channels, 1, 1, b"super_secret_value", 2)
+///         .expect("split failed");
 ///
 /// let channel_id = ChannelId(1);
 /// let shared_key = [42u8; 32];
@@ -377,7 +380,7 @@ fn validate_produce_inputs(
     let secret_id = inner_share.secret_id;
 
     let vss_share = vss::VSSShare {
-        points: crate::extensions::derec_share::into_vss_points(inner_share.points),
+        subshares: crate::extensions::derec_share::into_vss_subshares(inner_share.subshares),
         encrypted_secret: inner_share.encrypted_secret,
         commitment: committed_share.commitment.clone(),
         merkle_path: committed_share

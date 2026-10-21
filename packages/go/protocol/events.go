@@ -88,10 +88,13 @@ const (
 // Fields that are `Option<T>` on the Rust side (and therefore genuinely
 // absent — not just zero — on some variants) are Go pointers: Version,
 // ReplicaID, AuthorReplicaID, HeldAuthorReplicaID, IncomingAuthorReplicaID,
-// SenderKind, ShareDescription, ShareSecretID, ShareSize, UnpairMemo. Every other
-// field is a plain value; a variant that does not carry it simply leaves
-// it at the zero value, which callers should not read without first
-// checking Type.
+// SenderKind, ShareDescription, ShareSecretID, ShareSize, UnpairMemo. Weight
+// is also a Go pointer, though plain (non-Option) on the Rust side: it is
+// carried only by ProtectSecretStarted/ProtectSecretFailed, so every other
+// variant must decode it as absent rather than the ambiguous zero value.
+// Every other field is a plain value; a variant that does not carry it
+// simply leaves it at the zero value, which callers should not read without
+// first checking Type.
 type Event struct {
 	// Type is the wire discriminator — the Rust variant name verbatim
 	// (e.g. "PairingCompleted", "ShareStored", "NoOp"). Compare against
@@ -123,6 +126,11 @@ type Event struct {
 	Version       *uint32        `json:"version"`
 	Secret        *Secret        `json:"secret"`
 	Shares        []ChannelShare `json:"shares"`
+
+	// ProtectSecretStarted, ProtectSecretFailed: the number of subshares
+	// sent (or, on Failed, that would have been sent) to this channel — the
+	// ProtectSecretParams.Weights entry for it, or 1 when absent.
+	Weight *uint32 `json:"weight"`
 
 	// ReplicaSecretReceived, ReplicaSecretInstalled — the member that
 	// published Version; nil when the serving member's snapshot records no

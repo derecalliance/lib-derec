@@ -84,7 +84,10 @@ impl<
     /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret). A device holding no snapshot still
     /// publishes an empty one to a promoted Destination, since the payload
     /// carries the roster; a promoted helper, for which an empty payload is
-    /// inert, is sent nothing.
+    /// inert, is sent nothing. That publish carries no weights: every Helper
+    /// receives one subshare, and an application that wants weights calls
+    /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret)
+    /// again, which publishes the next version.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(channel_id = channel_id.0)))]
     pub async fn verify_fingerprint(
         &mut self,
@@ -165,6 +168,7 @@ impl<
                 self.start_protect_secret(
                     secrets,
                     description,
+                    std::collections::HashMap::new(),
                     &Round {
                         reply_to: &reply_to,
                         trace_id: crate::derec_message::fresh_trace_id(),

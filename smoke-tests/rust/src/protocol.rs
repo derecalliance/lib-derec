@@ -37,6 +37,8 @@ pub async fn run_all() {
     run_replica_verifies_only_synced_versions_flow().await;
     run_discovery_and_recovery_flow().await;
     run_helper_without_the_version_flow().await;
+    run_weighted_helpers_flow().await;
+    run_max_subshares_flow().await;
     run_share_store_refusal_flow().await;
     run_corrupted_share_flow().await;
     run_unpairing_flow().await;
@@ -706,6 +708,34 @@ impl Peer {
             protocol,
             transport,
         }
+    }
+
+    /// Build a peer whose sharing rounds are capped at `max` total
+    /// subshares, returning the builder's error as is.
+    fn with_max_subshares(
+        label: &'static str,
+        uri: &str,
+        threshold: usize,
+        max: u64,
+    ) -> Result<Self, derec_library::Error> {
+        let transport = InProcessTransport::new();
+        let protocol = DeRecProtocolBuilder::new(DEFAULT_TEST_SECRET_ID)
+            .with_channel_store(InMemoryChannelStore::default())
+            .with_share_store(InMemoryShareStore::default())
+            .with_secret_store(InMemorySecretStore::default())
+            .with_user_secret_store(InMemoryUserSecretStore::default())
+            .with_transport(transport.clone())
+            .with_state_store(InMemoryStateStore::default())
+            .with_own_transports([uri])
+            .with_threshold(threshold)
+            .with_max_subshares(max)
+            .build()?;
+        Ok(Self {
+            label,
+            uri: uri.to_owned(),
+            protocol,
+            transport,
+        })
     }
 
     fn with_full_options(
@@ -1797,6 +1827,7 @@ async fn run_protect_secret_with_replica_targets_flow() {
                 data: secret_data.clone(),
             }],
             description: Some("replica + helper distribution".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .expect("owner start(ProtectSecret) with replica target failed");
@@ -2165,6 +2196,7 @@ async fn run_protect_secret_per_target_failure_flow() {
                 data: b"payload".to_vec(),
             }],
             description: None,
+            weights: HashMap::new(),
         })
         .await
         .expect("start(ProtectSecret) must not Err on per-target failure");
@@ -2249,6 +2281,7 @@ async fn run_sharing_flow() {
                 data: b"super-secret-value".to_vec(),
             }],
             description: Some("smoke-test distribution".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -2304,6 +2337,7 @@ async fn run_verification_flow() {
                 data: b"bytes-to-be-proven".to_vec(),
             }],
             description: None,
+            weights: HashMap::new(),
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -2530,6 +2564,7 @@ async fn run_replica_mirror_then_verify_flow() {
                 data: b"vault-contents".to_vec(),
             }],
             description: Some("mirror round".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .expect("source start(ProtectSecret) failed");
@@ -2621,6 +2656,7 @@ async fn run_replica_mirror_then_verify_flow() {
                 data: b"vault-contents-v2".to_vec(),
             }],
             description: Some("round the destination misses".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .expect("source start(ProtectSecret) failed");
@@ -2760,6 +2796,7 @@ async fn run_replica_roster_describes_every_member_flow() {
                 data: b"roster-contents".to_vec(),
             }],
             description: None,
+            weights: HashMap::new(),
         })
         .await
         .expect("source start(ProtectSecret) failed");
@@ -2865,6 +2902,7 @@ async fn run_replica_verifies_only_synced_versions_flow() {
                 data: b"alice-secret-v1".to_vec(),
             }],
             description: None,
+            weights: HashMap::new(),
         })
         .await
         .expect("alice start(ProtectSecret) v1 failed")
@@ -3107,6 +3145,7 @@ async fn run_discovery_and_recovery_flow() {
                 data: secret_data.clone(),
             }],
             description: Some("wallet seed phrase".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -3381,6 +3420,7 @@ async fn run_helper_without_the_version_flow() {
                 data: secret_data.clone(),
             }],
             description: None,
+            weights: HashMap::new(),
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -3497,6 +3537,181 @@ async fn run_helper_without_the_version_flow() {
     println!("Protocol helper without the version flow test passed.");
 }
 
+/// `with_max_subshares` caps a sharing round's total subshares. A cap below
+/// the threshold is refused by `build()` with `InvalidInput`; a round whose
+/// weights total more than the cap fails `start(ProtectSecret)` with
+/// `SharingError::TooManySubshares` before anything is sent.
+async fn run_max_subshares_flow() {
+    println!("=== Protocol max-subshares cap test ===");
+
+    let refused = Peer::with_max_subshares("owner", "https://owner.example.com", 3, 2);
+    assert!(
+        matches!(refused, Err(derec_library::Error::InvalidInput(_))),
+        "a cap below the threshold must fail build() with InvalidInput"
+    );
+    println!("  build() refuses a cap below the threshold (InvalidInput)  ✓");
+
+    let mut owner = Peer::with_max_subshares("owner", "https://owner.example.com", 3, 3)
+        .expect("a cap at the threshold builds");
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(1)).await;
+    let channel_b = pair(&mut owner, &mut helper_b, ChannelId(2)).await;
+    owner.drain();
+
+    let result = owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![5],
+                name: "capped secret".to_owned(),
+                data: b"capped-secret".to_vec(),
+            }],
+            description: None,
+            weights: HashMap::from([(channel_a, 2), (channel_b, 2)]),
+        })
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(derec_library::Error::Sharing(
+                derec_library::primitives::sharing::SharingError::TooManySubshares {
+                    subshares: 4,
+                    max: 3
+                }
+            ))
+        ),
+        "4 subshares over a cap of 3 must fail with TooManySubshares, got {result:?}"
+    );
+    assert!(
+        owner.drain().is_empty(),
+        "a round over the cap must send nothing"
+    );
+    println!(
+        "  start(ProtectSecret) over the cap fails with TooManySubshares and sends nothing  ✓"
+    );
+
+    println!("Protocol max-subshares cap test passed.");
+}
+
+/// A weighted round: four helpers, `t = 3`, and helper-0 at weight 2.
+///
+/// Helper-0 receives two subshares and every other helper one, as the
+/// dispatch events report. Once every helper confirms, the round meets the
+/// threshold, and the secret is then recovered from helper-0 and helper-1
+/// alone: two helpers holding three subshares.
+async fn run_weighted_helpers_flow() {
+    println!("=== Protocol weighted helpers flow test ===");
+
+    let mut owner = Peer::with_threshold("owner", "https://owner.example.com", 3);
+    let mut helper_0 = Peer::new("helper-0", "https://helper-0.example.com");
+    let mut helper_1 = Peer::new("helper-1", "https://helper-1.example.com");
+    let mut helper_2 = Peer::new("helper-2", "https://helper-2.example.com");
+    let mut helper_3 = Peer::new("helper-3", "https://helper-3.example.com");
+
+    let channel_0 = pair(&mut owner, &mut helper_0, ChannelId(1)).await;
+    let channel_1 = pair(&mut owner, &mut helper_1, ChannelId(2)).await;
+    let channel_2 = pair(&mut owner, &mut helper_2, ChannelId(3)).await;
+    let channel_3 = pair(&mut owner, &mut helper_3, ChannelId(4)).await;
+
+    let secret_data = b"two helpers, three subshares".to_vec();
+    let protect_events = owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![3],
+                name: "weighted secret".to_owned(),
+                data: secret_data.clone(),
+            }],
+            description: None,
+            weights: HashMap::from([(channel_0, 2)]),
+        })
+        .await
+        .expect("owner start(ProtectSecret) with weights failed");
+
+    let mut weights: Vec<(ChannelId, u32)> = protect_events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ProtectSecretStarted {
+                channel_id, weight, ..
+            } => Some((*channel_id, *weight)),
+            _ => None,
+        })
+        .collect();
+    weights.sort_unstable();
+    let mut expected = vec![
+        (channel_0, 2),
+        (channel_1, 1),
+        (channel_2, 1),
+        (channel_3, 1),
+    ];
+    expected.sort_unstable();
+    assert_eq!(
+        weights, expected,
+        "ProtectSecretStarted must report each helper's weight"
+    );
+    let version = protect_events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ProtectSecretStarted { version, .. } => Some(*version),
+            _ => None,
+        })
+        .expect("the round must report the version it published");
+
+    let share_events = pump_many(&mut [
+        &mut owner,
+        &mut helper_0,
+        &mut helper_1,
+        &mut helper_2,
+        &mut helper_3,
+    ])
+    .await;
+    let threshold_met = share_events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::SharingComplete { threshold_met, .. } => Some(*threshold_met),
+            _ => None,
+        })
+        .expect("the round completes once every helper confirms");
+    assert!(threshold_met, "five confirmed subshares meet t = 3");
+
+    let owner_sid = owner.protocol.secret_id();
+    for channel_id in [channel_2, channel_3] {
+        owner
+            .protocol
+            .channel_store
+            .remove(owner_sid, ChannelQuery::Helper { channel_id })
+            .await
+            .expect("owner forgets helper-2 and helper-3");
+    }
+
+    owner
+        .protocol
+        .start(DeRecFlow::RecoverSecret {
+            secret_id: owner_sid,
+            version,
+        })
+        .await
+        .expect("owner start(RecoverSecret) failed");
+    let recovery_events = pump_many(&mut [&mut owner, &mut helper_0, &mut helper_1]).await;
+    let recovered = recovery_events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::SecretRecovered { secret } => Some(secret.clone()),
+            _ => None,
+        })
+        .expect("helper-0 (2 subshares) and helper-1 (1 subshare) must recover the secret");
+    assert!(
+        recovered
+            .secrets
+            .iter()
+            .any(|s| s.id == vec![3] && s.data == secret_data),
+        "recovered secret must carry the protected bytes"
+    );
+
+    println!("Protocol weighted helpers flow test passed.");
+}
+
 /// A helper's share store refuses first a share, then a verification, with
 /// `TooFrequent`, as an application rate limit would.
 ///
@@ -3522,6 +3737,7 @@ async fn run_share_store_refusal_flow() {
             data: data.to_vec(),
         }],
         description: None,
+        weights: HashMap::new(),
     };
     let started_version = |events: &[DeRecEvent]| {
         events
@@ -3642,6 +3858,7 @@ async fn run_corrupted_share_flow() {
                 data: secret_data.clone(),
             }],
             description: None,
+            weights: HashMap::new(),
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -3669,7 +3886,7 @@ async fn run_corrupted_share_flow() {
         .expect("committed share decodes");
     let mut share =
         derec_proto::DeRecShare::decode(committed.de_rec_share.as_slice()).expect("share decodes");
-    share.points[0].y[0] ^= 0x01;
+    share.subshares[0].y[0] ^= 0x01;
     committed.de_rec_share = share.encode_to_vec();
     request.share = committed.encode_to_vec();
     stored.bytes = request.encode_to_vec();
@@ -4076,6 +4293,7 @@ async fn run_auto_publish_on_pair_flow() {
                 data: b"initial-payload".to_vec(),
             }],
             description: Some("initial publish".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -4269,6 +4487,7 @@ async fn run_replica_sync_version_progression_flow() {
         .start(DeRecFlow::ProtectSecret {
             secrets: vec![s1.clone()],
             description: Some("v=2 explicit publish".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .expect("ProtectSecret([s1]) failed");
@@ -4380,6 +4599,7 @@ async fn run_replica_sync_version_progression_flow() {
         .start(DeRecFlow::ProtectSecret {
             secrets: vec![s1.clone(), s2.clone()],
             description: Some("v=6 explicit publish".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .expect("ProtectSecret([s1, s2]) failed");
@@ -4659,6 +4879,7 @@ async fn run_replica_group_key_handover_flow() {
                 data: b"k_group payload".to_vec(),
             }],
             description: Some("post-handover round".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .expect("source start(ProtectSecret) failed");
@@ -4767,6 +4988,7 @@ async fn run_replica_publish_before_handover_ack_flow() {
                     data: payload.to_vec(),
                 }],
                 description: None,
+                weights: HashMap::new(),
             })
             .await
             .expect("source start(ProtectSecret) failed");
@@ -5067,6 +5289,7 @@ async fn run_auto_accept_flow() {
                 data: b"auto-accepted-value".to_vec(),
             }],
             description: Some("auto-accept smoke".to_owned()),
+            weights: HashMap::new(),
         })
         .await
         .expect("owner start(ProtectSecret) failed");

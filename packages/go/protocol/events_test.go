@@ -750,16 +750,32 @@ func TestDecodeEvents_DiscoveryFailed(t *testing.T) {
 }
 
 func TestDecodeEvents_ProtectSecretStarted(t *testing.T) {
-	ev := decodeOne(t, `{"type": "ProtectSecretStarted", "channel_id": "11", "version": 1}`)
+	ev := decodeOne(t, `{"type": "ProtectSecretStarted", "channel_id": "11", "version": 1, "weight": 2}`)
 	if ev.Type != EventTypeProtectSecretStarted || ev.Version == nil || *ev.Version != 1 {
 		t.Fatalf("got %+v", ev)
+	}
+	if ev.Weight == nil || *ev.Weight != 2 {
+		t.Fatalf("Weight: got %v", ev.Weight)
 	}
 }
 
 func TestDecodeEvents_ProtectSecretFailed(t *testing.T) {
-	ev := decodeOne(t, `{"type": "ProtectSecretFailed", "channel_id": "11", "version": 1, "error": "send failed"}`)
+	ev := decodeOne(t, `{"type": "ProtectSecretFailed", "channel_id": "11", "version": 1, "error": "send failed", "weight": 3}`)
 	if ev.Type != EventTypeProtectSecretFailed || ev.Error != "send failed" {
 		t.Fatalf("got %+v", ev)
+	}
+	if ev.Weight == nil || *ev.Weight != 3 {
+		t.Fatalf("Weight: got %v", ev.Weight)
+	}
+}
+
+// TestDecodeEvents_ProtectSecretStarted_WeightAbsentOnOtherVariants proves
+// Weight stays nil on a variant that does not carry it, rather than
+// decoding to the ambiguous zero value.
+func TestDecodeEvents_ProtectSecretStarted_WeightAbsentOnOtherVariants(t *testing.T) {
+	ev := decodeOne(t, `{"type": "ShareStored", "channel_id": "11", "version": 1}`)
+	if ev.Weight != nil {
+		t.Fatalf("expected nil Weight, got %v", *ev.Weight)
 	}
 }
 
