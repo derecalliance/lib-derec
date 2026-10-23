@@ -7,11 +7,11 @@
 //! The WASM bindings surface errors to JavaScript as strings, while the C ABI
 //! carries `i32`. These accessors let an FFI consumer produce the identical
 //! strings without embedding a copy of the mapping; both read the one table
-//! in `crate::interop::error_codes`.
+//! in `crate::error_codes`.
 
 use std::ffi::c_char;
 
-use crate::interop::error_codes::{Category, Code};
+use crate::error_codes::{Category, Code};
 
 /// Static NUL-terminated name for a `DEREC_CATEGORY_*` value.
 ///

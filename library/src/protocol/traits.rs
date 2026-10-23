@@ -393,6 +393,13 @@ pub trait DeRecChannelStore {
 ///   sent to each helper, so that the verification handler can replay the
 ///   commitment when validating each helper's response.
 ///
+/// [`Share::subshares`] is the one field beside the bytes that carries
+/// meaning: the library sets it on every owner-side row (the number of
+/// subshares that Helper holds for that version) and leaves it `None` on
+/// every helper-side row. Persist it as given, including `None`, and return
+/// it unchanged. Owner rows written before the field existed read back as
+/// `None`; the library never backfills them.
+///
 /// # Relation to channel linking
 ///
 /// This store is a **pure keyed store** — it never sees the channel-link
@@ -572,6 +579,16 @@ pub trait DeRecShareStore {
     /// Leave out only versions whose round failed or that the user rolled
     /// back. Only the application knows which versions committed; nothing
     /// in the stores records it.
+    ///
+    /// # The owner's own proofs
+    ///
+    /// The list also governs this store's owner-side rows. When a Helper
+    /// confirms `version`, the library removes, through
+    /// [`remove_versions`](Self::remove_versions), this device's rows for
+    /// that channel whose versions the list leaves out: the Helper has
+    /// removed those shares, so their proofs can no longer be answered. A
+    /// Helper that refuses `version` or never answers keeps its older
+    /// versions, and so do its rows here. `None` removes nothing.
     ///
     /// Replica pushes never consult this and always send an empty
     /// `keepList`.
@@ -1278,7 +1295,7 @@ impl<T: DeRecTransport + ?Sized> DeRecTransport for std::sync::Arc<T> {
 #[cfg(test)]
 mod pointer_forwarding_tests {
     use super::*;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };

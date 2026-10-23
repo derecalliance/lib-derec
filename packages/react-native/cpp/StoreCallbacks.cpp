@@ -245,6 +245,21 @@ CallResult toShareListResult(jsi::Runtime& rt, const jsi::Value& value) {
     text += "{\"secret_id\":\"" + secretIdStr + "\",\"version\":" + std::to_string(version) +
             ",\"bytes\":";
     appendByteArrayJson(text, bytes.ptr, bytes.len);
+    // `subshares` and `threshold`: `null`/`undefined` is none and is omitted,
+    // as Rust omits it; anything else must be a `u32` to cross as one.
+    for (const char* field : {"subshares", "threshold"}) {
+      jsi::Value value = entry.getProperty(rt, field);
+      if (value.isNull() || value.isUndefined()) continue;
+      if (!value.isNumber()) {
+        return CallResult{kBackendFailure, {}};
+      }
+      double number = value.asNumber();
+      if (!(number >= 0 && number <= 4294967295.0) ||
+          number != static_cast<double>(static_cast<uint32_t>(number))) {
+        return CallResult{kBackendFailure, {}};
+      }
+      text += std::string(",\"") + field + "\":" + std::to_string(static_cast<uint32_t>(number));
+    }
     text += '}';
   }
   text += ']';
@@ -843,6 +858,12 @@ extern "C" int32_t shareStoreSave(void* userData, uint64_t secretId, uint64_t ch
                          jsi::Value(rt, jsi::String::createFromUtf8(rt, decoded.secretId)));
     shareObj.setProperty(rt, "version", jsi::Value(static_cast<int>(decoded.version)));
     shareObj.setProperty(rt, "bytes", toUint8ArrayVal(rt, decoded.bytes));
+    if (decoded.subshares) {
+      shareObj.setProperty(rt, "subshares", jsi::Value(static_cast<double>(*decoded.subshares)));
+    }
+    if (decoded.threshold) {
+      shareObj.setProperty(rt, "threshold", jsi::Value(static_cast<double>(*decoded.threshold)));
+    }
     // A refusal thrown synchronously (rather than via a rejected promise)
     // never reaches `settleFromPromise`'s `onErr`, so it is read here,
     // before it would otherwise fall into `JsCallbackBridge::callSync`'s

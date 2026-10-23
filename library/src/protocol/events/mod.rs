@@ -40,9 +40,9 @@ pub enum IgnoreReason {
     /// The envelope's timestamp and the encrypted inner message's timestamp
     /// differ, or either or both are absent. A sender stamps both with the
     /// one time the message was sent, so a mismatch means the envelope was
-    /// altered or built by a non-conforming peer. A body with no timestamp
-    /// field, such as `ErrorResponse`, always lands here. Checked after
-    /// decryption and before dispatch.
+    /// altered or built by a non-conforming peer. Every body, including
+    /// `ErrorResponse`, carries the field and obeys the same rule. Checked
+    /// after decryption and before dispatch.
     TimestampMismatch,
     /// A `VerifyShareResponse` whose `(nonce, secret_id, version)` does not
     /// match the challenge outstanding on its channel: an answer to an
@@ -65,6 +65,10 @@ pub enum VerifyFailureReason {
     /// challenged version, so no answer could be checked. Reported when the
     /// round starts, in which case nothing is sent, or when the answer
     /// arrives after the proof was removed.
+    ///
+    /// The publishing device removes a proof when the Helper failed to store
+    /// that version, or when the Helper confirmed a later version whose
+    /// `keepList` left it out, since the Helper has then removed it too.
     NoProof,
     /// A local store or transport failure while preparing or sending the
     /// challenge; `error` names the cause.
@@ -125,6 +129,9 @@ pub enum PendingActionKind {
     GetShare,
     Unpair,
     UpdateChannelInfo,
+    /// A [`PendingAction::RespondToFailure`]: a request that failed and still
+    /// owes its sender a response. [`AutoAcceptPolicy`] never allows it.
+    Failed,
 }
 
 /// Per-flow opt-in for auto-accepting incoming requests.
@@ -191,6 +198,10 @@ pub enum PendingActionKind {
 /// applies to gating alone: auto-accept never relaxes an invariant the
 /// protocol enforces itself, only the application's opportunity to
 /// refuse.
+///
+/// No field covers [`PendingAction::RespondToFailure`]. A failed request can
+/// only be rejected, so [`Self::allows`] is `false` for it under every
+/// policy, [`Self::all`] included.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AutoAcceptPolicy {
     pub pairing: bool,
@@ -235,6 +246,7 @@ impl AutoAcceptPolicy {
             PendingActionKind::GetShare => self.get_share,
             PendingActionKind::Unpair => self.unpair,
             PendingActionKind::UpdateChannelInfo => self.update_channel_info,
+            PendingActionKind::Failed => false,
         }
     }
 }
@@ -252,6 +264,15 @@ impl AutoAcceptPolicy {
 /// reload the pairing secret from the secret store (single source of
 /// truth), so the token stays small and safe to persist or ship across a
 /// language boundary.
+///
+/// `Clone` lets an application keep a copy of an action it passes to
+/// [`super::DeRecProtocol::accept`], so it can still hand that copy to
+/// [`super::DeRecProtocol::reject`] if a
+/// [`DeRecEvent::RequestFailed`] follows.
+///
+/// The library never expires an unresolved action: a token stays valid until
+/// the application resolves it, however long that takes.
+#[derive(Clone)]
 pub enum PendingAction {
     Pairing {
         channel_id: ChannelId,
@@ -352,6 +373,101 @@ pub enum PendingAction {
         shared_key: SharedKey,
         trace_id: u64,
     },
+    /// A request that arrived on an authenticated channel failed, and the
+    /// response it is owed has not been sent. Carried by
+    /// [`DeRecEvent::RequestFailed`].
+    ///
+    /// The only resolution is [`super::DeRecProtocol::reject`], which sends
+    /// exactly one response with the given status and memo.
+    /// [`super::DeRecProtocol::accept`] returns
+    /// [`crate::Error::InvalidInput`]: there is no success to send for a
+    /// request that already failed.
+    ///
+    /// Carries no shared key. The key is loaded from the channel named by
+    /// `reply` when the response is sent.
+    ///
+    /// No token is issued when `reject` could never answer it, and
+    /// [`DeRecEvent::RequestFailed`] then carries `action: None`:
+    ///
+    /// - no reply target can exist: a request on a replica group channel that
+    ///   names no member and carries no `reply_to`;
+    /// - the channel whose key would encrypt the response has no key stored.
+    ///   A replica copy that hands this device the group key and fails before
+    ///   the copy is applied is the case: the admitter dropped the key of the
+    ///   channel it arrived on, so the response is owed on the group channel,
+    ///   whose key this device has not stored yet. The admitter learns of the
+    ///   failure by timing out. With `auto_respond_on_failure` on, the
+    ///   library answers it with the group key it holds in memory.
+    ///
+    /// The library is stateless and cannot tell a token it already answered
+    /// from a fresh one: rejecting the same token twice sends two responses.
+    /// Resolving each token once is the application's part.
+    RespondToFailure {
+        /// The channel the failed request arrived on.
+        channel_id: ChannelId,
+        /// Trace id read from the inbound request envelope. Echoed verbatim
+        /// on the response envelope; see `DeRecMessage.traceId`.
+        trace_id: u64,
+        /// Where the response goes.
+        reply: ReplyTarget,
+        /// The request being answered, which decides the response type.
+        request: FailedRequest,
+    },
+}
+
+/// Where the response to a [`PendingAction::RespondToFailure`] is sent.
+///
+/// The key is not part of the target: it is loaded from `channel_id` when
+/// the response is sent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplyTarget {
+    /// The channel whose shared key encrypts the response.
+    pub channel_id: ChannelId,
+    /// The endpoints the response is delivered to.
+    pub endpoints: Vec<TransportProtocol>,
+}
+
+/// The request a [`PendingAction::RespondToFailure`] answers.
+///
+/// One variant per request type that is owed a response, each holding the
+/// decoded request so the response can be built for it. Helper-bound and
+/// replica-bound requests share a variant: the request message is the same,
+/// and only the reply target differs.
+///
+/// `Debug` shows only the variant name, keeping peer-supplied request
+/// contents out of log lines.
+#[derive(Clone, PartialEq)]
+pub enum FailedRequest {
+    /// Answered with a `StoreShareResponse`.
+    StoreShare(StoreShareRequestMessage),
+    /// Answered with a `VerifyShareResponse`.
+    VerifyShare(VerifyShareRequestMessage),
+    /// Answered with a `GetSecretIdsVersionsResponse`.
+    GetSecretIdsVersions(GetSecretIdsVersionsRequestMessage),
+    /// Answered with a `GetShareResponse`.
+    GetShare(GetShareRequestMessage),
+    /// Answered with an `UnpairResponse`.
+    Unpair(UnpairRequestMessage),
+    /// Answered with an `UpdateChannelInfoResponse`.
+    UpdateChannelInfo(UpdateChannelInfoRequestMessage),
+    /// The message decrypted under the channel key but its body could not be
+    /// decoded, or it was a request type not expected under a channel key.
+    /// Answered with an `ErrorResponseMessage`.
+    Undecodable,
+}
+
+impl std::fmt::Debug for FailedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FailedRequest::StoreShare(_) => "StoreShare",
+            FailedRequest::VerifyShare(_) => "VerifyShare",
+            FailedRequest::GetSecretIdsVersions(_) => "GetSecretIdsVersions",
+            FailedRequest::GetShare(_) => "GetShare",
+            FailedRequest::Unpair(_) => "Unpair",
+            FailedRequest::UpdateChannelInfo(_) => "UpdateChannelInfo",
+            FailedRequest::Undecodable => "Undecodable",
+        })
+    }
 }
 
 impl std::fmt::Debug for PendingAction {
@@ -364,7 +480,8 @@ impl std::fmt::Debug for PendingAction {
             | PendingAction::Discovery { channel_id, .. }
             | PendingAction::GetShare { channel_id, .. }
             | PendingAction::Unpair { channel_id, .. }
-            | PendingAction::UpdateChannelInfo { channel_id, .. } => channel_id,
+            | PendingAction::UpdateChannelInfo { channel_id, .. }
+            | PendingAction::RespondToFailure { channel_id, .. } => channel_id,
         };
         f.debug_struct("PendingAction")
             .field("kind", &self.kind())
@@ -388,6 +505,7 @@ impl PendingAction {
             PendingAction::GetShare { .. } => PendingActionKind::GetShare,
             PendingAction::Unpair { .. } => PendingActionKind::Unpair,
             PendingAction::UpdateChannelInfo { .. } => PendingActionKind::UpdateChannelInfo,
+            PendingAction::RespondToFailure { .. } => PendingActionKind::Failed,
         }
     }
 
@@ -408,7 +526,8 @@ impl PendingAction {
             | PendingAction::Discovery { trace_id, .. }
             | PendingAction::GetShare { trace_id, .. }
             | PendingAction::Unpair { trace_id, .. }
-            | PendingAction::UpdateChannelInfo { trace_id, .. } => *trace_id,
+            | PendingAction::UpdateChannelInfo { trace_id, .. }
+            | PendingAction::RespondToFailure { trace_id, .. } => *trace_id,
         }
     }
 }
@@ -447,49 +566,89 @@ pub enum DeRecFlow {
     /// instance manages exactly one secret.
     ///
     /// The target set is derived from the channel store: every paired
-    /// Owner→Helper channel receives a share if the configured threshold
+    /// Owner→Helper channel receives a share if the round's threshold
     /// is met, and every paired Source→ReplicaDestination channel
     /// receives the full secret payload. Apps that need to drive a single
     /// peer should pair just that peer; the protocol no longer accepts
     /// a per-call subset.
     ///
-    /// When the total subshares across paired Helpers (each Helper's
-    /// weight, `1` when unlisted) is below
-    /// [`crate::protocol::DeRecProtocolBuilder::with_threshold`], no VSS
+    /// When the total subshares across paired Helpers (the sum of their
+    /// weights) is below the round's threshold (see
+    /// [`threshold`](DeRecFlow::ProtectSecret::threshold)), no VSS
     /// split runs and Helpers receive nothing — the secret still lands on
-    /// any paired Replica destinations in "secret-only" form.
+    /// any paired Replica destinations in "secret-only" form. No
+    /// [`DeRecEvent::ProtectSecretStarted`] or
+    /// [`DeRecEvent::ProtectSecretFailed`] is
+    /// emitted for a Helper, since none was targeted; with no Replicas
+    /// paired either, [`super::DeRecProtocol::start`] returns `Ok` with no
+    /// events at all. This is deliberately not an error: the version is
+    /// still advanced and the secrets and description are saved as the
+    /// latest snapshot, so the next publish that reaches `threshold` —
+    /// including one the library starts on its own — shares that snapshot.
+    /// An app can tell the two cases apart without waiting on events, by
+    /// comparing the weights it is about to assign (or, for a
+    /// library-initiated publish, the stored
+    /// [`HelperChannel::weight`](crate::protocol::types::HelperChannel::weight)
+    /// of every paired Helper) against the round's threshold before calling.
     ///
-    /// Publishes the library starts on its own (after pairing completes,
-    /// after a fingerprint is confirmed) pass no weights, so every Helper
-    /// receives one subshare. That publish is still a new version, so for an
-    /// application using weights it can:
+
+    /// # Weights are recorded
     ///
-    /// - drop the total below the threshold: with `threshold = 4` and
-    ///   Helpers `A` (weight 3) and `B` (weight 1), pairing a third Helper
-    ///   publishes 3 subshares, so no split runs and Helpers receive nothing,
-    ///   yet the version is consumed and the newest version carries no
-    ///   Helper shares;
-    /// - change who can recover, even when the total still meets the
-    ///   threshold, since every Helper now counts for one subshare.
-    ///
-    /// An application using weights therefore calls `start` with
-    /// `ProtectSecret` and its weights again after `PairingCompleted` or a
-    /// confirmed fingerprint. The library's publish has already been
-    /// dispatched by then: its events arrive in the same `process` result
-    /// as `PairingCompleted`, and it runs inside
-    /// [`super::DeRecProtocol::verify_fingerprint`] before that returns
-    /// `true`. The application's call publishes the next version.
+    /// Each round writes the weight it gave every paired Helper to that
+    /// Helper's channel record
+    /// ([`HelperChannel::weight`](crate::protocol::types::HelperChannel::weight)),
+    /// before anything is sent. Publishes the library starts on its own
+    /// (after pairing completes, after a fingerprint is confirmed) reuse
+    /// those stored weights, and a newly paired Helper starts at `1`. The
+    /// weights also travel in the roster, so a device that restores from a
+    /// recovered secret, or hydrates as a replica, publishes with the same
+    /// weights. Weights change only through this flow.
     ProtectSecret {
         secrets: Vec<UserSecret>,
         description: Option<String>,
-        /// Helpers that receive more than one subshare, by channel. A
-        /// paired Helper not listed receives one. Applies to this round only.
+        /// The subshare weight of every paired Helper, by channel. The map is
+        /// the **full assignment**, not a patch: a paired Helper it does not
+        /// name receives one subshare.
+        ///
+        /// Weights are the user's choice. Before this call, the application
+        /// shows the user each paired Helper's current weight, pre-filled
+        /// from its channel store
+        /// ([`HelperChannel::weight`](crate::protocol::types::HelperChannel::weight)),
+        /// and passes the user's final choice as the whole map. Reading the
+        /// stored weights first is the normal flow.
+        ///
+        /// Every other call here the application makes, such as a republish
+        /// after editing the secrets or the publish that follows
+        /// [`restore`](crate::protocol::DeRecProtocol::restore), must pass
+        /// the stored weights unchanged. A Helper left out returns to `1`,
+        /// which silently undoes the user's choice. Only the publishes the
+        /// library starts on its own (after pairing completes, after a
+        /// fingerprint is confirmed) reuse the stored weights by themselves.
         ///
         /// Every key must be a paired Helper channel of this secret, and every
         /// weight must satisfy `1 <= weight < threshold`, so no Helper can
         /// recover alone. Any invalid entry fails the call with
-        /// [`crate::Error::Sharing`] before anything is sent or a version is
-        /// consumed.
+        /// [`crate::Error::Sharing`] before anything is written or sent, or a
+        /// version is consumed. Publishes the library starts on its own check
+        /// the stored weights the same way: a weight stored under a higher
+        /// threshold fails them with
+        /// [`SharingError::InvalidWeight`](crate::primitives::sharing::SharingError::InvalidWeight)
+        /// and nothing is sent, until a call here assigns valid weights.
+        /// The failure surfaces where the publish ran:
+        ///
+        /// - [`process`](crate::protocol::DeRecProtocol::process) returns a
+        ///   [`ProcessError`](crate::protocol::ProcessError) whose `events`
+        ///   keep the message's events, [`DeRecEvent::PairingCompleted`]
+        ///   included.
+        /// - [`accept`](crate::protocol::DeRecProtocol::accept) returns `Err`.
+        ///   The pairing has completed and its response was sent, but
+        ///   `PairingCompleted` is not returned.
+        /// - [`verify_fingerprint`](crate::protocol::DeRecProtocol::verify_fingerprint)
+        ///   returns `Err`. The promotion stands, a retry returns `Ok(true)`,
+        ///   and nothing is published.
+        ///
+        /// In each case a call here with valid weights publishes to every
+        /// Helper.
         ///
         /// Large totals are costly to recover: reconstruction time grows
         /// quadratically with the total number of subshares. A cap set with
@@ -497,8 +656,39 @@ pub enum DeRecFlow {
         /// bounds the total; a round above it fails with
         /// [`SharingError::TooManySubshares`](crate::primitives::sharing::SharingError::TooManySubshares)
         /// under the same guarantees. Publishes the library starts on its own
-        /// count one subshare per Helper against the same cap.
+        /// count the stored weights against the same cap.
         weights: HashMap<ChannelId, u32>,
+        /// The threshold `t` this round splits at: the number of distinct
+        /// subshares that reconstruct this version.
+        ///
+        /// `t` is recorded. Each round writes the `t` it used to the
+        /// [`UserSecrets::threshold`](crate::protocol::types::UserSecrets::threshold)
+        /// snapshot, the roster carries it, and
+        /// [`restore`](crate::protocol::DeRecProtocol::restore) and replica
+        /// hydration put it back. The round's `t` is, in order:
+        ///
+        /// 1. this value, when `Some`;
+        /// 2. otherwise the stored `UserSecrets::threshold`;
+        /// 3. otherwise the builder's
+        ///    [`with_threshold`](crate::protocol::DeRecProtocolBuilder::with_threshold).
+        ///
+        /// Pass `None` to keep the stored `t`, including on the publish that
+        /// follows `restore`. Pass `Some(t)` only to change it; once the
+        /// round passes validation the new `t` is written only to this
+        /// round's own snapshot, saved after distribution, so no earlier
+        /// snapshot is rewritten and a round that fails before its snapshot
+        /// is saved leaves the previous `t` in place. Publishes the library
+        /// starts on its own always use the stored `t`.
+        ///
+        /// The resolved `t` must be at least `2`
+        /// ([`SharingError::InvalidThreshold`](crate::primitives::sharing::SharingError::InvalidThreshold)),
+        /// above every resolved weight
+        /// ([`SharingError::InvalidWeight`](crate::primitives::sharing::SharingError::InvalidWeight)),
+        /// and no greater than a
+        /// [`with_max_subshares`](crate::protocol::DeRecProtocolBuilder::with_max_subshares)
+        /// cap ([`crate::Error::InvalidInput`]). Each check runs before a
+        /// version is chosen: a failing round writes and sends nothing.
+        threshold: Option<u32>,
     },
     VerifyShares {
         /// Must equal this instance's own `secret_id`.
@@ -751,6 +941,39 @@ pub enum DeRecEvent {
     /// version from [`Self::ReplicaSecretReceived`] instead.
     ShareStored { channel_id: ChannelId, version: u32 },
 
+    /// The library refused an inbound `StoreShareRequest` (Helper side):
+    /// nothing was stored, no stored version was removed, and the Owner was
+    /// sent a `StoreShareResponse` carrying `status` and `memo`, which it
+    /// observes as [`Self::ShareRejected`] with the same values.
+    ///
+    /// Emitted for every refusal the library itself makes, whatever the
+    /// [`AutoAcceptPolicy`] or the `auto_respond_on_failure` setting, and
+    /// always in place of [`Self::ActionRequired`] — a refused share never
+    /// reaches the application's accept/reject decision:
+    ///
+    /// - `FORMAT_ERROR` — `share` is empty, is not a `CommittedDeRecShare`,
+    ///   lacks its wrapped share, commitment or Merkle path, or does not
+    ///   wrap a `DeRecShare`.
+    /// - `VERIFICATION_FAILED` — the wrapped share does not verify against
+    ///   its commitment: no subshares, a repeated `x`, or a Merkle path that
+    ///   does not lead to the commitment.
+    /// - `SIZE_LIMIT_EXCEEDED` — `share` is outside the Helper's
+    ///   [`ParameterRange`](derec_proto::ParameterRange).
+    /// - `VERSION_CONFLICT` — a different share is already stored at
+    ///   `version` on this channel.
+    ///
+    /// A refusal decided by the application's
+    /// [`DeRecShareStore::save`](crate::protocol::DeRecShareStore::save) is
+    /// the application's own decision and does not emit this event.
+    ShareRefused {
+        channel_id: ChannelId,
+        version: u32,
+        /// The `StatusEnum` value sent to the Owner.
+        status: i32,
+        /// Human-readable reason sent to the Owner.
+        memo: String,
+    },
+
     /// A `ReplicaSource` peer pushed a secret sync on a `ReplicaDestination`
     /// channel. The library has already auto-acked the inbound
     /// `StoreShareRequest` and decoded the `ReplicaSecretPayload` into
@@ -865,6 +1088,53 @@ pub enum DeRecEvent {
         incoming_author_replica_id: Option<u64>,
         /// The incoming copy's full state: secrets, helpers and replicas.
         secret: crate::protocol::types::Secret,
+    },
+
+    /// This device refused a group member's copy of the secret.
+    ///
+    /// Emitted by the library on a group member receiving a copy of the
+    /// secret it will not apply. The whole payload is checked before
+    /// anything is written, so nothing was: no helper channel or key, no
+    /// tracking share, no group member and no snapshot.
+    ///
+    /// - On a push (a replica-bound `StoreShareRequest`) the publisher has
+    ///   already been answered with `status` and `memo`, whatever
+    ///   `auto_respond_on_failure` says, and sees
+    ///   [`Self::ReplicaSyncRejected`] carrying the same values. An
+    ///   admission handover is answered on the group channel under the
+    ///   group key it carries, since the admitter no longer holds the
+    ///   ephemeral key. A handover that does not decode, or whose group key
+    ///   or channel is unusable, leaves no channel the admitter can read:
+    ///   the answer is sent where the request arrived and the admitter
+    ///   learns of the refusal only by timing out.
+    /// - On a catch-up (a member's `GetShareResponse` carrying the secret)
+    ///   no answer is sent, since the payload is itself an answer.
+    ///   `from_replica_id` is the member that served it.
+    ///
+    /// - `FORMAT_ERROR` — the payload does not decode, lacks its `secret`,
+    ///   disagrees with the request's version or with the roster's group
+    ///   key, carries a key that is not 32 bytes or a member with a reserved
+    ///   id or unknown role, names a Helper in its share map that the roster
+    ///   does not list, or carries a share map entry that does not decode.
+    /// - `VERIFICATION_FAILED` — a share map entry does not verify against
+    ///   its commitment.
+    ///
+    /// A different copy of a version already held is reported as
+    /// [`Self::ReplicaVersionConflict`] instead.
+    ReplicaSecretRefused {
+        /// The channel the copy arrived on.
+        channel_id: ChannelId,
+        /// The member the copy came from.
+        from_replica_id: u64,
+        /// `secret_id` echoed from the inbound `StoreShareRequest`.
+        secret_id: u64,
+        /// `version` echoed from the inbound `StoreShareRequest`.
+        version: u32,
+        /// The `StatusEnum` value of the refusal, as sent to the publisher
+        /// on a push.
+        status: i32,
+        /// Human-readable reason, as sent to the publisher on a push.
+        memo: String,
     },
 
     /// A replica peer's `StoreShareResponse` to a secret sync we sent
@@ -1072,7 +1342,8 @@ pub enum DeRecEvent {
         version: u32,
         confirmed_count: usize,
         failed_count: usize,
-        /// `true` when the confirmed weight `>= threshold`: the subshares
+        /// `true` when the confirmed weight `>= threshold`, the threshold
+        /// this round split at: the subshares
         /// held by the confirmed Helpers, counting each Helper's weight from
         /// the share this device dispatched to it (`1` when that share is
         /// missing or does not decode). `confirmed_count` and `failed_count`
@@ -1081,7 +1352,28 @@ pub enum DeRecEvent {
     },
 
     /// A Helper's verification proof checked out (Owner side).
-    ShareVerified { channel_id: ChannelId, version: u32 },
+    ///
+    /// To judge whether `version` is recoverable, sum `subshares` over the
+    /// `ShareVerified` events for that version and compare the sum with
+    /// their `threshold`: recovery needs that many distinct subshares. If
+    /// either value is `None` on any of those events, the result is
+    /// unknown: a `None` count is not `0` or `1`.
+    ShareVerified {
+        channel_id: ChannelId,
+        version: u32,
+        /// How many subshares this Helper holds for `version`: the
+        /// [`Share::subshares`](crate::protocol::types::Share::subshares) of
+        /// the owner's stored share for this channel and version. It is the
+        /// weight of the round that published `version`, not the Helper's
+        /// current weight. `None` when that row was written before the count
+        /// was recorded.
+        subshares: Option<u32>,
+        /// The threshold `version` was split with: the
+        /// [`Share::threshold`](crate::protocol::types::Share::threshold) of
+        /// the same owner row. It is that version's `t`, not the current one.
+        /// `None` when that row was written before the threshold was recorded.
+        threshold: Option<u32>,
+    },
 
     /// A Helper answered a verification challenge with an OK status, but
     /// its proof does not match the share this device committed to (Owner
@@ -1208,6 +1500,13 @@ pub enum DeRecEvent {
     /// re-pair with the same helpers, or sync replicas after the
     /// recovery completes.
     ///
+    /// The replica group is `secret.replicas`: its `members` (each with
+    /// `replica_id`, `role` and `transports`, the lost device among them) and
+    /// the group `channel_id`. A group with members other than the lost
+    /// device is what the application checks before calling `restore`: if
+    /// any of them is still live, offer to join the group rather than
+    /// restore. See [`super::DeRecProtocol::restore`] for why.
+    ///
     /// The library decodes the two-layer (`DeRecSecret` → `Secret`)
     /// protobuf wrapping internally; a decode failure surfaces as
     /// [`Self::RecoveryShareError`] for that final share, not as
@@ -1252,6 +1551,69 @@ pub enum DeRecEvent {
         action_kind: PendingActionKind,
     },
 
+    /// A request that arrived on an authenticated channel failed while it was
+    /// being handled.
+    ///
+    /// Every such request is owed exactly one response. When the library sent
+    /// it, `responded` is `true` and `action` is `None`. Otherwise `responded`
+    /// is `false` and `action` holds a [`PendingAction::RespondToFailure`];
+    /// pass it to [`super::DeRecProtocol::reject`] to send the response.
+    ///
+    /// `action` is also `None`, with `responded` `false`, when no token could
+    /// ever be answered:
+    ///
+    /// - a request on a replica group channel that names no member and
+    ///   carries no `reply_to`, such as a body that could not be decoded. No
+    ///   reply target can exist for it, and nothing is sent in either
+    ///   `auto_respond_on_failure` mode;
+    /// - with `auto_respond_on_failure` off, a replica copy that hands this
+    ///   device the group key and fails before the copy is applied. The
+    ///   response is owed on the group channel, whose key is not stored yet.
+    ///
+    /// Reported instead of an error from [`super::DeRecProtocol::process`] or
+    /// [`super::DeRecProtocol::accept`], so the other events of the same call
+    /// are kept.
+    RequestFailed {
+        /// The channel the request arrived on.
+        channel_id: ChannelId,
+        /// The type of the request that failed. [`PendingActionKind::Failed`]
+        /// for a body that could not be decoded or a request the channel
+        /// cannot carry.
+        action_kind: PendingActionKind,
+        /// `true` when the response was handed to the transport.
+        responded: bool,
+        /// The `StatusEnum` value that was sent, or that would have been
+        /// sent.
+        status: i32,
+        /// The memo sent with `status`, or that would have been: wire-safe,
+        /// never the local error text. Passing `status` and `memo` to
+        /// [`super::DeRecProtocol::reject`] with `action` sends the response
+        /// `auto_respond_on_failure` would have sent.
+        memo: String,
+        /// The error's code name, as the SDKs surface it.
+        error_code: String,
+        /// Local description of the failure. Never sent to the peer.
+        message: String,
+        /// The token that answers the request, present only when
+        /// `responded` is `false` and a reply target can exist.
+        action: Option<PendingAction>,
+    },
+
+    /// The peer answered a message from this device with an
+    /// `ErrorResponseMessage`: it could not process it, typically because
+    /// the body could not be decoded (`FORMAT_ERROR`).
+    ///
+    /// Reported only once the message passes the envelope timestamp binding,
+    /// like any other body. It is never answered, in either
+    /// `auto_respond_on_failure` mode, so two peers cannot trade them.
+    ErrorResponseReceived {
+        channel_id: ChannelId,
+        /// The `StatusEnum` value from the peer's response.
+        status: i32,
+        /// Human-readable reason from the peer.
+        memo: String,
+    },
+
     /// The local channel state for `channel_id` has been dropped as the
     /// result of an unpair flow.
     ///
@@ -1291,6 +1653,33 @@ pub enum DeRecEvent {
         status: i32,
         /// Human-readable reason from the contact creator.
         memo: String,
+    },
+
+    /// This device refused an inbound `PairRequest` under a protocol rule,
+    /// whatever the [`AutoAcceptPolicy`] or the `auto_respond_on_failure`
+    /// setting, and sent the requester a `PairResponse` carrying `status`
+    /// and `memo`. No channel was created.
+    ///
+    /// The rules are a parameter range that does not overlap this device's
+    /// (`INCOMPATIBLE_PARAMETER_RANGE`) and a replica id already held by a
+    /// member of the group (`REPLICA_ID_CONFLICT`). The refusal is the
+    /// result of [`super::DeRecProtocol::process`], not an error; a refusal
+    /// that could not be sent fails `process` instead.
+    ///
+    /// `memo` is what the requester reads, written from its side. The local
+    /// reason is carried by `error_code` and `message`, in the same shape as
+    /// [`Self::RequestFailed`], so the application can log or render it.
+    PairingRefused {
+        channel_id: ChannelId,
+        /// The `StatusEnum` value sent to the requester.
+        status: i32,
+        /// Human-readable reason sent to the requester.
+        memo: String,
+        /// The refusal's error code name, as the SDKs surface it:
+        /// `incompatible_parameter_range` or `replica_id_conflict`.
+        error_code: String,
+        /// Local description of the refusal. Never sent to the peer.
+        message: String,
     },
 
     /// The stored [`crate::protocol::types::HelperChannel`] for `channel_id` has been updated
@@ -1426,9 +1815,11 @@ pub enum DeRecEvent {
         /// call dispatched. One token is drawn per round, so a fan-out shares
         /// it across all of its targets.
         trace_id: u64,
-        /// The number of subshares sent to `channel_id` this round: the
-        /// weight given in [`DeRecFlow::ProtectSecret`], or `1` for a Helper
-        /// not listed and for every publish the library starts on its own.
+        /// The number of subshares sent to `channel_id` this round, which is
+        /// also the weight now stored for it: its entry in
+        /// [`DeRecFlow::ProtectSecret`]'s `weights`, `1` for a Helper the map
+        /// does not name, or the stored weight on a publish the library
+        /// starts on its own.
         weight: u32,
     },
 
@@ -1607,6 +1998,21 @@ mod tests {
         }
     }
 
+    fn respond_to_failure_action() -> PendingAction {
+        PendingAction::RespondToFailure {
+            channel_id: ChannelId(1),
+            trace_id: 5,
+            reply: ReplyTarget {
+                channel_id: ChannelId(1),
+                endpoints: Vec::new(),
+            },
+            request: FailedRequest::StoreShare(StoreShareRequestMessage {
+                share: vec![0xAB; 4],
+                ..Default::default()
+            }),
+        }
+    }
+
     #[test]
     fn pending_action_kind_round_trips_each_variant() {
         assert_eq!(store_share_action().kind(), PendingActionKind::StoreShare);
@@ -1619,6 +2025,47 @@ mod tests {
             PendingActionKind::UpdateChannelInfo
         );
         assert_eq!(pre_pair_action().kind(), PendingActionKind::PrePair);
+        assert_eq!(
+            respond_to_failure_action().kind(),
+            PendingActionKind::Failed
+        );
+    }
+
+    /// A failed request is only ever rejected, so no policy, however
+    /// permissive, routes it to `accept`.
+    #[test]
+    fn auto_accept_never_allows_a_failed_request() {
+        assert!(!AutoAcceptPolicy::all().allows(&respond_to_failure_action()));
+        assert!(!AutoAcceptPolicy::default().allows(&respond_to_failure_action()));
+    }
+
+    /// A copy kept before `accept` is the same token, so it can still be
+    /// passed to `reject`.
+    #[test]
+    fn a_cloned_action_keeps_its_trace_id_and_kind() {
+        let action = respond_to_failure_action();
+        let copy = action.clone();
+        assert_eq!(copy.kind(), action.kind());
+        assert_eq!(copy.trace_id(), 5);
+    }
+
+    /// The token's `Debug` output names the kind and channel, never the
+    /// peer-supplied request.
+    #[test]
+    fn debug_keeps_failed_request_contents_out_of_logs() {
+        let rendered = format!("{:?}", respond_to_failure_action());
+        assert!(rendered.contains("Failed"), "{rendered}");
+        assert!(!rendered.contains("171"), "{rendered}");
+        assert_eq!(
+            format!(
+                "{:?}",
+                FailedRequest::StoreShare(StoreShareRequestMessage {
+                    share: vec![0xAB; 4],
+                    ..Default::default()
+                })
+            ),
+            "StoreShare"
+        );
     }
 
     #[test]

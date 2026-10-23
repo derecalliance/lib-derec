@@ -125,6 +125,12 @@ pub enum Error {
     /// fingerprint verification: there is no point asking a user to confirm a
     /// pairing that cannot complete.
     ///
+    /// Raised by the initiator, which learns the responder's id from its
+    /// `PairResponse`. A responder that receives a colliding `PairRequest`
+    /// instead refuses it with a `PairResponse` carrying `REPLICA_ID_CONFLICT`
+    /// and reports
+    /// [`DeRecEvent::PairingRefused`](crate::protocol::DeRecEvent::PairingRefused).
+    ///
     /// `replica_id` is assigned by the application, so this is a
     /// configuration fault — most often the same identity reused on two
     /// devices. Resolution is the application's: assign a distinct id and

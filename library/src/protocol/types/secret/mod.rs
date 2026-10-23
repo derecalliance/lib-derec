@@ -42,9 +42,10 @@
 //! or empty as "not present"). Schema:
 //!
 //! ```text
-//! Secret      { helpers:[Helper], secrets:[UserSecret], replicas?:Replicas }
+//! Secret      { helpers:[Helper], secrets:[UserSecret], replicas?:Replicas,
+//!               threshold?:int }
 //! Helper      { channel_id:str<u64>, transports:[Endpoint], shared_key:base64,
-//!               communication_info?:{str:str} }
+//!               communication_info?:{str:str}, weight?:int }
 //! UserSecret  { id:base64, name:str, data:base64 }
 //! Replicas    { members:[ReplicaInfo], shared_key:base64,
 //!               channel_id:str<u64> }
@@ -56,6 +57,18 @@
 //!
 //! `transports` lists every endpoint the peer advertised, in its preference
 //! order; `protocol` is the `TransportProtocol` discriminant.
+//!
+//! `weight` is the number of Shamir subshares the Helper received in the round
+//! that wrote the roster. It is omitted when `1`, an absent key decodes as `1`,
+//! and a `0` makes the payload malformed. The field was added within v3: a
+//! decoder that predates it ignores the key, and every roster written before
+//! it decodes with every Helper at `1`.
+//!
+//! `threshold` is the `t` the roster's version was split with. It is omitted
+//! when absent, an absent key decodes as `None`, and a value below `2` makes
+//! the payload malformed. The field was added within v3: a decoder that
+//! predates it ignores the key, and every roster written before it decodes
+//! with no threshold.
 //!
 //! ## What changed from v2
 //!

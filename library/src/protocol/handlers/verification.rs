@@ -11,6 +11,7 @@ use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::extensions::verify_share_response::VerifyShareResponseExt as _;
 use crate::protocol::context::{Exchange, Local, Round};
+use crate::protocol::obligation::{deliver, refused, reported};
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::{
     Error, Result,
@@ -92,7 +93,10 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 /// A channel is challenged only while this device holds a proof of its share
 /// at `version`; without one there is nothing to check an answer against, so
 /// the channel gets `VerifySharesFailed` with
-/// [`VerifyFailureReason::NoProof`] and no challenge is sent. A missing
+/// [`VerifyFailureReason::NoProof`] and no challenge is sent. The publishing
+/// device holds no proof for a version the channel's Helper failed to store,
+/// nor for one it removed under a later round's `keepList` once it confirmed
+/// that round. A missing
 /// shared key or a dispatch failure is reported the same way, with its own
 /// reason. Each failure is isolated to its channel rather than
 /// short-circuiting the fan-out.
@@ -203,7 +207,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
             version = request.version,
             "no stored share for the challenged version; answering UNKNOWN_SHARE_VERSION"
         );
-        reject(
+        let sent = reject(
             stores,
             local,
             exchange,
@@ -211,8 +215,14 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
             StatusEnum::UnknownShareVersion,
             NO_SHARE_FOR_VERSION,
         )
-        .await?;
-        return Ok(vec![DeRecEvent::NoOp]);
+        .await;
+        return refused(
+            exchange.obligation,
+            DeRecEvent::NoOp,
+            StatusEnum::UnknownShareVersion,
+            NO_SHARE_FOR_VERSION,
+            sent,
+        );
     };
 
     let stored =
@@ -225,7 +235,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     {
         Ok(()) => {}
         Err(ShareStoreError::Refused(refusal)) => {
-            reject(
+            let sent = reject(
                 stores,
                 local,
                 exchange,
@@ -233,7 +243,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
                 refusal.status(),
                 refusal.memo(),
             )
-            .await?;
+            .await;
 
             #[cfg(feature = "logging")]
             tracing::info!(
@@ -243,7 +253,13 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
                 "verification refused by the application's share store"
             );
 
-            return Ok(vec![DeRecEvent::NoOp]);
+            return refused(
+                exchange.obligation,
+                DeRecEvent::NoOp,
+                refusal.status(),
+                refusal.memo(),
+                sent,
+            );
         }
         Err(other) => return Err(other.into()),
     }
@@ -257,10 +273,19 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .resolve_response_endpoints(
             secret_id,
             channel_id,
+            local.policy,
             &crate::extensions::advertised_endpoints::reply_to_owned(request),
         )
         .await?;
-    stores.transport.send(&endpoint, envelope).await?;
+    let sent = deliver(
+        exchange.obligation,
+        stores.transport,
+        &endpoint,
+        envelope,
+        StatusEnum::Ok,
+        "",
+    )
+    .await;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -270,7 +295,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         "verification response sent"
     );
 
-    Ok(vec![DeRecEvent::NoOp])
+    reported(exchange.obligation, vec![DeRecEvent::NoOp], sent)
 }
 
 #[cfg_attr(
@@ -293,7 +318,31 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     memo: &str,
 ) -> Result<()> {
     let (secret_id, channel_id) = (local.secret_id, exchange.channel_id);
-    let response = VerifyShareResponseMessage {
+    crate::extensions::channel_store::send_channel_message(
+        stores.channels,
+        stores.transport,
+        secret_id,
+        channel_id,
+        failure_response(request, status, memo),
+        exchange.shared_key,
+        exchange.trace_id,
+        local.policy,
+        &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        exchange.obligation,
+        status,
+        memo,
+    )
+    .await
+}
+
+/// The `VerifyShareResponse` that answers `request` with a non-`Ok` `status`
+/// and no proof.
+pub(in crate::protocol) fn failure_response(
+    request: &VerifyShareRequestMessage,
+    status: StatusEnum,
+    memo: &str,
+) -> MessageBody {
+    MessageBody::VerifyShareResponse(VerifyShareResponseMessage {
         result: Some(DeRecResult {
             status: status as i32,
             memo: memo.to_owned(),
@@ -303,18 +352,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         nonce: request.nonce,
         hash: Vec::new(),
         timestamp: Some(current_timestamp()),
-    };
-    crate::extensions::channel_store::send_channel_message(
-        stores.channels,
-        stores.transport,
-        secret_id,
-        channel_id,
-        MessageBody::VerifyShareResponse(response),
-        exchange.shared_key,
-        exchange.trace_id,
-        &crate::extensions::advertised_endpoints::reply_to_owned(request),
-    )
-    .await
+    })
 }
 
 #[cfg_attr(
@@ -405,13 +443,13 @@ async fn on_response<S: StoreSet>(
         }]);
     }
 
-    let Some(committed_share_bytes) = stores
+    let Some((committed_share_bytes, subshares, threshold)) = stores
         .shares
         .load(secret_id, channel_id, &[version])
         .await?
         .into_iter()
         .next()
-        .map(|s| s.bytes)
+        .map(|s| (s.bytes, s.subshares, s.threshold))
     else {
         #[cfg(feature = "logging")]
         tracing::warn!(
@@ -443,6 +481,8 @@ async fn on_response<S: StoreSet>(
         DeRecEvent::ShareVerified {
             channel_id,
             version,
+            subshares,
+            threshold,
         }
     } else {
         DeRecEvent::ShareVerifyInvalid {
@@ -601,7 +641,7 @@ async fn dispatch_one<S: StoreSet>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::test::{StoreRig, run_async};
+    use crate::protocol::tests::{StoreRig, run_async};
     use crate::protocol::types::Share;
 
     const SECRET_ID: u64 = 0x5E1F;
@@ -639,6 +679,8 @@ mod tests {
                         secret_id: SECRET_ID,
                         version: VERSION,
                         bytes: vec![0x5A; 16],
+                        subshares: None,
+                        threshold: None,
                     },
                 )
                 .await
@@ -655,7 +697,7 @@ mod tests {
                 hash: Vec::new(),
                 timestamp: Some(current_timestamp()),
             };
-            let local = crate::protocol::test::LocalFixture::new(SECRET_ID);
+            let local = crate::protocol::tests::LocalFixture::new(SECRET_ID);
             let events = handle(
                 &mut rig.stores(),
                 &local.local(),
@@ -663,6 +705,7 @@ mod tests {
                     channel_id: CHANNEL,
                     shared_key: &[0u8; 32],
                     trace_id: 0,
+                    obligation: None,
                 },
                 MessageBody::VerifyShareResponse(response),
             )
@@ -701,7 +744,7 @@ mod tests {
     /// and the owner reads that answer as [`DeRecEvent::ShareVerifyRejected`].
     mod helper_without_the_share {
         use super::*;
-        use crate::protocol::test::{
+        use crate::protocol::tests::{
             InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
             InMemUserSecretStore, RecordingTransport,
         };
@@ -736,6 +779,7 @@ mod tests {
                         status: ChannelStatus::Paired,
                         created_at: 1,
                         peer_role: SenderKind::Owner,
+                        weight: 1,
                     }),
                 )
                 .await
@@ -798,11 +842,13 @@ mod tests {
                         secret_id: SECRET_ID,
                         version: VERSION,
                         bytes: vec![0x5A; 16],
+                        subshares: None,
+                        threshold: None,
                     },
                 )
                 .await
                 .expect("seed committed share");
-            let local = crate::protocol::test::LocalFixture::new(SECRET_ID);
+            let local = crate::protocol::tests::LocalFixture::new(SECRET_ID);
             handle(
                 &mut rig.stores(),
                 &local.local(),
@@ -810,6 +856,7 @@ mod tests {
                     channel_id: CHANNEL,
                     shared_key: &KEY,
                     trace_id: 0,
+                    obligation: None,
                 },
                 MessageBody::VerifyShareResponse(response),
             )
@@ -914,7 +961,7 @@ mod tests {
     mod record_verification_tests {
         use super::*;
         use crate::protocol::Refusal;
-        use crate::protocol::test::{
+        use crate::protocol::tests::{
             InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemUserSecretStore,
             LocalFixture, RecordingTransport, RefusingShareStore, StoreRig,
         };
@@ -986,6 +1033,8 @@ mod tests {
                         secret_id: REC_SECRET_ID,
                         version,
                         bytes: stored.encode_to_vec(),
+                        subshares: None,
+                        threshold: None,
                     },
                 )
                 .await
@@ -1030,6 +1079,8 @@ mod tests {
                         secret_id: REC_SECRET_ID,
                         version: request.version,
                         bytes: vec![0x5A; 16],
+                        subshares: None,
+                        threshold: None,
                     },
                 )
                 .await
@@ -1042,6 +1093,7 @@ mod tests {
                     channel_id: REC_CHANNEL,
                     shared_key: &REC_KEY,
                     trace_id: 0,
+                    obligation: None,
                 },
                 MessageBody::VerifyShareResponse(response),
             )
@@ -1068,6 +1120,7 @@ mod tests {
                         channel_id: REC_CHANNEL,
                         shared_key: &REC_KEY,
                         trace_id: 1,
+                        obligation: None,
                     },
                     &request,
                 )
@@ -1117,6 +1170,7 @@ mod tests {
                             channel_id: REC_CHANNEL,
                             shared_key: &REC_KEY,
                             trace_id: 1,
+                            obligation: None,
                         },
                         &rec_request(version, u64::from(version)),
                     )
@@ -1150,6 +1204,7 @@ mod tests {
                         channel_id: REC_CHANNEL,
                         shared_key: &REC_KEY,
                         trace_id: 1,
+                        obligation: None,
                     },
                     &rec_request(1, 0x0BAD_5EED),
                 )
@@ -1171,42 +1226,116 @@ mod tests {
             });
         }
 
-        /// A non-refusal `record_verification` failure propagates as an
-        /// error rather than being turned into a status response.
+        /// A non-refusal `record_verification` failure is the router's to
+        /// answer: `FAIL` with the generic memo when the library responds, a
+        /// token when it does not. No proof is sent either way.
         #[test]
-        fn helper_verification_backend_error_still_propagates() {
-            run_async(async {
-                let mut rig = rec_rig();
-                seed_stored_share(&mut rig, 1).await;
-                rig.shares.set_verification_backend_error(true);
-                let local = LocalFixture::new(REC_SECRET_ID);
+        fn helper_verification_backend_error_is_answered_through_the_router() {
+            for respond in [true, false] {
+                run_async(async move {
+                    use crate::protocol::obligation::{GENERIC_FAILURE_MEMO, Obligation, settle};
 
-                let result = accept(
-                    &mut rig.stores(),
-                    &local.local(),
-                    &Exchange {
+                    let mut rig = rec_rig();
+                    seed_stored_share(&mut rig, 1).await;
+                    rig.shares.set_verification_backend_error(true);
+                    let local = LocalFixture::new(REC_SECRET_ID);
+                    let request = rec_request(1, 0x0BAD_5EED);
+                    let action = PendingAction::VerifyShare {
                         channel_id: REC_CHANNEL,
-                        shared_key: &REC_KEY,
+                        request: request.clone(),
+                        shared_key: REC_KEY,
                         trace_id: 1,
-                    },
-                    &rec_request(1, 0x0BAD_5EED),
-                )
-                .await;
+                    };
+                    let obligation =
+                        Obligation::for_action(&action, local.local().policy).expect("a request");
 
-                assert!(
-                    matches!(
-                        result,
-                        Err(crate::Error::ShareStore(
-                            crate::protocol::ShareStoreError::Backend(_)
-                        ))
-                    ),
-                    "a non-refusal store failure propagates as an error, not a status response; got {result:?}"
-                );
-                assert!(
-                    rig.transport.sent_envelopes().is_empty(),
-                    "no status response is sent on a backend failure"
-                );
-            });
+                    let outcome = accept(
+                        &mut rig.stores(),
+                        &local.local(),
+                        &Exchange {
+                            channel_id: REC_CHANNEL,
+                            shared_key: &REC_KEY,
+                            trace_id: 1,
+                            obligation: Some(&obligation),
+                        },
+                        &request,
+                    )
+                    .await;
+                    assert!(
+                        matches!(
+                            outcome,
+                            Err(crate::Error::ShareStore(
+                                crate::protocol::ShareStoreError::Backend(_)
+                            ))
+                        ),
+                        "the flow itself leaves the failure to the router; got {outcome:?}"
+                    );
+                    assert!(rig.transport.sent_envelopes().is_empty());
+
+                    // The paired channel's key is in the secret store. The token
+                    // carries none: `reject` reads it from there.
+                    crate::protocol::DeRecSecretStore::save(
+                        &mut rig.secrets,
+                        REC_SECRET_ID,
+                        REC_CHANNEL,
+                        crate::protocol::SecretValue::SharedKey(REC_KEY),
+                    )
+                    .await
+                    .expect("seed the channel key");
+                    let events = settle(
+                        &mut rig.stores(),
+                        &local.local(),
+                        &obligation,
+                        respond,
+                        outcome,
+                    )
+                    .await;
+                    let token = match events.as_slice() {
+                        [
+                            DeRecEvent::RequestFailed {
+                                responded, action, ..
+                            },
+                        ] => {
+                            assert_eq!(*responded, respond);
+                            action.clone()
+                        }
+                        other => panic!("expected one RequestFailed, got {other:?}"),
+                    };
+                    if let Some(PendingAction::RespondToFailure {
+                        channel_id,
+                        trace_id,
+                        reply,
+                        request,
+                    }) = token
+                    {
+                        assert!(rig.transport.sent_envelopes().is_empty());
+                        let answer = Obligation::for_failure(
+                            channel_id,
+                            trace_id,
+                            &reply,
+                            request,
+                            local.local().policy,
+                        );
+                        crate::protocol::obligation::respond_to_failure(
+                            &mut rig.stores(),
+                            &local.local(),
+                            &answer,
+                            StatusEnum::Fail,
+                            GENERIC_FAILURE_MEMO,
+                        )
+                        .await
+                        .expect("the token answers the request");
+                    }
+
+                    let sent = rig.transport.sent_envelopes();
+                    assert_eq!(sent.len(), 1, "exactly one response");
+                    let response = decode_verify_share_response(&sent[0], &REC_KEY);
+                    assert!(response.hash.is_empty(), "no proof is sent");
+                    let result = response.result.expect("a result");
+                    assert_eq!(result.status, StatusEnum::Fail as i32);
+                    assert_eq!(result.memo, GENERIC_FAILURE_MEMO);
+                });
+            }
         }
     }
 
@@ -1240,6 +1369,7 @@ mod tests {
                         status: ChannelStatus::Paired,
                         created_at: 1,
                         peer_role: SenderKind::Helper,
+                        weight: 1,
                     }),
                 )
                 .await
@@ -1251,6 +1381,23 @@ mod tests {
         }
 
         async fn seed_proof(rig: &mut StoreRig, channel_id: ChannelId) {
+            seed_counted_proof(rig, channel_id, None).await;
+        }
+
+        async fn seed_counted_proof(
+            rig: &mut StoreRig,
+            channel_id: ChannelId,
+            subshares: Option<u32>,
+        ) {
+            seed_recorded_proof(rig, channel_id, subshares, None).await;
+        }
+
+        async fn seed_recorded_proof(
+            rig: &mut StoreRig,
+            channel_id: ChannelId,
+            subshares: Option<u32>,
+            threshold: Option<u32>,
+        ) {
             rig.shares
                 .save(
                     SECRET_ID,
@@ -1259,6 +1406,8 @@ mod tests {
                         secret_id: SECRET_ID,
                         version: VERSION,
                         bytes: PROOF.to_vec(),
+                        subshares,
+                        threshold,
                     },
                 )
                 .await
@@ -1333,7 +1482,7 @@ mod tests {
             rig: &mut StoreRig,
             response: VerifyShareResponseMessage,
         ) -> Result<Vec<DeRecEvent>> {
-            let local = crate::protocol::test::LocalFixture::new(SECRET_ID);
+            let local = crate::protocol::tests::LocalFixture::new(SECRET_ID);
             handle(
                 &mut rig.stores(),
                 &local.local(),
@@ -1341,6 +1490,7 @@ mod tests {
                     channel_id: CHANNEL,
                     shared_key: &KEY,
                     trace_id: 77,
+                    obligation: None,
                 },
                 MessageBody::VerifyShareResponse(response),
             )
@@ -1384,7 +1534,57 @@ mod tests {
                 assert!(
                     matches!(
                         events.as_slice(),
-                        [DeRecEvent::ShareVerified { channel_id, version }]
+                        [DeRecEvent::ShareVerified { channel_id, version, subshares: None, threshold: None }]
+                            if *channel_id == CHANNEL && *version == VERSION
+                    ),
+                    "a row written before the count was recorded verifies with none; got {events:?}"
+                );
+            });
+        }
+
+        /// The verdict carries the count recorded on the owner's row for that
+        /// version, whatever weight the channel holds now.
+        #[test]
+        fn share_verified_carries_the_recorded_subshares() {
+            run_async(async {
+                let mut rig = StoreRig::new();
+                seed_helper(&mut rig, CHANNEL, "https://weighted.example").await;
+                seed_counted_proof(&mut rig, CHANNEL, Some(2)).await;
+                seed_challenge(&mut rig, 0xA3).await;
+
+                let events = owner_reads(&mut rig, answer(0xA3, PROOF))
+                    .await
+                    .expect("verified");
+
+                assert!(
+                    matches!(
+                        events.as_slice(),
+                        [DeRecEvent::ShareVerified { channel_id, version, subshares: Some(2), threshold: None }]
+                            if *channel_id == CHANNEL && *version == VERSION
+                    ),
+                    "got {events:?}"
+                );
+            });
+        }
+
+        /// The verdict carries the threshold recorded on the owner's row for
+        /// that version.
+        #[test]
+        fn share_verified_carries_the_recorded_threshold() {
+            run_async(async {
+                let mut rig = StoreRig::new();
+                seed_helper(&mut rig, CHANNEL, "https://threshold.example").await;
+                seed_recorded_proof(&mut rig, CHANNEL, Some(1), Some(3)).await;
+                seed_challenge(&mut rig, 0xA4).await;
+
+                let events = owner_reads(&mut rig, answer(0xA4, PROOF))
+                    .await
+                    .expect("verified");
+
+                assert!(
+                    matches!(
+                        events.as_slice(),
+                        [DeRecEvent::ShareVerified { channel_id, version, subshares: Some(1), threshold: Some(3) }]
                             if *channel_id == CHANNEL && *version == VERSION
                     ),
                     "got {events:?}"
@@ -1494,7 +1694,7 @@ mod tests {
                 assert!(
                     matches!(
                         current.as_slice(),
-                        [DeRecEvent::ShareVerified { channel_id, version }]
+                        [DeRecEvent::ShareVerified { channel_id, version, .. }]
                             if *channel_id == CHANNEL && *version == VERSION
                     ),
                     "got {current:?}"
@@ -1531,7 +1731,7 @@ mod tests {
                 seed_helper(&mut rig, CHANNEL, "https://no-proof.example").await;
                 seed_helper(&mut rig, OTHER, "https://with-proof.example").await;
                 seed_proof(&mut rig, OTHER).await;
-                let local = crate::protocol::test::LocalFixture::new(SECRET_ID);
+                let local = crate::protocol::tests::LocalFixture::new(SECRET_ID);
 
                 let events = start(
                     &mut rig.stores(),

@@ -4,8 +4,8 @@
 #[cfg(test)]
 mod handshake_tests {
     use super::super::*;
-    use crate::protocol::test::LocalFixture;
-    use crate::protocol::test::StoreRig;
+    use crate::protocol::tests::LocalFixture;
+    use crate::protocol::tests::StoreRig;
 
     fn entries_of(c: &CommunicationInfo) -> Vec<(String, String)> {
         c.communication_info_entries
@@ -293,6 +293,7 @@ mod handshake_tests {
             status,
             created_at: 1_700_000_000,
             peer_role,
+            weight: 1,
         })
     }
 
@@ -366,8 +367,8 @@ mod handshake_tests {
 #[cfg(test)]
 mod prepair_record_shape_tests {
     use super::super::*;
-    use crate::protocol::test::LocalFixture;
-    use crate::protocol::test::{StoreRig, run_async};
+    use crate::protocol::tests::LocalFixture;
+    use crate::protocol::tests::{StoreRig, run_async};
     use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember};
     use crate::types::ReplicaId;
 
@@ -554,8 +555,8 @@ mod prepair_record_shape_tests {
 #[cfg(test)]
 mod pairing_material_cleanup_tests {
     use super::super::*;
-    use crate::protocol::test::StoreRig;
-    use crate::protocol::test::run_async;
+    use crate::protocol::tests::StoreRig;
+    use crate::protocol::tests::run_async;
     use crate::protocol::{DeRecSecretStore, SecretKind, SecretValue};
 
     const SECRET_ID: u64 = 0x0C00_7AC7;
@@ -606,9 +607,9 @@ mod pairing_material_cleanup_tests {
 #[cfg(test)]
 mod replica_id_conflict_tests {
     use crate::protocol::context::PairingConfig;
-    use crate::protocol::test::LocalFixture;
-    use crate::protocol::test::StoreRig;
-    use crate::protocol::test::{InMemChannelStore, run_async};
+    use crate::protocol::tests::LocalFixture;
+    use crate::protocol::tests::StoreRig;
+    use crate::protocol::tests::{InMemChannelStore, run_async};
     use crate::protocol::types::{ChannelRecord, ChannelStatus, ReplicaMember, ReplicaRole};
     use crate::protocol::{DeRecChannelStore, DeRecSecretStore, SecretKind, SecretValue};
     use crate::types::{ChannelId, ReplicaId};
@@ -759,7 +760,7 @@ mod replica_id_conflict_tests {
     fn accept_offers_the_transport_every_advertised_endpoint() {
         use super::super::pair::accept;
         use crate::primitives::pairing::request;
-        use crate::protocol::test::run_async;
+        use crate::protocol::tests::run_async;
         use crate::protocol::{DeRecSecretStore, PairingKeyMaterial, SecretValue};
         use crate::types::ChannelId;
         use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
@@ -956,7 +957,7 @@ mod fingerprint_gate_tests {
 mod own_member_channel_tests {
     use crate::primitives::pairing::{request, response};
     use crate::protocol::context::PairingConfig;
-    use crate::protocol::test::{LocalFixture, StoreRig, run_async};
+    use crate::protocol::tests::{LocalFixture, StoreRig, run_async};
     use crate::protocol::types::{
         ChannelQuery, ChannelRecord, ChannelStatus, ReplicaMember, ReplicaRole,
     };
@@ -1133,5 +1134,27 @@ mod own_member_channel_tests {
                 "the second admission must keep the first group channel"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod refusal_memo_tests {
+    use super::super::*;
+
+    /// The memo is read by the requester, so its own range comes first and
+    /// the responder's range is the accepted one.
+    #[test]
+    fn parameter_range_memo_reads_from_the_requester_side() {
+        let err = PairingError::IncompatibleParameterRange {
+            field: "shareSize",
+            local_min: 1_000,
+            local_max: 5_000,
+            peer_min: 10,
+            peer_max: 500,
+        };
+        assert_eq!(
+            parameter_range_memo(&err),
+            "`shareSize` range [10, 500] does not overlap the accepted range [1000, 5000]"
+        );
     }
 }

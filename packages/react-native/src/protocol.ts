@@ -122,13 +122,16 @@ export function buildProtectSecretParams(params: ProtectSecretParams): Record<st
     }
     out.weights = weights;
   }
+  if (params.threshold != null) {
+    out.threshold = params.threshold;
+  }
   return out;
 }
 
 function communicationInfoOrOmit(
-  info: Record<string, string> | undefined,
+  info: Record<string, string> | null | undefined,
 ): Record<string, string> | undefined {
-  return info !== undefined && Object.keys(info).length > 0 ? info : undefined;
+  return info != null && Object.keys(info).length > 0 ? info : undefined;
 }
 
 /**
@@ -136,9 +139,12 @@ function communicationInfoOrOmit(
  * `SecretWire`'s own shape: `channel_id`/`replica_id` are the decimal `u64`
  * strings the `SecretRecovered` event already carries, forwarded verbatim;
  * `communication_info` is omitted per-entry (not sent as `{}`) whenever a
- * helper or replica member has none, matching the Go SDK's `omitempty` and
- * the shared golden fixture byte-for-byte; `replicas` is omitted entirely
- * when the recovered secret has no replica group.
+ * helper or replica member has none — `undefined`, `null`, or an empty map
+ * are all treated the same — matching the Go SDK's `omitempty` and the
+ * shared golden fixture byte-for-byte; `weight` is forwarded as given
+ * whenever a helper carries one; `replicas` is omitted entirely when the
+ * recovered secret has no replica group, and `threshold` when the roster
+ * records none.
  *
  * Exported so it can be golden-tested against the shared wire fixture
  * without a native module.
@@ -157,6 +163,9 @@ export function buildRestoreParams(
       const info = communicationInfoOrOmit(helper.communication_info);
       if (info !== undefined) {
         out.communication_info = info;
+      }
+      if (helper.weight !== undefined) {
+        out.weight = helper.weight;
       }
       return out;
     }),
@@ -183,6 +192,9 @@ export function buildRestoreParams(
       }),
       shared_key: Array.from(recoveredSecret.replicas.shared_key),
     };
+  }
+  if (recoveredSecret.threshold != null) {
+    recovered.threshold = recoveredSecret.threshold;
   }
   return { version, recovered_secret: recovered };
 }
@@ -370,10 +382,20 @@ export class DeRecProtocolBuilder {
   }
 
   /**
-   * Minimum number of subshares required to reconstruct the secret. A
-   * helper holds one subshare unless `ProtectSecretParams.weights` gives it a
-   * weight, so with no weights this is the number of helpers, as before.
-   * Default: 3.
+   * The starting threshold: the minimum number of subshares required to
+   * reconstruct the secret, for a secret with no threshold stored. Every
+   * publish stores the threshold it used (`UserSecrets.threshold`), the
+   * roster carries it, and `restore` and replica hydration put it back. A
+   * round splits at `ProtectSecretParams.threshold`, otherwise at the stored
+   * threshold, and only otherwise at this value, so changing it later does
+   * not change a stored threshold.
+   *
+   * A Helper holds one subshare unless `ProtectSecretParams.weights` has
+   * given it a weight, so with no weights the threshold is a number of
+   * Helpers, as before. Every weight must be below the round's threshold, so
+   * no single Helper can recover alone. When this value applies and is
+   * lowered to or below a stored weight, every publish fails with
+   * `invalid_weight` until `ProtectSecret` assigns valid weights. Default: 3.
    */
   withThreshold(threshold: number): this {
     this.config.threshold = threshold;
@@ -410,7 +432,12 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
-  /** Default: false. */
+  /**
+   * Who answers an inbound request whose handling failed. `true`: the
+   * library sends the response itself. `false`: nothing is sent, and the
+   * `RequestFailed` event carries a token to pass to `reject`. Default:
+   * false.
+   */
   withAutoRespondOnFailure(enabled: boolean): this {
     this.config.auto_respond_on_failure = enabled;
     return this;
@@ -701,6 +728,17 @@ export class DeRecProtocol {
     return decodeEvents(buffer);
   }
 
+  /**
+   * Accept a pending action from an `ActionRequired` event, returning the
+   * events it produces.
+   *
+   * When the action completes a pairing, the publish that follows reuses the
+   * stored helper weights. If one is no longer valid under the round's
+   * threshold, that publish fails with `invalid_weight` before anything is
+   * sent and this throws: the pairing has completed and its response was
+   * sent, but the `PairingCompleted` event is not returned. Call `start`
+   * with `ProtectSecret` and valid weights to publish.
+   */
   async accept(actionBytes: Uint8Array): Promise<DeRecEvent[]> {
     const buffer = (await this.host.accept(actionBytes)) as ArrayBuffer;
     return decodeEvents(buffer);
@@ -723,6 +761,13 @@ export class DeRecProtocol {
    * group's vault: the source's publish is then installed as it arrives,
    * with no further prompt. Ask the user before calling this; to decline,
    * never confirm.
+   *
+   * On a promotion the current snapshot is published to the promoted peer,
+   * reusing the stored helper weights. If one is no longer valid under the
+   * current threshold, that publish fails with `invalid_weight` before
+   * anything is sent and this throws. The promotion stands: calling this
+   * again resolves `true` and publishes nothing, so call `start` with
+   * `ProtectSecret` and valid weights to reach the promoted peer.
    */
   async verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<boolean> {
     return (await this.host.verifyFingerprint(toBigInt(channelId), fingerprint)) as boolean;
@@ -742,6 +787,9 @@ export class DeRecProtocol {
    * A helper or member whose `transports` is empty gets no channel: it is
    * reported as a `PeerNotRestored` event in the returned array and the rest
    * of the roster is restored.
+   *
+   * A helper's or member's `communication_info` may be absent or `null`;
+   * both mean the same thing — no entries.
    *
    * Rejects with a `DeRecError`; among its codes:
    *

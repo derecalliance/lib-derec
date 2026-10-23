@@ -319,7 +319,7 @@ pub unsafe extern "C" fn derec_free_error(error: *mut DeRecError) {
 }
 
 fn categorize(err: &crate::Error) -> (i32, i32) {
-    let (category, code) = crate::interop::error_codes::classify(err);
+    let (category, code) = crate::error_codes::classify(err);
     (category as i32, code as i32)
 }
 

@@ -146,9 +146,18 @@ public sealed class DeRecProtocolBuilder
     }
 
     /// <summary>
-    /// Minimum number of shares required to reconstruct the secret.
+    /// The starting threshold: the minimum number of subshares required to
+    /// reconstruct the secret, for a secret with no threshold stored.
     /// Not calling this leaves the Rust library's default (3) in force.
     /// </summary>
+    /// <remarks>
+    /// Every publish stores the threshold it used
+    /// (<see cref="UserSecrets.Threshold"/>), the roster carries it, and
+    /// <c>RestoreAsync</c> and replica hydration put it back. A round splits
+    /// at <see cref="ProtectSecretParams.Threshold"/>, otherwise at the stored
+    /// threshold, and only otherwise at this value, so changing it later does
+    /// not change a stored threshold.
+    /// </remarks>
     public DeRecProtocolBuilder WithThreshold(int threshold)
     {
         _config = _config with { Threshold = threshold };
@@ -216,8 +225,10 @@ public sealed class DeRecProtocolBuilder
     }
 
     /// <summary>
-    /// Whether the protocol auto-replies on failed inbound processing.
-    /// Default: false.
+    /// Who answers an inbound request whose handling failed. <c>true</c>: the
+    /// library sends the response itself. <c>false</c>: nothing is sent, and
+    /// the <see cref="RequestFailedEvent"/> carries a token to pass to
+    /// <c>RejectAsync</c>. Default: false.
     /// </summary>
     public DeRecProtocolBuilder WithAutoRespondOnFailure(bool enabled)
     {
@@ -290,9 +301,12 @@ public sealed class DeRecProtocolBuilder
     /// <remarks>
     /// Embedded in outbound <c>PairRequest</c>/<c>PairResponse</c> envelopes
     /// and checked against the peer's range on inbound ones: a range that
-    /// fails to intersect rejects the pairing with
-    /// <see cref="DeRecCode.IncompatibleParameterRange"/>. Default: unset —
-    /// no constraints advertised, every peer range accepted.
+    /// fails to intersect refuses the pairing. A responder answers with
+    /// <c>INCOMPATIBLE_PARAMETER_RANGE</c> and reports a
+    /// <see cref="PairingRefusedEvent"/>; an initiator fails, with
+    /// <see cref="DeRecCode.IncompatibleParameterRange"/> when it finds the
+    /// mismatch itself. Default: unset — no constraints advertised, every
+    /// peer range accepted.
     /// </remarks>
     /// <remarks>
     /// Share size is enforced by the helper; frequency limits are enforced

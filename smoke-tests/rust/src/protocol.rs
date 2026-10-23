@@ -38,6 +38,7 @@ pub async fn run_all() {
     run_discovery_and_recovery_flow().await;
     run_helper_without_the_version_flow().await;
     run_weighted_helpers_flow().await;
+    run_sticky_threshold_flow().await;
     run_max_subshares_flow().await;
     run_share_store_refusal_flow().await;
     run_corrupted_share_flow().await;
@@ -1828,6 +1829,7 @@ async fn run_protect_secret_with_replica_targets_flow() {
             }],
             description: Some("replica + helper distribution".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("owner start(ProtectSecret) with replica target failed");
@@ -2197,6 +2199,7 @@ async fn run_protect_secret_per_target_failure_flow() {
             }],
             description: None,
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("start(ProtectSecret) must not Err on per-target failure");
@@ -2282,6 +2285,7 @@ async fn run_sharing_flow() {
             }],
             description: Some("smoke-test distribution".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -2338,6 +2342,7 @@ async fn run_verification_flow() {
             }],
             description: None,
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -2565,6 +2570,7 @@ async fn run_replica_mirror_then_verify_flow() {
             }],
             description: Some("mirror round".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("source start(ProtectSecret) failed");
@@ -2657,6 +2663,7 @@ async fn run_replica_mirror_then_verify_flow() {
             }],
             description: Some("round the destination misses".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("source start(ProtectSecret) failed");
@@ -2797,6 +2804,7 @@ async fn run_replica_roster_describes_every_member_flow() {
             }],
             description: None,
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("source start(ProtectSecret) failed");
@@ -2903,6 +2911,7 @@ async fn run_replica_verifies_only_synced_versions_flow() {
             }],
             description: None,
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("alice start(ProtectSecret) v1 failed")
@@ -3146,6 +3155,7 @@ async fn run_discovery_and_recovery_flow() {
             }],
             description: Some("wallet seed phrase".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -3421,6 +3431,7 @@ async fn run_helper_without_the_version_flow() {
             }],
             description: None,
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -3569,6 +3580,7 @@ async fn run_max_subshares_flow() {
             }],
             description: None,
             weights: HashMap::from([(channel_a, 2), (channel_b, 2)]),
+            threshold: None,
         })
         .await;
     assert!(
@@ -3625,6 +3637,7 @@ async fn run_weighted_helpers_flow() {
             }],
             description: None,
             weights: HashMap::from([(channel_0, 2)]),
+            threshold: None,
         })
         .await
         .expect("owner start(ProtectSecret) with weights failed");
@@ -3676,6 +3689,85 @@ async fn run_weighted_helpers_flow() {
     assert!(threshold_met, "five confirmed subshares meet t = 3");
 
     let owner_sid = owner.protocol.secret_id();
+    let v1_counts = sorted_counts(vec![
+        (channel_0, Some(2)),
+        (channel_1, Some(1)),
+        (channel_2, Some(1)),
+        (channel_3, Some(1)),
+    ]);
+    let mut stored_counts = Vec::new();
+    for channel_id in [channel_0, channel_1, channel_2, channel_3] {
+        let shares = owner
+            .protocol
+            .share_store
+            .load(owner_sid, channel_id, &[version])
+            .await
+            .expect("owner share load failed");
+        assert_eq!(shares.len(), 1, "the owner keeps one share per helper");
+        stored_counts.push((channel_id, shares[0].subshares));
+    }
+    assert_eq!(
+        sorted_counts(stored_counts),
+        v1_counts,
+        "the owner's stored shares must record each helper's subshare count"
+    );
+    for (helper, channel_id) in [
+        (&helper_0, channel_0),
+        (&helper_1, channel_1),
+        (&helper_2, channel_2),
+        (&helper_3, channel_3),
+    ] {
+        let shares = helper
+            .protocol
+            .share_store
+            .load(helper.protocol.secret_id(), channel_id, &[version])
+            .await
+            .expect("helper share load failed");
+        assert_eq!(
+            shares.len(),
+            1,
+            "{} stores the share it received",
+            helper.label
+        );
+        assert_eq!(
+            shares[0].subshares, None,
+            "{} must record no subshare count",
+            helper.label
+        );
+    }
+
+    let mut helpers = [helper_0, helper_1, helper_2, helper_3];
+    assert_eq!(
+        verified_counts(&mut owner, &mut helpers, version).await,
+        v1_counts,
+        "ShareVerified must carry each helper's subshare count"
+    );
+
+    owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![3],
+                name: "weighted secret".to_owned(),
+                data: b"re-weighted".to_vec(),
+            }],
+            description: None,
+            weights: HashMap::from([(channel_1, 2)]),
+            threshold: None,
+        })
+        .await
+        .expect("owner start(ProtectSecret) re-weighting failed");
+    {
+        let [h0, h1, h2, h3] = &mut helpers;
+        pump_many(&mut [&mut owner, h0, h1, h2, h3]).await;
+    }
+    assert_eq!(
+        verified_counts(&mut owner, &mut helpers, version).await,
+        v1_counts,
+        "after re-weighting, verifying the older version must report its own counts"
+    );
+    let [mut helper_0, mut helper_1, _, _] = helpers;
+
     for channel_id in [channel_2, channel_3] {
         owner
             .protocol
@@ -3712,6 +3804,251 @@ async fn run_weighted_helpers_flow() {
     println!("Protocol weighted helpers flow test passed.");
 }
 
+/// The threshold is sticky: each version's `t` is recorded on the owner's
+/// shares and reported by `ShareVerified`, a publish the library starts
+/// itself uses the stored `t` rather than the builder's, and `restore` puts
+/// the roster's `t` back on a device whose builder says otherwise.
+async fn run_sticky_threshold_flow() {
+    println!("=== Protocol sticky threshold flow test ===");
+
+    // The builder says 2; every round below splits at a recorded `t`.
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 0x7E5);
+    let mut h0 = Peer::new("helper-0", "https://helper-0.example.com");
+    let mut h1 = Peer::new("helper-1", "https://helper-1.example.com");
+    let mut h2 = Peer::new("helper-2", "https://helper-2.example.com");
+    let mut h3 = Peer::new("helper-3", "https://helper-3.example.com");
+    let mut h4 = Peer::new("helper-4", "https://helper-4.example.com");
+    let c0 = pair(&mut owner, &mut h0, ChannelId(1)).await;
+    let c1 = pair(&mut owner, &mut h1, ChannelId(2)).await;
+    let c2 = pair(&mut owner, &mut h2, ChannelId(3)).await;
+    let c3 = pair(&mut owner, &mut h3, ChannelId(4)).await;
+    let owner_sid = owner.protocol.secret_id();
+
+    let protect = |data: &[u8], threshold: Option<u32>| DeRecFlow::ProtectSecret {
+        secrets: vec![UserSecret {
+            id: vec![7],
+            name: "sticky".to_owned(),
+            data: data.to_vec(),
+        }],
+        description: None,
+        weights: HashMap::new(),
+        threshold,
+    };
+
+    // v1 at t = 3.
+    owner
+        .protocol
+        .start(protect(b"v1", Some(3)))
+        .await
+        .expect("owner start(ProtectSecret) at t = 3 failed");
+    pump_many(&mut [&mut owner, &mut h0, &mut h1, &mut h2, &mut h3]).await;
+    for channel_id in [c0, c1, c2, c3] {
+        let rows = owner
+            .protocol
+            .share_store
+            .load(owner_sid, channel_id, &[1])
+            .await
+            .expect("owner share load failed");
+        assert_eq!(rows.len(), 1, "the owner keeps one share per helper");
+        assert_eq!(
+            rows[0].threshold,
+            Some(3),
+            "the owner's share records the round's threshold"
+        );
+    }
+    for (helper, channel_id) in [(&h0, c0), (&h1, c1), (&h2, c2), (&h3, c3)] {
+        let rows = helper
+            .protocol
+            .share_store
+            .load(helper.protocol.secret_id(), channel_id, &[1])
+            .await
+            .expect("helper share load failed");
+        assert_eq!(rows.len(), 1, "{} stores the share", helper.label);
+        assert_eq!(
+            rows[0].threshold, None,
+            "{} must record no threshold",
+            helper.label
+        );
+    }
+
+    // v2 at an explicit t = 4.
+    owner
+        .protocol
+        .start(protect(b"v2", Some(4)))
+        .await
+        .expect("owner start(ProtectSecret) at t = 4 failed");
+    pump_many(&mut [&mut owner, &mut h0, &mut h1, &mut h2, &mut h3]).await;
+    let snapshot = owner
+        .protocol
+        .user_secret_store
+        .load_latest(owner_sid)
+        .await
+        .expect("load_latest failed")
+        .expect("a snapshot is stored");
+    assert_eq!(snapshot.threshold, Some(4), "the snapshot stores t = 4");
+
+    // Verifying v1 reports v1's t, not the current one.
+    owner
+        .protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id: owner_sid,
+            version: 1,
+            target: Target::All,
+        })
+        .await
+        .expect("owner start(VerifyShares) failed");
+    let events = pump_many(&mut [&mut owner, &mut h0, &mut h1, &mut h2, &mut h3]).await;
+    let verified: Vec<Option<u32>> = events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ShareVerified {
+                version: 1,
+                threshold,
+                ..
+            } => Some(*threshold),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        verified,
+        vec![Some(3); 4],
+        "ShareVerified must report the threshold v1 was split with"
+    );
+
+    // A publish the library starts itself (pairing a fifth helper) splits
+    // at the stored t = 4, not the builder's 2.
+    let contact = owner
+        .protocol
+        .create_contact(
+            Some(ChannelId(5)),
+            derec_proto::ContactMode::InlineKeys,
+            None,
+        )
+        .await
+        .expect("owner.create_contact(helper-4) failed");
+    h4.protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Helper,
+            contact,
+            peer_communication_info: HashMap::new(),
+        })
+        .await
+        .expect("helper-4 start(Pairing) failed");
+    let auto = pump_many(&mut [&mut owner, &mut h0, &mut h1, &mut h2, &mut h3, &mut h4]).await;
+    let c4 = extract_paired_channel_id(auto.iter(), ChannelId(5))
+        .expect("helper-4 PairingCompleted must fire");
+    for channel_id in [c0, c1, c2, c3, c4] {
+        let rows = owner
+            .protocol
+            .share_store
+            .load(owner_sid, channel_id, &[3])
+            .await
+            .expect("owner share load failed");
+        assert_eq!(rows.len(), 1, "the pairing publish reaches every helper");
+        assert_eq!(
+            rows[0].threshold,
+            Some(4),
+            "the library-started publish splits at the stored threshold"
+        );
+    }
+
+    // Recover v3 and restore it on a fresh device whose builder says 2.
+    owner
+        .protocol
+        .start(DeRecFlow::RecoverSecret {
+            secret_id: owner_sid,
+            version: 3,
+        })
+        .await
+        .expect("owner start(RecoverSecret) failed");
+    let recovery = pump_many(&mut [&mut owner, &mut h0, &mut h1, &mut h2, &mut h3, &mut h4]).await;
+    let recovered = recovery
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::SecretRecovered { secret } => Some(secret.clone()),
+            _ => None,
+        })
+        .expect("expected SecretRecovered on the owner");
+    assert_eq!(recovered.threshold, Some(4), "the roster carries t = 4");
+
+    let mut restored =
+        Peer::with_secret_id("restored-owner", "https://restored.example.com", owner_sid);
+    restored
+        .protocol
+        .restore(&recovered, 3)
+        .await
+        .expect("restore on a fresh peer must succeed");
+    let snapshot = restored
+        .protocol
+        .user_secret_store
+        .load_latest(owner_sid)
+        .await
+        .expect("load_latest after restore failed")
+        .expect("restore commits a snapshot");
+    assert_eq!(snapshot.threshold, Some(4), "restore keeps t = 4");
+    restored
+        .protocol
+        .start(protect(b"v4", None))
+        .await
+        .expect("the restored owner publishes");
+    for channel_id in [c0, c1, c2, c3, c4] {
+        let rows = restored
+            .protocol
+            .share_store
+            .load(owner_sid, channel_id, &[4])
+            .await
+            .expect("restored share load failed");
+        assert_eq!(rows.len(), 1, "the restored owner tracks each share");
+        assert_eq!(
+            rows[0].threshold,
+            Some(4),
+            "the publish after restore splits at the restored threshold"
+        );
+    }
+
+    println!("Protocol sticky threshold flow test passed.");
+}
+
+fn sorted_counts(mut counts: Vec<(ChannelId, Option<u32>)>) -> Vec<(ChannelId, Option<u32>)> {
+    counts.sort_unstable();
+    counts
+}
+
+/// Verify `version` on every helper and return `(channel, subshares)` of each
+/// `ShareVerified`, sorted by channel.
+async fn verified_counts(
+    owner: &mut Peer,
+    helpers: &mut [Peer; 4],
+    version: u32,
+) -> Vec<(ChannelId, Option<u32>)> {
+    let owner_sid = owner.protocol.secret_id();
+    owner
+        .protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id: owner_sid,
+            version,
+            target: Target::All,
+        })
+        .await
+        .expect("owner start(VerifyShares) failed");
+    let [h0, h1, h2, h3] = helpers;
+    let events = pump_many(&mut [owner, h0, h1, h2, h3]).await;
+    sorted_counts(
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DeRecEvent::ShareVerified {
+                    channel_id,
+                    version: v,
+                    subshares,
+                    ..
+                } if *v == version => Some((*channel_id, *subshares)),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
 /// A helper's share store refuses first a share, then a verification, with
 /// `TooFrequent`, as an application rate limit would.
 ///
@@ -3738,6 +4075,7 @@ async fn run_share_store_refusal_flow() {
         }],
         description: None,
         weights: HashMap::new(),
+        threshold: None,
     };
     let started_version = |events: &[DeRecEvent]| {
         events
@@ -3859,6 +4197,7 @@ async fn run_corrupted_share_flow() {
             }],
             description: None,
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -4294,6 +4633,7 @@ async fn run_auto_publish_on_pair_flow() {
             }],
             description: Some("initial publish".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -4488,6 +4828,7 @@ async fn run_replica_sync_version_progression_flow() {
             secrets: vec![s1.clone()],
             description: Some("v=2 explicit publish".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("ProtectSecret([s1]) failed");
@@ -4600,6 +4941,7 @@ async fn run_replica_sync_version_progression_flow() {
             secrets: vec![s1.clone(), s2.clone()],
             description: Some("v=6 explicit publish".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("ProtectSecret([s1, s2]) failed");
@@ -4880,6 +5222,7 @@ async fn run_replica_group_key_handover_flow() {
             }],
             description: Some("post-handover round".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("source start(ProtectSecret) failed");
@@ -4989,6 +5332,7 @@ async fn run_replica_publish_before_handover_ack_flow() {
                 }],
                 description: None,
                 weights: HashMap::new(),
+                threshold: None,
             })
             .await
             .expect("source start(ProtectSecret) failed");
@@ -5290,6 +5634,7 @@ async fn run_auto_accept_flow() {
             }],
             description: Some("auto-accept smoke".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -5462,13 +5807,10 @@ async fn run_start_pairing_rejects_already_paired_channel() {
 
 /// End-to-end: incompatible `ParameterRange` advertised by the two
 /// sides causes the responder to auto-send a non-Ok `PairResponse`
-/// (status = `IncompatibleParameterRange`) and surface the typed
-/// `PairingError::IncompatibleParameterRange` locally. The initiator
-/// then receives the rejection envelope and surfaces a typed
-/// `NonOkStatus` error.
+/// (status = `IncompatibleParameterRange`) and report it locally as
+/// `DeRecEvent::PairingRefused`. The initiator then receives the
+/// rejection envelope and surfaces a typed `NonOkStatus` error.
 async fn run_pairing_rejects_incompatible_parameter_range() {
-    use derec_library::primitives::pairing::PairingError;
-
     println!("=== Protocol pairing rejects incompatible parameter range ===");
 
     fn range(min_share_size: i64, max_share_size: i64) -> derec_proto::ParameterRange {
@@ -5485,6 +5827,9 @@ async fn run_pairing_rejects_incompatible_parameter_range() {
             max_unresponsive_deactivation_timeout: i64::MAX,
         }
     }
+
+    const EXPECTED_MEMO: &str = "`shareSize` range [10000000, 500000000] does not overlap \
+         the accepted range [1000000000, 5000000000]";
 
     let mut owner = Peer::with_parameter_range(
         "owner",
@@ -5518,30 +5863,36 @@ async fn run_pairing_rejects_incompatible_parameter_range() {
     assert_eq!(pair_request.len(), 1);
     let pair_request_bytes = pair_request.into_iter().next().unwrap().1;
 
-    let owner_result = owner.protocol.process(&pair_request_bytes).await;
-    match owner_result {
-        Err(e) => match e.source {
-            derec_library::Error::Pairing(PairingError::IncompatibleParameterRange {
-                field,
-                local_min,
-                peer_max,
+    let owner_events = owner
+        .protocol
+        .process(&pair_request_bytes)
+        .await
+        .expect("a pairing refusal is reported, not an error");
+    match owner_events.as_slice() {
+        [
+            DeRecEvent::PairingRefused {
+                status,
+                memo,
+                error_code,
+                message,
                 ..
-            }) => {
-                assert_eq!(field, "shareSize");
-                assert_eq!(local_min, 1_000_000_000);
-                assert_eq!(peer_max, 500_000_000);
-            }
-            other => panic!("expected IncompatibleParameterRange, got {other:?}"),
-        },
-        Ok(events) => {
-            panic!(
-                "expected owner.process to error; got {} events",
-                events.len()
-            )
+            },
+        ] => {
+            assert_eq!(
+                *status,
+                derec_proto::StatusEnum::IncompatibleParameterRange as i32
+            );
+            assert_eq!(memo, EXPECTED_MEMO, "memo reads from the requester's side");
+            assert_eq!(error_code, "incompatible_parameter_range");
+            assert!(
+                message.contains("shareSize"),
+                "message names the field: {message}"
+            );
         }
+        other => panic!("expected PairingRefused, got {other:?}"),
     }
     println!(
-        "  owner.process(PairRequest) → Err(IncompatibleParameterRange) with mismatched field surfaced  ✓"
+        "  owner.process(PairRequest) → PairingRefused(IncompatibleParameterRange) with memo, error_code and message  ✓"
     );
 
     let pair_response = owner.drain();
@@ -5566,9 +5917,9 @@ async fn run_pairing_rejects_incompatible_parameter_range() {
                 derec_proto::StatusEnum::IncompatibleParameterRange as i32,
                 "helper must surface StatusEnum::IncompatibleParameterRange from the rejection"
             );
-            assert!(
-                memo.contains("shareSize"),
-                "rejection memo should name the offending field; got: {memo}"
+            assert_eq!(
+                memo, EXPECTED_MEMO,
+                "the helper reads the memo the owner sent"
             );
         }
         Ok(events) => {

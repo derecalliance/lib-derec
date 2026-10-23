@@ -292,6 +292,14 @@ func (p *DeRecProtocol) GetFingerprint(channelID uint64) (string, error) {
 // group's vault: the source's publish is then installed as it arrives, with
 // no further prompt. Ask the user before calling this; to decline, never
 // confirm.
+//
+// On a promotion the current snapshot is published to the promoted peer,
+// reusing the stored helper weights. If one is no longer valid under the
+// current threshold, that publish fails with derec.CodeInvalidWeight before
+// anything is sent and this returns that error. The promotion stands:
+// calling VerifyFingerprint again returns true and publishes nothing, so
+// call Start(FlowKindProtectSecret, ...) with valid weights to reach the
+// promoted peer.
 func (p *DeRecProtocol) VerifyFingerprint(channelID uint64, fingerprint string) (bool, error) {
 	if p.closed {
 		return false, errors.New("protocol: VerifyFingerprint: protocol is closed")

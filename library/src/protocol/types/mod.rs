@@ -374,6 +374,24 @@ pub struct HelperChannel {
     pub status: ChannelStatus,
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub created_at: u64,
+    /// The number of Shamir subshares this Helper receives: the weight the
+    /// last [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret)
+    /// resolved for it, reused by every publish the library starts on its own.
+    ///
+    /// Each `ProtectSecret` round writes the weight it gave every paired
+    /// Helper, before anything is sent: its `weights` entry, or `1` when the
+    /// map does not name it. A new pairing starts at `1`. The value travels in
+    /// the roster as [`HelperInfo::weight`](crate::protocol::types::HelperInfo::weight),
+    /// so restore and replica hydration write it back. A record stored before
+    /// this field existed reads as `1`, and so does a stored `0`: `0` is never
+    /// a valid weight, so it can only come from a writer that predates the
+    /// field. On the helper side of a channel
+    /// (`peer_role == Owner`) it is unused and stays `1`.
+    #[cfg_attr(
+        any(feature = "serde", target_arch = "wasm32"),
+        serde(default = "channel_wire::default_weight")
+    )]
+    pub weight: u32,
 }
 
 /// One member of a replica group, including this device itself.
@@ -489,6 +507,11 @@ mod channel_wire {
         Ok(resolved)
     }
 
+    /// The weight of a record stored before `weight` existed.
+    pub(super) fn default_weight() -> u32 {
+        1
+    }
+
     /// Refuse a record written by a build that knew a shape this one does not.
     fn check_version(schema_version: u8, record: &'static str) -> Result<(), String> {
         if schema_version > CHANNEL_RECORD_SCHEMA_VERSION {
@@ -519,6 +542,8 @@ mod channel_wire {
         status: ChannelStatus,
         #[serde(default)]
         created_at: u64,
+        #[serde(default = "default_weight")]
+        weight: u32,
     }
 
     impl From<HelperChannel> for HelperChannelWire {
@@ -532,6 +557,7 @@ mod channel_wire {
                 peer_role: value.peer_role,
                 status: value.status,
                 created_at: value.created_at,
+                weight: value.weight,
             }
         }
     }
@@ -548,6 +574,7 @@ mod channel_wire {
                 peer_role: wire.peer_role,
                 status: wire.status,
                 created_at: wire.created_at,
+                weight: wire.weight.max(1),
             })
         }
     }
@@ -810,6 +837,21 @@ pub struct UserSecrets {
     /// `None` when the version was not published by a group member: an owner
     /// with no replica identity, or a snapshot rebuilt by recovery.
     pub author_replica_id: Option<u64>,
+    /// The threshold `t` the next publish splits at, unless
+    /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret)
+    /// passes its own `threshold`.
+    ///
+    /// Every publish writes the `t` it used. [`restore`](crate::protocol::DeRecProtocol::restore)
+    /// and replica hydration write the roster's
+    /// [`Secret::threshold`](crate::protocol::types::Secret::threshold), so a
+    /// recovered or receiving device keeps splitting at the `t` the secret
+    /// was shared under.
+    ///
+    /// `None` on a snapshot written before the threshold was recorded, or
+    /// restored from a roster that carries none. The builder's
+    /// [`with_threshold`](crate::protocol::DeRecProtocolBuilder::with_threshold)
+    /// then applies.
+    pub threshold: Option<u32>,
 }
 
 /// A single helper's share of the current secret — wire-pairs a
@@ -1313,6 +1355,16 @@ pub struct SharingRoundState {
     /// Members that refused, timed out, or could not be reached.
     pub behind_replicas: std::collections::HashSet<ReplicaId>,
     pub started_at: u64,
+    /// The `keepList` every Helper received in this round. A Helper that
+    /// confirms the round has removed every other version it held on that
+    /// channel, the confirmed one aside, so the owner removes its proofs of
+    /// those versions too. Empty when the round asked Helpers to keep every
+    /// version, or when it sent no share.
+    pub keep_list: Vec<u32>,
+    /// The threshold `t` this round split at, which `SharingComplete.threshold_met`
+    /// is judged against. `None` on a round written before the threshold was
+    /// recorded; the builder's threshold then applies.
+    pub threshold: Option<u32>,
 }
 
 impl StateItem {
@@ -1374,6 +1426,37 @@ pub struct Share {
     /// Opaque protobuf bytes — see [`crate::protocol::DeRecShareStore`] for
     /// the per-side format.
     pub bytes: Vec<u8>,
+    /// How many Shamir subshares this share carries. **Owner side only.**
+    ///
+    /// The library fills it on every share the owner side saves: the copy it
+    /// keeps of what it sent each Helper, and the copies a replica
+    /// Destination mirrors from its Source. It is the Helper's weight in the
+    /// round that published this version, which a later round may change, so
+    /// it is the only record of how many subshares a Helper holds for an
+    /// older version.
+    ///
+    /// - Always `None` on a Helper's stored share: a Helper has no notion of
+    ///   how many subshares it was given.
+    /// - `None` on an owner row written before this field existed, meaning
+    ///   the count was not recorded. The library never backfills it;
+    ///   recomputing it from `bytes` is the application's concern.
+    ///
+    /// Stores persist it as given and return it unchanged.
+    pub subshares: Option<u32>,
+    /// The threshold `t` this version was split with. **Owner side only.**
+    ///
+    /// Written on the same shares as [`Share::subshares`]: the copy the owner
+    /// keeps of what it sent each Helper carries the round's `t`, and a
+    /// replica Destination's mirrored copies carry the roster's `t`. A later
+    /// round may change `t`, so this is the only record of the `t` an older
+    /// version needs to be recoverable.
+    ///
+    /// - Always `None` on a Helper's stored share.
+    /// - `None` on an owner row written before this field existed. The library
+    ///   never backfills it.
+    ///
+    /// Stores persist it as given and return it unchanged.
+    pub threshold: Option<u32>,
 }
 
 /// The stored shape of a channel record, which applications persist and the
@@ -1457,6 +1540,61 @@ mod channel_record_format_tests {
         );
     }
 
+    /// A record written before `weight` existed is a Helper on one subshare,
+    /// which is what every publish gave it then. The schema version does not
+    /// move for an additive field.
+    #[test]
+    fn a_record_without_a_weight_reads_as_one() {
+        let current = r#"{
+            "schema_version": 3,
+            "channel_id": 42,
+            "transports": [{ "uri": "https://helper.example/derec", "protocol": 0 }],
+            "peer_role": "Helper"
+        }"#;
+        let decoded: HelperChannel = serde_json::from_str(current).expect("a v3 record");
+        assert_eq!(decoded.weight, 1);
+
+        let legacy: HelperChannel =
+            serde_json::from_str(LEGACY_HELPER).expect("a pre-0.0.3 record");
+        assert_eq!(legacy.weight, 1);
+    }
+
+    /// `0` is never a valid weight, so a stored `0` comes from a writer that
+    /// predates the field and reads as `1`, the same rule the protobuf roster
+    /// applies.
+    #[test]
+    fn a_stored_weight_of_zero_reads_as_one() {
+        let zero = r#"{
+            "schema_version": 3,
+            "channel_id": 42,
+            "transports": [{ "uri": "https://helper.example/derec", "protocol": 0 }],
+            "peer_role": "Helper",
+            "weight": 0
+        }"#;
+        let decoded: HelperChannel = serde_json::from_str(zero).expect("a v3 record");
+        assert_eq!(decoded.weight, 1);
+    }
+
+    #[test]
+    fn a_stored_weight_round_trips() {
+        let record = HelperChannel {
+            channel_id: ChannelId(42),
+            transports: vec![endpoint("https://helper.example/derec")],
+            communication_info: std::collections::HashMap::new(),
+            peer_role: derec_proto::SenderKind::Helper,
+            status: ChannelStatus::Paired,
+            created_at: 1_700_000_000,
+            weight: 3,
+        };
+        let json = serde_json::to_string(&record).expect("serializes");
+        let reloaded: HelperChannel = serde_json::from_str(&json).expect("reloads");
+        assert_eq!(reloaded.weight, 3);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["schema_version"],
+            serde_json::json!(3)
+        );
+    }
+
     /// A record from a build that knew a shape this one does not must not be
     /// read and written back with the unknown fields silently dropped.
     #[test]
@@ -1511,6 +1649,7 @@ mod channel_record_format_tests {
             peer_role: derec_proto::SenderKind::Helper,
             status: ChannelStatus::Paired,
             created_at: 1_700_000_000,
+            weight: 1,
         };
 
         let json: serde_json::Value =
@@ -1535,7 +1674,7 @@ mod channel_record_format_tests {
         // hand-written SDK expectation that nothing cross-checks.
         assert_eq!(
             serde_json::to_string(&record).expect("serializes"),
-            r#"{"schema_version":3,"channel_id":42,"transports":[{"uri":"https://helper.example/derec","protocol":0}],"communication_info":{},"peer_role":"Helper","status":"Paired","created_at":1700000000}"#
+            r#"{"schema_version":3,"channel_id":42,"transports":[{"uri":"https://helper.example/derec","protocol":0}],"communication_info":{},"peer_role":"Helper","status":"Paired","created_at":1700000000,"weight":1}"#
         );
     }
 

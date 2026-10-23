@@ -856,6 +856,15 @@ typedef struct SecretStoreCallbacks {
  * strings, matching the `Vec<u8>` ↔ JSON-array convention used for
  * every other wire-format buffer in this module.
  *
+ * A share crosses as the JSON object
+ * `{ "secret_id": "<u64>", "version": <u32>, "bytes": [..], "subshares": <u32>, "threshold": <u32> }`.
+ * `subshares` is the owner-side subshare count
+ * ([`crate::protocol::types::Share::subshares`]) and `threshold` the
+ * owner-side threshold the version was split with
+ * ([`crate::protocol::types::Share::threshold`]). Each is omitted when there
+ * is none, and absent or `null` reads as none. Store them as given and return
+ * them unchanged.
+ *
  * `keep_list` returns the JSON encoding of the application's answer:
  * `null` for no list (the owner sends an empty `keepList` and helpers keep
  * every version) or an array of version numbers. An empty buffer or return code `1` also
@@ -926,7 +935,9 @@ typedef struct ShareStoreCallbacks {
 /**
  * Caller-supplied callbacks for the user-secret store. Methods cross
  * the FFI keyed by `secret_id`; the `UserSecrets` payload travels as a
- * JSON buffer matching [`UserSecretsRecord`].
+ * JSON buffer matching [`UserSecretsRecord`]. Its `threshold` is the
+ * recorded threshold ([`crate::protocol::types::UserSecrets::threshold`]),
+ * omitted when there is none; store the buffer as given.
  */
 typedef struct UserSecretStoreCallbacks {
   void *user_data;
@@ -2038,7 +2049,8 @@ struct DeRecError derec_protocol_reject(struct DeRecProtocolHandle *handle,
  *                     "transports": [{ "uri": "https://replica.example", "protocol": "https" }],
  *                     "role": "Source", "communication_info": {} }],
  *       "shared_key": [..32 bytes..]
- *     }
+ *     },
+ *     "threshold": 3
  *   }
  * }
  * ```
@@ -2051,7 +2063,11 @@ struct DeRecError derec_protocol_reject(struct DeRecProtocolHandle *handle,
  * order; `protocol` is its name, `"https"` or `"grpc"`. An absent or
  * `null` `transports` reads as an empty list, and a helper or member with
  * no endpoint gets no channel: restore skips it and reports it as a
- * `PeerNotRestored` event. `role` is `"Source"` or `"Destination"`.
+ * `PeerNotRestored` event. `role` is `"Source"` or `"Destination"`. An
+ * absent or `null` `communication_info` reads as an empty map, and an
+ * absent or `null` helper `weight` as `1`. `threshold` is the threshold the
+ * secret was split with; absent or `null` is none, and a value below `2` is
+ * rejected. Restore writes it into the snapshot.
  *
  * `replicas` is an **object**, not an array, and is omitted entirely when
  * the `secret_id` has no replica group. Every member of the group shares

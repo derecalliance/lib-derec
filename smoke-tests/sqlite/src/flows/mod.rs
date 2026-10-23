@@ -12,11 +12,15 @@ pub mod pairing;
 pub mod persistence;
 pub mod replica_sync;
 pub mod sharing;
+pub mod subshares;
+pub mod threshold;
 pub mod unpairing;
 
 pub async fn run_all() {
     pairing::run().await;
     sharing::run().await;
+    subshares::run().await;
+    threshold::run().await;
     discovery_recovery::run().await;
     unpairing::run().await;
     persistence::run().await;

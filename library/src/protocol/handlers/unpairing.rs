@@ -188,17 +188,36 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .resolve_response_endpoints(
             local.secret_id,
             channel_id,
+            local.policy,
             &crate::extensions::advertised_endpoints::reply_to_owned(request),
         )
         .await?;
-    stores.transport.send(&endpoint, envelope).await?;
+    let sent = crate::protocol::obligation::deliver(
+        exchange.obligation,
+        stores.transport,
+        &endpoint,
+        envelope,
+        StatusEnum::Ok,
+        "",
+    )
+    .await;
+    if sent.is_err() && !crate::protocol::obligation::attempted(exchange.obligation) {
+        return sent.map(|()| Vec::new());
+    }
 
-    drop_channel_state(stores, local, channel_id).await?;
+    // The acknowledgement is out, so the peer may already have dropped its
+    // side: the local state goes too, and a failure from here on is
+    // reported after `Unpaired`, never answered a second time.
+    let dropped = drop_channel_state(stores, local, channel_id).await;
 
     #[cfg(feature = "logging")]
     tracing::info!("unpair accepted; local state dropped");
 
-    Ok(vec![DeRecEvent::Unpaired { channel_id }])
+    crate::protocol::obligation::reported(
+        exchange.obligation,
+        vec![DeRecEvent::Unpaired { channel_id }],
+        sent.and(dropped),
+    )
 }
 
 #[cfg_attr(
@@ -213,25 +232,33 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
-    let response = UnpairResponseMessage {
-        result: Some(DeRecResult {
-            status: status as i32,
-            memo: memo.to_owned(),
-        }),
-        timestamp: Some(current_timestamp()),
-    };
-
     crate::extensions::channel_store::send_channel_message(
         stores.channels,
         stores.transport,
         local.secret_id,
         exchange.channel_id,
-        MessageBody::UnpairResponse(response),
+        failure_response(status, memo),
         exchange.shared_key,
         exchange.trace_id,
+        local.policy,
         &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        exchange.obligation,
+        status,
+        memo,
     )
     .await
+}
+
+/// The `UnpairResponse` that answers an unpair request with a non-`Ok`
+/// `status`; the channel is kept.
+pub(in crate::protocol) fn failure_response(status: StatusEnum, memo: &str) -> MessageBody {
+    MessageBody::UnpairResponse(UnpairResponseMessage {
+        result: Some(DeRecResult {
+            status: status as i32,
+            memo: memo.to_owned(),
+        }),
+        timestamp: Some(current_timestamp()),
+    })
 }
 
 pub(in crate::protocol) async fn drop_channel_state<S: StoreSet>(

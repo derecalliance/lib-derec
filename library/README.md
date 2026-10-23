@@ -225,7 +225,9 @@ loop {
                     println!("recovered {} ({}B)", entry.name, entry.data.len());
                 }
                 // Nothing has been written yet: show the user what was
-                // recovered, or ask them, before committing it. Call
+                // recovered, or ask them, before committing it. If
+                // `secret.replicas` names live members, join that group
+                // instead (see "Recover, then restore or join"). Call
                 // `restore` on this same `protocol` — the one that ran
                 // recovery and still holds the recovery-mode channels it
                 // unpairs. `restore` commits the recovered Secret into this
@@ -244,6 +246,27 @@ loop {
 A complete working example lives in the repository's end-to-end tests; see
 [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
+### Recover, then restore or join
+
+`SecretRecovered` writes nothing, so the application decides between restore
+and join before committing. When `secret.replicas` names a group with live
+members other than the lost device, do not restore: tell the user and offer to
+join the group as a new replica — pair with a live member, confirm the
+fingerprint, run `start(DeRecFlow::ReplicaDiscovery)`. With no live member,
+restore. The reasons:
+
+- Neither path gives this device the proofs of earlier versions, so it cannot
+  verify them. Restore writes none. A joining device gets only the share map
+  of the single version each push or catch-up carries. The live members keep
+  the proofs they hold.
+- A restored device cannot publish, or answer a member's catch-up, until the
+  application configures a `replica_id` the roster names.
+- Joining adds the device to the group as a new member. Restoring next to
+  live replicas makes a second device claim the lost device's role.
+
+See
+[Restore or join](https://derec-alliance.gitbook.io/docs/concepts/replicas/restore-or-join).
+
 ### After a restore
 
 `restore` writes no owner-side tracking shares, so `VerifyShares` at the
@@ -258,15 +281,49 @@ carries no channel id).
 Publish once to get verification back. `start(ProtectSecret)` derives
 `recovered_version + 1` from the snapshot `restore` committed, writes real
 tracking shares as it distributes, and verification at that version behaves
-as it does for an owner that never recovered:
+as it does for an owner that never recovered.
+
+Pass the stored weights unchanged, for the Helpers `restore` actually
+restored. `restore` writes each reachable `helpers[].weight` into the
+restored `HelperChannel.weight`, so the roster's weights are the stored
+ones, and the `weights` map replaces every stored weight, so a helper left
+out returns to 1. A roster helper with no endpoint gets no channel —
+`restore` reports it as `PeerNotRestored` instead — and naming its
+`channel_id` in `weights` fails the call with `InvalidWeight`, since the key
+is not a paired Helper channel.
+
+Pass no `threshold`. `restore` puts the roster's threshold (`Secret.threshold`)
+back into `UserSecrets.threshold`, and every later publish splits at it,
+whatever `with_threshold` says on this device. To change it, pass `threshold`
+on `start(ProtectSecret)`. A roster written before the threshold was recorded
+carries none, and `with_threshold` applies:
 
 ```rust,ignore
-protocol.restore(&secret, recovered_version).await?;
+let restore_events = protocol.restore(&secret, recovered_version).await?;
+// A roster helper with no endpoint gets no channel and is reported here
+// instead; naming it in `weights` below would fail the publish with
+// `InvalidWeight`.
+let not_restored: std::collections::HashSet<ChannelId> = restore_events
+    .iter()
+    .filter_map(|e| match e {
+        DeRecEvent::PeerNotRestored { channel_id, .. } => Some(*channel_id),
+        _ => None,
+    })
+    .collect();
 // Re-publish so this device holds tracking shares of its own.
 protocol.start(DeRecFlow::ProtectSecret {
     secrets: secret.secrets.clone(),
     description: None,
-    weights: Default::default(), // every Helper gets one subshare
+    // The stored (roster) weights of the Helpers restore actually paired;
+    // a Helper left out would return to 1.
+    weights: secret
+        .helpers
+        .iter()
+        .filter(|h| !not_restored.contains(&ChannelId(h.channel_id)))
+        .map(|h| (ChannelId(h.channel_id), h.weight.max(1)))
+        .collect(),
+    // Keep the restored threshold.
+    threshold: None,
 }).await?;
 // Now verifiable, at recovered_version + 1.
 ```
@@ -292,7 +349,7 @@ Optional setters have defaults:
 
 | Setter | Default | Purpose |
 |--------|---------|---------|
-| `with_threshold(n)` | `3` | Minimum subshares required to reconstruct the secret (`t`). Each paired Helper contributes one subshare unless `ProtectSecret` gives it more weight; see [Weighted helpers](#weighted-helpers). |
+| `with_threshold(n)` | `3` | The starting threshold `t`, the minimum subshares required to reconstruct the secret, for a secret with no threshold stored. Each paired Helper contributes one subshare unless `ProtectSecret` gives it more weight; see [Weighted helpers](#weighted-helpers). Once a publish stores a `t`, that `t` applies; see [The threshold is recorded](#the-threshold-is-recorded). |
 | `with_timeouts(timeouts)` | see [Timeouts](#timeouts) | All four waiting periods in one call; unspecified fields keep their default. `inbound_message` 300s is the staleness/replay window, `sharing_round` and `unpair_ack` 60s are liveness budgets, `expired_channels` `Enabled { 300 }` sweeps channels awaiting fingerprint confirmation. |
 | `with_unsafe_connection(bool)` | `false` | Accept plaintext `http://` and `grpc://` endpoints. **Development only.** Loopback is accepted for your own endpoint regardless; see [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
@@ -300,7 +357,7 @@ Optional setters have defaults:
 | `with_auto_accept(policy)` | every flow off | Per-flow opt-in to auto-accepting inbound requests instead of surfacing `ActionRequired`. Read the per-flow caveats before enabling — several are state-changing. |
 | `with_parameter_range(range)` | unset | Advertised protocol parameter bounds, checked for overlap at pairing time. A helper also enforces its own `minShareSize`/`maxShareSize` on every inbound share (see [Helper-side admission control](#helper-side-admission-control)). |
 | `with_max_subshares(max)` | unset (no cap) | Cap on a sharing round's total subshares (the sum of the Helpers' weights). Checked at sharing only, never at recovery; must be `>= threshold`. See [Weighted helpers](#weighted-helpers). |
-| `with_auto_respond_on_failure(bool)` | `false` | If `true`, the protocol replies to the peer on inbound processing failures; if `false`, errors only surface as events. |
+| `with_auto_respond_on_failure(bool)` | `false` | Who answers an inbound request whose handling failed. If `true`, the library sends the response itself; if `false`, it reports `RequestFailed` with a token the app passes to `reject`. See [Failed requests](#failed-requests). |
 | `with_unpair_ack(ack)` | `UnpairAck::Required` | Whether the unpair initiator waits for the peer's `Ok` before dropping local state. |
 | `with_auto_reply_to(bool)` | `false` | If `true`, every outbound request stamps `replyTo = own_transport` so the responder routes the reply back to this node — even if the channel's stored peer endpoint points elsewhere. Useful for replica scenarios. See [Correlation and routing on the wire](#correlation-and-routing-on-the-wire). |
 
@@ -404,12 +461,38 @@ before any target-level events are emitted.
 - `ActionRequired { channel_id, action }` — an incoming request needs
   application confirmation. The app calls `protocol.accept(action)` or
   `protocol.reject(action, status, memo)` to complete the flow.
+- `RequestFailed { channel_id, action_kind, responded, status, memo, error_code, message, action }`
+  — an inbound request failed while it was being handled; it still gets
+  exactly one response. See [Failed requests](#failed-requests)
+- `ErrorResponseReceived { channel_id, status, memo }` — the peer answered a
+  message from this device with an `ErrorResponseMessage` (typically
+  `FORMAT_ERROR`: it could not decode the body). Never answered
+- `PairingRefused { channel_id, status, memo, error_code, message }` — this
+  device refused an inbound `PairRequest` under a protocol rule
+  (`INCOMPATIBLE_PARAMETER_RANGE` or `REPLICA_ID_CONFLICT`) and sent the
+  requester that status with `memo`, written from the requester's side.
+  `error_code` and `message` carry the local reason, as on `RequestFailed`,
+  and are never sent. No channel is created
 - `PairingCompleted { channel_id, kind, peer_communication_info }`
 - `ShareStored { channel_id, version }` / `ShareConfirmed { … }` /
   `ShareRejected { … }` / `SharingComplete { … }`
+- `ShareRefused { channel_id, version, status, memo }` — helper side: the
+  library refused an inbound share instead of raising `ActionRequired`, and
+  answered the owner, who sees `ShareRejected` with the same `status` and
+  `memo`. `status` is `FORMAT_ERROR` (the share does not decode),
+  `VERIFICATION_FAILED` (it does not verify against its commitment),
+  `SIZE_LIMIT_EXCEEDED` (outside the helper's `ParameterRange`) or
+  `VERSION_CONFLICT` (a different share is already stored at `version`).
+  Nothing is stored and no version is removed. It is sent whatever
+  `auto_respond_on_failure` says; a refusal from the application's own
+  `DeRecShareStore::save` does not emit it
 - Verification verdicts — every challenged channel ends with exactly one of:
-  - `ShareVerified { channel_id, version }` — the helper proved it holds the
-    exact share;
+  - `ShareVerified { channel_id, version, subshares, threshold }` — the helper
+    proved it holds the exact share. `subshares: Option<u32>` is how many
+    subshares that helper holds for `version` and `threshold: Option<u32>` the
+    threshold `version` was split with, both read from this device's stored
+    share (see
+    [Judging a version's recoverability](#judging-a-versions-recoverability));
   - `ShareVerifyInvalid { channel_id, version }` — the helper answered with a
     proof that does not match the share this device stored (a damaged or
     dishonest helper). It is an event, not an error from `process`;
@@ -490,15 +573,58 @@ of two things: confirmed by its helper (`ShareConfirmed`), or part of a
 sharing round still open. When a round settles a channel as failed — the
 helper rejected the share (`ShareRejected`) or the round timed out — that
 channel's proof for the round's version is deleted, and a late
-`ShareConfirmed` for it is still emitted but stores nothing. This guarantee
-holds on the publishing device; a replica Destination holds the proofs the
-Source mirrored at publish time and never sees `SharingComplete`, so
-verifying there can report `ShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`)
-for a helper that failed the Source's round.
+`ShareConfirmed` for it is still emitted but stores nothing.
 
-So verify only versions whose round completed (`SharingComplete`). A channel
-with no proof at the requested version gets `VerifySharesFailed` with
-`NoProof`, and no challenge is sent to it.
+A confirmation also deletes the proofs of versions the helper dropped. A
+helper that stores a version applies that round's `keepList` and deletes
+every other version it holds that the list leaves out (see
+[the owner's keep list](#share-store-the-owners-keep-list)). So when a helper
+confirms, this device deletes its proofs for that channel whose versions the
+`keepList` sent in that round leaves out; the confirmed version always stays.
+A helper that rejects the round or never answers keeps its older versions,
+and this device keeps their proofs. With no keep list (`None`) nothing is
+deleted.
+
+A replica Destination never sees the helpers' answers, and it keeps every
+proof it receives: it never deletes one on its own, and freeing that storage
+is the application's concern. Verifying on a Destination a version that a
+helper refused, or later dropped under the keep list, gets
+`ShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`) from that helper, where the
+Source reports `NoProof`. The application may delete such rows from the
+Destination's share store; verifying a version whose rows are gone then gives
+`VerifySharesFailed` with `NoProof`.
+
+So verify only versions whose round completed (`SharingComplete`) and that
+the latest keep list still names. A channel with no proof at the requested
+version gets `VerifySharesFailed` with `NoProof`, and no challenge is sent to
+it.
+
+### Judging a version's recoverability
+
+Sum `subshares` over the `ShareVerified` events for a version and compare the
+sum with their `threshold`: the version is recoverable from the verified
+helpers when the sum is `>= threshold`. Every `ShareVerified` for a version
+carries that version's own threshold, not the current one.
+
+If either value is `None` on any of those events, the result is unknown. A
+`None` count is not `0` or `1`: recompute it from the stored share's bytes, or
+treat the version's total as unknown.
+
+The count comes from `Share::subshares` on this device's stored share for that
+channel and version, so it is the weight of the round that published the
+version, not the helper's current `HelperChannel.weight`, which a later round
+may have changed. The library sets `Share::subshares` on every share the owner
+side saves, including a replica Destination's mirrored copies, and always
+leaves it `None` on a helper's stored share. An owner share saved before the
+field existed reads back as `None`, and so does `ShareVerified.subshares` for
+it; the library never backfills it. Recomputing it from the stored bytes is
+the application's choice.
+
+The threshold comes from `Share::threshold` on the same stored share, with the
+same rules: the owner side records the round's threshold on the shares it
+sends, and a replica Destination records the roster's threshold on its
+mirrored copies; it is `None` on a helper's share and on owner shares saved
+before the field existed.
 
 ### Timestamps
 
@@ -532,6 +658,100 @@ match protocol.process(&bytes).await {
 
 Every SDK carries the same two fields on its `process` error.
 
+An error from `process` is left for what cannot be answered: an envelope
+that does not decode, a channel with no key, a message that does not
+decrypt, any other failure of the pairing handshake or of a response this
+device received, and a store failure before the message could be
+authenticated. A request that arrived on an authenticated channel and then
+failed is not an error; see [Failed requests](#failed-requests).
+
+A responder whose `PairResponse` was handed to the transport has completed
+the pairing on its side, so a failure of that send, or of dropping the
+pairing secret after it, is not an error either: `process` returns
+`PairingCompleted` followed by `RequestFailed { action_kind: Pairing,
+responded: true }`.
+
+### Failed requests
+
+Every request that arrives on an authenticated channel gets exactly one
+response, even when handling it fails. Such a failure does not make
+`process` or `accept` return `Err`: it is reported as
+`DeRecEvent::RequestFailed`, and the call's other events (`AutoAccepted`
+included) are kept.
+
+- `action_kind` is the type of the request that failed, a
+  `PendingActionKind` (`PendingActionKind::Failed` when its body could not
+  be decoded, or was a request type the channel cannot carry).
+- `responded` is `true` when the library already handed the response to the
+  transport. It is never sent twice, so a failure after that point is only
+  reported.
+- `status` is the status that was sent, or would have been. It is always
+  present. `memo` is the wire-safe memo sent with it, or that would have
+  been, so `reject(action, status, memo)` sends exactly the response the
+  library would have sent.
+- `error_code` is the error's `DeRecErrorCode` name and `message` a local
+  description; neither goes on the wire.
+- `action`, when `responded` is `false`, is a
+  `PendingAction::RespondToFailure` token. Pass it to `reject`, which sends
+  the one response; `accept` returns `Error::InvalidInput` for it. It is
+  `None` only when `reject` could never answer it: a request on a replica
+  group channel that names no member and carries no `reply_to`, which has
+  no reply target, or, with `with_auto_respond_on_failure` off, a replica
+  copy that hands this device the group key and fails before `hydrate`
+  stores that key.
+
+`with_auto_respond_on_failure` decides who answers, the failure-side twin of
+`with_auto_accept`:
+
+- **On:** the library sends the request's own response type with a non-`Ok`
+  status. A failure with a protocol meaning keeps its status and memo
+  (`REJECTED` for a role mismatch, `UNSUPPORTED_TRANSPORT_PROTOCOL` when no
+  endpoint is usable); anything else (a store backend error, an internal
+  error) is `FAIL` with the generic memo `"request could not be processed"`,
+  so no local error text reaches the peer. If no reply target can be
+  resolved before any send, the event carries the token anyway.
+- **Off** (the default): nothing is sent, and the event carries the token.
+
+```rust,ignore
+for event in protocol.process(&bytes).await? {
+    if let DeRecEvent::RequestFailed { responded: false, status, memo, action: Some(token), .. } = event {
+        let status = StatusEnum::try_from(status).unwrap_or(StatusEnum::Fail);
+        protocol.reject(token, status, &memo).await?;
+    }
+}
+```
+
+The library never expires an unresolved `PendingAction`, a token included:
+a request the application never answers leaves its sender to time out.
+`PendingAction` is `Clone`, so an application can keep a copy of an action
+it accepts. The library is stateless, so resolving each token once is the
+application's part: rejecting the same token twice, or rejecting a copy of
+an action already accepted, sends a second response.
+
+Before acting on a persisted action, `accept` checks its channel again. A
+channel that is gone or no longer `Paired` has nothing to answer on, so
+`accept` returns `Error::InvalidInput` and nothing is stored or sent. A peer
+that no longer holds the role the flow requires is a failed request with
+status `REJECTED`.
+
+A message that decrypts under the channel key but whose body cannot be
+decoded, or that carries a `PairRequest` or `PrePairRequest` on a paired
+channel, is a request too. It is answered with an `ErrorResponseMessage`
+(`FORMAT_ERROR`, memo `"message body could not be decoded"`, when the
+library answers it). A received `ErrorResponseMessage` is reported as
+`DeRecEvent::ErrorResponseReceived` and never answered.
+
+The protocol's own refusals are answered in both modes, each with its event:
+a share that fails validation (`ShareRefused`), a replica copy that does not
+check (`ReplicaSecretRefused`), and a `PairRequest` outside the parameter
+range or announcing a replica id already in the group (`PairingRefused`).
+
+Nothing is answered for a message that fails to decrypt (it carries no proof
+of who sent it, and replying would make this device a decryption oracle), an
+expired message (older than the `inbound_message` window, which is the
+library's replay bound), a message ignored as `MessageIgnored`, a
+response, the pairing handshake, or a replica-group removal notice.
+
 ### Channel roles
 
 A channel row describes the participant on the other end, so each paired
@@ -560,7 +780,11 @@ The orchestrator enforces flow directionality against this value:
 - `UpdateChannelInfo` is symmetric — either side may initiate it, and the
   peer role is not consulted.
 
-A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
+An outbound mismatch fails `start` with
+`Error::RoleMismatch { channel_id, expected, actual }`. An inbound request
+from a peer with the wrong role is a failed request with status `REJECTED`,
+reported as `RequestFailed` with error code `role_mismatch`; see
+[Failed requests](#failed-requests).
 
 ---
 
@@ -641,7 +865,8 @@ answers the owner with the mapped status — `TooFrequent` → `TOO_FREQUENT`,
 `SizeLimitExceeded` → `SIZE_LIMIT_EXCEEDED`, `Rejected` → `REJECTED` — and the
 helper's call returns `Ok([NoOp])`; the owner sees `ShareRejected` or
 `ShareVerifyRejected` with that status. `record_verification` defaults to
-`Ok(())`. Any other store error still propagates as an error.
+`Ok(())`. Any other store error is a failed request, reported as
+`RequestFailed` (see [Failed requests](#failed-requests)).
 
 ### `auto_accept.store_share` removes this gate
 
@@ -689,50 +914,81 @@ transport cap protects resources, `reject` enforces policy.
 
 ### Weighted helpers
 
-`DeRecFlow::ProtectSecret` takes an optional `weights: HashMap<ChannelId, u32>`
-naming the paired Helpers that should receive more than one subshare. A
-Helper not listed receives one subshare, so an empty map is today's behavior —
-one subshare per Helper. `with_threshold` counts subshares, not Helpers: with no
-weights the two coincide, but an owner who gives one Helper 2 subshares and
-sets `threshold = 3` lets that Helper plus any one other recover, while any
-two of the remaining Helpers still cannot.
+`DeRecFlow::ProtectSecret` takes `weights: HashMap<ChannelId, u32>`, the
+number of subshares each paired Helper receives. `with_threshold` counts
+subshares, not Helpers: with every Helper at 1 the two coincide, but an owner
+who gives one Helper 2 subshares and sets `threshold = 3` lets that Helper plus
+any one other recover, while any two of the remaining Helpers still cannot.
 
-Validation runs in `start` before anything is sent: every key must be a
-currently paired Helper channel of this secret, and every weight must satisfy
-`1 <= weight < threshold`, so no single Helper ever holds enough subshares to
-recover alone. An invalid entry fails the call with no share sent and no
-version consumed.
+**The map is the full assignment, not a patch.** A paired Helper the map does
+not name receives one subshare. The intended flow:
 
-**Weights are not sticky.** They apply only to the `start` call that names
-them — nothing is persisted per Helper, and the roster (`Secret.helpers`)
-does not carry them. A later `ProtectSecret` with no weights publishes with
-one subshare per Helper again; remembering a choice across calls is the
-application's job. The weight actually sent to each channel is reported back
-on `ProtectSecretStarted` / `ProtectSecretFailed` so the application can
-persist or display it.
+1. Weights are the user's choice. Before `start(ProtectSecret)`, show the user
+   each paired Helper's current weight, pre-filled from your channel store
+   (`HelperChannel.weight`), and pass the user's final choice as the whole
+   map. Reading the stored weights first is the normal flow.
+2. Every other `start(ProtectSecret)` the app makes, such as a republish after
+   editing the secrets or the follow-up after `restore`, must pass the stored
+   weights unchanged. A Helper left out returns to 1, which silently undoes
+   the user's choice.
+3. Only the publishes the library starts on its own, after pairing and after
+   a fingerprint is confirmed, reuse the stored weights by themselves.
 
-**Library-initiated publishes ignore weights.** Publishes the library starts
-on its own — after pairing completes, after a fingerprint is confirmed —
-always use one subshare per Helper, and each one is a new version. For an
-application using weights that has two consequences:
+Validation runs in `start` before anything is written or sent: every key must
+be a currently paired Helper channel of this secret, and every weight must
+satisfy `1 <= weight < threshold`, so no single Helper ever holds enough
+subshares to recover alone. An invalid entry fails the call with no share sent
+and no version consumed.
 
-- The total can fall below the threshold. With `threshold = 4` and Helpers
-  `A` (weight 3) and `B` (weight 1), pairing a third Helper `C` publishes
-  `1 + 1 + 1 = 3` subshares: no split runs and Helpers receive nothing, but the
-  version is still consumed, so the newest version carries no Helper shares.
-- Even when the total still meets the threshold, the set of Helpers that can
-  recover changes, since every Helper now counts for one subshare.
+**Weights are recorded.** Each round writes the weight it gave every paired
+Helper to that Helper's `HelperChannel.weight`, before anything is sent. The
+weight actually sent to each channel is also reported on
+`ProtectSecretStarted` / `ProtectSecretFailed`.
 
-An application using weights should call `start(ProtectSecret)` with its
-weights again after `PairingCompleted` or a confirmed fingerprint. The
-library's publish has already been dispatched by then — its events arrive in
-the same `process` result as `PairingCompleted`, and it runs inside
-`verify_fingerprint` before that returns `true` — so the application can
-follow it immediately; its call publishes the next version.
+- Publishes the library starts on its own — after pairing completes, after a
+  fingerprint is confirmed — reuse the stored weights. A newly paired Helper
+  starts at 1.
+- The weights travel in the roster (`Secret.helpers[].weight`). `restore` and
+  replica hydration write them back into the `HelperChannel` records they
+  create, so a recovered or replica device publishes with the same weights and
+  its channel store already holds them.
+- Weights change only through `start(ProtectSecret)`. There is no separate
+  getter or setter: read `HelperChannel.weight` from your channel store.
+
+**A stored weight can become invalid.** When `with_threshold` applies (no
+threshold is stored), lowering it to or below a stored weight makes the next
+publish fail with `SharingError::InvalidWeight`
+(`invalid_weight`) before anything is sent — explicit and library-initiated
+publishes alike. The pairing-time publish returns it from `process` (as a
+`ProcessError` carrying the message's events) or from `accept`; the
+fingerprint-time publish returns it from `verify_fingerprint`, after the
+channel has been promoted. Call `start(ProtectSecret)` with valid weights to
+recover.
 
 `SharingComplete.threshold_met` is `true` when the confirmed Helpers'
-combined weight is `>= threshold`, not when a threshold-sized *count* of
-Helpers has confirmed.
+combined weight is `>= threshold`, the threshold that round split at, not when
+a threshold-sized *count* of Helpers has confirmed.
+
+**Below the threshold.** When the paired Helpers' total weight is below
+`threshold`, `start(ProtectSecret)` skips the split: no Helper receives
+anything, so no `ProtectSecretStarted` / `ProtectSecretFailed` is emitted for
+any of them. Paired Replicas, if any, still receive their secret-only
+composite and report their usual events; with none paired, the call returns
+`Ok` with no events at all. This is not an error — the version still
+advances and the secrets/description are saved as the latest snapshot, so
+the next publish that reaches `threshold` (including one the library starts
+on its own, after pairing or after a fingerprint is confirmed) shares that
+snapshot. An app can detect the case before calling, by summing the weights
+it is about to assign (or the stored `HelperChannel.weight` of every paired
+Helper, for a library-initiated publish) against `threshold`; after calling,
+zero `ProtectSecretStarted` / `ProtectSecretFailed` events means nothing was
+split. This is more likely with weighted Helpers than with the default
+weight of 1: a configuration such as two Helpers at weight 2 against
+`threshold = 3` (total weight 4) drops below threshold if a publish leaves
+both out of the weights map, resetting each to weight 1 under the
+full-assignment rule above, for a total of 2. The restore follow-up publish
+(see [After a restore](#after-a-restore)) is a typical case when it does not
+pass the stored weights unchanged, as that section describes.
 
 **Capping the total.** Recovery time grows quadratically with the total
 number of subshares a round splits the secret into — measured in release mode
@@ -741,8 +997,8 @@ per attempt — while splitting stays cheap, so nothing warns at sharing time.
 `with_max_subshares(max)` caps that total: a round whose weights sum above it
 fails `start(ProtectSecret)` with `SharingError::TooManySubshares` (FFI code
 `66`, `too_many_subshares`) before anything is sent and before a version is
-consumed. Unset means no cap. Publishes the library starts itself count one
-subshare per Helper and respect the cap too. A cap below the threshold fails
+consumed. Unset means no cap. Publishes the library starts itself count the
+stored weights and respect the cap too. A cap below the threshold fails
 `build()` with `Error::InvalidInput`. The cap applies at sharing only, never
 at recovery: a recovering device cannot know the cap the shares were made
 under, and refusing there could make a secret unrecoverable.
@@ -750,6 +1006,37 @@ under, and refusing there could make a secret unrecoverable.
 The stateless `request::split` primitive takes the same weights, with the
 same rules, for callers working below the protocol layer — see
 [Share Distribution](#share-distribution).
+
+### The threshold is recorded
+
+`DeRecFlow::ProtectSecret` takes `threshold: Option<u32>`. The `t` a round
+splits at is, in order:
+
+1. the explicit `threshold`, when `Some`;
+2. otherwise the stored `UserSecrets::threshold`;
+3. otherwise the builder's `with_threshold`.
+
+Every publish stores the `t` it used in `UserSecrets::threshold`, the roster
+carries it (`Secret.threshold`), and `restore` and replica hydration put it
+back. `with_threshold` is therefore the starting `t` for a secret with nothing
+stored: an app that never passes `threshold` behaves as before until its first
+publish, and from then on keeps that `t` even if its configuration changes.
+Publishes the library starts on its own never pass a `threshold`, so they use
+the stored `t`, then the builder's.
+
+Changing `t` is an explicit `start(ProtectSecret)` with `Some(t)`. The new `t`
+is checked before anything is written or sent: it must be at least `2`
+(`SharingError::InvalidThreshold`), above every resolved weight
+(`SharingError::InvalidWeight`), and no greater than a `with_max_subshares` cap
+(`Error::InvalidInput`). A round that fails a check writes and sends nothing.
+Once it passes, the weights are written before anything is sent, but the new
+`t` is stored only on the round's own snapshot, saved after distribution. A
+snapshot never records a `t` its version was not split with, so a round that
+fails before its snapshot is saved leaves the previous `t` in place.
+
+Each owner share records the `t` of its version (`Share::threshold`), which is
+what `ShareVerified.threshold` reports. There is no getter: read
+`UserSecrets.threshold` from your user-secret store.
 
 ### Transport endpoints and plaintext
 
@@ -976,6 +1263,10 @@ could. The same map travels on a replica catch-up, so a member that
 became current by pulling is no less able to verify than one that
 received a push.
 
+A destination keeps every proof it receives and never deletes one on its
+own; freeing them is the application's concern (see
+[Which versions to verify](#which-versions-to-verify)).
+
 #### When a mixed round reports
 
 A round that targets both helpers and replica members reports **only once
@@ -1003,6 +1294,23 @@ Two things follow for application authors:
 
 A helpers-only round is unaffected and completes as soon as the helpers
 answer.
+
+#### Refused copies
+
+A member checks the whole of an incoming copy before writing any of it, so a
+copy is applied in full or not at all. One that does not decode or is not
+self-consistent (a share map naming a helper the roster does not list, a
+version or group key that disagrees with the request, a malformed key, id or
+role) is refused with `FORMAT_ERROR`; one whose share map carries a share that
+does not verify against its commitment, with `VERIFICATION_FAILED`. The
+receiving member emits
+`ReplicaSecretRefused { channel_id, from_replica_id, secret_id, version, status, memo }`
+and answers the publisher whatever `auto_respond_on_failure` says; the
+publisher sees `ReplicaSyncRejected` with the same `status` and `memo`, and
+the member lands in `behind`. A refused admission handover is answered on the
+group channel under the group key it carried. A copy served by a catch-up is
+checked the same way and reported with the same event; nothing is answered,
+since that copy is itself an answer.
 
 #### Version conflicts: what the application must do
 
@@ -1146,6 +1454,24 @@ data. Two ways to get this wrong, both of which have shipped:
 - **Asserting the two are equal** fires on the ordinary case of a helper
   holding someone else's share.
 
+### Share store: `Share::subshares`
+
+`Share::subshares: Option<u32>` is the number of subshares the share carries,
+recorded on the owner side only. The library sets it on every share the owner
+side saves (including a replica Destination's mirrored copies) and leaves it
+`None` on every helper-side share. Persist it as given, including `None` (a
+nullable column in SQL), and return it unchanged. Owner rows written before
+the field existed read back as `None`; the library never backfills them. It is
+what `ShareVerified.subshares` reports; see
+[Judging a version's recoverability](#judging-a-versions-recoverability).
+
+`Share::threshold: Option<u32>` is the threshold the share's version was split
+with, under the same rules: set on the same owner-side shares, `None` on a
+helper's share and on rows written before it existed, never backfilled. It is
+what `ShareVerified.threshold` reports. `UserSecrets::threshold: Option<u32>`
+is the stored threshold the next publish splits at; persist it with the
+snapshot, including `None`.
+
 ### Share store: the owner's keep list
 
 Every `StoreShareRequestMessage` carries a `keepList`: the complete set of
@@ -1190,6 +1516,12 @@ it holds is safe: at worst helpers keep a version that was rolled back.
 Helpers delete everything that is not listed, so a list that leaves out too
 much can make the secret unrecoverable. Replica pushes never consult `keep_list` and always
 send an empty `keepList`.
+
+The list governs this device's own rows too. When a helper confirms the
+round, the library deletes, through `remove_versions`, this device's proofs
+for that channel whose versions the list leaves out, since the helper has
+deleted those shares. A helper that rejects the round keeps its older
+versions, and so does this device.
 
 ### Transport: implement `SendOne`, not `send`
 
@@ -1291,11 +1623,13 @@ Public errors are structured and typed:
 - [`ProcessError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/struct.ProcessError.html) — wraps `Error` with the `channel_id` an inbound message was processed against (if known) and the `events` the call produced before failing. See [When `process` fails](#when-process-fails).
 - [`ChannelStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.ChannelStoreError.html), [`ShareStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.ShareStoreError.html), [`SecretStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.SecretStoreError.html) — surfaced by storage trait implementations.
 
-The protocol never panics on malformed input. Inbound parsing or decryption
-failures surface as events, or as a typed `Error::ProtobufDecode` /
-`Error::Pairing(PairingError::PairingEncryption(..))`; see
-`with_auto_respond_on_failure` for controlling whether such failures are
-replied to.
+The protocol never panics on malformed input. A message that fails to
+decode or decrypt before a channel key authenticates it surfaces as a typed
+`Error::ProtobufDecode` /
+`Error::Pairing(PairingError::PairingEncryption(..))` and is never answered.
+A body that fails to decode after the channel key authenticated it is a
+failed request, answered and reported as `RequestFailed`; see
+[Failed requests](#failed-requests).
 
 ---
 

@@ -266,7 +266,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
             version = request.version,
             "no stored share for the requested version; answering UNKNOWN_SHARE_VERSION"
         );
-        reject(
+        let sent = reject(
             stores,
             local,
             exchange,
@@ -274,8 +274,14 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
             StatusEnum::UnknownShareVersion,
             NO_SHARE_FOR_VERSION,
         )
-        .await?;
-        return Ok(vec![DeRecEvent::NoOp]);
+        .await;
+        return crate::protocol::obligation::refused(
+            exchange.obligation,
+            DeRecEvent::NoOp,
+            StatusEnum::UnknownShareVersion,
+            NO_SHARE_FOR_VERSION,
+            sent,
+        );
     };
 
     let stored =
@@ -289,10 +295,19 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .resolve_response_endpoints(
             local.secret_id,
             exchange.channel_id,
+            local.policy,
             &crate::extensions::advertised_endpoints::reply_to_owned(request),
         )
         .await?;
-    stores.transport.send(&endpoints, envelope).await?;
+    crate::protocol::obligation::deliver(
+        exchange.obligation,
+        stores.transport,
+        &endpoints,
+        envelope,
+        StatusEnum::Ok,
+        "",
+    )
+    .await?;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -324,7 +339,32 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
-    let response = GetShareResponseMessage {
+    crate::extensions::channel_store::send_channel_message(
+        stores.channels,
+        stores.transport,
+        local.secret_id,
+        exchange.channel_id,
+        failure_response(local, request, status, memo),
+        exchange.shared_key,
+        exchange.trace_id,
+        local.policy,
+        &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        exchange.obligation,
+        status,
+        memo,
+    )
+    .await
+}
+
+/// The `GetShareResponse` that answers `request` with a non-`Ok` `status`
+/// and no share.
+pub(in crate::protocol) fn failure_response(
+    local: &Local<'_>,
+    request: &GetShareRequestMessage,
+    status: StatusEnum,
+    memo: &str,
+) -> MessageBody {
+    MessageBody::GetShareResponse(GetShareResponseMessage {
         result: Some(DeRecResult {
             status: status as i32,
             memo: memo.to_owned(),
@@ -337,19 +377,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         // Answer on the path the request arrived on: a member asking gets a
         // member's answer, a helper exchange stays helper-bound.
         replica_id: local.replica_id.filter(|_| request.replica_id.is_some()),
-    };
-
-    crate::extensions::channel_store::send_channel_message(
-        stores.channels,
-        stores.transport,
-        local.secret_id,
-        exchange.channel_id,
-        MessageBody::GetShareResponse(response),
-        exchange.shared_key,
-        exchange.trace_id,
-        &crate::extensions::advertised_endpoints::reply_to_owned(request),
-    )
-    .await
+    })
 }
 
 #[cfg_attr(
@@ -836,8 +864,8 @@ mod recovery_ids_tests {
 
     use super::*;
     use crate::protocol::context::Exchange;
-    use crate::protocol::test::LocalFixture;
-    use crate::protocol::test::{
+    use crate::protocol::tests::LocalFixture;
+    use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, RecordingTransport,
         StoreRig, run_async,
     };
@@ -917,6 +945,7 @@ mod recovery_ids_tests {
                 status,
                 created_at: 1,
                 peer_role,
+                weight: 1,
             }),
         };
         channels.save(sid, record).await.expect("channel saved");
@@ -2015,7 +2044,7 @@ mod recovery_ids_tests {
     /// waiting, and the exchange is not a failure of the helper's `process`.
     mod helper_without_the_share {
         use super::*;
-        use crate::protocol::test::{InMemShareStore, InMemUserSecretStore};
+        use crate::protocol::tests::{InMemShareStore, InMemUserSecretStore};
         use crate::protocol::{AutoAcceptPolicy, DeRecProtocolBuilder};
 
         type TestProto = crate::protocol::DeRecProtocol<
@@ -2157,7 +2186,7 @@ mod recovery_ids_tests {
 
     mod wiring {
         use super::*;
-        use crate::protocol::test::{InMemShareStore, InMemUserSecretStore};
+        use crate::protocol::tests::{InMemShareStore, InMemUserSecretStore};
         use crate::protocol::{DeRecFlow, DeRecProtocolBuilder};
 
         type TestProto = crate::protocol::DeRecProtocol<
@@ -2511,6 +2540,8 @@ mod recovery_ids_tests {
                             secret_id: secret,
                             version: VERSION,
                             bytes: stored_share(secret, VERSION),
+                            subshares: None,
+                            threshold: None,
                         },
                     )
                     .await
@@ -2530,6 +2561,7 @@ mod recovery_ids_tests {
                         channel_id: ChannelId(WANTED_CHANNEL),
                         shared_key: &[0xB2; 32],
                         trace_id: 0,
+                        obligation: None,
                     },
                     &request,
                 )
@@ -2572,6 +2604,7 @@ mod tests {
                 }],
                 shared_key: vec![0xAA; 32],
                 communication_info: HashMap::from([("name".to_owned(), "Helper".to_owned())]),
+                weight: 1,
             }],
             secrets: vec![
                 UserSecret {
@@ -2609,6 +2642,7 @@ mod tests {
                 ],
                 shared_key: vec![0x55; 32],
             }),
+            threshold: None,
         }
     }
 
@@ -2792,7 +2826,7 @@ mod share_judging_tests {
         let good = responses(b"payload", 2, 3);
         let mut committed =
             CommittedDeRecShare::decode(good[0].committed_de_rec_share.as_slice()).unwrap();
-        committed.de_rec_share = crate::protocol::test::pre_0_0_9_derec_share(SECRET_ID, VERSION);
+        committed.de_rec_share = crate::protocol::tests::pre_0_0_9_derec_share(SECRET_ID, VERSION);
         let old = GetShareResponseMessage {
             committed_de_rec_share: committed.encode_to_vec(),
             ..good[0].clone()

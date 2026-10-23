@@ -336,7 +336,7 @@ fn test_recover_from_share_responses_decode_derec_share_error() {
 
 fn committed_pre_0_0_9_share(secret_id: u64, version: u32) -> Vec<u8> {
     CommittedDeRecShare {
-        de_rec_share: crate::protocol::test::pre_0_0_9_derec_share(secret_id, version),
+        de_rec_share: crate::protocol::tests::pre_0_0_9_derec_share(secret_id, version),
         commitment: vec![0xCD; 32],
         merkle_path: vec![],
     }
@@ -346,11 +346,11 @@ fn committed_pre_0_0_9_share(secret_id: u64, version: u32) -> Vec<u8> {
 #[test]
 fn test_pre_0_0_9_layout_fails_only_at_the_old_y_field() {
     assert!(
-        DeRecShare::decode(crate::protocol::test::pre_0_0_9_fields_before_y().as_slice()).is_ok(),
+        DeRecShare::decode(crate::protocol::tests::pre_0_0_9_fields_before_y().as_slice()).is_ok(),
         "the old x field must not be what fails"
     );
     assert!(
-        DeRecShare::decode(crate::protocol::test::pre_0_0_9_derec_share(1, 0).as_slice()).is_err()
+        DeRecShare::decode(crate::protocol::tests::pre_0_0_9_derec_share(1, 0).as_slice()).is_err()
     );
 }
 

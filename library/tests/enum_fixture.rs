@@ -141,6 +141,7 @@ fn pending_action_kind_fixture_is_complete() {
         PendingActionKind::GetShare,
         PendingActionKind::Unpair,
         PendingActionKind::UpdateChannelInfo,
+        PendingActionKind::Failed,
     ];
     let names: Vec<&str> = all
         .iter()
@@ -153,6 +154,7 @@ fn pending_action_kind_fixture_is_complete() {
             PendingActionKind::GetShare => "GetShare",
             PendingActionKind::Unpair => "Unpair",
             PendingActionKind::UpdateChannelInfo => "UpdateChannelInfo",
+            PendingActionKind::Failed => "Failed",
         })
         .collect();
     assert_matches_fixture("PendingActionKind", &names);
@@ -361,10 +363,11 @@ fn numeric_discriminants_match_the_fixture() {
     );
 }
 
-/// The TypeScript SDKs declare their enums as *types*, which erase at runtime,
-/// so there is nothing a JS test can inspect and no runtime check to write.
-/// The drift that matters there is a union missing a member the core emits, so
-/// the check is textual and lives here, where the fixture is already loaded.
+/// The TypeScript SDKs declare their string enums as *types*, which erase at
+/// runtime, so there is nothing a JS test can inspect and no runtime check to
+/// write. The drift that matters there is a union missing a member the core
+/// emits, so the check is textual and lives here, where the fixture is already
+/// loaded.
 #[test]
 fn typescript_declarations_cover_the_fixture() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
@@ -425,22 +428,34 @@ fn typescript_declarations_cover_the_fixture() {
             );
         }
 
-        // ContactMode is re-declared as a value enum in both packages.
-        let mut missing_modes = Vec::new();
-        for v in fixture["enums"]["ContactMode"]["variants"]
-            .as_array()
-            .expect("contact modes")
-        {
-            let name = v["name"].as_str().expect("name");
-            let wire = v["wire"].as_i64().expect("wire");
-            if !dts.contains(&format!("{name} = {wire}")) {
-                missing_modes.push(format!("{name} = {wire}"));
+        // The value enums are declared as the frozen objects the shim ships:
+        // `export declare const X: { readonly Name: wire; … }`, with no
+        // reverse mapping, so each member must be declared with its wire value.
+        for enum_name in ["ContactMode", "FlowKind", "StatusEnum"] {
+            assert!(
+                dts.contains(&format!("export declare const {enum_name}: {{")),
+                "packages/{pkg}/index.d.ts must declare `{enum_name}` as the const object index.js ships"
+            );
+            assert!(
+                !dts.contains(&format!("export enum {enum_name}")),
+                "packages/{pkg}/index.d.ts declares `{enum_name}` as an enum, whose reverse mapping index.js does not ship"
+            );
+            let mut missing = Vec::new();
+            for v in fixture["enums"][enum_name]["variants"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{enum_name} variants"))
+            {
+                let name = v["name"].as_str().expect("name");
+                let wire = v["wire"].as_i64().expect("wire");
+                if !dts.contains(&format!("readonly {name}: {wire};")) {
+                    missing.push(format!("{name}: {wire}"));
+                }
             }
+            assert!(
+                missing.is_empty(),
+                "packages/{pkg}/index.d.ts {enum_name} is missing: {missing:?}"
+            );
         }
-        assert!(
-            missing_modes.is_empty(),
-            "packages/{pkg}/index.d.ts ContactMode is missing: {missing_modes:?}"
-        );
     }
 }
 
@@ -503,4 +518,137 @@ fn every_typescript_surface_names_every_event_and_reason() {
             "{surface} does not name {missing:?}. Add them, then update the fixture if the core changed."
         );
     }
+}
+
+/// Every double-quoted snake_case literal between the first occurrence of
+/// `start` and the following occurrence of `end` in `source`.
+fn quoted_literals_between(source: &str, start: &str, end: &str) -> BTreeSet<String> {
+    let from = source
+        .find(start)
+        .unwrap_or_else(|| panic!("source does not contain {start:?}"));
+    let rest = &source[from + start.len()..];
+    let to = rest
+        .find(end)
+        .unwrap_or_else(|| panic!("source does not contain {end:?} after {start:?}"));
+    let block = &rest[..to];
+
+    let mut out = BTreeSet::new();
+    let bytes = block.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"'
+            && let Some(len) = block[i + 1..].find('"')
+        {
+            out.insert(block[i + 1..i + 1 + len].to_owned());
+            i += 1 + len + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `DeRecErrorCode` is a string-literal union in every TypeScript surface, so
+/// — like the reason unions above — there is no runtime value a JS test can
+/// check; the drift that matters is textual, and this is where the fixture
+/// is already loaded.
+///
+/// Node and Web go through WASM, which raises marshalling-level codes of its
+/// own before a value ever reaches the library (malformed argument shapes,
+/// bad flow kinds, values that will not fit a `u64`); those codes are not in
+/// the fixture because no Rust `Error` variant produces them, so they are
+/// listed explicitly here, sourced from every `js_error("...")` call site
+/// under `library/src/interop/wasm/`. React Native goes through the C ABI
+/// instead, which raises no marshalling-level codes of its own (malformed
+/// FFI input is reported under the fixture's own `ffi_*` codes), so its
+/// union is exactly the fixture with no extras.
+#[test]
+fn derec_error_code_union_covers_fixture_and_wasm_extras() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let fixture: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(format!("{root}/library/tests/fixtures/enums.json"))
+            .expect("read fixture"),
+    )
+    .expect("parse fixture");
+
+    let fixture_codes: BTreeSet<String> = fixture["enums"]["DeRecErrorCode"]["variants"]
+        .as_array()
+        .expect("DeRecErrorCode variants")
+        .iter()
+        .map(|v| v["text"].as_str().expect("variant text").to_owned())
+        .collect();
+
+    // Every `js_error("...")` call site under library/src/interop/wasm/, as
+    // of this test's writing. A code added there without a matching entry
+    // here fails this test the moment the corresponding `.d.ts` union is
+    // updated to carry it — see the two `assert_eq!`s below.
+    let wasm_only: BTreeSet<String> = [
+        "builder_missing",
+        "decode_error",
+        "envelope_decode_error",
+        "internal",
+        "invalid_auto_accept_policy",
+        "invalid_communication_info",
+        "invalid_contact_mode",
+        "invalid_discovery_target",
+        "invalid_flow_kind",
+        "invalid_flow_params",
+        "invalid_max_subshares",
+        "invalid_nonce",
+        "invalid_own_transport",
+        "invalid_parameter_range",
+        "invalid_peer_communication_info",
+        "invalid_protocol",
+        "invalid_recovered_secret",
+        "invalid_refusal_reason",
+        "invalid_replica_id",
+        "invalid_secret_id",
+        "invalid_sender_kind",
+        "invalid_shared_key_length",
+        "invalid_status",
+        "invalid_timeouts",
+        "invalid_transport_protocol",
+        "invalid_unpair_ack",
+        "serialization_error",
+        "serialize",
+        "wasm_deserialize_error",
+        "wasm_serialize_error",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    assert!(
+        wasm_only.is_disjoint(&fixture_codes),
+        "a code listed as WASM-only is actually in the fixture: {:?}",
+        wasm_only.intersection(&fixture_codes).collect::<Vec<_>>()
+    );
+
+    // React Native goes through the C ABI, which has no marshalling-level
+    // codes of its own beyond the fixture's `ffi_*` entries.
+    let rn_only: BTreeSet<String> = BTreeSet::new();
+
+    for pkg in ["nodejs", "web"] {
+        let path = format!("{root}/packages/{pkg}/index.d.ts");
+        let dts = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        let declared = quoted_literals_between(&dts, "export type DeRecErrorCode =", ";");
+        let expected: BTreeSet<String> = fixture_codes.union(&wasm_only).cloned().collect();
+        assert_eq!(
+            declared, expected,
+            "packages/{pkg}/index.d.ts's DeRecErrorCode has drifted from the fixture plus the documented WASM-only codes"
+        );
+    }
+
+    let rn_path = format!("{root}/packages/react-native/src/errors.ts");
+    let rn_source =
+        std::fs::read_to_string(&rn_path).unwrap_or_else(|e| panic!("reading {rn_path}: {e}"));
+    let rn_declared = quoted_literals_between(
+        &rn_source,
+        "export const DEREC_ERROR_CODES = [",
+        "] as const;",
+    );
+    let rn_expected: BTreeSet<String> = fixture_codes.union(&rn_only).cloned().collect();
+    assert_eq!(
+        rn_declared, rn_expected,
+        "packages/react-native/src/errors.ts's DEREC_ERROR_CODES has drifted from the fixture"
+    );
 }

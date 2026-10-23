@@ -146,13 +146,72 @@ public sealed record ProtectSecretParams
     public string? Description { get; init; }
 
     /// <summary>
-    /// Channel ID to how many subshares that channel should hold. A
-    /// channel absent from the map, or an absent/null map, holds one subshare —
-    /// the same roster that would be sent with no weights at all.
+    /// Channel ID to how many subshares that channel should hold. The map is
+    /// the full assignment, not a patch: a paired helper absent from it holds
+    /// one subshare. The resolved weights are stored on each
+    /// <see cref="HelperChannel.Weight"/>.
+    /// <para>
+    /// Weights are the user's choice. Before <c>StartAsync</c>, show the user
+    /// each paired helper's current weight, pre-filled from your channel store
+    /// (the stored <see cref="HelperChannel.Weight"/>), and pass the user's
+    /// final choice as the whole map. Reading the stored weights first is the
+    /// normal flow. Every other <c>StartAsync</c> the app makes, such as a
+    /// republish after editing the secrets or the follow-up after
+    /// <c>RestoreAsync</c>, must pass the stored weights unchanged: a helper
+    /// left out returns to 1, which silently undoes the user's choice. Only
+    /// the publishes the library starts on its own (after pairing, after a
+    /// fingerprint is confirmed) reuse the stored weights by themselves.
+    /// </para>
+    /// <para>
+    /// A stored weight the round's threshold does not allow fails the
+    /// publishes the library starts on its own with
+    /// <see cref="DeRecCode.InvalidWeight"/>, before anything is sent:
+    /// <c>ProcessAsync</c> throws a <see cref="DeRecException"/> whose
+    /// <c>Events</c> keep the message's events, <see cref="PairingCompletedEvent"/>
+    /// included; <c>AcceptAsync</c> throws after the pairing has completed and
+    /// its response was sent, without returning <c>PairingCompletedEvent</c>;
+    /// <c>VerifyFingerprintAsync</c> throws after the promotion, which stands,
+    /// and a retry returns <c>true</c> and publishes nothing. Call
+    /// <c>StartAsync</c> with valid weights to publish.
+    /// </para>
+    /// <para>
+    /// When the paired helpers' resolved total is below the round's
+    /// threshold (see <see cref="Threshold"/>), <c>StartAsync</c> skips the split: no helper is sent
+    /// anything, so no <c>ProtectSecretStartedEvent</c> / <c>ProtectSecretFailedEvent</c>
+    /// is returned for one, and any paired replica still gets its usual
+    /// secret-only copy and events. With no replica paired either,
+    /// <c>StartAsync</c> returns an empty event list; this is not an error.
+    /// The version still advances and the secrets/description are saved as
+    /// the latest snapshot, so the next publish that reaches threshold
+    /// shares it. Compare the weights you are about to assign against the
+    /// threshold beforehand, or count the returned helper events
+    /// afterward, to detect the case.
+    /// </para>
     /// </summary>
     [JsonPropertyName("weights")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyDictionary<ulong, uint>? Weights { get; init; }
+
+    /// <summary>
+    /// The threshold this round splits at: the number of distinct subshares
+    /// that reconstruct this version. <c>null</c> keeps the stored threshold
+    /// (<see cref="UserSecrets.Threshold"/>), or the builder's
+    /// <c>WithThreshold</c> when none is stored; a value changes it, and the
+    /// new threshold is stored with this round. Leave it <c>null</c> on the
+    /// follow-up after <c>RestoreAsync</c>, which has already put the
+    /// recovered threshold back. Publishes the library starts on its own
+    /// always use the stored threshold.
+    /// <para>
+    /// The resolved threshold must be at least 2
+    /// (<see cref="DeRecCode.InvalidThreshold"/>), above every resolved
+    /// weight (<see cref="DeRecCode.InvalidWeight"/>), and no greater than a
+    /// <c>WithMaxSubshares</c> cap (<see cref="DeRecCode.InvalidInput"/>).
+    /// Each check runs before anything is written or sent.
+    /// </para>
+    /// </summary>
+    [JsonPropertyName("threshold")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public uint? Threshold { get; init; }
 }
 
 /// <summary>Params for <see cref="FlowKind.VerifyShares"/>.</summary>
@@ -361,8 +420,9 @@ public sealed record ActionRequiredEvent : DeRecEvent
 }
 
 /// <summary>
-/// The label vocabulary for <see cref="ActionRequiredEvent.ActionKind"/> and
-/// <see cref="AutoAcceptedEvent.ActionKind"/>. Matches the Rust
+/// The label vocabulary for <see cref="ActionRequiredEvent.ActionKind"/>,
+/// <see cref="AutoAcceptedEvent.ActionKind"/> and
+/// <see cref="RequestFailedEvent.ActionKind"/>. Matches the Rust
 /// <c>PendingActionKind</c> discriminants one-for-one.
 /// </summary>
 public static class PendingActionKind
@@ -375,6 +435,9 @@ public static class PendingActionKind
     public const string GetShare = "GetShare";
     public const string Unpair = "Unpair";
     public const string UpdateChannelInfo = "UpdateChannelInfo";
+    /// <summary>A body that could not be decoded or a request the channel
+    /// cannot carry (<see cref="RequestFailedEvent.ActionKind"/> only).</summary>
+    public const string Failed = "Failed";
 }
 
 public sealed record ShareStoredEvent : DeRecEvent
@@ -382,6 +445,29 @@ public sealed record ShareStoredEvent : DeRecEvent
     public override string EventType => "ShareStored";
     public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
+}
+
+/// <summary>
+/// The library refused an inbound share (helper side): nothing was stored, no
+/// stored version was removed, and the owner was answered with
+/// <see cref="Status"/> and <see cref="Memo"/>, which it observes as
+/// <see cref="ShareRejectedEvent"/> with the same values.
+/// </summary>
+/// <remarks>
+/// Raised instead of <see cref="ActionRequiredEvent"/> for a share that does
+/// not decode (<c>FormatError</c>), does not verify against its commitment
+/// (<c>VerificationFailed</c>), is outside the helper's size range
+/// (<c>SizeLimitExceeded</c>), or differs from the share already stored at
+/// its version (<c>VersionConflict</c>). A refusal from the application's own
+/// share store does not raise it.
+/// </remarks>
+public sealed record ShareRefusedEvent : DeRecEvent
+{
+    public override string EventType => "ShareRefused";
+    public required ulong ChannelId { get; init; }
+    public required uint Version { get; init; }
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
+    public required string Memo { get; init; }
 }
 
 public sealed record ShareConfirmedEvent : DeRecEvent
@@ -429,11 +515,35 @@ public sealed record SharingCompleteEvent : DeRecEvent
     public required bool ThresholdMet { get; init; }
 }
 
+/// <summary>
+/// A helper's verification proof checked out (owner side).
+/// </summary>
+/// <remarks>
+/// To judge whether <see cref="Version"/> is recoverable, sum
+/// <see cref="Subshares"/> over the <c>ShareVerified</c> events for that
+/// version and compare the sum with their <see cref="Threshold"/>. If either
+/// value is <c>null</c> on any of those events, the result is unknown: a
+/// <c>null</c> count is not <c>0</c> or <c>1</c>.
+/// </remarks>
 public sealed record ShareVerifiedEvent : DeRecEvent
 {
     public override string EventType => "ShareVerified";
     public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
+    /// <summary>
+    /// How many subshares this helper holds for <see cref="Version"/>: the
+    /// <see cref="Share.Subshares"/> of the owner's stored share for this
+    /// channel and version, not the helper's current weight. <c>null</c> when
+    /// that share was stored before the count was recorded.
+    /// </summary>
+    public uint? Subshares { get; init; }
+    /// <summary>
+    /// The threshold <see cref="Version"/> was split with: the
+    /// <see cref="Share.Threshold"/> of the same owner share, not the current
+    /// threshold. <c>null</c> when that share was stored before the threshold
+    /// was recorded.
+    /// </summary>
+    public uint? Threshold { get; init; }
 }
 
 /// <summary>
@@ -585,11 +695,64 @@ public sealed record PrePairRejectedEvent : DeRecEvent
     public required string Memo { get; init; }
 }
 
+/// <summary>
+/// The peer answered a message from this device with an
+/// <c>ErrorResponseMessage</c>: it could not process it, typically because the
+/// body could not be decoded (<c>FORMAT_ERROR</c>). It is never answered.
+/// </summary>
+public sealed record ErrorResponseReceivedEvent : DeRecEvent
+{
+    public override string EventType => "ErrorResponseReceived";
+    public required ulong ChannelId { get; init; }
+    /// <summary>The <c>StatusEnum</c> value from the peer's response.</summary>
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
+    /// <summary>Human-readable reason from the peer.</summary>
+    public required string Memo { get; init; }
+}
+
+/// <summary>
+/// This device refused an inbound <c>PairRequest</c> under a protocol rule
+/// (<c>INCOMPATIBLE_PARAMETER_RANGE</c> or <c>REPLICA_ID_CONFLICT</c>), whatever
+/// the <see cref="AutoAcceptPolicy"/> or the <c>auto_respond_on_failure</c>
+/// setting, and sent the requester a <c>PairResponse</c> carrying
+/// <see cref="Status"/> and <see cref="Memo"/>. No channel was created. It is
+/// returned by <c>ProcessAsync</c>, not thrown.
+/// <see cref="Memo"/> is what the requester reads, written from its side; the
+/// local reason is carried by <see cref="ErrorCode"/> and <see cref="Message"/>,
+/// in the same shape as <see cref="RequestFailedEvent"/>.
+/// </summary>
+public sealed record PairingRefusedEvent : DeRecEvent
+{
+    public override string EventType => "PairingRefused";
+    public required ulong ChannelId { get; init; }
+    /// <summary>The <c>StatusEnum</c> value sent to the requester.</summary>
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
+    /// <summary>Human-readable reason sent to the requester.</summary>
+    public required string Memo { get; init; }
+    /// <summary>The refusal's stable code name, as
+    /// <see cref="DeRecException.CodeName"/> reports it:
+    /// <c>incompatible_parameter_range</c> or <c>replica_id_conflict</c>.</summary>
+    public required string ErrorCode { get; init; }
+    /// <summary>Local description of the refusal. Never sent to the peer.</summary>
+    public required string Message { get; init; }
+}
+
+/// <summary>
+/// One helper of the recovered roster.
+/// </summary>
+/// <param name="Weight">
+/// The number of Shamir subshares this helper received in the round that
+/// wrote the roster. <see cref="DeRecProtocol.RestoreAsync"/> writes it into
+/// the helper's <see cref="HelperChannel.Weight"/>, so the next publish gives
+/// it the same count. A roster entry written before weights existed reads as
+/// <c>1</c>.
+/// </param>
 public sealed record HelperInfo(
     [property: JsonPropertyName("channel_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] ulong ChannelId,
     [property: JsonPropertyName("transports"), JsonConverter(typeof(TransportEndpointListJsonConverter))] IReadOnlyList<TransportProtocol> Transports,
     [property: JsonPropertyName("shared_key")] byte[] SharedKey,
-    [property: JsonPropertyName("communication_info"), OmitWhenEmpty] Dictionary<string, string> CommunicationInfo);
+    [property: JsonPropertyName("communication_info"), OmitWhenEmpty] Dictionary<string, string>? CommunicationInfo,
+    [property: JsonPropertyName("weight")] uint Weight = 1);
 
 /// <summary>
 /// One member of the replica group. Exactly one member of a group has
@@ -600,7 +763,7 @@ public sealed record ReplicaInfo(
     [property: JsonPropertyName("replica_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] ulong ReplicaId,
     [property: JsonPropertyName("transports"), JsonConverter(typeof(TransportEndpointListJsonConverter))] IReadOnlyList<TransportProtocol> Transports,
     [property: JsonPropertyName("role")] ReplicaRole Role,
-    [property: JsonPropertyName("communication_info"), OmitWhenEmpty] Dictionary<string, string> CommunicationInfo);
+    [property: JsonPropertyName("communication_info"), OmitWhenEmpty] Dictionary<string, string>? CommunicationInfo);
 
 public sealed record Secret(
     [property: JsonPropertyName("helpers")] IReadOnlyList<HelperInfo> Helpers,
@@ -615,6 +778,17 @@ public sealed record Secret(
     /// </summary>
     [JsonPropertyName("replicas")]
     public Replicas? Replicas { get; init; }
+
+    /// <summary>
+    /// The threshold the secret was split with. <c>null</c> when the roster
+    /// records none. <see cref="DeRecProtocol.RestoreAsync"/> writes it into
+    /// <see cref="UserSecrets.Threshold"/>, so the next publish splits at the
+    /// same threshold; to change it, pass
+    /// <see cref="ProtectSecretParams.Threshold"/> on <c>StartAsync</c>.
+    /// </summary>
+    [JsonPropertyName("threshold")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public uint? Threshold { get; init; }
 }
 
 public sealed record Replicas(
@@ -765,6 +939,32 @@ public sealed record ReplicaVersionConflictEvent : DeRecEvent
     public ulong? IncomingAuthorReplicaId { get; init; }
     /// <summary>The incoming copy's full state: secrets, helpers and replicas.</summary>
     public required Secret Secret { get; init; }
+}
+
+/// <summary>
+/// This device's library refused a group member's copy of the secret.
+/// <c>FORMAT_ERROR</c>: the payload does not decode or is not
+/// self-consistent. <c>VERIFICATION_FAILED</c>: a share map entry does not
+/// verify against its commitment. Nothing was written. On a push the
+/// publisher was answered with this <c>Status</c> and <c>Memo</c>, which it
+/// observes as <see cref="ReplicaSyncRejectedEvent"/>; a copy served by a
+/// catch-up is not answered.
+/// </summary>
+public sealed record ReplicaSecretRefusedEvent : DeRecEvent
+{
+    public override string EventType => "ReplicaSecretRefused";
+    /// <summary>The channel the copy arrived on.</summary>
+    public required ulong ChannelId { get; init; }
+    /// <summary>The member the copy came from.</summary>
+    public required ulong FromReplicaId { get; init; }
+    /// <summary><c>secret_id</c> echoed from the inbound request.</summary>
+    public required ulong SecretId { get; init; }
+    /// <summary><c>version</c> echoed from the inbound request.</summary>
+    public required uint Version { get; init; }
+    /// <summary>The status sent to the publisher.</summary>
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
+    /// <summary>Human-readable reason sent to the publisher.</summary>
+    public required string Memo { get; init; }
 }
 
 /// <summary>
@@ -955,9 +1155,10 @@ public sealed record ProtectSecretStartedEvent : DeRecEvent
     /// of its targets, and the peer echoes it on the response.</summary>
     public required ulong TraceId { get; init; }
 
-    /// <summary>Number of subshares sent to this channel: the
-    /// <see cref="ProtectSecretParams.Weights"/> entry for it, or 1 when
-    /// absent.</summary>
+    /// <summary>Number of subshares sent to this channel, which is also the
+    /// weight now stored for it: its <see cref="ProtectSecretParams.Weights"/>
+    /// entry, 1 when the map does not name it, or the stored weight on a
+    /// publish the library starts on its own.</summary>
     public required uint Weight { get; init; }
 }
 
@@ -1082,6 +1283,64 @@ public sealed record AutoAcceptedEvent : DeRecEvent
 }
 
 /// <summary>
+/// A request that arrived on an authenticated channel failed while it was
+/// being handled. Every such request is owed exactly one response.
+/// </summary>
+/// <remarks>
+/// When the library sent it, <see cref="Responded"/> is <c>true</c> and
+/// <see cref="Action"/> is <c>null</c>. Otherwise <see cref="Responded"/> is
+/// <c>false</c> and <see cref="Action"/> holds the same opaque token
+/// <see cref="ActionRequiredEvent.Action"/> carries: pass it to
+/// <c>RejectAsync</c> to send the response (<c>AcceptAsync</c> refuses it).
+/// <see cref="Action"/> is also <c>null</c> when <c>RejectAsync</c> could never
+/// answer it: a request on a replica group channel that names no member,
+/// which has no reply target, or, with <c>auto_respond_on_failure</c> off, a
+/// replica copy that hands this device the group key and fails before that
+/// key is stored. Resolve each token once: the library is stateless, so
+/// rejecting the same token twice sends two responses. Reported instead of an
+/// exception from <c>ProcessAsync</c> or <c>AcceptAsync</c>, so the call's
+/// other events are kept.
+/// </remarks>
+public sealed record RequestFailedEvent : DeRecEvent
+{
+    public override string EventType => "RequestFailed";
+
+    /// <summary>The channel the request arrived on.</summary>
+    public required ulong ChannelId { get; init; }
+
+    /// <summary>The type of the request that failed; one of the
+    /// <see cref="PendingActionKind"/> constants,
+    /// <see cref="PendingActionKind.Failed"/> for a body that could not be
+    /// decoded or a request the channel cannot carry.</summary>
+    public required string ActionKind { get; init; }
+
+    /// <summary><c>true</c> when the response was handed to the transport.</summary>
+    public required bool Responded { get; init; }
+
+    /// <summary>The <c>StatusEnum</c> value that was sent, or would have been.</summary>
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
+
+    /// <summary>The memo sent with <see cref="Status"/>, or that would have
+    /// been: wire-safe, never the local error text. Passing
+    /// <see cref="Action"/>, <see cref="Status"/> and <see cref="Memo"/> to
+    /// <c>RejectAsync</c> sends the response <c>auto_respond_on_failure</c>
+    /// would have sent.</summary>
+    public required string Memo { get; init; }
+
+    /// <summary>The error's stable code name, as
+    /// <see cref="DeRecException.CodeName"/> reports it.</summary>
+    public required string ErrorCode { get; init; }
+
+    /// <summary>Local description of the failure. Never sent to the peer.</summary>
+    public required string Message { get; init; }
+
+    /// <summary>Opaque PendingAction bytes that answer the request, present
+    /// only when <see cref="Responded"/> is <c>false</c> and the request can
+    /// still be answered. Round-trip verbatim to <c>RejectAsync</c>.</summary>
+    public byte[]? Action { get; init; }
+}
+
+/// <summary>
 /// Placeholder for any DeRecEvent variant not yet fully marshaled
 /// across the FFI. <see cref="Variant"/> carries the Rust discriminant
 /// name so the app can still log "unknown event" cleanly.
@@ -1116,6 +1375,13 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
             },
+            "ShareRefused" => new ShareRefusedEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Version = root.GetProperty("version").GetUInt32(),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
+                Memo = root.GetProperty("memo").GetString() ?? string.Empty,
+            },
             "ShareConfirmed" => new ShareConfirmedEvent
             {
                 ChannelId = ReadId(root.GetProperty("channel_id")),
@@ -1139,6 +1405,14 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
+                Subshares = root.TryGetProperty("subshares", out var ss)
+                    && ss.ValueKind != JsonValueKind.Null
+                    ? ss.GetUInt32()
+                    : null,
+                Threshold = root.TryGetProperty("threshold", out var st)
+                    && st.ValueKind != JsonValueKind.Null
+                    ? st.GetUInt32()
+                    : null,
             },
             "ShareVerifyInvalid" => new ShareVerifyInvalidEvent
             {
@@ -1197,6 +1471,20 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
                 Memo = root.GetProperty("memo").GetString() ?? string.Empty,
             },
+            "ErrorResponseReceived" => new ErrorResponseReceivedEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
+                Memo = root.GetProperty("memo").GetString() ?? string.Empty,
+            },
+            "PairingRefused" => new PairingRefusedEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
+                Memo = root.GetProperty("memo").GetString() ?? string.Empty,
+                ErrorCode = root.GetProperty("error_code").GetString() ?? string.Empty,
+                Message = root.GetProperty("message").GetString() ?? string.Empty,
+            },
             "ReplicaSecretReceived" => ParseReplicaSecretReceived(root),
             "ReplicaSecretInstalled" => ParseReplicaSecretInstalled(root),
             "ReplicaVersionConflict" => new ReplicaVersionConflictEvent
@@ -1208,6 +1496,15 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 HeldAuthorReplicaId = ReadOptionalId(root.GetProperty("held_author_replica_id")),
                 IncomingAuthorReplicaId = ReadOptionalId(root.GetProperty("incoming_author_replica_id")),
                 Secret = ParseSecretObject(root.GetProperty("secret")),
+            },
+            "ReplicaSecretRefused" => new ReplicaSecretRefusedEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                FromReplicaId = ReadId(root.GetProperty("from_replica_id")),
+                SecretId = ReadId(root.GetProperty("secret_id")),
+                Version = root.GetProperty("version").GetUInt32(),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
+                Memo = root.GetProperty("memo").GetString() ?? string.Empty,
             },
             "ReplicaSyncRejected" => new ReplicaSyncRejectedEvent
             {
@@ -1272,6 +1569,17 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 ActionKind = root.GetProperty("action_kind").GetString() ?? string.Empty,
+            },
+            "RequestFailed" => new RequestFailedEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                ActionKind = root.GetProperty("action_kind").GetString() ?? string.Empty,
+                Responded = root.GetProperty("responded").GetBoolean(),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
+                Memo = root.GetProperty("memo").GetString() ?? string.Empty,
+                ErrorCode = root.GetProperty("error_code").GetString() ?? string.Empty,
+                Message = root.GetProperty("message").GetString() ?? string.Empty,
+                Action = root.TryGetProperty("action", out var rfa) ? ReadByteArray(rfa) : null,
             },
             "NoOp" => new NoOpEvent(),
             "MessageIgnored" => new MessageIgnoredEvent
@@ -1462,7 +1770,10 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ReadId(h.GetProperty("channel_id")),
                 ReadEndpoints(h),
                 ReadByteArray(h.GetProperty("shared_key")),
-                h.TryGetProperty("communication_info", out var hci) ? ReadStringMap(hci) : new()));
+                h.TryGetProperty("communication_info", out var hci) ? ReadStringMap(hci) : new(),
+                h.TryGetProperty("weight", out var hw) && hw.ValueKind != JsonValueKind.Null
+                    ? hw.GetUInt32()
+                    : 1));
         }
         var secrets = new List<UserSecret>();
         foreach (var s in secretEl.GetProperty("secrets").EnumerateArray())
@@ -1496,6 +1807,10 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         return new Secret(helpers, secrets)
         {
             Replicas = replicas,
+            Threshold = secretEl.TryGetProperty("threshold", out var t)
+                && t.ValueKind != JsonValueKind.Null
+                ? t.GetUInt32()
+                : null,
         };
     }
 

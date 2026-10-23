@@ -74,6 +74,16 @@ pub(crate) enum Event {
         incoming_author_replica_id: Option<String>,
         secret: SecretWire,
     },
+    /// This device refused a group member's copy of the secret; nothing
+    /// was written and the publisher was answered with `status`.
+    ReplicaSecretRefused {
+        channel_id: String,
+        from_replica_id: String,
+        secret_id: String,
+        version: u32,
+        status: i32,
+        memo: String,
+    },
     ReplicaSecretAcked {
         channel_id: String,
         from_replica_id: String,
@@ -131,6 +141,12 @@ pub(crate) enum Event {
         channel_id: String,
         version: u32,
     },
+    ShareRefused {
+        channel_id: String,
+        version: u32,
+        status: i32,
+        memo: String,
+    },
     ShareConfirmed {
         channel_id: String,
         version: u32,
@@ -150,6 +166,14 @@ pub(crate) enum Event {
     ShareVerified {
         channel_id: String,
         version: u32,
+        /// The owner's recorded subshare count for this channel and version.
+        /// Absent when the stored share predates the count.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subshares: Option<u32>,
+        /// The threshold the owner recorded for this version. Absent when
+        /// the stored share predates it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        threshold: Option<u32>,
     },
     ShareVerifyInvalid {
         channel_id: String,
@@ -266,6 +290,38 @@ pub(crate) enum Event {
         /// route on a single string field.
         action_kind: String,
     },
+    /// An authenticated request failed. `action` is present only when the
+    /// response was not sent, and is the same opaque token `ActionRequired`
+    /// carries: pass it to `reject` verbatim.
+    RequestFailed {
+        channel_id: String,
+        /// Same label vocabulary as `ActionRequired.action_kind`, plus
+        /// `"Failed"` for a body that could not be decoded or a request the
+        /// channel cannot carry.
+        action_kind: String,
+        responded: bool,
+        status: i32,
+        /// The wire-safe memo sent with `status`, or that would have been.
+        memo: String,
+        error_code: String,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        action: Option<Vec<u8>>,
+    },
+    /// The peer answered with an `ErrorResponseMessage`.
+    ErrorResponseReceived {
+        channel_id: String,
+        status: i32,
+        memo: String,
+    },
+    /// This device refused an inbound `PairRequest` under a protocol rule.
+    PairingRefused {
+        channel_id: String,
+        status: i32,
+        memo: String,
+        error_code: String,
+        message: String,
+    },
     NoOp,
     MessageIgnored {
         channel_id: String,
@@ -370,6 +426,10 @@ pub struct SecretWire {
     /// setup. Carries the full member roster and the 32-byte group key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replicas: Option<ReplicasWire>,
+    /// The threshold the secret was split with. Absent when the roster
+    /// records none; passing this object back to `restore` restores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -411,6 +471,9 @@ pub struct Helper {
     pub shared_key: Vec<u8>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub communication_info: HashMap<String, String>,
+    /// The Helper's subshare count from the roster. Always present; passing
+    /// this object back to `restore` writes it into the Helper's channel.
+    pub weight: u32,
 }
 
 #[derive(Serialize)]
@@ -443,6 +506,7 @@ impl From<Secret> for SecretWire {
                 .helpers
                 .into_iter()
                 .map(|h| Helper {
+                    weight: h.effective_weight(),
                     channel_id: h.channel_id.to_string(),
                     transports: h.transports.into_iter().map(Into::into).collect(),
                     shared_key: h.shared_key,
@@ -474,6 +538,7 @@ impl From<Secret> for SecretWire {
                     .collect(),
                 shared_key: g.shared_key,
             }),
+            threshold: v.threshold,
         }
     }
 }
@@ -489,8 +554,8 @@ impl From<ChannelShare> for Share {
 
 impl Event {
     /// Map a [`DeRecEvent`] into its wire DTO. Returns `Err` only when
-    /// [`pending_action_wire::serialize`] fails (`ActionRequired`); all
-    /// other variants are infallible.
+    /// [`pending_action_wire::serialize`] fails (`ActionRequired`,
+    /// `RequestFailed`); all other variants are infallible.
     pub fn from_event(event: DeRecEvent) -> Result<Self, String> {
         Ok(match event {
             DeRecEvent::PairingCompleted {
@@ -562,6 +627,21 @@ impl Event {
                 incoming_author_replica_id: incoming_author_replica_id.map(encode_replica_id),
                 secret: secret.into(),
             },
+            DeRecEvent::ReplicaSecretRefused {
+                channel_id,
+                from_replica_id,
+                secret_id,
+                version,
+                status,
+                memo,
+            } => Self::ReplicaSecretRefused {
+                channel_id: channel_id.0.to_string(),
+                from_replica_id: encode_replica_id(from_replica_id),
+                secret_id: secret_id.to_string(),
+                version,
+                status,
+                memo,
+            },
             DeRecEvent::ReplicaSyncRejected {
                 replica_id,
                 secret_id,
@@ -631,6 +711,17 @@ impl Event {
                 channel_id: channel_id.0.to_string(),
                 version,
             },
+            DeRecEvent::ShareRefused {
+                channel_id,
+                version,
+                status,
+                memo,
+            } => Self::ShareRefused {
+                channel_id: channel_id.0.to_string(),
+                version,
+                status,
+                memo,
+            },
             DeRecEvent::ShareConfirmed {
                 channel_id,
                 version,
@@ -663,9 +754,13 @@ impl Event {
             DeRecEvent::ShareVerified {
                 channel_id,
                 version,
+                subshares,
+                threshold,
             } => Self::ShareVerified {
                 channel_id: channel_id.0.to_string(),
                 version,
+                subshares,
+                threshold,
             },
             DeRecEvent::ShareVerifyInvalid {
                 channel_id,
@@ -830,6 +925,47 @@ impl Event {
                     updated_transports,
                 }
             }
+            DeRecEvent::RequestFailed {
+                channel_id,
+                action_kind,
+                responded,
+                status,
+                memo,
+                error_code,
+                message,
+                action,
+            } => Self::RequestFailed {
+                channel_id: channel_id.0.to_string(),
+                action_kind: pending_action_kind_label(action_kind).to_owned(),
+                responded,
+                status,
+                memo,
+                error_code,
+                message,
+                action: action.map(pending_action_wire::serialize).transpose()?,
+            },
+            DeRecEvent::ErrorResponseReceived {
+                channel_id,
+                status,
+                memo,
+            } => Self::ErrorResponseReceived {
+                channel_id: channel_id.0.to_string(),
+                status,
+                memo,
+            },
+            DeRecEvent::PairingRefused {
+                channel_id,
+                status,
+                memo,
+                error_code,
+                message,
+            } => Self::PairingRefused {
+                channel_id: channel_id.0.to_string(),
+                status,
+                memo,
+                error_code,
+                message,
+            },
             DeRecEvent::NoOp => Self::NoOp,
             DeRecEvent::MessageIgnored {
                 channel_id,
@@ -1021,6 +1157,7 @@ pub(crate) fn pending_action_kind_label(
         K::GetShare => "GetShare",
         K::Unpair => "Unpair",
         K::UpdateChannelInfo => "UpdateChannelInfo",
+        K::Failed => "Failed",
     }
 }
 
@@ -1123,6 +1260,99 @@ mod tests {
         assert_eq!(json["share_secret_id"], "42");
         assert_eq!(json["version"], 5);
         assert!(json.get("share_size").is_none());
+    }
+
+    /// Every roster entry names its weight, so an application passing the
+    /// recovered secret back to `restore` hands the weights back with it. A
+    /// protobuf-default `0` reads as `1`.
+    #[test]
+    fn a_recovered_helper_carries_its_weight() {
+        let helper = |channel_id, weight| crate::protocol::types::HelperInfo {
+            channel_id,
+            transports: Vec::new(),
+            shared_key: vec![0; 32],
+            communication_info: HashMap::new(),
+            weight,
+        };
+        let wire = SecretWire::from(Secret {
+            helpers: vec![helper(1, 3), helper(2, 0)],
+            secrets: Vec::new(),
+            replicas: None,
+            threshold: None,
+        });
+        let json = serde_json::to_value(&wire).expect("serializes");
+        assert_eq!(json["helpers"][0]["weight"], 3);
+        assert_eq!(json["helpers"][1]["weight"], 1);
+    }
+
+    /// `ShareVerified` carries the recorded subshare count, and omits it when
+    /// the owner's share predates the count.
+    #[test]
+    fn share_verified_carries_its_subshares() {
+        let verified = |subshares| {
+            serde_json::to_string(
+                &Event::from_event(DeRecEvent::ShareVerified {
+                    channel_id: crate::types::ChannelId(11),
+                    version: 2,
+                    subshares,
+                    threshold: None,
+                })
+                .expect("converts"),
+            )
+            .expect("serializes")
+        };
+        assert_eq!(
+            verified(Some(3)),
+            r#"{"type":"ShareVerified","channel_id":"11","version":2,"subshares":3}"#
+        );
+        assert_eq!(
+            verified(None),
+            r#"{"type":"ShareVerified","channel_id":"11","version":2}"#
+        );
+    }
+
+    /// `ShareVerified` carries the threshold the version was split with, and
+    /// omits it when the owner's share predates it.
+    #[test]
+    fn share_verified_carries_its_threshold() {
+        let verified = |threshold| {
+            serde_json::to_string(
+                &Event::from_event(DeRecEvent::ShareVerified {
+                    channel_id: crate::types::ChannelId(11),
+                    version: 2,
+                    subshares: Some(1),
+                    threshold,
+                })
+                .expect("converts"),
+            )
+            .expect("serializes")
+        };
+        assert_eq!(
+            verified(Some(3)),
+            r#"{"type":"ShareVerified","channel_id":"11","version":2,"subshares":1,"threshold":3}"#
+        );
+        assert_eq!(
+            verified(None),
+            r#"{"type":"ShareVerified","channel_id":"11","version":2,"subshares":1}"#
+        );
+    }
+
+    /// The recovered roster names its threshold, so passing it back to
+    /// `restore` restores the threshold too. It is omitted when the roster
+    /// records none.
+    #[test]
+    fn a_recovered_secret_carries_its_threshold() {
+        let wire = |threshold| {
+            serde_json::to_value(SecretWire::from(Secret {
+                helpers: Vec::new(),
+                secrets: Vec::new(),
+                replicas: None,
+                threshold,
+            }))
+            .expect("serializes")
+        };
+        assert_eq!(wire(Some(3))["threshold"], 3);
+        assert!(wire(None).get("threshold").is_none());
     }
 
     #[test]
@@ -1280,6 +1510,52 @@ mod tests {
     }
 
     #[test]
+    fn share_refused_maps_status_and_memo() {
+        let mapped = Event::from_event(DeRecEvent::ShareRefused {
+            channel_id: ChannelId(u64::MAX),
+            version: 6,
+            status: derec_proto::StatusEnum::VerificationFailed as i32,
+            memo: "bad merkle path".to_owned(),
+        })
+        .expect("ShareRefused must map");
+
+        let json = serde_json::to_value(&mapped).expect("serializes");
+        assert_eq!(json["type"], "ShareRefused");
+        assert_eq!(json["channel_id"], u64::MAX.to_string());
+        assert_eq!(json["version"], 6);
+        assert_eq!(
+            json["status"],
+            derec_proto::StatusEnum::VerificationFailed as i32
+        );
+        assert_eq!(json["memo"], "bad merkle path");
+    }
+
+    #[test]
+    fn replica_secret_refused_maps_status_and_memo() {
+        let mapped = Event::from_event(DeRecEvent::ReplicaSecretRefused {
+            channel_id: ChannelId(u64::MAX),
+            from_replica_id: 7,
+            secret_id: u64::MAX,
+            version: 3,
+            status: derec_proto::StatusEnum::VerificationFailed as i32,
+            memo: "bad merkle path".to_owned(),
+        })
+        .expect("ReplicaSecretRefused must map");
+
+        let json = serde_json::to_value(&mapped).expect("serializes");
+        assert_eq!(json["type"], "ReplicaSecretRefused");
+        assert_eq!(json["channel_id"], u64::MAX.to_string());
+        assert_eq!(json["from_replica_id"], "7");
+        assert_eq!(json["secret_id"], u64::MAX.to_string());
+        assert_eq!(json["version"], 3);
+        assert_eq!(
+            json["status"],
+            derec_proto::StatusEnum::VerificationFailed as i32
+        );
+        assert_eq!(json["memo"], "bad merkle path");
+    }
+
+    #[test]
     fn recovery_share_refused_maps_status_and_memo() {
         let mapped = Event::from_event(DeRecEvent::RecoveryShareRefused {
             channel_id: ChannelId(u64::MAX),
@@ -1375,5 +1651,111 @@ mod tests {
         assert_eq!(member["channel_id"], "21");
         assert_eq!(member["replica_id"], u64::MAX.to_string());
         assert_eq!(member["reason"], "NoTransports");
+    }
+
+    /// An unanswered failure carries the token the application passes to
+    /// `reject`, as the same opaque bytes `ActionRequired` uses, and the
+    /// status that would have been sent.
+    #[test]
+    fn request_failed_carries_its_token_when_unanswered() {
+        let action = PendingAction::RespondToFailure {
+            channel_id: ChannelId(u64::MAX),
+            trace_id: 9,
+            reply: crate::protocol::ReplyTarget {
+                channel_id: ChannelId(u64::MAX),
+                endpoints: Vec::new(),
+            },
+            request: crate::protocol::FailedRequest::Undecodable,
+        };
+        let expected_bytes = pending_action_wire::serialize(action.clone()).expect("serializes");
+        let mapped = Event::from_event(DeRecEvent::RequestFailed {
+            channel_id: ChannelId(u64::MAX),
+            action_kind: crate::protocol::PendingActionKind::StoreShare,
+            responded: false,
+            status: derec_proto::StatusEnum::Fail as i32,
+            memo: "request could not be processed".to_owned(),
+            error_code: "store".to_owned(),
+            message: "backend unavailable".to_owned(),
+            action: Some(action),
+        })
+        .expect("RequestFailed must map");
+
+        let json = serde_json::to_value(&mapped).expect("serializes");
+        assert_eq!(json["type"], "RequestFailed");
+        assert_eq!(json["channel_id"], u64::MAX.to_string());
+        assert_eq!(json["action_kind"], "StoreShare");
+        assert_eq!(json["responded"], false);
+        assert_eq!(json["status"], derec_proto::StatusEnum::Fail as i32);
+        assert_eq!(json["memo"], "request could not be processed");
+        assert_eq!(json["error_code"], "store");
+        assert_eq!(json["message"], "backend unavailable");
+        assert_eq!(json["action"], serde_json::json!(expected_bytes));
+    }
+
+    /// An answered failure has nothing left to resolve: no token. The status
+    /// it was answered with is always present.
+    #[test]
+    fn request_failed_omits_the_token_and_keeps_the_status_when_answered() {
+        let mapped = Event::from_event(DeRecEvent::RequestFailed {
+            channel_id: ChannelId(4),
+            action_kind: crate::protocol::PendingActionKind::Failed,
+            responded: true,
+            status: derec_proto::StatusEnum::FormatError as i32,
+            memo: "message body could not be decoded".to_owned(),
+            error_code: "internal".to_owned(),
+            message: "cause".to_owned(),
+            action: None,
+        })
+        .expect("RequestFailed must map");
+
+        let json = serde_json::to_value(&mapped).expect("serializes");
+        assert_eq!(json["action_kind"], "Failed");
+        assert_eq!(json["responded"], true);
+        let object = json.as_object().expect("object");
+        assert!(!object.contains_key("action"));
+        assert_eq!(json["status"], derec_proto::StatusEnum::FormatError as i32);
+        assert_eq!(json["memo"], "message body could not be decoded");
+    }
+
+    #[test]
+    fn error_response_received_maps_status_and_memo() {
+        let mapped = Event::from_event(DeRecEvent::ErrorResponseReceived {
+            channel_id: ChannelId(u64::MAX),
+            status: derec_proto::StatusEnum::FormatError as i32,
+            memo: "message body could not be decoded".to_owned(),
+        })
+        .expect("ErrorResponseReceived must map");
+
+        let json = serde_json::to_value(&mapped).expect("serializes");
+        assert_eq!(json["type"], "ErrorResponseReceived");
+        assert_eq!(json["channel_id"], u64::MAX.to_string());
+        assert_eq!(json["status"], derec_proto::StatusEnum::FormatError as i32);
+        assert_eq!(json["memo"], "message body could not be decoded");
+    }
+
+    #[test]
+    fn pairing_refused_maps_status_memo_and_error() {
+        let mapped = Event::from_event(DeRecEvent::PairingRefused {
+            channel_id: ChannelId(u64::MAX),
+            status: derec_proto::StatusEnum::ReplicaIdConflict as i32,
+            memo: "replica id in use".to_owned(),
+            error_code: "replica_id_conflict".to_owned(),
+            message: "replica id 7 is already in use by another member of the group".to_owned(),
+        })
+        .expect("PairingRefused must map");
+
+        let json = serde_json::to_value(&mapped).expect("serializes");
+        assert_eq!(json["type"], "PairingRefused");
+        assert_eq!(json["channel_id"], u64::MAX.to_string());
+        assert_eq!(
+            json["status"],
+            derec_proto::StatusEnum::ReplicaIdConflict as i32
+        );
+        assert_eq!(json["memo"], "replica id in use");
+        assert_eq!(json["error_code"], "replica_id_conflict");
+        assert_eq!(
+            json["message"],
+            "replica id 7 is already in use by another member of the group"
+        );
     }
 }

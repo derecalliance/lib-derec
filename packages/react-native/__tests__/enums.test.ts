@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { DEREC_ERROR_CATEGORIES } from '../src/errors';
+import { DEREC_ERROR_CATEGORIES, DEREC_ERROR_CODES } from '../src/errors';
 import { MessageKind } from '../src/messages';
 import { ContactMode, FlowKind, SenderKind, StatusEnum } from '../src/types';
 
@@ -57,5 +57,15 @@ describe('enum parity with the shared fixture', () => {
     expect([...DEREC_ERROR_CATEGORIES].sort()).toEqual(
       [...(expected as string[])].sort(),
     );
+  });
+
+  // The C ABI emits exactly `library/src/interop/error_codes.rs`'s `Code`
+  // table, the same table the fixture mirrors — unlike the WASM bindings,
+  // this SDK has no marshalling-level codes of its own, so no extra entries
+  // belong here.
+  it('DeRecErrorCode covers exactly the codes the C ABI can emit', () => {
+    const expected = fixture.enums.DeRecErrorCode.variants.map((v) => v.text);
+    expect(expected.every((text) => typeof text === 'string')).toBe(true);
+    expect([...DEREC_ERROR_CODES].sort()).toEqual([...(expected as string[])].sort());
   });
 });

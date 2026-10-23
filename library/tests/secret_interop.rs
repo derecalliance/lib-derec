@@ -23,6 +23,7 @@ fn recovered_secret_decodes_without_the_protocol() {
             }],
             shared_key: vec![0xAB; 32],
             communication_info: HashMap::from([("name".to_owned(), "Helper 0".to_owned())]),
+            weight: 1,
         }],
         secrets: vec![UserSecret {
             id: vec![0xDE, 0xAD, 0xBE, 0xEF],
@@ -53,6 +54,7 @@ fn recovered_secret_decodes_without_the_protocol() {
                 },
             ],
         }),
+        threshold: None,
     };
 
     // The bytes a helper stores / recovery reconstructs into secret_data.

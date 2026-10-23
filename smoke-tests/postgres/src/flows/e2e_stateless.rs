@@ -42,7 +42,8 @@ use derec_proto::{ContactMode, SenderKind};
 
 use crate::db::Database;
 use crate::flows::assertions::{
-    Tables, assert_tables, replica_ids, share_versions, snapshot, snapshot_version,
+    Tables, assert_tables, replica_ids, share_versions, snapshot, snapshot_threshold,
+    snapshot_version,
 };
 use crate::peer::PeerOptions;
 use crate::stateless::{StatelessPeer, deliver, pump, pump_tolerating_stale};
@@ -985,6 +986,16 @@ async fn step_3_recover_after_device_loss(
         Some(2),
         "restore() must commit the recovered version as the owner's snapshot"
     );
+    assert_eq!(
+        recovered.threshold,
+        Some(THRESHOLD as u32),
+        "the recovered roster carries the threshold it was split with"
+    );
+    assert_eq!(
+        snapshot_threshold(&owner.client(), SECRET_ID).await,
+        Some(THRESHOLD as i64),
+        "restore() must put the roster's threshold back on the snapshot"
+    );
 
     // Post-recovery the owner is whole again: five re-paired channels, their
     // keys and the snapshot. Restore writes no tracking shares — recovery
@@ -1196,6 +1207,7 @@ async fn protect(
             secrets,
             description: Some(description.to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("owner.start(ProtectSecret) failed");
@@ -1473,6 +1485,7 @@ async fn step_10_a_silent_helper_is_resolved_by_a_scheduled_tick(
             secrets: secrets.to_vec(),
             description: Some("published while one helper is offline".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("owner.start(ProtectSecret)");

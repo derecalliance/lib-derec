@@ -93,13 +93,11 @@ pub(crate) trait MessageBodyExt {
     /// The inner message's timestamp: the time it was sent.
     ///
     /// The envelope carries the same value, and a receiver rejects a message
-    /// whose two copies differ. `None` when the field is absent, and always
-    /// for `ErrorResponse`, which has no timestamp field.
+    /// whose two copies differ. `None` when the field is absent.
     fn timestamp(&self) -> Option<&prost_types::Timestamp>;
 
     /// Stamp the inner message with the time it is being sent, so the
-    /// envelope can carry the same value. A no-op for `ErrorResponse`, which
-    /// has no timestamp field.
+    /// envelope can carry the same value.
     fn set_timestamp(&mut self, ts: prost_types::Timestamp);
 }
 
@@ -160,7 +158,7 @@ impl MessageBodyExt for MessageBody {
             MessageBody::GetSecretIdsVersionsResponse(m) => m.timestamp.as_ref(),
             MessageBody::GetShareRequest(m) => m.timestamp.as_ref(),
             MessageBody::GetShareResponse(m) => m.timestamp.as_ref(),
-            MessageBody::ErrorResponse(_) => None,
+            MessageBody::ErrorResponse(m) => m.timestamp.as_ref(),
             MessageBody::UpdateChannelInfoRequest(m) => m.timestamp.as_ref(),
             MessageBody::UpdateChannelInfoResponse(m) => m.timestamp.as_ref(),
             MessageBody::PrePairRequest(m) => m.timestamp.as_ref(),
@@ -182,7 +180,7 @@ impl MessageBodyExt for MessageBody {
             MessageBody::GetSecretIdsVersionsResponse(m) => &mut m.timestamp,
             MessageBody::GetShareRequest(m) => &mut m.timestamp,
             MessageBody::GetShareResponse(m) => &mut m.timestamp,
-            MessageBody::ErrorResponse(_) => return,
+            MessageBody::ErrorResponse(m) => &mut m.timestamp,
             MessageBody::UpdateChannelInfoRequest(m) => &mut m.timestamp,
             MessageBody::UpdateChannelInfoResponse(m) => &mut m.timestamp,
             MessageBody::PrePairRequest(m) => &mut m.timestamp,
@@ -282,6 +280,20 @@ mod tests {
         for body in multi_valued {
             assert_eq!(body.expected_sender_role(), None, "{body:?}");
         }
+    }
+
+    /// An `ErrorResponse` is stamped and read like every other body, so it
+    /// passes the envelope timestamp check instead of always failing it.
+    #[test]
+    fn an_error_response_carries_its_timestamp() {
+        let ts = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 5,
+        };
+        let mut body = MessageBody::ErrorResponse(derec_proto::ErrorResponseMessage::default());
+        assert_eq!(body.timestamp(), None);
+        body.set_timestamp(ts);
+        assert_eq!(body.timestamp(), Some(&ts));
     }
 
     /// A `reply_to` is the one peer-chosen endpoint gated centrally, so a

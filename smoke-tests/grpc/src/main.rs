@@ -874,6 +874,7 @@ async fn protect_secret(owner: &Node, bus: &mut Bus) -> u32 {
             }],
             description: Some("grpc smoke-test distribution".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("owner start(ProtectSecret) failed");
@@ -958,6 +959,7 @@ async fn verify_shares(owner: &Node, bus: &mut Bus, version: u32) {
             DeRecEvent::ShareVerified {
                 channel_id,
                 version,
+                ..
             } => Some((*channel_id, *version)),
             _ => None,
         })

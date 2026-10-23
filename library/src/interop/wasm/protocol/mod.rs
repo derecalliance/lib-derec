@@ -702,8 +702,11 @@ impl DeRecProtocolWasm {
     /// * `params` — the flow's parameters, declared per kind in `index.d.ts`
     ///   as `PairingParams`, `DiscoveryParams`, … `UnpairReplicaParams`.
     ///   ProtectSecret's optional `weights` is a `Map<bigint, number>` of
-    ///   channel ID to how many subshares that channel holds; absent or
-    ///   `null` means one subshare each.
+    ///   channel ID to how many subshares that channel holds. It is the full
+    ///   assignment: an unnamed Helper gets one, and absent or `null` is an
+    ///   empty map, which resets every Helper to one. Its optional
+    ///   `threshold` is the round's threshold; absent or `null` keeps the
+    ///   stored one, or the builder's when none is stored.
     ///
     /// # Returns
     ///
@@ -918,7 +921,9 @@ impl DeRecProtocolWasm {
     /// `SecretRecovered` event; pass it verbatim. A helper or member whose
     /// `transports` is empty, `null` or absent gets no channel; it is
     /// reported as a `PeerNotRestored` event in the returned array and the
-    /// rest of the roster is restored.
+    /// rest of the roster is restored. An absent or `null`
+    /// `communication_info` reads as an empty map, and an absent or `null`
+    /// helper `weight` as `1`.
     ///
     /// Errors surface as a `DeRecError` (`category`, `code`, `message`):
     ///
@@ -1158,7 +1163,7 @@ fn parse_user_secrets(val: JsValue) -> Result<Vec<UserSecret>, JsValue> {
 /// Flow kinds:
 /// - `0` = Pairing: `{ kind: number, contact: ContactMessage, peerCommunicationInfo?: Record<string, string> }`
 /// - `1` = Discovery: `{ target?: Target }`
-/// - `2` = ProtectSecret: `{ secrets: UserSecret[], description?: string, weights?: Map<u64, number> }`
+/// - `2` = ProtectSecret: `{ secrets: UserSecret[], description?: string, weights?: Map<u64, number>, threshold?: number }`
 /// - `3` = VerifyShares: `{ secretId: u64, version: number, target?: Target }`
 /// - `4` = RecoverSecret: `{ secretId: u64, version: number }`
 /// - `5` = Unpair: `{ channel_id: u64, memo?: string }`
@@ -1169,7 +1174,10 @@ fn parse_user_secrets(val: JsValue) -> Result<Vec<UserSecret>, JsValue> {
 /// `u64` is a `bigint`, a non-negative safe-integer `number`, or a decimal
 /// string; `Target` is `null`/absent (every channel), a `bigint`/`number`, or an array
 /// of them. `weights` maps a channel ID to how many subshares that channel
-/// holds; `null`/absent means every channel holds one subshare (see [`parse_weights`]).
+/// holds. It is the full assignment, so `null`/absent is an empty map: every
+/// channel holds one subshare and that is what is stored (see [`parse_weights`]).
+/// `threshold` is the round's threshold; `null`/absent keeps the stored one,
+/// or the builder's when none is stored.
 fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
     match flow_kind {
         0 => {
@@ -1216,10 +1224,18 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
             let weights_val = js_sys::Reflect::get(&params, &JsValue::from_str("weights"))
                 .unwrap_or(JsValue::UNDEFINED);
             let weights = parse_weights(weights_val)?;
+            let threshold_val = js_sys::Reflect::get(&params, &JsValue::from_str("threshold"))
+                .unwrap_or(JsValue::UNDEFINED);
+            let threshold = if threshold_val.is_undefined() || threshold_val.is_null() {
+                None
+            } else {
+                Some(js_number_to_u32(&threshold_val, "threshold")?)
+            };
             Ok(DeRecFlow::ProtectSecret {
                 secrets,
                 description,
                 weights,
+                threshold,
             })
         }
         3 => {

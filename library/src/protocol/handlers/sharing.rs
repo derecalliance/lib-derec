@@ -12,6 +12,7 @@ use crate::extensions::message_body::{MessageBodyExt as _, Route};
 use crate::primitives::sharing::request::SHARE_ALGORITHM_REPLICA_SECRET;
 use crate::protocol::DeRecUserSecretStore;
 use crate::protocol::context::{Exchange, Local, Round};
+use crate::protocol::obligation::{deliver, refused, reported};
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::ChannelQuery;
 use crate::{
@@ -85,13 +86,32 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 /// that never write to `stores.shares`. The snapshot written at the end of
 /// this function is the source of truth the next round reads.
 ///
-/// `weights` names the Helpers that receive more than one subshare;
-/// every other paired Helper receives one. It is validated against the
-/// paired Helper channels before a version is chosen: a key that is not a
-/// paired Helper channel (a replica channel included), a weight of `0`, or
-/// a weight `>= threshold` fails the call with
-/// [`crate::Error::Sharing`] — nothing is sent, no version is consumed and
-/// no snapshot is written, even when the round would not have split.
+/// `weights` decides how many subshares each paired Helper receives. An
+/// explicit map is the full assignment: a Helper it names gets its entry and
+/// every other paired Helper gets `1`, so an empty map resets every Helper to
+/// `1`. `None` — a publish the library starts on its own — reuses the weight
+/// stored on each Helper's channel. A key that is not a paired Helper channel
+/// (a replica channel included) fails the call with
+/// [`crate::Error::Sharing`].
+///
+/// The round's threshold is `threshold` when given, otherwise the one stored
+/// on the latest [`UserSecrets`](crate::protocol::types::UserSecrets)
+/// snapshot, otherwise `default_threshold` (the builder's). It must be at
+/// least `2`, failing with
+/// [`SharingError::InvalidThreshold`](crate::primitives::sharing::SharingError::InvalidThreshold),
+/// and no greater than `max_subshares`, failing with [`Error::InvalidInput`].
+///
+/// Every resolved weight, stored ones included, must be in `1..threshold`; a
+/// weight recorded under a higher threshold fails the round the same way.
+/// These checks run before a version is chosen: nothing is written or sent,
+/// no version is consumed and no snapshot is written, even when the round
+/// would not have split. Once they pass, the resolved weights are written to
+/// each Helper's channel before anything is sent, so a round that later fails
+/// still leaves them recorded for the next one. The threshold is stored only
+/// on the round's own snapshot, saved at the end, and on the owner's copies
+/// of the shares it sends: a snapshot never records a threshold its version
+/// was not split with, so a round that fails before its snapshot is saved
+/// leaves the previous threshold in place.
 ///
 /// `max_subshares`, when set, bounds the round's total subshares. It is
 /// checked right after the weights, with the same guarantees: a total above
@@ -100,10 +120,10 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 /// before a version is chosen or anything is sent.
 ///
 /// The split runs once and feeds both the helper-distribution path and
-/// the Destination composite. Below `threshold` total subshares (the sum of
-/// every paired Helper's weight) no split runs at all: Helpers receive
-/// nothing this round and any paired Replicas receive a secret-only
-/// composite carrying no share material.
+/// the Destination composite. Below the round's threshold in total
+/// subshares (the sum of every paired Helper's weight) no split runs at all:
+/// Helpers receive nothing this round and any paired Replicas receive a
+/// secret-only composite carrying no share material.
 ///
 /// The snapshot is persisted only *after* distribution attempts
 /// complete, so an interrupted round never leaves the version ahead of
@@ -117,16 +137,21 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     local: &Local<'_>,
     secrets: Vec<UserSecret>,
     description: Option<String>,
-    weights: std::collections::HashMap<ChannelId, u32>,
-    threshold: usize,
+    weights: Option<&std::collections::HashMap<ChannelId, u32>>,
+    threshold: Option<u32>,
+    default_threshold: usize,
     max_subshares: Option<u64>,
     round: &Round<'_>,
 ) -> Result<Option<SharingRoundResult>> {
     let secret_id = local.secret_id;
-    let (helpers, replicas) = load_all_paired_targets(stores, local).await?;
+    let (mut helpers, replicas) = load_all_paired_targets(stores, local).await?;
 
-    let helper_channel_ids: Vec<ChannelId> = helpers.iter().map(|(ch, _)| ch.channel_id).collect();
-    let weighted_channels = weighted_helper_channels(&helper_channel_ids, &weights, threshold)?;
+    let previous = stores.user_secrets.load_latest(secret_id).await?;
+    let round_threshold = threshold
+        .or(previous.as_ref().and_then(|s| s.threshold))
+        .map_or(default_threshold, |t| t as usize);
+    validate_threshold(&helpers, round_threshold, max_subshares)?;
+    let weighted_channels = resolve_weights(&helpers, weights, round_threshold)?;
     let subshares = total_subshares(&weighted_channels);
     if let Some(max) = max_subshares
         && subshares > max
@@ -135,9 +160,24 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
             crate::primitives::sharing::SharingError::TooManySubshares { subshares, max }.into(),
         );
     }
+    let threshold = round_threshold;
+    let recorded_threshold = u32::try_from(threshold).ok();
 
     if helpers.is_empty() && replicas.is_empty() {
         return Ok(None);
+    }
+
+    for ((channel, _), &(_, weight)) in helpers.iter_mut().zip(&weighted_channels) {
+        if channel.weight != weight {
+            channel.weight = weight;
+            stores
+                .channels
+                .save(
+                    secret_id,
+                    crate::protocol::types::ChannelRecord::Helper(channel.clone()),
+                )
+                .await?;
+        }
     }
 
     let snapshot_secrets = secrets.clone();
@@ -167,7 +207,14 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         },
         None => None,
     };
-    let secret = build_secret(&helpers, &roster, secrets, group_channel, group_key)?;
+    let secret = build_secret(
+        &helpers,
+        &roster,
+        secrets,
+        group_channel,
+        group_key,
+        recorded_threshold,
+    )?;
 
     // A helper holds exactly one endpoint: the one it paired with. Every other
     // member of the group is invisible to it, so a publish from a group must
@@ -182,12 +229,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     };
     let derec_secret_bytes = wrap_for_helper_split(&secret, threshold);
 
-    let version = stores
-        .user_secrets
-        .load_latest(secret_id)
-        .await?
-        .map(|s| s.version + 1)
-        .unwrap_or(1);
+    let version = previous.as_ref().map(|s| s.version + 1).unwrap_or(1);
     let description = description.as_deref().unwrap_or("").to_owned();
 
     let split_result = if subshares >= threshold as u64 {
@@ -204,9 +246,10 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 
     let mut outcomes: Vec<(ChannelId, Result<()>)> = Vec::new();
     let mut replica_outcomes: Vec<(crate::types::ReplicaId, Result<()>)> = Vec::new();
+    let mut keep_list = Vec::new();
 
     if let Some(ref result) = split_result {
-        let keep_list = resolve_keep_list(stores, secret_id, version).await?;
+        keep_list = resolve_keep_list(stores, secret_id, version).await?;
         let helper_outcomes = distribute_shares(
             stores,
             local,
@@ -214,6 +257,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
             result,
             &keep_list,
             version,
+            recorded_threshold,
             &description,
             &Round {
                 reply_to: &helper_reply_to,
@@ -250,47 +294,99 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
                 secrets: snapshot_secrets,
                 description: snapshot_description,
                 author_replica_id: local.replica_id,
+                threshold: recorded_threshold,
             },
         )
         .await?;
 
     Ok(Some(SharingRoundResult {
         version,
+        threshold: recorded_threshold,
+        weights: weighted_channels.into_iter().collect(),
         outcomes,
         replica_outcomes,
+        keep_list,
     }))
 }
 
-/// Pairs every paired Helper channel with its subshare weight: its `weights`
-/// entry, or `1` when it has none.
+/// Checks the round's threshold before any weight is judged against it.
 ///
-/// Every `weights` key must be a paired Helper channel — a replica channel
-/// carries no subshares — and every weight must be in `1..threshold`. Entries
-/// are judged in ascending channel-ID order, so the first offending entry
-/// reported as [`crate::primitives::sharing::SharingError::InvalidWeight`] does
-/// not depend on the map's iteration order.
-fn weighted_helper_channels(
-    helper_channel_ids: &[ChannelId],
-    weights: &std::collections::HashMap<ChannelId, u32>,
+/// A threshold below `2` admits no valid weight, so it is reported as
+/// [`crate::primitives::sharing::SharingError::InvalidThreshold`]. A threshold
+/// above the `max_subshares` cap could never be met by a round that splits.
+fn validate_threshold(
+    helpers: &[(crate::protocol::types::HelperChannel, SharedKey)],
+    threshold: usize,
+    max_subshares: Option<u64>,
+) -> Result<()> {
+    if threshold < 2 || u32::try_from(threshold).is_err() {
+        return Err(crate::primitives::sharing::SharingError::InvalidThreshold {
+            threshold,
+            channels: helpers.len(),
+            subshares: helpers.iter().map(|(c, _)| u64::from(c.weight)).sum(),
+        }
+        .into());
+    }
+    if let Some(max) = max_subshares
+        && max < threshold as u64
+    {
+        return Err(Error::InvalidInput(
+            "max_subshares must be >= threshold; a lower cap fails every round that splits",
+        ));
+    }
+    Ok(())
+}
+
+/// Pairs every paired Helper channel with the subshare weight this round
+/// gives it, in `helpers` order.
+///
+/// With `weights` the map is the full assignment: a named Helper gets its
+/// entry and every other one gets `1`. Every key must be a paired Helper
+/// channel — a replica channel carries no subshares. Without it each Helper
+/// keeps the weight stored on its channel.
+///
+/// Every resolved weight must be in `1..threshold`. Map entries are judged
+/// first, then the resolved weights, each in ascending channel-ID order, so
+/// the offending entry reported as
+/// [`crate::primitives::sharing::SharingError::InvalidWeight`] does not depend
+/// on the map's iteration order.
+fn resolve_weights(
+    helpers: &[(crate::protocol::types::HelperChannel, SharedKey)],
+    weights: Option<&std::collections::HashMap<ChannelId, u32>>,
     threshold: usize,
 ) -> Result<Vec<WeightedChannel>> {
-    let mut entries: Vec<(ChannelId, u32)> = weights.iter().map(|(&c, &w)| (c, w)).collect();
-    entries.sort_by_key(|&(channel_id, _)| channel_id);
-    for (channel_id, weight) in entries {
-        if !helper_channel_ids.contains(&channel_id) {
-            return Err(crate::primitives::sharing::SharingError::InvalidWeight {
-                channel_id: channel_id.into(),
-                weight,
+    if let Some(weights) = weights {
+        let mut entries: Vec<(ChannelId, u32)> = weights.iter().map(|(&c, &w)| (c, w)).collect();
+        entries.sort_by_key(|&(channel_id, _)| channel_id);
+        for (channel_id, weight) in entries {
+            if !helpers.iter().any(|(ch, _)| ch.channel_id == channel_id) {
+                return Err(crate::primitives::sharing::SharingError::InvalidWeight {
+                    channel_id: channel_id.into(),
+                    weight,
+                }
+                .into());
             }
-            .into());
+            validate_weight(channel_id, weight, threshold)?;
         }
-        validate_weight(channel_id, weight, threshold)?;
     }
 
-    Ok(helper_channel_ids
+    let resolved: Vec<WeightedChannel> = helpers
         .iter()
-        .map(|&channel_id| (channel_id, weights.get(&channel_id).copied().unwrap_or(1)))
-        .collect())
+        .map(|(channel, _)| {
+            let weight = match weights {
+                Some(weights) => weights.get(&channel.channel_id).copied().unwrap_or(1),
+                None => channel.weight,
+            };
+            (channel.channel_id, weight)
+        })
+        .collect();
+
+    let mut ordered = resolved.clone();
+    ordered.sort_by_key(|&(channel_id, _)| channel_id);
+    for (channel_id, weight) in ordered {
+        validate_weight(channel_id, weight, threshold)?;
+    }
+    Ok(resolved)
 }
 
 /// The output of [`start`] on a round with at least one targeted peer.
@@ -301,6 +397,10 @@ fn weighted_helper_channels(
 /// entry to `ProtectSecretStarted` / `ProtectSecretFailed`.
 pub(in crate::protocol) struct SharingRoundResult {
     pub(in crate::protocol) version: u32,
+    /// The threshold this round split at.
+    pub(in crate::protocol) threshold: Option<u32>,
+    /// The weight this round gave every paired Helper, by channel.
+    pub(in crate::protocol) weights: std::collections::HashMap<ChannelId, u32>,
     /// One entry per helper written to, keyed by its channel.
     pub(in crate::protocol) outcomes: Vec<(ChannelId, Result<()>)>,
     /// One entry per group member written to, keyed by its `ReplicaId`.
@@ -309,6 +409,9 @@ pub(in crate::protocol) struct SharingRoundResult {
     /// them by `ChannelId` would collapse the whole group into a single
     /// entry, and the first answer would settle the round for all of them.
     pub(in crate::protocol) replica_outcomes: Vec<(crate::types::ReplicaId, Result<()>)>,
+    /// The `keepList` every Helper in `outcomes` was sent; empty when no
+    /// share was sent or the Helpers were told to keep every version.
+    pub(in crate::protocol) keep_list: Vec<u32>,
 }
 
 #[cfg_attr(
@@ -324,6 +427,15 @@ pub(in crate::protocol) struct SharingRoundResult {
 )]
 /// Helper side of a `StoreShareRequestMessage`: persist the incoming
 /// share, apply the request's `keepList`, and acknowledge.
+///
+/// # Refusals
+///
+/// The share is validated first, with the same rules `on_request` applies
+/// before raising `ActionRequired`. A share that does not decode
+/// (`FORMAT_ERROR`) or does not verify (`VERIFICATION_FAILED`), or a
+/// different share at an already-stored version (`VERSION_CONFLICT`), is
+/// answered with that status and reported as [`DeRecEvent::ShareRefused`]:
+/// nothing is stored and the `keepList` is not applied.
 ///
 /// # Retention (`keepList`)
 ///
@@ -355,6 +467,14 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     let secret_id = local.secret_id;
     let version = request.version;
     let keep_list = &request.keep_list;
+
+    // Validated before anything is loaded, stored or removed: an accepted
+    // `PendingAction` may have been persisted, or built by hand, without
+    // passing through `on_request`.
+    if let Err(fault) = sharing_response::validate_share(request) {
+        return refuse(stores, local, exchange, request, fault.status, fault.memo).await;
+    }
+
     let encoded_request = request.encode_to_vec();
 
     // Applying a `keepList` needs every version stored on the channel;
@@ -387,16 +507,6 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
 
     match already_stored {
         Some(stored) if stored.bytes != encoded_request => {
-            reject(
-                stores,
-                local,
-                exchange,
-                request,
-                StatusEnum::VersionConflict,
-                "a different share is already stored at this version",
-            )
-            .await?;
-
             #[cfg(feature = "logging")]
             tracing::warn!(
                 channel_id = channel_id.0,
@@ -405,7 +515,15 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
                 "version conflict — refused a second writer at an existing version"
             );
 
-            return Ok(vec![DeRecEvent::NoOp]);
+            return refuse(
+                stores,
+                local,
+                exchange,
+                request,
+                StatusEnum::VersionConflict,
+                "a different share is already stored at this version",
+            )
+            .await;
         }
         Some(_) => {
             // Byte-identical re-send: acknowledge without rewriting.
@@ -427,13 +545,15 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
                         secret_id: request.secret_id,
                         version,
                         bytes: encoded_request,
+                        subshares: None,
+                        threshold: None,
                     },
                 )
                 .await;
             match save_result {
                 Ok(()) => {}
                 Err(ShareStoreError::Refused(refusal)) => {
-                    reject(
+                    let sent = reject(
                         stores,
                         local,
                         exchange,
@@ -441,7 +561,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
                         refusal.status(),
                         refusal.memo(),
                     )
-                    .await?;
+                    .await;
 
                     #[cfg(feature = "logging")]
                     tracing::info!(
@@ -451,7 +571,13 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
                         "share update refused by the application's share store"
                     );
 
-                    return Ok(vec![DeRecEvent::NoOp]);
+                    return refused(
+                        exchange.obligation,
+                        DeRecEvent::NoOp,
+                        refusal.status(),
+                        refusal.memo(),
+                        sent,
+                    );
                 }
                 Err(other) => return Err(other.into()),
             }
@@ -491,10 +617,19 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .resolve_response_endpoints(
             secret_id,
             channel_id,
+            local.policy,
             &crate::extensions::advertised_endpoints::reply_to_owned(request),
         )
         .await?;
-    stores.transport.send(&endpoint, envelope).await?;
+    let sent = deliver(
+        exchange.obligation,
+        stores.transport,
+        &endpoint,
+        envelope,
+        StatusEnum::Ok,
+        "",
+    )
+    .await;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -504,10 +639,14 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         "share stored and acknowledged"
     );
 
-    Ok(vec![DeRecEvent::ShareStored {
-        channel_id,
-        version,
-    }])
+    reported(
+        exchange.obligation,
+        vec![DeRecEvent::ShareStored {
+            channel_id,
+            version,
+        }],
+        sent,
+    )
 }
 
 #[cfg_attr(
@@ -531,27 +670,19 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
 ) -> Result<()> {
     let channel_id = exchange.channel_id;
     let secret_id = local.secret_id;
-    let response = StoreShareResponseMessage {
-        result: Some(DeRecResult {
-            status: status as i32,
-            memo: memo.to_owned(),
-        }),
-        secret_id: request.secret_id,
-        version: request.version,
-        timestamp: Some(current_timestamp()),
-        // Mirror the request's audience: only a replica-bound request is
-        // rejected by a replica, and only then is a writer identity due.
-        replica_id: request.replica_id.and(local.replica_id),
-    };
     crate::extensions::channel_store::send_channel_message(
         stores.channels,
         stores.transport,
         secret_id,
         channel_id,
-        MessageBody::StoreShareResponse(response),
+        failure_response(local, request, status, memo),
         exchange.shared_key,
         exchange.trace_id,
+        local.policy,
         &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        exchange.obligation,
+        status,
+        memo,
     )
     .await?;
 
@@ -567,6 +698,62 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     Ok(())
 }
 
+/// The `StoreShareResponse` that answers `request` with a non-`Ok` `status`.
+pub(in crate::protocol) fn failure_response(
+    local: &Local<'_>,
+    request: &StoreShareRequestMessage,
+    status: StatusEnum,
+    memo: &str,
+) -> MessageBody {
+    MessageBody::StoreShareResponse(StoreShareResponseMessage {
+        result: Some(DeRecResult {
+            status: status as i32,
+            memo: memo.to_owned(),
+        }),
+        secret_id: request.secret_id,
+        version: request.version,
+        timestamp: Some(current_timestamp()),
+        // Mirror the request's audience: only a replica-bound request is
+        // rejected by a replica, and only then is a writer identity due.
+        replica_id: request.replica_id.and(local.replica_id),
+    })
+}
+
+/// A refusal the library itself makes on a `StoreShareRequest`: answer the
+/// Owner with `status` and `memo` and report
+/// [`DeRecEvent::ShareRefused`] carrying the same values.
+///
+/// The answer is sent whatever `auto_respond_on_failure` says: the request
+/// was authenticated and the refusal is a protocol outcome, not a failure,
+/// so an Owner left without it would only learn of it by timing out.
+///
+/// `ShareRefused` is reported however the answer fares. A send failure after
+/// the answer was handed to the transport is reported alongside it and never
+/// answered again; one before that is answered by the router with this same
+/// status and memo.
+async fn refuse<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    exchange: &Exchange<'_>,
+    request: &StoreShareRequestMessage,
+    status: StatusEnum,
+    memo: &str,
+) -> Result<Vec<DeRecEvent>> {
+    let sent = reject(stores, local, exchange, request, status, memo).await;
+    refused(
+        exchange.obligation,
+        DeRecEvent::ShareRefused {
+            channel_id: exchange.channel_id,
+            version: request.version,
+            status: status as i32,
+            memo: memo.to_owned(),
+        },
+        status,
+        memo,
+        sent,
+    )
+}
+
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(
@@ -578,6 +765,14 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         )
     )
 )]
+/// Helper side of an inbound `StoreShareRequestMessage`, before the
+/// application decides on it.
+///
+/// A share outside the Helper's size range (`SIZE_LIMIT_EXCEEDED`), or one
+/// that does not decode (`FORMAT_ERROR`) or verify (`VERIFICATION_FAILED`),
+/// is answered with that status and reported as
+/// [`DeRecEvent::ShareRefused`] instead of `ActionRequired`, so the
+/// application is never asked to store it.
 async fn on_request<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -589,7 +784,7 @@ async fn on_request<S: StoreSet>(
         let too_small = range.min_share_size > 0 && len < range.min_share_size;
         let too_large = range.max_share_size != 0 && len > range.max_share_size;
         if too_small || too_large {
-            reject(
+            return refuse(
                 stores,
                 local,
                 exchange,
@@ -597,9 +792,12 @@ async fn on_request<S: StoreSet>(
                 StatusEnum::SizeLimitExceeded,
                 "share size is outside the helper's accepted range",
             )
-            .await?;
-            return Ok(vec![DeRecEvent::NoOp]);
+            .await;
         }
+    }
+
+    if let Err(fault) = sharing_response::validate_share(&request) {
+        return refuse(stores, local, exchange, &request, fault.status, fault.memo).await;
     }
 
     Ok(vec![DeRecEvent::ActionRequired {
@@ -775,6 +973,7 @@ pub(in crate::protocol) fn build_secret(
     secrets: Vec<UserSecret>,
     group_channel: Option<ChannelId>,
     group_key: Option<SharedKey>,
+    threshold: Option<u32>,
 ) -> Result<Secret> {
     let helper_infos: Vec<HelperInfo> = paired_helpers
         .iter()
@@ -783,6 +982,7 @@ pub(in crate::protocol) fn build_secret(
             transports: channel.transports.clone(),
             shared_key: shared_key.to_vec(),
             communication_info: channel.communication_info.clone(),
+            weight: channel.weight,
         })
         .collect();
 
@@ -790,6 +990,7 @@ pub(in crate::protocol) fn build_secret(
         helpers: helper_infos,
         secrets,
         replicas: build_replicas(roster, group_channel, group_key)?,
+        threshold,
     })
 }
 
@@ -932,6 +1133,7 @@ async fn distribute_shares<S: StoreSet>(
     split_result: &crate::primitives::sharing::request::SplitResult,
     keep_list: &[u32],
     version: u32,
+    threshold: Option<u32>,
     description: &str,
     round: &Round<'_>,
 ) -> Vec<(ChannelId, Result<()>)> {
@@ -949,6 +1151,7 @@ async fn distribute_shares<S: StoreSet>(
             committed_share,
             keep_list,
             version,
+            threshold,
             description,
             round,
         )
@@ -983,6 +1186,19 @@ async fn distribute_shares<S: StoreSet>(
 
     results
 }
+/// How many subshares `committed` carries: the length of `subshares` in the
+/// `DeRecShare` it wraps, or `None` when that share does not decode or
+/// carries none — the proto requires at least one, so an empty list is a
+/// malformed share, not a real count of zero.
+pub(in crate::protocol) fn subshare_count(
+    committed: &derec_proto::CommittedDeRecShare,
+) -> Option<u32> {
+    derec_proto::DeRecShare::decode(committed.de_rec_share.as_slice())
+        .ok()
+        .and_then(|share| u32::try_from(share.subshares.len()).ok())
+        .filter(|&n| n > 0)
+}
+
 /// Send one Helper its share and save the owner's proof of what was sent.
 ///
 /// The saved proof is retained only until the round settles that channel:
@@ -992,11 +1208,27 @@ async fn distribute_shares<S: StoreSet>(
 /// `ShareRejected` (any status) or by the round timing out. A stored proof
 /// is therefore always either confirmed by its Helper or still part of an
 /// open round — a late `ShareConfirmed` arriving after the failure is
-/// recorded but never recreates it. This guarantee holds on the publishing
-/// device; a replica Destination holds the proofs the Source mirrored at
-/// publish time and never sees `SharingComplete`, so verifying there can
-/// report `ShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`) for a helper that
-/// failed the Source's round.
+/// recorded but never recreates it.
+///
+/// A confirmation also removes the proofs of older versions the Helper
+/// dropped: a Helper that accepts this share removes every version it holds
+/// on the channel that `keep_list` leaves out, so when it confirms, the
+/// owner removes its proofs of those versions for that channel. A Helper
+/// that refuses or never answers removes nothing, and neither does the
+/// owner. Verifying a removed version reports
+/// [`VerifyFailureReason::NoProof`](crate::protocol::VerifyFailureReason::NoProof)
+/// without asking the Helper.
+///
+/// None of this reaches a replica Destination. It never sees the Helpers'
+/// answers, and it keeps every proof the share map of a copy gives it: it
+/// never deletes one on its own, and freeing that storage is the
+/// application's concern. Verifying there a version that a Helper refused, or
+/// later dropped under the keep-list, draws `ShareVerifyRejected`
+/// (`UNKNOWN_SHARE_VERSION`) from that Helper, where this device reports
+/// `NoProof`. Once the application deletes those rows, verifying the version
+/// there reports
+/// [`VerifySharesFailed`](crate::protocol::DeRecEvent::VerifySharesFailed)
+/// with `NoProof`.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_share_to_helper<S: StoreSet>(
     stores: &mut Stores<'_, S>,
@@ -1006,6 +1238,7 @@ async fn dispatch_share_to_helper<S: StoreSet>(
     committed_share: &derec_proto::CommittedDeRecShare,
     keep_list: &[u32],
     version: u32,
+    threshold: Option<u32>,
     description: &str,
     round: &Round<'_>,
 ) -> Result<()> {
@@ -1032,6 +1265,8 @@ async fn dispatch_share_to_helper<S: StoreSet>(
                 secret_id,
                 version,
                 bytes: committed_share.encode_to_vec(),
+                subshares: subshare_count(committed_share),
+                threshold,
             },
         )
         .await?;
@@ -1185,8 +1420,8 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
 mod tests {
     use crate::primitives::sharing::request;
     use crate::protocol::context::Exchange;
-    use crate::protocol::test::LocalFixture;
-    use crate::protocol::test::{
+    use crate::protocol::tests::LocalFixture;
+    use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemUserSecretStore,
         NoopTransport, RecordingTransport, RefusingShareStore, StoreRig, run_async,
     };
@@ -1254,6 +1489,7 @@ mod tests {
                     channel_id,
                     shared_key: &shared_key,
                     trace_id: 1,
+                    obligation: None,
                 },
                 &request,
             )
@@ -1324,6 +1560,7 @@ mod tests {
                         channel_id,
                         shared_key: &shared_key,
                         trace_id: 1,
+                        obligation: None,
                     },
                     &request,
                 )
@@ -1402,6 +1639,7 @@ mod tests {
                     channel_id,
                     shared_key: &shared_key,
                     trace_id: 1,
+                    obligation: None,
                 },
                 &first,
             )
@@ -1415,6 +1653,7 @@ mod tests {
                     channel_id,
                     shared_key: &shared_key,
                     trace_id: 1,
+                    obligation: None,
                 },
                 &second,
             )
@@ -1422,8 +1661,12 @@ mod tests {
             .expect("the conflict is reported to the peer, not raised locally");
 
             assert!(
-                matches!(events.as_slice(), [crate::protocol::DeRecEvent::NoOp]),
-                "a refused write stores nothing and reports no ShareStored"
+                matches!(
+                    events.as_slice(),
+                    [crate::protocol::DeRecEvent::ShareRefused { version: 1, status, .. }]
+                        if *status == StatusEnum::VersionConflict as i32
+                ),
+                "a refused write stores nothing and reports ShareRefused, got {events:?}"
             );
 
             let stored = rig
@@ -1485,6 +1728,7 @@ mod tests {
                 channel_id: KEEP_CHANNEL,
                 shared_key: &KEEP_KEY,
                 trace_id: 1,
+                obligation: None,
             },
             request,
         )
@@ -1520,6 +1764,66 @@ mod tests {
             .collect();
         versions.sort_unstable();
         versions
+    }
+
+    /// A Helper stores no subshare count, even for a share carrying several.
+    #[test]
+    fn a_helper_records_no_subshare_count() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[]).await;
+            let split = request::split(
+                &[(KEEP_CHANNEL, 2), (ChannelId(12), 1)],
+                KEEP_SECRET_ID,
+                1,
+                b"weighted secret",
+                3,
+            )
+            .expect("split secret");
+            let committed = split.shares.get(&KEEP_CHANNEL).expect("share");
+            let produced = request::produce(
+                KEEP_CHANNEL,
+                1,
+                KEEP_SECRET_ID,
+                committed,
+                &[],
+                "",
+                &KEEP_KEY,
+                &[],
+            )
+            .expect("produce request");
+            let weighted = request::extract(&produced.envelope, &KEEP_KEY)
+                .expect("extract request")
+                .request;
+            accept_request(&mut rig, &weighted).await;
+
+            let stored = rig
+                .shares
+                .data
+                .lock()
+                .unwrap()
+                .get(&(KEEP_SECRET_ID, KEEP_CHANNEL.0, 1))
+                .cloned()
+                .expect("the helper stored the share");
+            assert_eq!(stored.subshares, None);
+        });
+    }
+
+    /// A `DeRecShare` that decodes but carries no subshare must read back as
+    /// `None`, not as a real count of `0`: the proto requires at least one
+    /// subshare, so an empty list means the share is malformed, not that the
+    /// helper holds zero of them.
+    #[test]
+    fn subshare_count_of_an_empty_subshare_list_is_none() {
+        let malformed = derec_proto::DeRecShare {
+            subshares: Vec::new(),
+            ..Default::default()
+        };
+        let committed = derec_proto::CommittedDeRecShare {
+            de_rec_share: malformed.encode_to_vec(),
+            commitment: Vec::new(),
+            merkle_path: Vec::new(),
+        };
+        assert_eq!(super::subshare_count(&committed), None);
     }
 
     /// `keepList` is the complete set of versions to retain: every stored
@@ -1579,6 +1883,8 @@ mod tests {
                 secret_id: KEEP_SECRET_ID,
                 version: 1,
                 bytes: vec![1, 2, 3],
+                subshares: None,
+                threshold: None,
             };
             rig.shares
                 .save(KEEP_SECRET_ID, ChannelId(99), other)
@@ -1619,6 +1925,7 @@ mod tests {
                         status: crate::protocol::types::ChannelStatus::Paired,
                         created_at: 0,
                         peer_role: derec_proto::SenderKind::Owner,
+                        weight: 1,
                     },
                 ),
             )
@@ -1706,6 +2013,7 @@ mod tests {
                     channel_id: PARAM_CHANNEL,
                     shared_key: &PARAM_KEY,
                     trace_id: 1,
+                    obligation: None,
                 },
                 request,
             )
@@ -1713,8 +2021,13 @@ mod tests {
             .expect("an oversized share is refused, not raised as an error");
 
             assert!(
-                matches!(events.as_slice(), [crate::protocol::DeRecEvent::NoOp]),
-                "a refused share reports no ActionRequired, only NoOp"
+                matches!(
+                    events.as_slice(),
+                    [crate::protocol::DeRecEvent::ShareRefused { channel_id, version: 1, status, .. }]
+                        if *channel_id == PARAM_CHANNEL
+                            && *status == StatusEnum::SizeLimitExceeded as i32
+                ),
+                "a refused share reports ShareRefused instead of ActionRequired, got {events:?}"
             );
             assert!(
                 rig.shares.data.lock().unwrap().is_empty(),
@@ -1757,6 +2070,7 @@ mod tests {
                     channel_id: PARAM_CHANNEL,
                     shared_key: &PARAM_KEY,
                     trace_id: 1,
+                    obligation: None,
                 },
                 request,
             )
@@ -1764,8 +2078,13 @@ mod tests {
             .expect("an undersized share is refused, not raised as an error");
 
             assert!(
-                matches!(events.as_slice(), [crate::protocol::DeRecEvent::NoOp]),
-                "a refused share reports no ActionRequired, only NoOp"
+                matches!(
+                    events.as_slice(),
+                    [crate::protocol::DeRecEvent::ShareRefused { channel_id, version: 1, status, .. }]
+                        if *channel_id == PARAM_CHANNEL
+                            && *status == StatusEnum::SizeLimitExceeded as i32
+                ),
+                "a refused share reports ShareRefused instead of ActionRequired, got {events:?}"
             );
             assert!(
                 rig.shares.data.lock().unwrap().is_empty(),
@@ -1810,6 +2129,7 @@ mod tests {
                     channel_id: PARAM_CHANNEL,
                     shared_key: &PARAM_KEY,
                     trace_id: 1,
+                    obligation: None,
                 },
                 request.clone(),
             )
@@ -1833,6 +2153,7 @@ mod tests {
                     channel_id: PARAM_CHANNEL,
                     shared_key: &PARAM_KEY,
                     trace_id: 1,
+                    obligation: None,
                 },
                 &request,
             )
@@ -1871,6 +2192,7 @@ mod tests {
                     channel_id: PARAM_CHANNEL,
                     shared_key: &PARAM_KEY,
                     trace_id: 1,
+                    obligation: None,
                 },
                 request,
             )
@@ -1921,6 +2243,7 @@ mod tests {
                     channel_id: PARAM_CHANNEL,
                     shared_key: &PARAM_KEY,
                     trace_id: 1,
+                    obligation: None,
                 },
                 &request,
             )
@@ -1967,6 +2290,7 @@ mod tests {
                     channel_id: PARAM_CHANNEL,
                     shared_key: &PARAM_KEY,
                     trace_id: 1,
+                    obligation: None,
                 },
                 &request,
             )
@@ -1986,6 +2310,7 @@ mod tests {
                     channel_id: PARAM_CHANNEL,
                     shared_key: &PARAM_KEY,
                     trace_id: 1,
+                    obligation: None,
                 },
                 &request,
             )
@@ -2001,38 +2326,524 @@ mod tests {
         });
     }
 
-    /// A non-refusal store failure propagates as an error rather than
-    /// being turned into a status response.
+    /// A non-refusal store failure is the router's to answer: `FAIL` with the
+    /// generic memo when the library responds, or a token when it does not.
+    /// Either way exactly one response leaves, and the store's error text
+    /// stays local.
     #[test]
-    fn helper_save_backend_error_still_propagates() {
-        run_async(async {
-            let request = param_request(b"a payload whose save backend fails outright");
-            let lf = LocalFixture::new(PARAM_SECRET_ID);
-            let mut rig = param_rig();
-            rig.shares.set_backend_error(true);
+    fn helper_save_backend_error_is_answered_through_the_router() {
+        for respond in [true, false] {
+            run_async(async move {
+                use crate::protocol::obligation::{GENERIC_FAILURE_MEMO, Obligation, settle};
 
-            let result = super::accept(
-                &mut rig.stores(),
-                &lf.local(),
-                &Exchange {
+                let request = param_request(b"a payload whose save backend fails outright");
+                let lf = LocalFixture::new(PARAM_SECRET_ID);
+                let mut rig = param_rig();
+                rig.shares.set_backend_error(true);
+                let action = crate::protocol::PendingAction::StoreShare {
                     channel_id: PARAM_CHANNEL,
-                    shared_key: &PARAM_KEY,
+                    request: request.clone(),
+                    shared_key: PARAM_KEY,
                     trace_id: 1,
-                },
-                &request,
-            )
-            .await;
+                };
+                let obligation =
+                    Obligation::for_action(&action, lf.local().policy).expect("a request");
 
-            assert!(
-                matches!(
-                    result,
-                    Err(crate::Error::ShareStore(ShareStoreError::Backend(_)))
-                ),
-                "a non-refusal store failure propagates as an error, not a status response"
+                let outcome = super::accept(
+                    &mut rig.stores(),
+                    &lf.local(),
+                    &Exchange {
+                        channel_id: PARAM_CHANNEL,
+                        shared_key: &PARAM_KEY,
+                        trace_id: 1,
+                        obligation: Some(&obligation),
+                    },
+                    &request,
+                )
+                .await;
+                assert!(
+                    matches!(
+                        outcome,
+                        Err(crate::Error::ShareStore(ShareStoreError::Backend(_)))
+                    ),
+                    "the flow itself leaves the failure to the router"
+                );
+                assert!(rig.transport.sent_envelopes().is_empty());
+
+                // The paired channel's key is in the secret store. The token
+                // carries none: `reject` reads it from there.
+                crate::protocol::DeRecSecretStore::save(
+                    &mut rig.secrets,
+                    PARAM_SECRET_ID,
+                    PARAM_CHANNEL,
+                    crate::protocol::SecretValue::SharedKey(PARAM_KEY),
+                )
+                .await
+                .expect("seed the channel key");
+                let events = settle(
+                    &mut rig.stores(),
+                    &lf.local(),
+                    &obligation,
+                    respond,
+                    outcome,
+                )
+                .await;
+                let token = match events.as_slice() {
+                    [
+                        crate::protocol::DeRecEvent::RequestFailed {
+                            responded, action, ..
+                        },
+                    ] => {
+                        assert_eq!(*responded, respond);
+                        action.clone()
+                    }
+                    other => panic!("expected one RequestFailed, got {other:?}"),
+                };
+                if let Some(token) = token {
+                    assert!(rig.transport.sent_envelopes().is_empty());
+                    let crate::protocol::PendingAction::RespondToFailure {
+                        channel_id,
+                        trace_id,
+                        reply,
+                        request,
+                    } = token
+                    else {
+                        panic!("a RespondToFailure token");
+                    };
+                    let answer = Obligation::for_failure(
+                        channel_id,
+                        trace_id,
+                        &reply,
+                        request,
+                        lf.local().policy,
+                    );
+                    crate::protocol::obligation::respond_to_failure(
+                        &mut rig.stores(),
+                        &lf.local(),
+                        &answer,
+                        StatusEnum::Fail,
+                        GENERIC_FAILURE_MEMO,
+                    )
+                    .await
+                    .expect("the token answers the request");
+                }
+
+                let sent = rig.transport.sent_envelopes();
+                assert_eq!(sent.len(), 1, "exactly one response");
+                let response = decode_store_share_response(&sent[0], &PARAM_KEY);
+                let result = response.result.expect("a result");
+                assert_eq!(result.status, StatusEnum::Fail as i32);
+                assert_eq!(result.memo, GENERIC_FAILURE_MEMO);
+            });
+        }
+    }
+}
+
+/// A Helper refuses a share that does not decode or does not verify before
+/// anything is stored or removed, and answers the Owner whatever
+/// `auto_respond_on_failure` says.
+#[cfg(test)]
+mod invalid_share_tests {
+    use crate::derec_message::DeRecMessageBuilder;
+    use crate::primitives::sharing::request;
+    use crate::protocol::builder::DeRecProtocolBuilder;
+    use crate::protocol::context::Exchange;
+    use crate::protocol::tests::{
+        InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+        InMemUserSecretStore, LocalFixture, RecordingTransport, StoreRig, run_async,
+    };
+    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, SecretValue, Share};
+    use crate::protocol::{
+        AutoAcceptPolicy, DeRecChannelStore, DeRecEvent, DeRecProtocol, DeRecSecretStore,
+        DeRecShareStore,
+    };
+    use crate::types::{ChannelId, SharedKey};
+    use derec_proto::{
+        CommittedDeRecShare, MessageBody, Protocol, SenderKind, StatusEnum,
+        StoreShareRequestMessage, TransportProtocol,
+    };
+    use prost::Message as _;
+
+    const HELPER_SECRET_ID: u64 = 0x4E;
+    const OWNER_SECRET_ID: u64 = 0xA11CE;
+    const CHANNEL: ChannelId = ChannelId(61);
+    const KEY: SharedKey = [7u8; 32];
+
+    /// The version already held before the invalid request arrives.
+    const HELD: u32 = 1;
+    /// The version the invalid request claims; its `keepList` names only
+    /// itself, so honouring it would remove [`HELD`].
+    const INCOMING: u32 = 2;
+
+    type Helper = DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemStateStore,
+        RecordingTransport,
+    >;
+
+    pub(super) fn owner_endpoint() -> TransportProtocol {
+        TransportProtocol {
+            uri: "https://owner.example".to_owned(),
+            protocol: Protocol::Https as i32,
+        }
+    }
+
+    fn valid_request(version: u32, keep_list: &[u32]) -> StoreShareRequestMessage {
+        let split = request::split(
+            &[(CHANNEL, 1), (ChannelId(62), 1)],
+            OWNER_SECRET_ID,
+            version,
+            format!("secret at version {version}").as_bytes(),
+            2,
+        )
+        .expect("split secret");
+        let committed = split.shares.get(&CHANNEL).expect("share for channel");
+        let produced = request::produce(
+            CHANNEL,
+            version,
+            OWNER_SECRET_ID,
+            committed,
+            keep_list,
+            "",
+            &KEY,
+            std::slice::from_ref(&owner_endpoint()),
+        )
+        .expect("produce request");
+        request::extract(&produced.envelope, &KEY)
+            .expect("extract request")
+            .request
+    }
+
+    /// `share` holds bytes that are not a `CommittedDeRecShare`.
+    pub(super) fn not_a_share() -> StoreShareRequestMessage {
+        let mut request = valid_request(INCOMING, &[INCOMING]);
+        request.share = b"not a share".to_vec();
+        request
+    }
+
+    /// A well-formed `CommittedDeRecShare` whose Merkle path does not lead
+    /// to its commitment.
+    fn broken_merkle_path() -> StoreShareRequestMessage {
+        let mut request = valid_request(INCOMING, &[INCOMING]);
+        let mut committed =
+            CommittedDeRecShare::decode(request.share.as_slice()).expect("valid committed share");
+        committed.merkle_path[0].hash[0] ^= 0xFF;
+        request.share = committed.encode_to_vec();
+        request
+    }
+
+    pub(super) fn envelope(request: &StoreShareRequestMessage) -> Vec<u8> {
+        DeRecMessageBuilder::channel()
+            .channel_id(CHANNEL)
+            .timestamp(request.timestamp.expect("request timestamp"))
+            .message_body(MessageBody::StoreShareRequest(request.clone()))
+            .encrypt(&KEY)
+            .expect("encrypt")
+            .build()
+            .expect("build")
+            .encode_to_vec()
+    }
+
+    async fn seed(channels: &mut InMemChannelStore, shares: &mut InMemShareStore) {
+        channels
+            .save(
+                HELPER_SECRET_ID,
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id: CHANNEL,
+                    transports: vec![owner_endpoint()],
+                    communication_info: std::collections::HashMap::new(),
+                    status: ChannelStatus::Paired,
+                    created_at: crate::utils::now_secs(),
+                    peer_role: SenderKind::Owner,
+                    weight: 1,
+                }),
+            )
+            .await
+            .expect("seed channel");
+        shares
+            .save(
+                HELPER_SECRET_ID,
+                CHANNEL,
+                Share {
+                    secret_id: OWNER_SECRET_ID,
+                    version: HELD,
+                    bytes: valid_request(HELD, &[]).encode_to_vec(),
+                    subshares: None,
+                    threshold: None,
+                },
+            )
+            .await
+            .expect("seed held share");
+    }
+
+    pub(super) async fn helper(
+        policy: AutoAcceptPolicy,
+        auto_respond: bool,
+    ) -> (Helper, InMemShareStore, RecordingTransport) {
+        let mut channels = InMemChannelStore::default();
+        let mut secrets = InMemSecretStore::default();
+        let mut shares = InMemShareStore::default();
+        let transport = RecordingTransport::default();
+        seed(&mut channels, &mut shares).await;
+        secrets
+            .save(HELPER_SECRET_ID, CHANNEL, SecretValue::SharedKey(KEY))
+            .await
+            .expect("seed shared key");
+
+        let protocol = DeRecProtocolBuilder::new(HELPER_SECRET_ID)
+            .with_channel_store(channels)
+            .with_share_store(shares.clone())
+            .with_secret_store(secrets)
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(transport.clone())
+            .with_state_store(InMemStateStore)
+            .with_own_transports(["https://helper.example.com"])
+            .with_threshold(2)
+            .with_auto_accept(policy)
+            .with_auto_respond_on_failure(auto_respond)
+            .build()
+            .expect("test protocol builds");
+        (protocol, shares, transport)
+    }
+
+    fn refusals(events: &[DeRecEvent]) -> Vec<(ChannelId, u32, i32, String)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DeRecEvent::ShareRefused {
+                    channel_id,
+                    version,
+                    status,
+                    memo,
+                } => Some((*channel_id, *version, *status, memo.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Nothing at [`INCOMING`] is stored, [`HELD`] survives, and exactly one
+    /// response carrying `expected` reached the Owner, which reads it as
+    /// `ShareRejected` with the refusal's status and memo.
+    async fn assert_refused_without_side_effects(
+        events: &[DeRecEvent],
+        shares: &InMemShareStore,
+        transport: &RecordingTransport,
+        expected: StatusEnum,
+    ) {
+        let refused = refusals(events);
+        assert_eq!(refused.len(), 1, "exactly one ShareRefused, got {events:?}");
+        let (channel_id, version, status, memo) = refused[0].clone();
+        assert_eq!(channel_id, CHANNEL);
+        assert_eq!(version, INCOMING);
+        assert_eq!(status, expected as i32, "got {events:?}");
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                DeRecEvent::ActionRequired { .. }
+                    | DeRecEvent::AutoAccepted { .. }
+                    | DeRecEvent::ShareStored { .. }
+            )),
+            "a refused share never reaches the application's decision, got {events:?}"
+        );
+
+        assert!(
+            shares
+                .load(HELPER_SECRET_ID, CHANNEL, &[INCOMING])
+                .await
+                .expect("load")
+                .is_empty(),
+            "the refused share is not stored"
+        );
+        let held: Vec<u32> = shares
+            .load(HELPER_SECRET_ID, CHANNEL, &[])
+            .await
+            .expect("load")
+            .iter()
+            .map(|s| s.version)
+            .collect();
+        assert_eq!(held, vec![HELD], "the refused keepList prunes nothing");
+
+        let sent = transport.sent_envelopes();
+        assert_eq!(sent.len(), 1, "exactly one response is sent to the owner");
+        let envelope = derec_proto::DeRecMessage::decode(sent[0].as_slice()).expect("envelope");
+        let MessageBody::StoreShareResponse(response) =
+            crate::derec_message::extract_inner_message(&envelope.message, &KEY).expect("decrypt")
+        else {
+            panic!("expected a StoreShareResponse");
+        };
+        let result = response.result.clone().expect("result");
+        assert_eq!(result.status, expected as i32);
+        assert_eq!(result.memo, memo);
+        assert_eq!(response.version, INCOMING);
+
+        let owner_events =
+            super::on_response(CHANNEL, &response).expect("owner processes the rejection");
+        assert!(
+            matches!(
+                owner_events.as_slice(),
+                [DeRecEvent::ShareRejected { status, memo: owner_memo, .. }]
+                    if *status == expected as i32 && *owner_memo == memo
+            ),
+            "the owner sees the same status and memo, got {owner_events:?}"
+        );
+    }
+
+    async fn process_refuses(
+        policy: AutoAcceptPolicy,
+        auto_respond: bool,
+        request: StoreShareRequestMessage,
+        expected: StatusEnum,
+    ) {
+        let (mut protocol, shares, transport) = helper(policy, auto_respond).await;
+        let events = protocol
+            .process(&envelope(&request))
+            .await
+            .expect("an invalid share is refused, not raised as an error");
+        assert_refused_without_side_effects(&events, &shares, &transport, expected).await;
+    }
+
+    #[test]
+    fn auto_accepting_helper_refuses_bytes_that_are_not_a_share() {
+        for auto_respond in [true, false] {
+            run_async(process_refuses(
+                AutoAcceptPolicy::all(),
+                auto_respond,
+                not_a_share(),
+                StatusEnum::FormatError,
+            ));
+        }
+    }
+
+    #[test]
+    fn auto_accepting_helper_refuses_a_broken_merkle_path() {
+        for auto_respond in [true, false] {
+            run_async(process_refuses(
+                AutoAcceptPolicy::all(),
+                auto_respond,
+                broken_merkle_path(),
+                StatusEnum::VerificationFailed,
+            ));
+        }
+    }
+
+    #[test]
+    fn manual_helper_refuses_an_invalid_share_instead_of_asking() {
+        for (request, expected) in [
+            (not_a_share(), StatusEnum::FormatError),
+            (broken_merkle_path(), StatusEnum::VerificationFailed),
+        ] {
+            run_async(process_refuses(
+                AutoAcceptPolicy::default(),
+                false,
+                request,
+                expected,
+            ));
+        }
+    }
+
+    /// `accept` validates on its own, so a `PendingAction::StoreShare`
+    /// carrying an invalid share cannot store it either.
+    #[test]
+    fn accept_refuses_an_invalid_share_without_storing() {
+        for (request, expected) in [
+            (not_a_share(), StatusEnum::FormatError),
+            (broken_merkle_path(), StatusEnum::VerificationFailed),
+        ] {
+            run_async(async {
+                let mut rig = StoreRig::with_transport(RecordingTransport::default());
+                seed(&mut rig.channels, &mut rig.shares).await;
+                let lf = LocalFixture::new(HELPER_SECRET_ID);
+
+                let events = super::accept(
+                    &mut rig.stores(),
+                    &lf.local(),
+                    &Exchange {
+                        channel_id: CHANNEL,
+                        shared_key: &KEY,
+                        trace_id: 1,
+                        obligation: None,
+                    },
+                    &request,
+                )
+                .await
+                .expect("an invalid share is refused, not raised as an error");
+
+                assert_refused_without_side_effects(&events, &rig.shares, &rig.transport, expected)
+                    .await;
+            });
+        }
+    }
+}
+
+/// `reply_to` names where the courtesy failure response is sent, but it is
+/// peer-supplied and must pass the same transport policy as any other
+/// peer-supplied endpoint — including when it is the refusal itself that
+/// triggers the response.
+#[cfg(test)]
+mod refused_reply_to_tests {
+    use super::invalid_share_tests::{envelope, helper, not_a_share, owner_endpoint};
+    use crate::protocol::AutoAcceptPolicy;
+    use crate::protocol::tests::run_async;
+    use derec_proto::{Protocol, StoreShareRequestMessage, TransportProtocol};
+
+    /// A plaintext, non-loopback endpoint: refused by the default transport
+    /// policy whether it is a peer's advertised endpoint or a one-shot
+    /// `reply_to`.
+    fn refused_reply_to() -> TransportProtocol {
+        TransportProtocol {
+            uri: "http://owner.example".to_owned(),
+            protocol: Protocol::Https as i32,
+        }
+    }
+
+    fn with_reply_to(
+        mut request: StoreShareRequestMessage,
+        reply_to: TransportProtocol,
+    ) -> StoreShareRequestMessage {
+        request.reply_to_transports = vec![reply_to];
+        request
+    }
+
+    /// The refused `reply_to` must never receive the failure response; it
+    /// is sent to the channel's recorded endpoint instead, exactly as if
+    /// the peer had named no `reply_to` at all.
+    #[test]
+    fn refused_reply_to_falls_back_to_the_recorded_endpoint() {
+        run_async(async {
+            let request = with_reply_to(not_a_share(), refused_reply_to());
+            let (mut protocol, _shares, transport) = helper(AutoAcceptPolicy::all(), true).await;
+
+            let _ = protocol.process(&envelope(&request)).await;
+
+            assert_eq!(
+                transport.sent_uris(),
+                vec![owner_endpoint().uri],
+                "the refused reply_to must never be used as a destination"
             );
-            assert!(
-                rig.transport.sent_envelopes().is_empty(),
-                "no status response is sent on a backend failure"
+        });
+    }
+
+    /// A `reply_to` the policy accepts is still honoured: the fix must not
+    /// stop answering a well-behaved peer at the address it asked for.
+    #[test]
+    fn accepted_reply_to_is_still_used() {
+        run_async(async {
+            let accepted_reply_to = TransportProtocol {
+                uri: "https://owner-reply.example".to_owned(),
+                protocol: Protocol::Https as i32,
+            };
+            let request = with_reply_to(not_a_share(), accepted_reply_to.clone());
+            let (mut protocol, _shares, transport) = helper(AutoAcceptPolicy::all(), true).await;
+
+            let _ = protocol.process(&envelope(&request)).await;
+
+            assert_eq!(
+                transport.sent_uris(),
+                vec![accepted_reply_to.uri],
+                "an accepted reply_to is used, not the recorded endpoint"
             );
         });
     }
@@ -2044,7 +2855,7 @@ mod tests {
 mod owner_keep_list_tests {
     use crate::primitives::sharing::request;
     use crate::protocol::context::{Exchange, Round};
-    use crate::protocol::test::{LocalFixture, StoreRig, run_async};
+    use crate::protocol::tests::{LocalFixture, StoreRig, run_async};
     use crate::protocol::types::{
         ChannelRecord, ChannelStatus, HelperChannel, SecretValue, UserSecret, UserSecrets,
     };
@@ -2088,6 +2899,7 @@ mod owner_keep_list_tests {
                         status: ChannelStatus::Paired,
                         created_at: 0,
                         peer_role: SenderKind::Helper,
+                        weight: 1,
                     }),
                 )
                 .await
@@ -2113,6 +2925,7 @@ mod owner_keep_list_tests {
                     secrets: Vec::new(),
                     description: None,
                     author_replica_id: None,
+                    threshold: None,
                 },
             )
             .await
@@ -2131,7 +2944,8 @@ mod owner_keep_list_tests {
                 data: b"data".to_vec(),
             }],
             None,
-            std::collections::HashMap::new(),
+            Some(&std::collections::HashMap::new()),
+            None,
             THRESHOLD,
             None,
             &Round {
@@ -2237,6 +3051,7 @@ mod owner_keep_list_tests {
                     status: ChannelStatus::Paired,
                     created_at: 0,
                     peer_role: SenderKind::Owner,
+                    weight: 1,
                 }),
             )
             .await
@@ -2258,6 +3073,7 @@ mod owner_keep_list_tests {
                     channel_id: ChannelId(channel),
                     shared_key: &key_of(channel),
                     trace_id: 1,
+                    obligation: None,
                 },
                 &request,
             )
@@ -2349,9 +3165,9 @@ mod owner_keep_list_tests {
 #[cfg(test)]
 mod group_conformance_tests {
     use crate::protocol::DeRecChannelStore;
-    use crate::protocol::test::LocalFixture;
-    use crate::protocol::test::StoreRig;
-    use crate::protocol::test::{InMemChannelStore, InMemSecretStore, run_async};
+    use crate::protocol::tests::LocalFixture;
+    use crate::protocol::tests::StoreRig;
+    use crate::protocol::tests::{InMemChannelStore, InMemSecretStore, run_async};
     use crate::protocol::types::{
         ChannelRecord, ChannelStatus, ReplicaMember, ReplicaRole, SecretValue,
     };
@@ -2521,9 +3337,15 @@ mod group_conformance_tests {
                 super::group_channel_of(&lf.local(), &roster).expect("group channel resolves");
             assert_eq!(group_channel, Some(GROUP_CHANNEL));
 
-            let secret =
-                super::build_secret(&[], &roster, Vec::new(), group_channel, Some([0x42; 32]))
-                    .expect("a destination must be able to build the payload");
+            let secret = super::build_secret(
+                &[],
+                &roster,
+                Vec::new(),
+                group_channel,
+                Some([0x42; 32]),
+                None,
+            )
+            .expect("a destination must be able to build the payload");
 
             let group = secret.replicas.expect("roster is present");
             assert_eq!(group.members.len(), 2, "the roster still names everyone");
@@ -2619,6 +3441,7 @@ mod group_conformance_tests {
                     status: ChannelStatus::Paired,
                     created_at: 0,
                     peer_role: derec_proto::SenderKind::Helper,
+                    weight: 1,
                 }),
             )
             .await
@@ -2640,6 +3463,8 @@ mod group_conformance_tests {
                         secret_id: SECRET_ID,
                         version,
                         bytes,
+                        subshares: None,
+                        threshold: None,
                     },
                 )
                 .await
@@ -2653,6 +3478,7 @@ mod group_conformance_tests {
                     secrets: Vec::new(),
                     description: None,
                     author_replica_id: None,
+                    threshold: None,
                 },
             )
             .await
@@ -2719,7 +3545,7 @@ mod group_conformance_tests {
     #[test]
     fn a_published_roster_describes_every_member_including_the_writer() {
         run_async(async {
-            let lf = crate::protocol::test::LocalFixture {
+            let lf = crate::protocol::tests::LocalFixture {
                 own_transports: vec![
                     endpoint("https://self"),
                     TransportProtocol {
@@ -2838,13 +3664,27 @@ mod group_conformance_tests {
                         transports: vec![endpoint("https://helper")],
                         shared_key: vec![0xAA; 32],
                         communication_info: std::collections::HashMap::new(),
+                        weight: 1,
                     }],
                     secrets: Vec::new(),
                     replicas: Some(payload_roster()),
+                    threshold: None,
                 }),
                 shares: vec![crate::protocol::types::ChannelShare {
                     channel_id: HELPER_CHANNEL.0,
-                    committed_share: vec![0x01, 0x02],
+                    committed_share: prost::Message::encode_to_vec(
+                        crate::primitives::sharing::request::split(
+                            &[(HELPER_CHANNEL, 1), (ChannelId(HELPER_CHANNEL.0 + 1), 1)],
+                            SECRET_ID,
+                            4,
+                            b"the secret",
+                            2,
+                        )
+                        .expect("split secret")
+                        .shares
+                        .get(&HELPER_CHANNEL)
+                        .expect("share for helper"),
+                    ),
                 }],
                 shared_key: Vec::new(),
                 version: 4,
@@ -2855,6 +3695,7 @@ mod group_conformance_tests {
             super::hydrate_catch_up(
                 &mut rig.stores(),
                 &lf.local(),
+                crate::types::ChannelId(5001),
                 1001,
                 SECRET_ID,
                 9,
@@ -2900,6 +3741,7 @@ mod group_conformance_tests {
                     helpers: Vec::new(),
                     secrets: Vec::new(),
                     replicas: Some(payload_roster()),
+                    threshold: None,
                 }),
                 shares: Vec::new(),
                 shared_key: Vec::new(),
@@ -2910,6 +3752,7 @@ mod group_conformance_tests {
             super::hydrate_catch_up(
                 &mut rig.stores(),
                 &lf.local(),
+                crate::types::ChannelId(5001),
                 1001,
                 SECRET_ID,
                 9,
@@ -2944,6 +3787,7 @@ mod group_conformance_tests {
                     helpers: Vec::new(),
                     secrets: Vec::new(),
                     replicas: Some(payload_roster()),
+                    threshold: None,
                 }),
                 shares: Vec::new(),
                 shared_key: Vec::new(),
@@ -2954,6 +3798,7 @@ mod group_conformance_tests {
             let events = super::hydrate_catch_up(
                 &mut rig.stores(),
                 &lf.local(),
+                crate::types::ChannelId(5001),
                 1001,
                 SENDER_SECRET_ID,
                 3,
@@ -3004,6 +3849,12 @@ mod group_conformance_tests {
 /// This is no wider a disclosure than a publish: the push path has always
 /// carried the same share material to the same audience, and every member
 /// already holds each helper's `shared_key` through the roster.
+///
+/// # Proof retention
+///
+/// The map covers the snapshot's version only, so an asker gains no proof of
+/// an earlier version from it. Nor does it lose any: the asker keeps every
+/// proof it already holds (see [`replica::hydrate`]).
 pub(in crate::protocol) async fn build_catch_up_payload<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -3038,6 +3889,7 @@ pub(in crate::protocol) async fn build_catch_up_payload<S: StoreSet>(
         snapshot.secrets,
         group_channel,
         group_key,
+        snapshot.threshold,
     )?;
 
     let mut shares: Vec<crate::protocol::types::ChannelShare> = Vec::new();
@@ -3082,29 +3934,69 @@ pub(in crate::protocol) async fn build_catch_up_payload<S: StoreSet>(
 /// Filing the map under the requested version instead would key a helper's
 /// share to a version it never held, and verification would then hash the
 /// wrong bytes and report a healthy helper as corrupt.
+///
+/// # Proof retention
+///
+/// Hydration adds the proofs of the payload's share map and deletes none:
+/// this device keeps every proof it has received, and freeing them is the
+/// application's concern (see [`replica::hydrate`]).
+///
+/// # Refusal
+///
+/// A payload that does not decode, lacks its `secret`, or fails
+/// [`replica::check`] is reported as
+/// [`DeRecEvent::ReplicaSecretRefused`] on `arrived_on`, and nothing is
+/// written. No answer is sent: this payload is itself the answer to this
+/// device's request.
 pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
+    arrived_on: ChannelId,
     from_replica_id: u64,
     secret_id: u64,
     response_version: u32,
     payload: &[u8],
 ) -> Result<Vec<DeRecEvent>> {
-    let composite = crate::protocol::types::ReplicaSecretPayload::decode(payload)
-        .map_err(crate::Error::ProtobufDecode)?;
-    let secret = composite.secret.ok_or(crate::Error::InvalidInput(
-        "catch-up payload missing `secret` field",
-    ))?;
+    let refused = |version: u32, fault: replica::PayloadFault| {
+        Ok(vec![DeRecEvent::ReplicaSecretRefused {
+            channel_id: arrived_on,
+            from_replica_id,
+            secret_id,
+            version,
+            status: fault.status as i32,
+            memo: fault.memo.to_owned(),
+        }])
+    };
+
+    let Ok(composite) = crate::protocol::types::ReplicaSecretPayload::decode(payload) else {
+        return refused(
+            response_version,
+            replica::PayloadFault::format("catch-up payload is not a valid ReplicaSecretPayload"),
+        );
+    };
     let version = if composite.version == 0 {
         response_version
     } else {
         composite.version
+    };
+    let Some(secret) = composite.secret else {
+        return refused(
+            version,
+            replica::PayloadFault::format("catch-up payload missing `secret` field"),
+        );
     };
 
     // A catch-up answer comes from whichever member answered, so only the
     // payload can name the author.
     let author_replica_id = composite.author_replica_id;
     let channel_id = ChannelId(secret.replicas.as_ref().map_or(0, |g| g.channel_id));
+
+    // Checked whole before anything is written, so a served copy is applied
+    // in full or not at all.
+    let checked = match replica::check(&secret, &composite.shares) {
+        Ok(checked) => checked,
+        Err(fault) => return refused(version, fault),
+    };
 
     let is_install =
         match replica::arrival(stores, local, version, author_replica_id, &secret.secrets).await? {
@@ -3131,8 +4023,7 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
         stores,
         local,
         version,
-        &secret,
-        &composite.shares,
+        &checked,
         String::new(),
         author_replica_id,
     )
@@ -3169,7 +4060,7 @@ mod weighted_round_tests {
     use crate::primitives::sharing::SharingError;
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::context::Round;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, LocalFixture, RecordingTransport, StoreRig, run_async,
     };
@@ -3210,6 +4101,7 @@ mod weighted_round_tests {
                     status: ChannelStatus::Paired,
                     created_at: 0,
                     peer_role: SenderKind::Helper,
+                    weight: 1,
                 }),
             )
             .await
@@ -3241,6 +4133,7 @@ mod weighted_round_tests {
                     secrets: Vec::new(),
                     description: None,
                     author_replica_id: None,
+                    threshold: None,
                 },
             )
             .await
@@ -3270,7 +4163,8 @@ mod weighted_round_tests {
                 &lf.local(),
                 secrets(),
                 None,
-                HashMap::from([(ChannelId(999), 2)]),
+                Some(&HashMap::from([(ChannelId(999), 2)])),
+                None,
                 5,
                 None,
                 &Round {
@@ -3340,7 +4234,8 @@ mod weighted_round_tests {
                 &lf.local(),
                 secrets(),
                 None,
-                HashMap::from([(ChannelId(GROUP_CHANNEL), 1)]),
+                Some(&HashMap::from([(ChannelId(GROUP_CHANNEL), 1)])),
+                None,
                 2,
                 None,
                 &Round {
@@ -3382,7 +4277,8 @@ mod weighted_round_tests {
                 &lf.local(),
                 secrets(),
                 None,
-                HashMap::from([(ChannelId(999), 2), (ChannelId(41), 0)]),
+                Some(&HashMap::from([(ChannelId(999), 2), (ChannelId(41), 0)])),
+                None,
                 5,
                 None,
                 &Round {
@@ -3422,6 +4318,7 @@ mod weighted_round_tests {
         channels: InMemChannelStore,
         secrets: InMemSecretStore,
         shares: InMemShareStore,
+        user_secrets: InMemUserSecretStore,
     }
 
     async fn protocol_rig(helpers: &[u64], threshold: usize) -> ProtocolRig {
@@ -3431,11 +4328,12 @@ mod weighted_round_tests {
         for &ch in helpers {
             seed_helper(&mut channels, &mut secrets, ch).await;
         }
+        let user_secrets = InMemUserSecretStore::default();
         let protocol = DeRecProtocolBuilder::new(SECRET_ID)
             .with_channel_store(channels.clone())
             .with_share_store(shares.clone())
             .with_secret_store(secrets.clone())
-            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_user_secret_store(user_secrets.clone())
             .with_transport(RecordingTransport::default())
             .with_state_store(InMemPersistedStateStore::default())
             .with_own_transports(["https://owner.example.com"])
@@ -3447,7 +4345,76 @@ mod weighted_round_tests {
             channels,
             secrets,
             shares,
+            user_secrets,
         }
+    }
+
+    /// The same owner restarted with a different threshold: every store is
+    /// kept, so the weights recorded under the old threshold are still there.
+    fn rebuild_with_threshold(rig: &mut ProtocolRig, threshold: usize) {
+        rig.protocol = DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(rig.channels.clone())
+            .with_share_store(rig.shares.clone())
+            .with_secret_store(rig.secrets.clone())
+            .with_user_secret_store(rig.user_secrets.clone())
+            .with_transport(RecordingTransport::default())
+            .with_state_store(InMemPersistedStateStore::default())
+            .with_own_transports(["https://owner.example.com"])
+            .with_threshold(threshold)
+            .build()
+            .expect("test protocol builds");
+    }
+
+    /// The snapshot as an owner upgrading from a build that did not record the
+    /// threshold left it: the builder's threshold applies again.
+    async fn forget_stored_threshold(rig: &mut ProtocolRig) {
+        let mut snapshot = rig
+            .user_secrets
+            .load_latest(SECRET_ID)
+            .await
+            .unwrap()
+            .expect("a snapshot is stored");
+        snapshot.threshold = None;
+        rig.user_secrets
+            .save_latest(SECRET_ID, snapshot)
+            .await
+            .unwrap();
+    }
+
+    async fn stored_weight(channels: &InMemChannelStore, channel: u64) -> u32 {
+        channels
+            .load(
+                SECRET_ID,
+                crate::protocol::types::ChannelQuery::Helper {
+                    channel_id: ChannelId(channel),
+                },
+            )
+            .await
+            .expect("load helper")
+            .and_then(|r| r.as_helper().cloned())
+            .expect("helper row present")
+            .weight
+    }
+
+    fn paired(channel: u64) -> DeRecEvent {
+        DeRecEvent::PairingCompleted {
+            channel_id: ChannelId(channel),
+            pairing_channel_id: ChannelId(channel),
+            kind: SenderKind::Owner,
+            peer_communication_info: HashMap::new(),
+        }
+    }
+
+    async fn protect(rig: &mut ProtocolRig, weights: &[(u64, u32)]) -> Vec<DeRecEvent> {
+        rig.protocol
+            .start(DeRecFlow::ProtectSecret {
+                secrets: secrets(),
+                description: None,
+                weights: weights.iter().map(|&(c, w)| (ChannelId(c), w)).collect(),
+                threshold: None,
+            })
+            .await
+            .expect("protect secret")
     }
 
     /// `(channel, weight)` of every `ProtectSecretStarted`, sorted by channel.
@@ -3482,6 +4449,107 @@ mod weighted_round_tests {
             .len()
     }
 
+    /// The subshare count the library recorded on the owner's row.
+    fn recorded_subshares(shares: &InMemShareStore, channel: u64, version: u32) -> Option<u32> {
+        shares
+            .data
+            .lock()
+            .unwrap()
+            .get(&(SECRET_ID, channel, version))
+            .expect("the owner keeps a tracking share per dispatched helper")
+            .subshares
+    }
+
+    /// Answer the verification challenge sent to `channel` at `version` the
+    /// way an honest Helper would, and hand the answer to the owner.
+    async fn answer_verification(
+        rig: &mut ProtocolRig,
+        channel: u64,
+        version: u32,
+    ) -> Vec<DeRecEvent> {
+        use crate::primitives::verification::{request, response};
+        let key = [channel as u8; 32];
+        let challenge = rig
+            .protocol
+            .transport
+            .sent_envelopes()
+            .iter()
+            .rev()
+            .find_map(|env| request::extract(env, &key).ok())
+            .expect("a challenge was sent to the channel")
+            .request;
+        let held = rig
+            .shares
+            .data
+            .lock()
+            .unwrap()
+            .get(&(SECRET_ID, channel, version))
+            .expect("the owner's proof")
+            .bytes
+            .clone();
+        let answer =
+            response::produce(ChannelId(channel), &challenge, &key, held).expect("answer produced");
+        rig.protocol
+            .process(&answer.envelope)
+            .await
+            .expect("the owner processes the answer")
+    }
+
+    /// The owner's row records how many subshares each Helper was sent.
+    #[test]
+    fn the_owner_row_records_each_helpers_subshare_count() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 3).await;
+            protect(&mut rig, &[(51, 2)]).await;
+
+            assert_eq!(recorded_subshares(&rig.shares, 51, 1), Some(2));
+            assert_eq!(recorded_subshares(&rig.shares, 52, 1), Some(1));
+        });
+    }
+
+    /// Verifying an older version reports the counts of the round that
+    /// published it, not the weights a later round recorded.
+    #[test]
+    fn verifying_an_older_version_reports_its_own_counts() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 3).await;
+            protect(&mut rig, &[(51, 2)]).await;
+            protect(&mut rig, &[(52, 2)]).await;
+            assert_eq!(recorded_subshares(&rig.shares, 51, 2), Some(1));
+            assert_eq!(recorded_subshares(&rig.shares, 52, 2), Some(2));
+            assert_eq!(stored_weight(&rig.channels, 51).await, 1);
+
+            for (channel, expected) in [(51, 2), (52, 1)] {
+                rig.protocol
+                    .start(DeRecFlow::VerifyShares {
+                        secret_id: SECRET_ID,
+                        version: 1,
+                        target: crate::protocol::types::Target::Single(ChannelId(channel)),
+                    })
+                    .await
+                    .expect("verification starts");
+                let events = answer_verification(&mut rig, channel, 1).await;
+                let verified: Vec<_> = events
+                    .iter()
+                    .filter_map(|e| match e {
+                        DeRecEvent::ShareVerified {
+                            channel_id,
+                            version,
+                            subshares,
+                            ..
+                        } => Some((channel_id.0, *version, *subshares)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    verified,
+                    vec![(channel, 1, Some(expected))],
+                    "got {events:?}"
+                );
+            }
+        });
+    }
+
     #[test]
     fn weighted_round_splits_with_fewer_helpers_than_threshold() {
         run_async(async {
@@ -3492,6 +4560,7 @@ mod weighted_round_tests {
                     secrets: secrets(),
                     description: None,
                     weights: HashMap::from([(ChannelId(51), 2)]),
+                    threshold: None,
                 })
                 .await
                 .expect("a weighted round over 3 subshares meets t = 3");
@@ -3512,6 +4581,7 @@ mod weighted_round_tests {
                     secrets: secrets(),
                     description: None,
                     weights: HashMap::new(),
+                    threshold: None,
                 })
                 .await
                 .expect("an unweighted round runs");
@@ -3534,6 +4604,7 @@ mod weighted_round_tests {
                     secrets: secrets(),
                     description: None,
                     weights: HashMap::new(),
+                    threshold: None,
                 })
                 .await
                 .expect("a round below threshold is not an error");
@@ -3556,7 +4627,7 @@ mod weighted_round_tests {
                 .with_share_store(InMemShareStore::default())
                 .with_secret_store(secrets_store)
                 .with_user_secret_store(InMemUserSecretStore::default())
-                .with_transport(crate::protocol::test::FailingTransport)
+                .with_transport(crate::protocol::tests::FailingTransport)
                 .with_state_store(InMemPersistedStateStore::default())
                 .with_own_transports(["https://owner.example.com"])
                 .with_threshold(3)
@@ -3568,6 +4639,7 @@ mod weighted_round_tests {
                     secrets: secrets(),
                     description: None,
                     weights: HashMap::from([(ChannelId(51), 2)]),
+                    threshold: None,
                 })
                 .await
                 .expect("per-channel failures do not fail the round");
@@ -3586,39 +4658,513 @@ mod weighted_round_tests {
         });
     }
 
+    /// Weights are recorded per Helper: a publish the library starts on its
+    /// own reuses them, and a Helper paired since gets one subshare.
     #[test]
-    fn pair_completion_auto_publish_reports_weight_one() {
+    fn a_pairing_publish_reuses_the_stored_weights() {
         run_async(async {
             let mut rig = protocol_rig(&[51, 52], 3).await;
-            rig.protocol
-                .start(DeRecFlow::ProtectSecret {
-                    secrets: secrets(),
-                    description: None,
-                    weights: HashMap::from([(ChannelId(51), 2)]),
-                })
-                .await
-                .expect("weighted round");
+            protect(&mut rig, &[(51, 2)]).await;
+            assert_eq!(stored_weight(&rig.channels, 51).await, 2);
+            assert_eq!(stored_weight(&rig.channels, 52).await, 1);
 
             seed_helper(&mut rig.channels, &mut rig.secrets, 53).await;
             let events = rig
                 .protocol
-                .maybe_auto_publish_after_pair(&[DeRecEvent::PairingCompleted {
-                    channel_id: ChannelId(53),
-                    pairing_channel_id: ChannelId(53),
-                    kind: SenderKind::Owner,
-                    peer_communication_info: HashMap::new(),
-                }])
+                .maybe_auto_publish_after_pair(&[paired(53)])
                 .await
                 .expect("auto-publish runs");
 
+            assert_eq!(started_weights(&events), vec![(51, 2), (52, 1), (53, 1)]);
+            assert_eq!(stored_subshares(&rig.shares, 51, 2), 2);
+            assert_eq!(stored_subshares(&rig.shares, 52, 2), 1);
+            assert_eq!(stored_subshares(&rig.shares, 53, 2), 1);
+            assert_eq!(stored_weight(&rig.channels, 53).await, 1);
+        });
+    }
+
+    /// An explicit map is the full assignment: a Helper it does not name goes
+    /// back to one subshare, and an empty map resets every Helper.
+    #[test]
+    fn an_explicit_map_replaces_every_stored_weight() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52, 53], 3).await;
+            protect(&mut rig, &[(51, 2), (52, 2)]).await;
+
+            let events = protect(&mut rig, &[(52, 2)]).await;
+            assert_eq!(started_weights(&events), vec![(51, 1), (52, 2), (53, 1)]);
+            assert_eq!(stored_subshares(&rig.shares, 51, 2), 1);
+            assert_eq!(stored_weight(&rig.channels, 51).await, 1);
+            assert_eq!(stored_weight(&rig.channels, 52).await, 2);
+
+            let events = protect(&mut rig, &[]).await;
+            assert_eq!(started_weights(&events), vec![(51, 1), (52, 1), (53, 1)]);
+            for ch in [51, 52, 53] {
+                assert_eq!(stored_weight(&rig.channels, ch).await, 1);
+                assert_eq!(stored_subshares(&rig.shares, ch, 3), 1);
+            }
+        });
+    }
+
+    fn assert_invalid_weight(result: crate::Result<Vec<DeRecEvent>>, channel_id: u64, weight: u32) {
+        assert!(
+            matches!(
+                result,
+                Err(crate::Error::Sharing(SharingError::InvalidWeight { channel_id: c, weight: w }))
+                    if c == channel_id && w == weight
+            ),
+            "expected InvalidWeight {{ {channel_id}, {weight} }}; got {:?}",
+            result.as_ref().map(|_| ())
+        );
+    }
+
+    /// The owner passes back the weights it recorded with an explicit, lower
+    /// threshold under which one of them would let a Helper recover alone.
+    /// The round fails before anything is written or sent.
+    #[test]
+    fn an_explicit_weight_invalid_under_a_lowered_threshold_fails_the_round() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52, 53], 3).await;
+            protect(&mut rig, &[(51, 2), (52, 2)]).await;
+            rig.protocol.transport.clear();
+
+            let result = rig
+                .protocol
+                .start(DeRecFlow::ProtectSecret {
+                    secrets: secrets(),
+                    description: None,
+                    weights: HashMap::from([(ChannelId(51), 2), (ChannelId(52), 2)]),
+                    threshold: Some(2),
+                })
+                .await;
+
+            assert_invalid_weight(result, 51, 2);
+            assert!(rig.protocol.transport.sent_envelopes().is_empty());
+            assert_eq!(
+                rig.protocol
+                    .user_secret_store
+                    .load_latest(SECRET_ID)
+                    .await
+                    .unwrap()
+                    .map(|s| s.version),
+                Some(1)
+            );
+            assert_eq!(
+                stored_weight(&rig.channels, 51).await,
+                2,
+                "nothing is written"
+            );
+        });
+    }
+
+    /// The same lowered threshold fails a publish the library starts on its
+    /// own: the stored weight is validated like an explicit one, and the
+    /// error is what the pairing hook returns to `process` and `accept`.
+    #[test]
+    fn a_stored_weight_invalid_under_a_lowered_threshold_fails_the_pairing_publish() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 3).await;
+            protect(&mut rig, &[(51, 2)]).await;
+            forget_stored_threshold(&mut rig).await;
+            rebuild_with_threshold(&mut rig, 2);
+            seed_helper(&mut rig.channels, &mut rig.secrets, 53).await;
+
+            let result = rig
+                .protocol
+                .maybe_auto_publish_after_pair(&[paired(53)])
+                .await;
+
+            assert_invalid_weight(result, 51, 2);
+            assert!(rig.protocol.transport.sent_envelopes().is_empty());
+            assert_eq!(
+                rig.protocol
+                    .user_secret_store
+                    .load_latest(SECRET_ID)
+                    .await
+                    .unwrap()
+                    .map(|s| s.version),
+                Some(1)
+            );
+            assert_eq!(stored_weight(&rig.channels, 51).await, 2);
+        });
+    }
+
+    /// The fingerprint hook fails the same way. The channel is already
+    /// promoted when the publish runs, so the promotion stands and
+    /// `verify_fingerprint` returns the publish's error.
+    #[test]
+    fn a_stored_weight_invalid_under_a_lowered_threshold_fails_the_fingerprint_publish() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 3).await;
+            protect(&mut rig, &[(51, 2)]).await;
+            forget_stored_threshold(&mut rig).await;
+            rebuild_with_threshold(&mut rig, 2);
+            rig.channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Helper(HelperChannel {
+                        channel_id: ChannelId(53),
+                        transports: vec![endpoint(53)],
+                        communication_info: HashMap::new(),
+                        status: ChannelStatus::Pending,
+                        created_at: 0,
+                        peer_role: SenderKind::Helper,
+                        weight: 1,
+                    }),
+                )
+                .await
+                .expect("seed pending helper");
+            rig.secrets
+                .save(SECRET_ID, ChannelId(53), SecretValue::SharedKey([53; 32]))
+                .await
+                .expect("seed helper key");
+            let fingerprint = rig
+                .protocol
+                .get_fingerprint(ChannelId(53))
+                .await
+                .expect("fingerprint");
+
+            let result = rig
+                .protocol
+                .verify_fingerprint(ChannelId(53), &fingerprint)
+                .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::Error::Sharing(SharingError::InvalidWeight {
+                        channel_id: 51,
+                        weight: 2
+                    }))
+                ),
+                "got {result:?}"
+            );
+            assert!(rig.protocol.transport.sent_envelopes().is_empty());
+            assert_eq!(
+                rig.protocol
+                    .user_secret_store
+                    .load_latest(SECRET_ID)
+                    .await
+                    .unwrap()
+                    .map(|s| s.version),
+                Some(1)
+            );
+            let promoted = rig
+                .channels
+                .load(
+                    SECRET_ID,
+                    crate::protocol::types::ChannelQuery::Helper {
+                        channel_id: ChannelId(53),
+                    },
+                )
+                .await
+                .expect("load helper")
+                .and_then(|r| r.as_helper().cloned())
+                .expect("helper row present");
+            assert_eq!(
+                promoted.status,
+                ChannelStatus::Paired,
+                "the promotion stands"
+            );
+
+            let retry = rig
+                .protocol
+                .verify_fingerprint(ChannelId(53), &fingerprint)
+                .await;
+            assert!(matches!(retry, Ok(true)), "got {retry:?}");
+            assert!(
+                rig.protocol.transport.sent_envelopes().is_empty(),
+                "a retry does not publish"
+            );
+        });
+    }
+
+    /// The pairing hook driven through `process`: the owner's PairResponse
+    /// completes the pairing, and the publish after it fails on a stored
+    /// weight the lowered threshold no longer allows. `process` returns the
+    /// error together with the pairing's events, and nothing is sent.
+    #[test]
+    fn a_pair_response_whose_publish_fails_returns_its_events_with_the_error() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 3).await;
+            protect(&mut rig, &[(51, 2)]).await;
+            forget_stored_threshold(&mut rig).await;
+            rebuild_with_threshold(&mut rig, 2);
+
+            let helper_transport = RecordingTransport::default();
+            let mut helper = DeRecProtocolBuilder::new(SECRET_ID)
+                .with_channel_store(InMemChannelStore::default())
+                .with_share_store(InMemShareStore::default())
+                .with_secret_store(InMemSecretStore::default())
+                .with_user_secret_store(InMemUserSecretStore::default())
+                .with_transport(helper_transport.clone())
+                .with_state_store(InMemPersistedStateStore::default())
+                .with_own_transports(["https://helper-53.example"])
+                .with_threshold(2)
+                .with_auto_accept(crate::protocol::AutoAcceptPolicy {
+                    pairing: true,
+                    ..Default::default()
+                })
+                .build()
+                .expect("helper builds");
+            let contact = helper
+                .create_contact(
+                    Some(ChannelId(9393)),
+                    derec_proto::ContactMode::InlineKeys,
+                    None,
+                )
+                .await
+                .expect("contact");
+            rig.protocol
+                .start(DeRecFlow::Pairing {
+                    kind: SenderKind::Owner,
+                    contact,
+                    peer_communication_info: HashMap::new(),
+                })
+                .await
+                .expect("pairing starts");
+            let request = rig
+                .protocol
+                .transport
+                .sent_envelopes()
+                .pop()
+                .expect("the pair request");
+            helper.process(&request).await.expect("the helper answers");
+            let response = helper_transport
+                .sent_envelopes()
+                .pop()
+                .expect("the pair response");
+            let sent_before = rig.protocol.transport.sent_envelopes().len();
+
+            let err = rig
+                .protocol
+                .process(&response)
+                .await
+                .expect_err("the publish after pairing fails");
+
+            assert!(
+                matches!(
+                    err.source,
+                    crate::Error::Sharing(SharingError::InvalidWeight {
+                        channel_id: 51,
+                        weight: 2
+                    })
+                ),
+                "got {:?}",
+                err.source
+            );
+            assert!(
+                err.events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::PairingCompleted { .. })),
+                "the pairing is reported: {:?}",
+                err.events
+            );
+            assert!(
+                !err.events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::ProtectSecretStarted { .. })),
+                "no publish is reported: {:?}",
+                err.events
+            );
+            assert_eq!(
+                rig.protocol.transport.sent_envelopes().len(),
+                sent_before,
+                "nothing is sent"
+            );
+            assert_eq!(
+                rig.protocol
+                    .user_secret_store
+                    .load_latest(SECRET_ID)
+                    .await
+                    .unwrap()
+                    .map(|s| s.version),
+                Some(1),
+                "no version is consumed"
+            );
+        });
+    }
+
+    /// Two devices of one replica group, and a third recovering from the
+    /// roster: the weights the source chose travel in the roster, hydration
+    /// and restore write them back into each device's channels, and the next
+    /// publish each device starts on its own gives every Helper the same
+    /// number of subshares the source did.
+    #[test]
+    fn hydration_and_restore_carry_the_weights_into_the_next_publish() {
+        run_async(async {
+            const GROUP: u64 = 5101;
+            const SOURCE: u64 = 1001;
+            const DESTINATION: u64 = 1002;
+            const GROUP_KEY: [u8; 32] = [0x42; 32];
+
+            async fn seed_member(
+                channels: &mut InMemChannelStore,
+                replica_id: u64,
+                role: ReplicaRole,
+                uri: &str,
+            ) {
+                channels
+                    .save(
+                        SECRET_ID,
+                        ChannelRecord::Replica(ReplicaMember {
+                            channel_id: ChannelId(GROUP),
+                            replica_id: ReplicaId(replica_id),
+                            transports: vec![TransportProtocol {
+                                uri: uri.to_owned(),
+                                protocol: Protocol::Https as i32,
+                            }],
+                            communication_info: HashMap::new(),
+                            role,
+                            status: ChannelStatus::Paired,
+                            created_at: 0,
+                        }),
+                    )
+                    .await
+                    .expect("seed member");
+            }
+
+            struct Device {
+                protocol: TestProtocol,
+                channels: InMemChannelStore,
+                secrets: InMemSecretStore,
+                shares: InMemShareStore,
+                transport: RecordingTransport,
+            }
+
+            async fn device(replica_id: Option<u64>, own_uri: &str) -> Device {
+                let mut channels = InMemChannelStore::default();
+                let mut secrets = InMemSecretStore::default();
+                if replica_id.is_some() {
+                    seed_member(&mut channels, SOURCE, ReplicaRole::Source, "https://source").await;
+                    seed_member(
+                        &mut channels,
+                        DESTINATION,
+                        ReplicaRole::Destination,
+                        "https://destination",
+                    )
+                    .await;
+                    secrets
+                        .save(
+                            SECRET_ID,
+                            ChannelId(GROUP),
+                            SecretValue::SharedKey(GROUP_KEY),
+                        )
+                        .await
+                        .expect("seed group key");
+                }
+                let shares = InMemShareStore::default();
+                let transport = RecordingTransport::default();
+                let mut builder = DeRecProtocolBuilder::new(SECRET_ID)
+                    .with_channel_store(channels.clone())
+                    .with_share_store(shares.clone())
+                    .with_secret_store(secrets.clone())
+                    .with_user_secret_store(InMemUserSecretStore::default())
+                    .with_transport(transport.clone())
+                    .with_state_store(InMemPersistedStateStore::default())
+                    .with_own_transports([own_uri])
+                    .with_threshold(3);
+                if let Some(id) = replica_id {
+                    builder = builder.with_replica_id(id);
+                }
+                Device {
+                    protocol: builder.build().expect("test protocol builds"),
+                    channels,
+                    secrets,
+                    shares,
+                    transport,
+                }
+            }
+
+            let mut source = device(Some(SOURCE), "https://source").await;
+            for ch in [51, 52, 53] {
+                seed_helper(&mut source.channels, &mut source.secrets, ch).await;
+            }
+            source
+                .protocol
+                .start(DeRecFlow::ProtectSecret {
+                    secrets: secrets(),
+                    description: None,
+                    weights: HashMap::from([(ChannelId(51), 2)]),
+                    threshold: None,
+                })
+                .await
+                .expect("the source publishes");
+            let source_counts: Vec<usize> = [51, 52, 53]
+                .iter()
+                .map(|&ch| stored_subshares(&source.shares, ch, 1))
+                .collect();
+            assert_eq!(source_counts, vec![2, 1, 1]);
+
+            let push = source
+                .transport
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(to, _)| to.iter().any(|t| t.uri == "https://destination"))
+                .map(|(_, envelope)| envelope.clone())
+                .expect("the source pushes the roster to its destination");
+
+            let mut destination = device(Some(DESTINATION), "https://destination").await;
+            let events = destination
+                .protocol
+                .process(&push)
+                .await
+                .expect("the destination installs the roster");
+            let roster = events
+                .iter()
+                .find_map(|e| match e {
+                    DeRecEvent::ReplicaSecretInstalled { secret, .. } => Some(secret.clone()),
+                    _ => None,
+                })
+                .expect("the roster is installed");
+            assert_eq!(stored_weight(&destination.channels, 51).await, 2);
+
+            seed_helper(&mut destination.channels, &mut destination.secrets, 54).await;
+            let events = destination
+                .protocol
+                .maybe_auto_publish_after_pair(&[paired(54)])
+                .await
+                .expect("the destination publishes");
             assert_eq!(
                 started_weights(&events),
-                vec![(51, 1), (52, 1), (53, 1)],
-                "a library-initiated publish gives every helper one subshare"
+                vec![(51, 2), (52, 1), (53, 1), (54, 1)]
             );
-            for ch in [51, 52, 53] {
-                assert_eq!(stored_subshares(&rig.shares, ch, 2), 1);
-            }
+            let destination_counts: Vec<usize> = [51, 52, 53]
+                .iter()
+                .map(|&ch| stored_subshares(&destination.shares, ch, 2))
+                .collect();
+            assert_eq!(destination_counts, source_counts);
+
+            // Restore reads the roster through its recoverable encoding, as a
+            // recovered secret arrives.
+            let mut recovered = crate::protocol::types::Secret::decode(&roster.encode())
+                .expect("the roster decodes");
+            recovered.replicas = None;
+            let mut restored = device(None, "https://restored").await;
+            restored
+                .protocol
+                .restore(&recovered, 1)
+                .await
+                .expect("restore succeeds");
+            assert_eq!(stored_weight(&restored.channels, 51).await, 2);
+
+            seed_helper(&mut restored.channels, &mut restored.secrets, 54).await;
+            let events = restored
+                .protocol
+                .maybe_auto_publish_after_pair(&[paired(54)])
+                .await
+                .expect("the restored device publishes");
+            assert_eq!(
+                started_weights(&events),
+                vec![(51, 2), (52, 1), (53, 1), (54, 1)]
+            );
+            let restored_counts: Vec<usize> = [51, 52, 53]
+                .iter()
+                .map(|&ch| stored_subshares(&restored.shares, ch, 2))
+                .collect();
+            assert_eq!(restored_counts, source_counts);
         });
     }
 
@@ -3640,7 +5186,8 @@ mod weighted_round_tests {
                 &lf.local(),
                 secrets(),
                 None,
-                HashMap::from([(ChannelId(41), 2), (ChannelId(42), 2)]),
+                Some(&HashMap::from([(ChannelId(41), 2), (ChannelId(42), 2)])),
+                None,
                 3,
                 Some(3),
                 &Round {
@@ -3684,11 +5231,12 @@ mod weighted_round_tests {
         for &ch in helpers {
             seed_helper(&mut channels, &mut secrets, ch).await;
         }
+        let user_secrets = InMemUserSecretStore::default();
         let protocol = DeRecProtocolBuilder::new(SECRET_ID)
             .with_channel_store(channels.clone())
             .with_share_store(shares.clone())
             .with_secret_store(secrets.clone())
-            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_user_secret_store(user_secrets.clone())
             .with_transport(RecordingTransport::default())
             .with_state_store(InMemPersistedStateStore::default())
             .with_own_transports(["https://owner.example.com"])
@@ -3701,6 +5249,7 @@ mod weighted_round_tests {
             channels,
             secrets,
             shares,
+            user_secrets,
         }
     }
 
@@ -3714,6 +5263,7 @@ mod weighted_round_tests {
                     secrets: secrets(),
                     description: None,
                     weights: HashMap::from([(ChannelId(51), 2)]),
+                    threshold: None,
                 })
                 .await
                 .expect("3 subshares fit a cap of 3");
@@ -3733,6 +5283,7 @@ mod weighted_round_tests {
                     secrets: secrets(),
                     description: None,
                     weights: HashMap::from([(ChannelId(51), 2), (ChannelId(52), 2)]),
+                    threshold: None,
                 })
                 .await;
 
@@ -3762,6 +5313,7 @@ mod weighted_round_tests {
                     secrets: secrets(),
                     description: None,
                     weights: HashMap::from([(ChannelId(51), 2), (ChannelId(52), 2)]),
+                    threshold: None,
                 })
                 .await
                 .expect("no cap is configured");
@@ -3770,9 +5322,9 @@ mod weighted_round_tests {
         });
     }
 
-    /// A library-initiated publish gives every Helper one subshare, so its
-    /// total is the Helper count; once that exceeds the cap the publish fails
-    /// the same way `start` does, and nothing reaches any Helper.
+    /// A library-initiated publish totals the stored weights — here one per
+    /// Helper — so pairing a third Helper exceeds the cap and the publish
+    /// fails the same way `start` does, and nothing reaches any Helper.
     #[test]
     fn pair_completion_auto_publish_respects_the_subshare_cap() {
         run_async(async {
@@ -3782,6 +5334,7 @@ mod weighted_round_tests {
                     secrets: secrets(),
                     description: None,
                     weights: HashMap::new(),
+                    threshold: None,
                 })
                 .await
                 .expect("2 subshares fit a cap of 2");
@@ -3823,6 +5376,289 @@ mod weighted_round_tests {
                     .map(|s| s.version),
                 Some(1),
                 "no version is consumed"
+            );
+        });
+    }
+
+    async fn stored_threshold(rig: &ProtocolRig) -> Option<u32> {
+        rig.user_secrets
+            .load_latest(SECRET_ID)
+            .await
+            .unwrap()
+            .and_then(|s| s.threshold)
+    }
+
+    /// The threshold the library recorded on the owner's row.
+    fn recorded_threshold(shares: &InMemShareStore, channel: u64, version: u32) -> Option<u32> {
+        shares
+            .data
+            .lock()
+            .unwrap()
+            .get(&(SECRET_ID, channel, version))
+            .expect("the owner keeps a tracking share per dispatched helper")
+            .threshold
+    }
+
+    async fn round_threshold(rig: &ProtocolRig, version: u32) -> Option<u32> {
+        use crate::protocol::DeRecStateStore as _;
+        match rig
+            .protocol
+            .state_store
+            .load(
+                SECRET_ID,
+                crate::protocol::types::StateKey::SharingRound { version },
+            )
+            .await
+            .unwrap()
+        {
+            Some(crate::protocol::types::StateItem::SharingRound(round)) => round.threshold,
+            other => panic!("no open round at v{version}: {other:?}"),
+        }
+    }
+
+    async fn protect_at(
+        rig: &mut ProtocolRig,
+        weights: &[(u64, u32)],
+        threshold: Option<u32>,
+    ) -> crate::Result<Vec<DeRecEvent>> {
+        rig.protocol
+            .start(DeRecFlow::ProtectSecret {
+                secrets: secrets(),
+                description: None,
+                weights: weights.iter().map(|&(c, w)| (ChannelId(c), w)).collect(),
+                threshold,
+            })
+            .await
+    }
+
+    fn helper_dispatches(events: &[DeRecEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, DeRecEvent::ProtectSecretStarted { .. }))
+            .count()
+    }
+
+    /// With nothing stored, the builder's threshold is the round's, and it is
+    /// recorded on the snapshot, the owner rows and the round.
+    #[test]
+    fn with_nothing_stored_the_builders_threshold_is_used_and_recorded() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52, 53], 2).await;
+            protect(&mut rig, &[]).await;
+
+            assert_eq!(stored_threshold(&rig).await, Some(2));
+            for ch in [51, 52, 53] {
+                assert_eq!(recorded_threshold(&rig.shares, ch, 1), Some(2));
+            }
+            assert_eq!(round_threshold(&rig, 1).await, Some(2));
+        });
+    }
+
+    /// An explicit threshold beats the builder's and becomes the stored one.
+    /// A later publish passing none keeps it, and so does the publish the
+    /// library starts after a pairing. A new explicit threshold replaces it.
+    #[test]
+    fn an_explicit_threshold_is_stored_and_reused_until_replaced() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52, 53], 2).await;
+            protect_at(&mut rig, &[], Some(3)).await.expect("v1");
+            assert_eq!(stored_threshold(&rig).await, Some(3));
+            assert_eq!(recorded_threshold(&rig.shares, 51, 1), Some(3));
+            assert_eq!(round_threshold(&rig, 1).await, Some(3));
+
+            protect(&mut rig, &[]).await;
+            assert_eq!(recorded_threshold(&rig.shares, 51, 2), Some(3));
+
+            seed_helper(&mut rig.channels, &mut rig.secrets, 54).await;
+            rig.protocol
+                .maybe_auto_publish_after_pair(&[paired(54)])
+                .await
+                .expect("the pairing publish runs");
+            for ch in [51, 52, 53, 54] {
+                assert_eq!(recorded_threshold(&rig.shares, ch, 3), Some(3));
+            }
+            assert_eq!(stored_threshold(&rig).await, Some(3));
+
+            protect_at(&mut rig, &[], Some(4)).await.expect("v4");
+            assert_eq!(stored_threshold(&rig).await, Some(4));
+            for ch in [51, 52, 53, 54] {
+                assert_eq!(recorded_threshold(&rig.shares, ch, 4), Some(4));
+            }
+        });
+    }
+
+    /// The split itself follows the stored threshold, not the builder's: three
+    /// weight-1 Helpers reach a builder threshold of 2 but not a stored 4, so
+    /// no share is sent until a fourth Helper pairs.
+    #[test]
+    fn the_split_follows_the_stored_threshold() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52, 53], 2).await;
+            let events = protect_at(&mut rig, &[], Some(4)).await.expect("v1");
+            assert_eq!(helper_dispatches(&events), 0, "3 subshares miss t = 4");
+            assert_eq!(stored_threshold(&rig).await, Some(4));
+
+            let events = protect(&mut rig, &[]).await;
+            assert_eq!(helper_dispatches(&events), 0, "the stored t = 4 applies");
+
+            seed_helper(&mut rig.channels, &mut rig.secrets, 54).await;
+            let events = rig
+                .protocol
+                .maybe_auto_publish_after_pair(&[paired(54)])
+                .await
+                .expect("the pairing publish runs");
+            assert_eq!(helper_dispatches(&events), 4, "4 subshares reach t = 4");
+            assert_eq!(recorded_threshold(&rig.shares, 54, 3), Some(4));
+        });
+    }
+
+    /// A stored threshold survives a restart with a different builder value.
+    #[test]
+    fn a_stored_threshold_beats_the_builders() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52, 53], 3).await;
+            protect(&mut rig, &[]).await;
+            rebuild_with_threshold(&mut rig, 2);
+
+            protect(&mut rig, &[]).await;
+            assert_eq!(recorded_threshold(&rig.shares, 51, 2), Some(3));
+            assert_eq!(stored_threshold(&rig).await, Some(3));
+        });
+    }
+
+    /// An explicit threshold that a passed weight is not below fails the
+    /// round before anything is written or sent.
+    #[test]
+    fn an_explicit_threshold_at_or_below_a_weight_fails_with_nothing_written() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52, 53], 3).await;
+            protect(&mut rig, &[(51, 2)]).await;
+            rig.protocol.transport.clear();
+
+            let result = protect_at(&mut rig, &[(51, 2)], Some(2)).await;
+
+            assert_invalid_weight(result, 51, 2);
+            assert!(rig.protocol.transport.sent_envelopes().is_empty());
+            assert_eq!(stored_threshold(&rig).await, Some(3));
+            assert_eq!(
+                rig.user_secrets
+                    .load_latest(SECRET_ID)
+                    .await
+                    .unwrap()
+                    .map(|s| s.version),
+                Some(1)
+            );
+            assert_eq!(stored_weight(&rig.channels, 51).await, 2);
+        });
+    }
+
+    /// An explicit threshold above the subshare cap fails the round before
+    /// anything is written or sent.
+    #[test]
+    fn an_explicit_threshold_above_the_subshare_cap_fails_with_nothing_written() {
+        run_async(async {
+            let mut rig = protocol_rig_with_cap(&[51, 52, 53], 2, 3).await;
+            let result = protect_at(&mut rig, &[], Some(4)).await;
+
+            assert!(
+                matches!(result, Err(crate::Error::InvalidInput(_))),
+                "got {:?}",
+                result.as_ref().map(|_| ())
+            );
+            assert!(rig.protocol.transport.sent_envelopes().is_empty());
+            assert!(
+                rig.user_secrets
+                    .load_latest(SECRET_ID)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    /// An explicit threshold below 2 fails the round before anything is
+    /// written or sent.
+    #[test]
+    fn an_explicit_threshold_below_two_fails_with_nothing_written() {
+        run_async(async {
+            for t in [0, 1] {
+                let mut rig = protocol_rig(&[51, 52, 53], 2).await;
+                let result = protect_at(&mut rig, &[], Some(t)).await;
+
+                assert!(
+                    matches!(
+                        result,
+                        Err(crate::Error::Sharing(SharingError::InvalidThreshold { threshold, .. }))
+                            if threshold == t as usize
+                    ),
+                    "t = {t}: got {:?}",
+                    result.as_ref().map(|_| ())
+                );
+                assert!(rig.protocol.transport.sent_envelopes().is_empty());
+                assert!(
+                    rig.user_secrets
+                        .load_latest(SECRET_ID)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        });
+    }
+
+    /// A round that changes the threshold and fails after validation, before
+    /// its own snapshot is saved, leaves the previous snapshot as it was: a
+    /// snapshot never records a threshold its version was not split with.
+    #[test]
+    fn a_threshold_changing_round_that_fails_leaves_the_previous_snapshot_unchanged() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52, 53], 2).await;
+            protect_at(&mut rig, &[], Some(2)).await.expect("v1");
+            *rig.shares.keep_list_error.lock().unwrap() = true;
+
+            let result = protect_at(&mut rig, &[], Some(3)).await;
+
+            assert!(result.is_err(), "the keep-list read fails the round");
+            let snapshot = rig
+                .user_secrets
+                .load_latest(SECRET_ID)
+                .await
+                .unwrap()
+                .expect("v1's snapshot is kept");
+            assert_eq!(snapshot.version, 1);
+            assert_eq!(snapshot.threshold, Some(2));
+        });
+    }
+
+    /// The owner rows carry the threshold; the Helpers' rows carry none.
+    /// Verifying v1 after v2 changed the threshold reports v1's.
+    #[test]
+    fn verifying_an_older_version_reports_its_own_threshold() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52, 53], 2).await;
+            protect_at(&mut rig, &[], Some(3)).await.expect("v1");
+            protect_at(&mut rig, &[], Some(2)).await.expect("v2");
+            assert_eq!(recorded_threshold(&rig.shares, 51, 2), Some(2));
+
+            rig.protocol
+                .start(DeRecFlow::VerifyShares {
+                    secret_id: SECRET_ID,
+                    version: 1,
+                    target: crate::protocol::types::Target::Single(ChannelId(51)),
+                })
+                .await
+                .expect("verification starts");
+            let events = answer_verification(&mut rig, 51, 1).await;
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::ShareVerified {
+                        version: 1,
+                        threshold: Some(3),
+                        ..
+                    }
+                )),
+                "got {events:?}"
             );
         });
     }

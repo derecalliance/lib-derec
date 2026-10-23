@@ -59,12 +59,14 @@ function goldenRestoreInput(): Extract<DeRecEvent, { type: 'SecretRecovered' }>[
         transports: [{ uri: 'https://helper-a.example.com', protocol: 'https' }],
         shared_key: sharedKey1,
         communication_info: { foo: 'bar' },
+        weight: 1,
       },
       {
         channel_id: '22',
         transports: [{ uri: 'https://helper-b.example.com', protocol: 'https' }],
         shared_key: sharedKey2,
         communication_info: {},
+        weight: 2,
       },
     ],
     secrets: goldenUserSecrets(),
@@ -86,6 +88,7 @@ function goldenRestoreInput(): Extract<DeRecEvent, { type: 'SecretRecovered' }>[
       ],
       shared_key: replicaGroupKey,
     },
+    threshold: 3,
   };
 }
 
@@ -100,6 +103,35 @@ describe('wire golden vectors', () => {
     );
   });
 
+  it('protect_secret_weighted params accept decimal-string channel ids identically', () => {
+    const input = {
+      ...goldenProtectSecretInput(),
+      weights: new Map<bigint | string, number>([
+        ['7', 2],
+        ['12', 3],
+      ]),
+    };
+    expect(buildProtectSecretParams(input)).toEqual(golden.protect_secret_weighted);
+  });
+
+  it('protect_secret_threshold params match the shared fixture', () => {
+    expect(buildProtectSecretParams({ ...goldenProtectSecretInput(), threshold: 3 })).toEqual(
+      golden.protect_secret_threshold,
+    );
+  });
+
+  it('protect_secret params treat a null threshold as no threshold', () => {
+    const input = { ...goldenProtectSecretInput(), threshold: null as unknown as number };
+    expect(buildProtectSecretParams(input)).toEqual(golden.protect_secret);
+  });
+
+  it('restore params omit the threshold when the roster records none', () => {
+    const input = goldenRestoreInput();
+    delete input.threshold;
+    const params = buildRestoreParams(input, 7) as { recovered_secret: Record<string, unknown> };
+    expect(params.recovered_secret).not.toHaveProperty('threshold');
+  });
+
   it('protect_secret params treat null weights as no weights', () => {
     const input = { ...goldenProtectSecretInput(), weights: null as unknown as Map<bigint, number> };
     expect(buildProtectSecretParams(input)).toEqual(golden.protect_secret);
@@ -109,10 +141,24 @@ describe('wire golden vectors', () => {
     expect(buildRestoreParams(goldenRestoreInput(), 7)).toEqual(golden.restore);
   });
 
+  it('restore params treat null communication_info as omitted, same as absent or empty', () => {
+    const input = goldenRestoreInput();
+    input.helpers[0].communication_info = null as unknown as Record<string, string>;
+    input.replicas!.members[0].communication_info = null as unknown as Record<string, string>;
+    const params = buildRestoreParams(input, 7) as {
+      recovered_secret: {
+        helpers: Array<Record<string, unknown>>;
+        replicas: { members: Array<Record<string, unknown>> };
+      };
+    };
+    expect(params.recovered_secret.helpers[0]).not.toHaveProperty('communication_info');
+    expect(params.recovered_secret.replicas.members[0]).not.toHaveProperty('communication_info');
+  });
+
   // A section added to the fixture with no assertion here would leave this
   // SDK's params builder for it unchecked.
   it('covers every fixture section', () => {
-    const covered = ['protect_secret', 'protect_secret_weighted', 'restore'];
+    const covered = ['protect_secret', 'protect_secret_threshold', 'protect_secret_weighted', 'restore'];
     const sections = Object.keys(golden).filter((k) => !k.startsWith('$')).sort();
     expect(sections).toEqual(covered);
   });

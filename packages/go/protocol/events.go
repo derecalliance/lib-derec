@@ -21,6 +21,7 @@ const (
 	EventTypeReplicaSecretReceived     = "ReplicaSecretReceived"
 	EventTypeReplicaSecretInstalled    = "ReplicaSecretInstalled"
 	EventTypeReplicaVersionConflict    = "ReplicaVersionConflict"
+	EventTypeReplicaSecretRefused      = "ReplicaSecretRefused"
 	EventTypeReplicaSyncRejected       = "ReplicaSyncRejected"
 	EventTypeReplicaSyncFailed         = "ReplicaSyncFailed"
 	EventTypeReplicaSyncComplete       = "ReplicaSyncComplete"
@@ -30,6 +31,7 @@ const (
 	EventTypeSelfRemovedFromGroup      = "SelfRemovedFromGroup"
 	EventTypeReplicaSecretAcked        = "ReplicaSecretAcked"
 	EventTypeShareStored               = "ShareStored"
+	EventTypeShareRefused              = "ShareRefused"
 	EventTypeShareConfirmed            = "ShareConfirmed"
 	EventTypeShareRejected             = "ShareRejected"
 	EventTypeSharingComplete           = "SharingComplete"
@@ -45,10 +47,13 @@ const (
 	EventTypeUnpaired                  = "Unpaired"
 	EventTypeUnpairRejected            = "UnpairRejected"
 	EventTypePrePairRejected           = "PrePairRejected"
+	EventTypeErrorResponseReceived     = "ErrorResponseReceived"
+	EventTypePairingRefused            = "PairingRefused"
 	EventTypeChannelInfoUpdated        = "ChannelInfoUpdated"
 	EventTypeChannelInfoUpdateRejected = "ChannelInfoUpdateRejected"
 	EventTypeActionRequired            = "ActionRequired"
 	EventTypeAutoAccepted              = "AutoAccepted"
+	EventTypeRequestFailed             = "RequestFailed"
 	EventTypeNoOp                      = "NoOp"
 	EventTypeMessageIgnored            = "MessageIgnored"
 	EventTypePeerNotRestored           = "PeerNotRestored"
@@ -88,7 +93,7 @@ const (
 // Fields that are `Option<T>` on the Rust side (and therefore genuinely
 // absent — not just zero — on some variants) are Go pointers: Version,
 // ReplicaID, AuthorReplicaID, HeldAuthorReplicaID, IncomingAuthorReplicaID,
-// SenderKind, ShareDescription, ShareSecretID, ShareSize, UnpairMemo. Weight
+// SenderKind, ShareDescription, ShareSecretID, ShareSize, Subshares, Threshold, UnpairMemo. Weight
 // is also a Go pointer, though plain (non-Option) on the Rust side: it is
 // carried only by ProtectSecretStarted/ProtectSecretFailed, so every other
 // variant must decode it as absent rather than the ambiguous zero value.
@@ -117,9 +122,9 @@ type Event struct {
 	PeerCommunicationInfo map[string]string `json:"peer_communication_info"`
 
 	// ReplicaPaired, ReplicaSecretReceived, ReplicaSecretInstalled,
-	// ReplicaVersionConflict, ReplicaSecretAcked. FromReplicaID is the member
-	// the copy came from: the publisher on a push, the responder on a
-	// catch-up.
+	// ReplicaVersionConflict, ReplicaSecretRefused, ReplicaSecretAcked.
+	// FromReplicaID is the member the copy came from: the publisher on a
+	// push, the responder on a catch-up.
 	PeerReplicaID uint64         `json:"peer_replica_id,string"`
 	FromReplicaID uint64         `json:"from_replica_id,string"`
 	SecretID      uint64         `json:"secret_id,string"`
@@ -128,9 +133,25 @@ type Event struct {
 	Shares        []ChannelShare `json:"shares"`
 
 	// ProtectSecretStarted, ProtectSecretFailed: the number of subshares
-	// sent (or, on Failed, that would have been sent) to this channel — the
-	// ProtectSecretParams.Weights entry for it, or 1 when absent.
+	// sent (or, on Failed, that would have been sent) to this channel, which
+	// is also the weight now stored for it — the ProtectSecretParams.Weights
+	// entry for it, 1 when the map does not name it, or the stored weight on
+	// a publish the library starts on its own.
 	Weight *uint32 `json:"weight"`
+
+	// ShareVerified — how many subshares this helper holds for Version: the
+	// Subshares of the owner's stored share for this channel and version,
+	// not the helper's current weight. nil when that share was stored before
+	// the count was recorded. To judge whether a version is recoverable, sum
+	// Subshares over its ShareVerified events and compare with their
+	// Threshold. If either is nil on any of those events, the result is
+	// unknown: a nil count is not 0 or 1.
+	Subshares *uint32 `json:"subshares"`
+
+	// ShareVerified — the threshold Version was split with: the Threshold of
+	// the same owner share, not the current threshold. nil when that share
+	// was stored before the threshold was recorded.
+	Threshold *uint32 `json:"threshold"`
 
 	// ReplicaSecretReceived, ReplicaSecretInstalled — the member that
 	// published Version; nil when the serving member's snapshot records no
@@ -152,16 +173,48 @@ type Event struct {
 	HeldAuthorReplicaID     *uint64 `json:"held_author_replica_id,string"`
 	IncomingAuthorReplicaID *uint64 `json:"incoming_author_replica_id,string"`
 
-	// ReplicaSecretAcked, ReplicaSyncRejected, ShareRejected,
-	// ShareVerifyRejected, RecoveryShareRefused, UnpairRejected,
-	// PrePairRejected, ChannelInfoUpdateRejected. Status is the protocol
-	// StatusEnum the peer answered with.
+	// ReplicaSecretAcked, ReplicaSyncRejected, ReplicaSecretRefused,
+	// ShareRejected, ShareRefused, ShareVerifyRejected, RecoveryShareRefused,
+	// UnpairRejected, PrePairRejected, ChannelInfoUpdateRejected,
+	// ErrorResponseReceived. Status is the protocol StatusEnum the peer
+	// answered with.
+	//
+	// ErrorResponseReceived is the peer answering a message from this device
+	// with an ErrorResponseMessage: it could not process it, typically because
+	// the body could not be decoded (FORMAT_ERROR). It is never answered.
+	//
+	// PairingRefused is this device refusing an inbound PairRequest under a
+	// protocol rule (INCOMPATIBLE_PARAMETER_RANGE or REPLICA_ID_CONFLICT),
+	// whatever the AutoAccept or AutoRespondOnFailure setting. The requester
+	// was sent a PairResponse carrying this Status and Memo, and no channel
+	// was created. It is returned by Process, not as an error. Memo is what
+	// the requester reads, written from its side; the local reason is in
+	// ErrorCode and Message, as on RequestFailed.
+	//
+	// ReplicaSecretRefused is this device's library refusing a group
+	// member's copy of the secret: FORMAT_ERROR (the payload does not decode
+	// or is not self-consistent) or VERIFICATION_FAILED (a share map entry
+	// does not verify against its commitment). Nothing was written. On a push
+	// the publisher was answered with this Status and Memo, which it observes
+	// as ReplicaSyncRejected; a copy served by a catch-up is not answered.
 	//
 	// RecoveryShareRefused is a helper answering a recovery share request
 	// with a non-OK Status (e.g. UNKNOWN_SHARE_VERSION) instead of a share.
 	// The refusal is not collected — it does not count towards
 	// SharesReceived and the recovery stays open for the other helpers'
 	// shares — but it does answer that helper's RecoverSecretStarted.
+	//
+	// ShareRefused is this helper's library refusing an inbound share
+	// instead of raising ActionRequired: FORMAT_ERROR (it does not decode),
+	// VERIFICATION_FAILED (it does not verify against its commitment),
+	// SIZE_LIMIT_EXCEEDED (outside the helper's size range) or
+	// VERSION_CONFLICT (a different share is stored at Version). Nothing was
+	// stored or removed, and the owner was answered with this Status and
+	// Memo, which it observes as ShareRejected. A refusal from the
+	// application's own share store does not raise it.
+	//
+	// RequestFailed carries the status and memo this device sent, or would
+	// have sent; see Responded below.
 	Status derecpb.StatusEnum `json:"status"`
 	Memo   string             `json:"memo"`
 
@@ -246,9 +299,42 @@ type Event struct {
 	// UpdateChannelInfoFailed.
 	Error string `json:"error"`
 
-	// ActionRequired, AutoAccepted. Action is the opaque pending action to
-	// pass back to Accept/Reject verbatim; ActionKind is one of the
-	// ActionKind* constants. The remaining fields are ActionRequired only and
+	// RequestFailed — a request that arrived on an authenticated channel
+	// failed while it was being handled. Every such request is owed exactly
+	// one response. Reported instead of an error from Process or Accept, so
+	// the call's other events are kept.
+	//
+	//   - ActionKind: the type of the request that failed, one of the
+	//     ActionKind* constants; ActionKindFailed for a body that could not
+	//     be decoded or a request the channel cannot carry.
+	//   - Responded: true when the response was handed to the transport.
+	//   - Status: the StatusEnum value that was sent, or would have been.
+	//   - Memo: the memo sent with Status, or that would have been;
+	//     wire-safe, never the local error text. Reject(Action, Status, Memo)
+	//     sends the response AutoRespondOnFailure would have sent.
+	//   - ErrorCode: the error's stable code name, as derec.Error.CodeName
+	//     reports it.
+	//   - Message: local description of the failure, never sent to the peer.
+	//   - Action: present only when Responded is false and the request can
+	//     still be answered — the same opaque token ActionRequired carries.
+	//     Pass it to Reject to send the response; Accept refuses it. It is
+	//     nil when Reject could never answer it: a request on a replica
+	//     group channel that names no member, which has no reply target, or,
+	//     with AutoRespondOnFailure off, a replica copy that hands this device
+	//     the group key and fails before that key is stored. Resolve each
+	//     token once: the library is stateless, so rejecting the same token
+	//     twice sends two responses.
+	//
+	// PairingRefused also sets ErrorCode (incompatible_parameter_range or
+	// replica_id_conflict) and Message, the local description of the
+	// refusal, never sent to the requester.
+	Responded bool   `json:"responded"`
+	ErrorCode string `json:"error_code"`
+	Message   string `json:"message"`
+
+	// ActionRequired, AutoAccepted, RequestFailed. Action is the opaque
+	// pending action to pass back to Accept/Reject verbatim; ActionKind is one
+	// of the ActionKind* constants. The remaining fields are ActionRequired only and
 	// set per ActionKind:
 	//
 	//   - SenderKind: Pairing.
@@ -275,9 +361,9 @@ type Event struct {
 }
 
 // The label vocabulary for Event.ActionKind, one value per pending-action
-// kind the protocol can raise. Compare against these rather than writing the
-// string literal — they match the Rust PendingActionKind discriminants
-// one-for-one.
+// kind the protocol can raise. Compare against these
+// rather than writing the string literal — they match the Rust
+// PendingActionKind discriminants one-for-one.
 const (
 	ActionKindPairing           = "Pairing"
 	ActionKindPrePair           = "PrePair"
@@ -287,6 +373,9 @@ const (
 	ActionKindGetShare          = "GetShare"
 	ActionKindUnpair            = "Unpair"
 	ActionKindUpdateChannelInfo = "UpdateChannelInfo"
+	// ActionKindFailed: a body that could not be decoded or a request the
+	// channel cannot carry (RequestFailed only).
+	ActionKindFailed = "Failed"
 )
 
 // The label vocabulary for Event.Reason on a MessageIgnored event. Matches
@@ -343,18 +432,24 @@ const (
 // wire.rs's UserSecret DTO has the identical shape. That type carries
 // explicit `json:"id"`/`"name"`/`"data"` tags that match the wire field
 // names, so it decodes this event's secrets directly.
+//
+// Threshold is the threshold the secret was split with, nil when the roster
+// records none. Restore writes it into UserSecrets.Threshold, so the next
+// publish splits at the same threshold; to change it, pass
+// ProtectSecretParams.Threshold on Start.
 type Secret struct {
-	Helpers  []Helper     `json:"helpers"`
-	Secrets  []UserSecret `json:"secrets"`
-	Replicas *Replicas    `json:"replicas"`
+	Helpers   []Helper     `json:"helpers"`
+	Secrets   []UserSecret `json:"secrets"`
+	Replicas  *Replicas    `json:"replicas"`
+	Threshold *uint32      `json:"threshold"`
 }
 
 // MarshalJSON implements json.Marshaler. Secret decodes with the default
 // unmarshaler (the `json` tags above already match wire.rs's SecretWire
 // field-for-field), but re-marshaling it — e.g. to build Restore's
-// recovered_secret params — needs the Replicas field omitted when nil
-// (mirroring `#[serde(skip_serializing_if = "Option::is_none")]` on
-// SecretWire.replicas) rather than emitted as a JSON null. Helpers/Secrets
+// recovered_secret params — needs the Replicas and Threshold fields omitted
+// when nil (mirroring `#[serde(skip_serializing_if = "Option::is_none")]` on
+// SecretWire) rather than emitted as a JSON null. Helpers/Secrets
 // are normalized to non-nil so a nil slice marshals as `[]`, not `null` —
 // Rust's `helpers`/`secrets` fields are plain (non-Option) Vecs and would
 // reject a null.
@@ -368,13 +463,15 @@ func (s Secret) MarshalJSON() ([]byte, error) {
 		secrets = []UserSecret{}
 	}
 	return json.Marshal(struct {
-		Helpers  []Helper     `json:"helpers"`
-		Secrets  []UserSecret `json:"secrets"`
-		Replicas *Replicas    `json:"replicas,omitempty"`
+		Helpers   []Helper     `json:"helpers"`
+		Secrets   []UserSecret `json:"secrets"`
+		Replicas  *Replicas    `json:"replicas,omitempty"`
+		Threshold *uint32      `json:"threshold,omitempty"`
 	}{
-		Helpers:  helpers,
-		Secrets:  secrets,
-		Replicas: s.Replicas,
+		Helpers:   helpers,
+		Secrets:   secrets,
+		Replicas:  s.Replicas,
+		Threshold: s.Threshold,
 	})
 }
 
@@ -454,11 +551,17 @@ func (e *EndpointJSON) UnmarshalJSON(data []byte) error {
 
 // Helper mirrors the Helper wire DTO in wire.rs — one entry of Secret's
 // helper roster.
+//
+// Weight is the number of Shamir subshares the helper received in the round
+// that wrote the roster. Restore writes it into the helper's
+// HelperChannel.Weight, so the next publish gives it the same count. It is
+// always sent as given; restore refuses a weight of 0.
 type Helper struct {
 	ChannelID         uint64            `json:"channel_id,string"`
 	Transports        []EndpointJSON    `json:"transports"`
 	SharedKey         []byte            `json:"shared_key"`
 	CommunicationInfo map[string]string `json:"communication_info"`
+	Weight            uint32            `json:"weight"`
 }
 
 // MarshalJSON implements json.Marshaler: SharedKey as a JSON number array
@@ -472,11 +575,13 @@ func (h Helper) MarshalJSON() ([]byte, error) {
 		Transports        []EndpointJSON       `json:"transports"`
 		SharedKey         native.JSONByteArray `json:"shared_key"`
 		CommunicationInfo map[string]string    `json:"communication_info,omitempty"`
+		Weight            uint32               `json:"weight"`
 	}{
 		ChannelID:         h.ChannelID,
 		Transports:        h.Transports,
 		SharedKey:         native.JSONByteArray(h.SharedKey),
 		CommunicationInfo: h.CommunicationInfo,
+		Weight:            h.Weight,
 	})
 }
 

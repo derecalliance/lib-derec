@@ -26,6 +26,13 @@ type HelperChannel struct {
 	PeerRole          SenderKind
 	Status            ChannelStatus
 	CreatedAt         uint64
+	// Weight is the number of Shamir subshares this helper receives: the
+	// weight the last ProtectSecret resolved for it, reused by every publish
+	// the library starts on its own. The library writes it; read it here to
+	// pre-fill an edit of the weights, since a ProtectSecret weights map
+	// replaces every helper's weight. 1 for a new pairing. The core reads a
+	// record stored without it, or with 0, as 1.
+	Weight uint32
 }
 
 // ReplicaMember is one member of a replica group, including this device
@@ -288,10 +295,25 @@ type SecretValue struct {
 
 // Share is a single stored share entry, keyed by (channelID, secretID,
 // version) at the store layer. Mirrors the Rust-side Share struct.
+//
+// Subshares is the number of subshares the share carries, recorded on the
+// owner side only: the library sets it on every share the owner saves
+// (including a replica Destination's mirrored copies) and leaves it nil on a
+// helper's share. Owner shares stored before the field existed read back as
+// nil; the library never backfills them. Persist it as given and return it
+// unchanged.
+//
+// Threshold is the threshold this version was split with, recorded on the
+// owner side only, on the same shares as Subshares: a later round may change
+// the threshold, so this is the only record of the one an older version needs
+// to be recoverable. It is nil on a helper's share and on owner shares stored
+// before the field existed. Persist it as given and return it unchanged.
 type Share struct {
-	SecretID uint64
-	Version  uint32
-	Bytes    []byte
+	SecretID  uint64
+	Version   uint32
+	Bytes     []byte
+	Subshares *uint32
+	Threshold *uint32
 }
 
 // StateKind tags which category of in-flight orchestrator state a
@@ -347,7 +369,8 @@ type StateKey struct {
 //   - PendingUnpair: ChannelID, StartedAt (unix seconds).
 //   - SharingRound: Version, Pending/Confirmed/Failed (channel-id sets),
 //     PendingReplicas/SyncedReplicas/BehindReplicas (replica-id sets),
-//     StartedAt (unix seconds).
+//     StartedAt (unix seconds), KeepList (the versions every Helper was told
+//     to keep).
 //   - PendingReplicaDiscovery: LocalVersion, PendingReplicas (members still
 //     to answer), Reported (replicaID → version each member reported),
 //     StartedAt (unix seconds).
@@ -376,6 +399,13 @@ type StateItem struct {
 	SyncedReplicas []uint64
 	// BehindReplicas are members that refused, timed out, or were unreachable.
 	BehindReplicas []uint64
+	// KeepList is the keepList every Helper of a sharing round received.
+	// Rows written before 0.0.9 carry none, which the library reads as empty.
+	KeepList []uint32
+	// Threshold is the threshold a sharing round split at. Rows written
+	// before 0.0.9 carry none, and the library judges such a round against
+	// the builder's threshold.
+	Threshold *uint32
 	// LocalVersion is the version this device held when a catch-up started.
 	LocalVersion *uint32
 	// Reported maps each member that has answered a catch-up to the version
@@ -430,6 +460,13 @@ type UserSecrets struct {
 	// AuthorReplicaID is the replica member that published Version, or nil
 	// when the snapshot records no author. Store it as given.
 	AuthorReplicaID *uint64
+	// Threshold is the threshold the next publish splits at unless
+	// ProtectSecretParams.Threshold passes its own. Every publish writes the
+	// threshold it used, and Restore and replica hydration write the
+	// recovered roster's. nil on a snapshot written before the threshold was
+	// recorded, or restored from a roster that carries none; the configured
+	// DeRecProtocolConfig.Threshold then applies. Store it as given.
+	Threshold *uint32
 }
 
 // ChannelFilter narrows a listing from ChannelStore.

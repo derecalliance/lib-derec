@@ -100,13 +100,22 @@ internal sealed class ReplicaRoleJsonConverter : JsonConverter<ReplicaRole>
 /// helper-pairing held by an Owner carries <c>Helper</c> here, and the
 /// Helper's own row for the same channel carries <c>Owner</c>.
 /// </param>
+/// <param name="Weight">
+/// The number of Shamir subshares this helper receives: the weight the last
+/// <c>ProtectSecret</c> resolved for it, reused by every publish the library
+/// starts on its own. Written by the library; read it here to pre-fill an
+/// edit of the weights, since a <c>ProtectSecret</c> weights map replaces
+/// every helper's weight. <c>1</c> for a new pairing. The core reads a record
+/// stored without it, or with <c>0</c>, as <c>1</c>.
+/// </param>
 public sealed record HelperChannel(
     ulong ChannelId,
     IReadOnlyList<TransportProtocol> Transports,
     Dictionary<string, string> CommunicationInfo,
     ChannelStatus Status,
     ulong CreatedAt,
-    Pairing.SenderKind PeerRole);
+    Pairing.SenderKind PeerRole,
+    uint Weight = 1);
 
 /// <summary>
 /// One member of a replica group, including this device itself.
@@ -362,8 +371,24 @@ public interface ISecretStore
 /// a helper is the owner's id — it is <b>not</b> the partition the row is
 /// keyed under. See <see cref="IShareStore.Save"/>.
 /// </para>
+/// <para>
+/// <see cref="Subshares"/> is the number of subshares the share carries,
+/// recorded on the owner side only: the library sets it on every share the
+/// owner saves (including a replica Destination's mirrored copies) and
+/// leaves it <c>null</c> on a helper's share. Owner shares stored before the
+/// field existed read back as <c>null</c>; the library never backfills them.
+/// Persist it as given and return it unchanged.
+/// </para>
+/// <para>
+/// <see cref="Threshold"/> is the threshold this version was split with,
+/// recorded on the owner side only, on the same shares as
+/// <see cref="Subshares"/>: a later round may change the threshold, so this is
+/// the only record of the one an older version needs to be recoverable. It is
+/// <c>null</c> on a helper's share and on owner shares stored before the field
+/// existed. Persist it as given and return it unchanged.
+/// </para>
 /// </summary>
-public sealed record Share(ulong SecretId, uint Version, byte[] Bytes);
+public sealed record Share(ulong SecretId, uint Version, byte[] Bytes, uint? Subshares = null, uint? Threshold = null);
 
 /// <summary>
 /// Share-record persistence. Same per-call-isolation contract as
@@ -496,8 +521,17 @@ public sealed record UserSecretEntry(byte[] Id, string Name, byte[] Data);
 /// Persist it with the snapshot and return it unchanged: a replica compares
 /// it against incoming copies of the same version to detect conflicts.
 /// </para>
+/// <para>
+/// <see cref="Threshold"/> is the threshold the next publish splits at unless
+/// <see cref="ProtectSecretParams.Threshold"/> passes its own. Every publish
+/// writes the threshold it used, and restore and replica hydration write the
+/// recovered roster's. <c>null</c> on a snapshot written before the threshold
+/// was recorded, or restored from a roster that carries none; the builder's
+/// <c>WithThreshold</c> then applies. Persist it as given and return it
+/// unchanged.
+/// </para>
 /// </summary>
-public sealed record UserSecrets(uint Version, UserSecretEntry[] Secrets, string? Description, ulong? AuthorReplicaId = null);
+public sealed record UserSecrets(uint Version, UserSecretEntry[] Secrets, string? Description, ulong? AuthorReplicaId = null, uint? Threshold = null);
 
 /// <summary>
 /// Persistence for the user-facing secret contents, keyed by
@@ -793,6 +827,16 @@ public sealed record StateKey(StateKind Kind, ulong? ChannelId, ulong? SecretId,
 /// index-aligned with it (only for <see cref="StateKind.PendingRecovery"/>).
 /// A row without it is read by the library as no shares collected.
 /// </param>
+/// <param name="KeepList">
+/// The <c>keepList</c> every Helper of the round received (only for
+/// <see cref="StateKind.SharingRound"/>). A row without it is read by the
+/// library as an empty list.
+/// </param>
+/// <param name="Threshold">
+/// The threshold the round split at (only for
+/// <see cref="StateKind.SharingRound"/>). A row without it is judged against
+/// the builder's threshold.
+/// </param>
 /// <remarks>
 /// Fields are carried exactly as the library wrote them. A replica-id set
 /// left null is read by the library as empty.
@@ -813,7 +857,9 @@ public sealed record StateItem(
     ulong[]? BehindReplicas = null,
     uint? LocalVersion = null,
     IReadOnlyDictionary<ulong, uint>? Reported = null,
-    ulong[]? ShareChannels = null)
+    ulong[]? ShareChannels = null,
+    uint[]? KeepList = null,
+    uint? Threshold = null)
 {
     public StateKey Key() => Kind switch
     {
@@ -844,9 +890,11 @@ public sealed record StateItem(
         ulong startedAt,
         ulong[]? pendingReplicas = null,
         ulong[]? syncedReplicas = null,
-        ulong[]? behindReplicas = null) =>
+        ulong[]? behindReplicas = null,
+        uint[]? keepList = null,
+        uint? threshold = null) =>
         new(StateKind.SharingRound, null, null, version, startedAt, null, null, pending, confirmed, failed,
-            pendingReplicas, syncedReplicas, behindReplicas);
+            pendingReplicas, syncedReplicas, behindReplicas, KeepList: keepList, Threshold: threshold);
     public static StateItem PendingReplicaDiscovery(
         uint localVersion,
         ulong[] pendingReplicas,

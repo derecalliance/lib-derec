@@ -67,14 +67,19 @@ internal static class Protocol
         RunOrchestratorFingerprintTest();
         RunOrchestratorFingerprintMismatchTest();
         RunOrchestratorPairFlowTest();
+        RunOrchestratorPairingRefusalTest();
         RunOrchestratorCommunicationInfoPairTest();
         RunStateKeyVersionTest();
         RunOrchestratorSharingRoundKeyTest();
         RunOrchestratorProtectSecretWeightTest();
+        RunShareSubsharesTest();
+        RunStickyThresholdTest();
+        RunChannelStatusRequiredOnDecodeTest();
         RunOrchestratorMaxSubsharesTest();
         RunHelperKeepListPrunesShareStoreTest();
         RunOwnerKeepListReachesHelpersTest();
         RunShareStoreRefusalTest();
+        RunRequestFailedTokenTest();
         RunLibraryDefaultThresholdTest();
         RunOrchestratorHashedKeysPairFlowTest();
         RunOrchestratorNoKeysPairFlowTest();
@@ -92,6 +97,9 @@ internal static class Protocol
         RunReplicaRoleDecodeTest();
         RunRejectStatusEnumTest();
         RunStatusEventParseTest();
+        RunShareRefusedParseTest();
+        RunResponseGuaranteeEventParseTest();
+        RunReplicaSecretRefusedParseTest();
         RunRecoveryShareCorruptedParseTest();
         RunEndpointProtocolNameTest();
         RunWireGoldenTest();
@@ -641,6 +649,70 @@ internal static class Protocol
     }
 
     /// <summary>
+    /// A responder whose <c>ParameterRange</c> does not overlap the
+    /// requester's refuses the <c>PairRequest</c>: it reports
+    /// <see cref="PairingRefusedEvent"/>, sends exactly one rejecting
+    /// <c>PairResponse</c>, and the requester's <c>ProcessAsync</c> fails with
+    /// the peer's status and memo on the <see cref="DeRecException"/>.
+    /// </summary>
+    private static void RunOrchestratorPairingRefusalTest()
+    {
+        Console.WriteLine("=== Orchestrator pairing refusal test ===");
+
+        // The memo is read by the requester, so its own range comes first.
+        const string expectedMemo =
+            "`shareSize` range [10000000, 500000000] does not overlap the accepted range [1000000000, 5000000000]";
+
+        using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions(
+            ParameterRange: new ParameterRange { MinShareSize = 1_000_000_000, MaxShareSize = 5_000_000_000 }));
+        using var helper = MakeNode("Helper", "https://helper.example.com", new NodeOptions(
+            ParameterRange: new ParameterRange { MinShareSize = 10_000_000, MaxShareSize = 500_000_000 }));
+
+        byte[] contact = owner.Protocol.CreateContactAsync(1UL, ContactMode.InlineKeys).GetAwaiter().GetResult();
+        helper.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
+        {
+            Kind = Pairing.SenderKind.Helper,
+            Contact = contact,
+        }).GetAwaiter().GetResult();
+        byte[] pairRequest = helper.Transport.DrainOne();
+
+        var ownerEvents = owner.Protocol.ProcessAsync(pairRequest).GetAwaiter().GetResult();
+        if (ownerEvents.Count != 1 || ownerEvents[0] is not PairingRefusedEvent refused)
+            throw new InvalidOperationException(
+                $"the responder must report exactly one PairingRefused; got [{string.Join(", ", ownerEvents.Select(e => e.EventType))}]");
+        if (refused.Status != Org.Derecalliance.Derec.Protobuf.StatusEnum.IncompatibleParameterRange)
+            throw new InvalidOperationException($"PairingRefused.Status must be IncompatibleParameterRange, got {refused.Status}");
+        if (refused.Memo != expectedMemo)
+            throw new InvalidOperationException($"PairingRefused.Memo must read from the requester's side, got {refused.Memo}");
+        if (refused.ErrorCode != "incompatible_parameter_range")
+            throw new InvalidOperationException($"PairingRefused.ErrorCode must be incompatible_parameter_range, got {refused.ErrorCode}");
+        if (string.IsNullOrEmpty(refused.Message))
+            throw new InvalidOperationException("PairingRefused.Message must be non-empty");
+        Console.WriteLine("  owner.ProcessAsync(PairRequest) → PairingRefused(IncompatibleParameterRange) with memo, error_code and message  ✓");
+
+        if (owner.Transport.Outbox.Count != 1)
+            throw new InvalidOperationException(
+                $"the responder must send exactly one rejecting PairResponse, got {owner.Transport.Outbox.Count}");
+        byte[] pairResponse = owner.Transport.DrainOne();
+
+        try
+        {
+            helper.Protocol.ProcessAsync(pairResponse).GetAwaiter().GetResult();
+            throw new InvalidOperationException("the requester must fail on a rejecting PairResponse");
+        }
+        catch (DeRecException e) when (e.Code == DeRecCode.NonOkStatus)
+        {
+            if (e.PeerStatus != (int)Org.Derecalliance.Derec.Protobuf.StatusEnum.IncompatibleParameterRange)
+                throw new InvalidOperationException($"DeRecException.PeerStatus must be IncompatibleParameterRange, got {e.PeerStatus}");
+            if (e.PeerMemo != expectedMemo)
+                throw new InvalidOperationException($"DeRecException.PeerMemo must carry the responder's memo, got {e.PeerMemo}");
+        }
+        Console.WriteLine("  helper.ProcessAsync(PairResponse:rejected) → DeRecException(NonOkStatus) with PeerStatus and PeerMemo  ✓");
+
+        Console.WriteLine("Orchestrator pairing refusal test passed.\n");
+    }
+
+    /// <summary>
     /// A channel named in <c>ProtectSecretParams.Weights</c> gets that many
     /// subshares and the <c>ProtectSecretStartedEvent</c> dispatched for
     /// it carries the same number back; a channel absent from the map
@@ -697,7 +769,339 @@ internal static class Protocol
                 "a weight-2 helper plus an unweighted helper (3 subshares) must meet a threshold of 3");
         Console.WriteLine("  round with weighted helper (2 + 1 = 3 subshares) meets threshold 3  ✓");
 
+        // The library wrote the resolved weights into the channel records it
+        // saved through this store, and FromDto carried them onto the typed
+        // record.
+        uint StoredWeight(ulong channelId) =>
+            owner.ChannelStore.Load(secretId, channelId, 0)?.Helper?.Weight
+            ?? throw new InvalidOperationException($"helper channel {channelId} missing");
+        if (StoredWeight(channelA) != 2 || StoredWeight(channelB) != 1)
+            throw new InvalidOperationException(
+                $"stored weights must be A=2, B=1; got A={StoredWeight(channelA)}, B={StoredWeight(channelB)}");
+        Console.WriteLine("  HelperChannel.Weight records the resolved weights  ✓");
+
+        // Pairing a third helper makes the library publish on its own. It
+        // reads the stored weights back through ToDto, so A keeps 2 and the
+        // new helper starts at 1.
+        using var helperC = MakeNode("HelperC", "https://helper-c.example.com", new NodeOptions(SecretId: secretId));
+        byte[] contact = helperC.Protocol.CreateContactAsync(13UL, ContactMode.InlineKeys).GetAwaiter().GetResult();
+        owner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
+        {
+            Kind = Pairing.SenderKind.Owner,
+            Contact = contact,
+        }).GetAwaiter().GetResult();
+        helperC.Protocol.ProcessAndAcceptAllAsync(owner.Transport.DrainOne()).GetAwaiter().GetResult();
+        var republished = owner.Protocol.ProcessAndAcceptAllAsync(helperC.Transport.DrainOne())
+            .GetAwaiter().GetResult();
+        ulong channelC = republished.OfType<PairingCompletedEvent>().Single().ChannelId;
+        var auto = republished.OfType<ProtectSecretStartedEvent>().ToDictionary(e => e.ChannelId);
+        if (auto.Count != 3 || auto[channelA].Weight != 2 || auto[channelB].Weight != 1 || auto[channelC].Weight != 1)
+            throw new InvalidOperationException(
+                $"the pairing publish must reuse the stored weights (A=2, B=1, C=1); got [{string.Join(", ", auto.Values.Select(e => $"{e.ChannelId}={e.Weight}"))}]");
+        Console.WriteLine("  a pairing publish reuses the stored weights; the new helper gets 1  ✓");
+
+        // The private DTO mirrors the Rust record field for field: `weight`
+        // is last.
+        var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+        var dtoType = typeof(DeRecProtocol).GetNestedType("HelperChannelDto", System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("DeRecProtocol.HelperChannelDto not found");
+        var toDto = typeof(DeRecProtocol).GetMethod("ToDto", flags, new[] { typeof(HelperChannel) })!;
+        var fromDto = typeof(DeRecProtocol).GetMethod("FromDto", flags, new[] { dtoType })!;
+        var record = new HelperChannel(42, new[] { new TransportProtocol("https://helper.example/derec") },
+            new(), ChannelStatus.Paired, 1_700_000_000, Pairing.SenderKind.Helper, Weight: 3);
+        string written = JsonSerializer.Serialize(toDto.Invoke(null, new object[] { record }), dtoType, DeRecJsonOptions.Wire);
+        const string expectedJson = """{"schema_version":3,"channel_id":42,"transports":[{"uri":"https://helper.example/derec","protocol":0}],"communication_info":{},"peer_role":"Helper","status":"Paired","created_at":1700000000,"weight":3}""";
+        if (written != expectedJson)
+            throw new InvalidOperationException($"HelperChannelDto must match the Rust record:\n  expected {expectedJson}\n  written  {written}");
+        var reread = (HelperChannel)fromDto.Invoke(null, new[] { JsonSerializer.Deserialize(written, dtoType, DeRecJsonOptions.Wire) })!;
+        if (reread.Weight != 3)
+            throw new InvalidOperationException($"weight must round-trip (3); got {reread.Weight}");
+        Console.WriteLine("  HelperChannelDto round-trips weight  ✓");
+
         Console.WriteLine("Orchestrator ProtectSecret weight test passed.\n");
+    }
+
+    /// <summary>
+    /// The owner records each helper's subshare count on its stored shares
+    /// (<see cref="Share.Subshares"/>); helpers record none.
+    /// <see cref="ShareVerifiedEvent.Subshares"/> reports the count of the
+    /// verified version, and a later re-weight leaves an older version's
+    /// counts intact.
+    /// </summary>
+    private static void RunShareSubsharesTest()
+    {
+        Console.WriteLine("=== Share subshares test ===");
+
+        const ulong secretId = 0x5B5BUL;
+        using var owner = MakeNode("Owner", "https://owner.example.com",
+            new NodeOptions(SecretId: secretId, Threshold: 3));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com", new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com", new NodeOptions(SecretId: secretId));
+        ulong channelA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 21UL);
+        ulong channelB = DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 22UL);
+
+        var helpersByUri = new Dictionary<string, Node>
+        {
+            ["https://helper-a.example.com"] = helperA,
+            ["https://helper-b.example.com"] = helperB,
+        };
+        List<DeRecEvent> RoundTrip()
+        {
+            var ownerEvents = new List<DeRecEvent>();
+            foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
+            {
+                var h = helpersByUri[uri];
+                h.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+                ownerEvents.AddRange(owner.Protocol.ProcessAndAcceptAllAsync(h.Transport.DrainOne()).GetAwaiter().GetResult());
+            }
+            return ownerEvents;
+        }
+        uint Protect(Dictionary<ulong, uint> weights)
+        {
+            uint v = owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+            {
+                Secrets = new[]
+                {
+                    new UserSecret { Id = new byte[] { 0x05 }, Name = "weighted", Data = Encoding.UTF8.GetBytes("subshares") },
+                },
+                Weights = weights,
+            }).GetAwaiter().GetResult().OfType<ProtectSecretStartedEvent>().First().Version;
+            RoundTrip();
+            return v;
+        }
+        string Verified(uint version)
+        {
+            owner.Protocol.StartAsync(FlowKind.VerifyShares, new VerifySharesParams
+            {
+                SecretId = secretId,
+                Version = version,
+            }).GetAwaiter().GetResult();
+            var verified = RoundTrip().OfType<ShareVerifiedEvent>().Where(e => e.Version == version).ToList();
+            return $"A={verified.Single(e => e.ChannelId == channelA).Subshares}, B={verified.Single(e => e.ChannelId == channelB).Subshares}";
+        }
+        uint? Stored(Node node, ulong channelId, uint version) =>
+            node.ShareStore.Load(secretId, channelId, new[] { version }).Single().Subshares;
+
+        uint v1 = Protect(new Dictionary<ulong, uint> { [channelA] = 2 });
+        if (Stored(owner, channelA, v1) != 2 || Stored(owner, channelB, v1) != 1)
+            throw new InvalidOperationException(
+                $"the owner's v1 shares must record A=2, B=1; got A={Stored(owner, channelA, v1)}, B={Stored(owner, channelB, v1)}");
+        Console.WriteLine("  owner's stored shares record Subshares A=2, B=1  ✓");
+        if (Stored(helperA, channelA, v1) is not null || Stored(helperB, channelB, v1) is not null)
+            throw new InvalidOperationException("a helper's stored share must carry no subshare count");
+        Console.WriteLine("  helpers' stored shares carry Subshares=null  ✓");
+
+        string first = Verified(v1);
+        if (first != "A=2, B=1")
+            throw new InvalidOperationException($"ShareVerified must report A=2, B=1 for v1; got {first}");
+        Console.WriteLine("  ShareVerifiedEvent.Subshares reports A=2, B=1  ✓");
+
+        uint v2 = Protect(new Dictionary<ulong, uint> { [channelB] = 2 });
+        if (Stored(owner, channelA, v2) != 1 || Stored(owner, channelB, v2) != 2)
+            throw new InvalidOperationException("the owner's v2 shares must record the re-weighted counts A=1, B=2");
+        string again = Verified(v1);
+        if (again != "A=2, B=1")
+            throw new InvalidOperationException($"after re-weighting, verifying v1 must still report A=2, B=1; got {again}");
+        Console.WriteLine("  re-weighted v2 (A=1, B=2); verifying v1 still reports A=2, B=1  ✓");
+
+        // The private DTO mirrors the Rust ShareRecord: `subshares` is last
+        // and omitted when null.
+        var dtoType = typeof(DeRecProtocol).GetNestedType("ShareRecordDto", System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("DeRecProtocol.ShareRecordDto not found");
+        string Written(uint? subshares) => JsonSerializer.Serialize(
+            Activator.CreateInstance(dtoType, "7", 2u, new byte[] { 1, 2 }, subshares, null), dtoType, DeRecJsonOptions.Wire);
+        const string withCount = """{"secret_id":"7","version":2,"bytes":[1,2],"subshares":3}""";
+        const string withoutCount = """{"secret_id":"7","version":2,"bytes":[1,2]}""";
+        if (Written(3) != withCount || Written(null) != withoutCount)
+            throw new InvalidOperationException($"ShareRecordDto must match the Rust record; got {Written(3)} and {Written(null)}");
+        Console.WriteLine("  ShareRecordDto matches the Rust record with and without a count  ✓");
+
+        Console.WriteLine("Share subshares test passed.\n");
+    }
+
+    /// <summary>
+    /// The threshold is sticky. Each version's threshold is recorded on the
+    /// owner's shares and reported by <see cref="ShareVerifiedEvent.Threshold"/>
+    /// after a later round changed it, helpers record none, and the publish
+    /// the library starts after a pairing splits at the stored threshold, not
+    /// the builder's. The store DTOs carry it byte-for-byte like Rust.
+    /// </summary>
+    private static void RunStickyThresholdTest()
+    {
+        Console.WriteLine("=== Sticky threshold test ===");
+
+        const ulong secretId = 0x7E57UL;
+        // The builder says 2.
+        using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions(SecretId: secretId));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com", new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com", new NodeOptions(SecretId: secretId));
+        using var helperC = MakeNode("HelperC", "https://helper-c.example.com", new NodeOptions(SecretId: secretId));
+        using var helperD = MakeNode("HelperD", "https://helper-d.example.com", new NodeOptions(SecretId: secretId));
+        ulong channelA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 31UL);
+        ulong channelB = DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 32UL);
+        ulong channelC = DoOrchestratorPair(helperC, helperC.Transport, owner, owner.Transport, 33UL);
+
+        var helpersByUri = new Dictionary<string, Node>
+        {
+            ["https://helper-a.example.com"] = helperA,
+            ["https://helper-b.example.com"] = helperB,
+            ["https://helper-c.example.com"] = helperC,
+            ["https://helper-d.example.com"] = helperD,
+        };
+        List<DeRecEvent> RoundTrip()
+        {
+            var ownerEvents = new List<DeRecEvent>();
+            foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
+            {
+                var h = helpersByUri[uri];
+                h.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+                ownerEvents.AddRange(owner.Protocol.ProcessAndAcceptAllAsync(h.Transport.DrainOne()).GetAwaiter().GetResult());
+            }
+            return ownerEvents;
+        }
+        uint Protect(uint? threshold)
+        {
+            uint v = owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+            {
+                Secrets = new[]
+                {
+                    new UserSecret { Id = new byte[] { 0x07 }, Name = "sticky", Data = Encoding.UTF8.GetBytes("threshold") },
+                },
+                Threshold = threshold,
+            }).GetAwaiter().GetResult().OfType<ProtectSecretStartedEvent>().First().Version;
+            RoundTrip();
+            return v;
+        }
+        uint? Stored(Node node, ulong channelId, uint version) =>
+            node.ShareStore.Load(secretId, channelId, new[] { version }).Single().Threshold;
+        var channels = new[] { channelA, channelB, channelC };
+
+        // v1 at the builder's 2, v2 at an explicit 3.
+        uint v1 = Protect(null);
+        uint v2 = Protect(3);
+        foreach (ulong c in channels)
+        {
+            if (Stored(owner, c, v1) != 2 || Stored(owner, c, v2) != 3)
+                throw new InvalidOperationException(
+                    $"the owner's shares must record v1 t=2, v2 t=3; got {Stored(owner, c, v1)}, {Stored(owner, c, v2)}");
+        }
+        Console.WriteLine("  owner's stored shares record Threshold v1=2, v2=3  ✓");
+        if (Stored(helperA, channelA, v1) is not null || Stored(helperB, channelB, v1) is not null
+            || Stored(helperC, channelC, v1) is not null)
+            throw new InvalidOperationException("a helper's stored share must carry no threshold");
+        Console.WriteLine("  helpers' stored shares carry Threshold=null  ✓");
+        uint? snapshotThreshold = owner.UserSecretStore.LoadLatest(secretId)?.Threshold;
+        if (snapshotThreshold != 3)
+            throw new InvalidOperationException($"the snapshot must store t=3; got {snapshotThreshold}");
+        Console.WriteLine("  UserSecrets.Threshold is 3  ✓");
+
+        owner.Protocol.StartAsync(FlowKind.VerifyShares, new VerifySharesParams
+        {
+            SecretId = secretId,
+            Version = v1,
+        }).GetAwaiter().GetResult();
+        var verified = RoundTrip().OfType<ShareVerifiedEvent>().Where(e => e.Version == v1).ToList();
+        if (verified.Count != 3 || verified.Any(e => e.Threshold != 2))
+            throw new InvalidOperationException(
+                $"ShareVerified for v1 must report t=2; got [{string.Join(", ", verified.Select(e => e.Threshold))}]");
+        Console.WriteLine("  ShareVerifiedEvent.Threshold reports v1's t=2 after v2 changed it  ✓");
+
+        // Pairing HelperD makes the library publish v3 on its own.
+        ulong channelD = DoOrchestratorPair(helperD, helperD.Transport, owner, owner.Transport, 34UL);
+        RoundTrip();
+        foreach (ulong c in channels.Append(channelD))
+        {
+            if (Stored(owner, c, v2 + 1) != 3)
+                throw new InvalidOperationException(
+                    $"the library-started publish must split at the stored t=3; got {Stored(owner, c, v2 + 1)}");
+        }
+        Console.WriteLine("  the pairing publish splits at the stored t=3, not the builder's 2  ✓");
+
+        // The store DTOs mirror the Rust records: `threshold` is omitted when null.
+        var shareDto = typeof(DeRecProtocol).GetNestedType("ShareRecordDto", System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("DeRecProtocol.ShareRecordDto not found");
+        string ShareWritten(uint? t) => JsonSerializer.Serialize(
+            Activator.CreateInstance(shareDto, "7", 2u, new byte[] { 1, 2 }, 1u, t), shareDto, DeRecJsonOptions.Wire);
+        if (ShareWritten(3) != """{"secret_id":"7","version":2,"bytes":[1,2],"subshares":1,"threshold":3}"""
+            || ShareWritten(null) != """{"secret_id":"7","version":2,"bytes":[1,2],"subshares":1}""")
+            throw new InvalidOperationException($"ShareRecordDto must match the Rust record; got {ShareWritten(3)} and {ShareWritten(null)}");
+        var userSecretsDto = typeof(DeRecProtocol).GetNestedType("UserSecretsDto", System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("DeRecProtocol.UserSecretsDto not found");
+        var userSecretDto = typeof(DeRecProtocol).GetNestedType("UserSecretDto", System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("DeRecProtocol.UserSecretDto not found");
+        string SnapshotWritten(uint? t) => JsonSerializer.Serialize(
+            Activator.CreateInstance(userSecretsDto, 2u, Array.CreateInstance(userSecretDto, 0), null, null, t),
+            userSecretsDto, DeRecJsonOptions.Wire);
+        if (SnapshotWritten(3) != """{"version":2,"secrets":[],"threshold":3}"""
+            || SnapshotWritten(null) != """{"version":2,"secrets":[]}""")
+            throw new InvalidOperationException($"UserSecretsDto must match the Rust record; got {SnapshotWritten(3)} and {SnapshotWritten(null)}");
+        Console.WriteLine("  ShareRecordDto and UserSecretsDto match the Rust records with and without a threshold  ✓");
+
+        // A recovered roster hands its threshold and each helper's weight back.
+        var recoveredEvent = JsonSerializer.Deserialize<DeRecEvent>(
+            """{"type":"SecretRecovered","secret":{"helpers":[{"channel_id":"9","transports":[],"shared_key":[1],"weight":2}],"secrets":[],"threshold":3}}""")
+            as SecretRecoveredEvent
+            ?? throw new InvalidOperationException("SecretRecovered must decode");
+        if (recoveredEvent.Secret.Threshold != 3 || recoveredEvent.Secret.Helpers[0].Weight != 2)
+            throw new InvalidOperationException(
+                $"the recovered roster must carry t=3 and weight 2; got t={recoveredEvent.Secret.Threshold}, weight={recoveredEvent.Secret.Helpers[0].Weight}");
+        Console.WriteLine("  SecretRecovered carries the roster's threshold and weights  ✓");
+
+        Console.WriteLine("Sticky threshold test passed.\n");
+    }
+
+    /// <summary>
+    /// Rust's channel-record serde (<c>library/src/protocol/types/mod.rs</c>,
+    /// <c>channel_wire</c>) writes <c>status</c> unconditionally on encode — it
+    /// is never skipped — so every JSON payload the FFI boundary hands to a
+    /// store callback carries it. <c>FromDto</c> must decode exactly what is
+    /// there: a record missing <c>status</c> is malformed input, not a
+    /// <see cref="ChannelStatus.Paired"/> channel, and must fail to decode
+    /// rather than default.
+    /// </summary>
+    private static void RunChannelStatusRequiredOnDecodeTest()
+    {
+        Console.WriteLine("=== ChannelRecord decode requires `status` test ===");
+
+        var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+        var helperDtoType = typeof(DeRecProtocol).GetNestedType("HelperChannelDto", System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("DeRecProtocol.HelperChannelDto not found");
+        var replicaDtoType = typeof(DeRecProtocol).GetNestedType("ReplicaMemberDto", System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("DeRecProtocol.ReplicaMemberDto not found");
+        var fromHelperDto = typeof(DeRecProtocol).GetMethod("FromDto", flags, new[] { helperDtoType })!;
+        var fromReplicaDto = typeof(DeRecProtocol).GetMethod("FromDto", flags, new[] { replicaDtoType })!;
+
+        const string helperJsonNoStatus = """{"schema_version":3,"channel_id":42,"transports":[{"uri":"https://helper.example/derec","protocol":0}],"communication_info":{},"peer_role":"Helper","created_at":1700000000,"weight":3}""";
+        var helperDtoNoStatus = JsonSerializer.Deserialize(helperJsonNoStatus, helperDtoType, DeRecJsonOptions.Wire);
+        bool helperThrew = false;
+        try
+        {
+            fromHelperDto.Invoke(null, new[] { helperDtoNoStatus });
+        }
+        catch (System.Reflection.TargetInvocationException e) when (e.InnerException is InvalidOperationException)
+        {
+            helperThrew = true;
+        }
+        if (!helperThrew)
+            throw new InvalidOperationException("FromDto(HelperChannelDto) must throw when `status` is absent, not default to Paired");
+        Console.WriteLine("  FromDto(HelperChannelDto) refuses a record missing `status`  ✓");
+
+        const string replicaJsonNoStatus = """{"schema_version":3,"channel_id":33,"replica_id":44,"transports":[{"uri":"https://replica.example/derec","protocol":0}],"communication_info":{},"role":"Source","created_at":1700000000}""";
+        var replicaDtoNoStatus = JsonSerializer.Deserialize(replicaJsonNoStatus, replicaDtoType, DeRecJsonOptions.Wire);
+        bool replicaThrew = false;
+        try
+        {
+            fromReplicaDto.Invoke(null, new[] { replicaDtoNoStatus });
+        }
+        catch (System.Reflection.TargetInvocationException e) when (e.InnerException is InvalidOperationException)
+        {
+            replicaThrew = true;
+        }
+        if (!replicaThrew)
+            throw new InvalidOperationException("FromDto(ReplicaMemberDto) must throw when `status` is absent, not default to Paired");
+        Console.WriteLine("  FromDto(ReplicaMemberDto) refuses a record missing `status`  ✓");
+
+        Console.WriteLine("ChannelRecord decode requires `status` test passed.\n");
     }
 
     /// <summary>
@@ -958,6 +1362,84 @@ internal static class Protocol
     }
 
     /// <summary>
+    /// With <c>auto_respond_on_failure</c> off (the default), a request whose
+    /// handling fails is not answered by the library: it is reported as a
+    /// <see cref="RequestFailedEvent"/> carrying a token, and
+    /// <see cref="DeRecProtocol.RejectAsync"/> on that token sends the one
+    /// response the peer is owed.
+    /// </summary>
+    /// <remarks>
+    /// The failure is a share store backend error on an accepted
+    /// <c>StoreShare</c>. The owner observes exactly one
+    /// <see cref="ShareRejectedEvent"/> carrying the status passed to
+    /// <c>RejectAsync</c>.
+    /// </remarks>
+    private static void RunRequestFailedTokenTest()
+    {
+        Console.WriteLine("=== Failed request is answered once through its RequestFailed token ===");
+
+        const ulong secretId = 0x7171UL;
+        using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions(SecretId: secretId));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com", new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com", new NodeOptions(SecretId: secretId));
+        var channelA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 51UL);
+        DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 52UL);
+
+        helperA.ShareStore.FailSaves = true;
+        var version = owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret { Id = new byte[] { 0x0A }, Name = "failing", Data = Encoding.UTF8.GetBytes("payload") },
+            },
+            Description = "payload",
+        }).GetAwaiter().GetResult().OfType<ProtectSecretStartedEvent>().First().Version;
+
+        var ownerEvents = new List<DeRecEvent>();
+        RequestFailedEvent? failed = null;
+        foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
+        {
+            if (uri == "https://helper-b.example.com")
+            {
+                helperB.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+                ownerEvents.AddRange(owner.Protocol.ProcessAndAcceptAllAsync(helperB.Transport.DrainOne()).GetAwaiter().GetResult());
+                continue;
+            }
+            var helperEvents = helperA.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+            failed = helperEvents.OfType<RequestFailedEvent>().SingleOrDefault()
+                ?? throw new InvalidOperationException(
+                    $"HelperA must report RequestFailed; got [{string.Join(", ", helperEvents)}]");
+        }
+        if (failed is null)
+            throw new InvalidOperationException("the owner sent HelperA no share");
+        if (failed.ChannelId != channelA || failed.ActionKind != PendingActionKind.StoreShare
+            || failed.Responded || failed.Action is null || failed.ErrorCode.Length == 0
+            || failed.Status != Org.Derecalliance.Derec.Protobuf.StatusEnum.Fail
+            || failed.Memo != "request could not be processed")
+            throw new InvalidOperationException($"unexpected RequestFailed: {failed}");
+        if (helperA.Transport.Outbox.Count != 0)
+            throw new InvalidOperationException("with auto_respond_on_failure off, HelperA must not answer by itself");
+        Console.WriteLine($"  [HelperA] Save fails → RequestFailed(action_kind={failed.ActionKind}, responded=false, status={failed.Status}, memo=\"{failed.Memo}\", error_code={failed.ErrorCode}) with a token, nothing sent  ✓");
+
+        const Org.Derecalliance.Derec.Protobuf.StatusEnum fail = Org.Derecalliance.Derec.Protobuf.StatusEnum.Fail;
+        helperA.Protocol.RejectAsync(failed.Action, failed.Status, failed.Memo).GetAwaiter().GetResult();
+        if (helperA.Transport.Outbox.Count != 1)
+            throw new InvalidOperationException(
+                $"RejectAsync(token) must send exactly one response; sent {helperA.Transport.Outbox.Count}");
+        ownerEvents.AddRange(owner.Protocol.ProcessAndAcceptAllAsync(helperA.Transport.DrainOne()).GetAwaiter().GetResult());
+
+        var rejected = ownerEvents.OfType<ShareRejectedEvent>().ToList();
+        if (rejected.Count != 1 || rejected[0].ChannelId != channelA
+            || rejected[0].Version != version || rejected[0].Status != fail
+            || rejected[0].Memo != failed.Memo)
+            throw new InvalidOperationException(
+                $"expected one ShareRejected(Fail, event memo) from HelperA; got [{string.Join(", ", rejected)}]");
+        Console.WriteLine("  [HelperA] RejectAsync(token, event.Status, event.Memo) → one response; [Owner] ShareRejected(status=Fail, same memo)  ✓");
+
+        Console.WriteLine("Request failed token test passed.\n");
+    }
+
+    /// <summary>
     /// A builder that never calls <c>WithThreshold</c> must leave the Rust
     /// library's default (3) in force rather than a value restated here.
     /// </summary>
@@ -1209,13 +1691,22 @@ internal static class Protocol
         // Restore: build a fresh peer on the same secretId and replay
         // the recovered Secret — mirrors the real recovery flow where
         // the device that lost state stands up an empty protocol.
+        // Its builder says 5; restore must put back the 2 the secret was
+        // split with.
         using var restored = MakeNode("RestoredOwner", "https://restored.example.com",
-            new NodeOptions(SecretId: secretId));
+            new NodeOptions(SecretId: secretId, Threshold: 5));
+        if (recovered.Secret.Threshold != DefaultThreshold)
+            throw new InvalidOperationException(
+                $"the recovered roster must carry t={DefaultThreshold}; got {recovered.Secret.Threshold}");
         var restoreEvents = restored.Protocol.RestoreAsync(recovered.Secret, version: 1).GetAwaiter().GetResult();
         Console.WriteLine($"  RestoreAsync returned {restoreEvents.Count} event(s)  ✓");
 
         var snapshot = restored.UserSecretStore.LoadLatest(secretId)
             ?? throw new InvalidOperationException("restore must commit a UserSecrets snapshot");
+        if (snapshot.Threshold != DefaultThreshold)
+            throw new InvalidOperationException(
+                $"restore must keep t={DefaultThreshold}, not the builder's 5; got {snapshot.Threshold}");
+        Console.WriteLine($"  restore keeps t={DefaultThreshold} over the builder's 5  ✓");
         if (snapshot.Version != 1)
             throw new InvalidOperationException(
                 $"restored snapshot version mismatch: {snapshot.Version} != 1");
@@ -1560,7 +2051,7 @@ internal static class Protocol
         string path = Path.Combine("..", "..", "library", "tests", "fixtures", "wire_golden.json");
         var fixture = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!.AsObject();
 
-        var covered = new[] { "protect_secret", "protect_secret_weighted", "restore" };
+        var covered = new[] { "protect_secret", "protect_secret_threshold", "protect_secret_weighted", "restore" };
         var sections = fixture.Select(kv => kv.Key).Where(k => !k.StartsWith('$')).OrderBy(k => k, StringComparer.Ordinal).ToArray();
         if (!sections.SequenceEqual(covered))
             throw new InvalidOperationException(
@@ -1596,6 +2087,14 @@ internal static class Protocol
         };
         AssertSection(fixture, "protect_secret_weighted", JsonSerializer.Serialize(protectWeighted, DeRecJsonOptions.Wire));
 
+        object protectThreshold = new ProtectSecretParams
+        {
+            Secrets = userSecrets,
+            Description = "capture description",
+            Threshold = 3,
+        };
+        AssertSection(fixture, "protect_secret_threshold", JsonSerializer.Serialize(protectThreshold, DeRecJsonOptions.Wire));
+
         static byte[] Key(Func<int, int> at) => Enumerable.Range(0, 32).Select(i => (byte)at(i)).ToArray();
         var https = DeRec.Library.Protocol.Https;
         var secret = new Secret(
@@ -1606,7 +2105,7 @@ internal static class Protocol
                 // An empty map is omitted, so the fixture's second helper
                 // carries no communication_info key.
                 new HelperInfo(22, new[] { new TransportProtocol("https://helper-b.example.com", https) },
-                    Key(i => 31 - i), new()),
+                    Key(i => 31 - i), new(), Weight: 2),
             },
             userSecrets)
         {
@@ -1619,6 +2118,7 @@ internal static class Protocol
                         ReplicaRole.Destination, new()),
                 },
                 new byte[] { 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 }),
+            Threshold = 3,
         };
         // RestoreAsync serializes a private params record; building that
         // record here, rather than a look-alike, is what makes a change to its
@@ -1660,6 +2160,8 @@ internal static class Protocol
         {
             ("""{ "type": "ShareRejected", "channel_id": "1", "version": 1, "status": 3, "memo": "m" }""",
                 e => ((ShareRejectedEvent)e).Status),
+            ("""{ "type": "ShareRefused", "channel_id": "1", "version": 1, "status": 3, "memo": "m" }""",
+                e => ((ShareRefusedEvent)e).Status),
             ("""{ "type": "ShareVerifyRejected", "channel_id": "1", "version": 1, "status": 3, "memo": "m" }""",
                 e => ((ShareVerifyRejectedEvent)e).Status),
             ("""{ "type": "RecoveryShareRefused", "channel_id": "1", "version": 1, "status": 3, "memo": "m" }""",
@@ -1674,6 +2176,8 @@ internal static class Protocol
                 e => ((ReplicaSyncRejectedEvent)e).Status),
             ("""{ "type": "ReplicaSecretAcked", "channel_id": "1", "from_replica_id": "7", "secret_id": "42", "version": 2, "status": 3, "memo": "m" }""",
                 e => ((ReplicaSecretAckedEvent)e).Status),
+            ("""{ "type": "ReplicaSecretRefused", "channel_id": "1", "from_replica_id": "7", "secret_id": "42", "version": 2, "status": 3, "memo": "m" }""",
+                e => ((ReplicaSecretRefusedEvent)e).Status),
         };
         foreach (var (json, status) in events)
         {
@@ -1685,6 +2189,102 @@ internal static class Protocol
         }
 
         Console.WriteLine("Status event parse test passed.\n");
+    }
+
+    /// <summary>
+    /// <see cref="ShareRefusedEvent"/> decodes every field the helper-side
+    /// refusal carries.
+    /// </summary>
+    private static void RunShareRefusedParseTest()
+    {
+        Console.WriteLine("=== ShareRefused parse test ===");
+
+        var json = """{ "type": "ShareRefused", "channel_id": "18446744073709551615", "version": 2, "status": 8, "memo": "CommittedDeRecShare Merkle proof verification failed" }""";
+        var ev = JsonSerializer.Deserialize<DeRecEvent>(json) as ShareRefusedEvent
+            ?? throw new InvalidOperationException($"must parse as ShareRefusedEvent: {json}");
+        if (ev.ChannelId != ulong.MaxValue
+            || ev.Version != 2
+            || ev.Status != Org.Derecalliance.Derec.Protobuf.StatusEnum.VerificationFailed
+            || ev.Memo != "CommittedDeRecShare Merkle proof verification failed")
+            throw new InvalidOperationException($"ShareRefused mismatch: {ev}");
+        Console.WriteLine("  ShareRefused(VerificationFailed) decodes channel, version, status, memo  ✓");
+
+        Console.WriteLine("ShareRefused parse test passed.\n");
+    }
+
+    /// <summary>
+    /// <see cref="RequestFailedEvent"/>, <see cref="ErrorResponseReceivedEvent"/>
+    /// and <see cref="PairingRefusedEvent"/> decode every field the core emits,
+    /// including an answered <see cref="RequestFailedEvent"/>, which carries
+    /// its status and no token.
+    /// </summary>
+    private static void RunResponseGuaranteeEventParseTest()
+    {
+        Console.WriteLine("=== RequestFailed / ErrorResponseReceived / PairingRefused parse test ===");
+
+        var unanswered = """{ "type": "RequestFailed", "channel_id": "18446744073709551615", "action_kind": "StoreShare", "responded": false, "status": 2, "memo": "request could not be processed", "error_code": "store_error", "message": "backend unavailable", "action": [1, 2, 255] }""";
+        var rf = JsonSerializer.Deserialize<DeRecEvent>(unanswered) as RequestFailedEvent
+            ?? throw new InvalidOperationException($"must parse as RequestFailedEvent: {unanswered}");
+        if (rf.ChannelId != ulong.MaxValue
+            || rf.ActionKind != PendingActionKind.StoreShare
+            || rf.Responded
+            || rf.Status != Org.Derecalliance.Derec.Protobuf.StatusEnum.Fail
+            || rf.Memo != "request could not be processed"
+            || rf.ErrorCode != "store_error"
+            || rf.Message != "backend unavailable"
+            || rf.Action is null || !rf.Action.SequenceEqual(new byte[] { 1, 2, 255 }))
+            throw new InvalidOperationException($"RequestFailed mismatch: {rf}");
+        Console.WriteLine("  RequestFailed(responded=false) decodes action_kind, status, memo, error_code, message, token  ✓");
+
+        var answered = """{ "type": "RequestFailed", "channel_id": "4", "action_kind": "Failed", "responded": true, "status": 9, "memo": "message body could not be decoded", "error_code": "internal", "message": "cause" }""";
+        var rfa = JsonSerializer.Deserialize<DeRecEvent>(answered) as RequestFailedEvent
+            ?? throw new InvalidOperationException($"must parse as RequestFailedEvent: {answered}");
+        if (rfa.ActionKind != PendingActionKind.Failed || !rfa.Responded || rfa.Status != Org.Derecalliance.Derec.Protobuf.StatusEnum.FormatError || rfa.Memo != "message body could not be decoded" || rfa.Action is not null)
+            throw new InvalidOperationException($"answered RequestFailed mismatch: {rfa}");
+        Console.WriteLine("  RequestFailed(responded=true) decodes its status and leaves the token null  ✓");
+
+        var err = """{ "type": "ErrorResponseReceived", "channel_id": "7", "status": 9, "memo": "message body could not be decoded" }""";
+        var er = JsonSerializer.Deserialize<DeRecEvent>(err) as ErrorResponseReceivedEvent
+            ?? throw new InvalidOperationException($"must parse as ErrorResponseReceivedEvent: {err}");
+        if (er.ChannelId != 7 || er.Status != Org.Derecalliance.Derec.Protobuf.StatusEnum.FormatError
+            || er.Memo != "message body could not be decoded")
+            throw new InvalidOperationException($"ErrorResponseReceived mismatch: {er}");
+        Console.WriteLine("  ErrorResponseReceived(FormatError) decodes channel, status, memo  ✓");
+
+        var refused = """{ "type": "PairingRefused", "channel_id": "8", "status": 14, "memo": "replica id in use", "error_code": "replica_id_conflict", "message": "replica id 7 is already in use by another member of the group" }""";
+        var pr = JsonSerializer.Deserialize<DeRecEvent>(refused) as PairingRefusedEvent
+            ?? throw new InvalidOperationException($"must parse as PairingRefusedEvent: {refused}");
+        if (pr.ChannelId != 8 || pr.Status != Org.Derecalliance.Derec.Protobuf.StatusEnum.ReplicaIdConflict
+            || pr.Memo != "replica id in use"
+            || pr.ErrorCode != "replica_id_conflict"
+            || pr.Message != "replica id 7 is already in use by another member of the group")
+            throw new InvalidOperationException($"PairingRefused mismatch: {pr}");
+        Console.WriteLine("  PairingRefused(ReplicaIdConflict) decodes channel, status, memo, error_code, message  ✓");
+
+        Console.WriteLine("Response guarantee event parse test passed.\n");
+    }
+
+    /// <summary>
+    /// <see cref="ReplicaSecretRefusedEvent"/> decodes every field the
+    /// destination-side refusal carries.
+    /// </summary>
+    private static void RunReplicaSecretRefusedParseTest()
+    {
+        Console.WriteLine("=== ReplicaSecretRefused parse test ===");
+
+        var json = """{ "type": "ReplicaSecretRefused", "channel_id": "18446744073709551615", "from_replica_id": "7", "secret_id": "42", "version": 3, "status": 8, "memo": "CommittedDeRecShare Merkle proof verification failed" }""";
+        var ev = JsonSerializer.Deserialize<DeRecEvent>(json) as ReplicaSecretRefusedEvent
+            ?? throw new InvalidOperationException($"must parse as ReplicaSecretRefusedEvent: {json}");
+        if (ev.ChannelId != ulong.MaxValue
+            || ev.FromReplicaId != 7
+            || ev.SecretId != 42
+            || ev.Version != 3
+            || ev.Status != Org.Derecalliance.Derec.Protobuf.StatusEnum.VerificationFailed
+            || ev.Memo != "CommittedDeRecShare Merkle proof verification failed")
+            throw new InvalidOperationException($"ReplicaSecretRefused mismatch: {ev}");
+        Console.WriteLine("  ReplicaSecretRefused(VerificationFailed) decodes channel, member, secret, version, status, memo  ✓");
+
+        Console.WriteLine("ReplicaSecretRefused parse test passed.\n");
     }
 
     /// <summary>
@@ -3042,7 +3642,8 @@ internal static class Protocol
         AutoAcceptPolicy? AutoAccept = null,
         bool UnsafeConnection = false,
         bool OmitThreshold = false,
-        ulong? MaxSubshares = null);
+        ulong? MaxSubshares = null,
+        ParameterRange? ParameterRange = null);
 
     private const int DefaultThreshold = 2;
 
@@ -3202,6 +3803,8 @@ internal static class Protocol
             builder = builder.WithReplicaId(replicaId);
         if (options.MaxSubshares is ulong maxSubshares)
             builder = builder.WithMaxSubshares(maxSubshares);
+        if (options.ParameterRange is ParameterRange range)
+            builder = builder.WithParameterRange(range);
 
         return new Node(builder.Build(), transport, channelStore, shareStore, secretStore, userSecretStore, stateStore);
     }

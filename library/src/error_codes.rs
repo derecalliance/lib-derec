@@ -6,7 +6,9 @@
 //! A library [`crate::Error`] is classified once, here, into a [`Category`]
 //! (the layer or flow that failed) and a [`Code`] (the specific reason). The
 //! C ABI carries the numeric discriminants; WASM carries the names. Both come
-//! from this table, so the same failure reads the same in every SDK.
+//! from this table, so the same failure reads the same in every SDK, and so
+//! does the code a [`DeRecEvent::RequestFailed`](crate::protocol::DeRecEvent::RequestFailed)
+//! carries.
 //!
 //! Errors a binding raises itself, before a value reaches the library, are
 //! outside this table's library categories: the C ABI reports them under
@@ -41,7 +43,7 @@ macro_rules! vocabulary {
             }
 
             /// [`Self::name`], NUL-terminated for the C ABI.
-            #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+            #[cfg_attr(any(target_arch = "wasm32", not(feature = "ffi")), allow(dead_code))]
             pub(crate) fn c_name(self) -> &'static str {
                 match self {
                     $($enum::$variant => concat!($name, "\0"),)*
@@ -49,7 +51,10 @@ macro_rules! vocabulary {
             }
 
             /// The member with this discriminant, if any.
-            #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+            #[cfg_attr(
+                any(target_arch = "wasm32", not(any(feature = "ffi", test))),
+                allow(dead_code)
+            )]
             pub(crate) fn from_i32(value: i32) -> Option<Self> {
                 match value {
                     $($value => Some($enum::$variant),)*

@@ -190,6 +190,14 @@ pub(crate) struct ShareRecord {
     pub secret_id: String,
     pub version: u32,
     pub bytes: Vec<u8>,
+    /// [`Share::subshares`]: omitted when `None`; absent or `null` reads as
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subshares: Option<u32>,
+    /// [`Share::threshold`]: omitted when `None`; absent or `null` reads as
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u32>,
 }
 
 impl From<&Share> for ShareRecord {
@@ -198,6 +206,8 @@ impl From<&Share> for ShareRecord {
             secret_id: s.secret_id.to_string(),
             version: s.version,
             bytes: s.bytes.clone(),
+            subshares: s.subshares,
+            threshold: s.threshold,
         }
     }
 }
@@ -212,6 +222,8 @@ impl ShareRecord {
             secret_id,
             version: self.version,
             bytes: self.bytes,
+            subshares: self.subshares,
+            threshold: self.threshold,
         })
     }
 }
@@ -437,6 +449,15 @@ pub struct SecretStoreCallbacks {
 /// strings, matching the `Vec<u8>` ↔ JSON-array convention used for
 /// every other wire-format buffer in this module.
 ///
+/// A share crosses as the JSON object
+/// `{ "secret_id": "<u64>", "version": <u32>, "bytes": [..], "subshares": <u32>, "threshold": <u32> }`.
+/// `subshares` is the owner-side subshare count
+/// ([`crate::protocol::types::Share::subshares`]) and `threshold` the
+/// owner-side threshold the version was split with
+/// ([`crate::protocol::types::Share::threshold`]). Each is omitted when there
+/// is none, and absent or `null` reads as none. Store them as given and return
+/// them unchanged.
+///
 /// `keep_list` returns the JSON encoding of the application's answer:
 /// `null` for no list (the owner sends an empty `keepList` and helpers keep
 /// every version) or an array of version numbers. An empty buffer or return code `1` also
@@ -519,7 +540,9 @@ pub struct ShareStoreCallbacks {
 
 /// Caller-supplied callbacks for the user-secret store. Methods cross
 /// the FFI keyed by `secret_id`; the `UserSecrets` payload travels as a
-/// JSON buffer matching [`UserSecretsRecord`].
+/// JSON buffer matching [`UserSecretsRecord`]. Its `threshold` is the
+/// recorded threshold ([`crate::protocol::types::UserSecrets::threshold`]),
+/// omitted when there is none; store the buffer as given.
 #[repr(C)]
 pub struct UserSecretStoreCallbacks {
     pub user_data: *mut c_void,
@@ -556,6 +579,10 @@ pub(crate) struct UserSecretsRecord {
     /// these records. Absent when the snapshot records no author.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author_replica_id: Option<String>,
+    /// [`UserSecrets::threshold`]: omitted when `None`; absent or `null`
+    /// reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u32>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -580,6 +607,7 @@ impl From<&UserSecrets> for UserSecretsRecord {
                 .collect(),
             description: v.description.clone(),
             author_replica_id: v.author_replica_id.map(|id| id.to_string()),
+            threshold: v.threshold,
         }
     }
 }
@@ -608,6 +636,7 @@ impl TryFrom<UserSecretsRecord> for UserSecrets {
                 .collect(),
             description: r.description,
             author_replica_id,
+            threshold: r.threshold,
         })
     }
 }
@@ -1635,6 +1664,33 @@ mod user_secrets_record_tests {
             secrets: Vec::new(),
             description: None,
             author_replica_id,
+            threshold: None,
+        }
+    }
+
+    #[test]
+    fn a_threshold_round_trips_and_is_omitted_when_none() {
+        let with = UserSecrets {
+            threshold: Some(3),
+            ..snapshot(None)
+        };
+        let json = serde_json::to_value(UserSecretsRecord::from(&with)).expect("serializes");
+        assert_eq!(json["threshold"], 3);
+        let back: UserSecretsRecord = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(UserSecrets::try_from(back).expect("converts"), with);
+
+        let json =
+            serde_json::to_value(UserSecretsRecord::from(&snapshot(None))).expect("serializes");
+        assert!(json.get("threshold").is_none());
+        for raw in [
+            r#"{"version":3,"secrets":[]}"#,
+            r#"{"version":3,"secrets":[],"threshold":null}"#,
+        ] {
+            let back: UserSecretsRecord = serde_json::from_str(raw).expect("deserializes");
+            assert_eq!(
+                UserSecrets::try_from(back).expect("converts").threshold,
+                None
+            );
         }
     }
 
@@ -1792,6 +1848,73 @@ mod transport_endpoints_json_tests {
     }
 }
 
+/// The share record's `subshares` and `threshold` fields: absent and `null`
+/// both read as none, and a value survives a round trip.
+#[cfg(test)]
+mod share_record_tests {
+    use super::*;
+
+    fn decoded(json: &str) -> Share {
+        serde_json::from_str::<ShareRecord>(json)
+            .expect("record parses")
+            .into_share()
+            .expect("record converts")
+    }
+
+    #[test]
+    fn an_absent_count_reads_as_none() {
+        let share = decoded(r#"{"secret_id":"7","version":2,"bytes":[1,2]}"#);
+        assert_eq!(share.subshares, None);
+    }
+
+    #[test]
+    fn a_null_count_reads_as_none() {
+        let share = decoded(r#"{"secret_id":"7","version":2,"bytes":[1,2],"subshares":null}"#);
+        assert_eq!(share.subshares, None);
+    }
+
+    #[test]
+    fn a_count_round_trips() {
+        let share = decoded(r#"{"secret_id":"7","version":2,"bytes":[1,2],"subshares":3}"#);
+        assert_eq!(share.subshares, Some(3));
+        let json = serde_json::to_string(&ShareRecord::from(&share)).expect("serializes");
+        assert_eq!(
+            json,
+            r#"{"secret_id":"7","version":2,"bytes":[1,2],"subshares":3}"#
+        );
+    }
+
+    #[test]
+    fn no_count_is_omitted() {
+        let share = Share {
+            secret_id: 7,
+            version: 2,
+            bytes: vec![1, 2],
+            subshares: None,
+            threshold: None,
+        };
+        let json = serde_json::to_string(&ShareRecord::from(&share)).expect("serializes");
+        assert_eq!(json, r#"{"secret_id":"7","version":2,"bytes":[1,2]}"#);
+    }
+
+    #[test]
+    fn an_absent_or_null_threshold_reads_as_none() {
+        let share = decoded(r#"{"secret_id":"7","version":2,"bytes":[1,2]}"#);
+        assert_eq!(share.threshold, None);
+        let share = decoded(r#"{"secret_id":"7","version":2,"bytes":[1,2],"threshold":null}"#);
+        assert_eq!(share.threshold, None);
+    }
+
+    #[test]
+    fn a_threshold_round_trips() {
+        let json = r#"{"secret_id":"7","version":2,"bytes":[1,2],"subshares":2,"threshold":3}"#;
+        let share = decoded(json);
+        assert_eq!(share.threshold, Some(3));
+        let back = serde_json::to_string(&ShareRecord::from(&share)).expect("serializes");
+        assert_eq!(back, json);
+    }
+}
+
 #[cfg(test)]
 mod share_store_refusal_tests {
     use super::*;
@@ -1930,6 +2053,8 @@ mod share_store_refusal_tests {
             secret_id: 1,
             version: 1,
             bytes: vec![1, 2, 3],
+            subshares: None,
+            threshold: None,
         }
     }
 

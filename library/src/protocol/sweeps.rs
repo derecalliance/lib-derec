@@ -283,6 +283,94 @@ impl<
         }
     }
 
+    /// Drop the owner's proofs for the versions `channel_id` removed when it
+    /// confirmed round `version`.
+    ///
+    /// A Helper that accepts a share applies the request's `keepList`: it
+    /// removes every other version it holds on the channel, the accepted one
+    /// aside, so the owner's proofs of those versions can no longer be
+    /// answered. This mirrors that rule on the owner, and errs only towards
+    /// keeping a proof:
+    ///
+    /// - An empty `keep_list` told the Helper to keep everything, so nothing
+    ///   is removed.
+    /// - A Helper ignores the `keepList` of a request older than a version it
+    ///   already holds. When the owner holds a proof newer than `version` for
+    ///   this channel the Helper may have accepted that one first, so nothing
+    ///   is removed.
+    /// - A version whose round is still waiting on this Helper may reach it
+    ///   after `version` and be stored without pruning, so its proof stays.
+    ///
+    /// A proof left behind this way is removed by a later confirmation whose
+    /// `keepList` leaves it out. A confirmation arriving after its round has
+    /// closed carries no `keepList` to apply and removes nothing.
+    ///
+    /// A store error is logged and swallowed, as in
+    /// [`Self::drop_failed_proofs`].
+    async fn drop_pruned_proofs(
+        &mut self,
+        channel_id: ChannelId,
+        version: u32,
+        keep_list: &[u32],
+        unanswered: &[(u32, std::collections::HashSet<ChannelId>)],
+    ) {
+        if keep_list.is_empty() {
+            return;
+        }
+        let stored = match self.share_store.load(self.secret_id, channel_id, &[]).await {
+            Ok(stored) => stored,
+            Err(_error) => {
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    channel_id = channel_id.0,
+                    version,
+                    error = %_error,
+                    "keep-list proof cleanup could not load the channel's proofs"
+                );
+                return;
+            }
+        };
+        if stored.iter().any(|share| share.version > version) {
+            return;
+        }
+        let mut dropped: Vec<u32> = stored
+            .iter()
+            .map(|share| share.version)
+            .filter(|v| *v != version && !keep_list.contains(v))
+            .filter(|v| {
+                !unanswered
+                    .iter()
+                    .any(|(round, pending)| round == v && pending.contains(&channel_id))
+            })
+            .collect();
+        dropped.sort_unstable();
+        dropped.dedup();
+        if dropped.is_empty() {
+            return;
+        }
+        if let Err(_error) = self
+            .share_store
+            .remove_versions(self.secret_id, channel_id, &dropped)
+            .await
+        {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                channel_id = channel_id.0,
+                version,
+                error = %_error,
+                "keep-list proof cleanup failed; proofs left in store"
+            );
+        } else {
+            #[cfg(feature = "logging")]
+            tracing::debug!(
+                channel_id = channel_id.0,
+                version,
+                removed = ?dropped,
+                "owner proofs outside the confirmed keepList removed"
+            );
+        }
+    }
+
     /// The number of subshares this device dispatched to `channel_id` at
     /// `version`, read from the tracking share it kept: the length of `subshares` in
     /// the `DeRecShare` inside the stored `CommittedDeRecShare`.
@@ -332,6 +420,17 @@ impl<
 
         let mut produced: Vec<DeRecEvent> = Vec::new();
 
+        // Which helpers each open round is still waiting on, as loaded and
+        // before any of this batch is applied: a version a helper has not
+        // yet answered may still reach it, so its proof is never pruned.
+        let unanswered: Vec<(u32, std::collections::HashSet<ChannelId>)> = rounds
+            .iter()
+            .filter_map(|item| match item {
+                StateItem::SharingRound(round) => Some((round.version, round.pending.clone())),
+                _ => None,
+            })
+            .collect();
+
         for item in rounds {
             let StateItem::SharingRound(round) = item else {
                 continue;
@@ -345,6 +444,8 @@ impl<
                 mut synced_replicas,
                 mut behind_replicas,
                 started_at,
+                keep_list,
+                threshold,
             } = *round;
 
             self.settle_one_round(
@@ -358,6 +459,9 @@ impl<
                 &mut synced_replicas,
                 &mut behind_replicas,
                 started_at,
+                keep_list,
+                threshold,
+                &unanswered,
             )
             .await;
         }
@@ -401,6 +505,8 @@ impl<
                 synced_replicas,
                 mut behind_replicas,
                 started_at,
+                keep_list,
+                threshold,
             } = *round;
 
             if now.saturating_sub(started_at) <= self.timeouts.sharing_round.as_secs() {
@@ -455,6 +561,8 @@ impl<
                         synced_replicas,
                         behind_replicas,
                         started_at,
+                        keep_list,
+                        threshold,
                     })),
                 )
                 .await;
@@ -535,9 +643,13 @@ impl<
         synced_replicas: &mut std::collections::HashSet<crate::types::ReplicaId>,
         behind_replicas: &mut std::collections::HashSet<crate::types::ReplicaId>,
         started_at: u64,
+        keep_list: Vec<u32>,
+        threshold: Option<u32>,
+        unanswered: &[(u32, std::collections::HashSet<ChannelId>)],
     ) {
         let events = inbound;
         let mut newly_failed: Vec<ChannelId> = Vec::new();
+        let mut newly_confirmed: Vec<ChannelId> = Vec::new();
         for event in events.iter() {
             match event {
                 DeRecEvent::ShareConfirmed {
@@ -552,6 +664,7 @@ impl<
                     // whose proof no longer exists.
                     if pending.remove(channel_id) {
                         confirmed.insert(*channel_id);
+                        newly_confirmed.push(*channel_id);
                     }
                 }
                 DeRecEvent::ShareRejected {
@@ -594,6 +707,10 @@ impl<
         }
 
         self.drop_failed_proofs(round_version, &newly_failed).await;
+        for channel_id in newly_confirmed {
+            self.drop_pruned_proofs(channel_id, round_version, &keep_list, unanswered)
+                .await;
+        }
 
         let is_complete = pending.is_empty() && pending_replicas.is_empty();
         let confirmed_count = confirmed.len();
@@ -604,7 +721,10 @@ impl<
             for channel_id in confirmed.iter() {
                 confirmed_weight += self.tracked_weight(*channel_id, round_version).await;
             }
-            let threshold_met = confirmed_weight >= self.threshold as u64;
+            // A round written before its threshold was recorded is judged
+            // against the builder's.
+            let round_threshold = threshold.map_or(self.threshold as u64, u64::from);
+            let threshold_met = confirmed_weight >= round_threshold;
             let _ = self
                 .state_store
                 .remove(
@@ -706,6 +826,8 @@ impl<
                         synced_replicas: std::mem::take(synced_replicas),
                         behind_replicas: std::mem::take(behind_replicas),
                         started_at,
+                        keep_list,
+                        threshold,
                     })),
                 )
                 .await;
@@ -717,7 +839,7 @@ impl<
 mod expired_channel_sweep_tests {
     use super::*;
     use crate::protocol::builder::DeRecProtocolBuilder;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
@@ -752,6 +874,7 @@ mod expired_channel_sweep_tests {
                     status,
                     created_at: now_secs().saturating_sub(age_secs),
                     peer_role: derec_proto::SenderKind::Helper,
+                    weight: 1,
                 }),
             )
             .await
@@ -1019,7 +1142,7 @@ mod expired_channel_sweep_tests {
 mod sharing_round_outcome_tests {
     use super::*;
     use crate::protocol::builder::DeRecProtocolBuilder;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
@@ -1073,6 +1196,8 @@ mod sharing_round_outcome_tests {
                     synced_replicas: HashSet::new(),
                     behind_replicas: HashSet::new(),
                     started_at: now_secs(),
+                    keep_list: Vec::new(),
+                    threshold: None,
                 })),
             )
             .await
@@ -1191,6 +1316,8 @@ mod sharing_round_outcome_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::new(),
                         started_at: now_secs().saturating_sub(600),
+                        keep_list: Vec::new(),
+                        threshold: None,
                     })),
                 )
                 .await
@@ -1253,6 +1380,8 @@ mod sharing_round_outcome_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::new(),
                         started_at: now_secs().saturating_sub(600),
+                        keep_list: Vec::new(),
+                        threshold: None,
                     })),
                 )
                 .await
@@ -1410,6 +1539,7 @@ mod sharing_round_outcome_tests {
                                 peer_role: derec_proto::SenderKind::Helper,
                                 status: crate::protocol::types::ChannelStatus::Pending,
                                 created_at: now_secs().saturating_sub(3600),
+                                weight: 1,
                             },
                         ),
                     )
@@ -1716,6 +1846,8 @@ mod sharing_round_outcome_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::from([ReplicaId(1003)]),
                         started_at: now_secs(),
+                        keep_list: Vec::new(),
+                        threshold: None,
                     })),
                 )
                 .await
@@ -1850,7 +1982,7 @@ mod sharing_round_outcome_tests {
 mod timeout_tests {
     use super::*;
     use crate::protocol::builder::DeRecProtocolBuilder;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
@@ -1993,6 +2125,8 @@ mod timeout_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::new(),
                         started_at: now_secs().saturating_sub(30),
+                        keep_list: Vec::new(),
+                        threshold: None,
                     })),
                 )
                 .await
@@ -2013,7 +2147,7 @@ mod timeout_tests {
 mod proof_cleanup_tests {
     use super::*;
     use crate::protocol::builder::DeRecProtocolBuilder;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
@@ -2169,6 +2303,8 @@ mod proof_cleanup_tests {
                     synced_replicas: HashSet::new(),
                     behind_replicas: HashSet::new(),
                     started_at: now_secs(),
+                    keep_list: Vec::new(),
+                    threshold: None,
                 })),
             )
             .await
@@ -2183,6 +2319,8 @@ mod proof_cleanup_tests {
                 secret_id: SECRET_ID,
                 version,
                 bytes: vec![0xAB],
+                subshares: None,
+                threshold: None,
             },
         );
     }
@@ -2253,6 +2391,8 @@ mod proof_cleanup_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::new(),
                         started_at: now_secs().saturating_sub(600),
+                        keep_list: Vec::new(),
+                        threshold: None,
                     })),
                 )
                 .await
@@ -2422,6 +2562,8 @@ mod proof_cleanup_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::new(),
                         started_at: now_secs().saturating_sub(600),
+                        keep_list: Vec::new(),
+                        threshold: None,
                     })),
                 )
                 .await
@@ -2459,6 +2601,8 @@ mod proof_cleanup_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::new(),
                         started_at: now_secs(),
+                        keep_list: Vec::new(),
+                        threshold: None,
                     })),
                 )
                 .await
@@ -2495,7 +2639,7 @@ mod proof_cleanup_tests {
 mod weighted_tally_tests {
     use super::*;
     use crate::protocol::builder::DeRecProtocolBuilder;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
@@ -2524,6 +2668,15 @@ mod weighted_tally_tests {
     /// of `A`..`D` at [`VERSION`], split with `A` at weight 2, and an open
     /// round awaiting all four.
     async fn rig() -> (TestProtocol, InMemShareStore) {
+        rig_with(THRESHOLD, None).await
+    }
+
+    /// [`rig`] with the builder's threshold and the round's recorded one set
+    /// separately. The shares are always split at [`THRESHOLD`].
+    async fn rig_with(
+        builder_threshold: usize,
+        round_threshold: Option<u32>,
+    ) -> (TestProtocol, InMemShareStore) {
         let channels = [
             (ChannelId(A), 2),
             (ChannelId(B), 1),
@@ -2546,6 +2699,8 @@ mod weighted_tally_tests {
                     secret_id: SECRET_ID,
                     version: VERSION,
                     bytes: committed.encode_to_vec(),
+                    subshares: None,
+                    threshold: None,
                 },
             );
         }
@@ -2558,7 +2713,7 @@ mod weighted_tally_tests {
             .with_transport(NoopTransport)
             .with_state_store(InMemPersistedStateStore::default())
             .with_own_transports(["https://owner.example.com"])
-            .with_threshold(THRESHOLD)
+            .with_threshold(builder_threshold)
             .build()
             .expect("test protocol builds");
         protocol
@@ -2574,6 +2729,8 @@ mod weighted_tally_tests {
                     synced_replicas: HashSet::new(),
                     behind_replicas: HashSet::new(),
                     started_at: now_secs(),
+                    keep_list: Vec::new(),
+                    threshold: round_threshold,
                 })),
             )
             .await
@@ -2644,6 +2801,33 @@ mod weighted_tally_tests {
         });
     }
 
+    /// The round is judged against the threshold it split at, whatever the
+    /// builder says now.
+    #[test]
+    fn threshold_met_follows_the_rounds_own_threshold() {
+        run_async(async {
+            // B + C hold 2 subshares: enough for a builder at 2, not for the
+            // round's 3.
+            let (mut protocol, _) = rig_with(2, Some(3)).await;
+            let mut events = answers(&[B, C], &[A, D]);
+            protocol.update_sharing_round(&mut events).await;
+            assert!(!threshold_met(&events), "got {events:?}");
+
+            // A + B hold 3 subshares: short of a builder at 4, enough for the
+            // round's 3.
+            let (mut protocol, _) = rig_with(4, Some(3)).await;
+            let mut events = answers(&[A, B], &[C, D]);
+            protocol.update_sharing_round(&mut events).await;
+            assert!(threshold_met(&events), "got {events:?}");
+
+            // A round with no recorded threshold falls back to the builder's.
+            let (mut protocol, _) = rig_with(2, None).await;
+            let mut events = answers(&[B, C], &[A, D]);
+            protocol.update_sharing_round(&mut events).await;
+            assert!(threshold_met(&events), "got {events:?}");
+        });
+    }
+
     #[test]
     fn threshold_met_counts_a_missing_tracking_share_as_one() {
         run_async(async {
@@ -2656,6 +2840,391 @@ mod weighted_tally_tests {
                 threshold_met(&events),
                 "A's weight is unknown without its tracking share and counts as 1, so A + B + C hold 3 subshares; got {events:?}"
             );
+        });
+    }
+}
+
+/// A Helper prunes the versions a `keepList` leaves out when it accepts the
+/// version that carries it, so the owner's proofs for those versions follow
+/// the Helper's confirmation and never its refusal.
+#[cfg(test)]
+mod keep_list_proof_tests {
+    use super::*;
+    use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
+    use crate::protocol::DeRecFlow;
+    use crate::protocol::builder::DeRecProtocolBuilder;
+    use crate::protocol::events::VerifyFailureReason;
+    use crate::protocol::tests::{
+        InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
+        InMemUserSecretStore, RecordingTransport, run_async,
+    };
+    use crate::protocol::types::{
+        ChannelRecord, ChannelStatus, HelperChannel, SecretValue, Target, UserSecret,
+    };
+    use derec_proto::{DeRecResult, MessageBody, StoreShareResponseMessage};
+    use prost::Message as _;
+
+    const SECRET_ID: u64 = 0x4EE9;
+    const A: u64 = 31;
+    const B: u64 = 32;
+
+    type TestProtocol = DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemPersistedStateStore,
+        RecordingTransport,
+    >;
+
+    fn uri(channel: u64) -> String {
+        format!("https://helper-{channel}.example")
+    }
+
+    fn key_of(channel: u64) -> [u8; 32] {
+        [channel as u8; 32]
+    }
+
+    async fn owner(shares: InMemShareStore, transport: RecordingTransport) -> TestProtocol {
+        let mut channels = InMemChannelStore::default();
+        let mut secrets = InMemSecretStore::default();
+        for channel in [A, B] {
+            channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Helper(HelperChannel {
+                        channel_id: ChannelId(channel),
+                        transports: vec![derec_proto::TransportProtocol {
+                            uri: uri(channel),
+                            protocol: derec_proto::Protocol::Https as i32,
+                        }],
+                        communication_info: std::collections::HashMap::new(),
+                        peer_role: derec_proto::SenderKind::Helper,
+                        status: ChannelStatus::Paired,
+                        created_at: now_secs(),
+                        weight: 1,
+                    }),
+                )
+                .await
+                .expect("seed helper");
+            secrets
+                .save(
+                    SECRET_ID,
+                    ChannelId(channel),
+                    SecretValue::SharedKey(key_of(channel)),
+                )
+                .await
+                .expect("seed key");
+        }
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(channels)
+            .with_share_store(shares)
+            .with_secret_store(secrets)
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_state_store(InMemPersistedStateStore::default())
+            .with_transport(transport)
+            .with_own_transports(["https://owner.example"])
+            .with_threshold(2)
+            .build()
+            .expect("test protocol builds")
+    }
+
+    /// The channel each envelope sent so far went to, with the request it
+    /// carried.
+    fn sent_requests(
+        transport: &RecordingTransport,
+    ) -> Vec<(u64, derec_proto::StoreShareRequestMessage)> {
+        transport
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(endpoints, envelope)| {
+                let channel = [A, B]
+                    .into_iter()
+                    .find(|c| endpoints[0].uri == uri(*c))
+                    .expect("every send goes to a seeded helper");
+                let request =
+                    crate::primitives::sharing::request::extract(envelope, &key_of(channel))
+                        .expect("a store-share request")
+                        .request;
+                (channel, request)
+            })
+            .collect()
+    }
+
+    fn answer(channel: u64, version: u32, status: derec_proto::StatusEnum) -> Vec<u8> {
+        let timestamp = current_timestamp();
+        DeRecMessageBuilder::channel()
+            .channel_id(ChannelId(channel))
+            .timestamp(timestamp)
+            .message_body(MessageBody::StoreShareResponse(StoreShareResponseMessage {
+                result: Some(DeRecResult {
+                    status: status as i32,
+                    memo: String::new(),
+                }),
+                version,
+                timestamp: Some(timestamp),
+                secret_id: SECRET_ID,
+                replica_id: None,
+            }))
+            .encrypt(&key_of(channel))
+            .expect("encrypt")
+            .build()
+            .expect("build")
+            .encode_to_vec()
+    }
+
+    /// Publish once and have each Helper answer with the status `status_of`
+    /// gives its channel. Returns the version published.
+    async fn round(
+        protocol: &mut TestProtocol,
+        transport: &RecordingTransport,
+        status_of: impl Fn(u64) -> derec_proto::StatusEnum,
+    ) -> u32 {
+        transport.sent.lock().unwrap().clear();
+        protocol
+            .start(DeRecFlow::ProtectSecret {
+                secrets: vec![UserSecret {
+                    id: b"id".to_vec(),
+                    name: "name".to_owned(),
+                    data: b"data".to_vec(),
+                }],
+                description: None,
+                weights: std::collections::HashMap::new(),
+                threshold: None,
+            })
+            .await
+            .expect("publish");
+        let requests = sent_requests(transport);
+        assert_eq!(requests.len(), 2, "one request per helper");
+        let version = requests[0].1.version;
+        for (channel, request) in requests {
+            protocol
+                .process(&answer(channel, request.version, status_of(channel)))
+                .await
+                .expect("the owner reads the answer");
+        }
+        version
+    }
+
+    fn versions_held(shares: &InMemShareStore, channel: u64) -> Vec<u32> {
+        let mut versions: Vec<u32> = shares
+            .data
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(s, c, _)| *s == SECRET_ID && *c == channel)
+            .map(|(_, _, v)| *v)
+            .collect();
+        versions.sort_unstable();
+        versions
+    }
+
+    fn ok(_: u64) -> derec_proto::StatusEnum {
+        derec_proto::StatusEnum::Ok
+    }
+
+    /// An application keeping no older version: once both Helpers confirm
+    /// v3 they hold only v3, and so does the owner. Verifying v1 is then a
+    /// local condition, not a question for the Helpers.
+    #[test]
+    fn confirmed_versions_outside_the_keep_list_lose_their_proofs() {
+        run_async(async {
+            let shares = InMemShareStore::default();
+            *shares.keep.lock().unwrap() = Some(Vec::new());
+            let transport = RecordingTransport::default();
+            let mut protocol = owner(shares.clone(), transport.clone()).await;
+
+            for expected in 1..=3 {
+                assert_eq!(round(&mut protocol, &transport, ok).await, expected);
+            }
+
+            assert_eq!(versions_held(&shares, A), vec![3]);
+            assert_eq!(versions_held(&shares, B), vec![3]);
+
+            transport.sent.lock().unwrap().clear();
+            let events = protocol
+                .start(DeRecFlow::VerifyShares {
+                    secret_id: SECRET_ID,
+                    version: 1,
+                    target: Target::All,
+                })
+                .await
+                .expect("verify starts");
+
+            assert_eq!(events.len(), 2, "one verdict per helper; got {events:?}");
+            assert!(
+                events.iter().all(|e| matches!(
+                    e,
+                    DeRecEvent::VerifySharesFailed {
+                        version: 1,
+                        reason: VerifyFailureReason::NoProof,
+                        ..
+                    }
+                )),
+                "got {events:?}"
+            );
+            assert!(
+                transport.sent_envelopes().is_empty(),
+                "no challenge is sent for a version no helper holds"
+            );
+        });
+    }
+
+    /// A Helper that refuses v3 prunes nothing, so the owner keeps the
+    /// proofs of the versions it still holds; the Helper that confirmed
+    /// loses them.
+    #[test]
+    fn a_rejecting_helper_keeps_its_older_proofs() {
+        run_async(async {
+            let shares = InMemShareStore::default();
+            let transport = RecordingTransport::default();
+            let mut protocol = owner(shares.clone(), transport.clone()).await;
+
+            round(&mut protocol, &transport, ok).await;
+            round(&mut protocol, &transport, ok).await;
+            assert_eq!(versions_held(&shares, B), vec![1, 2]);
+
+            *shares.keep.lock().unwrap() = Some(Vec::new());
+            let version = round(&mut protocol, &transport, |channel| {
+                if channel == B {
+                    derec_proto::StatusEnum::Fail
+                } else {
+                    derec_proto::StatusEnum::Ok
+                }
+            })
+            .await;
+            assert_eq!(version, 3);
+
+            assert_eq!(versions_held(&shares, A), vec![3]);
+            assert_eq!(
+                versions_held(&shares, B),
+                vec![1, 2],
+                "B refused v3: it still holds v1 and v2, and v3's proof is dropped"
+            );
+        });
+    }
+
+    /// A version the keep list names is still held by the Helper, so its
+    /// proof stays.
+    #[test]
+    fn a_version_the_keep_list_names_keeps_its_proof() {
+        run_async(async {
+            let shares = InMemShareStore::default();
+            *shares.keep.lock().unwrap() = Some(vec![1]);
+            let transport = RecordingTransport::default();
+            let mut protocol = owner(shares.clone(), transport.clone()).await;
+
+            for _ in 1..=3 {
+                round(&mut protocol, &transport, ok).await;
+            }
+
+            assert_eq!(versions_held(&shares, A), vec![1, 3]);
+            assert_eq!(versions_held(&shares, B), vec![1, 3]);
+        });
+    }
+
+    fn seed_proof(shares: &InMemShareStore, channel: u64, version: u32) {
+        shares.data.lock().unwrap().insert(
+            (SECRET_ID, channel, version),
+            crate::protocol::types::Share {
+                secret_id: SECRET_ID,
+                version,
+                bytes: vec![0xAB],
+                subshares: None,
+                threshold: None,
+            },
+        );
+    }
+
+    async fn seed_open_round(protocol: &mut TestProtocol, version: u32, keep_list: Vec<u32>) {
+        protocol
+            .state_store
+            .save(
+                SECRET_ID,
+                StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    version,
+                    pending: [ChannelId(A), ChannelId(B)].into_iter().collect(),
+                    confirmed: Default::default(),
+                    failed: Default::default(),
+                    pending_replicas: Default::default(),
+                    synced_replicas: Default::default(),
+                    behind_replicas: Default::default(),
+                    started_at: now_secs(),
+                    keep_list,
+                    threshold: None,
+                })),
+            )
+            .await
+            .expect("seed round");
+    }
+
+    /// A Helper ignores the `keepList` of a request older than a version it
+    /// already holds. While the owner holds a newer proof for the channel,
+    /// confirming the older round removes nothing.
+    #[test]
+    fn a_confirmation_older_than_a_held_proof_removes_nothing() {
+        run_async(async {
+            let shares = InMemShareStore::default();
+            for version in [3, 4, 5] {
+                seed_proof(&shares, A, version);
+            }
+            let mut protocol = owner(shares.clone(), RecordingTransport::default()).await;
+            seed_open_round(&mut protocol, 4, vec![4]).await;
+
+            let mut events = vec![DeRecEvent::ShareConfirmed {
+                channel_id: ChannelId(A),
+                version: 4,
+            }];
+            protocol.update_sharing_round(&mut events).await;
+
+            assert_eq!(versions_held(&shares, A), vec![3, 4, 5]);
+        });
+    }
+
+    /// A version whose round still waits on the Helper may reach it after
+    /// the newer one and be stored without pruning, so its proof stays.
+    #[test]
+    fn a_version_still_awaiting_the_helper_keeps_its_proof() {
+        run_async(async {
+            let shares = InMemShareStore::default();
+            for version in [3, 4, 5] {
+                seed_proof(&shares, A, version);
+            }
+            let mut protocol = owner(shares.clone(), RecordingTransport::default()).await;
+            seed_open_round(&mut protocol, 4, vec![4]).await;
+            seed_open_round(&mut protocol, 5, vec![5]).await;
+
+            let mut events = vec![DeRecEvent::ShareConfirmed {
+                channel_id: ChannelId(A),
+                version: 5,
+            }];
+            protocol.update_sharing_round(&mut events).await;
+
+            assert_eq!(
+                versions_held(&shares, A),
+                vec![4, 5],
+                "v3 is pruned; v4 still awaits this helper"
+            );
+        });
+    }
+
+    /// With no list from the application every Helper keeps every version,
+    /// and so does the owner.
+    #[test]
+    fn no_keep_list_keeps_every_proof() {
+        run_async(async {
+            let shares = InMemShareStore::default();
+            let transport = RecordingTransport::default();
+            let mut protocol = owner(shares.clone(), transport.clone()).await;
+
+            for _ in 1..=3 {
+                round(&mut protocol, &transport, ok).await;
+            }
+
+            assert_eq!(versions_held(&shares, A), vec![1, 2, 3]);
+            assert_eq!(versions_held(&shares, B), vec![1, 2, 3]);
         });
     }
 }

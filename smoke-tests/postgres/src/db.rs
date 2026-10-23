@@ -14,6 +14,16 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0002_user_secrets_author",
         include_str!("../migrations/0002_user_secrets_author.sql"),
     ),
+    (
+        3,
+        "0003_share_subshares",
+        include_str!("../migrations/0003_share_subshares.sql"),
+    ),
+    (
+        4,
+        "0004_threshold",
+        include_str!("../migrations/0004_threshold.sql"),
+    ),
 ];
 
 /// Connection string default; override via `DATABASE_URL`.

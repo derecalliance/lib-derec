@@ -54,8 +54,14 @@ import (
 // Nothing is validated here: New hands the result to the library, which
 // checks it exactly as it checks the same value set field by field.
 type DeRecProtocolConfig struct {
-	// Threshold is the minimum number of shares required to reconstruct
-	// the secret. nil uses the library default (3). Every non-nil value,
+	// Threshold is the starting threshold: the minimum number of subshares
+	// required to reconstruct the secret, for a secret with no threshold
+	// stored. Every publish stores the threshold it used
+	// (UserSecrets.Threshold), the roster carries it, and Restore and replica
+	// hydration put it back. A round splits at ProtectSecretParams.Threshold,
+	// otherwise at the stored threshold, and only otherwise at this value, so
+	// changing it later does not change a stored threshold.
+	// nil uses the library default (3). Every non-nil value,
 	// including 0, is forwarded as given: the library rejects a threshold
 	// below 2 with a *derec.Error, because a threshold of 0 or 1 lets a
 	// single helper reconstruct the secret.
@@ -82,9 +88,11 @@ type DeRecProtocolConfig struct {
 	// ParameterRange declares the bounds this node advertises during pair
 	// negotiation. Embedded in outbound PairRequest/PairResponse envelopes
 	// and checked against the peer's range on inbound ones: a range that
-	// fails to intersect rejects the pairing with
-	// derec.CodeIncompatibleParameterRange. Default: unset — no constraints
-	// advertised, every peer range accepted.
+	// fails to intersect refuses the pairing. A responder answers with
+	// INCOMPATIBLE_PARAMETER_RANGE and reports EventTypePairingRefused; an
+	// initiator fails, with derec.CodeIncompatibleParameterRange when it
+	// finds the mismatch itself. Default: unset — no constraints advertised,
+	// every peer range accepted.
 	//
 	// Share size is enforced by the helper; frequency limits are enforced by
 	// the app's share store (refuse from Save / RecordVerification); the
@@ -95,8 +103,10 @@ type DeRecProtocolConfig struct {
 	// off.
 	AutoAccept *AutoAcceptPolicy `json:"auto_accept,omitempty"`
 
-	// AutoRespondOnFailure controls whether the protocol auto-replies on
-	// failed inbound processing. Default: false.
+	// AutoRespondOnFailure decides who answers an inbound request whose
+	// handling failed. true: the library sends the response itself. false:
+	// nothing is sent, and the EventTypeRequestFailed event carries a token
+	// to pass to Reject. Default: false.
 	AutoRespondOnFailure *bool `json:"auto_respond_on_failure,omitempty"`
 
 	// AutoReplyTo controls whether outbound requests carry an ephemeral

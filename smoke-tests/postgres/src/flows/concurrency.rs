@@ -128,6 +128,7 @@ async fn independent_partitions_run_in_parallel() {
                     }],
                     description: Some(format!("user {i}")),
                     weights: HashMap::new(),
+                    threshold: None,
                 })
                 .await
                 .expect("start(ProtectSecret)");
@@ -234,6 +235,7 @@ async fn one_partition_serializes_under_an_application_lock() {
             }],
             description: Some("contended round".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("start(ProtectSecret)");
@@ -375,6 +377,7 @@ async fn a_scheduled_tick_shares_the_same_lock_as_inbound_messages() {
             }],
             description: Some("tick contention".to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("start(ProtectSecret)");

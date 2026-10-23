@@ -31,6 +31,7 @@ func TestEncodeChannelRecord_Helper_MatchesRustJSONShape(t *testing.T) {
 		PeerRole:          SenderKindHelper,
 		Status:            ChannelStatusPaired,
 		CreatedAt:         1700000000,
+		Weight:            2,
 	}
 
 	got, err := EncodeChannelRecord(ChannelRecord{Helper: &h})
@@ -39,7 +40,7 @@ func TestEncodeChannelRecord_Helper_MatchesRustJSONShape(t *testing.T) {
 	}
 
 	want := `{"Helper":{"schema_version":3,"channel_id":123456789,"transports":[{"uri":"https://example.com/derec","protocol":0}],` +
-		`"communication_info":{"name":"helper"},"peer_role":"Helper","status":"Paired","created_at":1700000000}}`
+		`"communication_info":{"name":"helper"},"peer_role":"Helper","status":"Paired","created_at":1700000000,"weight":2}}`
 	if string(got) != want {
 		t.Fatalf("EncodeChannelRecord mismatch:\n got: %s\nwant: %s", got, want)
 	}
@@ -204,6 +205,41 @@ func TestChannelRecordRoundTrip_StampsTheMarkerOnUnversionedInput(t *testing.T) 
 	}
 }
 
+// The core writes weight on every helper record, and the bridge carries it
+// unchanged.
+func TestDecodeChannelRecord_HelperWeight(t *testing.T) {
+	sample := `{"Helper":{"schema_version":3,"channel_id":1,"transports":[{"uri":"https://a.example","protocol":0}],` +
+		`"communication_info":{},"peer_role":"Helper","status":"Paired","created_at":0,"weight":3}}`
+	record, err := DecodeChannelRecord([]byte(sample))
+	if err != nil {
+		t.Fatalf("DecodeChannelRecord: %v", err)
+	}
+	if record.Helper.Weight != 3 {
+		t.Errorf("Weight = %d, want 3", record.Helper.Weight)
+	}
+}
+
+func TestHelperChannelWeightRoundTrip(t *testing.T) {
+	orig := HelperChannel{
+		ChannelID:  9,
+		Transports: []TransportEndpoint{{URI: "https://h.example.com", Protocol: 0}},
+		PeerRole:   SenderKindHelper,
+		Status:     ChannelStatusPaired,
+		Weight:     4,
+	}
+	wire, err := EncodeChannelRecord(ChannelRecord{Helper: &orig})
+	if err != nil {
+		t.Fatalf("EncodeChannelRecord: %v", err)
+	}
+	record, err := DecodeChannelRecord(wire)
+	if err != nil {
+		t.Fatalf("DecodeChannelRecord: %v", err)
+	}
+	if record.Helper.Weight != 4 {
+		t.Fatalf("Weight = %d, want 4 (wire %s)", record.Helper.Weight, wire)
+	}
+}
+
 func TestDecodeChannelRecord_CarriesWhatTheLibrarySent(t *testing.T) {
 	r, err := DecodeChannelRecord([]byte(`{}`))
 	if err != nil {
@@ -291,6 +327,49 @@ func TestShareListRoundTrip(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].SecretID != 1 || got[1].SecretID != 2 {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+// subshares is the owner-side count: omitted when nil, and absent or null
+// decode as nil.
+func TestShareSubshares_MatchesRustJSONShape(t *testing.T) {
+	three := uint32(3)
+	got, err := EncodeShare(Share{SecretID: 7, Version: 2, Bytes: []byte{1, 2}, Subshares: &three})
+	if err != nil {
+		t.Fatalf("EncodeShare: %v", err)
+	}
+	want := `{"secret_id":"7","version":2,"bytes":[1,2],"subshares":3}`
+	if string(got) != want {
+		t.Fatalf("EncodeShare mismatch:\n got: %s\nwant: %s", got, want)
+	}
+	list, err := EncodeShareList([]Share{{SecretID: 7, Version: 2, Bytes: []byte{1, 2}, Subshares: &three}})
+	if err != nil {
+		t.Fatalf("EncodeShareList: %v", err)
+	}
+	if string(list) != "["+want+"]" {
+		t.Fatalf("EncodeShareList mismatch: %s", list)
+	}
+}
+
+func TestShareSubshares_Decode(t *testing.T) {
+	for sample, want := range map[string]*uint32{
+		`{"secret_id":"7","version":2,"bytes":[1]}`:                  nil,
+		`{"secret_id":"7","version":2,"bytes":[1],"subshares":null}`: nil,
+		`{"secret_id":"7","version":2,"bytes":[1],"subshares":2}`:    func() *uint32 { v := uint32(2); return &v }(),
+	} {
+		s, err := DecodeShare([]byte(sample))
+		if err != nil {
+			t.Fatalf("DecodeShare(%s): %v", sample, err)
+		}
+		list, err := DecodeShareList([]byte("[" + sample + "]"))
+		if err != nil {
+			t.Fatalf("DecodeShareList(%s): %v", sample, err)
+		}
+		for _, got := range []*uint32{s.Subshares, list[0].Subshares} {
+			if (got == nil) != (want == nil) || (got != nil && *got != *want) {
+				t.Fatalf("%s: got %v want %v", sample, got, want)
+			}
+		}
 	}
 }
 
@@ -540,6 +619,46 @@ func TestStateItemRoundTrip_SharingRound(t *testing.T) {
 	}
 	if len(got.Pending) != 2 || len(got.Confirmed) != 1 || len(got.Failed) != 0 {
 		t.Fatalf("set mismatch: got %+v", got)
+	}
+}
+
+func TestStateItemRoundTrip_SharingRoundKeepList(t *testing.T) {
+	ver := uint32(4)
+	sa := uint64(100)
+	wire, err := EncodeStateItem(StateItem{
+		Kind:      StateKindSharingRound,
+		Version:   &ver,
+		StartedAt: &sa,
+		KeepList:  []uint32{2, 4},
+	})
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	got, err := DecodeStateItem(wire)
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if len(got.KeepList) != 2 || got.KeepList[0] != 2 || got.KeepList[1] != 4 {
+		t.Fatalf("KeepList = %v", got.KeepList)
+	}
+}
+
+// A row written before 0.0.9 has no keep_list; it stays absent so the
+// library reads it as empty.
+func TestDecodeStateItem_SharingRoundWithoutKeepList(t *testing.T) {
+	item, err := DecodeStateItem([]byte(`{"kind":3,"version":5,"started_at":"1","pending":[],"confirmed":[],"failed":[]}`))
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if item.KeepList != nil {
+		t.Fatalf("absent keep_list must stay absent, got %v", item.KeepList)
+	}
+	wire, err := EncodeStateItem(item)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	if strings.Contains(string(wire), "keep_list") {
+		t.Fatalf("absent keep_list must not be written, got %s", wire)
 	}
 }
 
@@ -940,5 +1059,120 @@ func TestDecodeStateItem_PendingRecoveryWithoutSecretIDDecodesVerbatim(t *testin
 	}
 	if item.SecretID != nil || item.Version == nil || *item.Version != 4 || item.Shares == nil {
 		t.Fatalf("got %+v", item)
+	}
+}
+
+// The owner's recorded threshold crosses the share record like subshares:
+// omitted when nil, and absent or null reads as nil.
+func TestShareThreshold_MatchesRustJSONShape(t *testing.T) {
+	one, three := uint32(1), uint32(3)
+	got, err := EncodeShare(Share{SecretID: 7, Version: 2, Bytes: []byte{1, 2}, Subshares: &one, Threshold: &three})
+	if err != nil {
+		t.Fatalf("EncodeShare: %v", err)
+	}
+	want := `{"secret_id":"7","version":2,"bytes":[1,2],"subshares":1,"threshold":3}`
+	if string(got) != want {
+		t.Fatalf("EncodeShare mismatch:\n got: %s\nwant: %s", got, want)
+	}
+	list, err := EncodeShareList([]Share{{SecretID: 7, Version: 2, Bytes: []byte{1, 2}, Subshares: &one, Threshold: &three}})
+	if err != nil {
+		t.Fatalf("EncodeShareList: %v", err)
+	}
+	if string(list) != "["+want+"]" {
+		t.Fatalf("EncodeShareList mismatch: %s", list)
+	}
+	for sample, want := range map[string]*uint32{
+		`{"secret_id":"7","version":2,"bytes":[1]}`:                  nil,
+		`{"secret_id":"7","version":2,"bytes":[1],"threshold":null}`: nil,
+		`{"secret_id":"7","version":2,"bytes":[1],"threshold":3}`:    &three,
+	} {
+		s, err := DecodeShare([]byte(sample))
+		if err != nil {
+			t.Fatalf("DecodeShare(%s): %v", sample, err)
+		}
+		list, err := DecodeShareList([]byte("[" + sample + "]"))
+		if err != nil {
+			t.Fatalf("DecodeShareList(%s): %v", sample, err)
+		}
+		for _, got := range []*uint32{s.Threshold, list[0].Threshold} {
+			if (got == nil) != (want == nil) || (got != nil && *got != *want) {
+				t.Fatalf("%s: got %v want %v", sample, got, want)
+			}
+		}
+	}
+}
+
+// The snapshot's threshold is written when set, omitted when nil, and an
+// absent or null value reads as nil.
+func TestUserSecretsThreshold_RoundTrip(t *testing.T) {
+	three := uint32(3)
+	wire, err := EncodeUserSecrets(UserSecrets{Version: 2, Secrets: []UserSecret{}, Threshold: &three})
+	if err != nil {
+		t.Fatalf("EncodeUserSecrets: %v", err)
+	}
+	if string(wire) != `{"version":2,"secrets":[],"threshold":3}` {
+		t.Fatalf("EncodeUserSecrets = %s", wire)
+	}
+	got, err := DecodeUserSecrets(wire)
+	if err != nil {
+		t.Fatalf("DecodeUserSecrets: %v", err)
+	}
+	if got.Threshold == nil || *got.Threshold != 3 {
+		t.Fatalf("Threshold = %v", got.Threshold)
+	}
+	wire, err = EncodeUserSecrets(UserSecrets{Version: 2, Secrets: []UserSecret{}})
+	if err != nil {
+		t.Fatalf("EncodeUserSecrets: %v", err)
+	}
+	if strings.Contains(string(wire), "threshold") {
+		t.Fatalf("a nil threshold must not be written, got %s", wire)
+	}
+	for _, sample := range []string{`{"version":2,"secrets":[]}`, `{"version":2,"secrets":[],"threshold":null}`} {
+		got, err := DecodeUserSecrets([]byte(sample))
+		if err != nil {
+			t.Fatalf("DecodeUserSecrets(%s): %v", sample, err)
+		}
+		if got.Threshold != nil {
+			t.Fatalf("%s: Threshold = %v", sample, *got.Threshold)
+		}
+	}
+}
+
+// A sharing round carries the threshold it split at; a row without one keeps
+// it absent so the library judges the round against the builder's.
+func TestStateItemRoundTrip_SharingRoundThreshold(t *testing.T) {
+	ver, sa, three := uint32(4), uint64(100), uint32(3)
+	wire, err := EncodeStateItem(StateItem{
+		Kind:      StateKindSharingRound,
+		Version:   &ver,
+		StartedAt: &sa,
+		Threshold: &three,
+	})
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	if !strings.Contains(string(wire), `"threshold":3`) {
+		t.Fatalf("threshold not written: %s", wire)
+	}
+	got, err := DecodeStateItem(wire)
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if got.Threshold == nil || *got.Threshold != 3 {
+		t.Fatalf("Threshold = %v", got.Threshold)
+	}
+	item, err := DecodeStateItem([]byte(`{"kind":3,"version":5,"started_at":"1","pending":[],"confirmed":[],"failed":[]}`))
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if item.Threshold != nil {
+		t.Fatalf("absent threshold must stay absent, got %v", *item.Threshold)
+	}
+	wire, err = EncodeStateItem(item)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	if strings.Contains(string(wire), "threshold") {
+		t.Fatalf("absent threshold must not be written, got %s", wire)
 	}
 }

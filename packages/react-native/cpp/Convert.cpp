@@ -169,6 +169,15 @@ std::optional<DecodedShare> decodeShareRecord(const uint8_t* ptr, size_t len) {
   out.secretId = std::move(*secretId);
   out.version = static_cast<uint32_t>(parseUnsignedAt(json, versionPos));
   out.bytes = parseByteArrayAt(json, bytesPos);
+  auto optionalUnsigned = [&json](const char* field) -> std::optional<uint32_t> {
+    size_t pos = fieldValueOffset(json, field);
+    if (pos != std::string::npos && pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
+      return static_cast<uint32_t>(parseUnsignedAt(json, pos));
+    }
+    return std::nullopt;
+  };
+  out.subshares = optionalUnsigned("subshares");
+  out.threshold = optionalUnsigned("threshold");
   return out;
 }
 

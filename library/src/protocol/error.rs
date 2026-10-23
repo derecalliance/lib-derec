@@ -180,28 +180,6 @@ pub enum ShareStoreError {
     Refused(Refusal),
 }
 
-/// Map an internal failure to the closest [`derec_proto::StatusEnum`] a peer
-/// can act on.
-///
-/// Deliberately coarse: a peer can only decide whether to retry, correct its
-/// request, or give up, and the memo carries the detail. `FAIL` is the honest
-/// answer for anything that does not map cleanly, rather than inventing a
-/// more specific-sounding status than the error actually supports.
-///
-/// Takes the error by reference because the caller still owns it — the status
-/// goes out to the peer while the original error is returned to the
-/// application unchanged.
-impl From<&crate::Error> for derec_proto::StatusEnum {
-    fn from(error: &crate::Error) -> Self {
-        match error {
-            crate::Error::ProtobufDecode(_) => Self::FormatError,
-            crate::Error::RoleMismatch { .. } => Self::Rejected,
-            crate::Error::NoUsableEndpoint { .. } => Self::UnsupportedTransportProtocol,
-            _ => Self::Fail,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

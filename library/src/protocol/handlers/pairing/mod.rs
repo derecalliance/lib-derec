@@ -87,17 +87,18 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
                 request,
                 pairing.parameter_range,
             ) {
-                pair::reject(
+                let memo = parameter_range_memo(&err);
+                return refuse(
                     stores,
                     local,
                     channel_id,
                     request,
                     StatusEnum::IncompatibleParameterRange,
-                    &err.to_string(),
+                    &memo,
+                    &Error::from(err),
                     inbound_trace_id,
                 )
-                .await?;
-                return Err(err.into());
+                .await;
             }
             // A colliding id is refused before the application is asked to
             // confirm anything: the pairing cannot complete, so surfacing an
@@ -109,19 +110,19 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
                 if let Some(peer_replica_id) = peer_replica_id
                     && replica_id_is_taken(stores, local, peer_replica_id).await?
                 {
-                    pair::reject(
+                    return refuse(
                         stores,
                         local,
                         channel_id,
                         request,
                         StatusEnum::ReplicaIdConflict,
                         "replica id already in use by a member of this group",
+                        &Error::ReplicaIdConflict {
+                            replica_id: peer_replica_id,
+                        },
                         inbound_trace_id,
                     )
-                    .await?;
-                    return Err(Error::ReplicaIdConflict {
-                        replica_id: peer_replica_id,
-                    });
+                    .await;
                 }
             }
             pair::on_request(local, channel_id, request, inbound_trace_id)
@@ -136,6 +137,70 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
             "unexpected MessageBody variant in pairing message",
         )),
     }
+}
+
+/// The memo sent with an `INCOMPATIBLE_PARAMETER_RANGE` refusal.
+///
+/// The requester reads it, so its own range (`peer` here) is named first and
+/// this device's range is the accepted one.
+fn parameter_range_memo(err: &PairingError) -> String {
+    match err {
+        PairingError::IncompatibleParameterRange {
+            field,
+            local_min,
+            local_max,
+            peer_min,
+            peer_max,
+        } => format!(
+            "`{field}` range [{peer_min}, {peer_max}] does not overlap \
+             the accepted range [{local_min}, {local_max}]"
+        ),
+        _ => "parameter range does not overlap the accepted range".to_owned(),
+    }
+}
+
+/// Refuse a `PairRequest` under a protocol rule: send the requester a
+/// `PairResponse` carrying `status` and `memo`, and report the refusal as
+/// [`DeRecEvent::PairingRefused`]. No channel is created.
+///
+/// `error` is the local reason for the refusal. Its code and description
+/// are reported on the event and never sent to the requester.
+///
+/// Once the refusal was handed to the transport it is reported as sent. A
+/// failure of that send, or of dropping the pairing secret after it, follows
+/// as a [`DeRecEvent::RequestFailed`] with `responded: true`.
+#[allow(clippy::too_many_arguments)]
+async fn refuse<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    channel_id: ChannelId,
+    request: &PairRequestMessage,
+    status: StatusEnum,
+    memo: &str,
+    error: &Error,
+    trace_id: u64,
+) -> Result<Vec<DeRecEvent>> {
+    let after =
+        pair::send_refusal(stores, local, channel_id, request, status, memo, trace_id).await?;
+    let mut events = vec![DeRecEvent::PairingRefused {
+        channel_id,
+        status: status as i32,
+        memo: memo.to_owned(),
+        error_code: crate::error_codes::classify(error).1.name().to_owned(),
+        message: error.to_string(),
+    }];
+    if let Some(error) = after {
+        events.push(crate::protocol::obligation::request_failed(
+            channel_id,
+            crate::protocol::PendingActionKind::Pairing,
+            true,
+            status as i32,
+            memo,
+            &error,
+            None,
+        ));
+    }
+    Ok(events)
 }
 
 #[cfg_attr(
@@ -329,6 +394,7 @@ async fn persist_start_record<S: StoreSet>(
                 peer_role: own_kind.counterparty(),
                 status: ChannelStatus::Pending,
                 created_at: now_secs(),
+                weight: 1,
             }),
         )
         .await?;

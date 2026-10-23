@@ -35,7 +35,11 @@
 //!
 //! ### `ShareStore`
 //! ```ts
-//! interface Share { secretId: string; version: number; bytes: Uint8Array }
+//! // `subshares` is the owner-side subshare count and `threshold` the
+//! // owner-side threshold the version was split with; store and return them
+//! // as given. Each is absent on a helper's share and on owner rows written
+//! // before it existed.
+//! interface Share { secretId: string; version: number; bytes: Uint8Array; subshares?: number | null; threshold?: number | null }
 //! interface ShareStore {
 //!   // `secretId` is the u64 secret identifier as a decimal string.
 //!   // For `load`/`loadMany`, an empty `versions` array means "all versions of secretId".
@@ -643,7 +647,38 @@ fn share_to_js(share: &Share) -> JsValue {
     .unwrap_or_default();
     let js_bytes = Uint8Array::from(share.bytes.as_slice());
     js_sys::Reflect::set(&obj, &"bytes".into(), &js_bytes).unwrap_or_default();
+    for (key, value) in [
+        ("subshares", share.subshares),
+        ("threshold", share.threshold),
+    ] {
+        if let Some(value) = value {
+            js_sys::Reflect::set(&obj, &key.into(), &JsValue::from_f64(f64::from(value)))
+                .unwrap_or_default();
+        }
+    }
     obj.into()
+}
+
+/// `record[key]`: `undefined` or `null` is none, otherwise a `u32`. `what`
+/// names the record in the error.
+fn optional_u32_from_js(
+    item: &JsValue,
+    what: &str,
+    key: &str,
+) -> Result<Option<u32>, ShareStoreError> {
+    let value = js_sys::Reflect::get(item, &key.into()).unwrap_or(JsValue::UNDEFINED);
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_f64()
+        .filter(|n| n.fract() == 0.0 && *n >= 0.0 && *n <= f64::from(u32::MAX))
+        .map(|n| Some(n as u32))
+        .ok_or_else(|| {
+            ShareStoreError::Backend(box_err(format!(
+                "{what}.{key} must be a u32, null or undefined"
+            )))
+        })
 }
 
 fn share_from_js(item: &JsValue) -> Result<Share, ShareStoreError> {
@@ -664,13 +699,12 @@ fn share_from_js(item: &JsValue) -> Result<Share, ShareStoreError> {
         })? as u32;
     let bytes_val = js_sys::Reflect::get(item, &"bytes".into()).unwrap_or(JsValue::null());
     let bytes = Uint8Array::new(&bytes_val).to_vec();
-    // `replicaId` is an optional decimal-string on the JS side
-    // (matching `derec.replica_id` and `Channel.replicaId`). Missing /
-    // null / empty string all map to `None`.
     Ok(Share {
         secret_id,
         version,
         bytes,
+        subshares: optional_u32_from_js(item, "share", "subshares")?,
+        threshold: optional_u32_from_js(item, "share", "threshold")?,
     })
 }
 
@@ -945,6 +979,9 @@ impl DeRecShareStore for JsShareStore {
 ///   version: number;
 ///   secrets: { id: Uint8Array; name: string; data: Uint8Array }[];
 ///   description?: string;
+///   author_replica_id?: string;
+///   // The recorded threshold; store and return it as given.
+///   threshold?: number | null;
 /// };
 /// ```
 pub struct JsUserSecretStore(pub JsValue);
@@ -978,6 +1015,14 @@ fn user_secrets_to_js(value: &UserSecrets) -> JsValue {
             &obj,
             &"author_replica_id".into(),
             &JsValue::from_str(&author.to_string()),
+        )
+        .unwrap_or_default();
+    }
+    if let Some(threshold) = value.threshold {
+        js_sys::Reflect::set(
+            &obj,
+            &"threshold".into(),
+            &JsValue::from_f64(f64::from(threshold)),
         )
         .unwrap_or_default();
     }
@@ -1027,6 +1072,7 @@ fn user_secrets_from_js(value: &JsValue) -> Result<UserSecrets, ShareStoreError>
         secrets,
         description,
         author_replica_id,
+        threshold: optional_u32_from_js(value, "userSecrets", "threshold")?,
     })
 }
 

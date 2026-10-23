@@ -274,6 +274,7 @@ func fixtureRestoreSecret(helperChannelID uint64) Secret {
 				ChannelID:  helperChannelID,
 				Transports: []EndpointJSON{{URI: "https://helper.example.com", Protocol: 0}},
 				SharedKey:  sharedKey,
+				Weight:     1,
 			},
 		},
 		Secrets: []UserSecret{

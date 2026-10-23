@@ -6,6 +6,7 @@ use derec_library::protocol::{DeRecShareStore, ShareStoreFuture};
 use derec_library::types::ChannelId;
 use tokio_postgres::types::ToSql;
 
+use crate::codec::{sql_to_subshares, sql_to_threshold, subshares_to_sql, threshold_to_sql};
 use crate::db::{SharedClient, sql_to_u64, u64_to_sql};
 
 pub struct PostgresShareStore {
@@ -33,7 +34,7 @@ impl DeRecShareStore for PostgresShareStore {
             let rows = if versions.is_empty() {
                 client
                     .query(
-                        "SELECT share_secret_id, version, bytes FROM shares \
+                        "SELECT share_secret_id, version, bytes, subshares, threshold FROM shares \
                          WHERE secret_id = $1 AND channel_id = $2",
                         &[&secret_id_i64, &channel_id_i64],
                     )
@@ -43,7 +44,7 @@ impl DeRecShareStore for PostgresShareStore {
                 let params: [&(dyn ToSql + Sync); 3] = [&secret_id_i64, &channel_id_i64, &versions];
                 client
                     .query(
-                        "SELECT share_secret_id, version, bytes FROM shares \
+                        "SELECT share_secret_id, version, bytes, subshares, threshold FROM shares \
                          WHERE secret_id = $1 AND channel_id = $2 AND version = ANY($3::bigint[])",
                         &params,
                     )
@@ -72,7 +73,7 @@ impl DeRecShareStore for PostgresShareStore {
                 let params: [&(dyn ToSql + Sync); 2] = [&secret_id_i64, &channel_ids];
                 client
                     .query(
-                        "SELECT share_secret_id, version, bytes FROM shares \
+                        "SELECT share_secret_id, version, bytes, subshares, threshold FROM shares \
                          WHERE secret_id = $1 AND channel_id = ANY($2::bigint[])",
                         &params,
                     )
@@ -82,7 +83,7 @@ impl DeRecShareStore for PostgresShareStore {
                 let params: [&(dyn ToSql + Sync); 3] = [&secret_id_i64, &channel_ids, &versions];
                 client
                     .query(
-                        "SELECT share_secret_id, version, bytes FROM shares \
+                        "SELECT share_secret_id, version, bytes, subshares, threshold FROM shares \
                          WHERE secret_id = $1 AND channel_id = ANY($2::bigint[]) \
                          AND version = ANY($3::bigint[])",
                         &params,
@@ -109,7 +110,7 @@ impl DeRecShareStore for PostgresShareStore {
             let params: [&(dyn ToSql + Sync); 2] = [&secret_id_i64, &channel_ids];
             let rows = client
                 .query(
-                    "SELECT share_secret_id, version, bytes FROM shares \
+                    "SELECT share_secret_id, version, bytes, subshares, threshold FROM shares \
                      WHERE secret_id = $1 AND channel_id = ANY($2::bigint[])",
                     &params,
                 )
@@ -150,20 +151,26 @@ impl DeRecShareStore for PostgresShareStore {
         let version_i64 = share.version as i64;
         let share_secret_id_i64 = u64_to_sql(share.secret_id);
         let bytes = share.bytes;
+        let subshares = subshares_to_sql(share.subshares);
+        let threshold = threshold_to_sql(share.threshold);
         Box::pin(async move {
             client
                 .execute(
-                    "INSERT INTO shares (secret_id, channel_id, version, share_secret_id, bytes) \
-                     VALUES ($1, $2, $3, $4, $5)
+                    "INSERT INTO shares (secret_id, channel_id, version, share_secret_id, bytes, subshares, threshold) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)
                      ON CONFLICT ON CONSTRAINT shares_uniq DO UPDATE SET
                          share_secret_id = EXCLUDED.share_secret_id,
-                         bytes           = EXCLUDED.bytes",
+                         bytes           = EXCLUDED.bytes,
+                         subshares       = EXCLUDED.subshares,
+                         threshold       = EXCLUDED.threshold",
                     &[
                         &secret_id_i64,
                         &channel_id_i64,
                         &version_i64,
                         &share_secret_id_i64,
                         &bytes,
+                        &subshares,
+                        &threshold,
                     ],
                 )
                 .await
@@ -229,5 +236,7 @@ fn row_to_share(row: tokio_postgres::Row) -> Share {
         secret_id: sql_to_u64(row.get::<_, i64>(0)),
         version: row.get::<_, i64>(1) as u32,
         bytes: row.get::<_, Vec<u8>>(2),
+        subshares: sql_to_subshares(row.get::<_, Option<i64>>(3)),
+        threshold: sql_to_threshold(row.get::<_, Option<i64>>(4)),
     }
 }

@@ -73,6 +73,7 @@ pub async fn protect_secret(
             secrets: vec![user_secret],
             description: Some(description.to_owned()),
             weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("owner.start(ProtectSecret) failed");

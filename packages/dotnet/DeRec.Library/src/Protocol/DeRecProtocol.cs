@@ -260,6 +260,16 @@ public sealed class DeRecProtocol : IDisposable
     /// arrives, with no further prompt. Ask the user before calling this; to
     /// decline, never confirm.
     /// </para>
+    /// <para>
+    /// On a promotion the current snapshot is published to the promoted peer,
+    /// reusing the stored helper weights. If one is no longer valid under the
+    /// current threshold, that publish fails with
+    /// <see cref="DeRecCode.InvalidWeight"/> before anything is sent and this
+    /// throws. The promotion stands: calling this again returns <c>true</c>
+    /// and publishes nothing, so call <see cref="StartAsync"/> with
+    /// <see cref="ProtectSecretParams"/> and valid weights to reach the
+    /// promoted peer.
+    /// </para>
     /// </summary>
     public Task<bool> VerifyFingerprintAsync(ulong channelId, string fingerprint)
     {
@@ -384,6 +394,15 @@ public sealed class DeRecProtocol : IDisposable
     /// resumes whichever flow was suspended and returns the resulting
     /// event stream (e.g. <see cref="PairingCompletedEvent"/>).
     /// </summary>
+    /// <remarks>
+    /// When the action completes a pairing, the publish that follows reuses
+    /// the stored helper weights. If one is no longer valid under the round's
+    /// threshold, that publish fails with <see cref="DeRecCode.InvalidWeight"/>
+    /// before anything is sent and this throws: the pairing has completed and
+    /// its response was sent, but the <see cref="PairingCompletedEvent"/> is
+    /// not returned. Call <see cref="StartAsync"/> with
+    /// <see cref="ProtectSecretParams"/> and valid weights to publish.
+    /// </remarks>
     public Task<IReadOnlyList<DeRecEvent>> AcceptAsync(byte[] actionBytes)
     {
         EnsureNotDisposed();
@@ -406,7 +425,12 @@ public sealed class DeRecProtocol : IDisposable
 
     /// <summary>
     /// Reject a pending action with a status + memo. <paramref name="status"/>
-    /// is the <c>StatusEnum</c> the peer receives in the response.
+    /// is the <c>StatusEnum</c> the peer receives in the response. The action
+    /// is the bytes of an <see cref="ActionRequiredEvent"/>, or of a
+    /// <see cref="RequestFailedEvent"/> whose request was not answered; the
+    /// latter sends that request's one response. Resolve each token once: the
+    /// library is stateless, so rejecting the same token twice sends two
+    /// responses.
     /// </summary>
     public Task RejectAsync(byte[] actionBytes, Org.Derecalliance.Derec.Protobuf.StatusEnum status, string memo)
     {
@@ -501,7 +525,10 @@ public sealed class DeRecProtocol : IDisposable
     /// is the <see cref="Secret"/> carried by <see cref="SecretRecoveredEvent.Secret"/>;
     /// pass it verbatim. A helper or member whose transports list is empty
     /// gets no channel: it is reported as a <see cref="PeerNotRestoredEvent"/>
-    /// in the returned list and the rest of the roster is restored.
+    /// in the returned list and the rest of the roster is restored. A
+    /// helper's or member's <see cref="HelperInfo.CommunicationInfo"/> /
+    /// <see cref="ReplicaInfo.CommunicationInfo"/> may be <c>null</c> or
+    /// absent; both mean the same thing — no entries.
     /// <para>
     /// Recovery and restore are separate steps on purpose:
     /// <see cref="SecretRecoveredEvent"/> writes nothing. Show the user what
@@ -634,7 +661,8 @@ public sealed class DeRecProtocol : IDisposable
         h.CommunicationInfo,
         h.PeerRole.ToString(),
         h.Status.ToString(),
-        h.CreatedAt);
+        h.CreatedAt,
+        h.Weight);
 
     private static ReplicaMemberDto ToDto(ReplicaMember m) => new(
         ChannelRecordSchemaVersion,
@@ -650,9 +678,11 @@ public sealed class DeRecProtocol : IDisposable
         d.channel_id,
         d.transports.Select(t => new TransportProtocol(t.uri, (Protocol)t.protocol)).ToList(),
         d.communication_info ?? new(),
-        Enum.Parse<ChannelStatus>(d.status ?? nameof(ChannelStatus.Paired)),
+        Enum.Parse<ChannelStatus>(
+            d.status ?? throw new InvalidOperationException("HelperChannel JSON is missing `status`")),
         d.created_at,
-        Enum.Parse<LibPairing.SenderKind>(d.peer_role));
+        Enum.Parse<LibPairing.SenderKind>(d.peer_role),
+        d.weight);
 
     private static ReplicaMember FromDto(ReplicaMemberDto d) => new(
         d.channel_id,
@@ -660,7 +690,8 @@ public sealed class DeRecProtocol : IDisposable
         d.transports.Select(t => new TransportProtocol(t.uri, (Protocol)t.protocol)).ToList(),
         d.communication_info ?? new(),
         Enum.Parse<ReplicaRole>(d.role),
-        Enum.Parse<ChannelStatus>(d.status ?? nameof(ChannelStatus.Paired)),
+        Enum.Parse<ChannelStatus>(
+            d.status ?? throw new InvalidOperationException("ReplicaMember JSON is missing `status`")),
         d.created_at);
 
     private int ChannelLoadImpl(IntPtr userData, ulong secretId, ulong channelId, ulong replicaId, out IntPtr outPtr, out UIntPtr outLen)
@@ -904,7 +935,7 @@ public sealed class DeRecProtocol : IDisposable
         {
             uint[] versions = DeserializeJsonArray<uint>(versionsJsonPtr, versionsJsonLen) ?? Array.Empty<uint>();
             var records = _shareStore.Load(secretId, channelId, versions)
-                .Select(s => new ShareRecordDto(s.SecretId.ToString(), s.Version, s.Bytes))
+                .Select(s => new ShareRecordDto(s.SecretId.ToString(), s.Version, s.Bytes, s.Subshares, s.Threshold))
                 .ToList();
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(records, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
@@ -928,7 +959,7 @@ public sealed class DeRecProtocol : IDisposable
             ulong[] channelIds = DeserializeJsonArray<ulong>(channelIdsJsonPtr, channelIdsJsonLen) ?? Array.Empty<ulong>();
             uint[] versions = DeserializeJsonArray<uint>(versionsJsonPtr, versionsJsonLen) ?? Array.Empty<uint>();
             var records = _shareStore.LoadMany(secretId, channelIds, versions)
-                .Select(s => new ShareRecordDto(s.SecretId.ToString(), s.Version, s.Bytes))
+                .Select(s => new ShareRecordDto(s.SecretId.ToString(), s.Version, s.Bytes, s.Subshares, s.Threshold))
                 .ToList();
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(records, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
@@ -950,7 +981,7 @@ public sealed class DeRecProtocol : IDisposable
         {
             ulong[] channelIds = DeserializeJsonArray<ulong>(channelIdsJsonPtr, channelIdsJsonLen) ?? Array.Empty<ulong>();
             var records = _shareStore.LoadAll(secretId, channelIds)
-                .Select(s => new ShareRecordDto(s.SecretId.ToString(), s.Version, s.Bytes))
+                .Select(s => new ShareRecordDto(s.SecretId.ToString(), s.Version, s.Bytes, s.Subshares, s.Threshold))
                 .ToList();
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(records, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
@@ -987,7 +1018,7 @@ public sealed class DeRecProtocol : IDisposable
             Marshal.Copy(shareJsonPtr, buf, 0, buf.Length);
             var rec = JsonSerializer.Deserialize<ShareRecordDto>(buf, JsonOpts)
                 ?? throw new InvalidOperationException("null ShareRecord");
-            _shareStore.Save(secretId, channelId, new Share(ulong.Parse(rec.secret_id), rec.version, rec.bytes));
+            _shareStore.Save(secretId, channelId, new Share(ulong.Parse(rec.secret_id), rec.version, rec.bytes, rec.subshares, rec.threshold));
             return 0;
         }
         catch (ShareStoreRefusedException ex) { return RefusalCode(ex.Refusal); }
@@ -1066,7 +1097,8 @@ public sealed class DeRecProtocol : IDisposable
                 value.Version,
                 value.Secrets.Select(s => new UserSecretDto(s.Id, s.Name, s.Data)).ToArray(),
                 value.Description,
-                value.AuthorReplicaId?.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                value.AuthorReplicaId?.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                value.Threshold);
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
         }
@@ -1096,7 +1128,8 @@ public sealed class DeRecProtocol : IDisposable
                 dto.description,
                 dto.author_replica_id is null
                     ? null
-                    : ulong.Parse(dto.author_replica_id, System.Globalization.CultureInfo.InvariantCulture)));
+                    : ulong.Parse(dto.author_replica_id, System.Globalization.CultureInfo.InvariantCulture),
+                dto.threshold));
             return 0;
         }
         catch { return -1; }
@@ -1109,8 +1142,8 @@ public sealed class DeRecProtocol : IDisposable
     }
 
     // Wire shape matches Rust `UserSecretsRecord`; `author_replica_id` is a
-    // decimal string, omitted when null.
-    private sealed record UserSecretsDto(uint version, UserSecretDto[] secrets, string? description, string? author_replica_id);
+    // decimal string, omitted when null, and so is `threshold`.
+    private sealed record UserSecretsDto(uint version, UserSecretDto[] secrets, string? description, string? author_replica_id, uint? threshold);
     private sealed record UserSecretDto(byte[] id, string name, byte[] data);
 
     // Wire shape matches Rust `StateItemRecord` — snake_case field names, byte[]
@@ -1131,7 +1164,9 @@ public sealed class DeRecProtocol : IDisposable
         string[]? behind_replicas,
         uint? local_version,
         ReplicaDiscoveryReportDto[]? reported,
-        string[]? share_channels);
+        string[]? share_channels,
+        uint[]? keep_list,
+        uint? threshold);
 
     private sealed record ReplicaDiscoveryReportDto(string replica_id, uint version);
 
@@ -1161,7 +1196,9 @@ public sealed class DeRecProtocol : IDisposable
             .OrderBy(r => r.Key)
             .Select(r => new ReplicaDiscoveryReportDto(r.Key.ToString(), r.Value))
             .ToArray(),
-        item.ShareChannels?.Select(c => c.ToString()).ToArray());
+        item.ShareChannels?.Select(c => c.ToString()).ToArray(),
+        item.KeepList,
+        item.Threshold);
 
     private static StateItem FromDto(StateItemDto dto)
     {
@@ -1202,7 +1239,7 @@ public sealed class DeRecProtocol : IDisposable
         return new StateItem(
             kind, channelId, secretId, dto.version, startedAt, dto.bytes, dto.shares,
             pending, confirmed, failed, pendingReplicas, syncedReplicas, behindReplicas,
-            dto.local_version, reported, shareChannels);
+            dto.local_version, reported, shareChannels, dto.keep_list, dto.threshold);
     }
 
     private static StateKey ParseKeyBuffer(IntPtr ptr, UIntPtr len)
@@ -1323,7 +1360,9 @@ public sealed class DeRecProtocol : IDisposable
         return JsonSerializer.Deserialize<T[]>(buf, JsonOpts);
     }
 
-    private sealed record ShareRecordDto(string secret_id, uint version, byte[] bytes);
+    // Mirrors ShareRecord in stores.rs. A null subshares or threshold is
+    // omitted on write (DeRecJsonOptions.Wire), matching the Rust side.
+    private sealed record ShareRecordDto(string secret_id, uint version, byte[] bytes, uint? subshares, uint? threshold);
 
     private int TransportSendImpl(IntPtr userData, IntPtr endpointsPtr, UIntPtr endpointsLen, IntPtr bytes, UIntPtr len)
     {
@@ -1374,7 +1413,8 @@ public sealed class DeRecProtocol : IDisposable
         Dictionary<string, string>? communication_info,
         string peer_role,
         string? status,
-        ulong created_at);
+        ulong created_at,
+        uint weight);
 
     private sealed record ReplicaMemberDto(
         byte schema_version,

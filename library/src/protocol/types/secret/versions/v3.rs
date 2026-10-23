@@ -62,6 +62,13 @@ struct SecretJson {
     secrets: Vec<UserSecretJson>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replicas: Option<ReplicasJson>,
+    /// Absent on a roster written before the threshold was recorded.
+    #[serde(
+        default,
+        deserialize_with = "de_threshold",
+        skip_serializing_if = "Option::is_none"
+    )]
+    threshold: Option<u32>,
 }
 
 /// One advertised endpoint. `protocol` is the `Protocol` discriminant, the
@@ -104,6 +111,14 @@ struct HelperJson {
         skip_serializing_if = "HashMap::is_empty"
     )]
     communication_info: HashMap<String, String>,
+    /// Absent means `1`, so a roster written before weights existed and one
+    /// where every Helper holds one subshare encode identically.
+    #[serde(
+        default,
+        deserialize_with = "de_weight",
+        skip_serializing_if = "Option::is_none"
+    )]
+    weight: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -145,6 +160,7 @@ impl From<&Secret> for SecretJson {
             helpers: s.helpers.iter().map(HelperJson::from).collect(),
             secrets: s.secrets.iter().map(UserSecretJson::from).collect(),
             replicas: s.replicas.as_ref().map(ReplicasJson::from),
+            threshold: s.threshold,
         }
     }
 }
@@ -155,6 +171,7 @@ impl From<SecretJson> for Secret {
             helpers: j.helpers.into_iter().map(HelperInfo::from).collect(),
             secrets: j.secrets.into_iter().map(UserSecret::from).collect(),
             replicas: j.replicas.map(Replicas::from),
+            threshold: j.threshold,
         }
     }
 }
@@ -166,6 +183,7 @@ impl From<&HelperInfo> for HelperJson {
             transports: h.transports.iter().map(EndpointJson::from).collect(),
             shared_key: h.shared_key.clone(),
             communication_info: h.communication_info.clone(),
+            weight: Some(h.effective_weight()).filter(|&w| w != 1),
         }
     }
 }
@@ -177,6 +195,7 @@ impl From<HelperJson> for HelperInfo {
             transports: j.transports.into_iter().map(Into::into).collect(),
             shared_key: j.shared_key,
             communication_info: j.communication_info,
+            weight: j.weight.unwrap_or(1),
         }
     }
 }
@@ -275,10 +294,153 @@ fn gunzip(data: &[u8]) -> Result<Vec<u8>, SecretError> {
     Ok(out)
 }
 
+/// A present `weight` must be at least `1`: a Helper that received no
+/// subshare is not part of the roster.
+fn de_weight<'de, D>(d: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    match Option::<u32>::deserialize(d)? {
+        Some(0) => Err(serde::de::Error::custom("helper weight must be at least 1")),
+        other => Ok(other),
+    }
+}
+
+/// A present `threshold` must be at least `2`: below that, a single subshare
+/// reconstructs the secret.
+fn de_threshold<'de, D>(d: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    match Option::<u32>::deserialize(d)? {
+        Some(t) if t < 2 => Err(serde::de::Error::custom("threshold must be at least 2")),
+        other => Ok(other),
+    }
+}
+
 fn de_map<'de, D>(d: D) -> Result<HashMap<String, String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize as _;
     Ok(Option::<HashMap<String, String>>::deserialize(d)?.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod weight_tests {
+    use super::*;
+
+    fn helper(weight: u32) -> HelperInfo {
+        HelperInfo {
+            channel_id: 2,
+            transports: vec![derec_proto::TransportProtocol {
+                uri: "https://h.example/derec".to_owned(),
+                protocol: derec_proto::Protocol::Https as i32,
+            }],
+            shared_key: vec![1, 2, 3],
+            communication_info: HashMap::new(),
+            weight,
+        }
+    }
+
+    fn secret_with(weight: u32) -> Secret {
+        Secret {
+            helpers: vec![helper(weight)],
+            secrets: Vec::new(),
+            replicas: None,
+            threshold: None,
+        }
+    }
+
+    fn json_of(secret: &Secret) -> serde_json::Value {
+        serde_json::from_slice(&gunzip(&encode(secret)).unwrap()).unwrap()
+    }
+
+    fn decode_json(json: &str) -> Result<Secret, SecretError> {
+        decode(&gzip(json.as_bytes()))
+    }
+
+    const HELPER_PREFIX: &str =
+        r#"{"helpers":[{"channel_id":"2","transports":[],"shared_key":"AQID""#;
+
+    #[test]
+    fn a_weight_of_one_is_omitted() {
+        let json = json_of(&secret_with(1));
+        assert!(json["helpers"][0].get("weight").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_weight_above_one_round_trips() {
+        let secret = secret_with(3);
+        assert_eq!(json_of(&secret)["helpers"][0]["weight"], 3);
+        assert_eq!(decode(&encode(&secret)).unwrap(), secret);
+    }
+
+    #[test]
+    fn an_absent_weight_decodes_as_one() {
+        let secret = decode_json(&format!("{HELPER_PREFIX}}}]}}")).unwrap();
+        assert_eq!(secret.helpers[0].weight, 1);
+        let secret = decode_json(&format!("{HELPER_PREFIX},\"weight\":null}}]}}")).unwrap();
+        assert_eq!(secret.helpers[0].weight, 1);
+    }
+
+    #[test]
+    fn a_weight_of_zero_is_malformed() {
+        let err = decode_json(&format!("{HELPER_PREFIX},\"weight\":0}}]}}"))
+            .expect_err("a helper holding no subshare is not a roster entry");
+        assert!(matches!(err, SecretError::Json(_)), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::*;
+
+    fn secret_with(threshold: Option<u32>) -> Secret {
+        Secret {
+            helpers: Vec::new(),
+            secrets: Vec::new(),
+            replicas: None,
+            threshold,
+        }
+    }
+
+    fn json_of(secret: &Secret) -> serde_json::Value {
+        serde_json::from_slice(&gunzip(&encode(secret)).unwrap()).unwrap()
+    }
+
+    fn decode_json(json: &str) -> Result<Secret, SecretError> {
+        decode(&gzip(json.as_bytes()))
+    }
+
+    #[test]
+    fn an_absent_threshold_is_omitted_and_decodes_as_none() {
+        let json = json_of(&secret_with(None));
+        assert!(json.get("threshold").is_none(), "{json}");
+        assert_eq!(decode_json(r#"{"helpers":[]}"#).unwrap().threshold, None);
+        assert_eq!(
+            decode_json(r#"{"helpers":[],"threshold":null}"#)
+                .unwrap()
+                .threshold,
+            None
+        );
+    }
+
+    #[test]
+    fn a_threshold_round_trips() {
+        let secret = secret_with(Some(3));
+        assert_eq!(json_of(&secret)["threshold"], 3);
+        assert_eq!(decode(&encode(&secret)).unwrap(), secret);
+    }
+
+    #[test]
+    fn a_threshold_below_two_is_malformed() {
+        for t in [0, 1] {
+            let err = decode_json(&format!(r#"{{"helpers":[],"threshold":{t}}}"#))
+                .expect_err("a threshold below 2 lets one subshare recover the secret");
+            assert!(matches!(err, SecretError::Json(_)), "{err:?}");
+        }
+    }
 }

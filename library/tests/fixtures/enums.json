@@ -35,7 +35,7 @@
     },
     "PendingActionKind": {
       "encoding": "name",
-      "note": "ActionRequired.action_kind / AutoAccepted.action_kind",
+      "note": "ActionRequired.action_kind / AutoAccepted.action_kind / RequestFailed.action_kind",
       "variants": [
         {
           "name": "Pairing",
@@ -68,6 +68,10 @@
         {
           "name": "UpdateChannelInfo",
           "wire": "UpdateChannelInfo"
+        },
+        {
+          "name": "Failed",
+          "wire": "Failed"
         }
       ]
     },
@@ -168,6 +172,10 @@
           "wire": "DiscoveryStarted"
         },
         {
+          "name": "ErrorResponseReceived",
+          "wire": "ErrorResponseReceived"
+        },
+        {
           "name": "MessageIgnored",
           "wire": "MessageIgnored"
         },
@@ -178,6 +186,10 @@
         {
           "name": "PairingCompleted",
           "wire": "PairingCompleted"
+        },
+        {
+          "name": "PairingRefused",
+          "wire": "PairingRefused"
         },
         {
           "name": "PairingStarted",
@@ -244,6 +256,10 @@
           "wire": "ReplicaSecretReceived"
         },
         {
+          "name": "ReplicaSecretRefused",
+          "wire": "ReplicaSecretRefused"
+        },
+        {
           "name": "ReplicaSourceChanged",
           "wire": "ReplicaSourceChanged"
         },
@@ -264,6 +280,10 @@
           "wire": "ReplicaVersionConflict"
         },
         {
+          "name": "RequestFailed",
+          "wire": "RequestFailed"
+        },
+        {
           "name": "SecretRecovered",
           "wire": "SecretRecovered"
         },
@@ -282,6 +302,10 @@
         {
           "name": "ShareRejected",
           "wire": "ShareRejected"
+        },
+        {
+          "name": "ShareRefused",
+          "wire": "ShareRefused"
         },
         {
           "name": "ShareStored",

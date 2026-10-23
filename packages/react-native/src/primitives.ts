@@ -600,7 +600,7 @@ const sharing = {
       secret_data: Uint8Array,
       threshold: number,
     ): SplitResult {
-      const ids = channels.map(([channelId]) => channelId);
+      const ids = channels.map(([channelId]) => BigInt(channelId));
       const weights = channels.map(([, weight]) => weight);
       const packed = call(
         'protect_secret',

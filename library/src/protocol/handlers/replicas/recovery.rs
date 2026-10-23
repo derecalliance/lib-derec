@@ -11,10 +11,10 @@
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::primitives::sharing::request::SHARE_ALGORITHM_REPLICA_SECRET;
+use crate::protocol::DeRecEvent;
 use crate::protocol::context::{Exchange, Local};
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::ReplicaMember;
-use crate::protocol::{DeRecEvent, DeRecTransport};
 use crate::types::{ReplicaId, SharedKey};
 use crate::{Error, Result};
 use derec_proto::{
@@ -40,6 +40,9 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
                 .channels
                 .load_replica_member(local.secret_id, exchange.channel_id, author)
                 .await?;
+            if let Some(obligation) = exchange.obligation {
+                obligation.answer_at(&member.transports);
+            }
             on_request(
                 stores,
                 local,
@@ -47,11 +50,19 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
                 &request,
                 *exchange.shared_key,
                 exchange.trace_id,
+                exchange.obligation,
             )
             .await
         }
         MessageBody::GetShareResponse(response) => {
-            on_response(stores, local, ReplicaId::try_from(author)?, &response).await
+            on_response(
+                stores,
+                local,
+                exchange.channel_id,
+                ReplicaId::try_from(author)?,
+                &response,
+            )
+            .await
         }
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in replica recovery handler",
@@ -71,6 +82,7 @@ async fn on_request<S: StoreSet>(
     request: &GetShareRequestMessage,
     shared_key: SharedKey,
     inbound_trace_id: u64,
+    obligation: Option<&crate::protocol::obligation::Obligation>,
 ) -> Result<Vec<DeRecEvent>> {
     let composite = super::super::sharing::build_catch_up_payload(stores, local).await?;
 
@@ -87,7 +99,7 @@ async fn on_request<S: StoreSet>(
     let response = GetShareResponseMessage {
         result: Some(DeRecResult {
             status: status as i32,
-            memo,
+            memo: memo.clone(),
         }),
         committed_de_rec_share: share,
         // The discriminator: the bytes are the whole secret, not a share.
@@ -106,14 +118,28 @@ async fn on_request<S: StoreSet>(
         .build()?
         .encode_to_vec();
     let envelope = crate::derec_message::apply_trace_id(&envelope, inbound_trace_id)?;
-    // A reply-to overrides the recorded endpoints for this exchange only.
-    let reply_to = crate::extensions::advertised_endpoints::reply_to_owned(request);
+    // A reply-to overrides the recorded endpoints for this exchange only,
+    // and only once it has passed the same transport policy every other
+    // peer-supplied endpoint is held to; an offer refused in full is no
+    // reply-to at all.
+    let reply_to = crate::extensions::channel_store::filter_reply_to(
+        local.policy,
+        &crate::extensions::advertised_endpoints::reply_to_owned(request),
+    );
     let endpoint = if reply_to.is_empty() {
         member.transports.clone()
     } else {
         reply_to
     };
-    stores.transport.send(&endpoint, envelope).await?;
+    crate::protocol::obligation::deliver(
+        obligation,
+        stores.transport,
+        &endpoint,
+        envelope,
+        status,
+        &memo,
+    )
+    .await?;
 
     Ok(vec![DeRecEvent::NoOp])
 }
@@ -122,6 +148,7 @@ async fn on_request<S: StoreSet>(
 async fn on_response<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
+    arrived_on: crate::types::ChannelId,
     from: ReplicaId,
     response: &GetShareResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
@@ -138,6 +165,7 @@ async fn on_response<S: StoreSet>(
     super::super::sharing::hydrate_catch_up(
         stores,
         local,
+        arrived_on,
         from.0,
         response.secret_id,
         response.version,

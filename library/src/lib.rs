@@ -66,6 +66,7 @@ pub mod types;
 mod utils;
 
 mod error;
+mod error_codes;
 pub use error::Error;
 
 /// Generate a fresh **replica identity** using the OS CSPRNG.

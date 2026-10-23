@@ -612,6 +612,78 @@ fn test_produce_store_share_response_message_rejects_tampered_commitment() {
     );
 }
 
+/// The validator a Helper runs before storing classifies each failure by
+/// the status it answers the Owner with.
+#[test]
+fn validate_share_classifies_each_failure_by_status() {
+    use crate::primitives::sharing::response::validate_share;
+    use derec_proto::StatusEnum;
+
+    let status_of = |request: &derec_proto::StoreShareRequestMessage| {
+        validate_share(request)
+            .map(|_| ())
+            .map_err(|f| (f.status, f.memo))
+    };
+
+    assert_eq!(status_of(&make_request_with_mutated_share(|_| {})), Ok(()));
+
+    let mut empty = make_request_with_mutated_share(|_| {});
+    empty.share.clear();
+    assert_eq!(
+        status_of(&empty).unwrap_err().0,
+        StatusEnum::FormatError,
+        "an empty share"
+    );
+
+    let mut garbage = make_request_with_mutated_share(|_| {});
+    garbage.share = b"not a share".to_vec();
+    assert_eq!(
+        status_of(&garbage).unwrap_err().0,
+        StatusEnum::FormatError,
+        "bytes that are not a CommittedDeRecShare"
+    );
+
+    assert_eq!(
+        status_of(&make_request_with_mutated_share(|s| s.commitment.clear())),
+        Err((
+            StatusEnum::FormatError,
+            "CommittedDeRecShare.commitment is empty"
+        )),
+    );
+
+    assert_eq!(
+        status_of(&make_request_with_mutated_share(|s| {
+            s.de_rec_share = b"not a share".to_vec();
+        }))
+        .unwrap_err()
+        .0,
+        StatusEnum::FormatError,
+        "a de_rec_share that is not a DeRecShare"
+    );
+
+    assert_eq!(
+        status_of(&make_request_with_mutated_share(|s| {
+            s.merkle_path[0].hash[0] ^= 0xFF;
+        }))
+        .unwrap_err()
+        .0,
+        StatusEnum::VerificationFailed,
+        "a Merkle path that does not lead to the commitment"
+    );
+
+    assert_eq!(
+        status_of(&make_request_with_mutated_share(|s| {
+            let mut inner = DeRecShare::decode(s.de_rec_share.as_slice()).expect("inner share");
+            inner.subshares.clear();
+            s.de_rec_share = inner.encode_to_vec();
+        }))
+        .unwrap_err()
+        .0,
+        StatusEnum::VerificationFailed,
+        "a share with no subshares"
+    );
+}
+
 /// A peer-supplied `reply_to` that declares `Protocol::Https` but ships
 /// a URI with an unsupported scheme is rejected at extract — the
 /// scheme-vs-protocol gate is what stops a malicious request sender

@@ -160,9 +160,13 @@ internal sealed class InMemoryShareStore : IShareStore
 
     public bool RefuseVerifications { get; set; }
 
+    /// <summary>Fail every save, the way an unavailable storage backend would.</summary>
+    public bool FailSaves { get; set; }
+
     public void Save(ulong secretId, ulong channelId, Share share)
     {
         if (RefuseSaves) throw new ShareStoreRefusedException(ShareStoreRefusal.TooFrequent);
+        if (FailSaves) throw new InvalidOperationException("share backend unavailable");
         _data[(secretId, channelId, share.Version)] = share;
     }
 

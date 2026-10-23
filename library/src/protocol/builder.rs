@@ -173,13 +173,26 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         Transport,
     >
 {
-    /// Minimum number of subshares required to reconstruct the secret.
+    /// The starting threshold `t`: the minimum number of subshares required
+    /// to reconstruct the secret, for a secret with no threshold stored.
     ///
-    /// A Helper holds one subshare unless
-    /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret)
-    /// gives it a weight, so with no weights this is the number of Helpers,
-    /// as before. Every weight must be below this threshold, so no single
-    /// Helper can recover alone.
+    /// `t` is recorded. Every publish writes the `t` it used to the
+    /// [`UserSecrets::threshold`](crate::protocol::types::UserSecrets::threshold)
+    /// snapshot, the roster carries it, and
+    /// [`restore`](crate::protocol::DeRecProtocol::restore) and replica
+    /// hydration put it back. A round splits at the `threshold` passed on
+    /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret),
+    /// otherwise at the stored `t`, and only otherwise at this value. So this
+    /// setting decides `t` until something is stored, and changing it later
+    /// does not change a stored `t`; pass `threshold` on `ProtectSecret` to do
+    /// that.
+    ///
+    /// A Helper holds one subshare unless `ProtectSecret` has given it a
+    /// weight, so with no weights `t` is a number of Helpers, as before.
+    /// Every weight must be below the round's `t`, so no single Helper can
+    /// recover alone. When this value applies and is lowered to or below a
+    /// stored weight, every publish fails until `ProtectSecret` assigns valid
+    /// weights.
     ///
     /// Large subshare totals are costly to recover: reconstruction time grows
     /// quadratically with the total number of subshares. See
@@ -212,9 +225,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// [`SharingError::TooManySubshares`](crate::primitives::sharing::SharingError::TooManySubshares)
     /// before a version is chosen: nothing is sent and no version is
     /// consumed. Publishes the library starts on its own (after a pairing
-    /// completes or a fingerprint is confirmed) give every Helper one
-    /// subshare, so their total is the Helper count, and they are bounded
-    /// the same way.
+    /// completes or a fingerprint is confirmed) total the stored weights,
+    /// and they are bounded the same way.
     ///
     /// Recovery applies no cap: a recovering device cannot know the cap the
     /// secret was shared under, and a lower one could leave it unrecoverable.
@@ -321,21 +333,54 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         self
     }
 
-    /// Whether the protocol replies to peers on inbound processing failures.
+    /// Whether the library answers a failed inbound request itself.
     ///
-    /// - `true`: when an inbound request fails after it was decrypted, the
-    ///   protocol also sends the peer a response with a non-`Ok` status
-    ///   (`FORMAT_ERROR` for a decode failure, `REJECTED` for a role mismatch,
-    ///   `UNSUPPORTED_TRANSPORT_PROTOCOL` when no endpoint is usable, `FAIL`
-    ///   otherwise). [`DeRecProtocol::process`] still returns the error.
-    /// - `false`: the failure is only returned from
-    ///   [`DeRecProtocol::process`] and nothing is sent — the application
-    ///   decides how to respond.
+    /// Every request that arrives on an authenticated channel is owed exactly
+    /// one response. When handling it fails, [`DeRecProtocol::process`] (or
+    /// [`DeRecProtocol::accept`], for an action the application accepted)
+    /// still returns `Ok`, and the failure is reported as
+    /// [`DeRecEvent::RequestFailed`](crate::protocol::DeRecEvent::RequestFailed)
+    /// alongside the call's other events.
+    ///
+    /// - `true`: the library sends the request's own response type with a
+    ///   non-`Ok` status and reports `responded: true`. A failure with a
+    ///   protocol meaning keeps its status and memo (`REJECTED` for a role
+    ///   mismatch, `UNSUPPORTED_TRANSPORT_PROTOCOL` when no endpoint is
+    ///   usable); anything else is `FAIL` with a generic memo, so no local
+    ///   error text reaches the peer.
+    /// - `false`: nothing is sent. The event carries `responded: false` and a
+    ///   [`PendingAction::RespondToFailure`](crate::protocol::PendingAction::RespondToFailure)
+    ///   token; pass it to [`DeRecProtocol::reject`] with the status and memo
+    ///   to send. The library never expires the token, so a request the
+    ///   application never answers leaves its sender to time out.
+    ///
+    /// When the library cannot tell where to answer before any send, it hands
+    /// over the token even with this `true`. A request on a replica group
+    /// channel that names no member and carries no `reply_to` has no reply
+    /// target at all: it is reported with `action: None` and never answered.
+    ///
+    /// The protocol's own refusals (a share that fails validation, a replica
+    /// copy that does not check, a `PairRequest` outside the parameter range
+    /// or announcing a taken replica id) are answered in both modes, and so
+    /// is a response that was already handed to the transport: a later
+    /// failure is reported with `responded: true` and never answered twice.
+    ///
+    /// A message that decrypts under the channel key but whose body cannot
+    /// be decoded, or that carries a pairing request a paired channel cannot
+    /// carry, is a request too. It is answered with an `ErrorResponseMessage`
+    /// carrying `FORMAT_ERROR` and the memo `message body could not be
+    /// decoded`, and reported with
+    /// [`PendingActionKind::Failed`](crate::protocol::PendingActionKind::Failed).
+    /// A received `ErrorResponseMessage` is reported as
+    /// [`DeRecEvent::ErrorResponseReceived`](crate::protocol::DeRecEvent::ErrorResponseReceived)
+    /// and never answered.
     ///
     /// A message that fails to decrypt is never answered: it carries no proof
     /// of who sent it, and replying would make this device a decryption
-    /// oracle. The reply is best effort; failing to send it does not replace
-    /// the original error.
+    /// oracle. Neither are expired messages (older than the
+    /// `inbound_message` window, which is the library's replay bound),
+    /// response messages, the pairing handshake, or a replica-group removal
+    /// notice.
     ///
     /// Default: `false`.
     pub fn with_auto_respond_on_failure(mut self, enabled: bool) -> Self {
@@ -433,8 +478,12 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// checked against the peer's range on inbound ones: if any field's
     /// range fails to intersect (e.g. local `minShareSize` exceeds a non-zero
     /// peer `maxShareSize`), or the peer's range is malformed, the pairing is
-    /// rejected with
-    /// [`Error::Pairing(PairingError::IncompatibleParameterRange { .. })`](crate::Error::Pairing).
+    /// refused. A responder sends a `PairResponse` carrying
+    /// `INCOMPATIBLE_PARAMETER_RANGE` and reports
+    /// [`DeRecEvent::PairingRefused`](crate::protocol::DeRecEvent::PairingRefused);
+    /// an initiator checking the responder's range fails with
+    /// [`Error::Pairing(PairingError::IncompatibleParameterRange { .. })`](crate::Error::Pairing),
+    /// and one receiving the refusal fails with its non-`Ok` status.
     ///
     /// A field value of `0` means "no bound", on both sides: `min == 0` is no
     /// minimum and `max == 0` is no maximum, so a `max` of `0` overlaps any
@@ -2151,7 +2200,7 @@ mod tests {
     /// unconditionally — with nothing to return.
     #[test]
     fn build_rejects_an_empty_own_transport_list() {
-        use crate::protocol::test::{
+        use crate::protocol::tests::{
             InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
             InMemUserSecretStore, NoopTransport,
         };
@@ -2177,15 +2226,15 @@ mod tests {
         range: derec_proto::ParameterRange,
     ) -> crate::Result<
         DeRecProtocol<
-            crate::protocol::test::InMemChannelStore,
-            crate::protocol::test::InMemShareStore,
-            crate::protocol::test::InMemSecretStore,
-            crate::protocol::test::InMemUserSecretStore,
-            crate::protocol::test::InMemStateStore,
-            crate::protocol::test::NoopTransport,
+            crate::protocol::tests::InMemChannelStore,
+            crate::protocol::tests::InMemShareStore,
+            crate::protocol::tests::InMemSecretStore,
+            crate::protocol::tests::InMemUserSecretStore,
+            crate::protocol::tests::InMemStateStore,
+            crate::protocol::tests::NoopTransport,
         >,
     > {
-        use crate::protocol::test::{
+        use crate::protocol::tests::{
             InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
             InMemUserSecretStore, NoopTransport,
         };
@@ -2208,15 +2257,15 @@ mod tests {
         max_subshares: Option<u64>,
     ) -> crate::Result<
         DeRecProtocol<
-            crate::protocol::test::InMemChannelStore,
-            crate::protocol::test::InMemShareStore,
-            crate::protocol::test::InMemSecretStore,
-            crate::protocol::test::InMemUserSecretStore,
-            crate::protocol::test::InMemStateStore,
-            crate::protocol::test::NoopTransport,
+            crate::protocol::tests::InMemChannelStore,
+            crate::protocol::tests::InMemShareStore,
+            crate::protocol::tests::InMemSecretStore,
+            crate::protocol::tests::InMemUserSecretStore,
+            crate::protocol::tests::InMemStateStore,
+            crate::protocol::tests::NoopTransport,
         >,
     > {
-        use crate::protocol::test::{
+        use crate::protocol::tests::{
             InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
             InMemUserSecretStore, NoopTransport,
         };
@@ -2426,7 +2475,7 @@ mod tests {
     /// record and pairing secret.
     #[test]
     fn with_stores_builds_like_the_five_setters() {
-        use crate::protocol::test::{
+        use crate::protocol::tests::{
             InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
             InMemUserSecretStore, RecordingTransport, run_async,
         };
@@ -2544,7 +2593,7 @@ mod tests {
     /// store, not the one `with_stores` put there.
     #[test]
     fn with_stores_then_a_setter_replaces_that_store() {
-        use crate::protocol::test::{
+        use crate::protocol::tests::{
             InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
             InMemUserSecretStore, NoopTransport, run_async,
         };
@@ -2581,6 +2630,8 @@ mod tests {
                         secret_id: 0,
                         version: 1,
                         bytes: vec![0xAB],
+                        subshares: None,
+                        threshold: None,
                     },
                 )
                 .await
@@ -2823,16 +2874,16 @@ mod tests {
     }
 
     type InMemBuilder = DeRecProtocolBuilder<
-        BuilderSlotSetMarker<crate::protocol::test::InMemChannelStore>,
-        BuilderSlotSetMarker<crate::protocol::test::InMemShareStore>,
-        BuilderSlotSetMarker<crate::protocol::test::InMemSecretStore>,
-        BuilderSlotSetMarker<crate::protocol::test::InMemUserSecretStore>,
-        BuilderSlotSetMarker<crate::protocol::test::InMemStateStore>,
-        BuilderSlotSetMarker<crate::protocol::test::NoopTransport>,
+        BuilderSlotSetMarker<crate::protocol::tests::InMemChannelStore>,
+        BuilderSlotSetMarker<crate::protocol::tests::InMemShareStore>,
+        BuilderSlotSetMarker<crate::protocol::tests::InMemSecretStore>,
+        BuilderSlotSetMarker<crate::protocol::tests::InMemUserSecretStore>,
+        BuilderSlotSetMarker<crate::protocol::tests::InMemStateStore>,
+        BuilderSlotSetMarker<crate::protocol::tests::NoopTransport>,
     >;
 
     fn in_mem_builder() -> InMemBuilder {
-        use crate::protocol::test::{
+        use crate::protocol::tests::{
             InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
             InMemUserSecretStore, NoopTransport,
         };

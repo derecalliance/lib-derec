@@ -110,6 +110,6 @@ pub fn share_store_refusal(reason: &str) -> Result<js_sys::Error, JsValue> {
 }
 
 fn categorize(err: &crate::Error) -> (&'static str, &'static str) {
-    let (category, code) = crate::interop::error_codes::classify(err);
+    let (category, code) = crate::error_codes::classify(err);
     (category.name(), code.name())
 }

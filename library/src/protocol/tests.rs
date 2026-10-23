@@ -231,6 +231,9 @@ pub(crate) struct InMemShareStore {
     /// Every `(secret_id, version)` [`DeRecShareStore::keep_list`] was asked
     /// about, in call order.
     pub(crate) keep_list_calls: Arc<Mutex<Vec<(u64, u32)>>>,
+    /// When set, every [`DeRecShareStore::keep_list`] fails with a backend
+    /// error.
+    pub(crate) keep_list_error: Arc<Mutex<bool>>,
 }
 
 impl DeRecShareStore for InMemShareStore {
@@ -299,6 +302,13 @@ impl DeRecShareStore for InMemShareStore {
     }
     fn keep_list(&self, sid: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
         self.keep_list_calls.lock().unwrap().push((sid, version));
+        if *self.keep_list_error.lock().unwrap() {
+            return Box::pin(std::future::ready(Err(
+                crate::protocol::ShareStoreError::Backend(
+                    "share store backend unavailable".to_owned().into(),
+                ),
+            )));
+        }
         let keep = self.keep.lock().unwrap().clone();
         Box::pin(std::future::ready(Ok(keep)))
     }
@@ -559,6 +569,11 @@ impl RecordingTransport {
             .iter()
             .map(|(endpoints, _)| endpoints.clone())
             .collect()
+    }
+
+    /// Forget every envelope sent so far.
+    pub(crate) fn clear(&self) {
+        self.sent.lock().unwrap().clear();
     }
 
     /// Raw envelopes sent so far, in send order.

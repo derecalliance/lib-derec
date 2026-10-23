@@ -590,6 +590,57 @@ describe('event byte fields', () => {
     expect(decoded[0].status).toBe(StatusEnum.UnknownShareVersion);
   });
 
+  it('passes ShareRefused through with its status and memo', async () => {
+    const events = [
+      {
+        type: 'ShareRefused',
+        channel_id: '18446744073709551615',
+        version: 2,
+        status: StatusEnum.VerificationFailed,
+        memo: 'CommittedDeRecShare Merkle proof verification failed',
+      },
+    ];
+    host.tick = () => Promise.resolve(utf8(JSON.stringify(events)).buffer);
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    const decoded = (await protocol.tick()) as Array<
+      Extract<DeRecEvent, {type: 'ShareRefused'}>
+    >;
+
+    expect(decoded[0]).toEqual(events[0]);
+    expect(decoded[0].channel_id).toBe('18446744073709551615');
+    expect(decoded[0].version).toBe(2);
+    expect(decoded[0].status).toBe(StatusEnum.VerificationFailed);
+  });
+
+  it('passes ReplicaSecretRefused through with its status and memo', async () => {
+    const events = [
+      {
+        type: 'ReplicaSecretRefused',
+        channel_id: '18446744073709551615',
+        from_replica_id: '7',
+        secret_id: '42',
+        version: 3,
+        status: StatusEnum.VerificationFailed,
+        memo: 'CommittedDeRecShare Merkle proof verification failed',
+      },
+    ];
+    host.tick = () => Promise.resolve(utf8(JSON.stringify(events)).buffer);
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    const decoded = (await protocol.tick()) as Array<
+      Extract<DeRecEvent, {type: 'ReplicaSecretRefused'}>
+    >;
+
+    expect(decoded[0]).toEqual(events[0]);
+    expect(decoded[0].channel_id).toBe('18446744073709551615');
+    expect(decoded[0].from_replica_id).toBe('7');
+    expect(decoded[0].version).toBe(3);
+    expect(decoded[0].status).toBe(StatusEnum.VerificationFailed);
+  });
+
   it('passes RecoveryShareRefused through with its status and memo', async () => {
     const events = [
       {
@@ -612,6 +663,47 @@ describe('event byte fields', () => {
     expect(decoded[0].channel_id).toBe('18446744073709551615');
     expect(decoded[0].version).toBe(2);
     expect(decoded[0].status).toBe(StatusEnum.UnknownShareVersion);
+  });
+
+  it('passes RequestFailed through with its status and memo, answered or not', async () => {
+    const events = [
+      {
+        type: 'RequestFailed',
+        channel_id: '18446744073709551615',
+        action_kind: 'StoreShare',
+        responded: false,
+        status: StatusEnum.Fail,
+        memo: 'request could not be processed',
+        error_code: 'store_error',
+        message: 'backend unavailable',
+        action: [1, 2, 255],
+      },
+      {
+        type: 'RequestFailed',
+        channel_id: '4',
+        action_kind: 'Failed',
+        responded: true,
+        status: StatusEnum.FormatError,
+        memo: 'message body could not be decoded',
+        error_code: 'internal',
+        message: 'cause',
+      },
+    ];
+    host.tick = () => Promise.resolve(utf8(JSON.stringify(events)).buffer);
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    const decoded = (await protocol.tick()) as Array<
+      Extract<DeRecEvent, {type: 'RequestFailed'}>
+    >;
+
+    expect(decoded[0].status).toBe(StatusEnum.Fail);
+    expect(decoded[0].memo).toBe('request could not be processed');
+    expect(decoded[0].action).toBeInstanceOf(Uint8Array);
+    expect(Array.from(decoded[0].action!)).toEqual([1, 2, 255]);
+    expect(decoded[1]).toEqual(events[1]);
+    expect(decoded[1].status).toBe(StatusEnum.FormatError);
+    expect(decoded[1].action).toBeUndefined();
   });
 
   it('passes RecoveryShareCorrupted through with every reason', async () => {

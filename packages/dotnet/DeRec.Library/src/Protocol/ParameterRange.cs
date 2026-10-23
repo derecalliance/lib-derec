@@ -6,10 +6,13 @@ namespace DeRec.Library;
 /// </summary>
 /// <remarks>
 /// Every bound is optional and defaults to <c>0</c>, which the proto reads as
-/// "no constraint on this dimension". A pairing is rejected with
-/// <see cref="DeRecCode.IncompatibleParameterRange"/> when any field's range
-/// fails to intersect the peer's — for example when the local
-/// <see cref="MinShareSize"/> exceeds the peer's <see cref="MaxShareSize"/>.
+/// "no constraint on this dimension". A pairing is refused when any field's
+/// range fails to intersect the peer's — for example when the local
+/// <see cref="MinShareSize"/> exceeds the peer's <see cref="MaxShareSize"/>:
+/// a responder reports a
+/// <see cref="DeRec.Library.Orchestrator.PairingRefusedEvent"/>, and an
+/// initiator fails, with <see cref="DeRecCode.IncompatibleParameterRange"/>
+/// when it finds the mismatch itself.
 /// </remarks>
 public sealed record ParameterRange
 {

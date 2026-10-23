@@ -100,6 +100,7 @@ fn parse_protect_secret_flow(params_json: &[u8]) -> Result<DeRecFlow, String> {
             .into_iter()
             .map(|(channel_id, weight)| (ChannelId(channel_id), weight))
             .collect(),
+        threshold: raw.threshold,
     })
 }
 
@@ -214,10 +215,15 @@ struct ProtectSecretParamsJson {
     #[serde(default)]
     description: Option<String>,
     /// Channel ID (a decimal string, as JSON object keys are) to how many
-    /// subshares that channel holds. Absent, `null` or empty means every
-    /// channel holds one subshare.
+    /// subshares that channel holds. It is the full assignment: a paired
+    /// helper it does not name holds one subshare, and absent, `null` or
+    /// empty resets every stored helper weight to 1.
     #[serde(default)]
     weights: Option<HashMap<u64, u32>>,
+    /// The threshold this round splits at. Absent or `null` keeps the stored
+    /// threshold, or the builder's when none is stored.
+    #[serde(default)]
+    threshold: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -314,6 +320,37 @@ mod tests {
         let weights =
             protect_secret_weights(br#"{"secrets":[]}"#).expect("absent weights should parse");
         assert!(weights.is_empty());
+    }
+
+    fn protect_secret_threshold(params_json: &[u8]) -> Result<Option<u32>, String> {
+        match parse_flow(FLOW_KIND_PROTECT_SECRET, params_json)? {
+            DeRecFlow::ProtectSecret { threshold, .. } => Ok(threshold),
+            _ => panic!("FLOW_KIND_PROTECT_SECRET parsed to another flow"),
+        }
+    }
+
+    #[test]
+    fn protect_secret_threshold_is_forwarded_and_absent_or_null_is_none() {
+        assert_eq!(
+            protect_secret_threshold(br#"{"secrets":[],"threshold":4}"#),
+            Ok(Some(4))
+        );
+        assert_eq!(protect_secret_threshold(br#"{"secrets":[]}"#), Ok(None));
+        assert_eq!(
+            protect_secret_threshold(br#"{"secrets":[],"threshold":null}"#),
+            Ok(None)
+        );
+        assert!(protect_secret_threshold(br#"{"secrets":[],"threshold":-1}"#).is_err());
+    }
+
+    /// The threshold params every SDK builds byte-for-byte decode here.
+    #[test]
+    fn the_shared_protect_secret_threshold_golden_carries_its_threshold() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../tests/fixtures/wire_golden.json"))
+                .expect("fixture parses");
+        let params = serde_json::to_vec(&fixture["protect_secret_threshold"]).expect("encodes");
+        assert_eq!(protect_secret_threshold(&params), Ok(Some(3)));
     }
 
     #[test]

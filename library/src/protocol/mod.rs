@@ -82,6 +82,7 @@ pub(crate) mod context;
 pub(crate) mod fingerprint;
 pub(crate) mod flows;
 mod handlers;
+pub(crate) mod obligation;
 pub(crate) mod process;
 pub(crate) mod protocol_config;
 pub(crate) mod stores;
@@ -92,7 +93,7 @@ pub(crate) mod sweeps;
 /// doubles implement the [`traits`] store interfaces and the rigs build
 /// a whole [`DeRecProtocol`] — neither is specific to [`handlers`].
 #[cfg(test)]
-pub(crate) mod test;
+pub(crate) mod tests;
 
 pub use builder::{DEFAULT_THRESHOLD, DeRecProtocolBuilder, DeRecStores};
 use derec_proto::TransportProtocol;
@@ -115,8 +116,9 @@ pub use types::{
 };
 
 pub use events::{
-    AutoAcceptPolicy, CorruptionReason, DeRecEvent, DeRecFlow, IgnoreReason, NotRestoredReason,
-    PendingAction, PendingActionKind, UnpairAck, VerifyFailureReason,
+    AutoAcceptPolicy, CorruptionReason, DeRecEvent, DeRecFlow, FailedRequest, IgnoreReason,
+    NotRestoredReason, PendingAction, PendingActionKind, ReplyTarget, UnpairAck,
+    VerifyFailureReason,
 };
 pub use handlers::restore::RestoreError;
 

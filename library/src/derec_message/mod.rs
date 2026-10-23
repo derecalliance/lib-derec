@@ -50,12 +50,28 @@ pub fn extract_inner_message(
     message_bytes: &[u8],
     shared_key: &SharedKey,
 ) -> Result<MessageBody, crate::Error> {
-    let decrypted = derec_cryptography::channel::decrypt_message(message_bytes, shared_key)
-        .map_err(DeRecMessageBuilderError::Encryption)?;
+    let decrypted = decrypt_inner_message(message_bytes, shared_key)?;
 
     let inner = MessageBody::decode_from_vec(&decrypted).map_err(crate::Error::ProtobufDecode)?;
 
     Ok(inner)
+}
+
+/// Decrypt a channel envelope's `message` under `shared_key`, without
+/// decoding the plaintext.
+///
+/// Success authenticates the sender as the holder of the channel key, which
+/// is what separates an undecryptable message (no one to answer) from an
+/// authenticated one whose body cannot be decoded (answered with an
+/// `ErrorResponseMessage`).
+pub(crate) fn decrypt_inner_message(
+    message_bytes: &[u8],
+    shared_key: &SharedKey,
+) -> Result<Vec<u8>, crate::Error> {
+    Ok(
+        derec_cryptography::channel::decrypt_message(message_bytes, shared_key)
+            .map_err(DeRecMessageBuilderError::Encryption)?,
+    )
 }
 
 /// Re-stamp the `trace_id` field on an already-produced DeRecMessage envelope.

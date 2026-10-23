@@ -335,4 +335,20 @@ describe('sharing.request.split', () => {
     expect(args[2]).toEqual([1n]);
     expect(args[3]).toEqual([1]);
   });
+
+  it('marshals string channel ids to the same payload as bigint ids', () => {
+    primitives.sharing.request.split(
+      [
+        ['1', 2],
+        ['2', 3],
+      ],
+      5n,
+      1,
+      new Uint8Array([9]),
+      2,
+    );
+    const { args } = find('protect_secret');
+    expect(args[2]).toEqual([1n, 2n]);
+    expect(args[3]).toEqual([2, 3]);
+  });
 });

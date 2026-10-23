@@ -92,6 +92,11 @@ pub(crate) struct Exchange<'a> {
     /// outbound envelope. It is the same token either way, and carrying it
     /// here is what stops a new call site from forgetting it.
     pub(crate) trace_id: u64,
+    /// The response the exchange's request is owed, when it is a request.
+    /// Every response to it is sent through
+    /// [`deliver`](crate::protocol::obligation::deliver) with this, so it is
+    /// answered once.
+    pub(crate) obligation: Option<&'a crate::protocol::obligation::Obligation>,
 }
 
 /// What one [`DeRecProtocol::start`](crate::protocol::DeRecProtocol::start)

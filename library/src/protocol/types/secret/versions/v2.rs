@@ -135,6 +135,7 @@ impl From<SecretJson> for Secret {
             helpers: j.helpers.into_iter().map(HelperInfo::from).collect(),
             secrets: j.secrets.into_iter().map(UserSecret::from).collect(),
             replicas: j.replicas.map(Replicas::from),
+            threshold: None,
         }
     }
 }
@@ -146,6 +147,7 @@ impl From<HelperJson> for HelperInfo {
             transports: lift_endpoint(&j.transport_uri),
             shared_key: j.shared_key,
             communication_info: j.communication_info,
+            weight: 1,
         }
     }
 }

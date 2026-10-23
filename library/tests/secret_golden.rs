@@ -45,6 +45,7 @@ fn golden_secret() -> Secret {
             }],
             shared_key: vec![0x01, 0x02, 0x03],
             communication_info: HashMap::new(),
+            weight: 1,
         }],
         secrets: vec![UserSecret {
             id: vec![0x0A],
@@ -52,6 +53,7 @@ fn golden_secret() -> Secret {
             data: vec![0x0B, 0x0C],
         }],
         replicas: None,
+        threshold: None,
     }
 }
 
@@ -69,6 +71,7 @@ fn golden_secret_full() -> Secret {
             }],
             shared_key: vec![0x01, 0x02, 0x03],
             communication_info: HashMap::from([("k".to_owned(), "v".to_owned())]),
+            weight: 1,
         }],
         secrets: vec![UserSecret {
             id: vec![0x0A],
@@ -99,7 +102,75 @@ fn golden_secret_full() -> Secret {
             ],
             shared_key: vec![0x04, 0x05, 0x06],
         }),
+        threshold: None,
     }
+}
+
+/// A roster whose helpers hold different numbers of subshares. `weight` is
+/// written only when it is not `1`, which is what keeps the vectors above
+/// unchanged.
+fn golden_secret_weighted() -> Secret {
+    let helper = |channel_id: u64, uri: &str, weight: u32| HelperInfo {
+        channel_id,
+        transports: vec![derec_proto::TransportProtocol {
+            uri: uri.to_owned(),
+            protocol: derec_proto::Protocol::Https as i32,
+        }],
+        shared_key: vec![0x01, 0x02, 0x03],
+        communication_info: HashMap::new(),
+        weight,
+    };
+    Secret {
+        helpers: vec![
+            helper(2, "https://a.example/derec", 3),
+            helper(3, "https://b.example/derec", 1),
+        ],
+        secrets: vec![UserSecret {
+            id: vec![0x0A],
+            name: "n".to_owned(),
+            data: vec![0x0B, 0x0C],
+        }],
+        replicas: None,
+        threshold: None,
+    }
+}
+
+/// A roster that records the threshold its version was split with. The key
+/// is written only when a threshold is recorded, which is what keeps the
+/// vectors above unchanged.
+fn golden_secret_threshold() -> Secret {
+    Secret {
+        threshold: Some(3),
+        ..golden_secret()
+    }
+}
+
+#[test]
+fn encoder_matches_golden_json_threshold() {
+    assert_matches_golden(
+        &golden_secret_threshold(),
+        include_bytes!("golden/secret_v3_threshold.json"),
+    );
+}
+
+#[test]
+fn golden_threshold_round_trips() {
+    let secret = golden_secret_threshold();
+    assert_eq!(Secret::decode(&secret.encode()).unwrap(), secret);
+}
+
+#[test]
+fn encoder_matches_golden_json_weighted() {
+    assert_matches_golden(
+        &golden_secret_weighted(),
+        include_bytes!("golden/secret_v3_weighted.json"),
+    );
+}
+
+#[test]
+fn golden_weighted_round_trips() {
+    let secret = golden_secret_weighted();
+    assert_eq!(Secret::decode(&secret.encode()).unwrap(), secret);
 }
 
 #[test]

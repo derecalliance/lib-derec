@@ -295,6 +295,88 @@ for (const [channelId, committedShare] of shares) {
 
 ---
 
+### Helper weights
+
+`ProtectSecretParams.weights` (`Map<bigint | string, number>`) sets how many
+subshares each paired helper holds. The map is the **full assignment, not a
+patch**: a paired helper it does not name holds one subshare.
+`ProtectSecretStarted` and
+`ProtectSecretFailed` report the `weight` each channel was given.
+
+Weights are recorded. Each round writes the weight it gave every paired helper
+to that helper's channel record before anything is sent, and the publishes the
+library starts on its own (after pairing, after a fingerprint is confirmed)
+reuse those weights; a newly paired helper starts at 1. The weights also travel
+in the recovered secret (`helpers[].weight`), so `restore` and replica
+hydration write them back into the channel records they create.
+
+The threshold is recorded too. A round splits at `ProtectSecretParams.threshold` when
+given, otherwise at the stored threshold (`UserSecrets.threshold`), and only otherwise
+at `withThreshold`, which is therefore the starting threshold for a secret with
+nothing stored. Every publish stores the threshold it used, the recovered
+secret carries it (`secret.threshold`), and `restore` and replica
+hydration put it back, so the publishes the library starts on its own and
+the follow-up after `restore` keep it: leave `threshold` unset there. To
+change it, pass `threshold` on `start(FlowKind.ProtectSecret, …)`. It must be at least 2,
+above every weight, and no greater than a subshare cap; a round that fails
+a check writes and sends nothing. Your `UserSecretStore` must persist the
+snapshot's threshold as given.
+
+The intended flow. Weights are the user's choice: before `start`, show the
+user each paired helper's current weight, pre-filled from your `ChannelStore`,
+and pass the user's final choice as the whole `weights` map. Reading the
+stored weights first is the normal flow. Every other `start(FlowKind.ProtectSecret, ...)`
+the app makes, such as a republish after editing the secrets or the follow-up
+after `restore`, must pass the stored weights unchanged: a helper left out
+returns to 1, which silently undoes the user's choice. Only the publishes the
+library starts on its own (after pairing, after a fingerprint is confirmed)
+reuse the stored weights by themselves.
+
+A helper record is opaque JSON bytes, `{"Helper": {...}}`. Parsing one to read
+`weight` is safe: it is a small integer, and the channel id comes from the
+`channelId` argument your store received, never from the parsed object's
+`channel_id` (a `u64` that `JSON.parse` can round). What the `ChannelStore`
+docs forbid is re-serialising a parsed record; keep persisting the original
+bytes.
+
+```ts
+const weight = JSON.parse(new TextDecoder().decode(helperRecordBytes)).Helper.weight || 1;
+```
+
+When the builder's threshold applies (no threshold is stored), lowering it to
+or below a stored weight makes the next publish fail
+with code `invalid_weight` before anything is sent, until
+`start(FlowKind.ProtectSecret, ...)` assigns valid weights.
+
+That failure surfaces where the library started the publish, and in each
+case nothing is sent:
+
+- `process()` throws a `DeRecError` whose `events` keep the message's
+  events, `PairingCompleted` included.
+- `accept()` throws. The pairing has completed and its response was sent,
+  but `PairingCompleted` is not returned.
+- `verifyFingerprint()` throws. The promotion stands: calling it again
+  resolves `true` and publishes nothing.
+
+Call `start(FlowKind.ProtectSecret, ...)` with valid weights to publish to
+every helper.
+
+**Below the threshold.** When the paired helpers' total weight is below the
+threshold, `start` skips the split: no helper receives anything, so no
+`ProtectSecretStarted` / `ProtectSecretFailed` comes back for one. A paired
+replica still gets its usual secret-only copy and events; with none paired,
+`start` resolves with no events at all — this is not an error. The version
+still advances and the secrets/description are saved as the latest
+snapshot, so the next publish that reaches threshold (including one the
+library starts on its own) shares it. Sum the weights about to be assigned
+against the threshold beforehand, or count the returned helper events
+afterward, to tell the two cases apart. This is more reachable with
+weighted helpers than with the default of 1: two helpers at weight 2 against
+a threshold of 3 (total weight 4) drop below it when a publish leaves both
+out of the weights map, resetting each to weight 1 for a total of 2 — a
+risk for a restore follow-up publish that does not pass the stored weights
+unchanged.
+
 ### Capping the total subshares
 
 `DeRecProtocolBuilder.withMaxSubshares(max)` caps the total subshares one
@@ -304,7 +386,7 @@ Recovery time grows quadratically with that total (about 0.2 s at 200, 5.5 s
 at 1,000 and 87 s at 4,000 subshares per attempt) while splitting stays cheap,
 so this is the place to bound it. A round over the cap fails with code
 `too_many_subshares` before anything is sent; publishes the library starts
-itself respect it too. A cap below the threshold makes `build()` throw
+itself count the stored weights and respect it too. A cap below the threshold makes `build()` throw
 `invalid_input`. The cap applies at sharing only, never at recovery: a
 recovering device cannot know the cap the shares were made under. The
 `split` primitive applies no cap.
@@ -366,6 +448,20 @@ A helper or member with no endpoint in the recovered roster gets no channel;
 `restore` returns a `PeerNotRestored` event for it (`reason: "NoTransports"`)
 and restores the rest.
 
+**Restore or join.** `SecretRecovered` writes nothing, so decide first. When
+`secret.replicas?.members` names live members other than the lost device, do
+not restore: tell the user and offer to join that group as a new replica —
+pair with a live member, confirm the fingerprint, then run
+`start(FlowKind.ReplicaDiscovery)`. With no live member, restore. Neither path gives this device the proofs of
+earlier versions, so it cannot verify them: restore writes none, and a
+joining device gets only the share map of the single version each push or
+catch-up carries. The live members keep the proofs they hold. A restored
+device also cannot publish, or answer a member's catch-up, until the app
+configures a `replica_id` the roster names. Joining adds the device as a new
+member, while restoring next to live replicas makes a second device claim
+the lost device's role. See
+[Restore or join](https://derec-alliance.gitbook.io/docs/concepts/replicas/restore-or-join).
+
 ```ts
 const events = await protocol.process(responseBytes);
 for (const ev of events) {
@@ -378,7 +474,9 @@ for (const ev of events) {
 Errors surface as a `DeRecError` with a `category` and `code` —
 `already_restored`, `restore_conflict` (with `channel_ids`), `invariant`,
 `invalid_recovered_secret` (a malformed `secret`), or `store_error` (a store call failed; `category`
-names the store).
+names the store). `code` is typed `DeRecErrorCode`, the full union of every
+code the library can report plus the WASM-marshalling codes this binding
+raises itself (e.g. `decode_error`, `invalid_timeouts`).
 
 > **Secret format:** the recoverable secret (the bytes helpers store and
 > recovery reconstructs) is `[version byte] · payload` — v1's payload is
@@ -448,7 +546,20 @@ console.log("Valid:", isValid);
 `protocol.start(FlowKind.VerifyShares, …)` challenges each targeted helper,
 and every challenged channel ends with exactly one event:
 
-- `ShareVerified` — the helper proved it holds the exact share.
+- `ShareVerified` — the helper proved it holds the exact share. `subshares`
+  is how many subshares that helper holds for `version`, read from this
+  device's stored share, so it is the weight of the round that published
+  `version`, not the helper's current weight; it is absent when that share was
+  stored before the count was recorded. `threshold` is the threshold that version was split with, from the
+  same stored share, not the current one; it is absent when that share was
+  stored before the threshold was recorded. To judge whether a version is
+  recoverable, sum `subshares` over its `ShareVerified` events and compare the
+  sum with their `threshold`. If either is absent on any of those events,
+  the result is unknown: a absent count is not `0` or `1`. The count lives on `Share.subshares`, which the
+  library sets on owner-side shares only (absent on a helper's share and never
+  backfilled): your `ShareStore` must persist it as given and return it
+  unchanged. `Share.threshold` follows the same rules, and must be
+  persisted the same way.
 - `ShareVerifyInvalid { channel_id, version }` — the helper's proof does not
   match the share this device stored. It is an event; `process()` does not
   throw.
@@ -460,11 +571,19 @@ and every challenged channel ends with exactly one event:
 
 A stored proof is either confirmed by its helper or part of a sharing round
 still open: when a round settles a channel as failed (a rejection or a
-timeout), that channel's proof is deleted. This guarantee holds on the
-publishing device; a replica Destination holds the proofs the Source
-mirrored at publish time and never sees `SharingComplete`, so verifying
-there can return `ShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`) for a
-helper that failed the Source's round. Verify only versions whose round
+timeout), that channel's proof is deleted. A confirmation also deletes the
+proofs of versions the helper dropped: a helper that stores a version
+deletes every other version that round's `keepList` leaves out, so when it
+confirms, its proofs for those versions are deleted here too (the confirmed
+version stays). A helper that rejects the round keeps its older versions, and
+so do their proofs; with no keep list nothing is deleted. A replica Destination never sees the helpers' answers, and it keeps every
+proof it receives: it never deletes one on its own, and freeing that storage
+is the app's concern. Verifying on a Destination a version that a helper
+refused, or later dropped under the `keepList`, gets `ShareVerifyRejected`
+(`UNKNOWN_SHARE_VERSION`) from that helper, where the Source reports
+`NoProof`. The app may delete such rows from the Destination's share store;
+verifying a version whose rows are gone then gives `VerifySharesFailed` with
+`reason: "NoProof"`. Verify only versions whose round
 completed (`SharingComplete`). Starting verification on a channel with no
 proof sends nothing and returns `VerifySharesFailed` with
 `reason: "NoProof"` at once. A late response to an earlier challenge is
@@ -597,6 +716,70 @@ try {
 }
 ```
 
+A request this device fails to handle does not reject the call; see
+[Failed requests](#failed-requests).
+
+---
+
+## Failed requests
+
+Every request that arrives on an authenticated channel gets exactly one
+response, even when handling it fails. Such a failure does not make
+`process()` or `accept()` reject: it is reported as a `RequestFailed` event,
+and the call's other events are kept.
+
+- `action_kind` is the type of the request that failed, a
+  `PendingActionKind` label (`"Failed"` when its body could not be decoded,
+  or was a request type the channel cannot carry).
+- `responded` is `true` when the library already sent the response.
+- `status` is the `StatusEnum` that was sent, or would have been. It is
+  always present. `memo` is the wire-safe memo sent with it, or that would
+  have been, so `reject(action, status, memo)` sends exactly the response
+  the library would have sent.
+- `error_code` is the error's `DeRecErrorCode` and `message` a local
+  description; neither goes on the wire.
+- `action`, when `responded` is `false`, is the token that answers the
+  request. Pass it to `reject`, which sends the one response; `accept`
+  refuses it. The library never expires it. It is absent only when `reject`
+  could never answer it: a request on a replica group channel that names no
+  member and carries no `replyTo`, which has no reply target, or, with
+  `withAutoRespondOnFailure` off, a replica copy that hands this device the
+  group key and fails before that key is stored.
+
+Resolve each token once. The library is stateless, so rejecting the same
+token twice, or rejecting an action already accepted, sends a second
+response.
+
+`withAutoRespondOnFailure` decides who answers. With it on, the library sends
+the response itself (a known failure keeps its specific status; anything else
+is `FAIL` with a generic memo). With it off (the default), nothing is sent and
+the event carries the token:
+
+```ts
+for (const event of events) {
+  if (event.type === "RequestFailed" && !event.responded && event.action) {
+    await protocol.reject(event.action, event.status, event.memo);
+  }
+}
+```
+
+A message that decrypts under the channel key but whose body cannot be
+decoded is answered with an `ErrorResponseMessage` (`FORMAT_ERROR` when the
+library answers it; the status passed to `reject` otherwise). A peer that
+answers this device that way is reported as an `ErrorResponseReceived` event
+with `status` and `memo`; it is never answered.
+
+An inbound `PairRequest` refused under a protocol rule (a parameter range that
+does not overlap this device's, `INCOMPATIBLE_PARAMETER_RANGE`, or a replica id
+already in the group, `REPLICA_ID_CONFLICT`) is answered with that status in
+every mode and reported as a `PairingRefused` event with `status` and `memo`,
+the reason sent to the requester and written from its side. `error_code`
+(`incompatible_parameter_range` or `replica_id_conflict`) and `message` carry
+the local reason for logging or display, as on `RequestFailed`; they are never
+sent. `process()` does not reject for it, and no channel is created. The
+requester's `process()` rejects with code `non_ok_status`, whose `status` and
+`memo` hold the refusal.
+
 ---
 
 ## Correlation and routing
@@ -648,8 +831,9 @@ The library answers the owner with the mapped status (`"too_frequent"` →
 `TOO_FREQUENT`, `"size_limit_exceeded"` → `SIZE_LIMIT_EXCEEDED`,
 `"rejected"` → `REJECTED`), and the owner sees `ShareRejected` or
 `ShareVerifyRejected` with that `status`. Any other rejection is an ordinary
-store failure. Every `ShareStore` implements `recordVerification`; an app
-with no limit resolves it. See
+store failure, reported as a `RequestFailed` event (see
+[Failed requests](#failed-requests)). Every `ShareStore` implements
+`recordVerification`; an app with no limit resolves it. See
 [Helper-side admission control](https://github.com/derecalliance/lib-derec/tree/main/library#helper-side-admission-control).
 
 ---

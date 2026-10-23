@@ -345,7 +345,8 @@ pub unsafe extern "C" fn derec_protocol_reject(
 ///                     "transports": [{ "uri": "https://replica.example", "protocol": "https" }],
 ///                     "role": "Source", "communication_info": {} }],
 ///       "shared_key": [..32 bytes..]
-///     }
+///     },
+///     "threshold": 3
 ///   }
 /// }
 /// ```
@@ -358,7 +359,11 @@ pub unsafe extern "C" fn derec_protocol_reject(
 /// order; `protocol` is its name, `"https"` or `"grpc"`. An absent or
 /// `null` `transports` reads as an empty list, and a helper or member with
 /// no endpoint gets no channel: restore skips it and reports it as a
-/// `PeerNotRestored` event. `role` is `"Source"` or `"Destination"`.
+/// `PeerNotRestored` event. `role` is `"Source"` or `"Destination"`. An
+/// absent or `null` `communication_info` reads as an empty map, and an
+/// absent or `null` helper `weight` as `1`. `threshold` is the threshold the
+/// secret was split with; absent or `null` is none, and a value below `2` is
+/// rejected. Restore writes it into the snapshot.
 ///
 /// `replicas` is an **object**, not an array, and is omitted entirely when
 /// the `secret_id` has no replica group. Every member of the group shares

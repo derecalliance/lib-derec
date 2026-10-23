@@ -84,6 +84,7 @@ type helperChannelWire struct {
 	PeerRole          SenderKind        `json:"peer_role"`
 	Status            ChannelStatus     `json:"status"`
 	CreatedAt         uint64            `json:"created_at"`
+	Weight            uint32            `json:"weight"`
 }
 
 type replicaMemberWire struct {
@@ -126,6 +127,7 @@ func helperToWire(h HelperChannel) helperChannelWire {
 		PeerRole:          h.PeerRole,
 		Status:            h.Status,
 		CreatedAt:         h.CreatedAt,
+		Weight:            h.Weight,
 	}
 }
 
@@ -150,6 +152,7 @@ func helperFromWire(w helperChannelWire) HelperChannel {
 		PeerRole:          w.PeerRole,
 		Status:            w.Status,
 		CreatedAt:         w.CreatedAt,
+		Weight:            w.Weight,
 	}
 }
 
@@ -226,11 +229,15 @@ func EncodeReplicaMemberList(members []ReplicaMember) ([]byte, error) {
 // shareWire mirrors ShareRecord in stores.rs: secret_id is stringified (a
 // u64 wouldn't safely round-trip through some host languages' JSON number
 // type), version is a plain u32, bytes a number array. Notably there is no
-// replica_id field — ShareRecord never carries it.
+// replica_id field — ShareRecord never carries it. Field order matches the
+// Rust struct so the encoded bytes are identical; subshares and threshold
+// are omitted when nil, as Rust's skip_serializing_if does.
 type shareWire struct {
-	SecretID string        `json:"secret_id"`
-	Version  uint32        `json:"version"`
-	Bytes    JSONByteArray `json:"bytes"`
+	SecretID  string        `json:"secret_id"`
+	Version   uint32        `json:"version"`
+	Bytes     JSONByteArray `json:"bytes"`
+	Subshares *uint32       `json:"subshares,omitempty"`
+	Threshold *uint32       `json:"threshold,omitempty"`
 }
 
 // EncodeShare produces the JSON a ShareStoreCallbacks.save call carries.
@@ -238,9 +245,11 @@ type shareWire struct {
 // `impl From<&Share> for ShareRecord`, which never reads it.
 func EncodeShare(s Share) ([]byte, error) {
 	w := shareWire{
-		SecretID: strconv.FormatUint(s.SecretID, 10),
-		Version:  s.Version,
-		Bytes:    JSONByteArray(s.Bytes),
+		SecretID:  strconv.FormatUint(s.SecretID, 10),
+		Version:   s.Version,
+		Bytes:     JSONByteArray(s.Bytes),
+		Subshares: s.Subshares,
+		Threshold: s.Threshold,
 	}
 	return json.Marshal(w)
 }
@@ -257,7 +266,7 @@ func DecodeShare(data []byte) (Share, error) {
 	if err != nil {
 		return Share{}, fmt.Errorf("native: Share secret_id is not a decimal u64: %w", err)
 	}
-	return Share{SecretID: id, Version: w.Version, Bytes: []byte(w.Bytes)}, nil
+	return Share{SecretID: id, Version: w.Version, Bytes: []byte(w.Bytes), Subshares: w.Subshares, Threshold: w.Threshold}, nil
 }
 
 // EncodeShareList produces the JSON array a ShareStoreCallbacks
@@ -266,9 +275,11 @@ func EncodeShareList(shares []Share) ([]byte, error) {
 	wires := make([]shareWire, len(shares))
 	for i, s := range shares {
 		wires[i] = shareWire{
-			SecretID: strconv.FormatUint(s.SecretID, 10),
-			Version:  s.Version,
-			Bytes:    JSONByteArray(s.Bytes),
+			SecretID:  strconv.FormatUint(s.SecretID, 10),
+			Version:   s.Version,
+			Bytes:     JSONByteArray(s.Bytes),
+			Subshares: s.Subshares,
+			Threshold: s.Threshold,
 		}
 	}
 	return json.Marshal(wires)
@@ -286,7 +297,7 @@ func DecodeShareList(data []byte) ([]Share, error) {
 		if err != nil {
 			return nil, fmt.Errorf("native: Share[%d] secret_id is not a decimal u64: %w", i, err)
 		}
-		out[i] = Share{SecretID: id, Version: w.Version, Bytes: []byte(w.Bytes)}
+		out[i] = Share{SecretID: id, Version: w.Version, Bytes: []byte(w.Bytes), Subshares: w.Subshares, Threshold: w.Threshold}
 	}
 	return out, nil
 }
@@ -423,6 +434,12 @@ type stateItemWire struct {
 	BehindReplicas  *[]string               `json:"behind_replicas,omitempty"`
 	LocalVersion    *uint32                 `json:"local_version,omitempty"`
 	Reported        *[]replicaDiscoveryWire `json:"reported,omitempty"`
+	// KeepList is SharingRound only. Absent on rows written before 0.0.9,
+	// which the library reads as an empty list.
+	KeepList *[]uint32 `json:"keep_list,omitempty"`
+	// Threshold is SharingRound only. Absent on rows written before 0.0.9,
+	// which the library judges against the builder's threshold.
+	Threshold *uint32 `json:"threshold,omitempty"`
 }
 
 type replicaDiscoveryWire struct {
@@ -497,6 +514,11 @@ func EncodeStateItem(item StateItem) ([]byte, error) {
 		w.PendingReplicas = &pendingReplicas
 		w.SyncedReplicas = &syncedReplicas
 		w.BehindReplicas = &behindReplicas
+		if item.KeepList != nil {
+			keepList := item.KeepList
+			w.KeepList = &keepList
+		}
+		w.Threshold = item.Threshold
 	case StateKindPendingReplicaDiscovery:
 		pendingReplicas := stringifyUint64s(item.PendingReplicas)
 		w.PendingReplicas = &pendingReplicas
@@ -559,6 +581,10 @@ func DecodeStateItem(data []byte) (StateItem, error) {
 			return StateItem{}, err
 		}
 	}
+	if w.KeepList != nil {
+		item.KeepList = append([]uint32{}, (*w.KeepList)...)
+	}
+	item.Threshold = w.Threshold
 	if w.Reported != nil {
 		item.Reported = make(map[uint64]uint32, len(*w.Reported))
 		for _, r := range *w.Reported {
@@ -588,6 +614,8 @@ type userSecretsWire struct {
 	Description *string          `json:"description,omitempty"`
 	// Decimal-encoded u64, omitted when absent.
 	AuthorReplicaID *string `json:"author_replica_id,omitempty"`
+	// Omitted when absent.
+	Threshold *uint32 `json:"threshold,omitempty"`
 }
 
 // EncodeUserSecrets produces the JSON a
@@ -597,7 +625,7 @@ func EncodeUserSecrets(v UserSecrets) ([]byte, error) {
 	for i, s := range v.Secrets {
 		secrets[i] = userSecretWire{ID: JSONByteArray(s.ID), Name: s.Name, Data: JSONByteArray(s.Data)}
 	}
-	w := userSecretsWire{Version: v.Version, Secrets: secrets, Description: v.Description}
+	w := userSecretsWire{Version: v.Version, Secrets: secrets, Description: v.Description, Threshold: v.Threshold}
 	if v.AuthorReplicaID != nil {
 		author := strconv.FormatUint(*v.AuthorReplicaID, 10)
 		w.AuthorReplicaID = &author
@@ -616,7 +644,7 @@ func DecodeUserSecrets(data []byte) (UserSecrets, error) {
 	for i, s := range w.Secrets {
 		secrets[i] = UserSecret{ID: []byte(s.ID), Name: s.Name, Data: []byte(s.Data)}
 	}
-	out := UserSecrets{Version: w.Version, Secrets: secrets, Description: w.Description}
+	out := UserSecrets{Version: w.Version, Secrets: secrets, Description: w.Description, Threshold: w.Threshold}
 	if w.AuthorReplicaID != nil {
 		author, err := strconv.ParseUint(*w.AuthorReplicaID, 10, 64)
 		if err != nil {

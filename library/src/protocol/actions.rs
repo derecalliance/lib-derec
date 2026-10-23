@@ -10,6 +10,7 @@
 
 use super::context::{Exchange, Round, local, pairing_config};
 use super::events::{DeRecEvent, PendingAction};
+use super::obligation::{Obligation, respond_to_failure, settle};
 use super::stores::borrow_stores;
 use super::traits::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport,
@@ -33,12 +34,107 @@ impl<
     ///
     /// Executes the "do work + send response" path for the given action,
     /// returning the same events that auto-respond would have produced.
+    ///
+    /// # Failures
+    ///
+    /// A failure of the request the action answers is **not** an `Err`. It is
+    /// reported as [`DeRecEvent::RequestFailed`] in the returned events, and
+    /// the request is answered exactly once: by the library under
+    /// [`with_auto_respond_on_failure`](crate::protocol::DeRecProtocolBuilder::with_auto_respond_on_failure),
+    /// or by passing the event's [`PendingAction::RespondToFailure`] to
+    /// [`reject`](Self::reject).
+    ///
+    /// Before acting, a persisted action is checked against its channel. A
+    /// channel that is gone or no longer `Paired` has nothing to answer on,
+    /// so that is an `Err` ([`crate::Error::InvalidInput`]) and nothing is
+    /// stored or sent. A channel whose peer no longer holds the role the flow
+    /// requires is answered `REJECTED`, like any other answerable failure.
+    ///
+    /// `Err` is left for what cannot be answered: the checks above, a
+    /// [`PendingAction::RespondToFailure`] (which only `reject` resolves),
+    /// failures of the pairing handshake, and a failure of the publish that
+    /// follows a completed pairing.
+    ///
+    /// That publish runs after the pairing is complete and its response has
+    /// been sent. It reuses every Helper's stored weight, and a stored weight
+    /// the round's threshold no longer allows fails it with
+    /// [`SharingError::InvalidWeight`](crate::primitives::sharing::SharingError::InvalidWeight)
+    /// before anything is sent. `accept` then returns that `Err`: the channel
+    /// is `Paired` on both sides, but the [`DeRecEvent::PairingCompleted`]
+    /// event is not returned. Call
+    /// `start(`[`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret)`)`
+    /// with valid weights to publish to every Helper, the new one included.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(trace_id = action.trace_id())))]
     pub async fn accept(&mut self, action: PendingAction) -> Result<Vec<DeRecEvent>> {
-        let mut events = self.accept_inner(action).await?;
+        let obligation = Obligation::for_action(&action, local!(self).policy);
+        let mut events = match &obligation {
+            Some(obligation) => {
+                let outcome = match self.still_answerable(&action).await? {
+                    Ok(()) => self.accept_inner(action, Some(obligation)).await,
+                    Err(failure) => Err(failure),
+                };
+                settle(
+                    &mut borrow_stores!(self),
+                    &local!(self),
+                    obligation,
+                    self.auto_respond_on_failure,
+                    outcome,
+                )
+                .await
+            }
+            None => self.accept_inner(action, None).await?,
+        };
         let auto_publish_events = self.maybe_auto_publish_after_pair(&events).await?;
         events.extend(auto_publish_events);
         Ok(events)
+    }
+
+    /// Re-check a persisted action against the channel it answers on.
+    ///
+    /// `Err` when the channel is gone or no longer `Paired`: there is nothing
+    /// to answer on. `Ok(Err(..))` is an answerable failure — the peer no
+    /// longer holds the role the flow requires, or the channel could not be
+    /// read — for the router to answer.
+    async fn still_answerable(&self, action: &PendingAction) -> Result<Result<()>> {
+        use crate::protocol::types::{ChannelQuery, ChannelStatus};
+        use derec_proto::SenderKind;
+
+        let (channel_id, required) = match action {
+            PendingAction::StoreShare { channel_id, .. }
+            | PendingAction::VerifyShare { channel_id, .. }
+            | PendingAction::Discovery { channel_id, .. }
+            | PendingAction::GetShare { channel_id, .. }
+            | PendingAction::Unpair { channel_id, .. } => (*channel_id, Some(SenderKind::Owner)),
+            PendingAction::UpdateChannelInfo { channel_id, .. } => (*channel_id, None),
+            PendingAction::Pairing { .. }
+            | PendingAction::PrePair { .. }
+            | PendingAction::RespondToFailure { .. } => return Ok(Ok(())),
+        };
+        let record = match self
+            .channel_store
+            .load(self.secret_id, ChannelQuery::Helper { channel_id })
+            .await
+        {
+            Ok(record) => record,
+            Err(error) => return Ok(Err(error.into())),
+        };
+        let Some(channel) = record
+            .as_ref()
+            .and_then(|r| r.as_helper())
+            .filter(|c| c.status == ChannelStatus::Paired)
+        else {
+            return Err(crate::Error::InvalidInput(
+                "the action's channel is no longer paired",
+            ));
+        };
+        Ok(match required {
+            Some(expected) if channel.peer_role != expected => Err(crate::Error::RoleMismatch {
+                channel_id,
+                expected,
+                actual: channel.peer_role,
+            }),
+            _ => Ok(()),
+        })
     }
 
     /// Reject a pending action from an [`DeRecEvent::ActionRequired`] event.
@@ -108,6 +204,23 @@ impl<
     /// is `false`. Enabling it makes `process()` accept and store every
     /// inbound share internally, and no `ActionRequired` is emitted to
     /// reject.
+    ///
+    /// # Answering a failed request
+    ///
+    /// [`PendingAction::RespondToFailure`], carried by
+    /// [`DeRecEvent::RequestFailed`], is resolved here: the request is sent
+    /// its own response type with `status` and `memo`, encrypted under the
+    /// key of the token's reply channel and delivered to its endpoints. A
+    /// body that could not be decoded or a request the channel cannot carry
+    /// names no request type the channel answers, so its token is answered
+    /// with an `ErrorResponseMessage`. Passing the event's own `status` and
+    /// `memo` sends the response `auto_respond_on_failure` would have sent.
+    ///
+    /// The library is stateless and never expires an action, so it cannot
+    /// tell an action it has already resolved from a fresh one: rejecting the
+    /// same token twice, or rejecting a copy of an action already accepted,
+    /// sends a second response. Resolving each action once is the
+    /// application's part.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(trace_id = action.trace_id())))]
     pub async fn reject(
         &mut self,
@@ -115,6 +228,8 @@ impl<
         status: StatusEnum,
         memo: &str,
     ) -> Result<()> {
+        let obligation = Obligation::for_action(&action, local!(self).policy);
+        let obligation = obligation.as_ref();
         match action {
             PendingAction::Pairing {
                 channel_id,
@@ -146,6 +261,7 @@ impl<
                         channel_id,
                         shared_key: &shared_key,
                         trace_id,
+                        obligation,
                     },
                     &request,
                     status,
@@ -166,6 +282,7 @@ impl<
                         channel_id,
                         shared_key: &shared_key,
                         trace_id,
+                        obligation,
                     },
                     &request,
                     status,
@@ -186,6 +303,7 @@ impl<
                         channel_id,
                         shared_key: &shared_key,
                         trace_id,
+                        obligation,
                     },
                     &request,
                     status,
@@ -206,6 +324,7 @@ impl<
                         channel_id,
                         shared_key: &shared_key,
                         trace_id,
+                        obligation,
                     },
                     &request,
                     status,
@@ -226,6 +345,7 @@ impl<
                         channel_id,
                         shared_key: &shared_key,
                         trace_id,
+                        obligation,
                     },
                     &request,
                     status,
@@ -246,6 +366,7 @@ impl<
                         channel_id,
                         shared_key: &shared_key,
                         trace_id,
+                        obligation,
                     },
                     status,
                     memo,
@@ -268,6 +389,28 @@ impl<
                 )
                 .await
             }
+            PendingAction::RespondToFailure {
+                channel_id,
+                trace_id,
+                reply,
+                request,
+            } => {
+                let obligation = Obligation::for_failure(
+                    channel_id,
+                    trace_id,
+                    &reply,
+                    request,
+                    local!(self).policy,
+                );
+                respond_to_failure(
+                    &mut borrow_stores!(self),
+                    &local!(self),
+                    &obligation,
+                    status,
+                    memo,
+                )
+                .await
+            }
         }
     }
 
@@ -276,6 +419,11 @@ impl<
     /// the policy opts into is replaced with `AutoAccepted` plus the
     /// flow events `accept_inner(action)` produces. Other events pass
     /// through unchanged.
+    ///
+    /// An answerable failure of the accepted request is settled in place —
+    /// answered or tokenized as [`DeRecEvent::RequestFailed`] — so
+    /// `AutoAccepted` and the rest of the batch are kept. Only a pairing
+    /// failure, which has no channel request to answer, is an `Err`.
     pub(super) async fn apply_auto_accept(
         &mut self,
         events: Vec<DeRecEvent>,
@@ -291,8 +439,22 @@ impl<
                         channel_id,
                         action_kind,
                     });
-                    let accept_events = self.accept_inner(action).await?;
-                    out.extend(accept_events);
+                    match Obligation::for_action(&action, local!(self).policy) {
+                        Some(obligation) => {
+                            let outcome = self.accept_inner(action, Some(&obligation)).await;
+                            out.extend(
+                                settle(
+                                    &mut borrow_stores!(self),
+                                    &local!(self),
+                                    &obligation,
+                                    self.auto_respond_on_failure,
+                                    outcome,
+                                )
+                                .await,
+                            );
+                        }
+                        None => out.extend(self.accept_inner(action, None).await?),
+                    }
                 }
                 other => out.push(other),
             }
@@ -322,10 +484,12 @@ impl<
     /// multi-device sync stays consistent before the application has
     /// added any user secrets.
     ///
-    /// The publish carries no weights: every Helper receives one
-    /// subshare. An application that wants weights calls `start` with
-    /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret)
-    /// again, which publishes the next version.
+    /// The publish reuses every Helper's stored weight, and the new Helper
+    /// starts at `1`. A stored weight that is invalid under the round's
+    /// threshold fails the publish with
+    /// [`SharingError::InvalidWeight`](crate::primitives::sharing::SharingError::InvalidWeight)
+    /// before anything is sent; `process` returns it as a `ProcessError`
+    /// carrying the message's events, and `accept` returns it as its error.
     pub(super) async fn maybe_auto_publish_after_pair(
         &mut self,
         events: &[DeRecEvent],
@@ -378,7 +542,8 @@ impl<
         self.start_protect_secret(
             secrets,
             description,
-            std::collections::HashMap::new(),
+            None,
+            None,
             &Round {
                 reply_to: &reply_to,
                 trace_id: crate::derec_message::fresh_trace_id(),
@@ -416,7 +581,11 @@ impl<
             .collect()
     }
 
-    async fn accept_inner(&mut self, action: PendingAction) -> Result<Vec<DeRecEvent>> {
+    async fn accept_inner(
+        &mut self,
+        action: PendingAction,
+        obligation: Option<&Obligation>,
+    ) -> Result<Vec<DeRecEvent>> {
         match action {
             PendingAction::Pairing {
                 channel_id,
@@ -449,6 +618,7 @@ impl<
                         channel_id,
                         shared_key: &shared_key,
                         trace_id,
+                        obligation,
                     },
                     &request,
                 )
@@ -467,6 +637,7 @@ impl<
                         channel_id,
                         shared_key: &shared_key,
                         trace_id,
+                        obligation,
                     },
                     &request,
                 )
@@ -485,6 +656,7 @@ impl<
                         channel_id,
                         shared_key: &shared_key,
                         trace_id,
+                        obligation,
                     },
                     &request,
                 )
@@ -503,6 +675,7 @@ impl<
                         channel_id,
                         shared_key: &shared_key,
                         trace_id,
+                        obligation,
                     },
                     &request,
                 )
@@ -521,6 +694,7 @@ impl<
                         channel_id,
                         shared_key: &shared_key,
                         trace_id,
+                        obligation,
                     },
                     &request,
                 )
@@ -539,6 +713,7 @@ impl<
                         channel_id,
                         shared_key: &shared_key,
                         trace_id,
+                        obligation,
                     },
                     &request,
                 )
@@ -558,6 +733,9 @@ impl<
                 )
                 .await
             }
+            PendingAction::RespondToFailure { .. } => Err(crate::Error::InvalidInput(
+                "a failed request can only be rejected",
+            )),
         }
     }
 }
@@ -566,7 +744,7 @@ impl<
 mod tests {
     use super::*;
     use crate::protocol::builder::DeRecProtocolBuilder;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
@@ -715,6 +893,34 @@ mod tests {
                 })
                 .await
                 .expect("the secure entry survives the plaintext one");
+        });
+    }
+
+    /// A failed request has no success to send, so the token can only be
+    /// rejected.
+    #[test]
+    fn accepting_a_failed_request_is_refused() {
+        run_async(async {
+            let mut protocol = build(InMemSecretStore::default(), false);
+            let err = protocol
+                .accept(PendingAction::RespondToFailure {
+                    channel_id: CHANNEL,
+                    trace_id: 1,
+                    reply: crate::protocol::ReplyTarget {
+                        channel_id: CHANNEL,
+                        endpoints: Vec::new(),
+                    },
+                    request: crate::protocol::FailedRequest::Undecodable,
+                })
+                .await
+                .expect_err("a failed request cannot be accepted");
+            assert!(
+                matches!(
+                    err,
+                    crate::Error::InvalidInput("a failed request can only be rejected")
+                ),
+                "expected InvalidInput, got {err:?}"
+            );
         });
     }
 

@@ -732,18 +732,18 @@ mod tests {
     }
 
     type InMemProtocol = crate::protocol::DeRecProtocol<
-        crate::protocol::test::InMemChannelStore,
-        crate::protocol::test::InMemShareStore,
-        crate::protocol::test::InMemSecretStore,
-        crate::protocol::test::InMemUserSecretStore,
-        crate::protocol::test::InMemStateStore,
-        crate::protocol::test::NoopTransport,
+        crate::protocol::tests::InMemChannelStore,
+        crate::protocol::tests::InMemShareStore,
+        crate::protocol::tests::InMemSecretStore,
+        crate::protocol::tests::InMemUserSecretStore,
+        crate::protocol::tests::InMemStateStore,
+        crate::protocol::tests::NoopTransport,
     >;
 
     /// Builds through the same path as [`derec_protocol_new`], with the
     /// in-memory store doubles in place of the host's callback tables.
     fn build_from(json: &str) -> crate::Result<InMemProtocol> {
-        use crate::protocol::test::{
+        use crate::protocol::tests::{
             InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
             InMemUserSecretStore, NoopTransport,
         };

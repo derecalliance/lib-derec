@@ -503,6 +503,20 @@ catch (DeRecException e) when (e.Code == DeRecCode.RestoreConflict)
 }
 ```
 
+**Restore or join.** `SecretRecoveredEvent` writes nothing, so decide first.
+When `Secret.Replicas?.Members` names live members other than the lost
+device, do not restore: tell the user and offer to join that group as a new
+replica — pair with a live member, confirm the fingerprint, then run
+`StartAsync(FlowKind.ReplicaDiscovery, new ReplicaDiscoveryParams())`. With no live member, restore. Neither path gives this device the proofs of
+earlier versions, so it cannot verify them: restore writes none, and a
+joining device gets only the share map of the single version each push or
+catch-up carries. The live members keep the proofs they hold. A restored
+device also cannot publish, or answer a member's catch-up, until the app
+configures a `ReplicaId` the roster names. Joining adds the device as a new
+member, while restoring next to live replicas makes a second device claim
+the lost device's role. See
+[Restore or join](https://derec-alliance.gitbook.io/docs/concepts/replicas/restore-or-join).
+
 > **Secret format:** the `recovered` bytes above (and the recoverable secret
 > data underlying `Secret`) are `[version byte] · payload` — v1's payload is
 > **gzip (RFC 1952)** compressed **JSON**, with byte fields as **standard
@@ -545,9 +559,9 @@ await helper.RejectAsync(action.Action,
     Org.Derecalliance.Derec.Protobuf.StatusEnum.SizeLimitExceeded, "over quota");
 ```
 
-The answer arrives typed the same way: `Status` on `ShareRejectedEvent`,
+The answer arrives typed the same way: `Status` on `ShareRejectedEvent`, `ShareRefusedEvent`,
 `ShareVerifyRejectedEvent`, `RecoveryShareRefusedEvent`, `UnpairRejectedEvent`, `PrePairRejectedEvent`,
-`ChannelInfoUpdateRejectedEvent`, `ReplicaSyncRejectedEvent` and
+`ChannelInfoUpdateRejectedEvent`, `ReplicaSyncRejectedEvent`, `ReplicaSecretRefusedEvent` and
 `ReplicaSecretAckedEvent` is that `StatusEnum`:
 
 ```csharp
@@ -606,14 +620,14 @@ var protectEvents = await owner.StartAsync(FlowKind.ProtectSecret, new ProtectSe
     },
     Description = "initial backup",
     // Optional: give a chosen helper's channel more than one subshare so it
-    // alone can cover more of the threshold. Absent/null means every
-    // targeted channel holds one subshare. Every value must satisfy
-    // 1 <= weight < threshold.
+    // alone can cover more of the threshold. The map is the full assignment:
+    // a helper it does not name holds one subshare, so pass the stored
+    // weights (below). Every value must satisfy 1 <= weight < threshold.
     // Weights = new Dictionary<ulong, uint> { [helperChannelId] = 2 },
 });
 // One ProtectSecretStartedEvent per targeted channel (helper + replica);
 // its Weight is that channel's subshare count — the Weights entry, or 1 when
-// absent. Any ProtectSecretFailedEvent { ChannelId, Version, Weight, Error }
+// the map does not name it. Any ProtectSecretFailedEvent { ChannelId, Version, Weight, Error }
 // here means that specific target's request could not be dispatched — the
 // rest are still in flight.
 // Peer responses arrive via ProcessAsync as ShareStoredEvent /
@@ -621,13 +635,77 @@ var protectEvents = await owner.StartAsync(FlowKind.ProtectSecret, new ProtectSe
 // closes.
 ```
 
+Weights are recorded. Each round writes the weight it gave every paired helper
+to that helper's `HelperChannel.Weight` in your `IChannelStore` before anything
+is sent, and the publishes the library starts on its own (after pairing, after
+a fingerprint is confirmed) reuse those weights; a newly paired helper starts
+at 1. The weights also travel in the recovered secret (`HelperInfo.Weight`), so
+`RestoreAsync` and replica hydration write them back into the channel records
+they create. When the builder's threshold applies (no threshold is stored),
+lowering it to or below a stored weight makes the next publish fail with
+`DeRecCode.InvalidWeight` (65) before anything is sent, until `StartAsync`
+assigns valid weights.
+
+The threshold is recorded too. A round splits at `ProtectSecretParams.Threshold` when
+given, otherwise at the stored threshold (`UserSecrets.Threshold`), and only otherwise
+at `WithThreshold`, which is therefore the starting threshold for a secret with
+nothing stored. Every publish stores the threshold it used, the recovered
+secret carries it (`Secret.Threshold`), and `RestoreAsync` and replica
+hydration put it back, so the publishes the library starts on its own and
+the follow-up after `RestoreAsync` keep it: leave `Threshold` unset there. To
+change it, pass `Threshold` on `StartAsync(FlowKind.ProtectSecret, …)`. It must be at least 2,
+above every weight, and no greater than a subshare cap; a round that fails
+a check writes and sends nothing. Your `IUserSecretStore` must persist the
+snapshot's threshold as given.
+
+That failure surfaces where the library started the publish, and in each
+case nothing is sent:
+
+- `ProcessAsync` throws a `DeRecException` whose `Events` keep the message's
+  events, `PairingCompletedEvent` included.
+- `AcceptAsync` throws. The pairing has completed and its response was sent,
+  but `PairingCompletedEvent` is not returned.
+- `VerifyFingerprintAsync` throws. The promotion stands: calling it again
+  returns `true` and publishes nothing.
+
+Call `StartAsync` with `ProtectSecretParams` and valid `Weights` to publish
+to every helper.
+
+The intended flow. Weights are the user's choice: before `StartAsync`, show
+the user each paired helper's current weight, pre-filled from the stored
+`HelperChannel.Weight` in your `IChannelStore`, and pass the user's final
+choice as the whole `Weights` map. Reading the stored weights first is the
+normal flow. Every other `StartAsync(FlowKind.ProtectSecret, ...)` the app
+makes, such as a republish after editing the secrets or the follow-up after
+`RestoreAsync`, must pass the stored weights unchanged: a helper left out
+returns to 1, which silently undoes the user's choice. Only the publishes
+the library starts on its own (after pairing, after a fingerprint is
+confirmed) reuse the stored weights by themselves.
+
+**Below the threshold.** When the paired helpers' total weight is below the
+threshold, `StartAsync` skips the split: no helper receives anything, so no
+`ProtectSecretStartedEvent` / `ProtectSecretFailedEvent` comes back for one.
+A paired replica still gets its usual secret-only copy and events; with none
+paired, `StartAsync` returns an empty list — this is not an error. The
+version still advances and the secrets/description are saved as the latest
+snapshot, so the next publish that reaches threshold (including one the
+library starts on its own) shares it. Sum the weights you are about to
+assign against the threshold beforehand, or count the returned helper
+events afterward, to tell the two cases apart. This is more reachable with
+weighted helpers than with the default of 1: two helpers at weight 2 against
+a threshold of 3 (total weight 4) drop below it when a publish leaves both
+out of the weights map, resetting each to weight 1 for a total of 2 —
+exactly what a restore follow-up publish risks if it does not pass the
+stored weights unchanged.
+
 `WithMaxSubshares(max)` on the builder caps the total subshares one round
 splits the secret into — the sum of every helper's weight. Unset means no cap.
 Recovery time grows quadratically with that total (about 0.2 s at 200, 5.5 s
 at 1,000 and 87 s at 4,000 subshares per attempt) while splitting stays cheap,
 so this is the place to bound it. A round over the cap fails `StartAsync`
 with a `DeRecException` whose `Code` is `DeRecCode.TooManySubshares` (66)
-before anything is sent; publishes the library starts itself respect it too.
+before anything is sent; publishes the library starts itself count the stored
+weights and respect it too.
 A cap below the threshold makes `Build()` throw (`InvalidInput`). The cap
 applies at sharing only, never at recovery: a recovering device cannot know
 the cap the shares were made under.
@@ -638,6 +716,19 @@ the cap the shares were made under.
 every challenged channel ends with exactly one of:
 
 - `ShareVerifiedEvent` — the helper proved it holds the exact share.
+  `Subshares` is how many subshares that helper holds for `Version`, read from
+  this device's stored share, so it is the weight of the round that published
+  `Version`, not the helper's current weight; it is `null` when that share was
+  stored before the count was recorded. `Threshold` is the threshold that version was split with, from the
+  same stored share, not the current one; it is `null` when that share was
+  stored before the threshold was recorded. To judge whether a version is
+  recoverable, sum `Subshares` over its `ShareVerifiedEvent` events and compare the
+  sum with their `Threshold`. If either is `null` on any of those events,
+  the result is unknown: a `null` count is not `0` or `1`. The count lives on `Share.Subshares`, which the
+  library sets on owner-side shares only (`null` on a helper's share and never
+  backfilled): your `IShareStore` must persist it as given and return it
+  unchanged. `Share.Threshold` follows the same rules, and must be
+  persisted the same way.
 - `ShareVerifyInvalidEvent { ChannelId, Version }` — the helper's proof does
   not match the share this device stored. It is an event; `ProcessAsync`
   does not throw.
@@ -649,11 +740,19 @@ every challenged channel ends with exactly one of:
 
 A stored proof is either confirmed by its helper or part of a sharing round
 still open: when a round settles a channel as failed (a rejection or a
-timeout), that channel's proof is deleted. This guarantee holds on the
-publishing device; a replica Destination holds the proofs the Source
-mirrored at publish time and never sees `SharingCompleteEvent`, so
-verifying there can return `ShareVerifyRejectedEvent` (`UNKNOWN_SHARE_VERSION`)
-for a helper that failed the Source's round. Verify only versions whose round
+timeout), that channel's proof is deleted. A confirmation also deletes the
+proofs of versions the helper dropped: a helper that stores a version
+deletes every other version that round's `keepList` leaves out, so when it
+confirms, its proofs for those versions are deleted here too (the confirmed
+version stays). A helper that rejects the round keeps its older versions, and
+so do their proofs; with no keep list nothing is deleted. A replica Destination never sees the helpers' answers, and it keeps every
+proof it receives: it never deletes one on its own, and freeing that storage
+is the app's concern. Verifying on a Destination a version that a helper
+refused, or later dropped under the `keepList`, gets
+`ShareVerifyRejectedEvent` (`UNKNOWN_SHARE_VERSION`) from that helper, where
+the Source reports `NoProof`. The app may delete such rows from the
+Destination's share store; verifying a version whose rows are gone then
+gives `VerifySharesFailedEvent` with `VerifyFailureReason.NoProof`. Verify only versions whose round
 completed (`SharingCompleteEvent`). Starting verification on a channel with
 no proof sends nothing and returns `VerifySharesFailedEvent` with
 `VerifyFailureReason.NoProof` at once.
@@ -804,9 +903,67 @@ The library answers the owner with the mapped status (`TooFrequent` →
 `TOO_FREQUENT`, `SizeLimitExceeded` → `SIZE_LIMIT_EXCEEDED`, `Rejected` →
 `REJECTED`), and the owner sees `ShareRejectedEvent` or
 `ShareVerifyRejectedEvent` with that status. Any other exception is an
-ordinary store failure. Every `IShareStore` implements `RecordVerification`;
+ordinary store failure, reported as a `RequestFailedEvent` (see
+[Failed requests](#failed-requests)). Every `IShareStore` implements `RecordVerification`;
 an app with no limit leaves it empty. See
 [Helper-side admission control](https://github.com/derecalliance/lib-derec/tree/main/library#helper-side-admission-control).
+
+### Failed requests
+
+Every request that arrives on an authenticated channel gets exactly one
+response, even when handling it fails. Such a failure does not make
+`ProcessAsync` or `AcceptAsync` throw: it is reported as a
+`RequestFailedEvent`, and the call's other events are kept.
+
+- `ActionKind` is the type of the request that failed, one of the
+  `PendingActionKind` constants (`PendingActionKind.Failed` when its body
+  could not be decoded, or was a request type the channel cannot carry).
+- `Responded` is `true` when the library already sent the response.
+- `Status` (`StatusEnum`) is the status that was sent, or would have been.
+  It is always present. `Memo` is the wire-safe memo sent with it, or that
+  would have been, so `RejectAsync(Action, Status, Memo)` sends exactly the
+  response the library would have sent.
+- `ErrorCode` is the error's stable code name and `Message` a local
+  description; neither goes on the wire.
+- `Action`, when `Responded` is `false`, is the token that answers the
+  request. Pass it to `RejectAsync`, which sends the one response;
+  `AcceptAsync` refuses it. The library never expires it. It is `null` only
+  when `RejectAsync` could never answer it: a request on a replica group
+  channel that names no member and carries no `replyTo`, which has no reply
+  target, or, with `WithAutoRespondOnFailure` off, a replica copy that hands
+  this device the group key and fails before that key is stored.
+
+Resolve each token once. The library is stateless, so rejecting the same
+token twice, or rejecting an action already accepted, sends a second
+response.
+
+`WithAutoRespondOnFailure` decides who answers. With it on, the library sends
+the response itself (a known failure keeps its specific status; anything else
+is `FAIL` with a generic memo). With it off (the default), nothing is sent and
+the event carries the token:
+
+```csharp
+foreach (var failed in events.OfType<RequestFailedEvent>())
+{
+    if (!failed.Responded && failed.Action is byte[] token)
+        await protocol.RejectAsync(token, failed.Status, failed.Memo);
+}
+```
+
+A peer that answers with an `ErrorResponseMessage` (for example
+`FORMAT_ERROR` for a body it could not decode) is reported as an
+`ErrorResponseReceivedEvent` with `Status` and `Memo`; it is never answered.
+
+An inbound `PairRequest` refused under a protocol rule (a parameter range that
+does not overlap this device's, `INCOMPATIBLE_PARAMETER_RANGE`, or a replica id
+already in the group, `REPLICA_ID_CONFLICT`) is answered with that status in
+every mode and reported as a `PairingRefusedEvent` with `Status` and `Memo`,
+the reason sent to the requester and written from its side. `ErrorCode`
+(`incompatible_parameter_range` or `replica_id_conflict`) and `Message` carry
+the local reason for logging or display, as on `RequestFailedEvent`; they are
+never sent. `ProcessAsync` does not throw for it, and no channel is created.
+The requester's `ProcessAsync` throws a `DeRecException` with code
+`non_ok_status`, whose `PeerStatus` and `PeerMemo` hold the refusal.
 
 End-to-end coverage: see [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 

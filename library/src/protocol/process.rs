@@ -63,9 +63,30 @@ impl<
     /// Any [`DeRecEvent::ActionRequired`] whose action kind the configured
     /// [`AutoAcceptPolicy`](crate::protocol::AutoAcceptPolicy) opts into is replaced in place with
     /// `AutoAccepted` plus the events a manual
-    /// [`accept`](Self::accept) would have produced. A failure while
-    /// accepting surfaces as [`ProcessError`], the same way a manual accept
-    /// would reach the caller.
+    /// [`accept`](Self::accept) would have produced, including a
+    /// [`DeRecEvent::RequestFailed`] when accepting fails.
+    ///
+    /// # Failed requests
+    ///
+    /// A request that arrived on an authenticated channel and then failed is
+    /// **not** an `Err`. It is answered exactly once, and reported as
+    /// [`DeRecEvent::RequestFailed`] inside `Ok`, so the other events of the
+    /// call are kept. Whether the library sends the answer or hands the
+    /// application a token for [`reject`](Self::reject) is
+    /// [`with_auto_respond_on_failure`](crate::protocol::DeRecProtocolBuilder::with_auto_respond_on_failure).
+    /// That includes a message that decrypts but whose body cannot be
+    /// decoded, which is answered with an `ErrorResponseMessage`. A received
+    /// `ErrorResponseMessage` is reported as
+    /// [`DeRecEvent::ErrorResponseReceived`] and never answered.
+    ///
+    /// A `PairRequest` refused under a protocol rule is not an `Err` either:
+    /// the refusal is sent and reported as [`DeRecEvent::PairingRefused`].
+    ///
+    /// [`ProcessError`] is left for what cannot be answered: an envelope that
+    /// does not decode, a channel with no key, a message that does not
+    /// decrypt, any other failure of the pairing handshake or of a response
+    /// this device received, and a store failure before the message could be
+    /// authenticated.
     ///
     /// # Event ordering
     ///
@@ -104,7 +125,9 @@ impl<
     ///
     /// Malformed bytes — including truncation, varint overflow, and any
     /// `prost`-level decode failure — surface as
-    /// [`ProcessError`] wrapping [`Error::ProtobufDecode`]. This function
+    /// [`ProcessError`] wrapping [`Error::ProtobufDecode`], except an inner
+    /// body that decrypts under the channel key and then fails to decode,
+    /// which is a failed request (see *Failed requests* above). This function
     /// never panics on adversarial input. Protobuf recursion depth is
     /// bounded by `prost`'s decoder; DeRec's schema is shallow (~3 levels),
     /// so no additional caller-side recursion limit is required.
@@ -390,7 +413,7 @@ impl<
 mod tests {
     use super::*;
     use crate::protocol::builder::DeRecProtocolBuilder;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
         InMemUserSecretStore, RecordingTransport, run_async,
     };
@@ -421,6 +444,7 @@ mod tests {
                     status: ChannelStatus::Paired,
                     created_at: now_secs(),
                     peer_role: derec_proto::SenderKind::Helper,
+                    weight: 1,
                 }),
             )
             .await
@@ -482,10 +506,10 @@ mod tests {
             .encode_to_vec()
     }
 
-    /// Disabled is the default and stays silent: the failure is the caller's
-    /// to act on, and the peer is told nothing.
+    /// Disabled is the default: nothing is sent, and the caller gets the
+    /// failure as a `RequestFailed` carrying the token that answers it.
     #[test]
-    fn disabled_sends_nothing_and_still_errors() {
+    fn disabled_sends_nothing_and_hands_over_a_token() {
         run_async(async {
             let channels = InMemChannelStore::default();
             let secrets = InMemSecretStore::default();
@@ -494,20 +518,38 @@ mod tests {
             seed(&mut c, &mut s).await;
 
             let mut protocol = build(channels, secrets, transport.clone(), false);
-            let result = protocol.process(&failing_request()).await;
+            let events = protocol
+                .process(&failing_request())
+                .await
+                .expect("an answerable failure is reported, not raised");
 
-            assert!(result.is_err(), "the failure must reach the caller");
             assert!(
                 transport.sent_envelopes().is_empty(),
                 "nothing may go on the wire when the setting is off"
             );
+            let token = events
+                .into_iter()
+                .find_map(|e| match e {
+                    DeRecEvent::RequestFailed {
+                        responded: false,
+                        action: Some(action),
+                        ..
+                    } => Some(action),
+                    _ => None,
+                })
+                .expect("a RequestFailed carrying a token");
+
+            protocol
+                .reject(token, derec_proto::StatusEnum::Rejected, "declined")
+                .await
+                .expect("the token answers the request");
+            assert_eq!(transport.sent_envelopes().len(), 1, "exactly one response");
         });
     }
 
-    /// Enabled tells the peer as well — and still returns the same error, so
-    /// the caller's handling does not change with the setting.
+    /// Enabled tells the peer, and reports the failure as answered.
     #[test]
-    fn enabled_sends_a_failure_response_and_still_errors() {
+    fn enabled_sends_a_failure_response_and_reports_it() {
         run_async(async {
             let channels = InMemChannelStore::default();
             let secrets = InMemSecretStore::default();
@@ -516,18 +558,28 @@ mod tests {
             seed(&mut c, &mut s).await;
 
             let mut protocol = build(channels, secrets, transport.clone(), true);
-            let result = protocol.process(&failing_request()).await;
+            let events = protocol
+                .process(&failing_request())
+                .await
+                .expect("an answerable failure is reported, not raised");
 
             assert!(
-                result.is_err(),
-                "the caller still gets the error that mattered"
+                events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::RequestFailed {
+                        responded: true,
+                        action: None,
+                        ..
+                    }
+                )),
+                "{events:?}"
             );
 
             let sent = transport.sent_envelopes();
             assert_eq!(sent.len(), 1, "exactly one failure response");
 
-            // It is a real, decryptable VerifyShareResponse carrying a
-            // non-Ok status — not merely "some bytes were sent".
+            // It is a real, decryptable VerifyShareResponse carrying the
+            // role-mismatch status — not merely "some bytes were sent".
             let envelope = derec_proto::DeRecMessage::decode(sent[0].as_slice())
                 .expect("the response is a DeRec envelope");
             let inner = crate::derec_message::extract_inner_message(&envelope.message, &SHARED_KEY)
@@ -536,11 +588,7 @@ mod tests {
                 panic!("expected a VerifyShareResponse, got {inner:?}");
             };
             let status = response.result.expect("a result is present").status;
-            assert_ne!(
-                status,
-                derec_proto::StatusEnum::Ok as i32,
-                "the response must report failure"
-            );
+            assert_eq!(status, derec_proto::StatusEnum::Rejected as i32);
         });
     }
 
