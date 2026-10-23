@@ -233,7 +233,10 @@ type ShareStore interface {
 	LatestVersion(secretID uint64) (version uint32, ok bool, err error)
 	// Save inserts or replaces the share at (secretID, channelID,
 	// share.Version) — the secretID argument, not share.SecretID. See
-	// the interface docs.
+	// the interface docs. On a helper channel, saving a version not yet
+	// stored may return a *ShareStoreRefusedError to refuse the share with
+	// the matching protocol status; any other error is an ordinary backend
+	// failure.
 	Save(secretID, channelID uint64, share Share) error
 	// RemoveChannel deletes every share stored for channelID within
 	// secretID.

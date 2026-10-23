@@ -334,6 +334,22 @@ mod handshake_tests {
         });
     }
 
+    /// A channel still being unpaired keeps its key until the helper answers,
+    /// so pairing over it would overwrite that key mid-teardown.
+    #[test]
+    fn reject_start_on_paired_channel_errors_while_unpairing() {
+        run_async(async {
+            let lf = LocalFixture::new(42);
+            let mut rig = StoreRig::with_channels(FixedChannelStore {
+                seeded: Some(fake_channel(ChannelStatus::Unpairing, SenderKind::Helper)),
+            });
+            let err = reject_start_on_paired_channel(&mut rig.stores(), &lf.local(), ChannelId(1))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::ChannelAlreadyPaired { .. }));
+        });
+    }
+
     #[test]
     fn reject_start_on_paired_channel_allows_when_no_channel_record() {
         run_async(async {

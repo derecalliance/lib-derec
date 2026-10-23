@@ -532,8 +532,8 @@ before any target-level events are emitted.
   damaged or compromised helper — e.g. offer to unpair it
 - `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }` /
   `UnpairFailed { channel_id, error }` — emitted by `restore` when an
-  ephemeral recovery channel's teardown could not be delivered. The
-  teardown is fire-and-forget, so local state is dropped anyway and an
+  ephemeral recovery channel's teardown could not be delivered. The restore
+  has already committed, so local state is dropped anyway and an
   `Unpaired` for the same channel follows; the pair means "gone locally,
   peer not told"
 - `PeerNotRestored { channel_id, replica_id, reason }` — emitted by
@@ -2375,23 +2375,29 @@ Through the protocol layer:
 
 ```rust,ignore
 use derec_library::protocol::{DeRecFlow, UnpairAck};
-use derec_library::types::Target;
 
-let mut protocol = DeRecProtocolBuilder::new()
+let mut protocol = DeRecProtocolBuilder::new(secret_id)
     .with_unpair_ack(UnpairAck::Required)
     // … other setters …
     .build()?;
 
 protocol.start(DeRecFlow::Unpair {
-    target: Target::Single(channel_id),
+    channel_id,
     memo: Some("decommissioning".to_owned()),
 }).await?;
 ```
 
 `UnpairAck::Required` (default) keeps local state until the peer replies
 `Ok`, or until the configured timeout elapses; the `Unpaired` event surfaces
-in either case. `UnpairAck::NotRequired` drops local state immediately on
-`start(Unpair)` and ignores any later response.
+in either case. Meanwhile the channel is `ChannelStatus::Unpairing`: it keeps
+its key, so the reply can be read, but no flow selects it, so a publish
+started in that window does not hand the departing helper a share. A
+non-`Ok` reply emits `UnpairRejected` and returns the channel to `Paired`.
+`restore` unpairs its recovery channels the same way.
+
+`UnpairAck::NotRequired` drops local state immediately on `start(Unpair)`.
+The peer still answers, and since the channel is gone, `process` fails on
+that answer with an unknown-channel error the application can discard.
 
 When the peer's `UnpairRequest` arrives on the responder side, the
 orchestrator emits `DeRecEvent::ActionRequired { channel_id, action }` with

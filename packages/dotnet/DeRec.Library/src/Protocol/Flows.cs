@@ -1771,9 +1771,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ReadEndpoints(h),
                 ReadByteArray(h.GetProperty("shared_key")),
                 h.TryGetProperty("communication_info", out var hci) ? ReadStringMap(hci) : new(),
-                h.TryGetProperty("weight", out var hw) && hw.ValueKind != JsonValueKind.Null
-                    ? hw.GetUInt32()
-                    : 1));
+                h.GetProperty("weight").GetUInt32()));
         }
         var secrets = new List<UserSecret>();
         foreach (var s in secretEl.GetProperty("secrets").EnumerateArray())

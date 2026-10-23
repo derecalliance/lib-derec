@@ -388,9 +388,9 @@ int32_t shareRefusalCode(jsi::Runtime& rt, const jsi::Value& value) {
     return kBackendFailure;
   }
   std::string reason = refusal.asString(rt).utf8(rt);
-  if (reason == "too_frequent") return 4;
-  if (reason == "size_limit_exceeded") return 3;
-  if (reason == "rejected") return 10;
+  if (reason == "too_frequent") return DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT;
+  if (reason == "size_limit_exceeded") return DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED;
+  if (reason == "rejected") return DEREC_SHARE_STORE_REFUSED_REJECTED;
   return kBackendFailure;
 }
 

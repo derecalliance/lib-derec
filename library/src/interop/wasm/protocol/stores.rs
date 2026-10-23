@@ -535,7 +535,9 @@ impl DeRecChannelStore for JsChannelStore {
             let value = resolve_promise(promise_val)
                 .await
                 .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
-            Ok(value.as_bool().unwrap_or(false))
+            value.as_bool().ok_or_else(|| {
+                ChannelStoreError::Backend(box_err("remove must return a boolean".to_string()))
+            })
         })
     }
 
@@ -659,6 +661,32 @@ fn share_to_js(share: &Share) -> JsValue {
     obj.into()
 }
 
+/// `value` as a `u32`: a `number` that is an integer in `0..=u32::MAX`.
+fn u32_from_js(value: &JsValue) -> Option<u32> {
+    value
+        .as_f64()
+        .filter(|n| n.fract() == 0.0 && *n >= 0.0 && *n <= f64::from(u32::MAX))
+        .map(|n| n as u32)
+}
+
+/// `record[key]`: `undefined` or `null` is none, otherwise a string. `what`
+/// names the record in the error.
+fn optional_string_from_js(
+    item: &JsValue,
+    what: &str,
+    key: &str,
+) -> Result<Option<String>, ShareStoreError> {
+    let value = js_sys::Reflect::get(item, &key.into()).unwrap_or(JsValue::UNDEFINED);
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    value.as_string().map(Some).ok_or_else(|| {
+        ShareStoreError::Backend(box_err(format!(
+            "{what}.{key} must be a string, null or undefined"
+        )))
+    })
+}
+
 /// `record[key]`: `undefined` or `null` is none, otherwise a `u32`. `what`
 /// names the record in the error.
 fn optional_u32_from_js(
@@ -670,15 +698,11 @@ fn optional_u32_from_js(
     if value.is_undefined() || value.is_null() {
         return Ok(None);
     }
-    value
-        .as_f64()
-        .filter(|n| n.fract() == 0.0 && *n >= 0.0 && *n <= f64::from(u32::MAX))
-        .map(|n| Some(n as u32))
-        .ok_or_else(|| {
-            ShareStoreError::Backend(box_err(format!(
-                "{what}.{key} must be a u32, null or undefined"
-            )))
-        })
+    u32_from_js(&value).map(Some).ok_or_else(|| {
+        ShareStoreError::Backend(box_err(format!(
+            "{what}.{key} must be a u32, null or undefined"
+        )))
+    })
 }
 
 fn share_from_js(item: &JsValue) -> Result<Share, ShareStoreError> {
@@ -693,10 +717,10 @@ fn share_from_js(item: &JsValue) -> Result<Share, ShareStoreError> {
     })?;
     let version = js_sys::Reflect::get(item, &"version".into())
         .ok()
-        .and_then(|v| v.as_f64())
+        .and_then(|v| u32_from_js(&v))
         .ok_or_else(|| {
-            ShareStoreError::Backend(box_err("share.version must be a number".to_string()))
-        })? as u32;
+            ShareStoreError::Backend(box_err("share.version must be a u32".to_string()))
+        })?;
     let bytes_val = js_sys::Reflect::get(item, &"bytes".into()).unwrap_or(JsValue::null());
     let bytes = Uint8Array::new(&bytes_val).to_vec();
     Ok(Share {
@@ -756,11 +780,11 @@ impl DeRecShareStore for JsShareStore {
             if value.is_null() || value.is_undefined() {
                 Ok(None)
             } else {
-                let v = value.as_f64().ok_or_else(|| {
+                let v = u32_from_js(&value).ok_or_else(|| {
                     ShareStoreError::Backend(box_err(
-                        "latestVersion must return a number or null".to_string(),
+                        "latestVersion must return a u32 or null".to_string(),
                     ))
-                })? as u32;
+                })?;
                 Ok(Some(v))
             }
         })
@@ -1032,33 +1056,37 @@ fn user_secrets_to_js(value: &UserSecrets) -> JsValue {
 fn user_secrets_from_js(value: &JsValue) -> Result<UserSecrets, ShareStoreError> {
     let version = js_sys::Reflect::get(value, &"version".into())
         .ok()
-        .and_then(|v| v.as_f64())
+        .and_then(|v| u32_from_js(&v))
         .ok_or_else(|| {
-            ShareStoreError::Backend(box_err("userSecrets.version must be a number".to_string()))
-        })? as u32;
-    let entries_val = js_sys::Reflect::get(value, &"secrets".into()).unwrap_or(JsValue::null());
-    let entries_arr = Array::from(&entries_val);
-    let mut secrets = Vec::with_capacity(entries_arr.length() as usize);
-    for i in 0..entries_arr.length() {
-        let item = entries_arr.get(i);
-        let id_val = js_sys::Reflect::get(&item, &"id".into()).unwrap_or(JsValue::null());
-        let data_val = js_sys::Reflect::get(&item, &"data".into()).unwrap_or(JsValue::null());
-        let name = js_sys::Reflect::get(&item, &"name".into())
-            .ok()
-            .and_then(|v| v.as_string())
-            .unwrap_or_default();
-        secrets.push(UserSecret {
-            id: Uint8Array::new(&id_val).to_vec(),
-            name,
-            data: Uint8Array::new(&data_val).to_vec(),
-        });
+            ShareStoreError::Backend(box_err("userSecrets.version must be a u32".to_string()))
+        })?;
+    #[derive(serde::Deserialize)]
+    struct UserSecretShape {
+        #[serde(with = "serde_bytes")]
+        id: Vec<u8>,
+        name: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
     }
-    let description = js_sys::Reflect::get(value, &"description".into())
-        .ok()
-        .and_then(|v| v.as_string());
-    let author_replica_id = js_sys::Reflect::get(value, &"author_replica_id".into())
-        .ok()
-        .and_then(|v| v.as_string())
+    let entries_val = js_sys::Reflect::get(value, &"secrets".into()).unwrap_or(JsValue::UNDEFINED);
+    if !Array::is_array(&entries_val) {
+        return Err(ShareStoreError::Backend(box_err(
+            "userSecrets.secrets must be an array".to_string(),
+        )));
+    }
+    let secrets = serde_wasm_bindgen::from_value::<Vec<UserSecretShape>>(entries_val)
+        .map_err(|e| {
+            ShareStoreError::Backend(box_err(format!("invalid userSecrets.secrets: {e}")))
+        })?
+        .into_iter()
+        .map(|s| UserSecret {
+            id: s.id,
+            name: s.name,
+            data: s.data,
+        })
+        .collect();
+    let description = optional_string_from_js(value, "userSecrets", "description")?;
+    let author_replica_id = optional_string_from_js(value, "userSecrets", "author_replica_id")?
         .map(|id| {
             id.parse::<u64>().map_err(|_| {
                 ShareStoreError::Backend(box_err(format!(
@@ -1280,7 +1308,9 @@ impl DeRecStateStore for JsStateStore {
             let value = resolve_promise(promise_val)
                 .await
                 .map_err(|e| StateStoreError::Backend(box_err(e)))?;
-            Ok(value.as_bool().unwrap_or(false))
+            value.as_bool().ok_or_else(|| {
+                StateStoreError::Backend(box_err("remove must return a boolean".to_string()))
+            })
         })
     }
 

@@ -99,9 +99,9 @@ pub enum Error {
     },
 
     /// `start(Pairing)` was called for a `channel_id` that already has
-    /// a `Paired` channel record. Re-pairing would silently overwrite
-    /// the stored `SharedKey`; the caller must skip the call or unpair
-    /// first.
+    /// a `Paired` or `Unpairing` channel record. Re-pairing would silently
+    /// overwrite the stored `SharedKey`; the caller must skip the call, or
+    /// unpair first and wait for [`DeRecEvent::Unpaired`](crate::protocol::DeRecEvent::Unpaired).
     #[error("channel {channel_id:?} is already paired")]
     ChannelAlreadyPaired { channel_id: crate::types::ChannelId },
 

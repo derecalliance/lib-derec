@@ -599,6 +599,41 @@ impl DeRecStateStore for InMemStateStore {
     }
 }
 
+/// State store double that actually persists, keyed by
+/// `(secret_id, StateKey)`. A flow that waits on a row it wrote, such as an
+/// unpair awaiting its acknowledgement, needs this; [`InMemStateStore`]
+/// forgets every write.
+#[derive(Default, Clone)]
+pub struct InMemPersistedStateStore {
+    #[allow(clippy::type_complexity)]
+    pub data: Arc<Mutex<HashMap<(u64, StateKey), StateItem>>>,
+}
+impl DeRecStateStore for InMemPersistedStateStore {
+    fn save(&mut self, sid: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
+        self.data.lock().unwrap().insert((sid, item.key()), item);
+        Box::pin(std::future::ready(Ok(())))
+    }
+    fn load(&self, sid: u64, key: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
+        let v = self.data.lock().unwrap().get(&(sid, key)).cloned();
+        Box::pin(std::future::ready(Ok(v)))
+    }
+    fn remove(&mut self, sid: u64, key: StateKey) -> StateStoreFuture<'_, bool> {
+        let removed = self.data.lock().unwrap().remove(&(sid, key)).is_some();
+        Box::pin(std::future::ready(Ok(removed)))
+    }
+    fn load_all(&self, sid: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
+        let v: Vec<StateItem> = self
+            .data
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((s, k), _)| *s == sid && k.kind() == kind)
+            .map(|(_, i)| i.clone())
+            .collect();
+        Box::pin(std::future::ready(Ok(v)))
+    }
+}
+
 /// Transport double that records every outbound `(endpoints, envelope)` in
 /// send order, so a test can assert both *that* a message went out and
 /// *what* it carried.

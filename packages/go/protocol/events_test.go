@@ -1067,6 +1067,18 @@ func TestDecodeEvents_SecretRecoveredHelperWeight_RoundTripsToRestore(t *testing
 	}
 }
 
+// A roster entry built without a Weight leaves the key out, so restore reads
+// it as 1 rather than refusing a weight of 0.
+func TestHelper_UnsetWeightIsOmittedFromRestoreParams(t *testing.T) {
+	got, err := json.Marshal(Helper{ChannelID: 1, SharedKey: []byte{1}})
+	if err != nil {
+		t.Fatalf("marshal helper: %v", err)
+	}
+	if bytes.Contains(got, []byte(`"weight"`)) {
+		t.Fatalf("an unset weight must be omitted: %s", got)
+	}
+}
+
 // The recovered roster names its threshold, and Restore's params hand it back
 // so the restored snapshot keeps it. A roster without one omits it.
 func TestDecodeEvents_SecretRecoveredThreshold_RoundTripsToRestore(t *testing.T) {

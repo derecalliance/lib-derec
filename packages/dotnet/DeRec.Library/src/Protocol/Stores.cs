@@ -32,9 +32,13 @@ public enum ChannelStatus
     Paired,
 
     /// <summary>
-    /// A replica-group member that has been told to leave and is awaiting
-    /// the roster version that completes its removal. Never set on a helper
-    /// channel.
+    /// Being torn down. A helper channel is <c>Unpairing</c> from the moment
+    /// an unpair that awaits acknowledgement is sent until the helper answers
+    /// or the acknowledgement window elapses; a rejection returns it to
+    /// <c>Paired</c>. A replica-group member is <c>Unpairing</c> once told to
+    /// leave, until the roster version that completes its removal. Not a
+    /// publish target, not a recovery source, and not a target of any new
+    /// request, but inbound messages on it are still processed.
     /// </summary>
     Unpairing,
 }

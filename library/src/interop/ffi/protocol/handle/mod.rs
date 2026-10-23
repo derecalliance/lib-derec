@@ -24,9 +24,9 @@ use crate::interop::ffi::protocol::stores::{
 };
 use crate::protocol::{DeRecProtocolBuilder, DeRecProtocolConfig};
 
-mod config;
-mod flow;
-mod pairing;
+pub(in crate::interop::ffi) mod config;
+pub(in crate::interop::ffi) mod flow;
+pub(in crate::interop::ffi) mod pairing;
 
 pub(super) type Protocol = crate::protocol::DeRecProtocol<
     DotnetChannelStore,

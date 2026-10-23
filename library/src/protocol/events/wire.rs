@@ -16,6 +16,8 @@
 //!   never see noise from empty maps.
 //! - Enum variants use serde's default tag (`#[serde(tag = "type")]`)
 //!   with the Rust variant name as the discriminator value.
+//! - Byte fields serialize as bytes: a JSON array of numbers over the FFI,
+//!   a `Uint8Array` over WASM.
 
 use crate::protocol::utils::{pending_action_wire, reserved_keys::encode_replica_id};
 use crate::protocol::{
@@ -242,6 +244,7 @@ pub(crate) enum Event {
         channel_id: String,
         /// Opaque serialized [`PendingAction`] — pass back to
         /// `accept` / `reject` verbatim.
+        #[serde(with = "serde_bytes")]
         action: Vec<u8>,
         /// Human-readable tag (e.g. `"Pairing"`, `"StoreShare"`) so JS
         /// callers can route on action kind without decoding `action`.
@@ -305,7 +308,7 @@ pub(crate) enum Event {
         memo: String,
         error_code: String,
         message: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none", with = "serde_bytes")]
         action: Option<Vec<u8>>,
     },
     /// The peer answered with an `ErrorResponseMessage`.
@@ -441,6 +444,7 @@ pub struct ReplicasWire {
     pub members: Vec<Replica>,
     /// 32-byte replica group key. Required by `DeRecProtocol::restore`
     /// to rebuild replica channel state.
+    #[serde(with = "serde_bytes")]
     pub shared_key: Vec<u8>,
 }
 
@@ -468,6 +472,7 @@ impl From<derec_proto::TransportProtocol> for Endpoint {
 pub struct Helper {
     pub channel_id: String,
     pub transports: Vec<Endpoint>,
+    #[serde(with = "serde_bytes")]
     pub shared_key: Vec<u8>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub communication_info: HashMap<String, String>,
@@ -488,14 +493,17 @@ pub struct Replica {
 
 #[derive(Serialize)]
 pub struct UserSecret {
+    #[serde(with = "serde_bytes")]
     pub id: Vec<u8>,
     pub name: String,
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 
 #[derive(Serialize)]
 pub struct Share {
     pub channel_id: String,
+    #[serde(with = "serde_bytes")]
     pub committed_share: Vec<u8>,
 }
 

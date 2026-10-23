@@ -464,6 +464,47 @@ timestamps are one value, checked on receipt.
   read an explicit `null` as an empty map, as an absent key already was, so
   it follows the same rule as `transports` and `weight` beside it.
 
+- **Fixed: a helper being unpaired could still receive a share.**
+  *(behavior change; every SDK)*
+
+  Under `UnpairAck::Required` (the default) an owner's helper channel kept
+  the status `Paired` while the unpair awaited the helper's answer, so a
+  `ProtectSecret` started in that window sent the departing helper a share
+  and named it in the roster, and the helper then deleted it. The channel is
+  now `ChannelStatus::Unpairing` from the moment the request is sent until the
+  helper answers or the acknowledgement window elapses. It keeps its key, so
+  the answer is read as before, but no flow selects it: not sharing,
+  recovery, verification or channel-info updates. A non-`Ok` answer emits
+  `UnpairRejected` and returns the channel to `Paired`. `start(Pairing)` on
+  an `Unpairing` channel fails with `ChannelAlreadyPaired`, as on a `Paired`
+  one. A channel still `Pending` is left as it is. `Unpairing` was already
+  in every SDK's `ChannelStatus` for replica members; a channel store or UI
+  that lists helper channels can now see it on a helper row too.
+
+- **Changed: `restore` unpairs its recovery channels like any other
+  unpair.** *(behavior change; every SDK)*
+
+  `restore` forced `UnpairAck::NotRequired` on its recovery channels and
+  dropped them as the requests went out, so each recovery helper's answer
+  arrived on a channel that no longer existed and `process` failed with
+  "unknown channel_id". It now follows the configured `unpair_ack`, through
+  the same path as `start(Unpair)`. It returns an `UnpairStarted` per
+  recovery channel; under the default `UnpairAck::Required` each channel is
+  `Unpairing`, and its `Unpaired` arrives later, from `process` on the
+  helper's answer or from the timeout sweep, instead of in `restore`'s
+  return value. The publish that follows `restore` still reaches only the
+  restored helpers. A request that cannot be sent is handled as before:
+  `UnpairFailed`, then `Unpaired`, in `restore`'s events. With
+  `UnpairAck::NotRequired` configured, `restore` behaves as it did.
+
+- **Fixed (Go): `Restore` refused a helper built without a `Weight`.**
+  *(bug fix; Go)*
+
+  `protocol.Helper` sent an unset `Weight` as `0`, which restore refuses.
+  It now leaves a zero `Weight` out, so restore reads it as `1`, as it does
+  an omitted weight from every other SDK. A roster passed back from
+  `SecretRecovered` is unaffected: it always carries its weights.
+
 - **Changed: `build()` validates the configured parameter range.**
   *(behavior change; every SDK)*
 
@@ -895,6 +936,42 @@ timestamps are one value, checked on receipt.
   `pairing::DerecEncryptionError`, next to `DerecPairingError`. Their
   contents are unchanged; only the import paths move. The SDKs do not expose
   these items and are unaffected.
+
+- **Fixed: Node.js and Web events now match their declarations.**
+  *(bug fix; Node.js, Web)*
+
+  Byte fields on events (`ActionRequired.action`, `RequestFailed.action`, a
+  recovered or synced secret's `shared_key`, `id` and `data`, a share's
+  `committed_share`) arrived as plain arrays of numbers although
+  `index.d.ts` declares `Uint8Array`; they are now `Uint8Array`. An absent
+  `author_replica_id`, `held_author_replica_id` or
+  `incoming_author_replica_id` arrived as `undefined` although it is declared
+  `string | null`; it is now `null`, as it already was in React Native. Code
+  that compared those fields with `=== undefined`, or treated byte fields as
+  arrays, must be updated.
+
+- **Changed: the Node.js and Web bindings reject malformed input instead of
+  coercing it.** *(breaking; Node.js, Web)*
+
+  Numeric arguments (`withThreshold`, `restore`'s version, `createContact`'s
+  contact mode, `start`'s flow kind, `reject`'s status) must be integers in
+  range: `withThreshold(-1)` and `withThreshold(2.7)` used to become
+  4294967295 and 2, and now fail with `decode_error`. A `ProtectSecret`
+  secret missing `id`, `name` or `data`, a `secrets` value that is not an
+  array, and a non-string `description` or unpair `memo` are errors rather
+  than empty or dropped values. The same applies to what an application's
+  stores return: a version that is not a `u32`, a user-secret entry missing a
+  field, a non-string `description` or `author_replica_id`, or a non-boolean
+  from `ChannelStore.remove` or `StateStore.remove` is a store error. The FFI
+  bindings already rejected all of these.
+
+- **Changed: React Native primitives range-check their numeric arguments.**
+  *(breaking; React Native)*
+
+  Versions, thresholds, contact modes, message kinds, sender kinds and 64-bit
+  ids passed to the primitives must be integers in range; a negative,
+  fractional or out-of-range `number` (or an out-of-range `bigint`) is an
+  error instead of being truncated.
 
 - **Changed: secret material is wiped from memory after use.** *(hardening;
   every SDK)*

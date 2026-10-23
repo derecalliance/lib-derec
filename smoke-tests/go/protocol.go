@@ -1638,6 +1638,24 @@ func runConfigSurface() {
 	p.Close()
 	fmt.Println("  ParameterRange accepted by the FFI config  ✓")
 
+	// A negative bound, or a min above a non-zero max, is refused by the
+	// library, not by this SDK.
+	for _, bad := range []struct {
+		label string
+		r     protocol.ParameterRange
+	}{
+		{"a negative min", protocol.ParameterRange{MinShareSize: -1, MaxShareSize: 1 << 20}},
+		{"min above a non-zero max", protocol.ParameterRange{MinShareSize: 4096, MaxShareSize: 1024}},
+	} {
+		cfg = base()
+		cfg.ParameterRange = &bad.r
+		var rangeErr *derec.Error
+		_, err := build(cfg)
+		assertTrue(errors.As(err, &rangeErr) && rangeErr.Code == derec.CodeInvalidInput,
+			"a ParameterRange with %s must fail New with CodeInvalidInput, got %v", bad.label, err)
+	}
+	fmt.Println("  malformed ParameterRange (negative, min > max) refused with CodeInvalidInput  ✓")
+
 	// A device serves at most one endpoint per protocol: two HTTPS entries
 	// contradict rather than extend, so the set is refused even though each
 	// entry is individually well-formed.
@@ -1775,4 +1793,465 @@ func runUnconfirmedDestination() {
 
 	fmt.Println("Protocol unconfirmed replica destination test passed.")
 	fmt.Println()
+}
+
+// runRecoverRestoreRepublish protects a weighted secret, loses the owner,
+// recovers the secret on a new device at the same endpoint, restores it there
+// and republishes with the stored weights. The weights and the threshold reach
+// Rust only inside the recovered Secret this SDK re-encodes for Restore, so the
+// republish splitting at the original threshold with the original weights
+// proves that encoding carried them. The restored device holds no proof of the
+// recovered version, so verifying it fails with NoProof and sends nothing.
+func runRecoverRestoreRepublish() {
+	fmt.Println("=== Protocol recover → restore → republish test ===")
+
+	const ownerURI = "https://owner-restore.example.com"
+	owner := newPeer("owner", ownerURI, 2)
+	helperA := newPeer("helper-a", "https://helper-a-restore.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-restore.example.com", 2)
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+
+	channelA := pairPeers(owner, helperA, 1)
+	channelB := pairPeers(owner, helperB, 2)
+
+	three := uint32(3)
+	secretData := []byte("restore-me")
+	events, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets:   []protocol.UserSecret{{ID: []byte{11}, Name: "restored secret", Data: secretData}},
+		Weights:   map[uint64]uint32{channelA: 2},
+		Threshold: &three,
+	})
+	must(err, "owner.Start(ProtectSecret)")
+	var v1 uint32
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeProtectSecretStarted && ev.Version != nil {
+			v1 = *ev.Version
+		}
+	}
+	assertTrue(v1 != 0, "Start(ProtectSecret) must emit ProtectSecretStarted, got %+v", events)
+	pumpMany([]*peer{owner, helperA, helperB})
+	owner.proto.Close()
+
+	// The new device pairs with each helper afresh; each helper links its
+	// original channel to the new one so the recovery request finds the share
+	// stored under the original.
+	device := newPeer("device", ownerURI, 2)
+	defer device.proto.Close()
+	recoveryA := pairPeers(device, helperA, 100)
+	recoveryB := pairPeers(device, helperB, 101)
+	must(helperA.channelStore.LinkChannel(protocolSecretID, channelA, recoveryA), "helper-a LinkChannel")
+	must(helperB.channelStore.LinkChannel(protocolSecretID, channelB, recoveryB), "helper-b LinkChannel")
+	all := []*peer{device, helperA, helperB}
+
+	_, err = device.proto.Start(protocol.FlowKindRecoverSecret, protocol.RecoverSecretParams{
+		SecretID: protocolSecretID,
+		Version:  v1,
+	})
+	must(err, "device.Start(RecoverSecret)")
+	var recovered *protocol.Secret
+	for _, ev := range pumpMany(all) {
+		if ev.Type == protocol.EventTypeSecretRecovered && ev.Secret != nil {
+			recovered = ev.Secret
+		}
+	}
+	assertTrue(recovered != nil, "RecoverSecret must surface SecretRecovered")
+	assertTrue(len(recovered.Secrets) == 1 && bytes.Equal(recovered.Secrets[0].Data, secretData),
+		"the recovered secret must carry the protected data, got %+v", recovered.Secrets)
+	assertTrue(recovered.Threshold != nil && *recovered.Threshold == 3,
+		"the recovered secret must carry t=3, got %s", subsharesText(recovered.Threshold))
+	recoveredWeights := map[uint64]uint32{}
+	for _, h := range recovered.Helpers {
+		recoveredWeights[h.ChannelID] = h.Weight
+	}
+	assertTrue(len(recoveredWeights) == 2 && recoveredWeights[channelA] == 2 && recoveredWeights[channelB] == 1,
+		"the recovered secret must carry weights A=2, B=1, got %v", recoveredWeights)
+	fmt.Println("  SecretRecovered carries t=3 and weights A=2, B=1  ✓")
+
+	restoreEvents, err := device.proto.Restore(*recovered, v1)
+	must(err, "device.Restore")
+	started := map[uint64]bool{}
+	for _, ev := range restoreEvents {
+		assertTrue(ev.Type != protocol.EventTypeUnpaired,
+			"Restore must wait for the recovery helpers' answers, got %+v", restoreEvents)
+		if ev.Type == protocol.EventTypeUnpairStarted {
+			started[ev.ChannelID] = true
+		}
+	}
+	assertTrue(len(started) == 2 && started[recoveryA] && started[recoveryB],
+		"Restore must start unpairing both recovery channels, got %+v", restoreEvents)
+	for _, c := range []uint64{recoveryA, recoveryB} {
+		record, ok, err := device.channelStore.Load(protocolSecretID, c, 0)
+		must(err, "device.channelStore.Load")
+		assertTrue(ok && record.Helper != nil && record.Helper.Status == protocol.ChannelStatusUnpairing,
+			"recovery channel %d must be Unpairing until its helper answers", c)
+	}
+	// The helpers' acknowledgements land on channels that still exist, so
+	// Process ends each one rather than failing on an unknown channel.
+	unpaired := map[uint64]bool{}
+	for _, ev := range pumpMany(all) {
+		if ev.Type == protocol.EventTypeUnpaired {
+			unpaired[ev.ChannelID] = true
+		}
+	}
+	assertTrue(unpaired[recoveryA] && unpaired[recoveryB],
+		"the recovery helpers' answers must unpair both recovery channels, got %v", unpaired)
+	fmt.Println("  Restore unpairs the recovery channels once their helpers answer  ✓")
+	snapshot, ok, err := device.userSecrets.LoadLatest(protocolSecretID)
+	must(err, "device.userSecrets.LoadLatest")
+	assertTrue(ok && snapshot.Version == v1 && subsharesText(snapshot.Threshold) == "3",
+		"Restore must store v%d at t=3 over the configured 2, got ok=%v v%d t=%s",
+		v1, ok, snapshot.Version, subsharesText(snapshot.Threshold))
+	storedWeights := map[uint64]uint32{}
+	for _, c := range []uint64{channelA, channelB} {
+		record, ok, err := device.channelStore.Load(protocolSecretID, c, 0)
+		must(err, "device.channelStore.Load")
+		assertTrue(ok && record.Helper != nil, "Restore must write helper channel %d", c)
+		storedWeights[c] = record.Helper.Weight
+	}
+	assertTrue(storedWeights[channelA] == 2 && storedWeights[channelB] == 1,
+		"Restore must store weights A=2, B=1, got %v", storedWeights)
+	fmt.Println("  Restore stores t=3 and HelperChannel.Weight A=2, B=1  ✓")
+
+	events, err = device.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: snapshot.Secrets,
+		Weights: storedWeights,
+	})
+	must(err, "device.Start(ProtectSecret) after Restore")
+	var v2 uint32
+	republished := map[uint64]uint32{}
+	for _, ev := range events {
+		assertTrue(ev.Type != protocol.EventTypeProtectSecretFailed, "republish emitted ProtectSecretFailed: %+v", ev)
+		if ev.Type == protocol.EventTypeProtectSecretStarted && ev.Weight != nil && ev.Version != nil {
+			republished[ev.ChannelID] = *ev.Weight
+			v2 = *ev.Version
+		}
+	}
+	assertTrue(v2 > v1 && republished[channelA] == 2 && republished[channelB] == 1,
+		"the republish must be a newer version with weights A=2, B=1; got v%d %v", v2, republished)
+	confirmed := 0
+	for _, ev := range pumpMany(all) {
+		if ev.Type == protocol.EventTypeShareConfirmed {
+			confirmed++
+		}
+	}
+	assertTrue(confirmed == 2, "both helpers must confirm the republish, got %d", confirmed)
+	for _, c := range []uint64{channelA, channelB} {
+		assertTrue(storedThreshold(device, c, v2) == "3",
+			"the republish must split at the restored t=3, got %s", storedThreshold(device, c, v2))
+	}
+	assertTrue(storedSubshares(device, channelA, v2) == "2" && storedSubshares(device, channelB, v2) == "1",
+		"the republish must give A=2, B=1 subshares, got A=%s, B=%s",
+		storedSubshares(device, channelA, v2), storedSubshares(device, channelB, v2))
+	fmt.Printf("  republish v%d with the stored weights splits at t=3 with A=2, B=1, both helpers confirm  ✓\n", v2)
+
+	events, err = device.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+		SecretID: protocolSecretID,
+		Version:  v1,
+		Target:   protocol.TargetAll(),
+	})
+	must(err, "device.Start(VerifyShares) of the recovered version")
+	noProof := map[uint64]bool{}
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeVerifySharesFailed && ev.Reason == protocol.VerifyFailureReasonNoProof {
+			noProof[ev.ChannelID] = true
+		}
+	}
+	assertTrue(noProof[channelA] && noProof[channelB],
+		"Restore writes no proof, so verifying v%d must fail with NoProof on both helpers; got %+v", v1, events)
+	assertTrue(len(device.drain()) == 0, "no challenge may be sent without a proof to check the answer against")
+	fmt.Printf("  verifying the recovered v%d → VerifySharesFailed(NoProof) on both helpers, nothing sent  ✓\n", v1)
+
+	fmt.Println("Protocol recover → restore → republish test passed.")
+}
+
+// runHelperShareRefused gives one helper a ParameterRange whose share-size
+// bound every share exceeds. The helper refuses the share itself, before any
+// ActionRequired, and the owner sees the same status and memo.
+func runHelperShareRefused() {
+	fmt.Println("=== Protocol helper share-size refusal test ===")
+
+	owner := newPeer("owner", "https://owner-size.example.com", 2)
+	helperA, err := newPeerWithConfig("helper-a", "https://helper-a-size.example.com", protocol.Config{
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold:      proto.Uint32(2),
+			ParameterRange: &protocol.ParameterRange{MinShareSize: 1, MaxShareSize: 16},
+		},
+	})
+	must(err, "protocol.New(helper-a, bounded)")
+	helperB := newPeer("helper-b", "https://helper-b-size.example.com", 2)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+
+	channelA := pairPeers(owner, helperA, 1)
+	channelB := pairPeers(owner, helperB, 2)
+
+	events, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{12}, Name: "oversized", Data: []byte("larger than sixteen bytes")}},
+	})
+	must(err, "owner.Start(ProtectSecret)")
+	var version uint32
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeProtectSecretStarted && ev.Version != nil {
+			version = *ev.Version
+		}
+	}
+
+	var refused, rejected []protocol.Event
+	stored := map[uint64]bool{}
+	for _, ev := range pumpMany([]*peer{owner, helperA, helperB}) {
+		switch ev.Type {
+		case protocol.EventTypeShareRefused:
+			refused = append(refused, ev)
+		case protocol.EventTypeShareRejected:
+			rejected = append(rejected, ev)
+		case protocol.EventTypeShareStored:
+			stored[ev.ChannelID] = true
+		}
+	}
+	assertTrue(len(refused) == 1 && refused[0].ChannelID == channelA &&
+		refused[0].Version != nil && *refused[0].Version == version &&
+		refused[0].Status == derecpb.StatusEnum_SIZE_LIMIT_EXCEEDED && refused[0].Memo != "",
+		"helper-a must report one ShareRefused(SIZE_LIMIT_EXCEEDED) for v%d, got %+v", version, refused)
+	assertTrue(len(rejected) == 1 && rejected[0].ChannelID == channelA &&
+		rejected[0].Status == derecpb.StatusEnum_SIZE_LIMIT_EXCEEDED && rejected[0].Memo == refused[0].Memo,
+		"the owner must see one ShareRejected(SIZE_LIMIT_EXCEEDED) with the helper's memo, got %+v", rejected)
+	assertTrue(!stored[channelA] && stored[channelB], "only helper-b may store its share, got %v", stored)
+	held, err := helperA.shareStore.Load(protocolSecretID, channelA, nil)
+	must(err, "helper-a shareStore.Load")
+	assertTrue(len(held) == 0, "a refused share must not reach the helper's store, got %d", len(held))
+	fmt.Printf("  helper-a ShareRefused(SIZE_LIMIT_EXCEEDED, %q); owner ShareRejected with the same status and memo  ✓\n", refused[0].Memo)
+	fmt.Println("Protocol helper share-size refusal test passed.")
+}
+
+// runProtocolInvalidWeight checks that Start(ProtectSecret) refuses a weight
+// that is not below the threshold, and a weight keyed by an id that names no
+// paired channel, with CodeInvalidWeight before anything is sent or stored.
+func runProtocolInvalidWeight() {
+	fmt.Println("=== Protocol invalid weight test ===")
+
+	const threshold = 3
+	owner := newPeer("owner", "https://owner-invalid-weight.example.com", threshold)
+	helperA := newPeer("helper-a", "https://helper-a-invalid-weight.example.com", threshold)
+	helperB := newPeer("helper-b", "https://helper-b-invalid-weight.example.com", threshold)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+
+	channelA := pairPeers(owner, helperA, 1)
+	pairPeers(owner, helperB, 2)
+	owner.drain()
+
+	for _, c := range []struct {
+		label   string
+		weights map[uint64]uint32
+	}{
+		{"a weight equal to the threshold", map[uint64]uint32{channelA: threshold}},
+		{"a weight keyed by the transient pairing id", map[uint64]uint32{1: 2}},
+	} {
+		var startErr *derec.Error
+		_, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+			Secrets: []protocol.UserSecret{{ID: []byte{13}, Name: "invalid weight", Data: []byte("payload")}},
+			Weights: c.weights,
+		})
+		assertTrue(errors.As(err, &startErr) && startErr.Code == derec.CodeInvalidWeight,
+			"%s must fail with CodeInvalidWeight (65), got %v", c.label, err)
+		assertTrue(len(owner.drain()) == 0, "%s must send nothing", c.label)
+		_, ok, err := owner.userSecrets.LoadLatest(protocolSecretID)
+		must(err, "owner.userSecrets.LoadLatest")
+		assertTrue(!ok, "%s must store no snapshot", c.label)
+		fmt.Printf("  %s → CodeInvalidWeight, nothing sent or stored  ✓\n", c.label)
+	}
+	fmt.Println("Protocol invalid weight test passed.")
+}
+
+// runAutoRespondOnFailure is runRequestFailedToken with AutoRespondOnFailure
+// on: the library answers the failed request itself, so the RequestFailed event
+// carries no token and the owner observes the response the library sent.
+func runAutoRespondOnFailure() {
+	fmt.Println("=== Protocol failed request answered by the library test ===")
+
+	owner := newPeer("owner", "https://owner-autorespond.example.com", 2)
+	helperA, err := newPeerWithConfig("helper-a", "https://helper-a-autorespond.example.com", protocol.Config{
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold:            proto.Uint32(2),
+			AutoRespondOnFailure: proto.Bool(true),
+		},
+	})
+	must(err, "protocol.New(helper-a, auto-respond)")
+	helperB := newPeer("helper-b", "https://helper-b-autorespond.example.com", 2)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+
+	channelA := pairPeers(owner, helperA, 1)
+	pairPeers(owner, helperB, 2)
+
+	helperA.shareStore.mu.Lock()
+	helperA.shareStore.failSaves = true
+	helperA.shareStore.mu.Unlock()
+	events, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{14}, Name: "failing", Data: []byte("payload")}},
+	})
+	must(err, "owner.Start(ProtectSecret)")
+	var version uint32
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeProtectSecretStarted && ev.Version != nil {
+			version = *ev.Version
+		}
+	}
+	assertTrue(version != 0, "Start(ProtectSecret) must emit ProtectSecretStarted, got %+v", events)
+
+	var ownerEvents []protocol.Event
+	var failed []protocol.Event
+	for _, entry := range owner.drain() {
+		var target *peer
+		switch entry.uri {
+		case helperA.uri:
+			target = helperA
+		case helperB.uri:
+			target = helperB
+		default:
+			fail("no peer for destination uri %s", entry.uri)
+		}
+		for _, ev := range deliver(target, entry.message) {
+			if ev.Type == protocol.EventTypeRequestFailed {
+				failed = append(failed, ev)
+			}
+		}
+		for _, reply := range target.drain() {
+			ownerEvents = append(ownerEvents, deliver(owner, reply.message)...)
+		}
+	}
+	assertTrue(len(failed) == 1, "helper-a must report one RequestFailed, got %+v", failed)
+	rf := failed[0]
+	assertTrue(rf.ChannelID == channelA && rf.ActionKind == protocol.ActionKindStoreShare &&
+		rf.Responded && len(rf.Action) == 0 && rf.ErrorCode != "" &&
+		rf.Status == derecpb.StatusEnum_FAIL && rf.Memo == "request could not be processed",
+		"unexpected RequestFailed: %+v", rf)
+	fmt.Printf("  helper-a Save fails → RequestFailed(action_kind=%s, responded=true, no token, status=%s, memo=%q)  ✓\n",
+		rf.ActionKind, rf.Status, rf.Memo)
+
+	var rejected []protocol.Event
+	for _, ev := range ownerEvents {
+		if ev.Type == protocol.EventTypeShareRejected {
+			rejected = append(rejected, ev)
+		}
+	}
+	assertTrue(len(rejected) == 1 && rejected[0].ChannelID == channelA &&
+		rejected[0].Version != nil && *rejected[0].Version == version &&
+		rejected[0].Status == derecpb.StatusEnum_FAIL && rejected[0].Memo == "request could not be processed",
+		"expected one ShareRejected(FAIL, generic memo) from helper-a, got %+v", rejected)
+	fmt.Println("  the library's own response reaches the owner as ShareRejected(status=FAIL, same memo)  ✓")
+	fmt.Println("Protocol failed request answered by the library test passed.")
+}
+
+// runVerificationResponseVerdicts covers the verdicts on a verification
+// answer that does not prove the share: the answer to a challenge a newer one
+// replaced is ignored as StaleResponse, a proof over bytes that differ from the
+// owner's is ShareVerifyInvalid, and a message whose plaintext envelope
+// timestamp differs from the encrypted inner one is ignored as
+// TimestampMismatch.
+func runVerificationResponseVerdicts() {
+	fmt.Println("=== Protocol verification response verdicts test ===")
+
+	owner := newPeer("owner", "https://owner-verdicts.example.com", 2)
+	helperA := newPeer("helper-a", "https://helper-a-verdicts.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-verdicts.example.com", 2)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+
+	channelA := pairPeers(owner, helperA, 1)
+	pairPeers(owner, helperB, 2)
+
+	events, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{15}, Name: "verdicts", Data: []byte("verdicts")}},
+	})
+	must(err, "owner.Start(ProtectSecret)")
+	var version uint32
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeProtectSecretStarted && ev.Version != nil {
+			version = *ev.Version
+		}
+	}
+	pumpMany([]*peer{owner, helperA, helperB})
+
+	challenge := func() (uint64, []byte) {
+		events, err := owner.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+			SecretID: protocolSecretID,
+			Version:  version,
+			Target:   protocol.TargetOne(channelA),
+		})
+		must(err, "owner.Start(VerifyShares)")
+		var traceID uint64
+		for _, ev := range events {
+			if ev.Type == protocol.EventTypeVerifySharesStarted {
+				traceID = ev.TraceID
+			}
+		}
+		sent := owner.drain()
+		assertTrue(len(sent) == 1, "VerifyShares on one channel must send one challenge, sent %d", len(sent))
+		return traceID, sent[0].message
+	}
+	answer := func(challenge []byte) []byte {
+		deliver(helperA, challenge)
+		sent := helperA.drain()
+		assertTrue(len(sent) == 1, "helper-a must answer the challenge once, sent %d", len(sent))
+		return sent[0].message
+	}
+
+	firstTrace, firstChallenge := challenge()
+	_, secondChallenge := challenge()
+	firstAnswer := answer(firstChallenge)
+	secondAnswer := answer(secondChallenge)
+	stale, err := owner.proto.Process(firstAnswer)
+	must(err, "owner.Process(stale answer)")
+	assertTrue(len(stale) == 1 && stale[0].Type == protocol.EventTypeMessageIgnored &&
+		stale[0].Reason == protocol.IgnoreReasonStaleResponse && stale[0].ChannelID == channelA &&
+		stale[0].TraceID == firstTrace,
+		"the replaced challenge's answer must be MessageIgnored(StaleResponse, trace %d), got %+v", firstTrace, stale)
+	current, err := owner.proto.Process(secondAnswer)
+	must(err, "owner.Process(current answer)")
+	assertTrue(slices.ContainsFunc(current, func(ev protocol.Event) bool {
+		return ev.Type == protocol.EventTypeShareVerified && ev.ChannelID == channelA
+	}), "the current challenge's answer must still verify, got %+v", current)
+	fmt.Println("  answer to a replaced challenge → MessageIgnored(StaleResponse); current answer → ShareVerified  ✓")
+
+	// helper-a's stored share no longer matches the bytes the owner holds a
+	// proof of, as after storage corruption.
+	held, err := helperA.shareStore.Load(protocolSecretID, channelA, []uint32{version})
+	must(err, "helper-a shareStore.Load")
+	assertTrue(len(held) == 1, "helper-a must hold one share at v%d, got %d", version, len(held))
+	var request derecpb.StoreShareRequestMessage
+	must(proto.Unmarshal(held[0].Bytes, &request), "decode helper-a's stored StoreShareRequestMessage")
+	request.Share[len(request.Share)/2] ^= 0xFF
+	corrupted := held[0]
+	corrupted.Bytes, err = proto.Marshal(&request)
+	must(err, "encode the corrupted StoreShareRequestMessage")
+	must(helperA.shareStore.Save(protocolSecretID, channelA, corrupted), "helper-a shareStore.Save(corrupted)")
+	_, invalidChallenge := challenge()
+	invalid, err := owner.proto.Process(answer(invalidChallenge))
+	must(err, "owner.Process(proof over corrupted bytes)")
+	assertTrue(len(invalid) == 1 && invalid[0].Type == protocol.EventTypeShareVerifyInvalid &&
+		invalid[0].ChannelID == channelA && invalid[0].Version != nil && *invalid[0].Version == version,
+		"a proof over corrupted bytes must be ShareVerifyInvalid, got %+v", invalid)
+	fmt.Println("  proof over helper-a's corrupted share → ShareVerifyInvalid  ✓")
+
+	_, tsChallenge := challenge()
+	var envelope derecpb.DeRecMessage
+	must(proto.Unmarshal(tsChallenge, &envelope), "decode the challenge envelope")
+	envelope.Timestamp.Nanos = (envelope.Timestamp.Nanos + 1) % 1_000_000_000
+	mismatched, err := proto.Marshal(&envelope)
+	must(err, "encode the re-stamped envelope")
+	ignored, err := helperA.proto.Process(mismatched)
+	must(err, "helper-a.Process(mismatched timestamp)")
+	assertTrue(len(ignored) == 1 && ignored[0].Type == protocol.EventTypeMessageIgnored &&
+		ignored[0].Reason == protocol.IgnoreReasonTimestampMismatch && ignored[0].ChannelID == channelA,
+		"a mismatched envelope timestamp must be MessageIgnored(TimestampMismatch), got %+v", ignored)
+	assertTrue(len(helperA.drain()) == 0, "a message ignored for its timestamp must not be answered")
+	fmt.Println("  envelope timestamp ≠ inner timestamp → MessageIgnored(TimestampMismatch), nothing sent  ✓")
+
+	fmt.Println("Protocol verification response verdicts test passed.")
 }

@@ -120,24 +120,36 @@ jsi::Value toUint8ArrayVal(jsi::Runtime& rt, const std::vector<uint8_t>& bytes) 
 }
 
 uint64_t asU64(jsi::Runtime& rt, const jsi::Value& value) {
+  auto reject = [&]() -> uint64_t {
+    throw jsi::JSError(rt, "expected an integer in 0..=18446744073709551615");
+  };
   if (value.isBigInt()) {
-    return value.asBigInt(rt).asUint64(rt);
+    jsi::BigInt big = value.getBigInt(rt);
+    return big.isUint64(rt) ? big.getUint64(rt) : reject();
   }
-  return static_cast<uint64_t>(value.asNumber());
+  if (!value.isNumber()) {
+    return reject();
+  }
+  double number = value.getNumber();
+  // 18446744073709551616.0 is 2^64, the first double above `uint64_t`'s range.
+  if (!(number >= 0.0) || number >= 18446744073709551616.0 || std::trunc(number) != number) {
+    return reject();
+  }
+  return static_cast<uint64_t>(number);
 }
 
 namespace {
 
-/// Read one element of an integer array losslessly: a `bigint` or `number`
-/// holding an integer in `0..=max`. Anything else throws, so a value is never
-/// truncated, rounded, or wrapped on its way to the core.
-uint64_t asArrayInteger(jsi::Runtime& rt,
-                        const char* name,
-                        const jsi::Value& element,
-                        uint64_t max,
-                        const char* range) {
+/// Read an integer losslessly: a `bigint` or `number` holding an integer in
+/// `0..=max`. Anything else throws `<name> expects <expected>`, so a value is
+/// never truncated, rounded, or wrapped on its way to the core.
+uint64_t asBoundedInteger(jsi::Runtime& rt,
+                          const char* name,
+                          const jsi::Value& element,
+                          uint64_t max,
+                          const std::string& expected) {
   auto reject = [&]() -> uint64_t {
-    throw jsi::JSError(rt, std::string(name) + " expects an array of integers in " + range);
+    throw jsi::JSError(rt, std::string(name) + " expects " + expected);
   };
   if (element.isBigInt()) {
     jsi::BigInt big = element.getBigInt(rt);
@@ -157,6 +169,25 @@ uint64_t asArrayInteger(jsi::Runtime& rt,
   }
   auto integer = static_cast<uint64_t>(number);
   return integer <= max ? integer : reject();
+}
+
+/// Read one element of an integer array with `asBoundedInteger`.
+uint64_t asArrayInteger(jsi::Runtime& rt,
+                        const char* name,
+                        const jsi::Value& element,
+                        uint64_t max,
+                        const char* range) {
+  return asBoundedInteger(rt, name, element, max, std::string("an array of integers in ") + range);
+}
+
+/// Read the scalar argument `argument` with `asBoundedInteger`.
+uint64_t asScalarInteger(jsi::Runtime& rt,
+                         const char* name,
+                         const char* argument,
+                         const jsi::Value& value,
+                         uint64_t max) {
+  return asBoundedInteger(rt, name, value, max,
+                          std::string(argument) + " to be an integer in 0..=" + std::to_string(max));
 }
 
 /// Read a JS array of `bigint`/`number` elements as a `uint64_t` vector.
@@ -374,9 +405,11 @@ jsi::Value createContactMessage(jsi::Runtime& rt,
                                 size_t count) {
   requireArgs(rt, "create_contact_message", count, 5);
   uint64_t channelId = asU64(rt, args[0]);
-  auto contactMode = static_cast<int32_t>(args[1].asNumber());
+  auto contactMode = static_cast<int32_t>(asScalarInteger(
+      rt, "create_contact_message", "contact_mode", args[1], std::numeric_limits<int32_t>::max()));
   ByteView transportProtocols = asBytes(rt, args[2]);
-  auto hasNonce = static_cast<uint32_t>(args[3].asNumber());
+  auto hasNonce = static_cast<uint32_t>(asScalarInteger(
+      rt, "create_contact_message", "has_nonce", args[3], std::numeric_limits<uint32_t>::max()));
   uint64_t nonce = asU64(rt, args[4]);
   CreateContactMessageResult result = create_contact_message(
       channelId, contactMode, transportProtocols.ptr, transportProtocols.len,
@@ -450,7 +483,8 @@ jsi::Value decodeMessageJson(jsi::Runtime& rt,
                              const jsi::Value* args,
                              size_t count) {
   requireArgs(rt, "decode_message_json", count, 2);
-  auto kind = static_cast<int32_t>(args[0].asNumber());
+  auto kind = static_cast<int32_t>(asScalarInteger(
+      rt, "decode_message_json", "kind", args[0], std::numeric_limits<int32_t>::max()));
   ByteView proto = asBytes(rt, args[1]);
   DeRecMessageJsonResult result =
       derec_decode_message_json(kind, proto.ptr, proto.len);
@@ -470,7 +504,8 @@ jsi::Value encodeMessageJson(jsi::Runtime& rt,
                              const jsi::Value* args,
                              size_t count) {
   requireArgs(rt, "encode_message_json", count, 2);
-  auto kind = static_cast<int32_t>(args[0].asNumber());
+  auto kind = static_cast<int32_t>(asScalarInteger(
+      rt, "encode_message_json", "kind", args[0], std::numeric_limits<int32_t>::max()));
   ByteView json = asBytes(rt, args[1]);
   DeRecMessageJsonResult result =
       derec_encode_message_json(kind, json.ptr, json.len);
@@ -491,7 +526,8 @@ jsi::Value producePairRequestMessage(jsi::Runtime& rt,
                                      const jsi::Value* args,
                                      size_t count) {
   requireArgs(rt, "produce_pair_request_message", count, 5);
-  auto senderKind = static_cast<int32_t>(args[0].asNumber());
+  auto senderKind = static_cast<int32_t>(asScalarInteger(
+      rt, "produce_pair_request_message", "sender_kind", args[0], std::numeric_limits<int32_t>::max()));
   ByteView transportProtocols = asBytes(rt, args[1]);
   ByteView contactMessage = asBytes(rt, args[2]);
   ByteView communicationInfo = asBytes(rt, args[3]);
@@ -834,7 +870,8 @@ jsi::Value produceGetShareRequestMessage(jsi::Runtime& rt,
   requireArgs(rt, "produce_get_share_request_message", count, 5);
   uint64_t channelId = asU64(rt, args[0]);
   uint64_t secretId = asU64(rt, args[1]);
-  auto version = static_cast<uint32_t>(args[2].asNumber());
+  auto version = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_get_share_request_message", "version", args[2], std::numeric_limits<uint32_t>::max()));
   ByteView sharedKey = asBytes(rt, args[3]);
   ByteView replyTo = asBytes(rt, args[4]);
   ProduceGetShareRequestMessageResult result = produce_get_share_request_message(
@@ -924,7 +961,8 @@ jsi::Value recoverFromShareResponses(jsi::Runtime& rt,
   requireArgs(rt, "recover_from_share_responses", count, 3);
   ByteView responses = asBytes(rt, args[0]);
   uint64_t secretId = asU64(rt, args[1]);
-  auto version = static_cast<uint32_t>(args[2].asNumber());
+  auto version = static_cast<uint32_t>(asScalarInteger(
+      rt, "recover_from_share_responses", "version", args[2], std::numeric_limits<uint32_t>::max()));
   RecoverFromShareResponsesResult result = recover_from_share_responses(
       responses.ptr, responses.len, secretId, version);
   if (result.error.code != 0) {
@@ -951,8 +989,10 @@ jsi::Value protectSecret(jsi::Runtime& rt,
                        "protect_secret: channels and weights must have "
                        "the same length");
   }
-  auto threshold = static_cast<size_t>(args[4].asNumber());
-  auto version = static_cast<uint32_t>(args[5].asNumber());
+  auto threshold = static_cast<size_t>(asScalarInteger(
+      rt, "protect_secret", "threshold", args[4], std::numeric_limits<size_t>::max()));
+  auto version = static_cast<uint32_t>(asScalarInteger(
+      rt, "protect_secret", "version", args[5], std::numeric_limits<uint32_t>::max()));
   ProtectSecretResult result = protect_secret(
       secretId, secretData.ptr, secretData.len, channels.data(),
       weights.data(), channels.size(), threshold, version);
@@ -973,7 +1013,8 @@ jsi::Value produceStoreShareRequestMessage(jsi::Runtime& rt,
                                           size_t count) {
   requireArgs(rt, "produce_store_share_request_message", count, 8);
   uint64_t channelId = asU64(rt, args[0]);
-  auto version = static_cast<uint32_t>(args[1].asNumber());
+  auto version = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_store_share_request_message", "version", args[1], std::numeric_limits<uint32_t>::max()));
   uint64_t secretId = asU64(rt, args[2]);
   ByteView committedShare = asBytes(rt, args[3]);
   std::vector<uint32_t> keepList = asU32Array(rt, "produce_store_share_request_message", args[4]);
@@ -1080,7 +1121,8 @@ jsi::Value processStoreShareResponseMessage(jsi::Runtime& rt,
                                            const jsi::Value* args,
                                            size_t count) {
   requireArgs(rt, "process_store_share_response_message", count, 2);
-  auto version = static_cast<uint32_t>(args[0].asNumber());
+  auto version = static_cast<uint32_t>(asScalarInteger(
+      rt, "process_store_share_response_message", "version", args[0], std::numeric_limits<uint32_t>::max()));
   ByteView responseProto = asBytes(rt, args[1]);
   ProcessStoreShareResponseMessageResult result =
       process_store_share_response_message(version, responseProto.ptr,
@@ -1204,7 +1246,8 @@ jsi::Value produceVerifyShareRequestMessage(jsi::Runtime& rt,
   requireArgs(rt, "produce_verify_share_request_message", count, 5);
   uint64_t channelId = asU64(rt, args[0]);
   uint64_t secretId = asU64(rt, args[1]);
-  auto version = static_cast<uint32_t>(args[2].asNumber());
+  auto version = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_verify_share_request_message", "version", args[2], std::numeric_limits<uint32_t>::max()));
   ByteView sharedKey = asBytes(rt, args[3]);
   ByteView replyTo = asBytes(rt, args[4]);
   ProduceVerifyShareRequestMessageResult result =

@@ -474,7 +474,7 @@ async fn reject_start_on_paired_channel<S: StoreSet>(
             crate::protocol::types::ChannelQuery::Helper { channel_id },
         )
         .await?
-        && record.status() == crate::protocol::types::ChannelStatus::Paired
+        && record.status() != crate::protocol::types::ChannelStatus::Pending
     {
         return Err(Error::ChannelAlreadyPaired { channel_id });
     }

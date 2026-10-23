@@ -46,7 +46,7 @@ use crate::flows::assertions::{
     snapshot_version,
 };
 use crate::peer::PeerOptions;
-use crate::stateless::{StatelessPeer, deliver, pump, pump_tolerating_stale};
+use crate::stateless::{StatelessPeer, deliver, pump};
 
 /// The partition every peer in this scenario stores under.
 const SECRET_ID: u64 = 0x0005_CE1A;
@@ -1360,26 +1360,40 @@ async fn recover_from_helpers(
             .expect("expected SecretRecovered")
     };
 
-    owner
+    let restore_events = owner
         .session()
         .restore(&recovered, version)
         .await
         .expect("owner.restore() failed");
+    let recovery_channels: Vec<ChannelId> = restore_events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::UnpairStarted { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        recovery_channels.len(),
+        helpers.len(),
+        "restore starts one unpair per recovery channel"
+    );
 
-    // Restore unpairs the recovery-mode channels as scrap; those teardown
-    // messages are on the wire and have to land, or the helpers would keep a
-    // channel the owner has already forgotten. Each helper acknowledges, and
-    // those acknowledgements arrive at an owner that has already dropped the
-    // key — by design, so they are counted rather than fatal.
+    // Restore unpairs the recovery-mode channels like any other unpair: each
+    // stays `Unpairing` until its helper answers, so the answers land on
+    // channels that still exist and `pump` (which fails on any processing
+    // error) ends every one of them.
     {
         let mut cast: Vec<&StatelessPeer> = vec![owner];
         cast.extend(helpers.iter().map(|h| &h.peer));
-        let (_, stale) = pump_tolerating_stale(&cast).await;
-        assert_eq!(
-            stale,
-            helpers.len(),
-            "exactly one stale unpair acknowledgement per scrapped recovery channel"
-        );
+        let events = pump(&cast).await;
+        for channel_id in &recovery_channels {
+            assert!(
+                events.iter().any(
+                    |e| matches!(e, DeRecEvent::Unpaired { channel_id: c } if c == channel_id)
+                ),
+                "the helper's answer must unpair recovery channel {channel_id:?}"
+            );
+        }
     }
 
     (version, recovered)

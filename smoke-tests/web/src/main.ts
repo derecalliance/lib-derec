@@ -7,6 +7,7 @@
 
 import { init } from "@derec-alliance/web";
 import { runChannelFilterConformance } from "./channelFilterConformance";
+import { runEventFixtureConformance } from "./eventFixture";
 import { runPrimitivesSmoke } from "./primitives";
 import { runProtocolSmoke } from "./protocol";
 import { runProtocolVersionSmoke } from "./protocolVersion";
@@ -19,6 +20,8 @@ async function main(): Promise<void> {
   console.log("╚══════════════════════════════════════════╝\n");
 
   runChannelFilterConformance();
+
+  runEventFixtureConformance();
 
   runProtocolVersionSmoke();
 

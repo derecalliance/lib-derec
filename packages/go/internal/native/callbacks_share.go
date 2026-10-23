@@ -234,8 +234,6 @@ func dispatchShareRemoveChannel(s *storeSet, secretID, channelID uint64) (status
 	return ffiStatusOK
 }
 
-// --- C-facing callbacks ------------------------------------------------------
-
 func dispatchShareRemoveVersions(s *storeSet, secretID, channelID uint64, versionsJSON []byte) (status int32) {
 	defer recoverInto(&status)
 	versions, err := DecodeUint32Array(versionsJSON)
@@ -263,6 +261,8 @@ func dispatchShareKeepList(s *storeSet, secretID uint64, version uint32) (status
 	}
 	return ffiStatusOK, encoded
 }
+
+// --- C-facing callbacks ------------------------------------------------------
 
 func shareLoadCallback(userData uintptr, secretID, channelID uint64, versionsPtr *byte, versionsLen uintptr, outPtr, outLen *uintptr) (status int32) {
 	defer recoverInto(&status)
@@ -338,12 +338,6 @@ func shareRemoveChannelCallback(userData uintptr, secretID, channelID uint64) (s
 	return dispatchShareRemoveChannel(s, secretID, channelID)
 }
 
-// shareCallbackPtrs holds the purego.NewCallback address for every
-// ShareStoreCallbacks fn-pointer field except FreeBuffer (shared package-
-// wide via sharedFreeBufferCallback). These six functions are stateless
-// package-level funcs, so each needs exactly one registration total — see
-// registerChannelCallbacks in callbacks_channel.go for why per-call
-// registration would exhaust purego's 2000-slot callback table.
 func shareRemoveVersionsCallback(userData uintptr, secretID, channelID uint64, versionsPtr *byte, versionsLen uintptr) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
@@ -376,6 +370,12 @@ func shareRecordVerificationCallback(userData uintptr, secretID, channelID uint6
 	return dispatchShareRecordVerification(s, secretID, channelID, version)
 }
 
+// shareCallbackPtrs holds the purego.NewCallback address for every
+// ShareStoreCallbacks fn-pointer field except FreeBuffer (shared package-
+// wide via sharedFreeBufferCallback). These nine functions are stateless
+// package-level funcs, so each needs exactly one registration total — see
+// registerChannelCallbacks in callbacks_channel.go for why per-call
+// registration would exhaust purego's 2000-slot callback table.
 var (
 	shareCallbacksOnce sync.Once
 	shareCallbackPtrs  struct {

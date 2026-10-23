@@ -682,10 +682,23 @@ await init();
 ## Refusing a share or a verification
 
 A helper enforces share size itself: with a parameter range configured, a
-share outside its own `minShareSize`/`maxShareSize` (inclusive; a max of `0` means
+share outside its own `min_share_size`/`max_share_size` (inclusive; a max of `0` means
 unbounded) is answered with `SIZE_LIMIT_EXCEEDED` before any
-`ActionRequired` or auto-accept. Frequency limits on share updates and
-verifications are the application's to enforce, from its share store.
+`ActionRequired` or auto-accept. A share that does not decode
+(`FORMAT_ERROR`), does not verify against its commitment
+(`VERIFICATION_FAILED`) or differs from the one already stored at its version
+(`VERSION_CONFLICT`) is refused the same way. Nothing is stored, and the
+helper itself receives a `ShareRefused` event carrying the `status` and `memo`
+the owner was answered with; the owner sees `ShareRejected`. Frequency limits
+on share updates and verifications are the application's to enforce, from its
+share store.
+
+A replica destination checks a group member's copy of the secret the same
+way: a copy that does not decode or is not self-consistent (`FORMAT_ERROR`), or
+whose share map does not verify (`VERIFICATION_FAILED`), is refused before
+anything is written, and the destination receives `ReplicaSecretRefused`. On a
+push the publisher is answered with that `status` and `memo` and sees
+`ReplicaSyncRejected`; a copy served by a catch-up is not answered.
 
 On a helper channel, throw (or reject with) `shareStoreRefusal(reason)` from
 `ShareStore.save` (a genuinely new share version) or

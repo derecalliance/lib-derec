@@ -4,6 +4,9 @@
 #[cfg(any(feature = "ffi", target_arch = "wasm32"))]
 pub(crate) mod wire;
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::HashMap;
 
 use crate::{
@@ -1629,8 +1632,9 @@ pub enum DeRecEvent {
 
     /// The peer answered an outbound unpair request with a non-`Ok` status.
     ///
-    /// The initiator's local state is **not** dropped — the application
-    /// decides what to do (retry, escalate, or force-delete locally).
+    /// The initiator's local state is **not** dropped, and the channel is
+    /// `Paired` again — the application decides what to do (retry, escalate,
+    /// or force-delete locally).
     UnpairRejected {
         channel_id: ChannelId,
         /// The `StatusEnum` value from the peer's response.
@@ -1885,20 +1889,24 @@ pub enum DeRecEvent {
     /// An unpair request could not be dispatched to `channel_id`.
     ///
     /// Emitted by [`super::DeRecProtocol::restore`] when tearing down the
-    /// ephemeral recovery channels. The teardown is fire-and-forget, so
-    /// the peer's reachability was never load-bearing: local state is
-    /// dropped anyway and a [`Self::Unpaired`] for the same channel
-    /// follows. The pair reports "the channel is gone locally, but the
+    /// ephemeral recovery channels. A helper gone away is the expected
+    /// condition during recovery and the restore has already committed, so
+    /// the peer's reachability is not load-bearing: local state is dropped
+    /// anyway and a [`Self::Unpaired`] for the same channel follows. The pair reports "the channel is gone locally, but the
     /// peer was not told" — the application may notify it out-of-band.
     UnpairFailed {
         channel_id: ChannelId,
         error: String,
     },
 
-    /// An unpair request was dispatched to `channel_id`. Followed by
-    /// [`Self::Unpaired`] once the peer acknowledges (or, under
-    /// [`UnpairAck::NotRequired`], emitted in the same event vec
-    /// immediately after `UnpairStarted`).
+    /// An unpair request was dispatched to `channel_id`, by
+    /// `start(Unpair)` or by `restore` for each recovery channel. Under
+    /// [`UnpairAck::Required`] the channel is now
+    /// [`ChannelStatus::Unpairing`](crate::protocol::types::ChannelStatus::Unpairing),
+    /// and [`Self::Unpaired`] follows once the peer acknowledges or the
+    /// acknowledgement window elapses, or [`Self::UnpairRejected`] if the
+    /// peer refuses. Under [`UnpairAck::NotRequired`], `Unpaired` is
+    /// emitted in the same event vec immediately after `UnpairStarted`.
     UnpairStarted {
         channel_id: ChannelId,
         /// Correlates this request with the response it will draw, and with
@@ -1925,199 +1933,4 @@ pub enum DeRecEvent {
         channel_id: ChannelId,
         error: String,
     },
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use derec_proto::{
-        GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PrePairRequestMessage,
-        StoreShareRequestMessage, UnpairRequestMessage, UpdateChannelInfoRequestMessage,
-        VerifyShareRequestMessage,
-    };
-
-    fn store_share_action() -> PendingAction {
-        PendingAction::StoreShare {
-            channel_id: ChannelId(1),
-            request: StoreShareRequestMessage::default(),
-            shared_key: [0u8; 32],
-            trace_id: 0,
-        }
-    }
-
-    fn verify_share_action() -> PendingAction {
-        PendingAction::VerifyShare {
-            channel_id: ChannelId(1),
-            request: VerifyShareRequestMessage::default(),
-            shared_key: [0u8; 32],
-            trace_id: 0,
-        }
-    }
-
-    fn discovery_action() -> PendingAction {
-        PendingAction::Discovery {
-            channel_id: ChannelId(1),
-            request: GetSecretIdsVersionsRequestMessage::default(),
-            shared_key: [0u8; 32],
-            trace_id: 0,
-        }
-    }
-
-    fn get_share_action() -> PendingAction {
-        PendingAction::GetShare {
-            channel_id: ChannelId(1),
-            request: GetShareRequestMessage::default(),
-            shared_key: [0u8; 32],
-            trace_id: 0,
-        }
-    }
-
-    fn unpair_action() -> PendingAction {
-        PendingAction::Unpair {
-            channel_id: ChannelId(1),
-            request: UnpairRequestMessage::default(),
-            shared_key: [0u8; 32],
-            trace_id: 0,
-        }
-    }
-
-    fn update_channel_info_action() -> PendingAction {
-        PendingAction::UpdateChannelInfo {
-            channel_id: ChannelId(1),
-            request: UpdateChannelInfoRequestMessage::default(),
-            shared_key: [0u8; 32],
-            trace_id: 0,
-        }
-    }
-
-    fn pre_pair_action() -> PendingAction {
-        PendingAction::PrePair {
-            channel_id: ChannelId(1),
-            request: PrePairRequestMessage::default(),
-            trace_id: 0,
-        }
-    }
-
-    fn respond_to_failure_action() -> PendingAction {
-        PendingAction::RespondToFailure {
-            channel_id: ChannelId(1),
-            trace_id: 5,
-            reply: ReplyTarget {
-                channel_id: ChannelId(1),
-                endpoints: Vec::new(),
-            },
-            request: FailedRequest::StoreShare(StoreShareRequestMessage {
-                share: vec![0xAB; 4],
-                ..Default::default()
-            }),
-        }
-    }
-
-    #[test]
-    fn pending_action_kind_round_trips_each_variant() {
-        assert_eq!(store_share_action().kind(), PendingActionKind::StoreShare);
-        assert_eq!(verify_share_action().kind(), PendingActionKind::VerifyShare);
-        assert_eq!(discovery_action().kind(), PendingActionKind::Discovery);
-        assert_eq!(get_share_action().kind(), PendingActionKind::GetShare);
-        assert_eq!(unpair_action().kind(), PendingActionKind::Unpair);
-        assert_eq!(
-            update_channel_info_action().kind(),
-            PendingActionKind::UpdateChannelInfo
-        );
-        assert_eq!(pre_pair_action().kind(), PendingActionKind::PrePair);
-        assert_eq!(
-            respond_to_failure_action().kind(),
-            PendingActionKind::Failed
-        );
-    }
-
-    /// A failed request is only ever rejected, so no policy, however
-    /// permissive, routes it to `accept`.
-    #[test]
-    fn auto_accept_never_allows_a_failed_request() {
-        assert!(!AutoAcceptPolicy::all().allows(&respond_to_failure_action()));
-        assert!(!AutoAcceptPolicy::default().allows(&respond_to_failure_action()));
-    }
-
-    /// A copy kept before `accept` is the same token, so it can still be
-    /// passed to `reject`.
-    #[test]
-    fn a_cloned_action_keeps_its_trace_id_and_kind() {
-        let action = respond_to_failure_action();
-        let copy = action.clone();
-        assert_eq!(copy.kind(), action.kind());
-        assert_eq!(copy.trace_id(), 5);
-    }
-
-    /// The token's `Debug` output names the kind and channel, never the
-    /// peer-supplied request.
-    #[test]
-    fn debug_keeps_failed_request_contents_out_of_logs() {
-        let rendered = format!("{:?}", respond_to_failure_action());
-        assert!(rendered.contains("Failed"), "{rendered}");
-        assert!(!rendered.contains("171"), "{rendered}");
-        assert_eq!(
-            format!(
-                "{:?}",
-                FailedRequest::StoreShare(StoreShareRequestMessage {
-                    share: vec![0xAB; 4],
-                    ..Default::default()
-                })
-            ),
-            "StoreShare"
-        );
-    }
-
-    #[test]
-    fn auto_accept_policy_default_is_all_false() {
-        let p = AutoAcceptPolicy::default();
-        assert!(!p.pairing);
-        assert!(!p.pre_pair);
-        assert!(!p.store_share);
-        assert!(!p.verify_share);
-        assert!(!p.discovery);
-        assert!(!p.get_share);
-        assert!(!p.unpair);
-        assert!(!p.update_channel_info);
-    }
-
-    #[test]
-    fn auto_accept_policy_all_is_all_true() {
-        let p = AutoAcceptPolicy::all();
-        assert!(p.pairing);
-        assert!(p.pre_pair);
-        assert!(p.store_share);
-        assert!(p.verify_share);
-        assert!(p.discovery);
-        assert!(p.get_share);
-        assert!(p.unpair);
-        assert!(p.update_channel_info);
-    }
-
-    #[test]
-    fn auto_accept_policy_allows_dispatches_per_flow() {
-        let only_store = AutoAcceptPolicy {
-            store_share: true,
-            ..Default::default()
-        };
-        assert!(only_store.allows(&store_share_action()));
-        assert!(!only_store.allows(&verify_share_action()));
-        assert!(!only_store.allows(&discovery_action()));
-        assert!(!only_store.allows(&get_share_action()));
-        assert!(!only_store.allows(&unpair_action()));
-        assert!(!only_store.allows(&update_channel_info_action()));
-        assert!(!only_store.allows(&pre_pair_action()));
-
-        let none = AutoAcceptPolicy::default();
-        assert!(!none.allows(&store_share_action()));
-
-        let all = AutoAcceptPolicy::all();
-        assert!(all.allows(&store_share_action()));
-        assert!(all.allows(&verify_share_action()));
-        assert!(all.allows(&discovery_action()));
-        assert!(all.allows(&get_share_action()));
-        assert!(all.allows(&unpair_action()));
-        assert!(all.allows(&update_channel_info_action()));
-        assert!(all.allows(&pre_pair_action()));
-    }
 }

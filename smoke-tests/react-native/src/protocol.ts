@@ -489,6 +489,7 @@ function makeNode(
     unsafeConnection?: boolean;
     maxSubshares?: bigint;
     parameterRange?: Partial<ParameterRange>;
+    autoRespondOnFailure?: boolean;
   } = {},
 ): Node {
   const channelStore = options.channelStore ?? new InMemoryChannelStore();
@@ -523,6 +524,9 @@ function makeNode(
   }
   if (options.parameterRange !== undefined) {
     builder = builder.withParameterRange(options.parameterRange);
+  }
+  if (options.autoRespondOnFailure !== undefined) {
+    builder = builder.withAutoRespondOnFailure(options.autoRespondOnFailure);
   }
   const protocol = builder.build();
   return { protocol, transport, channelStore, shareStore, secretStore, userSecretStore, stateStore };
@@ -2831,6 +2835,533 @@ async function runRequestFailedTokenFlow(): Promise<void> {
   console.log("\n✓ Failed request token flow passed.\n");
 }
 
+/**
+ * A share outside the helper's configured size range is refused by the
+ * helper's library before any `ActionRequired`: the helper reports
+ * `ShareRefused(SIZE_LIMIT_EXCEEDED)`, stores nothing, and the owner observes
+ * `ShareRejected` with the same status and memo.
+ */
+async function runShareRefusedFlow(): Promise<void> {
+  console.log("=== [Protocol] Share refused by the helper's size range ===\n");
+
+  const secretId = 0x7171n;
+  const owner = makeNode("Owner", "https://owner.example.com", { secretId });
+  const helperA = makeNode("HelperA", "https://helper-a.example.com", {
+    secretId,
+    parameterRange: { max_share_size: 64n },
+  });
+  const helperB = makeNode("HelperB", "https://helper-b.example.com", { secretId });
+  const pairedA = await doPair(helperA, owner, 81n, "Owner↔HelperA");
+  await doPair(helperB, owner, 82n, "Owner↔HelperB");
+
+  const started = await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([11]), name: "oversized", data: utf8Encode("larger than 64 bytes once split") }],
+    description: "oversized",
+  });
+  const version = requireEvent(started, "ProtectSecretStarted", "Owner").version;
+
+  const ownerEvents: DeRecEvent[] = [];
+  let helperAEvents: DeRecEvent[] = [];
+  for (const { endpoint, message } of owner.transport.drain()) {
+    if (endpoint.uri === "https://helper-b.example.com") {
+      await processAll(helperB, message);
+      ownerEvents.push(...(await owner.protocol.process(drainOne(helperB, "HelperB"))));
+    } else if (endpoint.uri === "https://helper-a.example.com") {
+      helperAEvents = await helperA.protocol.process(message);
+      ownerEvents.push(...(await owner.protocol.process(drainOne(helperA, "HelperA"))));
+    } else {
+      throw new Error(`no peer for destination uri ${endpoint.uri}`);
+    }
+  }
+
+  const refused = helperAEvents[0];
+  if (
+    helperAEvents.length !== 1 ||
+    refused?.type !== "ShareRefused" ||
+    refused.channel_id !== pairedA.longTermChannelId ||
+    refused.version !== version ||
+    refused.status !== StatusEnum.SizeLimitExceeded ||
+    refused.memo.length === 0
+  ) {
+    throw new Error(`HelperA must report exactly one ShareRefused(SIZE_LIMIT_EXCEEDED), got ${JSON.stringify(helperAEvents)}`);
+  }
+  if ((await helperA.shareStore.load(secretId.toString(), refused.channel_id, [])).length !== 0) {
+    throw new Error("HelperA must store nothing for a refused share");
+  }
+  console.log(`  [HelperA] process(StoreShareRequest) → ShareRefused(status=SIZE_LIMIT_EXCEEDED, memo="${refused.memo}"), nothing stored  ✓`);
+
+  const rejected = ownerEvents.filter(
+    (e): e is Extract<DeRecEvent, { type: "ShareRejected" }> => e.type === "ShareRejected",
+  );
+  if (
+    rejected.length !== 1 ||
+    rejected[0]!.channel_id !== pairedA.longTermChannelId ||
+    rejected[0]!.version !== version ||
+    rejected[0]!.status !== StatusEnum.SizeLimitExceeded ||
+    rejected[0]!.memo !== refused.memo
+  ) {
+    throw new Error(`expected one ShareRejected(SIZE_LIMIT_EXCEEDED, same memo) from HelperA, got ${JSON.stringify(rejected)}`);
+  }
+  console.log("  [Owner] ShareRejected(status=SIZE_LIMIT_EXCEEDED, same memo)  ✓");
+
+  console.log("\n✓ Share refused flow passed.\n");
+}
+
+/**
+ * With `auto_respond_on_failure` on, the library answers a request whose
+ * handling fails by itself: `RequestFailed` reports `responded: true` and
+ * carries no token, and the owner observes one `ShareRejected` with no
+ * `reject` call.
+ */
+async function runAutoRespondOnFailureFlow(): Promise<void> {
+  console.log("=== [Protocol] Failed request answered by the library ===\n");
+
+  const secretId = 0x7272n;
+  const owner = makeNode("Owner", "https://owner.example.com", { secretId });
+  const helperA = makeNode("HelperA", "https://helper-a.example.com", {
+    secretId,
+    autoRespondOnFailure: true,
+  });
+  const helperB = makeNode("HelperB", "https://helper-b.example.com", { secretId });
+  const pairedA = await doPair(helperA, owner, 83n, "Owner↔HelperA");
+  await doPair(helperB, owner, 84n, "Owner↔HelperB");
+
+  helperA.shareStore.failSaves = true;
+  const started = await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([12]), name: "failing", data: utf8Encode("payload") }],
+    description: "failing",
+  });
+  const version = requireEvent(started, "ProtectSecretStarted", "Owner").version;
+
+  const ownerEvents: DeRecEvent[] = [];
+  const failed: Array<Extract<DeRecEvent, { type: "RequestFailed" }>> = [];
+  for (const { endpoint, message } of owner.transport.drain()) {
+    if (endpoint.uri === "https://helper-b.example.com") {
+      await processAll(helperB, message);
+      ownerEvents.push(...(await owner.protocol.process(drainOne(helperB, "HelperB"))));
+    } else if (endpoint.uri === "https://helper-a.example.com") {
+      for (const ev of await processAll(helperA, message)) {
+        if (ev.type === "RequestFailed") failed.push(ev);
+      }
+    } else {
+      throw new Error(`no peer for destination uri ${endpoint.uri}`);
+    }
+  }
+
+  const rf = failed[0];
+  if (
+    failed.length !== 1 ||
+    !rf ||
+    rf.channel_id !== pairedA.longTermChannelId ||
+    rf.action_kind !== "StoreShare" ||
+    !rf.responded ||
+    rf.action !== undefined ||
+    rf.status !== StatusEnum.Fail ||
+    rf.memo !== "request could not be processed" ||
+    rf.error_code.length === 0
+  ) {
+    throw new Error(`HelperA must report one answered RequestFailed(StoreShare) without a token, got ${JSON.stringify(failed)}`);
+  }
+  const answers = helperA.transport.drain();
+  if (answers.length !== 1) {
+    throw new Error(`with auto_respond_on_failure on, HelperA must answer once by itself; sent ${answers.length}`);
+  }
+  console.log(`  [HelperA] save fails → RequestFailed(responded=true, no action, status=${rf.status}, error_code=${rf.error_code}), one response sent  ✓`);
+
+  ownerEvents.push(...(await owner.protocol.process(answers[0]!.message)));
+  const rejected = ownerEvents.filter(
+    (e): e is Extract<DeRecEvent, { type: "ShareRejected" }> => e.type === "ShareRejected",
+  );
+  if (
+    rejected.length !== 1 ||
+    rejected[0]!.channel_id !== pairedA.longTermChannelId ||
+    rejected[0]!.version !== version ||
+    rejected[0]!.status !== StatusEnum.Fail ||
+    rejected[0]!.memo !== "request could not be processed"
+  ) {
+    throw new Error(`expected one ShareRejected(FAIL, "request could not be processed") from HelperA, got ${JSON.stringify(rejected)}`);
+  }
+  console.log('  [Owner] ShareRejected(status=FAIL, memo="request could not be processed") with no reject()  ✓');
+
+  console.log("\n✓ Auto-respond on failure flow passed.\n");
+}
+
+/**
+ * `start(ProtectSecret)` refuses a weight that is not below the threshold,
+ * and a weight naming a channel that is not a paired helper, with
+ * `invalid_weight` before anything is sent.
+ */
+async function runInvalidWeightAtStartFlow(): Promise<void> {
+  console.log("=== [Protocol] start(ProtectSecret) refuses an invalid weight ===\n");
+
+  const secretId = 0x7373n;
+  const owner = makeNode("Owner", "https://owner.example.com", { secretId });
+  const helperA = makeNode("HelperA", "https://helper-a.example.com", { secretId });
+  const helperB = makeNode("HelperB", "https://helper-b.example.com", { secretId });
+  const pairedA = await doPair(helperA, owner, 85n, "Owner↔HelperA");
+  await doPair(helperB, owner, 86n, "Owner↔HelperB");
+  owner.transport.drain();
+
+  const expectInvalidWeight = async (weights: Map<bigint | string, number>, what: string) => {
+    let error: DeRecError | undefined;
+    try {
+      await owner.protocol.start(FlowKind.ProtectSecret, {
+        secrets: [{ id: new Uint8Array([13]), name: "weighted", data: utf8Encode("invalid-weight") }],
+        weights,
+      });
+    } catch (e) {
+      error = e as DeRecError;
+    }
+    if (error?.code !== "invalid_weight") {
+      throw new Error(`${what} must fail with invalid_weight, got ${JSON.stringify(error)}`);
+    }
+    const sent = owner.transport.drain();
+    if (sent.length !== 0) {
+      throw new Error(`${what} must send nothing; sent ${sent.length}`);
+    }
+    console.log(`  ${what} → invalid_weight, nothing sent  ✓`);
+  };
+
+  await expectInvalidWeight(new Map([[pairedA.longTermChannelId, THRESHOLD]]), "a weight equal to the threshold");
+  await expectInvalidWeight(new Map([[0xBADn, 1]]), "a weight for an unpaired channel");
+
+  console.log("\n✓ Invalid weight at start flow passed.\n");
+}
+
+/**
+ * A channel whose share for the version was never confirmed has no proof on
+ * the owner: `start(VerifyShares)` fails that channel locally with
+ * `VerifySharesFailed(NoProof)` and sends it no challenge, while a channel
+ * that confirmed is challenged as usual.
+ */
+async function runVerifyNoProofFlow(): Promise<void> {
+  console.log("=== [Protocol] VerifyShares without a proof fails with NoProof ===\n");
+
+  const secretId = 0x7474n;
+  const owner = makeNode("Owner", "https://owner.example.com", { secretId });
+  const helperA = makeNode("HelperA", "https://helper-a.example.com", { secretId });
+  const helperB = makeNode("HelperB", "https://helper-b.example.com", { secretId });
+  const pairedA = await doPair(helperA, owner, 87n, "Owner↔HelperA");
+  const pairedB = await doPair(helperB, owner, 88n, "Owner↔HelperB");
+
+  const helpersByUri = new Map<string, [Node, string]>([
+    ["https://helper-a.example.com", [helperA, "HelperA"]],
+    ["https://helper-b.example.com", [helperB, "HelperB"]],
+  ]);
+  helperA.shareStore.refuseSaves = true;
+  const started = await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([14]), name: "unconfirmed", data: utf8Encode("no-proof") }],
+  });
+  const version = requireEvent(started, "ProtectSecretStarted", "Owner").version;
+  for (const { endpoint, message } of owner.transport.drain()) {
+    const [helper, label] = helpersByUri.get(endpoint.uri)!;
+    await processAll(helper, message);
+    await owner.protocol.process(drainOne(helper, label));
+  }
+
+  const events = await owner.protocol.start(FlowKind.VerifyShares, { secretId, version });
+  const noProof = events.filter(
+    (e): e is Extract<DeRecEvent, { type: "VerifySharesFailed" }> => e.type === "VerifySharesFailed",
+  );
+  if (
+    noProof.length !== 1 ||
+    noProof[0]!.channel_id !== pairedA.longTermChannelId ||
+    noProof[0]!.version !== version ||
+    noProof[0]!.reason !== "NoProof"
+  ) {
+    throw new Error(`expected one VerifySharesFailed(NoProof) for HelperA, got [${events.map((e) => e.type).join(", ")}]`);
+  }
+  if (!events.some((e) => e.type === "VerifySharesStarted" && e.channel_id === pairedB.longTermChannelId)) {
+    throw new Error("HelperB, which confirmed, must still be challenged");
+  }
+  const sent = owner.transport.drain();
+  if (sent.length !== 1 || sent[0]!.endpoint.uri !== "https://helper-b.example.com") {
+    throw new Error(`only HelperB may be challenged; sent to [${sent.map((m) => m.endpoint.uri).join(", ")}]`);
+  }
+  console.log(`  [Owner] v${version}: HelperA VerifySharesFailed(reason=NoProof), no challenge; HelperB challenged  ✓`);
+
+  console.log("\n✓ VerifyShares NoProof flow passed.\n");
+}
+
+/**
+ * Verdicts on verification responses that do not prove the share: an answer
+ * to a challenge a newer one replaced is ignored as `StaleResponse`, a proof
+ * over bytes that differ from the owner's is `ShareVerifyInvalid`, and a
+ * message whose plaintext envelope timestamp differs from the encrypted inner
+ * one is ignored as `TimestampMismatch`.
+ */
+async function runVerificationResponseVerdictsFlow(): Promise<void> {
+  console.log("=== [Protocol] Verification response verdicts ===\n");
+
+  const secretId = 0x7575n;
+  const owner = makeNode("Owner", "https://owner.example.com", { secretId });
+  const helperA = makeNode("HelperA", "https://helper-a.example.com", { secretId });
+  const helperB = makeNode("HelperB", "https://helper-b.example.com", { secretId });
+  const { longTermChannelId: channelA } = await doPair(helperA, owner, 89n, "Owner↔HelperA");
+  await doPair(helperB, owner, 90n, "Owner↔HelperB");
+
+  const helpersByUri = new Map<string, [Node, string]>([
+    ["https://helper-a.example.com", [helperA, "HelperA"]],
+    ["https://helper-b.example.com", [helperB, "HelperB"]],
+  ]);
+  const started = await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([15]), name: "verdicts", data: utf8Encode("verdicts") }],
+  });
+  const version = requireEvent(started, "ProtectSecretStarted", "Owner").version;
+  for (const { endpoint, message } of owner.transport.drain()) {
+    const [helper, label] = helpersByUri.get(endpoint.uri)!;
+    await processAll(helper, message);
+    await owner.protocol.process(drainOne(helper, label));
+  }
+
+  const challenge = async (): Promise<{ traceId: string; message: Uint8Array }> => {
+    const events = await owner.protocol.start(FlowKind.VerifyShares, {
+      secretId,
+      version,
+      target: BigInt(channelA),
+    });
+    const verifyStarted = requireEvent(events, "VerifySharesStarted", "Owner");
+    return { traceId: verifyStarted.trace_id, message: drainOne(owner, "Owner") };
+  };
+  const answer = async (request: Uint8Array): Promise<Uint8Array> => {
+    await processAll(helperA, request);
+    return drainOne(helperA, "HelperA");
+  };
+
+  // A second challenge replaces the first; the first one's answer is stale.
+  const first = await challenge();
+  const second = await challenge();
+  const firstAnswer = await answer(first.message);
+  const secondAnswer = await answer(second.message);
+  const stale = await owner.protocol.process(firstAnswer);
+  const ignored = stale[0];
+  if (
+    stale.length !== 1 ||
+    ignored?.type !== "MessageIgnored" ||
+    ignored.reason !== "StaleResponse" ||
+    ignored.channel_id !== channelA ||
+    ignored.trace_id !== first.traceId
+  ) {
+    throw new Error(`the replaced challenge's answer must be MessageIgnored(StaleResponse, trace ${first.traceId}), got ${JSON.stringify(stale)}`);
+  }
+  const current = await owner.protocol.process(secondAnswer);
+  if (!current.some((e) => e.type === "ShareVerified" && e.channel_id === channelA && e.version === version)) {
+    throw new Error(`the current challenge's answer must still verify, got [${current.map((e) => e.type).join(", ")}]`);
+  }
+  console.log("  [Owner] answer to a replaced challenge → MessageIgnored(StaleResponse); current answer → ShareVerified  ✓");
+
+  // HelperA's stored share no longer matches the bytes the owner holds a
+  // proof of, as after storage corruption. The stored record is the
+  // StoreShareRequestMessage, whose field 1 is the committed share.
+  const helperSid = secretId.toString();
+  const [stored] = await helperA.shareStore.load(helperSid, channelA, [version]);
+  if (!stored) throw new Error("HelperA must hold a share for the version");
+  const tampered = rewriteProtoField(stored.bytes, 1, (share) => {
+    const copy = share.slice();
+    copy[copy.length >> 1] ^= 0xff;
+    return copy;
+  });
+  await helperA.shareStore.save(helperSid, channelA, { ...stored, bytes: tampered });
+  const invalid = await owner.protocol.process(await answer((await challenge()).message));
+  const verdict = invalid[0];
+  if (
+    invalid.length !== 1 ||
+    verdict?.type !== "ShareVerifyInvalid" ||
+    verdict.channel_id !== channelA ||
+    verdict.version !== version
+  ) {
+    throw new Error(`a proof over corrupted bytes must be ShareVerifyInvalid, got ${JSON.stringify(invalid)}`);
+  }
+  console.log("  [Owner] proof over HelperA's corrupted share → ShareVerifyInvalid  ✓");
+
+  // The plaintext envelope timestamp (DeRecMessage field 5) is moved off the
+  // encrypted inner one.
+  const mismatchedEnvelope = rewriteProtoField((await challenge()).message, 5, (timestamp) => {
+    const { seconds, nanos } = decodeTimestamp(timestamp);
+    return encodeTimestamp(seconds, (nanos + 1) % 1_000_000_000);
+  });
+  const mismatched = await helperA.protocol.process(mismatchedEnvelope);
+  const tsIgnored = mismatched[0];
+  if (
+    mismatched.length !== 1 ||
+    tsIgnored?.type !== "MessageIgnored" ||
+    tsIgnored.reason !== "TimestampMismatch" ||
+    tsIgnored.channel_id !== channelA
+  ) {
+    throw new Error(`a mismatched envelope timestamp must be MessageIgnored(TimestampMismatch), got ${JSON.stringify(mismatched)}`);
+  }
+  if (helperA.transport.drain().length !== 0) {
+    throw new Error("a message ignored for its timestamp must not be answered");
+  }
+  console.log("  [HelperA] envelope timestamp ≠ inner timestamp → MessageIgnored(TimestampMismatch), nothing sent  ✓");
+
+  console.log("\n✓ Verification response verdicts flow passed.\n");
+}
+
+/**
+ * A replica destination refuses a copy of the secret whose share map does not
+ * verify: it reports `ReplicaSecretRefused(VERIFICATION_FAILED)` and writes
+ * nothing. The copy is served by a catch-up, built from the source's share
+ * store, whose committed share for one helper is corrupted first; a catch-up
+ * copy is itself an answer, so nothing is sent back.
+ */
+async function runReplicaSecretRefusedFlow(): Promise<void> {
+  console.log("\n=== [Protocol] Replica destination refuses an unverifiable copy ===\n");
+
+  const secretId = 0x7676n;
+  const SOURCE_REPLICA_ID = 0x5151_5151n;
+  const source = {
+    node: makeNode("Source", "https://source.example.com", { secretId, replicaId: SOURCE_REPLICA_ID }),
+    uri: "https://source.example.com",
+  };
+  const destination = {
+    node: makeNode("Destination", "https://destination.example.com", { secretId, replicaId: 0xde58_de58n }),
+    uri: "https://destination.example.com",
+  };
+  const helperA = { node: makeNode("HelperA", "https://helper-a.example.com", { secretId }), uri: "https://helper-a.example.com" };
+  const helperB = { node: makeNode("HelperB", "https://helper-b.example.com", { secretId }), uri: "https://helper-b.example.com" };
+  const { longTermChannelId: channelA } = await doPair(helperA.node, source.node, 91n, "Source↔HelperA");
+  await doPair(helperB.node, source.node, 92n, "Source↔HelperB");
+  await source.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([16]), name: "replicated", data: utf8Encode("replicated secret") }],
+  });
+  await pumpAll([source, helperA, helperB]);
+
+  // The destination has not confirmed the fingerprint, so the copy the
+  // source publishes on confirming its own side is ignored.
+  const { rekeyed } = await pairReplicaHandshake(source, destination, 93n);
+  const destinationFp = await destination.node.protocol.getFingerprint(rekeyed);
+  if (!(await source.node.protocol.verifyFingerprint(rekeyed, destinationFp))) {
+    throw new Error("source.verifyFingerprint must return true");
+  }
+  await pumpAll([source, destination, helperA, helperB]);
+
+  const latest = await source.node.userSecretStore.loadLatest(secretId.toString());
+  if (!latest) throw new Error("the source must hold a snapshot");
+  const [stored] = await source.node.shareStore.load(secretId.toString(), channelA, [latest.version]);
+  if (!stored) throw new Error(`the source must hold HelperA's committed share for v${latest.version}`);
+  // The last bytes of a CommittedDeRecShare are its Merkle path's last hash.
+  const corrupted = stored.bytes.slice();
+  corrupted[corrupted.length - 1] ^= 0xff;
+  await source.node.shareStore.save(secretId.toString(), channelA, { ...stored, bytes: corrupted });
+
+  const sourceFp = await source.node.protocol.getFingerprint(rekeyed);
+  if (!(await destination.node.protocol.verifyFingerprint(rekeyed, sourceFp))) {
+    throw new Error("destination.verifyFingerprint must return true");
+  }
+  await destination.node.protocol.start(FlowKind.ReplicaDiscovery);
+  const catchUp = await pumpAll([destination, source]);
+  const refused = catchUp.filter(
+    (e): e is Extract<DeRecEvent, { type: "ReplicaSecretRefused" }> => e.type === "ReplicaSecretRefused",
+  );
+  if (
+    refused.length !== 1 ||
+    refused[0]!.from_replica_id !== SOURCE_REPLICA_ID.toString() ||
+    refused[0]!.version !== latest.version ||
+    refused[0]!.status !== StatusEnum.VerificationFailed ||
+    refused[0]!.memo.length === 0
+  ) {
+    throw new Error(`the destination must report one ReplicaSecretRefused(VERIFICATION_FAILED), got ${JSON.stringify(catchUp)}`);
+  }
+  if (catchUp.some((e) => e.type === "ReplicaSecretInstalled" || e.type === "ReplicaSecretReceived")) {
+    throw new Error("a refused copy must not be installed");
+  }
+  if ((await destination.node.userSecretStore.loadLatest(secretId.toString())) !== null) {
+    throw new Error("the destination must write nothing for a refused copy");
+  }
+  console.log(`  [Destination] catch-up copy with an unverifiable share → ReplicaSecretRefused(status=VERIFICATION_FAILED, memo="${refused[0]!.memo}"), nothing written  ✓`);
+
+  console.log("\n✓ Replica secret refused flow passed.\n");
+}
+
+function readVarint(bytes: Uint8Array, start: number): [bigint, number] {
+  let value = 0n;
+  let shift = 0n;
+  for (let pos = start; pos < bytes.length; pos++) {
+    const byte = bytes[pos]!;
+    value |= BigInt(byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) return [value, pos + 1];
+    shift += 7n;
+  }
+  throw new Error("truncated protobuf varint");
+}
+
+function writeVarint(value: bigint): number[] {
+  const out: number[] = [];
+  do {
+    let byte = Number(value & 0x7fn);
+    value >>= 7n;
+    if (value > 0n) byte |= 0x80;
+    out.push(byte);
+  } while (value > 0n);
+  return out;
+}
+
+/**
+ * Replaces the value of the length-delimited protobuf field `field`, copying
+ * every other field's bytes unchanged. No SDK call writes a malformed or
+ * tampered message, so the flows that need one edit the wire bytes here.
+ */
+function rewriteProtoField(
+  message: Uint8Array,
+  field: number,
+  rewrite: (value: Uint8Array) => Uint8Array,
+): Uint8Array {
+  const out: number[] = [];
+  let found = false;
+  let pos = 0;
+  while (pos < message.length) {
+    const [key, afterKey] = readVarint(message, pos);
+    const wireType = Number(key & 7n);
+    let end: number;
+    if (wireType === 0) {
+      end = readVarint(message, afterKey)[1];
+    } else if (wireType === 1) {
+      end = afterKey + 8;
+    } else if (wireType === 5) {
+      end = afterKey + 4;
+    } else if (wireType === 2) {
+      const [length, afterLength] = readVarint(message, afterKey);
+      end = afterLength + Number(length);
+      if (Number(key >> 3n) === field) {
+        const value = rewrite(message.slice(afterLength, end));
+        out.push(...writeVarint(key), ...writeVarint(BigInt(value.length)), ...value);
+        found = true;
+        pos = end;
+        continue;
+      }
+    } else {
+      throw new Error(`unsupported protobuf wire type ${wireType}`);
+    }
+    out.push(...message.slice(pos, end));
+    pos = end;
+  }
+  if (!found) throw new Error(`protobuf field ${field} not found`);
+  return Uint8Array.from(out);
+}
+
+/** `google.protobuf.Timestamp`: `seconds` is field 1, `nanos` field 2. */
+function decodeTimestamp(bytes: Uint8Array): { seconds: bigint; nanos: number } {
+  let seconds = 0n;
+  let nanos = 0;
+  let pos = 0;
+  while (pos < bytes.length) {
+    const [key, afterKey] = readVarint(bytes, pos);
+    const [value, next] = readVarint(bytes, afterKey);
+    if (key === 0x08n) seconds = value;
+    if (key === 0x10n) nanos = Number(value);
+    pos = next;
+  }
+  return { seconds, nanos };
+}
+
+function encodeTimestamp(seconds: bigint, nanos: number): Uint8Array {
+  const out: number[] = [];
+  if (seconds !== 0n) out.push(0x08, ...writeVarint(seconds));
+  if (nanos !== 0) out.push(0x10, ...writeVarint(BigInt(nanos)));
+  return Uint8Array.from(out);
+}
+
 export async function runProtocolSmoke(): Promise<void> {
   console.log("━━━ [Protocol] Starting ━━━\n");
 
@@ -2850,6 +3381,12 @@ export async function runProtocolSmoke(): Promise<void> {
   await runMaxSubsharesFlow();
   await runShareStoreRefusalFlow();
   await runRequestFailedTokenFlow();
+  await runShareRefusedFlow();
+  await runAutoRespondOnFailureFlow();
+  await runInvalidWeightAtStartFlow();
+  await runVerifyNoProofFlow();
+  await runVerificationResponseVerdictsFlow();
+  await runReplicaSecretRefusedFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();
   await runUpdateChannelInfoFlow();

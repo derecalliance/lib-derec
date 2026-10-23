@@ -1359,8 +1359,14 @@ export type DeRecEvent =
    *  Confirming does not replay it: after `verifyFingerprint` succeeds, a
    *  replica destination calls `start(FlowKind.ReplicaDiscovery)` to pull
    *  the copy itself. `"Expired"` means the message was older than the
-   *  inbound timeout. `trace_id` matches the peer's `*Started` event for
-   *  the same round (`"0"` when the sender set none). */
+   *  inbound timeout. `"TimestampMismatch"` means the envelope's timestamp
+   *  and the encrypted message's differ, or one is absent: a sender stamps
+   *  both with the same time, so the envelope was altered or built by a
+   *  non-conforming peer. `"StaleResponse"` means a verification answer to
+   *  a challenge that a newer one on the channel replaced; the newer
+   *  challenge stays outstanding and its own answer still completes it.
+   *  `trace_id` matches the peer's `*Started` event for the same round
+   *  (`"0"` when the sender set none). */
   | {
       type: "MessageIgnored";
       channel_id: string;
@@ -1427,9 +1433,13 @@ export type DeRecEvent =
       version: number;
       error: string;
     }
-  /** An unpair request was dispatched to `channel_id`. Followed by an
-   *  `Unpaired` event once the peer acknowledges (or in the same event
-   *  vec, under `UnpairAck.NotRequired`). */
+  /** An unpair request was dispatched to `channel_id`, by
+   *  `start(Unpair)` or by `restore` for each recovery channel. Under
+   *  `UnpairAck.Required` the channel is now `"Unpairing"`, and an
+   *  `Unpaired` event follows once the peer acknowledges or the
+   *  acknowledgement window elapses, or `UnpairRejected` if the peer
+   *  refuses (the channel is `"Paired"` again). Under
+   *  `UnpairAck.NotRequired`, `Unpaired` follows in the same event vec. */
   | { type: "UnpairFailed"; channel_id: string; error: string }
   | { type: "UnpairStarted"; channel_id: string; trace_id: string }
   /** An update-channel-info request was dispatched to `channel_id`. */
@@ -2086,7 +2096,7 @@ export interface CommunicationInfo {
   communication_info_entries: CommunicationInfoKeyValue[];
 }
 
-// `ContactMessage` is defined once above (line ~75) and covers both
+// `ContactMessage` is defined once above and covers both
 // `INLINE_KEYS` and `HASHED_KEYS` modes.
 
 /** Why a `MessageIgnored` event dropped a message. Matches the Rust

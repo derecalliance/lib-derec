@@ -80,6 +80,10 @@ internal static class Protocol
         RunOwnerKeepListReachesHelpersTest();
         RunShareStoreRefusalTest();
         RunRequestFailedTokenTest();
+        RunAutoRespondOnFailureTest();
+        RunInvalidWeightAtStartTest();
+        RunVerifyNoProofTest();
+        RunVerificationResponseVerdictsTest();
         RunLibraryDefaultThresholdTest();
         RunOrchestratorHashedKeysPairFlowTest();
         RunOrchestratorNoKeysPairFlowTest();
@@ -146,9 +150,86 @@ internal static class Protocol
         AssertLabelConstants(typeof(CorruptionReason), enums, "CorruptionReason");
         AssertLabelConstants(typeof(VerifyFailureReason), enums, "VerifyFailureReason");
         AssertLabelConstants(typeof(PendingActionKind), enums, "PendingActionKind");
+        AssertNumericEnum<FlowKind>(enums, "FlowKind");
+        AssertNumericEnum<Pairing.SenderKind>(enums, "SenderKind");
+        AssertNumericEnum<ContactMode>(enums, "ContactMode");
+        AssertNumericEnum<Org.Derecalliance.Derec.Protobuf.StatusEnum>(enums, "StatusEnum");
+        AssertEventTypes(enums);
+        AssertErrorConstants(typeof(DeRecCategory), DeRecCategory.Name, enums, "DeRecErrorCategory");
+        AssertErrorConstants(typeof(DeRecCode), DeRecCode.Name, enums, "DeRecErrorCode");
+
+        // An enum added to the fixture must be mirrored above, or listed here
+        // as one this SDK has no surface for.
+        var notDeclared = new HashSet<string> { "MessageKind" };
+        var checkedEnums = new HashSet<string>
+        {
+            "ChannelStatus", "ReplicaRole", "StateKind", "SecretKind", "IgnoreReason",
+            "NotRestoredReason", "CorruptionReason", "VerifyFailureReason", "PendingActionKind",
+            "FlowKind", "SenderKind", "ContactMode", "StatusEnum", "DeRecEvent",
+            "DeRecErrorCategory", "DeRecErrorCode",
+        };
+        var unhandled = enums.EnumerateObject()
+            .Select(e => e.Name)
+            .Where(n => !checkedEnums.Contains(n) && !notDeclared.Contains(n))
+            .ToList();
+        if (unhandled.Count > 0)
+            throw new Exception($"enums.json lists [{string.Join(", ", unhandled)}], which this test does not check");
 
         Console.WriteLine("  every fixture variant is known to this SDK  ✓");
         Console.WriteLine("Protocol enum fixture test passed.\n");
+    }
+
+    /// <summary>
+    /// The <c>type</c> discriminators of the concrete events this SDK declares
+    /// are exactly the fixture's.
+    /// </summary>
+    private static void AssertEventTypes(JsonElement enums)
+    {
+        var declared = typeof(DeRecEvent).Assembly.GetTypes()
+            .Where(t => t.IsSubclassOf(typeof(DeRecEvent)) && !t.IsAbstract && t != typeof(UnmappedEvent))
+            .Select(t => ((DeRecEvent)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(t)).EventType)
+            .ToHashSet();
+        var fixture = enums.GetProperty("DeRecEvent").GetProperty("variants").EnumerateArray()
+            .Select(v => v.GetProperty("wire").GetString()!)
+            .ToHashSet();
+        if (!declared.SetEquals(fixture))
+        {
+            throw new Exception(
+                $"DeRecEvent: fixture only [{string.Join(", ", fixture.Except(declared))}], "
+                + $".NET only [{string.Join(", ", declared.Except(fixture))}]");
+        }
+    }
+
+    /// <summary>
+    /// Error constants: every fixture number is declared under the fixture's
+    /// name (casing aside) and nothing else is, and the core names that
+    /// number with the fixture's text.
+    /// </summary>
+    private static void AssertErrorConstants(Type holder, Func<int, string> coreName, JsonElement enums, string enumName)
+    {
+        var declared = holder
+            .GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+            .Where(f => f.IsLiteral && f.FieldType == typeof(int))
+            .ToDictionary(f => (int)f.GetRawConstantValue()!, f => f.Name);
+        int seen = 0;
+        foreach (var v in enums.GetProperty(enumName).GetProperty("variants").EnumerateArray())
+        {
+            string name = v.GetProperty("name").GetString()!;
+            int wire = v.GetProperty("wire").GetInt32();
+            string text = v.GetProperty("text").GetString()!;
+            if (!declared.TryGetValue(wire, out var declaredName))
+                throw new Exception($"{enumName}.{name} ({wire}) is in the fixture but {holder.Name} declares no constant for it");
+            if (!string.Equals(declaredName, name, StringComparison.OrdinalIgnoreCase))
+                throw new Exception($"{enumName} {wire}: fixture names it {name}, {holder.Name} declares {declaredName}");
+            string named = coreName(wire);
+            if (named != text)
+                throw new Exception($"{enumName}.{name} ({wire}): fixture text \"{text}\", {holder.Name}.Name gives \"{named}\"");
+            seen++;
+        }
+        if (seen != declared.Count)
+        {
+            throw new Exception($"{enumName}: fixture lists {seen} values, {holder.Name} declares {declared.Count}");
+        }
     }
 
     /// <summary>Variant-name enums: every fixture name must parse.</summary>
@@ -1440,6 +1521,282 @@ internal static class Protocol
     }
 
     /// <summary>
+    /// With <c>auto_respond_on_failure</c> on, the library answers a request
+    /// whose handling fails by itself: the <see cref="RequestFailedEvent"/>
+    /// reports <c>Responded</c> and carries no token, and the owner observes
+    /// one <see cref="ShareRejectedEvent"/> with no <c>RejectAsync</c> call.
+    /// </summary>
+    private static void RunAutoRespondOnFailureTest()
+    {
+        Console.WriteLine("=== Failed request is answered by the library with auto_respond_on_failure ===");
+
+        const ulong secretId = 0x7272UL;
+        using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions(SecretId: secretId));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com",
+            new NodeOptions(SecretId: secretId, AutoRespondOnFailure: true));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com", new NodeOptions(SecretId: secretId));
+        var channelA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 53UL);
+        DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 54UL);
+
+        helperA.ShareStore.FailSaves = true;
+        var version = owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret { Id = new byte[] { 0x0B }, Name = "failing", Data = Encoding.UTF8.GetBytes("payload") },
+            },
+            Description = "payload",
+        }).GetAwaiter().GetResult().OfType<ProtectSecretStartedEvent>().First().Version;
+
+        var ownerEvents = new List<DeRecEvent>();
+        RequestFailedEvent? failed = null;
+        foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
+        {
+            if (uri == "https://helper-b.example.com")
+            {
+                helperB.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+                ownerEvents.AddRange(owner.Protocol.ProcessAndAcceptAllAsync(helperB.Transport.DrainOne()).GetAwaiter().GetResult());
+                continue;
+            }
+            var helperEvents = helperA.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+            failed = helperEvents.OfType<RequestFailedEvent>().SingleOrDefault()
+                ?? throw new InvalidOperationException(
+                    $"HelperA must report RequestFailed; got [{string.Join(", ", helperEvents)}]");
+        }
+        if (failed is null)
+            throw new InvalidOperationException("the owner sent HelperA no share");
+        if (failed.ChannelId != channelA || failed.ActionKind != PendingActionKind.StoreShare
+            || !failed.Responded || failed.Action is not null || failed.ErrorCode.Length == 0
+            || failed.Status != Org.Derecalliance.Derec.Protobuf.StatusEnum.Fail
+            || failed.Memo != "request could not be processed")
+            throw new InvalidOperationException($"unexpected RequestFailed: {failed}");
+        if (helperA.Transport.Outbox.Count != 1)
+            throw new InvalidOperationException(
+                $"with auto_respond_on_failure on, HelperA must answer once by itself; sent {helperA.Transport.Outbox.Count}");
+        Console.WriteLine($"  [HelperA] Save fails → RequestFailed(responded=true, action=null, status={failed.Status}, error_code={failed.ErrorCode}), one response sent  ✓");
+
+        ownerEvents.AddRange(owner.Protocol.ProcessAndAcceptAllAsync(helperA.Transport.DrainOne()).GetAwaiter().GetResult());
+        var rejected = ownerEvents.OfType<ShareRejectedEvent>().ToList();
+        if (rejected.Count != 1 || rejected[0].ChannelId != channelA || rejected[0].Version != version
+            || rejected[0].Status != Org.Derecalliance.Derec.Protobuf.StatusEnum.Fail
+            || rejected[0].Memo != "request could not be processed")
+            throw new InvalidOperationException(
+                $"expected one ShareRejected(Fail, \"request could not be processed\") from HelperA; got [{string.Join(", ", rejected)}]");
+        Console.WriteLine("  [Owner] ShareRejected(status=Fail, memo=\"request could not be processed\") with no RejectAsync  ✓");
+
+        Console.WriteLine("Auto-respond on failure test passed.\n");
+    }
+
+    /// <summary>
+    /// <c>start(ProtectSecret)</c> refuses a weight that is not below the
+    /// threshold, and a weight naming a channel the secret is not shared with,
+    /// with <see cref="DeRecCode.InvalidWeight"/> before anything is sent.
+    /// </summary>
+    private static void RunInvalidWeightAtStartTest()
+    {
+        Console.WriteLine("=== start(ProtectSecret) refuses an invalid weight ===");
+
+        const ulong secretId = 0x7373UL;
+        using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions(SecretId: secretId));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com", new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com", new NodeOptions(SecretId: secretId));
+        ulong channelA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 55UL);
+        DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 56UL);
+        owner.Transport.DrainAll();
+
+        void ExpectInvalidWeight(Dictionary<ulong, uint> weights, string what)
+        {
+            int code = 0;
+            try
+            {
+                owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+                {
+                    Secrets = new[]
+                    {
+                        new UserSecret { Id = new byte[] { 0x0C }, Name = "weighted", Data = Encoding.UTF8.GetBytes("invalid-weight") },
+                    },
+                    Weights = weights,
+                }).GetAwaiter().GetResult();
+            }
+            catch (DeRecException e)
+            {
+                code = e.Code;
+            }
+            if (code != DeRecCode.InvalidWeight)
+                throw new InvalidOperationException($"{what} must fail with InvalidWeight, got code {code}");
+            if (owner.Transport.DrainAll().Count != 0)
+                throw new InvalidOperationException($"{what} must send nothing");
+            Console.WriteLine($"  {what} → DeRecException(InvalidWeight), nothing sent  ✓");
+        }
+
+        ExpectInvalidWeight(new Dictionary<ulong, uint> { [channelA] = (uint)DefaultThreshold }, "a weight equal to the threshold");
+        ExpectInvalidWeight(new Dictionary<ulong, uint> { [0xBADUL] = 1 }, "a weight for an unpaired channel");
+
+        Console.WriteLine("Invalid weight at start test passed.\n");
+    }
+
+    /// <summary>
+    /// A channel whose share for the version was never confirmed has no proof
+    /// on the owner: <c>start(VerifyShares)</c> fails that channel locally with
+    /// <see cref="VerifyFailureReason.NoProof"/> and sends it no challenge,
+    /// while a channel that confirmed is challenged as usual.
+    /// </summary>
+    private static void RunVerifyNoProofTest()
+    {
+        Console.WriteLine("=== VerifyShares without a proof fails with NoProof ===");
+
+        const ulong secretId = 0x7474UL;
+        using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions(SecretId: secretId));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com", new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com", new NodeOptions(SecretId: secretId));
+        ulong channelA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 57UL);
+        ulong channelB = DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 58UL);
+
+        var helpersByUri = new Dictionary<string, Node>
+        {
+            ["https://helper-a.example.com"] = helperA,
+            ["https://helper-b.example.com"] = helperB,
+        };
+        helperA.ShareStore.RefuseSaves = true;
+        uint version = owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret { Id = new byte[] { 0x0D }, Name = "unconfirmed", Data = Encoding.UTF8.GetBytes("no-proof") },
+            },
+        }).GetAwaiter().GetResult().OfType<ProtectSecretStartedEvent>().First().Version;
+        foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
+        {
+            var h = helpersByUri[uri];
+            h.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+            owner.Protocol.ProcessAndAcceptAllAsync(h.Transport.DrainOne()).GetAwaiter().GetResult();
+        }
+
+        var events = owner.Protocol.StartAsync(FlowKind.VerifyShares, new VerifySharesParams
+        {
+            SecretId = secretId,
+            Version = version,
+        }).GetAwaiter().GetResult();
+        var noProof = events.OfType<VerifySharesFailedEvent>().ToList();
+        if (noProof.Count != 1 || noProof[0].ChannelId != channelA || noProof[0].Version != version
+            || noProof[0].Reason != VerifyFailureReason.NoProof)
+            throw new InvalidOperationException(
+                $"expected one VerifySharesFailed(NoProof) for HelperA; got [{string.Join(", ", events)}]");
+        if (!events.OfType<VerifySharesStartedEvent>().Any(e => e.ChannelId == channelB))
+            throw new InvalidOperationException("HelperB, which confirmed, must still be challenged");
+        var sent = owner.Transport.DrainAll();
+        if (sent.Count != 1 || sent[0].Uri != "https://helper-b.example.com")
+            throw new InvalidOperationException(
+                $"only HelperB may be challenged; sent to [{string.Join(", ", sent.Select(s => s.Uri))}]");
+        Console.WriteLine($"  [Owner] v{version}: HelperA VerifySharesFailed(reason=NoProof), no challenge; HelperB challenged  ✓");
+
+        Console.WriteLine("VerifyShares NoProof test passed.\n");
+    }
+
+    /// <summary>
+    /// Verdicts on verification responses that do not prove the share:
+    /// an answer to a challenge a newer one replaced is ignored as
+    /// <see cref="IgnoreReason.StaleResponse"/>, a proof over bytes that
+    /// differ from the owner's is <see cref="ShareVerifyInvalidEvent"/>, and a
+    /// message whose plaintext envelope timestamp differs from the encrypted
+    /// inner one is ignored as <see cref="IgnoreReason.TimestampMismatch"/>.
+    /// </summary>
+    private static void RunVerificationResponseVerdictsTest()
+    {
+        Console.WriteLine("=== Verification response verdicts ===");
+
+        const ulong secretId = 0x7575UL;
+        using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions(SecretId: secretId));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com", new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com", new NodeOptions(SecretId: secretId));
+        ulong channelA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 59UL);
+        DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 60UL);
+
+        var helpersByUri = new Dictionary<string, Node>
+        {
+            ["https://helper-a.example.com"] = helperA,
+            ["https://helper-b.example.com"] = helperB,
+        };
+        uint version = owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret { Id = new byte[] { 0x0E }, Name = "verdicts", Data = Encoding.UTF8.GetBytes("verdicts") },
+            },
+        }).GetAwaiter().GetResult().OfType<ProtectSecretStartedEvent>().First().Version;
+        foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
+        {
+            var h = helpersByUri[uri];
+            h.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+            owner.Protocol.ProcessAndAcceptAllAsync(h.Transport.DrainOne()).GetAwaiter().GetResult();
+        }
+
+        (ulong TraceId, byte[] Challenge) Challenge()
+        {
+            var started = owner.Protocol.StartAsync(FlowKind.VerifyShares, new VerifySharesParams
+            {
+                SecretId = secretId,
+                Version = version,
+                Target = Target.One(channelA),
+            }).GetAwaiter().GetResult().OfType<VerifySharesStartedEvent>().Single();
+            return (started.TraceId, owner.Transport.DrainOne());
+        }
+        byte[] Answer(byte[] challenge)
+        {
+            helperA.Protocol.ProcessAndAcceptAllAsync(challenge).GetAwaiter().GetResult();
+            return helperA.Transport.DrainOne();
+        }
+
+        // A second challenge replaces the first; the first one's answer is stale.
+        var (firstTrace, firstChallenge) = Challenge();
+        var (_, secondChallenge) = Challenge();
+        byte[] firstAnswer = Answer(firstChallenge);
+        byte[] secondAnswer = Answer(secondChallenge);
+        var stale = owner.Protocol.ProcessAsync(firstAnswer).GetAwaiter().GetResult();
+        if (stale.Count != 1 || stale[0] is not MessageIgnoredEvent ignored
+            || ignored.Reason != IgnoreReason.StaleResponse || ignored.ChannelId != channelA
+            || ignored.TraceId != firstTrace)
+            throw new InvalidOperationException(
+                $"the replaced challenge's answer must be MessageIgnored(StaleResponse, trace {firstTrace}); got [{string.Join(", ", stale)}]");
+        var current = owner.Protocol.ProcessAsync(secondAnswer).GetAwaiter().GetResult();
+        if (!current.OfType<ShareVerifiedEvent>().Any(e => e.ChannelId == channelA && e.Version == version))
+            throw new InvalidOperationException(
+                $"the current challenge's answer must still verify; got [{string.Join(", ", current)}]");
+        Console.WriteLine("  [Owner] answer to a replaced challenge → MessageIgnored(StaleResponse); current answer → ShareVerified  ✓");
+
+        // HelperA's stored share no longer matches the bytes the owner holds a
+        // proof of, as after storage corruption.
+        var stored = helperA.ShareStore.Load(secretId, channelA, new[] { version }).Single();
+        var request = Org.Derecalliance.Derec.Protobuf.StoreShareRequestMessage.Parser.ParseFrom(stored.Bytes);
+        byte[] share = request.Share.ToByteArray();
+        share[share.Length / 2] ^= 0xFF;
+        request.Share = Google.Protobuf.ByteString.CopyFrom(share);
+        helperA.ShareStore.Save(secretId, channelA, stored with { Bytes = Google.Protobuf.MessageExtensions.ToByteArray(request) });
+        var invalid = owner.Protocol.ProcessAsync(Answer(Challenge().Challenge)).GetAwaiter().GetResult();
+        if (invalid.Count != 1 || invalid[0] is not ShareVerifyInvalidEvent inv
+            || inv.ChannelId != channelA || inv.Version != version)
+            throw new InvalidOperationException(
+                $"a proof over corrupted bytes must be ShareVerifyInvalid; got [{string.Join(", ", invalid)}]");
+        Console.WriteLine("  [Owner] proof over HelperA's corrupted share → ShareVerifyInvalid  ✓");
+
+        // The plaintext envelope timestamp is moved off the encrypted inner one.
+        var (_, challenge) = Challenge();
+        var envelope = Org.Derecalliance.Derec.Protobuf.DeRecMessage.Parser.ParseFrom(challenge);
+        envelope.Timestamp.Nanos = (envelope.Timestamp.Nanos + 1) % 1_000_000_000;
+        var mismatched = helperA.Protocol.ProcessAsync(Google.Protobuf.MessageExtensions.ToByteArray(envelope))
+            .GetAwaiter().GetResult();
+        if (mismatched.Count != 1 || mismatched[0] is not MessageIgnoredEvent tsIgnored
+            || tsIgnored.Reason != IgnoreReason.TimestampMismatch || tsIgnored.ChannelId != channelA)
+            throw new InvalidOperationException(
+                $"a mismatched envelope timestamp must be MessageIgnored(TimestampMismatch); got [{string.Join(", ", mismatched)}]");
+        if (helperA.Transport.Outbox.Count != 0)
+            throw new InvalidOperationException("a message ignored for its timestamp must not be answered");
+        Console.WriteLine("  [HelperA] envelope timestamp ≠ inner timestamp → MessageIgnored(TimestampMismatch), nothing sent  ✓");
+
+        Console.WriteLine("Verification response verdicts test passed.\n");
+    }
+
+    /// <summary>
     /// A builder that never calls <c>WithThreshold</c> must leave the Rust
     /// library's default (3) in force rather than a value restated here.
     /// </summary>
@@ -1777,7 +2134,7 @@ internal static class Protocol
           "secret": {
             "helpers": [
               { "channel_id": "{{max}}", "transports": [{ "uri": "https://h.example.com", "protocol": "https" }],
-                "shared_key": [{{sharedKey}}] }
+                "shared_key": [{{sharedKey}}], "weight": 1 }
             ],
             "secrets": [ { "id": [1], "name": "wallet", "data": [2, 3] } ]
           }
@@ -2327,7 +2684,7 @@ internal static class Protocol
           "incoming_author_replica_id": "18446744073709551615",
           "secret": {
             "helpers": [
-              { "channel_id": "5", "transports": [], "shared_key": [1, 2], "communication_info": {} }
+              { "channel_id": "5", "transports": [], "shared_key": [1, 2], "communication_info": {}, "weight": 1 }
             ],
             "secrets": [ { "id": [1], "name": "s", "data": [9, 8] } ],
             "replicas": {
@@ -3643,7 +4000,8 @@ internal static class Protocol
         bool UnsafeConnection = false,
         bool OmitThreshold = false,
         ulong? MaxSubshares = null,
-        ParameterRange? ParameterRange = null);
+        ParameterRange? ParameterRange = null,
+        bool? AutoRespondOnFailure = null);
 
     private const int DefaultThreshold = 2;
 
@@ -3805,6 +4163,8 @@ internal static class Protocol
             builder = builder.WithMaxSubshares(maxSubshares);
         if (options.ParameterRange is ParameterRange range)
             builder = builder.WithParameterRange(range);
+        if (options.AutoRespondOnFailure is bool autoRespond)
+            builder = builder.WithAutoRespondOnFailure(autoRespond);
 
         return new Node(builder.Build(), transport, channelStore, shareStore, secretStore, userSecretStore, stateStore);
     }

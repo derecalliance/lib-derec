@@ -112,8 +112,14 @@ pub enum ChannelStatus {
     /// Channel is fully paired and ready for protocol messages.
     #[default]
     Paired,
-    /// Replica member only: told to leave, awaiting the version that
-    /// completes its removal. Never set on a helper channel.
+    /// Being torn down. A helper channel is `Unpairing` from the moment an
+    /// unpair under [`UnpairAck::Required`](crate::protocol::UnpairAck::Required)
+    /// is sent until the helper answers or the acknowledgement window
+    /// elapses; a rejection returns it to `Paired`. A replica member is
+    /// `Unpairing` once told to leave, until the version that completes its
+    /// removal. Not a publish target, not a recovery source, and not a
+    /// target of any new request, but inbound messages on it are still
+    /// processed, so the answer to the unpair is.
     Unpairing,
 }
 

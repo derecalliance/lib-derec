@@ -158,9 +158,14 @@ const (
 	// ChannelStatusPaired marks a channel fully paired and ready for
 	// protocol messages.
 	ChannelStatusPaired
-	// ChannelStatusUnpairing marks a replica-group member that has been
-	// told to leave and is awaiting the roster version that completes its
-	// removal. Never set on a helper channel.
+	// ChannelStatusUnpairing marks a channel being torn down. A helper
+	// channel is Unpairing from the moment an unpair that awaits
+	// acknowledgement is sent until the helper answers or the
+	// acknowledgement window elapses; a rejection returns it to Paired. A
+	// replica-group member is Unpairing once told to leave, until the roster
+	// version that completes its removal. Not a publish target, not a
+	// recovery source, and not a target of any new request, but inbound
+	// messages on it are still processed.
 	ChannelStatusUnpairing
 )
 

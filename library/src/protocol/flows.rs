@@ -194,10 +194,16 @@ impl<
     /// with the roster's threshold
     /// ([`Secret::threshold`](crate::protocol::types::Secret::threshold));
     /// every channel under `self.secret_id` at no roster id (i.e. the
-    /// recovery-mode channels) is unpaired (request sent to the helper,
-    /// local state dropped). The protocol resumes normal operation
-    /// immediately — the next `start(ProtectSecret)` publishes
-    /// `recovered_version + 1` to the restored helpers.
+    /// recovery-mode channels) is unpaired as `start(`[`DeRecFlow::Unpair`]`)`
+    /// would, under the configured
+    /// [`with_unpair_ack`](crate::protocol::DeRecProtocolBuilder::with_unpair_ack):
+    /// the returned events carry an `UnpairStarted` per channel, and under
+    /// `UnpairAck::Required` its `Unpaired` arrives later, from `process`
+    /// on the helper's answer or from the timeout sweep. The protocol
+    /// resumes normal operation immediately — the next
+    /// `start(ProtectSecret)` publishes `recovered_version + 1` to the
+    /// restored helpers only, since a channel still being unpaired is
+    /// never a publish target.
     ///
     /// A helper or replica member whose `transports` is empty gets no
     /// channel — there would be nothing to send to. It is reported as
@@ -284,6 +290,7 @@ impl<
             &local!(self),
             secret,
             recovered_version,
+            self.unpair_ack,
         )
         .await
     }
@@ -518,8 +525,8 @@ impl<
 
     /// Emits `UnpairStarted`. When the channel needs no acknowledgement the
     /// handler returns `Unpaired` immediately, interleaved after it; otherwise
-    /// `Unpaired` arrives later, from [`process`](Self::process) on the
-    /// response or from the timeout sweep.
+    /// the channel is `Unpairing` and `Unpaired` arrives later, from
+    /// [`process`](Self::process) on the response or from the timeout sweep.
     async fn start_unpair(
         &mut self,
         channel_id: ChannelId,
@@ -533,23 +540,16 @@ impl<
                 derec_proto::SenderKind::Helper,
             )
             .await?;
-        let mut events = vec![DeRecEvent::UnpairStarted {
+        handlers::unpairing::start(
+            &mut borrow_stores!(self),
+            &local!(self),
             channel_id,
-            trace_id: round.trace_id,
-        }];
-        events.extend(
-            handlers::unpairing::start(
-                &mut borrow_stores!(self),
-                &local!(self),
-                channel_id,
-                memo,
-                self.unpair_ack,
-                now_secs(),
-                round,
-            )
-            .await?,
-        );
-        Ok(events)
+            memo,
+            self.unpair_ack,
+            now_secs(),
+            round,
+        )
+        .await
     }
 
     async fn start_update_channel_info(

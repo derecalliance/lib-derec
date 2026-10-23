@@ -66,7 +66,7 @@ use crate::{
     types::{ChannelId, WeightedChannel},
 };
 use derec_proto::{SenderKind, TransportProtocol};
-use js_sys::{Array, Uint8Array};
+use js_sys::Array;
 use stores::{
     JsChannelStore, JsSecretStore, JsShareStore, JsStateStore, JsTransport, JsUserSecretStore,
 };
@@ -302,11 +302,15 @@ impl DeRecProtocolBuilderWasm {
     }
 
     /// Minimum number of shares required to reconstruct the secret.
-    /// Default: [`crate::protocol::DEFAULT_THRESHOLD`].
+    /// Default: [`crate::protocol::DEFAULT_THRESHOLD`]. `threshold` must be an
+    /// integer in `0..=u32::MAX`.
     #[wasm_bindgen(js_name = withThreshold)]
-    pub fn with_threshold(mut self, threshold: u32) -> DeRecProtocolBuilderWasm {
-        self.config.threshold = Some(threshold as usize);
-        self
+    pub fn with_threshold(
+        mut self,
+        threshold: JsValue,
+    ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        self.config.threshold = Some(js_number_to_u32(&threshold, "threshold")? as usize);
+        Ok(self)
     }
 
     /// Accept plaintext transport endpoints — `http://` and `grpc://`.
@@ -593,11 +597,11 @@ impl DeRecProtocolWasm {
     pub async fn create_contact(
         &self,
         channel_id: JsValue,
-        contact_mode: u32,
+        contact_mode: JsValue,
         nonce: JsValue,
     ) -> Result<JsValue, JsValue> {
         let id = parse_optional_channel_id(channel_id)?;
-        let mode = match contact_mode {
+        let mode = match js_number_to_u32(&contact_mode, "contact_mode")? {
             0 => derec_proto::ContactMode::InlineKeys,
             1 => derec_proto::ContactMode::HashedKeys,
             2 => derec_proto::ContactMode::NoKeys,
@@ -713,8 +717,8 @@ impl DeRecProtocolWasm {
     /// An `Array` of `*Started` / `*Failed` events describing the
     /// dispatched requests. Same shape as `process()`.
     #[wasm_bindgen(js_name = "start")]
-    pub async fn start(&self, flow_kind: u32, params: JsValue) -> Result<JsValue, JsValue> {
-        let flow = parse_flow(flow_kind, params)?;
+    pub async fn start(&self, flow_kind: JsValue, params: JsValue) -> Result<JsValue, JsValue> {
+        let flow = parse_flow(js_number_to_u32(&flow_kind, "flow_kind")?, params)?;
         let rust_events = self
             .inner
             .lock()
@@ -831,17 +835,21 @@ impl DeRecProtocolWasm {
     pub async fn reject(
         &self,
         action_bytes: &[u8],
-        status: i32,
+        status: JsValue,
         memo: &str,
     ) -> Result<(), JsValue> {
         let action = pending_action_wire::deserialize(action_bytes)
             .map_err(|e| js_error("decode_error", e))?;
-        let status_enum = derec_proto::StatusEnum::try_from(status).map_err(|_| {
-            js_error(
-                "invalid_status",
-                format!("invalid StatusEnum value: {status}"),
-            )
-        })?;
+        let status_enum = status
+            .as_f64()
+            .filter(|f| f.fract() == 0.0 && (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(f))
+            .and_then(|f| derec_proto::StatusEnum::try_from(f as i32).ok())
+            .ok_or_else(|| {
+                js_error(
+                    "invalid_status",
+                    format!("invalid StatusEnum value: {status:?}"),
+                )
+            })?;
         self.inner
             .lock()
             .await
@@ -940,8 +948,9 @@ impl DeRecProtocolWasm {
     pub async fn restore(
         &self,
         recovered_secret: JsValue,
-        version: u32,
+        version: JsValue,
     ) -> Result<JsValue, JsValue> {
+        let version = js_number_to_u32(&version, "version")?;
         let secret = parse_recovered_secret(recovered_secret)?;
         let rust_events = self
             .inner
@@ -1135,27 +1144,43 @@ pub(crate) fn parse_weighted_channels(val: JsValue) -> Result<Vec<WeightedChanne
 }
 
 /// Parse a JS `Array<{ id: Uint8Array, name: string, data: Uint8Array }>` into
-/// a `Vec<UserSecret>`.
+/// a `Vec<UserSecret>`. A value that is not an array, or an entry missing a
+/// field or carrying one of the wrong type, is a decode error.
 fn parse_user_secrets(val: JsValue) -> Result<Vec<UserSecret>, JsValue> {
-    let arr = Array::from(&val);
-    let mut result = Vec::with_capacity(arr.length() as usize);
-    for i in 0..arr.length() {
-        let entry = arr.get(i);
-        let id = js_sys::Reflect::get(&entry, &JsValue::from_str("id"))
-            .map_err(|e| js_error("decode_error", format!("missing id: {e:?}")))?;
-        let name = js_sys::Reflect::get(&entry, &JsValue::from_str("name"))
-            .map_err(|e| js_error("decode_error", format!("missing name: {e:?}")))?
-            .as_string()
-            .ok_or_else(|| js_error("decode_error", "name must be a string"))?;
-        let data = js_sys::Reflect::get(&entry, &JsValue::from_str("data"))
-            .map_err(|e| js_error("decode_error", format!("missing data: {e:?}")))?;
-        result.push(UserSecret {
-            id: Uint8Array::new(&id).to_vec(),
-            name,
-            data: Uint8Array::new(&data).to_vec(),
-        });
+    #[derive(serde::Deserialize)]
+    struct UserSecretShape {
+        #[serde(with = "serde_bytes")]
+        id: Vec<u8>,
+        name: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
     }
-    Ok(result)
+    if !Array::is_array(&val) {
+        return Err(js_error("decode_error", "secrets must be an array"));
+    }
+    let parsed: Vec<UserSecretShape> = serde_wasm_bindgen::from_value(val)
+        .map_err(|e| js_error("decode_error", format!("invalid secrets: {e}")))?;
+    Ok(parsed
+        .into_iter()
+        .map(|s| UserSecret {
+            id: s.id,
+            name: s.name,
+            data: s.data,
+        })
+        .collect())
+}
+
+/// `params[key]` as an optional string: `undefined` or `null` is `None`, any
+/// other non-string is a decode error.
+fn optional_string(params: &JsValue, key: &str) -> Result<Option<String>, JsValue> {
+    let value = js_sys::Reflect::get(params, &JsValue::from_str(key)).unwrap_or(JsValue::UNDEFINED);
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_string()
+        .map(Some)
+        .ok_or_else(|| js_error("decode_error", format!("{key} must be a string")))
 }
 
 /// Parse a JS flow kind + params into a [`DeRecFlow`].
@@ -1218,9 +1243,7 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
             let secrets_val = js_sys::Reflect::get(&params, &JsValue::from_str("secrets"))
                 .map_err(|e| js_error("decode_error", format!("missing secrets: {e:?}")))?;
             let secrets = parse_user_secrets(secrets_val)?;
-            let description = js_sys::Reflect::get(&params, &JsValue::from_str("description"))
-                .unwrap_or(JsValue::UNDEFINED)
-                .as_string();
+            let description = optional_string(&params, "description")?;
             let weights_val = js_sys::Reflect::get(&params, &JsValue::from_str("weights"))
                 .unwrap_or(JsValue::UNDEFINED);
             let weights = parse_weights(weights_val)?;
@@ -1270,9 +1293,7 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
             let channel_id_val = js_sys::Reflect::get(&params, &JsValue::from_str("channel_id"))
                 .map_err(|e| js_error("decode_error", format!("missing channel_id: {e:?}")))?;
             let channel_id = ChannelId(js_value_to_u64(channel_id_val)?);
-            let memo = js_sys::Reflect::get(&params, &JsValue::from_str("memo"))
-                .unwrap_or(JsValue::UNDEFINED)
-                .as_string();
+            let memo = optional_string(&params, "memo")?;
             Ok(DeRecFlow::Unpair { channel_id, memo })
         }
         6 => {
@@ -1352,13 +1373,7 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
                         format!("replica_id must be a decimal u64: {e}"),
                     )
                 })?;
-            let memo_val = js_sys::Reflect::get(&params, &JsValue::from_str("memo"))
-                .unwrap_or(JsValue::UNDEFINED);
-            let memo = if memo_val.is_null() || memo_val.is_undefined() {
-                None
-            } else {
-                memo_val.as_string()
-            };
+            let memo = optional_string(&params, "memo")?;
             Ok(DeRecFlow::UnpairReplica { replica_id, memo })
         }
         7 => {

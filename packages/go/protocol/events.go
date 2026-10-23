@@ -554,8 +554,9 @@ func (e *EndpointJSON) UnmarshalJSON(data []byte) error {
 //
 // Weight is the number of Shamir subshares the helper received in the round
 // that wrote the roster. Restore writes it into the helper's
-// HelperChannel.Weight, so the next publish gives it the same count. It is
-// always sent as given; restore refuses a weight of 0.
+// HelperChannel.Weight, so the next publish gives it the same count. A zero
+// Weight is left out of the JSON, which restore reads as 1, as it does an
+// omitted weight in every other SDK.
 type Helper struct {
 	ChannelID         uint64            `json:"channel_id,string"`
 	Transports        []EndpointJSON    `json:"transports"`
@@ -575,7 +576,7 @@ func (h Helper) MarshalJSON() ([]byte, error) {
 		Transports        []EndpointJSON       `json:"transports"`
 		SharedKey         native.JSONByteArray `json:"shared_key"`
 		CommunicationInfo map[string]string    `json:"communication_info,omitempty"`
-		Weight            uint32               `json:"weight"`
+		Weight            uint32               `json:"weight,omitempty"`
 	}{
 		ChannelID:         h.ChannelID,
 		Transports:        h.Transports,

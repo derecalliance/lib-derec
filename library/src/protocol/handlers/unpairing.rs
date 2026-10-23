@@ -53,6 +53,7 @@ use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
 use crate::protocol::context::{Exchange, Local, Round};
 use crate::protocol::stores::{StoreSet, Stores};
+use crate::protocol::types::{ChannelQuery, ChannelRecord, ChannelStatus};
 use crate::{
     Error, Result,
     primitives::unpairing::{
@@ -116,7 +117,10 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 ) -> Result<Vec<DeRecEvent>> {
     let secret_id = local.secret_id;
     let memo_str = memo.unwrap_or_default();
-    let mut events = Vec::new();
+    let mut events = vec![DeRecEvent::UnpairStarted {
+        channel_id,
+        trace_id: round.trace_id,
+    }];
 
     let shared_key = match stores
         .secrets
@@ -157,6 +161,16 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
                     },
                 )
                 .await?;
+            // Written after the pending row, so an `Unpairing` channel always
+            // has one and the acknowledgement timeout always reaches it.
+            set_status(
+                stores,
+                local,
+                channel_id,
+                ChannelStatus::Paired,
+                ChannelStatus::Unpairing,
+            )
+            .await?;
         }
     }
 
@@ -341,11 +355,49 @@ async fn on_response<S: StoreSet>(
         Err(Error::Unpairing(crate::primitives::unpairing::UnpairingError::NonOkStatus {
             status,
             memo,
-        })) => Ok(vec![DeRecEvent::UnpairRejected {
-            channel_id: exchange.channel_id,
-            status,
-            memo,
-        }]),
+        })) => {
+            set_status(
+                stores,
+                local,
+                exchange.channel_id,
+                ChannelStatus::Unpairing,
+                ChannelStatus::Paired,
+            )
+            .await?;
+            Ok(vec![DeRecEvent::UnpairRejected {
+                channel_id: exchange.channel_id,
+                status,
+                memo,
+            }])
+        }
         Err(e) => Err(e),
     }
+}
+
+/// Move a helper channel from `from` to `to`, leaving any other status alone.
+///
+/// Only a `Paired` channel becomes `Unpairing`: one still `Pending` is
+/// already excluded from every flow, and a rejection must not promote it.
+async fn set_status<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    channel_id: ChannelId,
+    from: ChannelStatus,
+    to: ChannelStatus,
+) -> Result<()> {
+    let Some(mut helper) = stores
+        .channels
+        .load(local.secret_id, ChannelQuery::Helper { channel_id })
+        .await?
+        .and_then(|record| record.as_helper().cloned())
+        .filter(|helper| helper.status == from)
+    else {
+        return Ok(());
+    };
+    helper.status = to;
+    stores
+        .channels
+        .save(local.secret_id, ChannelRecord::Helper(helper))
+        .await?;
+    Ok(())
 }

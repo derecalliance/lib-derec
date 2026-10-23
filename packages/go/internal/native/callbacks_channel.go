@@ -237,7 +237,7 @@ func channelLinkedChannelsCallback(userData uintptr, secretID, channelID uint64,
 
 // channelCallbackPtrs holds the purego.NewCallback address for every
 // ChannelStoreCallbacks fn-pointer field except FreeBuffer (shared package-
-// wide via sharedFreeBufferCallback). All six functions are stateless
+// wide via sharedFreeBufferCallback). All seven functions are stateless
 // package-level funcs that resolve their *storeSet from UserData at call
 // time, so each needs exactly one registration total, reused across every
 // buildChannelStoreCallbacks call — purego.NewCallback has a fixed 2000-slot

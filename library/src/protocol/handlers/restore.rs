@@ -95,8 +95,9 @@ pub enum RestoreError {
 /// persisted with their `SharedKey`; canonical replica channels are
 /// persisted with the group key from `secret.replicas.shared_key`; the
 /// user-secret snapshot is committed at `recovered_version`; every
-/// recovery-mode channel under `secret_id` is unpaired
-/// (`UnpairAck::NotRequired`). The returned events are one
+/// recovery-mode channel under `secret_id` is unpaired under the
+/// configured `unpair_ack`, exactly as `start(Unpair)` would. The returned
+/// events are one
 /// [`DeRecEvent::PeerNotRestored`] per roster entry that got no channel,
 /// followed by those of the recovery-channel wipe, and should be drained
 /// into the protocol's `pending_start_events`.
@@ -178,19 +179,16 @@ pub enum RestoreError {
 ///    pass `threshold` on `start(ProtectSecret)`. This write is the commit
 ///    point — nothing is removed before it succeeds, so any earlier failure
 ///    is fully retryable.
-/// 5. **Wipe.** Send unpair requests to every channel at no roster id —
-///    the recovery-mode channels minted to drive `start(RecoverSecret)` —
-///    and drop their local state.
-///
-///    `UnpairAck::NotRequired` is forced here, deliberately, and does
-///    not follow the protocol's configured ack mode. Waiting on an
-///    acknowledgement would keep the ephemeral channels alive for up to
-///    the unpair timeout, and those channels are indistinguishable from
-///    the canonical ones to
-///    [`sharing`](super::sharing) — which selects purely on
-///    `peer_role == Helper && status == Paired` — so a subsequent
-///    `ProtectSecret` would double-send to every helper. The ephemeral
-///    channels must be gone by the time this call returns.
+/// 5. **Wipe.** Unpair every channel at no roster id — the recovery-mode
+///    channels minted to drive `start(RecoverSecret)` — under the
+///    configured `unpair_ack`, as `start(Unpair)` does. Under
+///    `UnpairAck::Required` each one is
+///    [`ChannelStatus::Unpairing`](crate::protocol::types::ChannelStatus::Unpairing)
+///    until its helper answers or the acknowledgement window elapses, so
+///    no flow selects it in the meantime: the follow-up `ProtectSecret`
+///    reaches only the restored helpers, and the helper's answer lands on
+///    a channel that still exists. Under `UnpairAck::NotRequired` its
+///    local state is dropped as the request goes out.
 ///
 ///    For the same reason the wipe cannot fail the restore. An old
 ///    helper that has gone away is the expected condition during
@@ -200,14 +198,17 @@ pub enum RestoreError {
 ///    [`RestoreError::AlreadyRestored`] blocking any retry. Instead each
 ///    undeliverable teardown surfaces as
 ///    [`DeRecEvent::UnpairFailed`] and local state is dropped anyway, so
-///    every wiped channel still yields exactly one
-///    [`DeRecEvent::Unpaired`].
+///    every wiped channel yields exactly one [`DeRecEvent::Unpaired`]:
+///    in the returned events when the request could not be sent or no
+///    acknowledgement is required, later from `process` or the timeout
+///    sweep otherwise.
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
 pub(in crate::protocol) async fn restore<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     secret: &Secret,
     recovered_version: u32,
+    unpair_ack: UnpairAck,
 ) -> Result<Vec<DeRecEvent>> {
     let plan = plan_restore(secret)?;
     let existing_channels = check_preconditions(stores, local, &plan).await?;
@@ -222,7 +223,14 @@ pub(in crate::protocol) async fn restore<S: StoreSet>(
 
     let mut events = plan.not_restored;
     events.extend(
-        unpair_recovery_channels(stores, local, &existing_channels, &plan.roster_ids).await,
+        unpair_recovery_channels(
+            stores,
+            local,
+            &existing_channels,
+            &plan.roster_ids,
+            unpair_ack,
+        )
+        .await,
     );
 
     #[cfg(feature = "logging")]
@@ -465,6 +473,7 @@ async fn unpair_recovery_channels<S: StoreSet>(
     local: &Local<'_>,
     existing_channels: &[HelperChannel],
     roster_ids: &HashSet<u64>,
+    unpair_ack: UnpairAck,
 ) -> Vec<DeRecEvent> {
     let recovery_ids: Vec<ChannelId> = existing_channels
         .iter()
@@ -481,16 +490,7 @@ async fn unpair_recovery_channels<S: StoreSet>(
     };
     let mut events = Vec::new();
     for channel_id in recovery_ids {
-        match super::unpairing::start(
-            stores,
-            local,
-            channel_id,
-            None,
-            UnpairAck::NotRequired,
-            now,
-            round,
-        )
-        .await
+        match super::unpairing::start(stores, local, channel_id, None, unpair_ack, now, round).await
         {
             Ok(mut per_channel) => events.append(&mut per_channel),
             Err(e) => {
@@ -550,8 +550,13 @@ mod tests {
     }
 
     fn build_rig(secret_id: u64) -> TestRig {
+        build_rig_with_ack(secret_id, UnpairAck::Required)
+    }
+
+    fn build_rig_with_ack(secret_id: u64, unpair_ack: UnpairAck) -> TestRig {
         let rig = StoreRig::new();
         let protocol = DeRecProtocolBuilder::new(secret_id)
+            .with_unpair_ack(unpair_ack)
             .with_channel_store(rig.channels.clone())
             .with_share_store(rig.shares.clone())
             .with_secret_store(rig.secrets.clone())
@@ -1241,37 +1246,94 @@ mod tests {
 
     // ---------------- Recovery-channel wipe ----------------
 
+    /// Seeds two recovery channels at ids that don't collide with any
+    /// canonical helper or replica id from `fixture_secret`. Each needs a
+    /// SharedKey in `secret_store` so the unpair handler can build the
+    /// encrypted request envelope.
+    fn seed_recovery_channels(rig: &TestRig, secret_id: u64) {
+        for rcid in RECOVERY_IDS {
+            rig.channel_store.helper_rows.lock().unwrap().insert(
+                (secret_id, rcid),
+                HelperChannel {
+                    channel_id: ChannelId(rcid),
+                    transports: vec![TransportProtocol {
+                        uri: format!("https://recovery-{rcid}.example"),
+                        protocol: 0,
+                    }],
+                    communication_info: HashMap::new(),
+                    status: ChannelStatus::Paired,
+                    created_at: 1,
+                    peer_role: SenderKind::Helper,
+                    weight: 1,
+                },
+            );
+            rig.secret_store.data.lock().unwrap().insert(
+                (secret_id, rcid, SecretKind::SharedKey as u8),
+                SecretValue::SharedKey([0x77; 32]),
+            );
+        }
+    }
+
+    const RECOVERY_IDS: [u64; 2] = [99, 100];
+
+    /// Under `UnpairAck::Required` a recovery channel waits for its helper's
+    /// answer like any other unpair: it is `Unpairing`, keeps its key so the
+    /// answer can be read, and no `Unpaired` is reported yet.
+    #[test]
+    fn restore_leaves_recovery_channels_unpairing_until_answered() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EC;
+            let mut rig = build_rig(secret_id);
+            seed_recovery_channels(&rig, secret_id);
+
+            let events = rig
+                .protocol
+                .restore(&fixture_secret(), 7)
+                .await
+                .expect("restore must succeed despite recovery channels");
+
+            for rcid in RECOVERY_IDS {
+                let channel = rig
+                    .channel_store
+                    .load(
+                        secret_id,
+                        ChannelQuery::Helper {
+                            channel_id: ChannelId(rcid),
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .and_then(|record| record.as_helper().cloned())
+                    .expect("the recovery channel stays until its helper answers");
+                assert_eq!(channel.status, ChannelStatus::Unpairing);
+                assert!(
+                    rig.secret_store
+                        .load(secret_id, ChannelId(rcid), SecretKind::SharedKey)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "the key stays, so the helper's answer can be decrypted"
+                );
+                assert!(events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::UnpairStarted { channel_id, .. } if *channel_id == ChannelId(rcid)
+                )));
+            }
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::Unpaired { .. })),
+                "no recovery channel is unpaired before its helper answers, got {events:?}"
+            );
+        });
+    }
+
     #[test]
     fn restore_unpairs_pre_existing_recovery_channels() {
         run_async(async {
             let secret_id: u64 = 0xDE_2EC;
-            let mut rig = build_rig(secret_id);
-
-            // Two recovery channels at ids that don't collide with any
-            // canonical helper or replica id from `fixture_secret`.
-            // Each needs a SharedKey in `secret_store` so the unpair
-            // handler can build the encrypted request envelope.
-            for rcid in [99_u64, 100] {
-                rig.channel_store.helper_rows.lock().unwrap().insert(
-                    (secret_id, rcid),
-                    HelperChannel {
-                        channel_id: ChannelId(rcid),
-                        transports: vec![TransportProtocol {
-                            uri: format!("https://recovery-{rcid}.example"),
-                            protocol: 0,
-                        }],
-                        communication_info: HashMap::new(),
-                        status: ChannelStatus::Paired,
-                        created_at: 1,
-                        peer_role: SenderKind::Helper,
-                        weight: 1,
-                    },
-                );
-                rig.secret_store.data.lock().unwrap().insert(
-                    (secret_id, rcid, SecretKind::SharedKey as u8),
-                    SecretValue::SharedKey([0x77; 32]),
-                );
-            }
+            let mut rig = build_rig_with_ack(secret_id, UnpairAck::NotRequired);
+            seed_recovery_channels(&rig, secret_id);
 
             rig.protocol
                 .restore(&fixture_secret(), 7)
@@ -1279,7 +1341,7 @@ mod tests {
                 .expect("restore must succeed despite recovery channels");
 
             // Recovery channels and their SharedKeys are gone.
-            for rcid in [99_u64, 100] {
+            for rcid in RECOVERY_IDS {
                 assert!(
                     rig.channel_store
                         .load(

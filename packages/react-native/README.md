@@ -282,6 +282,16 @@ sent. `process()` does not reject for it, and no channel is created. The
 requester's `process()` rejects with code `non_ok_status`, whose `status` and
 `memo` hold the refusal.
 
+An inbound share the library refuses before any `ActionRequired` (undecodable,
+failing its commitment, outside this device's share-size range, or conflicting
+with the share stored at that version) is reported as a `ShareRefused` event
+with the `status` and `memo` sent; the owner observes it as `ShareRejected`.
+
+A replica group member's copy of the secret that does not decode or verify is
+refused, nothing is written, and it is reported as a `ReplicaSecretRefused`
+event with `status` and `memo`; on a push the publisher observes it as
+`ReplicaSyncRejected`.
+
 ---
 
 ## Store interfaces

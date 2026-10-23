@@ -135,7 +135,7 @@ func secretRemoveCallback(userData uintptr, secretID, channelID uint64, kind uin
 
 // secretCallbackPtrs holds the purego.NewCallback address for every
 // SecretStoreCallbacks fn-pointer field except FreeBuffer (shared package-
-// wide via sharedFreeBufferCallback). These three functions are stateless
+// wide via sharedFreeBufferCallback). These four functions are stateless
 // package-level funcs, so each needs exactly one registration total — see
 // registerChannelCallbacks in callbacks_channel.go for why per-call
 // registration would exhaust purego's 2000-slot callback table.
