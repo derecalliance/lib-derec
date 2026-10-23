@@ -21,10 +21,19 @@ use super::channel::{decrypt_message, encrypt_message};
 use rand::SeedableRng;
 use rand::rngs::ChaCha20Rng;
 use std::collections::HashSet;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroizing;
 
+mod error;
+mod merkle_tree;
 mod shamir;
+mod types;
 mod utils;
+
+pub use error::*;
+pub use types::*;
+
+use merkle_tree::MERKLE_TREE_DEPTH;
+use types::SplitMaterial;
 
 #[allow(non_upper_case_globals)]
 const λ_bits: usize = 256;
@@ -32,59 +41,9 @@ const λ_bits: usize = 256;
 #[allow(non_upper_case_globals)]
 const λ: usize = λ_bits / 8;
 
-const MERKLE_TREE_DEPTH: u32 = 7;
-
 /// The most helpers one split can have: one Merkle leaf per helper. The total number of
 /// subshares and the threshold are not capped; only helpers are, by the Merkle tree depth.
 const MAX_HELPERS: u64 = 1 << MERKLE_TREE_DEPTH;
-
-/// One subshare: a Shamir `(x, y)` pair with `y = f(x)`, each coordinate a serialized field element.
-#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
-pub struct Subshare {
-    /// The x-coordinate; it identifies the subshare.
-    pub x: Vec<u8>,
-    /// The y-coordinate, `f(x)`.
-    pub y: Vec<u8>,
-}
-
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-pub struct VSSShare {
-    /// The subshares this share carries, in the order the Merkle leaf commits to.
-    pub subshares: Vec<Subshare>,
-    /// AES encryption of the secret message
-    pub encrypted_secret: Vec<u8>,
-    /// Merkle-root commitment to all shares
-    pub commitment: Vec<u8>,
-    /// bottom-up Merkle authentication path.
-    /// The `bool` denotes `is_left`, while the `Vec<u8>` is the SHA-256 hash.
-    pub merkle_path: Vec<(bool, Vec<u8>)>,
-}
-
-/// Custom error type for Verifiable Secret Sharing (VSS) operations.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum DerecVSSError {
-    #[error("inconsistent ciphertexts")]
-    InconsistentCiphertexts,
-
-    #[error("inconsistent commitments")]
-    InconsistentCommitments,
-
-    #[error("one or more shares are corrupted")]
-    CorruptShares,
-
-    #[error("insufficient shares")]
-    InsufficientShares,
-
-    #[error("decryption failed")]
-    DecryptionFailure,
-
-    #[error("encryption failed")]
-    EncryptionFailure,
-
-    #[error("invalid access structure")]
-    InvalidAccessStructure,
-}
 
 /// Generates VSS shares for a given secret using Shamir's Secret Sharing scheme,
 /// with additional cryptographic commitments for verifiability during reconstruction.
@@ -167,86 +126,31 @@ pub fn share(
         return Err(DerecVSSError::InvalidAccessStructure);
     };
 
-    //pseudo-random key derivation
-    // random_oracle returns [u8; 4*λ], so each λ-byte chunk is statically guaranteed to exist.
-    let hash = utils::random_oracle(msg, entropy, &[]);
-    let mut k = [0u8; λ];
-    let mut nonce = [0u8; λ];
-    let mut seed1 = [0u8; λ];
-    let mut seed2 = [0u8; λ];
-    k.copy_from_slice(&hash[..λ]);
-    nonce.copy_from_slice(&hash[λ..2 * λ]);
-    seed1.copy_from_slice(&hash[2 * λ..3 * λ]);
-    seed2.copy_from_slice(&hash[3 * λ..4 * λ]);
+    let material = derive_split_material(msg, entropy);
 
-    //AES encrypt the message using the pseudo-random key k
-    let c = encrypt_message(msg, &k, &nonce).map_err(|_e| {
+    let c = encrypt_message(msg, &material.key, &material.nonce).map_err(|_e| {
         #[cfg(feature = "logging")]
         tracing::warn!(error = %_e, "AES-GCM encryption failed during secret sharing");
         DerecVSSError::EncryptionFailure
     })?;
 
-    // generate shares of the AES key k
-    let mut shamir_shares = shamir::share(
-        &k,
+    let leaves = deal_subshares(
+        &material.key,
         threshold,
         total_subshares,
-        &mut ChaCha20Rng::from_seed(seed1),
-    )
-    .into_iter()
-    .map(|(x, y)| Subshare { x, y });
-
-    let leaves: Vec<Vec<Subshare>> = weights
-        .iter()
-        .map(|&weight| shamir_shares.by_ref().take(weight as usize).collect())
-        .collect();
-
-    let merkle_tree = utils::build_merkle_tree(
-        &leaves,
-        MERKLE_TREE_DEPTH,
-        &mut ChaCha20Rng::from_seed(seed2),
+        weights,
+        material.subshare_seed,
     );
-    let merkle_proofs =
-        utils::extract_merkle_proofs(&merkle_tree, MERKLE_TREE_DEPTH, leaves.len() as u64);
+    let output = commit_shares(
+        leaves,
+        &c,
+        &mut ChaCha20Rng::from_seed(material.padding_seed),
+    );
 
-    let output: Vec<VSSShare> = leaves
-        .into_iter()
-        .zip(merkle_proofs)
-        .map(|(subshares, merkle_path)| VSSShare {
-            subshares,
-            encrypted_secret: c.clone(),
-            commitment: merkle_tree[0].clone(),
-            merkle_path,
-        })
-        .collect();
     #[cfg(feature = "logging")]
     tracing::info!(shares_count = output.len(), "secret split into VSS shares");
 
     Ok(output)
-}
-
-/// The number of subshares `weights` hands out, or `None` when the access structure is
-/// invalid: no shares, more than [`MAX_HELPERS`] shares, a weight outside `1..threshold`, a
-/// total below `threshold`, or `threshold < 2`.
-fn total_subshares(threshold: u64, weights: &[u64]) -> Option<u64> {
-    if weights.is_empty() || weights.len() as u64 > MAX_HELPERS {
-        return None;
-    }
-    let mut total: u64 = 0;
-    for &weight in weights {
-        if weight == 0 || weight >= threshold {
-            return None;
-        }
-        total = total.checked_add(weight)?;
-    }
-    (threshold <= total).then_some(total)
-}
-
-/// Whether `subshares` can be a share's subshare list: at least one subshare and no x-coordinate
-/// twice.
-fn subshares_are_well_formed(subshares: &[Subshare]) -> bool {
-    let mut seen = HashSet::with_capacity(subshares.len());
-    !subshares.is_empty() && subshares.iter().all(|p| seen.insert(p.x.as_slice()))
 }
 
 /// Verifies that a single VSS share is consistent with its Merkle commitment.
@@ -285,17 +189,8 @@ pub fn verify(share: &VSSShare) -> bool {
         return false;
     }
 
-    let mut on_path_hash = utils::leaf_hash_pub(&share.subshares);
-
-    for (is_left, node_hash) in &share.merkle_path {
-        on_path_hash = if *is_left {
-            utils::intermediate_hash_pub(node_hash, &on_path_hash)
-        } else {
-            utils::intermediate_hash_pub(&on_path_hash, node_hash)
-        };
-    }
-
-    let result = on_path_hash == share.commitment;
+    let result =
+        merkle_tree::root_from_path(&share.subshares, &share.merkle_path) == share.commitment;
 
     #[cfg(feature = "logging")]
     tracing::debug!(verified = result, "Merkle proof checked");
@@ -372,11 +267,10 @@ pub fn recover(shares: &Vec<VSSShare>) -> Result<Vec<u8>, DerecVSSError> {
     }
 
     // Stage 2: reconstruct the AES key via Shamir polynomial interpolation.
-    let shamir_shares = shares
+    let points = shares
         .iter()
-        .flat_map(|s| s.subshares.iter().map(|p| (p.x.clone(), p.y.clone())))
-        .collect();
-    let k = shamir::recover(shamir_shares).ok_or(DerecVSSError::CorruptShares)?;
+        .flat_map(|s| s.subshares.iter().map(|p| (p.x.as_slice(), p.y.as_slice())));
+    let k = Zeroizing::new(shamir::recover(points).ok_or(DerecVSSError::CorruptShares)?);
 
     // Stage 3: decrypt the ciphertext with the recovered key.
     // A decryption failure here means insufficient or wrong shares were provided.
@@ -394,6 +288,92 @@ pub fn recover(shares: &Vec<VSSShare>) -> Result<Vec<u8>, DerecVSSError> {
     );
 
     Ok(secret)
+}
+
+/// The number of subshares `weights` hands out, or `None` when the access structure is
+/// invalid: no shares, more than [`MAX_HELPERS`] shares, a weight outside `1..threshold`, a
+/// total below `threshold`, or `threshold < 2`.
+fn total_subshares(threshold: u64, weights: &[u64]) -> Option<u64> {
+    if weights.is_empty() || weights.len() as u64 > MAX_HELPERS {
+        return None;
+    }
+    let mut total: u64 = 0;
+    for &weight in weights {
+        if weight == 0 || weight >= threshold {
+            return None;
+        }
+        total = total.checked_add(weight)?;
+    }
+    (threshold <= total).then_some(total)
+}
+
+/// Whether `subshares` can be a share's subshare list: at least one subshare and no x-coordinate
+/// twice.
+fn subshares_are_well_formed(subshares: &[Subshare]) -> bool {
+    let mut seen = HashSet::with_capacity(subshares.len());
+    !subshares.is_empty() && subshares.iter().all(|p| seen.insert(p.x.as_slice()))
+}
+
+/// Derives the [`SplitMaterial`] as consecutive `λ`-byte chunks of
+/// `random_oracle(msg, entropy)`, so the same inputs always split the same way.
+fn derive_split_material(msg: &[u8], entropy: &[u8; λ]) -> SplitMaterial {
+    // random_oracle returns [u8; 4*λ], so each λ-byte chunk is statically guaranteed to exist.
+    let hash = Zeroizing::new(utils::random_oracle(msg, entropy, &[]));
+    let chunk = |i: usize| -> [u8; λ] {
+        let mut out = [0u8; λ];
+        out.copy_from_slice(&hash[i * λ..(i + 1) * λ]);
+        out
+    };
+    SplitMaterial {
+        key: chunk(0),
+        nonce: chunk(1),
+        subshare_seed: chunk(2),
+        padding_seed: chunk(3),
+    }
+}
+
+/// Splits `key` into `total_subshares` subshares and deals them out in generation order:
+/// the first `weights[0]` to share 0, the next `weights[1]` to share 1, and so on.
+fn deal_subshares(
+    key: &[u8; λ],
+    threshold: u64,
+    total_subshares: u64,
+    weights: &[u64],
+    seed: [u8; λ],
+) -> Vec<Vec<Subshare>> {
+    let mut subshares = shamir::share(
+        key,
+        threshold,
+        total_subshares,
+        &mut ChaCha20Rng::from_seed(seed),
+    )
+    .into_iter()
+    .map(|(x, y)| Subshare { x, y });
+
+    weights
+        .iter()
+        .map(|&weight| subshares.by_ref().take(weight as usize).collect())
+        .collect()
+}
+
+/// Commits to `leaves` under one Merkle tree and turns each into a [`VSSShare`] carrying
+/// the root, its own proof and `encrypted_secret`.
+fn commit_shares<R: rand::CryptoRng + ?Sized>(
+    leaves: Vec<Vec<Subshare>>,
+    encrypted_secret: &[u8],
+    rng: &mut R,
+) -> Vec<VSSShare> {
+    let (root, proofs) = merkle_tree::commit(&leaves, rng);
+    leaves
+        .into_iter()
+        .zip(proofs)
+        .map(|(subshares, merkle_path)| VSSShare {
+            subshares,
+            encrypted_secret: encrypted_secret.to_vec(),
+            commitment: root.clone(),
+            merkle_path,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -495,7 +475,7 @@ mod tests {
     // passed off as a share's (x, y) with the shorter proof from that node to the root.
     fn internal_node_as_share(genuine: &VSSShare) -> VSSShare {
         let (sibling_is_left, sibling) = &genuine.merkle_path[0];
-        let leaf = utils::leaf_hash_pub(&genuine.subshares);
+        let leaf = merkle_tree::leaf_hash(&genuine.subshares);
         let (left, right) = if *sibling_is_left {
             (sibling.clone(), leaf)
         } else {
@@ -527,16 +507,10 @@ mod tests {
 
         // Walk the forged proof without the depth check, so only the
         // leaf/internal-node domain separation stands between it and the root.
-        let mut on_path_hash = utils::leaf_hash_pub(&forged.subshares);
-        for (is_left, node_hash) in &forged.merkle_path {
-            on_path_hash = if *is_left {
-                utils::intermediate_hash_pub(node_hash, &on_path_hash)
-            } else {
-                utils::intermediate_hash_pub(&on_path_hash, node_hash)
-            };
-        }
-
-        assert_ne!(on_path_hash, forged.commitment);
+        assert_ne!(
+            merkle_tree::root_from_path(&forged.subshares, &forged.merkle_path),
+            forged.commitment
+        );
     }
 
     #[test]
@@ -637,16 +611,7 @@ mod tests {
     fn test_recover_rejects_a_proven_coordinate_that_is_not_a_field_element() {
         let mut shares = share(2, &[1; 2], b"my secret", ENTROPY).unwrap();
         shares[0].subshares[0].y = vec![0xFF; shares[0].subshares[0].y.len()];
-        let tree = utils::build_merkle_tree(
-            &leaves_of(&shares),
-            MERKLE_TREE_DEPTH,
-            &mut crate::random::os_rng(),
-        );
-        let proofs = utils::extract_merkle_proofs(&tree, MERKLE_TREE_DEPTH, 2);
-        for (s, proof) in shares.iter_mut().zip(proofs) {
-            s.commitment = tree[0].clone();
-            s.merkle_path = proof;
-        }
+        let shares = commit(leaves_of(&shares), &shares[0].encrypted_secret);
 
         let err = recover(&shares).expect_err("an undecodable coordinate cannot interpolate");
         assert!(matches!(err, DerecVSSError::CorruptShares));
@@ -735,19 +700,7 @@ mod tests {
     /// Re-commits `leaves` under a fresh Merkle tree, so every share's proof opens to the
     /// root and only the subshare-list checks stand between a malformed share and `verify`.
     fn commit(leaves: Vec<Vec<Subshare>>, encrypted_secret: &[u8]) -> Vec<VSSShare> {
-        let tree =
-            utils::build_merkle_tree(&leaves, MERKLE_TREE_DEPTH, &mut crate::random::os_rng());
-        let proofs = utils::extract_merkle_proofs(&tree, MERKLE_TREE_DEPTH, leaves.len() as u64);
-        leaves
-            .into_iter()
-            .zip(proofs)
-            .map(|(subshares, merkle_path)| VSSShare {
-                subshares,
-                encrypted_secret: encrypted_secret.to_vec(),
-                commitment: tree[0].clone(),
-                merkle_path,
-            })
-            .collect()
+        commit_shares(leaves, encrypted_secret, &mut crate::random::os_rng())
     }
 
     fn leaves_of(shares: &[VSSShare]) -> Vec<Vec<Subshare>> {

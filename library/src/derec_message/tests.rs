@@ -5,7 +5,7 @@ use super::*;
 use crate::{
     derec_message::DeRecMessageBuilder, protocol_version::ProtocolVersion, types::ChannelId,
 };
-use derec_cryptography::pairing::pairing_ecies;
+use derec_cryptography::pairing::ecies;
 use derec_proto::{MessageBody, PairRequestMessage};
 use prost::Message;
 
@@ -14,7 +14,7 @@ const SEQUENCE: u32 = 7;
 const SHARED_KEY: [u8; 32] = [0xAB; 32];
 
 fn pairing_keypair() -> (Vec<u8>, Vec<u8>) {
-    pairing_ecies::generate_key(&mut crate::utils::os_rng()).unwrap()
+    ecies::generate_key(&mut crate::utils::os_rng()).unwrap()
 }
 
 fn sample_message() -> PairRequestMessage {

@@ -8,6 +8,7 @@ use ark_ec::*;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rand::CryptoRng;
 use sha2::*;
+use zeroize::Zeroizing;
 
 use super::DerecPairingError;
 
@@ -24,8 +25,8 @@ use super::DerecPairingError;
 pub fn generate_key<R: CryptoRng + ?Sized>(
     rng: &mut R,
 ) -> Result<(Vec<u8>, Vec<u8>), DerecPairingError> {
-    let sk: ark_secp256k1::Fr = crate::random::field_element(rng);
-    let pk = ark_secp256k1::Affine::generator() * sk;
+    let sk: Zeroizing<ark_secp256k1::Fr> = Zeroizing::new(crate::random::field_element(rng));
+    let pk = ark_secp256k1::Affine::generator() * *sk;
 
     let mut sk_bytes = Vec::new();
     sk.serialize_uncompressed(&mut sk_bytes)
@@ -54,19 +55,21 @@ pub fn generate_key<R: CryptoRng + ?Sized>(
 /// a 32-byte array representing the derived shared key.
 ///
 pub fn derive_shared_key(sk: &[u8], pk: &[u8]) -> Result<[u8; 32], DerecPairingError> {
-    let sk = ark_secp256k1::Fr::deserialize_uncompressed(sk)
-        .map_err(DerecPairingError::SerializationError)?;
+    let sk = Zeroizing::new(
+        ark_secp256k1::Fr::deserialize_uncompressed(sk)
+            .map_err(DerecPairingError::SerializationError)?,
+    );
     let pk = ark_secp256k1::Affine::deserialize_uncompressed(pk)
         .map_err(DerecPairingError::SerializationError)?;
 
-    let shared_key = pk * sk;
+    let shared_key = Zeroizing::new(pk * *sk);
 
-    let mut shared_key_bytes = Vec::new();
+    let mut shared_key_bytes = Zeroizing::new(Vec::new());
     shared_key
-        .serialize_uncompressed(&mut shared_key_bytes)
+        .serialize_uncompressed(&mut *shared_key_bytes)
         .map_err(DerecPairingError::SerializationError)?;
 
     let mut hasher = sha2::Sha256::new();
-    hasher.update(shared_key_bytes);
+    hasher.update(&*shared_key_bytes);
     Ok(hasher.finalize().into())
 }

@@ -12,8 +12,8 @@
 //! - **Responder**: the party that receives the contact message and replies with the pairing request.
 //!
 //! # Modules
-//! - `pairing_mlkem`: ML-KEM (Kyber) encapsulation/decapsulation primitives.
-//! - `pairing_ecies`: ECIES (Elliptic Curve Integrated Encryption Scheme) primitives.
+//! - `mlkem`: ML-KEM (Kyber) encapsulation/decapsulation primitives.
+//! - `ecies`: ECIES (Elliptic Curve Integrated Encryption Scheme) primitives.
 //!
 //! # Error Handling
 //! Defines `DerecPairingError` for error reporting throughout the pairing process.
@@ -38,169 +38,18 @@
 //! - `finish_pairing_initiator`: Used by the initiator to derive the shared key.
 //!
 
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rand::SeedableRng;
 use rand::rngs::ChaCha20Rng;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroizing;
 
+pub mod ecies;
 pub mod envelope;
-pub mod pairing_ecies;
-pub mod pairing_mlkem;
+mod error;
+pub mod mlkem;
+mod types;
 
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum DerecPairingError {
-    #[error("serialization error: {0:?}")]
-    SerializationError(ark_serialize::SerializationError),
-
-    #[error("ml-kem encapsulation failed")]
-    MLKemEncapsulationError,
-
-    #[error("ml-kem decapsulation failed")]
-    MLKemDecapsulationError,
-
-    #[error("invalid input size: expected {expected} bytes, got {got}")]
-    InvalidSize { expected: usize, got: usize },
-}
-
-#[derive(CanonicalSerialize, CanonicalDeserialize, Clone)]
-pub struct PairingContactMessageMaterial {
-    pub mlkem_encapsulation_key: Vec<u8>,
-    pub ecies_public_key: Vec<u8>,
-}
-
-/// Secret key material held by the **initiator** during pairing.
-///
-/// Produced by [`contact_message`] and consumed by [`finish_pairing_initiator`].
-/// Always holds an ML-KEM decapsulation key; never holds an ML-KEM shared secret.
-///
-/// The matching public components (`mlkem_encapsulation_key`, `ecies_public_key`)
-/// are also retained here so that the [`CONTACT_MODE_HASHED_KEYS`][PairingContactMessageMaterial]
-/// pre-pair flow can re-publish them after the contact creator has already given
-/// the contact away.
-#[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Zeroize, ZeroizeOnDrop)]
-pub struct InitiatorSecretKeyMaterial {
-    /// ML-KEM-1024 decapsulation key. Used in [`finish_pairing_initiator`] to recover
-    /// the post-quantum shared secret from the responder's ciphertext.
-    pub mlkem_decapsulation_key: Vec<u8>,
-    /// ECIES secret key. Used to decrypt incoming pairing messages and to derive the
-    /// ECDH component of the final shared key.
-    pub ecies_secret_key: Vec<u8>,
-    /// ML-KEM-1024 encapsulation key — the public counterpart of
-    /// `mlkem_decapsulation_key`. Republished verbatim in the `PrePairResponse`
-    /// flow when the contact was sent in `HASHED_KEYS` mode.
-    pub mlkem_encapsulation_key: Vec<u8>,
-    /// ECIES public key — the public counterpart of `ecies_secret_key`. Same
-    /// `PrePairResponse` purpose as `mlkem_encapsulation_key`.
-    pub ecies_public_key: Vec<u8>,
-}
-
-/// Secret key material held by the **responder** during pairing.
-///
-/// Produced by [`pairing_request_message`] and consumed by [`finish_pairing_responder`].
-/// Always holds an ML-KEM shared secret; never holds a decapsulation key.
-#[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Zeroize, ZeroizeOnDrop)]
-pub struct ResponderSecretKeyMaterial {
-    /// ML-KEM-1024 shared secret established during encapsulation. Combined with the
-    /// ECDH secret in [`finish_pairing_responder`] to derive the final shared key.
-    pub mlkem_shared_secret: [u8; 32],
-    /// ECIES secret key. Used to decrypt incoming pairing messages and to derive the
-    /// ECDH component of the final shared key.
-    pub ecies_secret_key: Vec<u8>,
-}
-
-/// Secret key material for an in-progress pairing session.
-///
-/// The variant encodes the local party's role:
-///
-/// - [`Initiator`](PairingSecretKeyMaterial::Initiator): held by the party that created the
-///   contact message. Contains an ML-KEM decapsulation key; no shared secret yet.
-/// - [`Responder`](PairingSecretKeyMaterial::Responder): held by the party that replied with
-///   the pairing request. Contains the ML-KEM shared secret; no decapsulation key.
-///
-/// Both variants carry an ECIES secret key, accessible via [`ecies_secret_key`](Self::ecies_secret_key).
-///
-/// # Serialization
-///
-/// Implements [`ark_serialize::CanonicalSerialize`] / [`ark_serialize::CanonicalDeserialize`]
-/// manually. The wire format is a single discriminant byte (`0` = Initiator, `1` = Responder)
-/// followed by the serialized inner struct.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-pub enum PairingSecretKeyMaterial {
-    Initiator(InitiatorSecretKeyMaterial),
-    Responder(ResponderSecretKeyMaterial),
-}
-
-impl PairingSecretKeyMaterial {
-    pub fn ecies_secret_key(&self) -> &[u8] {
-        match self {
-            Self::Initiator(m) => &m.ecies_secret_key,
-            Self::Responder(m) => &m.ecies_secret_key,
-        }
-    }
-}
-
-impl ark_serialize::Valid for PairingSecretKeyMaterial {
-    fn check(&self) -> Result<(), ark_serialize::SerializationError> {
-        match self {
-            Self::Initiator(m) => m.check(),
-            Self::Responder(m) => m.check(),
-        }
-    }
-}
-
-impl ark_serialize::CanonicalSerialize for PairingSecretKeyMaterial {
-    fn serialize_with_mode<W: std::io::Write>(
-        &self,
-        mut writer: W,
-        compress: ark_serialize::Compress,
-    ) -> Result<(), ark_serialize::SerializationError> {
-        match self {
-            Self::Initiator(m) => {
-                0u8.serialize_with_mode(&mut writer, compress)?;
-                m.serialize_with_mode(writer, compress)
-            }
-            Self::Responder(m) => {
-                1u8.serialize_with_mode(&mut writer, compress)?;
-                m.serialize_with_mode(writer, compress)
-            }
-        }
-    }
-
-    fn serialized_size(&self, compress: ark_serialize::Compress) -> usize {
-        1 + match self {
-            Self::Initiator(m) => m.serialized_size(compress),
-            Self::Responder(m) => m.serialized_size(compress),
-        }
-    }
-}
-
-impl ark_serialize::CanonicalDeserialize for PairingSecretKeyMaterial {
-    fn deserialize_with_mode<R: std::io::Read>(
-        mut reader: R,
-        compress: ark_serialize::Compress,
-        validate: ark_serialize::Validate,
-    ) -> Result<Self, ark_serialize::SerializationError> {
-        let tag = u8::deserialize_with_mode(&mut reader, compress, validate)?;
-        match tag {
-            0 => Ok(Self::Initiator(
-                InitiatorSecretKeyMaterial::deserialize_with_mode(reader, compress, validate)?,
-            )),
-            1 => Ok(Self::Responder(
-                ResponderSecretKeyMaterial::deserialize_with_mode(reader, compress, validate)?,
-            )),
-            _ => Err(ark_serialize::SerializationError::InvalidData),
-        }
-    }
-}
-
-#[derive(CanonicalSerialize, CanonicalDeserialize, Clone)]
-pub struct PairingRequestMessageMaterial {
-    pub mlkem_ciphertext: Vec<u8>,
-    pub ecies_public_key: Vec<u8>,
-}
-
-pub type PairingSharedKey = [u8; 32];
+pub use error::*;
+pub use types::*;
 
 /// Generates a contact message and corresponding secret key material for the initiator in the pairing protocol.
 ///
@@ -236,8 +85,8 @@ pub fn contact_message(
     entropy: [u8; 32],
 ) -> Result<(PairingContactMessageMaterial, InitiatorSecretKeyMaterial), DerecPairingError> {
     let mut csprng = ChaCha20Rng::from_seed(entropy);
-    let (dk, ek) = pairing_mlkem::generate_keypair(&mut csprng);
-    let (sk, pk) = pairing_ecies::generate_key(&mut csprng).inspect_err(|_e| {
+    let (dk, ek) = mlkem::generate_keypair(&mut csprng);
+    let (sk, pk) = ecies::generate_key(&mut csprng).inspect_err(|_e| {
         #[cfg(feature = "logging")]
         tracing::warn!(error = %_e, "ECIES key generation failed");
     })?;
@@ -268,6 +117,50 @@ pub fn contact_message(
             ecies_public_key: pk,
         },
     ))
+}
+
+/// SHA-384 binding hash that commits an initiator's pairing public keys to a
+/// `(nonce, channel_id)` session.
+///
+/// Used by `HashedKeys`-mode pairing: the initiator emits a `ContactMessage`
+/// carrying only this 48-byte hash, and the scanner — after fetching the real
+/// keys via a `PrePair` round-trip — recomputes the same hash and compares.
+/// Mismatch means the published keys don't match the contact's commitment
+/// (man-in-the-middle on the PrePair leg, swapped keys, etc.) and pairing
+/// MUST be refused.
+///
+/// # Domain
+///
+/// ```text
+/// SHA-384( mlkem_encapsulation_key
+///       || ecies_public_key
+///       || u64_be(nonce)
+///       || u64_be(channel_id) )
+/// ```
+///
+/// Integers are big-endian and the field order is fixed — both sides must
+/// hash identical bytes, byte-for-byte, for the comparison to succeed.
+///
+/// # Constant-time use
+///
+/// Returns the raw 48-byte digest. Callers MUST compare against
+/// `ContactMessage.contact_binding_hash` with a constant-time equality
+/// (`subtle::ConstantTimeEq`) — otherwise a timing oracle could leak which
+/// prefix of the expected hash an attacker has guessed correctly.
+pub fn contact_binding_hash(
+    mlkem_encapsulation_key: &[u8],
+    ecies_public_key: &[u8],
+    nonce: u64,
+    channel_id: u64,
+) -> [u8; 48] {
+    use sha2::{Digest, Sha384};
+
+    let mut hasher = Sha384::new();
+    hasher.update(mlkem_encapsulation_key);
+    hasher.update(ecies_public_key);
+    hasher.update(nonce.to_be_bytes());
+    hasher.update(channel_id.to_be_bytes());
+    hasher.finalize().into()
 }
 
 /// Generates a pairing request message and corresponding secret key material for the responder in the pairing protocol.
@@ -317,15 +210,13 @@ pub fn pairing_request_message(
 ) -> Result<(PairingRequestMessageMaterial, ResponderSecretKeyMaterial), DerecPairingError> {
     let mut csprng = ChaCha20Rng::from_seed(entropy);
 
-    let (ct, shared_key) =
-        pairing_mlkem::encapsulate(&received.mlkem_encapsulation_key, &mut csprng).inspect_err(
-            |_e| {
-                #[cfg(feature = "logging")]
-                tracing::warn!(error = %_e, "ML-KEM encapsulation failed");
-            },
-        )?;
+    let (ct, shared_key) = mlkem::encapsulate(&received.mlkem_encapsulation_key, &mut csprng)
+        .inspect_err(|_e| {
+            #[cfg(feature = "logging")]
+            tracing::warn!(error = %_e, "ML-KEM encapsulation failed");
+        })?;
 
-    let (sk, pk) = pairing_ecies::generate_key(&mut csprng).inspect_err(|_e| {
+    let (sk, pk) = ecies::generate_key(&mut csprng).inspect_err(|_e| {
         #[cfg(feature = "logging")]
         tracing::warn!(error = %_e, "ECIES key generation failed");
     })?;
@@ -395,14 +286,15 @@ pub fn finish_pairing_responder(
     secrets: &ResponderSecretKeyMaterial,
     received: &PairingContactMessageMaterial,
 ) -> Result<PairingSharedKey, DerecPairingError> {
-    let mlkem_shared_key = secrets.mlkem_shared_secret;
+    let mlkem_shared_key = &secrets.mlkem_shared_secret;
 
-    let ecies_shared_key =
-        pairing_ecies::derive_shared_key(&secrets.ecies_secret_key, &received.ecies_public_key)
+    let ecies_shared_key = Zeroizing::new(
+        ecies::derive_shared_key(&secrets.ecies_secret_key, &received.ecies_public_key)
             .inspect_err(|_e| {
                 #[cfg(feature = "logging")]
                 tracing::warn!(error = %_e, "ECIES shared key derivation failed");
-            })?;
+            })?,
+    );
 
     #[cfg(feature = "logging")]
     tracing::trace!(
@@ -469,19 +361,21 @@ pub fn finish_pairing_initiator(
         "decapsulation key loaded — length only, no key bytes"
     );
 
-    let mlkem_shared_key =
-        pairing_mlkem::decapsulate(&secrets.mlkem_decapsulation_key, &received.mlkem_ciphertext)
+    let mlkem_shared_key = Zeroizing::new(
+        mlkem::decapsulate(&secrets.mlkem_decapsulation_key, &received.mlkem_ciphertext)
             .inspect_err(|_e| {
                 #[cfg(feature = "logging")]
                 tracing::warn!(error = %_e, "ML-KEM decapsulation failed");
-            })?;
+            })?,
+    );
 
-    let ecies_shared_key =
-        pairing_ecies::derive_shared_key(&secrets.ecies_secret_key, &received.ecies_public_key)
+    let ecies_shared_key = Zeroizing::new(
+        ecies::derive_shared_key(&secrets.ecies_secret_key, &received.ecies_public_key)
             .inspect_err(|_e| {
                 #[cfg(feature = "logging")]
                 tracing::warn!(error = %_e, "ECIES shared key derivation failed");
-            })?;
+            })?,
+    );
 
     #[cfg(feature = "logging")]
     tracing::trace!(
@@ -497,50 +391,6 @@ pub fn finish_pairing_initiator(
     tracing::info!(shared_key_len = 32, "pairing complete — shared key derived");
 
     Ok(shared_key)
-}
-
-/// SHA-384 binding hash that commits an initiator's pairing public keys to a
-/// `(nonce, channel_id)` session.
-///
-/// Used by `HashedKeys`-mode pairing: the initiator emits a `ContactMessage`
-/// carrying only this 48-byte hash, and the scanner — after fetching the real
-/// keys via a `PrePair` round-trip — recomputes the same hash and compares.
-/// Mismatch means the published keys don't match the contact's commitment
-/// (man-in-the-middle on the PrePair leg, swapped keys, etc.) and pairing
-/// MUST be refused.
-///
-/// # Domain
-///
-/// ```text
-/// SHA-384( mlkem_encapsulation_key
-///       || ecies_public_key
-///       || u64_be(nonce)
-///       || u64_be(channel_id) )
-/// ```
-///
-/// Integers are big-endian and the field order is fixed — both sides must
-/// hash identical bytes, byte-for-byte, for the comparison to succeed.
-///
-/// # Constant-time use
-///
-/// Returns the raw 48-byte digest. Callers MUST compare against
-/// `ContactMessage.contact_binding_hash` with a constant-time equality
-/// (`subtle::ConstantTimeEq`) — otherwise a timing oracle could leak which
-/// prefix of the expected hash an attacker has guessed correctly.
-pub fn contact_binding_hash(
-    mlkem_encapsulation_key: &[u8],
-    ecies_public_key: &[u8],
-    nonce: u64,
-    channel_id: u64,
-) -> [u8; 48] {
-    use sha2::{Digest, Sha384};
-
-    let mut hasher = Sha384::new();
-    hasher.update(mlkem_encapsulation_key);
-    hasher.update(ecies_public_key);
-    hasher.update(nonce.to_be_bytes());
-    hasher.update(channel_id.to_be_bytes());
-    hasher.finalize().into()
 }
 
 #[cfg(test)]

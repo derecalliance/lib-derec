@@ -48,7 +48,7 @@ protect DeRec message payloads.
 
 It combines:
 
-- secp256k1 ECDH (via internal `pairing_ecies`)
+- secp256k1 ECDH (via `pairing::ecies`)
 - AES-256-GCM authenticated encryption (via `channel`)
 
 ### Design

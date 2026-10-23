@@ -886,6 +886,40 @@ timestamps are one value, checked on receipt.
   a `StatusEnum` no longer compiles. React Native is unchanged: its enums
   are real TypeScript enums and keep the reverse mapping.
 
+- **Changed (breaking, Rust): pairing import paths are shorter.**
+  *(breaking; `derec-cryptography`)*
+
+  `derec_cryptography::pairing::pairing_ecies` is now
+  `derec_cryptography::pairing::ecies`, `pairing::pairing_mlkem` is now
+  `pairing::mlkem`, and `pairing::envelope::DerecEncryptionError` is now
+  `pairing::DerecEncryptionError`, next to `DerecPairingError`. Their
+  contents are unchanged; only the import paths move. The SDKs do not expose
+  these items and are unaffected.
+
+- **Changed: secret material is wiped from memory after use.** *(hardening;
+  every SDK)*
+
+  `derec-cryptography` now zeroizes the intermediate secrets it handles: the
+  AES key and seeds a split derives, the Shamir polynomial, a reconstructed
+  key and its field elements, the ML-KEM and ECDH halves of a pairing key,
+  and the ECDH scalar and shared point. Recovery also borrows subshares
+  instead of copying them. `ml-kem`, `aes` and `aes-gcm` are built with their
+  `zeroize` feature, so decapsulation keys and AES key schedules are wiped
+  when dropped. Outputs are byte-for-byte unchanged; secrets returned to the
+  caller remain the caller's to wipe.
+
+- **Removed: expanded ML-KEM decapsulation keys.** *(breaking; every SDK)*
+
+  0.0.8 deprecated the 3168-byte expanded form of a stored decapsulation
+  key, which releases before 0.0.8 wrote, and planned its removal for
+  0.0.13. It is removed now: `mlkem::decapsulate` accepts only the 64-byte
+  seed form and returns `InvalidSize { expected: 64, got: 3168 }` for an
+  expanded key. A pairing whose initiator stored its secret before 0.0.8 can
+  no longer be finished by that initiator; start a new pairing.
+  `mlkem::EXPANDED_DECAPSULATION_KEY_SIZE_IN_BYTES` is gone, and so is
+  `DerecPairingError::MLKemDecapsulationError`, which only an invalid
+  expanded key produced.
+
 ### 0.0.8
 
 Every random value the library produces now comes straight from the operating

@@ -1,22 +1,20 @@
-//! Material produced before the move to `rand` 0.10 and `ml-kem` 0.3 must
-//! keep working: decapsulation keys held in stored pairing secrets and
-//! pairings a peer started on the old release. Shares helpers already hold do
-//! not: their Merkle commitments predate the 0.0.9 leaf and node hashing.
+//! Material produced before the move to `rand` 0.10 and `ml-kem` 0.3.
 //!
-//! Those decapsulation keys are in the expanded form, accepted until 0.0.13;
-//! the expanded-key cases go when that support is removed.
+//! A responder's stored secret still finishes its side of a pairing, since it
+//! holds the ML-KEM shared secret rather than a key. An initiator's stored
+//! decapsulation key does not: it is in the expanded form, and only the
+//! 64-byte seed form is accepted. Shares helpers already hold do not verify
+//! either: their Merkle commitments predate the 0.0.9 leaf and node hashing.
 
 #[path = "fixtures/pre_rand_0_10.rs"]
 mod fixture;
 
 use ark_serialize::CanonicalDeserialize;
 use derec_cryptography::pairing::{
-    self, InitiatorSecretKeyMaterial, PairingContactMessageMaterial, PairingRequestMessageMaterial,
-    ResponderSecretKeyMaterial, pairing_mlkem,
+    self, DerecPairingError, InitiatorSecretKeyMaterial, PairingContactMessageMaterial,
+    PairingRequestMessageMaterial, ResponderSecretKeyMaterial, mlkem,
 };
 use derec_cryptography::vss::{self, Subshare, VSSShare};
-use rand::rand_core::UnwrapErr;
-use rand::rngs::SysRng;
 
 fn bytes(hex: &str) -> Vec<u8> {
     (0..hex.len())
@@ -30,43 +28,34 @@ fn decode<T: CanonicalDeserialize>(hex: &str) -> T {
 }
 
 #[test]
-fn an_old_decapsulation_key_opens_old_and_new_ciphertexts() {
-    let dk = bytes(fixture::MLKEM_DK);
-    let ek = bytes(fixture::MLKEM_EK);
-
-    let old = pairing_mlkem::decapsulate(&dk, bytes(fixture::MLKEM_CT)).unwrap();
-    assert_eq!(old.to_vec(), bytes(fixture::MLKEM_SS));
-
-    let (ct, sent) = pairing_mlkem::encapsulate(&ek, &mut UnwrapErr(SysRng)).unwrap();
-    assert_eq!(pairing_mlkem::decapsulate(&dk, &ct).unwrap(), sent);
+fn an_expanded_decapsulation_key_is_rejected() {
+    let err = mlkem::decapsulate(bytes(fixture::MLKEM_DK), bytes(fixture::MLKEM_CT))
+        .expect_err("only the seed form is accepted");
+    assert!(matches!(
+        err,
+        DerecPairingError::InvalidSize {
+            expected: mlkem::DECAPSULATION_KEY_SIZE_IN_BYTES,
+            got: 3168,
+        }
+    ));
 }
 
 #[test]
-fn a_pairing_started_on_the_old_release_completes_on_the_new_one() {
+fn an_old_initiator_cannot_finish_but_an_old_responder_can() {
     let contact: PairingContactMessageMaterial = decode(fixture::CONTACT);
     let initiator: InitiatorSecretKeyMaterial = decode(fixture::INITIATOR_SECRET);
     let request: PairingRequestMessageMaterial = decode(fixture::REQUEST);
     let responder: ResponderSecretKeyMaterial = decode(fixture::RESPONDER_SECRET);
-    let expected = bytes(fixture::PAIRING_SHARED_KEY);
 
-    assert_eq!(
-        pairing::finish_pairing_initiator(&initiator, &request)
-            .unwrap()
-            .to_vec(),
-        expected
-    );
+    assert!(matches!(
+        pairing::finish_pairing_initiator(&initiator, &request),
+        Err(DerecPairingError::InvalidSize { got: 3168, .. })
+    ));
     assert_eq!(
         pairing::finish_pairing_responder(&responder, &contact)
             .unwrap()
             .to_vec(),
-        expected
-    );
-
-    let (new_request, new_responder) =
-        pairing::pairing_request_message([5u8; 32], &contact).unwrap();
-    assert_eq!(
-        pairing::finish_pairing_initiator(&initiator, &new_request).unwrap(),
-        pairing::finish_pairing_responder(&new_responder, &contact).unwrap()
+        bytes(fixture::PAIRING_SHARED_KEY)
     );
 }
 
