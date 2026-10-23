@@ -52,7 +52,7 @@ const (
 // A DeRecMessage provides:
 //
 // - protocol versioning information for compatibility handling
-// - ordering guarantees via a monotonically increasing sequence number
+// - a per-channel sequence number for ordering and duplicate detection
 // - channel identification for routing and key selection
 // - a timestamp for replay protection and observability
 // - an encrypted payload containing exactly one protocol message
@@ -62,25 +62,37 @@ const (
 //
 // # Ordering and Idempotency
 //
-// Communication follows a request/response pattern:
+// Request/response pairing is defined per message type: each request
+// message has a corresponding response message, and the response envelope
+// echoes the request's `traceId`. Most flows are initiated by the Owner;
+// some, such as UpdateChannelInfo, may be initiated by either party.
 //
-// - The Owner sends a request message
-// - The Helper replies with a corresponding response
+// Delivery of every message, responses included, follows the transport,
+// which is push: a response is a separate delivery to the requester's own
+// endpoint, not a return value on the delivery that carried the request.
 //
-// The `sequence` field is used to:
+// The `sequence` field is intended to:
 //
 // - enforce message ordering
 // - detect duplicates or out-of-order delivery
 // - support replay protection
+//
+// These semantics are not yet implemented by this library: a sender may set
+// `sequence`, but it is not checked on receipt. Replay protection currently
+// relies on `timestamp`: an envelope older than the receiver's configured
+// inbound-message window is discarded. After decryption the receiver also
+// checks that `envelope.timestamp` equals the inner message's `timestamp`, and
+// discards the message if they differ or either is absent.
 //
 // Implementations SHOULD treat messages as idempotent and be resilient to
 // retries and duplicate deliveries.
 //
 // # Key Rotation
 //
-// The sequence number may also be used as a trigger for automatic key rotation.
-// When a configured threshold is reached, implementations MAY initiate a key
-// rotation flow to maintain forward secrecy.
+// The sequence number is intended as a trigger for automatic key rotation:
+// when a configured threshold is reached, implementations MAY initiate a key
+// rotation flow to maintain forward secrecy. This library does not implement
+// sequence-triggered key rotation.
 //
 // # Versioning
 //
@@ -112,8 +124,8 @@ type DeRecMessage struct {
 	ProtocolVersionMinor uint32 `protobuf:"varint,2,opt,name=protocolVersionMinor,proto3" json:"protocolVersionMinor,omitempty"`
 	// Monotonically increasing message sequence number.
 	//
-	// This value increments by 1 for each message sent on a given channel.
-	// It is used to:
+	// This value is intended to increment by 1 for each message sent on a
+	// given channel, and to be used to:
 	//
 	// - enforce ordering
 	// - detect duplicates or missing messages
@@ -121,6 +133,10 @@ type DeRecMessage struct {
 	//
 	// Implementations MAY also use this value to trigger automatic key rotation
 	// once a predefined threshold is reached.
+	//
+	// Not yet implemented by this library: a sender may set this field, but it
+	// is not checked on receipt, and it does not trigger key rotation. Replay
+	// protection currently relies on `timestamp`.
 	Sequence uint32 `protobuf:"varint,3,opt,name=sequence,proto3" json:"sequence,omitempty"`
 	// Channel identifier associated with this communication session.
 	//
@@ -134,6 +150,9 @@ type DeRecMessage struct {
 	// This MUST match the channelId exchanged during the ContactMessage phase.
 	ChannelId uint64 `protobuf:"varint,4,opt,name=channelId,proto3" json:"channelId,omitempty"`
 	// Timestamp indicating when the sender created this message.
+	//
+	// The sender sets this to the same value as the inner message's
+	// `timestamp`; the receiver discards a message whose two timestamps differ.
 	//
 	// This value is expressed in UTC and can be used for:
 	//

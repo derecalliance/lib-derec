@@ -11,6 +11,7 @@ import type {
   ContactMessage,
   ContactMode,
   DeRecEvent,
+  DeRecProtocolConfig,
   Endpoint,
   DiscoveryParams,
   PairingParams,
@@ -31,6 +32,7 @@ import type {
   UpdateChannelInfoParams,
   UserSecretStore,
   VerifySharesParams,
+  StoresInit,
 } from './types';
 
 /** Shape of the `__DeRec` host object as seen from this file: every member is
@@ -113,13 +115,23 @@ export function buildProtectSecretParams(params: ProtectSecretParams): Record<st
   if (params.description !== undefined) {
     out.description = params.description;
   }
+  if (params.weights != null && params.weights.size > 0) {
+    const weights: Record<string, number> = {};
+    for (const [id, weight] of params.weights) {
+      weights[id.toString()] = weight;
+    }
+    out.weights = weights;
+  }
+  if (params.threshold != null) {
+    out.threshold = params.threshold;
+  }
   return out;
 }
 
 function communicationInfoOrOmit(
-  info: Record<string, string> | undefined,
+  info: Record<string, string> | null | undefined,
 ): Record<string, string> | undefined {
-  return info !== undefined && Object.keys(info).length > 0 ? info : undefined;
+  return info != null && Object.keys(info).length > 0 ? info : undefined;
 }
 
 /**
@@ -127,9 +139,12 @@ function communicationInfoOrOmit(
  * `SecretWire`'s own shape: `channel_id`/`replica_id` are the decimal `u64`
  * strings the `SecretRecovered` event already carries, forwarded verbatim;
  * `communication_info` is omitted per-entry (not sent as `{}`) whenever a
- * helper or replica member has none, matching the Go SDK's `omitempty` and
- * the shared golden fixture byte-for-byte; `replicas` is omitted entirely
- * when the recovered secret has no replica group.
+ * helper or replica member has none — `undefined`, `null`, or an empty map
+ * are all treated the same — matching the Go SDK's `omitempty` and the
+ * shared golden fixture byte-for-byte; `weight` is forwarded as given
+ * whenever a helper carries one; `replicas` is omitted entirely when the
+ * recovered secret has no replica group, and `threshold` when the roster
+ * records none.
  *
  * Exported so it can be golden-tested against the shared wire fixture
  * without a native module.
@@ -148,6 +163,9 @@ export function buildRestoreParams(
       const info = communicationInfoOrOmit(helper.communication_info);
       if (info !== undefined) {
         out.communication_info = info;
+      }
+      if (helper.weight !== undefined) {
+        out.weight = helper.weight;
       }
       return out;
     }),
@@ -174,6 +192,9 @@ export function buildRestoreParams(
       }),
       shared_key: Array.from(recoveredSecret.replicas.shared_key),
     };
+  }
+  if (recoveredSecret.threshold != null) {
+    recovered.threshold = recoveredSecret.threshold;
   }
   return { version, recovered_secret: recovered };
 }
@@ -321,6 +342,20 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
+  /**
+   * Set every store in one call. Forwards to {@link withChannelStore},
+   * {@link withShareStore}, {@link withSecretStore},
+   * {@link withUserSecretStore} and {@link withStateStore} in turn, so
+   * calling one of them again afterwards replaces just that store.
+   */
+  withStores(stores: StoresInit): this {
+    return this.withChannelStore(stores.channelStore)
+      .withShareStore(stores.shareStore)
+      .withSecretStore(stores.secretStore)
+      .withUserSecretStore(stores.userSecretStore)
+      .withStateStore(stores.stateStore);
+  }
+
   withTransport(transport: Transport): this {
     this.stores.transport = transport;
     return this;
@@ -346,7 +381,22 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
-  /** Default: 3. */
+  /**
+   * The starting threshold: the minimum number of subshares required to
+   * reconstruct the secret, for a secret with no threshold stored. Every
+   * publish stores the threshold it used (`UserSecrets.threshold`), the
+   * roster carries it, and `restore` and replica hydration put it back. A
+   * round splits at `ProtectSecretParams.threshold`, otherwise at the stored
+   * threshold, and only otherwise at this value, so changing it later does
+   * not change a stored threshold.
+   *
+   * A Helper holds one subshare unless `ProtectSecretParams.weights` has
+   * given it a weight, so with no weights the threshold is a number of
+   * Helpers, as before. Every weight must be below the round's threshold, so
+   * no single Helper can recover alone. When this value applies and is
+   * lowered to or below a stored weight, every publish fails with
+   * `invalid_weight` until `ProtectSecret` assigns valid weights. Default: 3.
+   */
   withThreshold(threshold: number): this {
     this.config.threshold = threshold;
     return this;
@@ -382,7 +432,12 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
-  /** Default: false. */
+  /**
+   * Who answers an inbound request whose handling failed. `true`: the
+   * library sends the response itself. `false`: nothing is sent, and the
+   * `RequestFailed` event carries a token to pass to `reject`. Default:
+   * false.
+   */
   withAutoRespondOnFailure(enabled: boolean): this {
     this.config.auto_respond_on_failure = enabled;
     return this;
@@ -436,6 +491,10 @@ export class DeRecProtocolBuilder {
    * applies its default.
    *
    * Default: unset — no constraints advertised, every peer range accepted.
+   *
+   * Share size is enforced by the helper; frequency limits are enforced by
+   * the app's share store (refuse from `save`/`recordVerification`); the
+   * deletion and deactivation timeouts are checked at pairing only.
    */
   withParameterRange(range: Partial<ParameterRange>): this {
     this.config.parameter_range = {
@@ -455,11 +514,89 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
+  /**
+   * Cap the total number of subshares one sharing round may split the
+   * secret into — the sum of every helper's weight. Crosses to the library
+   * as a decimal string. Default: unset, no cap.
+   *
+   * Checked only by `start(ProtectSecret)`, including the publishes the
+   * library starts itself: a round over the cap fails with
+   * `too_many_subshares` before anything is sent. Recovery applies no cap.
+   * Recovering costs time that grows quadratically with the total number of
+   * subshares, so the cap bounds what a later recovery must do. A cap below
+   * the threshold makes `build()` throw.
+   */
+  withMaxSubshares(max: bigint | number): this {
+    this.config.max_subshares = BigInt(max).toString();
+    return this;
+  }
+
+  /**
+   * Layer a {@link DeRecProtocolConfig} onto the builder: a field the config
+   * sets (present and not `null`) replaces what the builder currently
+   * holds, a field it leaves unset is untouched, and `timeouts` merges per
+   * field against the builder's current timeouts rather than resetting the
+   * other three. Every other nested object replaces as a whole. Apply a
+   * general config, then a per-user one, then any individual `with*` call —
+   * the last write wins per field, same as two `withConfig` calls in a row.
+   *
+   * Every key is assigned verbatim into the same `snake_case` config JSON
+   * `build()` sends to `protocol_new`, whatever it is spelled as: nothing
+   * here validates, defaults, or recognizes field names. Rust does both —
+   * `deny_unknown_fields` is what turns a misspelled key into an error.
+   *
+   * `secret_id` is not a config field — it is the constructor argument —
+   * and `build()` always sends the constructor's value last, so a config
+   * (e.g. loaded from a per-user record) can never redirect which secret
+   * this instance manages even if it carries a `secret_id` key.
+   *
+   * A config parsed from JSON can carry an own `__proto__` key. Assigning
+   * it through plain bracket notation would hit the accessor
+   * `Object.prototype` defines for that name and replace this builder's
+   * config object's prototype instead of setting a field on it — the value
+   * would then vanish from the JSON payload instead of reaching Rust to be
+   * rejected as an unknown key. `Object.defineProperty` makes it a genuine
+   * own property, the same as every other key here.
+   */
+  withConfig(config: DeRecProtocolConfig): this {
+    for (const [key, value] of Object.entries(config as Record<string, unknown>)) {
+      if (value === undefined || value === null) {
+        continue;
+      }
+      if (key === 'timeouts') {
+        const held = (this.config.timeouts as Record<string, unknown> | undefined) ?? {};
+        const merged: Record<string, unknown> = { ...held };
+        for (const [timeoutKey, timeoutValue] of Object.entries(
+          value as Record<string, unknown>,
+        )) {
+          if (timeoutValue !== undefined && timeoutValue !== null) {
+            merged[timeoutKey] = timeoutValue;
+          }
+        }
+        this.config.timeouts = merged;
+        continue;
+      }
+      if (key === '__proto__') {
+        Object.defineProperty(this.config, key, {
+          value,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+        continue;
+      }
+      this.config[key] = value;
+    }
+    return this;
+  }
+
   build(): DeRecProtocol {
     const config = {
-      secret_id: this.secretIdValue.toString(),
       replica_id: null,
       ...this.config,
+      // Last, so a config's own `secret_id` key (it is not a config field;
+      // see `withConfig`) can never override the constructor's.
+      secret_id: this.secretIdValue.toString(),
     };
     const host = (getNative() as unknown as NativeHost).protocol_new(
       JSON.stringify(config),
@@ -591,6 +728,17 @@ export class DeRecProtocol {
     return decodeEvents(buffer);
   }
 
+  /**
+   * Accept a pending action from an `ActionRequired` event, returning the
+   * events it produces.
+   *
+   * When the action completes a pairing, the publish that follows reuses the
+   * stored helper weights. If one is no longer valid under the round's
+   * threshold, that publish fails with `invalid_weight` before anything is
+   * sent and this throws: the pairing has completed and its response was
+   * sent, but the `PairingCompleted` event is not returned. Call `start`
+   * with `ProtectSecret` and valid weights to publish.
+   */
   async accept(actionBytes: Uint8Array): Promise<DeRecEvent[]> {
     const buffer = (await this.host.accept(actionBytes)) as ArrayBuffer;
     return decodeEvents(buffer);
@@ -613,6 +761,13 @@ export class DeRecProtocol {
    * group's vault: the source's publish is then installed as it arrives,
    * with no further prompt. Ask the user before calling this; to decline,
    * never confirm.
+   *
+   * On a promotion the current snapshot is published to the promoted peer,
+   * reusing the stored helper weights. If one is no longer valid under the
+   * current threshold, that publish fails with `invalid_weight` before
+   * anything is sent and this throws. The promotion stands: calling this
+   * again resolves `true` and publishes nothing, so call `start` with
+   * `ProtectSecret` and valid weights to reach the promoted peer.
    */
   async verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<boolean> {
     return (await this.host.verifyFingerprint(toBigInt(channelId), fingerprint)) as boolean;
@@ -632,6 +787,9 @@ export class DeRecProtocol {
    * A helper or member whose `transports` is empty gets no channel: it is
    * reported as a `PeerNotRestored` event in the returned array and the rest
    * of the roster is restored.
+   *
+   * A helper's or member's `communication_info` may be absent or `null`;
+   * both mean the same thing — no entries.
    *
    * Rejects with a `DeRecError`; among its codes:
    *

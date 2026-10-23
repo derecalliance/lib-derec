@@ -35,9 +35,11 @@
 //! - **RecoverSecret** — collect enough Helper shares to reconstruct an
 //!   earlier secret version.
 //! - **Restore** — [`DeRecProtocol::restore`] commits a recovered
-//!   [`crate::protocol::types::Secret`] into a fresh protocol instance:
+//!   [`crate::protocol::types::Secret`] into this `secret_id`'s stores:
 //!   reseats canonical helper / replica channels at the recovered
-//!   version and wipes the throwaway recovery-mode channels. Not a
+//!   version and wipes the throwaway recovery-mode channels. Called on
+//!   the same instance that ran recovery — it still holds the
+//!   recovery-mode channels `restore` needs to unpair. Not a
 //!   [`DeRecFlow`] variant — called once, directly on the protocol,
 //!   after a `SecretRecovered` event surfaces.
 //! - **UpdateChannelInfo** — broadcast updated `communication_info`
@@ -80,7 +82,9 @@ pub(crate) mod context;
 pub(crate) mod fingerprint;
 pub(crate) mod flows;
 mod handlers;
+pub(crate) mod obligation;
 pub(crate) mod process;
+pub(crate) mod protocol_config;
 pub(crate) mod stores;
 pub(crate) mod sweeps;
 
@@ -89,13 +93,14 @@ pub(crate) mod sweeps;
 /// doubles implement the [`traits`] store interfaces and the rigs build
 /// a whole [`DeRecProtocol`] — neither is specific to [`handlers`].
 #[cfg(test)]
-pub(crate) mod test;
+pub(crate) mod tests;
 
-pub use builder::{DEFAULT_THRESHOLD, DeRecProtocolBuilder};
+pub use builder::{DEFAULT_THRESHOLD, DeRecProtocolBuilder, DeRecStores};
 use derec_proto::TransportProtocol;
 pub use error::{
-    ChannelStoreError, ProcessError, SecretStoreError, ShareStoreError, StateStoreError,
+    ChannelStoreError, ProcessError, Refusal, SecretStoreError, ShareStoreError, StateStoreError,
 };
+pub use protocol_config::{DeRecProtocolConfig, ExpiredChannelsConfig, TimeoutsConfig};
 use std::collections::HashMap;
 pub use traits::{
     ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
@@ -111,8 +116,9 @@ pub use types::{
 };
 
 pub use events::{
-    AutoAcceptPolicy, CorruptionReason, DeRecEvent, DeRecFlow, IgnoreReason, NotRestoredReason,
-    PendingAction, PendingActionKind, UnpairAck,
+    AutoAcceptPolicy, CorruptionReason, DeRecEvent, DeRecFlow, FailedRequest, IgnoreReason,
+    NotRestoredReason, PendingAction, PendingActionKind, ReplyTarget, UnpairAck,
+    VerifyFailureReason,
 };
 pub use handlers::restore::RestoreError;
 
@@ -189,8 +195,7 @@ pub struct DeRecProtocol<
     /// Set via [`DeRecProtocolBuilder::with_transport`](crate::protocol::DeRecProtocolBuilder::with_transport).
     pub transport: Transport,
     /// Set via [`DeRecProtocolBuilder::with_own_transports`](crate::protocol::DeRecProtocolBuilder::with_own_transports), in preference order.
-    /// Never empty — the typestate builder cannot reach `build()` without
-    /// this slot filled. The order is the application's and is never
+    /// Never empty — `build()` refuses a builder with none set. The order is the application's and is never
     /// reinterpreted; the first entry is this device's primary endpoint.
     pub own_transports: Vec<TransportProtocol>,
     /// Configured via [`DeRecProtocolBuilder::with_unpair_ack`](crate::protocol::DeRecProtocolBuilder::with_unpair_ack).
@@ -240,6 +245,11 @@ pub struct DeRecProtocol<
     /// constraints — every peer range is accepted and outbound
     /// envelopes omit the field.
     pub(crate) parameter_range: Option<derec_proto::ParameterRange>,
+    /// Configured via [`DeRecProtocolBuilder::with_max_subshares`](crate::protocol::DeRecProtocolBuilder::with_max_subshares).
+    ///
+    /// `Some(max)` bounds the total subshares of every sharing round;
+    /// `None` applies no bound.
+    pub(crate) max_subshares: Option<u64>,
     /// Identifier of the single secret this protocol instance manages.
     ///
     /// Set at construction (`DeRecProtocolBuilder::new(secret_id)`) and

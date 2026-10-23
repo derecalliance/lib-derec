@@ -33,6 +33,7 @@ use ark_ff::{BigInteger, PrimeField, Zero};
 use ark_poly::{Polynomial, univariate::DensePolynomial};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rand::CryptoRng;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::*;
 
@@ -83,13 +84,14 @@ pub fn share<R: CryptoRng + ?Sized>(
 /// * `None` - A coordinate is not a valid field element, or two shares carry
 ///   the same x-coordinate, so the interpolation is undefined.
 ///
-pub fn recover(shares: Vec<(Vec<u8>, Vec<u8>)>) -> Option<[u8; λ]> {
+pub fn recover<'a>(shares: impl IntoIterator<Item = (&'a [u8], &'a [u8])>) -> Option<[u8; λ]> {
     let (xs, ys): (Vec<F>, Vec<F>) = shares
-        .iter()
+        .into_iter()
         .map(|(x, y)| Some((decode_coordinate(x)?, decode_coordinate(y)?)))
         .collect::<Option<Vec<(F, F)>>>()?
         .into_iter()
         .unzip();
+    let ys = Zeroizing::new(ys);
 
     for (i, x_i) in xs.iter().enumerate() {
         if xs[i + 1..].contains(x_i) {
@@ -102,13 +104,14 @@ pub fn recover(shares: Vec<(Vec<u8>, Vec<u8>)>) -> Option<[u8; λ]> {
     let lagrange_coeffs = lagrange_coefficients(&xs[..], F::from(0));
 
     //secret f(0) as a field element
-    let secret = ys
+    let mut secret = ys
         .iter()
         .zip(lagrange_coeffs.iter())
         .fold(F::from(0), |acc, (a, b)| acc + (a * b));
 
     // serialize secret into big-endian representation
-    let secret_bytes = secret.into_bigint().to_bytes_be();
+    let secret_bytes = Zeroizing::new(secret.into_bigint().to_bytes_be());
+    secret.zeroize();
 
     // our 256 bit key should be in the below slice
     let start = secret_bytes.len() - λ;
@@ -179,11 +182,13 @@ where
     // But we don't want a completely random polynomial,
     // but rather one whose evaluation at x=0 is the secret.
     // So, let us replace zero-th coefficient with our secret.
-    let secret_bigint = BigInteger::from_bits_be(&bytes_to_bits_be(secret));
+    let secret_bits = Zeroizing::new(bytes_to_bits_be(secret));
+    let mut secret_bigint = BigInteger::from_bits_be(&secret_bits);
     coeffs[0] = F::from_bigint(secret_bigint).unwrap();
+    secret_bigint.zeroize();
 
     // we now have all the right coefficients to define the polynomial
-    let poly = DensePolynomial { coeffs };
+    let mut poly = DensePolynomial { coeffs };
 
     // let us define a function for serializing polynomial evaluations
     let encode_point = |x: &F| -> Vec<u8> {
@@ -192,8 +197,8 @@ where
         buffer
     };
 
-    // Shamir shares are just evaluations of our polynomial above
-    (0..n)
+    // Subshares are just evaluations of our polynomial above
+    let points = (0..n)
         .map(|_| {
             // If x == 0, then (0, P(0)) = (0, secret). This check ensures that x is never zero.
             // In practice, this loop will execute only once as probability of x being 0 is
@@ -204,10 +209,16 @@ where
                     break candidate;
                 }
             };
-            let y = poly.evaluate(&x);
-            (encode_point(&x), encode_point(&y))
+            let mut y = poly.evaluate(&x);
+            let point = (encode_point(&x), encode_point(&y));
+            y.zeroize();
+            point
         })
-        .collect()
+        .collect();
+
+    // the coefficients are the secret and the randomness that hides it
+    poly.coeffs.zeroize();
+    points
 }
 
 #[cfg(test)]
@@ -231,9 +242,13 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed(seed);
 
         let shares = share(&secret, 3, 5, &mut rng);
-        let recovered = recover(shares).expect("well-formed shares interpolate");
+        let recovered = recover(as_points(&shares)).expect("well-formed shares interpolate");
 
         assert_eq!(secret, recovered);
+    }
+
+    fn as_points(shares: &[(Vec<u8>, Vec<u8>)]) -> impl Iterator<Item = (&[u8], &[u8])> {
+        shares.iter().map(|(x, y)| (x.as_slice(), y.as_slice()))
     }
 
     fn sample_shares() -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -245,21 +260,21 @@ mod tests {
     fn recover_rejects_a_coordinate_that_is_not_a_field_element() {
         let mut shares = sample_shares();
         shares[0].1 = vec![0xFF; shares[0].1.len()];
-        assert!(recover(shares).is_none());
+        assert!(recover(as_points(&shares)).is_none());
     }
 
     #[test]
     fn recover_rejects_a_truncated_coordinate() {
         let mut shares = sample_shares();
         shares[1].0.truncate(3);
-        assert!(recover(shares).is_none());
+        assert!(recover(as_points(&shares)).is_none());
     }
 
     #[test]
     fn recover_rejects_a_repeated_x_coordinate() {
         let mut shares = sample_shares();
         shares[1] = shares[0].clone();
-        assert!(recover(shares).is_none());
+        assert!(recover(as_points(&shares)).is_none());
     }
 
     #[test]
@@ -294,5 +309,19 @@ mod tests {
         for x in &actual_xs {
             assert!(!x.is_zero());
         }
+    }
+
+    #[test]
+    fn subshares_encode_as_48_byte_little_endian_field_elements() {
+        for (x, y) in sample_shares() {
+            assert_eq!(x.len(), 48);
+            assert_eq!(y.len(), 48);
+        }
+
+        let mut one = Vec::new();
+        F::from(1u64).serialize_compressed(&mut one).unwrap();
+        let mut expected = vec![0u8; 48];
+        expected[0] = 1;
+        assert_eq!(one, expected);
     }
 }

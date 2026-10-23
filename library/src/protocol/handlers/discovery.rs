@@ -17,6 +17,7 @@ use crate::{
     },
     protocol::{
         context::{Exchange, Local, Round},
+        obligation::deliver,
         stores::{StoreSet, Stores},
         types::Target,
     },
@@ -107,11 +108,15 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 /// Answer a peer's discovery request with the catalog of secrets held
 /// for it across every linked channel.
 ///
-/// Entries are grouped by `secret_id`, then keyed by `version`. A helper
+/// Entries are grouped by `secret_id`, then keyed by `version`. A channel
 /// holds exactly one share per `(secret_id, version)` — a second write
 /// carrying different content is refused with `VERSION_CONFLICT` rather
 /// than stored alongside — so a version identifies a share unambiguously
-/// and needs no writer to disambiguate it.
+/// and needs no writer to disambiguate it. Across the linked set the same
+/// holds only by assumption: links are expected to be one-to-one (see
+/// [`DeRecChannelStore::link_channel`](crate::protocol::DeRecChannelStore::link_channel)),
+/// and a `(secret_id, version)` found on more than one linked channel is
+/// reported once.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
@@ -141,10 +146,19 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .resolve_response_endpoints(
             secret_id,
             channel_id,
+            local.policy,
             &crate::extensions::advertised_endpoints::reply_to_owned(request),
         )
         .await?;
-    stores.transport.send(&endpoint, envelope).await?;
+    deliver(
+        exchange.obligation,
+        stores.transport,
+        &endpoint,
+        envelope,
+        StatusEnum::Ok,
+        "",
+    )
+    .await?;
 
     #[cfg(feature = "logging")]
     tracing::info!("discovery response sent");
@@ -164,7 +178,32 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
-    let response = GetSecretIdsVersionsResponseMessage {
+    crate::extensions::channel_store::send_channel_message(
+        stores.channels,
+        stores.transport,
+        local.secret_id,
+        exchange.channel_id,
+        failure_response(local, request, status, memo),
+        exchange.shared_key,
+        exchange.trace_id,
+        local.policy,
+        &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        exchange.obligation,
+        status,
+        memo,
+    )
+    .await
+}
+
+/// The `GetSecretIdsVersionsResponse` that answers `request` with a non-`Ok`
+/// `status` and no catalog.
+pub(in crate::protocol) fn failure_response(
+    local: &Local<'_>,
+    request: &GetSecretIdsVersionsRequestMessage,
+    status: StatusEnum,
+    memo: &str,
+) -> MessageBody {
+    MessageBody::GetSecretIdsVersionsResponse(GetSecretIdsVersionsResponseMessage {
         result: Some(DeRecResult {
             status: status as i32,
             memo: memo.to_owned(),
@@ -174,19 +213,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         // Answer on the path the request arrived on: a member asking gets a
         // member's answer, a helper exchange stays helper-bound.
         replica_id: local.replica_id.filter(|_| request.replica_id.is_some()),
-    };
-
-    crate::extensions::channel_store::send_channel_message(
-        stores.channels,
-        stores.transport,
-        local.secret_id,
-        exchange.channel_id,
-        MessageBody::GetSecretIdsVersionsResponse(response),
-        exchange.shared_key,
-        exchange.trace_id,
-        &crate::extensions::advertised_endpoints::reply_to_owned(request),
-    )
-    .await
+    })
 }
 
 #[cfg_attr(
@@ -350,6 +377,8 @@ mod tests {
                 ..Default::default()
             }
             .encode_to_vec(),
+            subshares: None,
+            threshold: None,
         }
     }
 
@@ -389,6 +418,8 @@ mod tests {
             secret_id: 1,
             version: 4,
             bytes: vec![0xFF, 0xFF, 0xFF],
+            subshares: None,
+            threshold: None,
         }]);
 
         assert_eq!(catalog[0].versions[0].version, 4);

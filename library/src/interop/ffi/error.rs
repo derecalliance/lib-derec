@@ -149,6 +149,8 @@ pub const DEREC_CODE_DUPLICATE_CHANNEL_ID: i32 = 61;
 pub const DEREC_CODE_INVALID_THRESHOLD: i32 = 62;
 pub const DEREC_CODE_EMPTY_SECRET_DATA: i32 = 63;
 pub const DEREC_CODE_VSS_SHARE_FAILED: i32 = 64;
+pub const DEREC_CODE_INVALID_WEIGHT: i32 = 65;
+pub const DEREC_CODE_TOO_MANY_SUBSHARES: i32 = 66;
 
 pub const DEREC_CODE_EMPTY_RESPONSES: i32 = 80;
 pub const DEREC_CODE_EMPTY_COMMITTED_DEREC_SHARE: i32 = 81;
@@ -184,6 +186,16 @@ pub const DEREC_CODE_TRANSPORT_INVALID: i32 = 120;
 pub const DEREC_CODE_NO_USABLE_ENDPOINT: i32 = 121;
 
 // 122 is retired (formerly the conflicting plaintext opt-in); never reassign it.
+
+/// Return codes for [`crate::interop::ffi::protocol::stores::ShareStoreCallbacks::save`]
+/// and `ShareStoreCallbacks::record_verification`: `0` is success, each of
+/// these three refuses the write/verification with the matching
+/// [`crate::protocol::Refusal`] variant, and any other non-zero value is an
+/// ordinary backend failure. The values are the `StatusEnum` numbers the
+/// helper answers the owner with, not FFI-local codes.
+pub const DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED: i32 = 3;
+pub const DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT: i32 = 4;
+pub const DEREC_SHARE_STORE_REFUSED_REJECTED: i32 = 10;
 
 pub(crate) fn success() -> DeRecError {
     DeRecError {
@@ -307,7 +319,7 @@ pub unsafe extern "C" fn derec_free_error(error: *mut DeRecError) {
 }
 
 fn categorize(err: &crate::Error) -> (i32, i32) {
-    let (category, code) = crate::interop::error_codes::classify(err);
+    let (category, code) = crate::error_codes::classify(err);
     (category as i32, code as i32)
 }
 

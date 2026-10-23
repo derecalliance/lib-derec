@@ -25,7 +25,7 @@ use crate::protocol::types::state_record::{StateItemRecord, StateKeyRecord};
 use crate::protocol::types::{UserSecret, UserSecrets};
 use crate::protocol::{
     ChannelStoreError, ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore,
-    DeRecStateStore, DeRecTransport, DeRecUserSecretStore, MissingPolicy, SecretKind,
+    DeRecStateStore, DeRecTransport, DeRecUserSecretStore, MissingPolicy, Refusal, SecretKind,
     SecretStoreError, SecretStoreFuture, SecretValue, Share, ShareStoreError, ShareStoreFuture,
     StateItem, StateKey, StateKind, StateStoreError, StateStoreFuture, TransportFuture,
 };
@@ -45,6 +45,22 @@ impl std::error::Error for CallbackError {}
 
 fn boxed_err(msg: String) -> Box<dyn std::error::Error + Send + Sync + 'static> {
     Box::new(CallbackError(msg))
+}
+
+/// Maps a [`ShareStoreCallbacks::save`] / `record_verification` return code
+/// to the [`Refusal`] it names, or `None` for a code that isn't one of the
+/// three refusal constants (including `0`, success).
+fn refusal_from_rc(rc: i32) -> Option<Refusal> {
+    use crate::interop::ffi::error::{
+        DEREC_SHARE_STORE_REFUSED_REJECTED, DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED,
+        DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT,
+    };
+    match rc {
+        DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED => Some(Refusal::SizeLimitExceeded),
+        DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT => Some(Refusal::TooFrequent),
+        DEREC_SHARE_STORE_REFUSED_REJECTED => Some(Refusal::Rejected),
+        _ => None,
+    }
 }
 
 /// Drives a load-style C callback that writes its result to
@@ -174,6 +190,14 @@ pub(crate) struct ShareRecord {
     pub secret_id: String,
     pub version: u32,
     pub bytes: Vec<u8>,
+    /// [`Share::subshares`]: omitted when `None`; absent or `null` reads as
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subshares: Option<u32>,
+    /// [`Share::threshold`]: omitted when `None`; absent or `null` reads as
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u32>,
 }
 
 impl From<&Share> for ShareRecord {
@@ -182,6 +206,8 @@ impl From<&Share> for ShareRecord {
             secret_id: s.secret_id.to_string(),
             version: s.version,
             bytes: s.bytes.clone(),
+            subshares: s.subshares,
+            threshold: s.threshold,
         }
     }
 }
@@ -196,6 +222,8 @@ impl ShareRecord {
             secret_id,
             version: self.version,
             bytes: self.bytes,
+            subshares: self.subshares,
+            threshold: self.threshold,
         })
     }
 }
@@ -421,10 +449,31 @@ pub struct SecretStoreCallbacks {
 /// strings, matching the `Vec<u8>` ↔ JSON-array convention used for
 /// every other wire-format buffer in this module.
 ///
+/// A share crosses as the JSON object
+/// `{ "secret_id": "<u64>", "version": <u32>, "bytes": [..], "subshares": <u32>, "threshold": <u32> }`.
+/// `subshares` is the owner-side subshare count
+/// ([`crate::protocol::types::Share::subshares`]) and `threshold` the
+/// owner-side threshold the version was split with
+/// ([`crate::protocol::types::Share::threshold`]). Each is omitted when there
+/// is none, and absent or `null` reads as none. Store them as given and return
+/// them unchanged.
+///
 /// `keep_list` returns the JSON encoding of the application's answer:
 /// `null` for no list (the owner sends an empty `keepList` and helpers keep
 /// every version) or an array of version numbers. An empty buffer or return code `1` also
 /// means `null`.
+///
+/// `save` and `record_verification` share a return-code convention: `0` is
+/// success; `3`/`4`/`10` (the
+/// [`DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED) /
+/// [`DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT) /
+/// [`DEREC_SHARE_STORE_REFUSED_REJECTED`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_REJECTED)
+/// constants) refuse the call with the matching
+/// [`crate::protocol::Refusal`] variant; any other non-zero value is an
+/// ordinary backend failure. `record_verification` is called once per
+/// accepted verification challenge, after the challenged share is found and
+/// before the helper answers — see
+/// [`crate::protocol::DeRecShareStore::record_verification`].
 #[repr(C)]
 pub struct ShareStoreCallbacks {
     pub user_data: *mut c_void,
@@ -484,12 +533,16 @@ pub struct ShareStoreCallbacks {
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
+    pub record_verification:
+        extern "C" fn(user_data: *mut c_void, secret_id: u64, channel_id: u64, version: u32) -> i32,
     pub free_buffer: extern "C" fn(user_data: *mut c_void, ptr: *mut u8, len: usize),
 }
 
 /// Caller-supplied callbacks for the user-secret store. Methods cross
 /// the FFI keyed by `secret_id`; the `UserSecrets` payload travels as a
-/// JSON buffer matching [`UserSecretsRecord`].
+/// JSON buffer matching [`UserSecretsRecord`]. Its `threshold` is the
+/// recorded threshold ([`crate::protocol::types::UserSecrets::threshold`]),
+/// omitted when there is none; store the buffer as given.
 #[repr(C)]
 pub struct UserSecretStoreCallbacks {
     pub user_data: *mut c_void,
@@ -526,6 +579,10 @@ pub(crate) struct UserSecretsRecord {
     /// these records. Absent when the snapshot records no author.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author_replica_id: Option<String>,
+    /// [`UserSecrets::threshold`]: omitted when `None`; absent or `null`
+    /// reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u32>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -550,6 +607,7 @@ impl From<&UserSecrets> for UserSecretsRecord {
                 .collect(),
             description: v.description.clone(),
             author_replica_id: v.author_replica_id.map(|id| id.to_string()),
+            threshold: v.threshold,
         }
     }
 }
@@ -578,6 +636,7 @@ impl TryFrom<UserSecretsRecord> for UserSecrets {
                 .collect(),
             description: r.description,
             author_replica_id,
+            threshold: r.threshold,
         })
     }
 }
@@ -1224,9 +1283,12 @@ impl DeRecShareStore for DotnetShareStore {
                 bytes.len(),
             );
             if rc != 0 {
-                return Err(ShareStoreError::Backend(boxed_err(format!(
-                    "share store save failed (rc={rc})"
-                ))));
+                return Err(match refusal_from_rc(rc) {
+                    Some(refusal) => ShareStoreError::Refused(refusal),
+                    None => ShareStoreError::Backend(boxed_err(format!(
+                        "share store save failed (rc={rc})"
+                    ))),
+                });
             }
             Ok(())
         })();
@@ -1288,6 +1350,28 @@ impl DeRecShareStore for DotnetShareStore {
                 .map_err(|e| ShareStoreError::Backend(boxed_err(format!("keep list JSON: {e}")))),
         };
         Box::pin(async move { res })
+    }
+
+    fn record_verification(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        version: u32,
+    ) -> ShareStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let rc = (cb.record_verification)(cb.user_data, secret_id, channel_id.0, version);
+        Box::pin(async move {
+            if rc != 0 {
+                Err(match refusal_from_rc(rc) {
+                    Some(refusal) => ShareStoreError::Refused(refusal),
+                    None => ShareStoreError::Backend(boxed_err(format!(
+                        "share store record_verification failed (rc={rc})"
+                    ))),
+                })
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 
@@ -1580,6 +1664,33 @@ mod user_secrets_record_tests {
             secrets: Vec::new(),
             description: None,
             author_replica_id,
+            threshold: None,
+        }
+    }
+
+    #[test]
+    fn a_threshold_round_trips_and_is_omitted_when_none() {
+        let with = UserSecrets {
+            threshold: Some(3),
+            ..snapshot(None)
+        };
+        let json = serde_json::to_value(UserSecretsRecord::from(&with)).expect("serializes");
+        assert_eq!(json["threshold"], 3);
+        let back: UserSecretsRecord = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(UserSecrets::try_from(back).expect("converts"), with);
+
+        let json =
+            serde_json::to_value(UserSecretsRecord::from(&snapshot(None))).expect("serializes");
+        assert!(json.get("threshold").is_none());
+        for raw in [
+            r#"{"version":3,"secrets":[]}"#,
+            r#"{"version":3,"secrets":[],"threshold":null}"#,
+        ] {
+            let back: UserSecretsRecord = serde_json::from_str(raw).expect("deserializes");
+            assert_eq!(
+                UserSecrets::try_from(back).expect("converts").threshold,
+                None
+            );
         }
     }
 
@@ -1734,5 +1845,277 @@ mod transport_endpoints_json_tests {
         }]);
         truncated.pop();
         assert_eq!(decode(&truncated), Err(DEREC_CODE_FFI_BAD_PROTO));
+    }
+}
+
+/// The share record's `subshares` and `threshold` fields: absent and `null`
+/// both read as none, and a value survives a round trip.
+#[cfg(test)]
+mod share_record_tests {
+    use super::*;
+
+    fn decoded(json: &str) -> Share {
+        serde_json::from_str::<ShareRecord>(json)
+            .expect("record parses")
+            .into_share()
+            .expect("record converts")
+    }
+
+    #[test]
+    fn an_absent_count_reads_as_none() {
+        let share = decoded(r#"{"secret_id":"7","version":2,"bytes":[1,2]}"#);
+        assert_eq!(share.subshares, None);
+    }
+
+    #[test]
+    fn a_null_count_reads_as_none() {
+        let share = decoded(r#"{"secret_id":"7","version":2,"bytes":[1,2],"subshares":null}"#);
+        assert_eq!(share.subshares, None);
+    }
+
+    #[test]
+    fn a_count_round_trips() {
+        let share = decoded(r#"{"secret_id":"7","version":2,"bytes":[1,2],"subshares":3}"#);
+        assert_eq!(share.subshares, Some(3));
+        let json = serde_json::to_string(&ShareRecord::from(&share)).expect("serializes");
+        assert_eq!(
+            json,
+            r#"{"secret_id":"7","version":2,"bytes":[1,2],"subshares":3}"#
+        );
+    }
+
+    #[test]
+    fn no_count_is_omitted() {
+        let share = Share {
+            secret_id: 7,
+            version: 2,
+            bytes: vec![1, 2],
+            subshares: None,
+            threshold: None,
+        };
+        let json = serde_json::to_string(&ShareRecord::from(&share)).expect("serializes");
+        assert_eq!(json, r#"{"secret_id":"7","version":2,"bytes":[1,2]}"#);
+    }
+
+    #[test]
+    fn an_absent_or_null_threshold_reads_as_none() {
+        let share = decoded(r#"{"secret_id":"7","version":2,"bytes":[1,2]}"#);
+        assert_eq!(share.threshold, None);
+        let share = decoded(r#"{"secret_id":"7","version":2,"bytes":[1,2],"threshold":null}"#);
+        assert_eq!(share.threshold, None);
+    }
+
+    #[test]
+    fn a_threshold_round_trips() {
+        let json = r#"{"secret_id":"7","version":2,"bytes":[1,2],"subshares":2,"threshold":3}"#;
+        let share = decoded(json);
+        assert_eq!(share.threshold, Some(3));
+        let back = serde_json::to_string(&ShareRecord::from(&share)).expect("serializes");
+        assert_eq!(back, json);
+    }
+}
+
+#[cfg(test)]
+mod share_store_refusal_tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    /// Polls an already-resolved [`ShareStoreFuture`] to completion. Every
+    /// future `DotnetShareStore` returns computes its result synchronously
+    /// before wrapping it in `Box::pin(async move { res })`, so one poll is
+    /// always enough — this just avoids pulling in an async runtime for it.
+    fn block_on<T>(mut fut: Pin<Box<dyn Future<Output = T> + Send + '_>>) -> T {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        loop {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    extern "C" fn unused_load(
+        _user_data: *mut c_void,
+        _secret_id: u64,
+        _channel_id: u64,
+        _versions_json_ptr: *const u8,
+        _versions_json_len: usize,
+        _out_ptr: *mut *mut u8,
+        _out_len: *mut usize,
+    ) -> i32 {
+        1
+    }
+
+    extern "C" fn unused_load_many(
+        _user_data: *mut c_void,
+        _secret_id: u64,
+        _channel_ids_json_ptr: *const u8,
+        _channel_ids_json_len: usize,
+        _versions_json_ptr: *const u8,
+        _versions_json_len: usize,
+        _out_ptr: *mut *mut u8,
+        _out_len: *mut usize,
+    ) -> i32 {
+        1
+    }
+
+    extern "C" fn unused_load_all(
+        _user_data: *mut c_void,
+        _secret_id: u64,
+        _channel_ids_json_ptr: *const u8,
+        _channel_ids_json_len: usize,
+        _out_ptr: *mut *mut u8,
+        _out_len: *mut usize,
+    ) -> i32 {
+        1
+    }
+
+    extern "C" fn unused_latest_version(
+        _user_data: *mut c_void,
+        _secret_id: u64,
+        _out_has_version: *mut u32,
+        _out_version: *mut u32,
+    ) -> i32 {
+        0
+    }
+
+    extern "C" fn unused_remove_channel(
+        _user_data: *mut c_void,
+        _secret_id: u64,
+        _channel_id: u64,
+    ) -> i32 {
+        0
+    }
+
+    extern "C" fn unused_remove_versions(
+        _user_data: *mut c_void,
+        _secret_id: u64,
+        _channel_id: u64,
+        _versions_json_ptr: *const u8,
+        _versions_json_len: usize,
+    ) -> i32 {
+        0
+    }
+
+    extern "C" fn unused_keep_list(
+        _user_data: *mut c_void,
+        _secret_id: u64,
+        _version: u32,
+        _out_ptr: *mut *mut u8,
+        _out_len: *mut usize,
+    ) -> i32 {
+        1
+    }
+
+    extern "C" fn noop_free_buffer(_user_data: *mut c_void, _ptr: *mut u8, _len: usize) {}
+
+    /// `save`'s return code, stashed in `user_data` so the stub can answer
+    /// with whatever a test configures without any shared mutable state.
+    extern "C" fn stub_save(
+        user_data: *mut c_void,
+        _secret_id: u64,
+        _channel_id: u64,
+        _share_json_ptr: *const u8,
+        _share_json_len: usize,
+    ) -> i32 {
+        user_data as i32
+    }
+
+    extern "C" fn stub_record_verification(
+        user_data: *mut c_void,
+        _secret_id: u64,
+        _channel_id: u64,
+        _version: u32,
+    ) -> i32 {
+        user_data as i32
+    }
+
+    fn callbacks_with_rc(rc: i32) -> ShareStoreCallbacks {
+        ShareStoreCallbacks {
+            user_data: rc as usize as *mut c_void,
+            load: unused_load,
+            load_many: unused_load_many,
+            load_all: unused_load_all,
+            latest_version: unused_latest_version,
+            save: stub_save,
+            remove_channel: unused_remove_channel,
+            remove_versions: unused_remove_versions,
+            keep_list: unused_keep_list,
+            record_verification: stub_record_verification,
+            free_buffer: noop_free_buffer,
+        }
+    }
+
+    fn sample_share() -> Share {
+        Share {
+            secret_id: 1,
+            version: 1,
+            bytes: vec![1, 2, 3],
+            subshares: None,
+            threshold: None,
+        }
+    }
+
+    /// `save`'s return code maps to the matching [`Refusal`] for 3/4/10, and
+    /// to an ordinary backend failure for anything else non-zero.
+    #[test]
+    fn ffi_save_rc_maps_to_refusal() {
+        for (rc, expected) in [
+            (3, Refusal::SizeLimitExceeded),
+            (4, Refusal::TooFrequent),
+            (10, Refusal::Rejected),
+        ] {
+            let mut store = DotnetShareStore {
+                cb: callbacks_with_rc(rc),
+            };
+            let err = block_on(store.save(1, ChannelId(2), sample_share()))
+                .expect_err("non-zero rc must error");
+            assert!(
+                matches!(err, ShareStoreError::Refused(r) if r == expected),
+                "rc={rc} should map to {expected:?}, got {err:?}"
+            );
+        }
+
+        let mut store = DotnetShareStore {
+            cb: callbacks_with_rc(7),
+        };
+        let err =
+            block_on(store.save(1, ChannelId(2), sample_share())).expect_err("rc=7 must error");
+        assert!(
+            matches!(err, ShareStoreError::Backend(_)),
+            "an unrecognized rc must be a backend failure, got {err:?}"
+        );
+    }
+
+    /// `record_verification` shares `save`'s return-code mapping.
+    #[test]
+    fn ffi_record_verification_rc_maps_to_refusal() {
+        for (rc, expected) in [
+            (3, Refusal::SizeLimitExceeded),
+            (4, Refusal::TooFrequent),
+            (10, Refusal::Rejected),
+        ] {
+            let mut store = DotnetShareStore {
+                cb: callbacks_with_rc(rc),
+            };
+            let err = block_on(store.record_verification(1, ChannelId(2), 1))
+                .expect_err("non-zero rc must error");
+            assert!(
+                matches!(err, ShareStoreError::Refused(r) if r == expected),
+                "rc={rc} should map to {expected:?}, got {err:?}"
+            );
+        }
+
+        let mut store = DotnetShareStore {
+            cb: callbacks_with_rc(7),
+        };
+        let err =
+            block_on(store.record_verification(1, ChannelId(2), 1)).expect_err("rc=7 must error");
+        assert!(
+            matches!(err, ShareStoreError::Backend(_)),
+            "an unrecognized rc must be a backend failure, got {err:?}"
+        );
     }
 }

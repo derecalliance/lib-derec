@@ -239,6 +239,10 @@
 
 #define DEREC_CODE_VSS_SHARE_FAILED 64
 
+#define DEREC_CODE_INVALID_WEIGHT 65
+
+#define DEREC_CODE_TOO_MANY_SUBSHARES 66
+
 #define DEREC_CODE_EMPTY_RESPONSES 80
 
 #define DEREC_CODE_EMPTY_COMMITTED_DEREC_SHARE 81
@@ -288,6 +292,20 @@
  * cannot be told. `DEREC_CATEGORY_INVALID_INPUT`.
  */
 #define DEREC_CODE_NO_USABLE_ENDPOINT 121
+
+/**
+ * Return codes for [`crate::interop::ffi::protocol::stores::ShareStoreCallbacks::save`]
+ * and `ShareStoreCallbacks::record_verification`: `0` is success, each of
+ * these three refuses the write/verification with the matching
+ * [`crate::protocol::Refusal`] variant, and any other non-zero value is an
+ * ordinary backend failure. The values are the `StatusEnum` numbers the
+ * helper answers the owner with, not FFI-local codes.
+ */
+#define DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED 3
+
+#define DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT 4
+
+#define DEREC_SHARE_STORE_REFUSED_REJECTED 10
 
 /**
  * Discriminants selecting which message [`derec_decode_message_json`] and
@@ -838,10 +856,31 @@ typedef struct SecretStoreCallbacks {
  * strings, matching the `Vec<u8>` ↔ JSON-array convention used for
  * every other wire-format buffer in this module.
  *
+ * A share crosses as the JSON object
+ * `{ "secret_id": "<u64>", "version": <u32>, "bytes": [..], "subshares": <u32>, "threshold": <u32> }`.
+ * `subshares` is the owner-side subshare count
+ * ([`crate::protocol::types::Share::subshares`]) and `threshold` the
+ * owner-side threshold the version was split with
+ * ([`crate::protocol::types::Share::threshold`]). Each is omitted when there
+ * is none, and absent or `null` reads as none. Store them as given and return
+ * them unchanged.
+ *
  * `keep_list` returns the JSON encoding of the application's answer:
  * `null` for no list (the owner sends an empty `keepList` and helpers keep
  * every version) or an array of version numbers. An empty buffer or return code `1` also
  * means `null`.
+ *
+ * `save` and `record_verification` share a return-code convention: `0` is
+ * success; `3`/`4`/`10` (the
+ * [`DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED) /
+ * [`DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT) /
+ * [`DEREC_SHARE_STORE_REFUSED_REJECTED`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_REJECTED)
+ * constants) refuse the call with the matching
+ * [`crate::protocol::Refusal`] variant; any other non-zero value is an
+ * ordinary backend failure. `record_verification` is called once per
+ * accepted verification challenge, after the challenged share is found and
+ * before the helper answers — see
+ * [`crate::protocol::DeRecShareStore::record_verification`].
  */
 typedef struct ShareStoreCallbacks {
   void *user_data;
@@ -886,13 +925,19 @@ typedef struct ShareStoreCallbacks {
                        uint32_t version,
                        uint8_t **out_ptr,
                        size_t *out_len);
+  int32_t (*record_verification)(void *user_data,
+                                 uint64_t secret_id,
+                                 uint64_t channel_id,
+                                 uint32_t version);
   void (*free_buffer)(void *user_data, uint8_t *ptr, size_t len);
 } ShareStoreCallbacks;
 
 /**
  * Caller-supplied callbacks for the user-secret store. Methods cross
  * the FFI keyed by `secret_id`; the `UserSecrets` payload travels as a
- * JSON buffer matching [`UserSecretsRecord`].
+ * JSON buffer matching [`UserSecretsRecord`]. Its `threshold` is the
+ * recorded threshold ([`crate::protocol::types::UserSecrets::threshold`]),
+ * omitted when there is none; store the buffer as given.
  */
 typedef struct UserSecretStoreCallbacks {
   void *user_data;
@@ -1704,13 +1749,15 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  * are still passed as individual pointers, since purego marshals
  * pointer-sized arguments natively.
  *
- * `config_json` must deserialize to [`ProtocolConfig`] — all field names
- * `snake_case`. `secret_id` is the only required field. Every other field
- * may be omitted, in which case the value matches
- * [`crate::protocol::DeRecProtocolBuilder::new`]'s own default for that
- * setting: [`ProtocolConfig`]'s field-level `#[serde(default)]` attributes
- * read the same constants the builder does. A field that is present is
- * used as given, including `0`, and validated by the builder.
+ * `config_json` is a JSON object holding `secret_id` plus the canonical
+ * [`DeRecProtocolConfig`] JSON, all field names `snake_case`. `secret_id`
+ * is the only required field. The rest is parsed as a
+ * [`DeRecProtocolConfig`] and applied with
+ * [`crate::protocol::DeRecProtocolBuilder::with_config`]: an omitted field
+ * keeps [`crate::protocol::DeRecProtocolBuilder::new`]'s own default for
+ * that setting, and a field that is present is used as given, including
+ * `0`, and validated by the builder. A key the config does not define is
+ * rejected with `DEREC_CODE_FFI_BAD_PROTO` rather than ignored.
  *
  * ```json
  * {
@@ -1749,7 +1796,8 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *     "max_unresponsive_deletion_timeout": 0,
  *     "min_unresponsive_deactivation_timeout": 0,
  *     "max_unresponsive_deactivation_timeout": 0
- *   }
+ *   },
+ *   "max_subshares": null
  * }
  * ```
  *
@@ -1758,9 +1806,10 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *   preference order — the order decides which of a peer's offered
  *   endpoints is used. `protocol` is its name (`"https"`, `"grpc"`) or
  *   its `derec_proto::Protocol` discriminant (`0`, `1`). Each entry is validated, and
- *   two entries of the same protocol are rejected. Required: an absent or
- *   empty list is refused, since a node with no endpoint cannot be reached
- *   by any peer.
+ *   two entries of the same protocol are rejected. An unknown discriminant
+ *   or an invalid URI is rejected with `DEREC_CODE_TRANSPORT_INVALID`.
+ *   Required: an absent or empty list is refused, since a node with no
+ *   endpoint cannot be reached by any peer.
  * - `threshold`: omitted means [`crate::protocol::DEFAULT_THRESHOLD`]. A
  *   `threshold` below `2` is rejected with `DEREC_CODE_INVALID_INPUT`.
  * - `unpair_ack`: `0` / `"required"` = Required, `1` / `"not_required"` =
@@ -1786,6 +1835,11 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *   string values. Mutually exclusive with a non-empty
  *   `communication_info_ptr` buffer; omitted with an empty buffer means
  *   no entries.
+ * - `max_subshares`: decimal-string `u64` capping the total subshares one
+ *   sharing round may split the secret into, or absent/`null` for no cap.
+ *   A cap below `threshold` is rejected by the builder with
+ *   `DEREC_CODE_INVALID_INPUT`; a round over the cap fails with
+ *   `DEREC_CODE_TOO_MANY_SUBSHARES`.
  *
  * # Safety
  *
@@ -1995,7 +2049,8 @@ struct DeRecError derec_protocol_reject(struct DeRecProtocolHandle *handle,
  *                     "transports": [{ "uri": "https://replica.example", "protocol": "https" }],
  *                     "role": "Source", "communication_info": {} }],
  *       "shared_key": [..32 bytes..]
- *     }
+ *     },
+ *     "threshold": 3
  *   }
  * }
  * ```
@@ -2008,7 +2063,11 @@ struct DeRecError derec_protocol_reject(struct DeRecProtocolHandle *handle,
  * order; `protocol` is its name, `"https"` or `"grpc"`. An absent or
  * `null` `transports` reads as an empty list, and a helper or member with
  * no endpoint gets no channel: restore skips it and reports it as a
- * `PeerNotRestored` event. `role` is `"Source"` or `"Destination"`.
+ * `PeerNotRestored` event. `role` is `"Source"` or `"Destination"`. An
+ * absent or `null` `communication_info` reads as an empty map, and an
+ * absent or `null` helper `weight` as `1`. `threshold` is the threshold the
+ * secret was split with; absent or `null` is none, and a value below `2` is
+ * rejected. Restore writes it into the snapshot.
  *
  * `replicas` is an **object**, not an array, and is omitted entirely when
  * the `secret_id` has no replica group. Every member of the group shares
@@ -2220,14 +2279,23 @@ struct RecoverFromShareResponsesResult recover_from_share_responses(const uint8_
 uint64_t derec_generate_replica_id(void);
 
 /**
+ * Splits `secret_data` into one committed share per weighted channel; see
+ * [`crate::primitives::sharing::request::split`] for the weight and threshold
+ * rules. Channels are given as the aligned `channels_ptr` / `weights_ptr`
+ * arrays described in the module-level "Weighted channels" section; the
+ * result does not depend on the order they are listed in.
+ *
  * # Safety
  *
- * Non-null input pointers must point to the corresponding readable byte ranges.
+ * Non-null input pointers must point to the corresponding readable ranges:
+ * `secret_data_len` bytes, and `channels_len` entries for each of
+ * `channels_ptr` and `weights_ptr`.
  */
 struct ProtectSecretResult protect_secret(uint64_t secret_id,
                                           const uint8_t *secret_data_ptr,
                                           size_t secret_data_len,
                                           const uint64_t *channels_ptr,
+                                          const uint32_t *weights_ptr,
                                           size_t channels_len,
                                           size_t threshold,
                                           uint32_t version);

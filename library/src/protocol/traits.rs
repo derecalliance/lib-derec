@@ -323,6 +323,42 @@ pub trait DeRecChannelStore {
     /// catch-up resolves peers through the roster. The replica paths never
     /// consult this graph, and wiring them into it would conflate two
     /// unrelated notions of "the same peer".
+    ///
+    /// # Linking is expected to be one-to-one
+    ///
+    /// Linking rests on one assumption: **a helper holds at most one share
+    /// per owner for a given `secret_id` and version.** Each new channel is
+    /// therefore linked to the single old channel it replaces.
+    ///
+    /// The two readers depend on it. Answering `GetShare`, the helper loads
+    /// the requested version across the whole linked set and answers with
+    /// **one** share: the first whose `secret_id` matches, in the order
+    /// [`DeRecShareStore::load_many`] returns. The library imposes no order,
+    /// so the share store implementation decides which share is served.
+    /// Answering `GetSecretIdsVersions`, it reports each `(secret_id,
+    /// version)` found across the linked set once. The library does not
+    /// check the assumption; [`Self::linked_channels`] returns whatever
+    /// graph the store holds.
+    ///
+    /// # Discouraged: one guardian acting as several helpers
+    ///
+    /// The protocol expects each share to go to a **different** helper:
+    /// threshold security depends on a single compromised helper yielding
+    /// at most one share. A single guardian acting as several helpers for
+    /// the same owner is against the protocol's recommendation, since one
+    /// compromise yields several shares. The library does not prevent it,
+    /// but it breaks the assumption above, and resolving that is the
+    /// application's responsibility.
+    ///
+    /// If several channels holding shares for the same owner are linked to
+    /// one recovery channel, the helper still answers with one share. When
+    /// every recovery channel is answered from the same share, the owner
+    /// receives it more than once — reconstruction counts it once — and can
+    /// fall below the threshold. An application that runs such a helper
+    /// keeps each recovery channel resolving to a distinct share: either
+    /// links stay one-to-one, or its share store's `load_many` returns, for
+    /// each requesting channel, the share intended for it first, in a
+    /// deterministic order.
     fn link_channel(
         &mut self,
         secret_id: u64,
@@ -333,7 +369,9 @@ pub trait DeRecChannelStore {
     /// Every channel linked to `channel_id`, **including itself**.
     ///
     /// Read only on the helper side, to reach shares stored under a channel
-    /// the owner has since replaced. See [`Self::link_channel`] for scope.
+    /// the owner has since replaced. See [`Self::link_channel`] for scope,
+    /// and for why links are expected to be one-to-one: the helper answers
+    /// a `GetShare` with a single share from this set.
     fn linked_channels(
         &self,
         secret_id: u64,
@@ -354,6 +392,13 @@ pub trait DeRecChannelStore {
 /// - **Owner** stores the encoded [`derec_proto::CommittedDeRecShare`] it
 ///   sent to each helper, so that the verification handler can replay the
 ///   commitment when validating each helper's response.
+///
+/// [`Share::subshares`] is the one field beside the bytes that carries
+/// meaning: the library sets it on every owner-side row (the number of
+/// subshares that Helper holds for that version) and leaves it `None` on
+/// every helper-side row. Persist it as given, including `None`, and return
+/// it unchanged. Owner rows written before the field existed read back as
+/// `None`; the library never backfills them.
 ///
 /// # Relation to channel linking
 ///
@@ -401,6 +446,14 @@ pub trait DeRecShareStore {
     /// implementation backed by a database is free to return rows in
     /// whatever order its query plan produces. Callers must select the
     /// share they want by inspecting [`Share`] rather than by position.
+    ///
+    /// The one place position matters is answering `GetShare`: among the
+    /// shares whose `secret_id` matches, the helper serves the first. With
+    /// one-to-one links there is only one, so order is irrelevant. An
+    /// implementation that links several share-holding channels for the
+    /// same owner must return them in a deterministic order, the share
+    /// intended for the requesting channel first; see
+    /// [`DeRecChannelStore::link_channel`].
     ///
     /// This matters because `secret_id` is a *partition*, not the secret
     /// being asked for: a Helper stores shares belonging to other people's
@@ -527,9 +580,42 @@ pub trait DeRecShareStore {
     /// back. Only the application knows which versions committed; nothing
     /// in the stores records it.
     ///
+    /// # The owner's own proofs
+    ///
+    /// The list also governs this store's owner-side rows. When a Helper
+    /// confirms `version`, the library removes, through
+    /// [`remove_versions`](Self::remove_versions), this device's rows for
+    /// that channel whose versions the list leaves out: the Helper has
+    /// removed those shares, so their proofs can no longer be answered. A
+    /// Helper that refuses `version` or never answers keeps its older
+    /// versions, and so do its rows here. `None` removes nothing.
+    ///
     /// Replica pushes never consult this and always send an empty
     /// `keepList`.
     fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>>;
+
+    /// Record a verification challenge the helper is about to answer for
+    /// `(secret_id, channel_id, version)`.
+    ///
+    /// Called once per accepted verification challenge, after the
+    /// challenged share is found and before the helper answers, so an
+    /// application can rate-limit verifications through its own share
+    /// store. Returning
+    /// [`ShareStoreError::Refused`] on a helper channel refuses the
+    /// verification; the library answers
+    /// the owner with the mapped status instead of the verification
+    /// result.
+    ///
+    /// Default: accept every verification unconditionally.
+    fn record_verification(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        version: u32,
+    ) -> ShareStoreFuture<'_, ()> {
+        let _ = (secret_id, channel_id, version);
+        Box::pin(std::future::ready(Ok(())))
+    }
 }
 
 /// Storage for the user-facing secret contents, keyed by `secret_id`.
@@ -970,6 +1056,14 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for Box<T> {
     fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
         (**self).keep_list(secret_id, version)
     }
+    fn record_verification(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        version: u32,
+    ) -> ShareStoreFuture<'_, ()> {
+        (**self).record_verification(secret_id, channel_id, version)
+    }
 }
 
 impl<T: DeRecUserSecretStore + ?Sized> DeRecUserSecretStore for Box<T> {
@@ -1139,6 +1233,14 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for &mut T {
     fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
         (**self).keep_list(secret_id, version)
     }
+    fn record_verification(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        version: u32,
+    ) -> ShareStoreFuture<'_, ()> {
+        (**self).record_verification(secret_id, channel_id, version)
+    }
 }
 
 impl<T: DeRecUserSecretStore + ?Sized> DeRecUserSecretStore for &mut T {
@@ -1193,7 +1295,7 @@ impl<T: DeRecTransport + ?Sized> DeRecTransport for std::sync::Arc<T> {
 #[cfg(test)]
 mod pointer_forwarding_tests {
     use super::*;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };

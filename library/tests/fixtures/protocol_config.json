@@ -1,0 +1,49 @@
+{
+  "full": {
+    "threshold": 3,
+    "max_subshares": "12",
+    "timeouts": {
+      "inbound_message_secs": 120,
+      "sharing_round_secs": 30,
+      "unpair_ack_secs": 45,
+      "expired_channels": { "enabled": true, "timeout_in_secs": 600 }
+    },
+    "parameter_range": {
+      "min_share_size": 1,
+      "max_share_size": 4096,
+      "min_time_between_verifications": 60,
+      "max_time_between_verifications": 86400,
+      "min_time_between_share_updates": 60,
+      "max_time_between_share_updates": 86400,
+      "min_unresponsive_deletion_timeout": 3600,
+      "max_unresponsive_deletion_timeout": "9007199254740993",
+      "min_unresponsive_deactivation_timeout": 3600,
+      "max_unresponsive_deactivation_timeout": 2592000
+    },
+    "auto_accept": {
+      "pairing": true,
+      "pre_pair": false,
+      "store_share": true,
+      "verify_share": true,
+      "discovery": false,
+      "get_share": false,
+      "unpair": true,
+      "update_channel_info": false
+    },
+    "auto_respond_on_failure": true,
+    "auto_reply_to": true,
+    "unpair_ack": "not_required",
+    "unsafe_connection": false,
+    "communication_info": { "name": "alice", "device": "laptop" },
+    "own_transports": [
+      { "uri": "https://me.example.com/derec", "protocol": "https" },
+      { "uri": "grpcs://me.example.com:443", "protocol": "grpc" }
+    ],
+    "replica_id": "9007199254740993"
+  },
+  "minimal": {
+    "own_transports": [
+      { "uri": "https://me.example.com/derec", "protocol": "https" }
+    ]
+  }
+}

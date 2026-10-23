@@ -5,25 +5,13 @@ use ml_kem::ml_kem_1024::{Ciphertext, DecapsulationKey, EncapsulationKey};
 use ml_kem::{Decapsulate, Encapsulate, Generate, KeyExport, Seed};
 use rand::CryptoRng;
 
-use super::DerecPairingError;
+use super::{DerecPairingError, SharedSecret};
 
 pub const ENCAPSULATION_KEY_SIZE_IN_BYTES: usize = 1568;
-/// Size of a decapsulation key in its seed form, the form [`generate_keypair`]
-/// produces.
-pub const DECAPSULATION_KEY_SIZE_IN_BYTES: usize = 64;
-/// Size of a decapsulation key in the FIPS 203 expanded form, which releases
-/// before 0.0.8 produced and stored.
-///
-/// [`decapsulate`] still accepts it so pairings started before 0.0.8 can
-/// complete.
-#[deprecated(
-    since = "0.0.8",
-    note = "expanded decapsulation keys are accepted only for pairings started before 0.0.8; removed at 0.0.13"
-)]
-pub const EXPANDED_DECAPSULATION_KEY_SIZE_IN_BYTES: usize = 3168;
-pub const CIPHERTEXT_SIZE_IN_BYTES: usize = 1568;
 
-pub type SharedSecret = [u8; 32];
+pub const DECAPSULATION_KEY_SIZE_IN_BYTES: usize = 64;
+
+pub const CIPHERTEXT_SIZE_IN_BYTES: usize = 1568;
 
 /// Generates a new ML-KEM-1024 key pair.
 ///
@@ -101,8 +89,7 @@ pub fn encapsulate<R: CryptoRng + ?Sized>(
 /// # Arguments
 ///
 /// * `dk_encoded` - The decapsulation key as produced by [`generate_keypair`]: its
-///   [`DECAPSULATION_KEY_SIZE_IN_BYTES`] (64) byte seed. A key in the expanded form
-///   (3168 bytes), stored by a release before 0.0.8, is also accepted until 0.0.13.
+///   [`DECAPSULATION_KEY_SIZE_IN_BYTES`] (64) byte seed.
 /// * `ctxt` - The ciphertext as a byte slice or compatible type.
 ///   Must be exactly [`CIPHERTEXT_SIZE_IN_BYTES`] (1568) bytes.
 ///
@@ -112,20 +99,20 @@ pub fn encapsulate<R: CryptoRng + ?Sized>(
 ///
 /// # Errors
 ///
-/// Returns [`DerecPairingError::InvalidSize`] if `dk_encoded` is neither a seed nor an
-/// expanded key, or `ctxt` is not exactly [`CIPHERTEXT_SIZE_IN_BYTES`] bytes.
-/// Returns [`DerecPairingError::MLKemDecapsulationError`] if `dk_encoded` is an expanded
-/// key that fails validation.
+/// Returns [`DerecPairingError::InvalidSize`] if `dk_encoded` is not exactly
+/// [`DECAPSULATION_KEY_SIZE_IN_BYTES`] bytes, or `ctxt` is not exactly
+/// [`CIPHERTEXT_SIZE_IN_BYTES`] bytes.
 ///
 pub fn decapsulate(
     dk_encoded: impl AsRef<[u8]>,
     ctxt: impl AsRef<[u8]>,
 ) -> Result<SharedSecret, DerecPairingError> {
     let dk_input = dk_encoded.as_ref();
-    let dk = match Seed::try_from(dk_input) {
-        Ok(seed) => DecapsulationKey::from_seed(seed),
-        Err(_) => from_expanded(dk_input)?,
-    };
+    let seed = Seed::try_from(dk_input).map_err(|_| DerecPairingError::InvalidSize {
+        expected: DECAPSULATION_KEY_SIZE_IN_BYTES,
+        got: dk_input.len(),
+    })?;
+    let dk = DecapsulationKey::from_seed(seed);
 
     let ct_input = ctxt.as_ref();
     let ct_array = Ciphertext::try_from(ct_input).map_err(|_| DerecPairingError::InvalidSize {
@@ -134,29 +121,6 @@ pub fn decapsulate(
     })?;
 
     Ok(dk.decapsulate(&ct_array).into())
-}
-
-/// Rebuilds a decapsulation key stored in the expanded form by a release before 0.0.8.
-#[allow(deprecated)]
-fn from_expanded(bytes: &[u8]) -> Result<DecapsulationKey, DerecPairingError> {
-    use ml_kem::ExpandedKeyEncoding;
-
-    let expanded: [u8; EXPANDED_DECAPSULATION_KEY_SIZE_IN_BYTES] =
-        bytes
-            .try_into()
-            .map_err(|_| DerecPairingError::InvalidSize {
-                expected: DECAPSULATION_KEY_SIZE_IN_BYTES,
-                got: bytes.len(),
-            })?;
-
-    #[cfg(feature = "logging")]
-    tracing::warn!(
-        "decapsulating an ML-KEM key stored in the expanded form before 0.0.8; \
-         support for it is removed at 0.0.13"
-    );
-
-    DecapsulationKey::from_expanded_bytes(&expanded.into())
-        .map_err(|_| DerecPairingError::MLKemDecapsulationError)
 }
 
 #[cfg(test)]

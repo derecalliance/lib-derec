@@ -1,5 +1,5 @@
 {
-  "$schema_note": "The API surface every SDK must expose, with each SDK's spelling. `api_surface_parity.rs` derives the expected surface from the Rust source and holds this file to it, then holds every SDK to this file, reading each SDK declaration as a block and comparing its members as a set. `protocol_methods` are the public methods of `DeRecProtocol`; `builder_options` and `builder_wiring` the public methods of `DeRecProtocolBuilder` (options are `with_<rust>`). `stores` lists each store trait with its methods: `rust_params` must equal the trait's parameters, `params` the parameters every SDK declares, modulo casing. `primitives` maps each public primitive to the FFI and WASM exports that carry it and to each SDK's path. `records` pairs a Rust struct with the type each SDK mirrors it as; fields are compared, not listed. Lifecycle entry points are not rows: each SDK expresses them idiomatically (Rust Drop, .NET Dispose, Go Close, JS free and Symbol.dispose) and the test spells them per language. `secret_id` is absent from `builder_options`: every SDK takes it as the builder's constructor argument. `sdk_helpers` covers conveniences every SDK must offer that have no counterpart in the core; .NET and Go entries name `Owner.Member` where the helper is a member.",
+  "$schema_note": "The API surface every SDK must expose, with each SDK's spelling. `api_surface_parity.rs` derives the expected surface from the Rust source and holds this file to it, then holds every SDK to this file, reading each SDK declaration as a block and comparing its members as a set. `protocol_methods` are the public methods of `DeRecProtocol`; `builder_options` and `builder_wiring` the public methods of `DeRecProtocolBuilder` (options are `with_<rust>`). `builder_bundles` names a setter that bundles several `builder_wiring` or `builder_options` setters into one call and forwards to them; it has no FFI callback of its own, so it is excluded from the FFI wiring check. Go has no builder: `with_stores` has no Go column, since Go bundles the same stores into its `Stores` struct, and the `go` column of `with_config` names the struct `Config` embeds, which `go_pattern` describes. `stores` lists each store trait with its methods: `rust_params` must equal the trait's parameters, `params` the parameters every SDK declares, modulo casing. `primitives` maps each public primitive to the FFI and WASM exports that carry it and to each SDK's path. `records` pairs a Rust struct with the type each SDK mirrors it as; fields are compared, not listed. Lifecycle entry points are not rows: each SDK expresses them idiomatically (Rust Drop, .NET Dispose, Go Close, JS free and Symbol.dispose) and the test spells them per language. `secret_id` is absent from `builder_options`: every SDK takes it as the builder's constructor argument. `sdk_helpers` covers conveniences every SDK must offer that have no counterpart in the core; .NET and Go entries name `Owner.Member` where the helper is a member.",
   "protocol_methods": [
     {
       "rust": "accept",
@@ -142,6 +142,12 @@
       "ts": "withParameterRange"
     },
     {
+      "rust": "max_subshares",
+      "dotnet": "WithMaxSubshares",
+      "go": "MaxSubshares",
+      "ts": "withMaxSubshares"
+    },
+    {
       "rust": "communication_info",
       "dotnet": "WithCommunicationInfo",
       "go": "CommunicationInfo",
@@ -184,6 +190,20 @@
       "dotnet": "WithTransport",
       "go": "transport",
       "ts": "withTransport"
+    }
+  ],
+  "builder_bundles": [
+    {
+      "rust": "with_stores",
+      "dotnet": "WithStores",
+      "ts": "withStores"
+    },
+    {
+      "rust": "with_config",
+      "dotnet": "WithConfig",
+      "ts": "withConfig",
+      "go": "DeRecProtocolConfig",
+      "go_pattern": "Config embeds DeRecProtocolConfig; a config file or record is layered onto it with json.Unmarshal, once per layer, which overwrites only the keys present: last write wins, as with_config does"
     }
   ],
   "flow_params": [
@@ -547,6 +567,22 @@
           ],
           "params": [
             "secret_id",
+            "version"
+          ]
+        },
+        {
+          "rust": "record_verification",
+          "dotnet": "RecordVerification",
+          "go": "RecordVerification",
+          "ts": "recordVerification",
+          "rust_params": [
+            "secret_id",
+            "channel_id",
+            "version"
+          ],
+          "params": [
+            "secret_id",
+            "channel_id",
             "version"
           ]
         }
@@ -1210,15 +1246,15 @@
     },
     {
       "what": "AutoAcceptPolicy",
-      "rust_file": "library/src/interop/ffi/protocol/handle/mod.rs",
-      "rust": "AutoAcceptConfig",
+      "rust_file": "library/src/protocol/events/mod.rs",
+      "rust": "AutoAcceptPolicy",
       "dotnet": "AutoAcceptPolicy",
       "go": "AutoAcceptPolicy",
       "ts": "AutoAcceptPolicy"
     },
     {
       "what": "Timeouts",
-      "rust_file": "library/src/interop/ffi/protocol/handle/mod.rs",
+      "rust_file": "library/src/protocol/protocol_config.rs",
       "rust": "TimeoutsConfig",
       "dotnet": "Timeouts",
       "go": "Timeouts",
@@ -1226,19 +1262,27 @@
     },
     {
       "what": "RemoveExpiredChannelsPolicy",
-      "rust_file": "library/src/interop/ffi/protocol/handle/mod.rs",
-      "rust": "RemoveExpiredChannelsConfig",
+      "rust_file": "library/src/protocol/protocol_config.rs",
+      "rust": "ExpiredChannelsConfig",
       "dotnet": "RemoveExpiredChannelsPolicy",
       "go": "RemoveExpiredChannelsPolicy",
       "ts": null
     },
     {
       "what": "ParameterRange",
-      "rust_file": "library/src/interop/ffi/protocol/handle/mod.rs",
-      "rust": "ParameterRangeConfig",
+      "rust_file": "library/src/protocol/protocol_config.rs",
+      "rust": "ParameterRangeWire",
       "dotnet": "ParameterRange",
       "go": "ParameterRange",
       "ts": "ParameterRange"
+    },
+    {
+      "what": "DeRecProtocolConfig",
+      "rust_file": "library/src/protocol/protocol_config.rs",
+      "rust": "DeRecProtocolConfig",
+      "dotnet": "DeRecProtocolConfig",
+      "go": "DeRecProtocolConfig",
+      "ts": "DeRecProtocolConfig"
     }
   ],
   "documented_api": {
@@ -1264,10 +1308,6 @@
       }
     ],
     "$deprecation_horizon_note": "The open deprecation wave: `since`, `removed_at` and any `exceptions`. `null` means no wave is open, and then no `#[deprecated]` may exist in the library — a deprecation is only ever introduced together with the horizon it is removed at.",
-    "deprecation_horizon": {
-      "since": "0.0.8",
-      "removed_at": "0.0.13",
-      "exceptions": []
-    }
+    "deprecation_horizon": null
   }
 }

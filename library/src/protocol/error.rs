@@ -105,6 +105,42 @@ pub enum StateStoreError {
     Backend(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
+/// Reason an application's share store gives for refusing a write on a
+/// helper channel, carried in [`ShareStoreError::Refused`].
+///
+/// The app picks the reason; the library alone decides the wire
+/// [`derec_proto::StatusEnum`] and memo that reach the peer, so the app
+/// cannot send an arbitrary status code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The app's rate limit on share updates or verifications was hit.
+    TooFrequent,
+    /// The incoming share falls outside the helper's accepted size range.
+    SizeLimitExceeded,
+    /// The app declined the write for a reason outside the other variants.
+    Rejected,
+}
+
+impl Refusal {
+    /// The [`derec_proto::StatusEnum`] the helper answers the owner with.
+    pub(crate) fn status(self) -> derec_proto::StatusEnum {
+        match self {
+            Self::TooFrequent => derec_proto::StatusEnum::TooFrequent,
+            Self::SizeLimitExceeded => derec_proto::StatusEnum::SizeLimitExceeded,
+            Self::Rejected => derec_proto::StatusEnum::Rejected,
+        }
+    }
+
+    /// The memo the helper answers the owner with.
+    pub(crate) fn memo(self) -> &'static str {
+        match self {
+            Self::TooFrequent => "refused by the helper: too frequent",
+            Self::SizeLimitExceeded => "refused by the helper: size limit exceeded",
+            Self::Rejected => "refused by the helper",
+        }
+    }
+}
+
 /// Errors produced by [`DeRecShareStore`](super::DeRecShareStore) implementations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -131,26 +167,47 @@ pub enum ShareStoreError {
     /// inspect the full error chain via [`std::error::Error::source`].
     #[error("share store backend error")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+
+    /// The app's store refused the write on a helper channel.
+    ///
+    /// Returned from [`DeRecShareStore::save`](super::DeRecShareStore::save) or
+    /// [`DeRecShareStore::record_verification`](super::DeRecShareStore::record_verification)
+    /// to refuse a share update or verification on a helper channel
+    /// (`peer_role == Owner`); the library answers the owner with the status
+    /// and memo it maps the carried variant to. Returned anywhere else — a replica destination's mirror
+    /// `save`, for instance — it is an ordinary store failure.
+    #[error("share store refused the write: {0:?}")]
+    Refused(Refusal),
 }
 
-/// Map an internal failure to the closest [`derec_proto::StatusEnum`] a peer
-/// can act on.
-///
-/// Deliberately coarse: a peer can only decide whether to retry, correct its
-/// request, or give up, and the memo carries the detail. `FAIL` is the honest
-/// answer for anything that does not map cleanly, rather than inventing a
-/// more specific-sounding status than the error actually supports.
-///
-/// Takes the error by reference because the caller still owns it — the status
-/// goes out to the peer while the original error is returned to the
-/// application unchanged.
-impl From<&crate::Error> for derec_proto::StatusEnum {
-    fn from(error: &crate::Error) -> Self {
-        match error {
-            crate::Error::ProtobufDecode(_) => Self::FormatError,
-            crate::Error::RoleMismatch { .. } => Self::Rejected,
-            crate::Error::NoUsableEndpoint { .. } => Self::UnsupportedTransportProtocol,
-            _ => Self::Fail,
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusal_maps_to_status_and_memo() {
+        assert_eq!(
+            Refusal::TooFrequent.status(),
+            derec_proto::StatusEnum::TooFrequent
+        );
+        assert_eq!(
+            Refusal::TooFrequent.memo(),
+            "refused by the helper: too frequent"
+        );
+
+        assert_eq!(
+            Refusal::SizeLimitExceeded.status(),
+            derec_proto::StatusEnum::SizeLimitExceeded
+        );
+        assert_eq!(
+            Refusal::SizeLimitExceeded.memo(),
+            "refused by the helper: size limit exceeded"
+        );
+
+        assert_eq!(
+            Refusal::Rejected.status(),
+            derec_proto::StatusEnum::Rejected
+        );
+        assert_eq!(Refusal::Rejected.memo(), "refused by the helper");
     }
 }

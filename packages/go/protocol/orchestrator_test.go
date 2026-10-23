@@ -110,14 +110,16 @@ func newOrchestratorPeerWith(t *testing.T, label, uri string, threshold uint32, 
 	transport := newInProcessTransport()
 
 	cfg := Config{
-		SecretID:      orchestratorSecretID,
-		OwnTransports: []TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(threshold),
+		SecretID: orchestratorSecretID,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(threshold),
+		},
 	}
 	if configure != nil {
 		configure(&cfg)
 	}
-	p, err := New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
+	p, err := New(Stores{Channel: channelStore, Share: shareStore, Secret: secretStore, UserSecret: userSecretStore, State: stateStore}, transport, cfg)
 	if err != nil {
 		t.Fatalf("New(%s): %v", label, err)
 	}
@@ -713,5 +715,75 @@ func TestOrchestrator_SecretStoreLoadManyServesTheWholeBroadcast(t *testing.T) {
 	}
 	if len(owner.secretStore.loadManyCalls) != 1 {
 		t.Fatalf("the failing broadcast must still be one LoadMany call, got %v", owner.secretStore.loadManyCalls)
+	}
+}
+
+// TestOrchestrator_HelperChannelWithoutWeightPublishesAtOne rebuilds the
+// owner's stored HelperChannel rows without Weight, the shape an application
+// that maps its own schema onto the struct produces, and asserts the next
+// library-initiated publish gives those helpers weight 1 instead of failing.
+func TestOrchestrator_HelperChannelWithoutWeightPublishesAtOne(t *testing.T) {
+	const threshold = 2
+
+	owner := newOrchestratorPeer(t, "owner", "https://owner.example.com", threshold)
+	helperA := newOrchestratorPeer(t, "helper-a", "https://helper-a.example.com", threshold)
+	helperB := newOrchestratorPeer(t, "helper-b", "https://helper-b.example.com", threshold)
+	helperC := newOrchestratorPeer(t, "helper-c", "https://helper-c.example.com", threshold)
+
+	channelA := pairOrchestratorPeers(t, owner, helperA, 1)
+	channelB := pairOrchestratorPeers(t, owner, helperB, 2)
+
+	if _, err := owner.protocol.Start(FlowKindProtectSecret, ProtectSecretParams{
+		Secrets: []UserSecret{{ID: []byte{1}, Name: "s", Data: []byte("v")}},
+	}); err != nil {
+		t.Fatalf("owner.Start(ProtectSecret): %v", err)
+	}
+	pumpOrchestratorPeersMany(t, []*orchestratorPeer{owner, helperA, helperB})
+
+	for _, cid := range []uint64{channelA, channelB} {
+		record, ok, err := owner.channelStore.Load(orchestratorSecretID, cid, 0)
+		if err != nil || !ok || record.Helper == nil {
+			t.Fatalf("owner channel %d: ok=%v err=%v", cid, ok, err)
+		}
+		h := record.Helper
+		rebuilt := HelperChannel{
+			ChannelID:         h.ChannelID,
+			Transports:        h.Transports,
+			CommunicationInfo: h.CommunicationInfo,
+			PeerRole:          h.PeerRole,
+			Status:            h.Status,
+			CreatedAt:         h.CreatedAt,
+		}
+		if err := owner.channelStore.Save(orchestratorSecretID, ChannelRecord{Helper: &rebuilt}); err != nil {
+			t.Fatalf("save rebuilt channel %d: %v", cid, err)
+		}
+	}
+
+	pairingChannelID := uint64(3)
+	contact, err := owner.protocol.CreateContact(&pairingChannelID, ContactModeInlineKeys, nil)
+	if err != nil {
+		t.Fatalf("owner.CreateContact: %v", err)
+	}
+	if _, err := helperC.protocol.Start(FlowKindPairing, PairingParams{
+		Kind:    SenderKindHelper,
+		Contact: contact.ContactBytes,
+	}); err != nil {
+		t.Fatalf("helperC.Start(Pairing): %v", err)
+	}
+	events := pumpOrchestratorPeersMany(t, []*orchestratorPeer{owner, helperA, helperB, helperC})
+
+	weights := map[uint64]uint32{}
+	for _, ev := range events {
+		if ev.Type == EventTypeProtectSecretFailed {
+			t.Fatalf("auto-publish failed: %+v", ev)
+		}
+		if ev.Type == EventTypeProtectSecretStarted && ev.Weight != nil {
+			weights[ev.ChannelID] = *ev.Weight
+		}
+	}
+	for _, cid := range []uint64{channelA, channelB} {
+		if weights[cid] != 1 {
+			t.Fatalf("channel %d published at weight %d, want 1 (all: %+v)", cid, weights[cid], weights)
+		}
 	}
 }

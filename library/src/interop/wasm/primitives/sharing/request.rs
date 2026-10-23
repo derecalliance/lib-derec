@@ -4,6 +4,7 @@
 use crate::{
     interop::wasm::{
         primitives::helpers::{from_js, parse_shared_key, parse_transport_protocol_list, to_js},
+        protocol::parse_weighted_channels,
         ts_bindings_utils::js_error_from_lib,
     },
     primitives::sharing::request,
@@ -33,6 +34,10 @@ pub struct ExtractResult {
     pub request: StoreShareRequestMessage,
 }
 
+/// `channels` is an array of `[channelId, weight]` tuples, one per channel:
+/// `channelId` is a `bigint`, `number` or decimal string, and `weight` is the
+/// number of subshares that channel's share carries (`1` for an ordinary
+/// Helper). See [`request::split`] for the weight and threshold rules.
 #[wasm_bindgen(js_name = "sharing_request_split")]
 pub fn split(
     channels: JsValue,
@@ -41,11 +46,10 @@ pub fn split(
     secret_data: &[u8],
     threshold: u32,
 ) -> Result<JsValue, JsValue> {
-    let channel_ids_raw: Vec<u64> = from_js(channels)?;
-    let channel_ids: Vec<ChannelId> = channel_ids_raw.into_iter().map(ChannelId::from).collect();
+    let channels = parse_weighted_channels(channels)?;
 
     let request::SplitResult { shares } = request::split(
-        &channel_ids,
+        &channels,
         secret_id,
         version,
         secret_data,

@@ -67,13 +67,13 @@ func TestVerificationRequestRejectsShortKey(t *testing.T) {
 func TestVerificationResponseRoundTrip(t *testing.T) {
 	const secretID = uint64(0x0102_0304_05ff)
 	secretData := []byte{5, 6, 7, 8, 255}
-	channelIDs := []uint64{1, 2, 3}
 	const threshold = 2
 	const version = uint32(1)
 	const channel1, channel2 = uint64(1), uint64(2)
 	key := sharedKey()
 
-	shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold, version)
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 1}, {ChannelID: 3, Weight: 1}}
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
 	if err != nil {
 		t.Fatalf("split: %v", err)
 	}

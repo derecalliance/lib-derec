@@ -44,6 +44,7 @@ use crate::{
     Error, Result,
     protocol::{
         context::{Exchange, Local, PairingConfig},
+        obligation::Obligation,
         stores::{StoreSet, Stores},
     },
     types::{ChannelId, SharedKey},
@@ -57,16 +58,31 @@ const NO_SHARE_FOR_VERSION: &str = "no share stored for this secret and version"
 
 /// Route a decrypted channel message to the module that owns its flow.
 ///
-/// Does only the part that is identical for every message: the peer-supplied
-/// endpoint policy check, the role gate for bodies that name exactly one
+/// Does only the part that is identical for every message: the
+/// envelope-vs-inner timestamp binding (a mismatch is
+/// [`IgnoreReason::TimestampMismatch`](crate::protocol::IgnoreReason::TimestampMismatch)),
+/// the peer-supplied endpoint policy check, the role gate for bodies that name exactly one
 /// permitted sender (see [`MessageBodyExt::expected_sender_role`](crate::extensions::message_body::MessageBodyExt::expected_sender_role)),
-/// the hand-off, and
-/// the courtesy failure response. Which relationship a multi-valued body
-/// concerns, and what to run for it, is the owning flow's decision.
+/// the hand-off, and the failure router. Which relationship a multi-valued
+/// body concerns, and what to run for it, is the owning flow's decision.
 ///
-/// Both gates run before dispatch and their failures are collected rather
-/// than returned, so a refusal reaches the auto-respond path below on the
-/// same footing as a failure from the flow itself.
+/// A message that does not decrypt under `shared_key` has no authenticated
+/// sender and fails with `Err`; nothing is sent. One that decrypts but whose
+/// body cannot be decoded, or that carries a pairing request the channel
+/// cannot carry, is a request owed an answer: an `ErrorResponseMessage` with
+/// `FORMAT_ERROR`, sent by the library or handed to the application as a
+/// [`DeRecEvent::RequestFailed`] token. A received `ErrorResponseMessage` is
+/// reported as [`DeRecEvent::ErrorResponseReceived`] once it passes the
+/// timestamp binding, and is never answered.
+///
+/// A request body builds an [`Obligation`] here, after decryption, so every
+/// response to it goes out once. A failure of an answerable request is
+/// returned as [`DeRecEvent::RequestFailed`] inside `Ok`, answered by the
+/// library or handed to the application as a token (see
+/// [`settle`](crate::protocol::obligation::settle)). Both gates run before
+/// dispatch and their failures are collected rather than returned, so a
+/// refusal reaches the router on the same footing as a failure from the flow
+/// itself.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(trace_id = message.trace_id, channel_id = channel_id.0))
@@ -79,24 +95,56 @@ pub(super) async fn handle<S: StoreSet>(
     shared_key: &SharedKey,
     auto_respond_on_failure: bool,
 ) -> Result<Vec<DeRecEvent>> {
-    let inner_message = crate::derec_message::extract_inner_message(&message.message, shared_key)?;
+    let plaintext = crate::derec_message::decrypt_inner_message(&message.message, shared_key)?;
+    // The sender holds the channel key, so a body that does not decode is
+    // still a request owed an answer, though no request type can be named.
+    let inner_message = match MessageBody::decode_from_vec(&plaintext) {
+        Ok(body) => body,
+        Err(error) => {
+            let obligation =
+                Obligation::undecodable(channel_id, shared_key, message.trace_id, local.policy);
+            return Ok(crate::protocol::obligation::settle(
+                stores,
+                local,
+                &obligation,
+                auto_respond_on_failure,
+                Err(Error::ProtobufDecode(error)),
+            )
+            .await);
+        }
+    };
+
+    // The sender stamps the envelope and the inner message with one value.
+    // A mismatch is dropped before any handler runs, so nothing is stored
+    // and nothing, not even a failure response, is sent.
+    if crate::utils::verify_timestamps(message.timestamp, inner_message.timestamp().copied())
+        .is_err()
+    {
+        return Ok(vec![DeRecEvent::MessageIgnored {
+            channel_id,
+            reason: super::IgnoreReason::TimestampMismatch,
+            trace_id: message.trace_id,
+        }]);
+    }
 
     let inbound_trace_id = message.trace_id;
+    let obligation = Obligation::for_body(
+        &inner_message,
+        channel_id,
+        shared_key,
+        inbound_trace_id,
+        local.policy,
+    );
     let exchange = &Exchange {
         channel_id,
         shared_key,
         trace_id: inbound_trace_id,
+        obligation: obligation.as_ref(),
     };
-
-    // Captured before dispatch because dispatch consumes the body, and only
-    // when the setting is on so the clone costs nothing by default.
-    let responder = auto_respond_on_failure
-        .then(|| FailureResponder::capture(&inner_message))
-        .flatten();
 
     // Both gates below reject an authenticated message, so both are failures
     // a peer can be told about. They are collected rather than `?`-ed so the
-    // auto-respond path at the bottom sees them alongside dispatch failures.
+    // router at the bottom answers them alongside dispatch failures.
     let mut refused: Option<Error> = None;
 
     for endpoint in inner_message.peer_supplied_endpoints() {
@@ -139,17 +187,38 @@ pub(super) async fn handle<S: StoreSet>(
             | MessageBody::UpdateChannelInfoResponse(_) => {
                 update_channel_info::handle(stores, local, exchange, inner_message).await
             }
-            _ => Err(Error::Invariant(
-                "unexpected MessageBody variant in channel message",
-            )),
+            MessageBody::ErrorResponse(response) => {
+                let (status, memo) = response
+                    .result
+                    .as_ref()
+                    .map(|r| (r.status, r.memo.clone()))
+                    .unwrap_or_default();
+                Ok(vec![DeRecEvent::ErrorResponseReceived {
+                    channel_id,
+                    status,
+                    memo,
+                }])
+            }
+            MessageBody::PairRequest(_) | MessageBody::PrePairRequest(_) => Err(
+                Error::InvalidInput("a pairing request cannot travel under a channel key"),
+            ),
+            MessageBody::PairResponse(_) | MessageBody::PrePairResponse(_) => Err(
+                Error::Invariant("unexpected MessageBody variant in channel message"),
+            ),
         },
     };
 
-    if let (Err(error), Some(responder)) = (&outcome, responder) {
-        auto_respond(stores, local, exchange, responder, error).await;
+    match &obligation {
+        Some(obligation) => Ok(crate::protocol::obligation::settle(
+            stores,
+            local,
+            obligation,
+            auto_respond_on_failure,
+            outcome,
+        )
+        .await),
+        None => outcome,
     }
-
-    outcome
 }
 
 #[cfg_attr(
@@ -185,103 +254,13 @@ pub(in crate::protocol) async fn handle_pairing<S: StoreSet>(
     .await
 }
 
-/// The inbound request a failure response would answer, captured before
-/// dispatch because the dispatch consumes the `MessageBody`.
-///
-/// Only request bodies appear: nothing is owed to a peer that was itself
-/// answering us, and the pairing flows carry their own accept/reject surface.
-enum FailureResponder {
-    StoreShare(Box<derec_proto::StoreShareRequestMessage>),
-    VerifyShare(Box<derec_proto::VerifyShareRequestMessage>),
-    Discovery(Box<derec_proto::GetSecretIdsVersionsRequestMessage>),
-    GetShare(Box<derec_proto::GetShareRequestMessage>),
-    Unpair(Box<derec_proto::UnpairRequestMessage>),
-    UpdateChannelInfo,
-}
-
-impl FailureResponder {
-    fn capture(inner: &MessageBody) -> Option<Self> {
-        match inner {
-            MessageBody::StoreShareRequest(r) => Some(Self::StoreShare(Box::new(r.clone()))),
-            MessageBody::VerifyShareRequest(r) => Some(Self::VerifyShare(Box::new(r.clone()))),
-            MessageBody::GetSecretIdsVersionsRequest(r) => {
-                Some(Self::Discovery(Box::new(r.clone())))
-            }
-            MessageBody::GetShareRequest(r) => Some(Self::GetShare(Box::new(r.clone()))),
-            MessageBody::UnpairRequest(r) => Some(Self::Unpair(Box::new(r.clone()))),
-            MessageBody::UpdateChannelInfoRequest(_) => Some(Self::UpdateChannelInfo),
-            _ => None,
-        }
-    }
-}
-
-/// Tell the peer its request failed, when the application has opted into
-/// [`with_auto_respond_on_failure`](crate::protocol::DeRecProtocolBuilder::with_auto_respond_on_failure).
-///
-/// # Why this is only reachable here
-///
-/// It runs after `extract_inner_message` succeeded, so the request was
-/// decrypted under the channel key and is therefore *authenticated*. That is
-/// the precondition for replying at all: a message that failed to decrypt
-/// carries no proof it came from the peer it names, and answering it would
-/// make this device an oracle for anyone able to send bytes at it. Those
-/// failures surface to the application as `ProcessError` and nothing goes
-/// back on the wire.
-///
-/// # Best effort
-///
-/// The reply is a courtesy on top of an already-failed exchange, so a failure
-/// to send it is logged and swallowed rather than replacing the error the
-/// caller actually needs to see.
-async fn auto_respond<S: StoreSet>(
-    stores: &mut Stores<'_, S>,
-    local: &Local<'_>,
-    exchange: &Exchange<'_>,
-    responder: FailureResponder,
-    error: &Error,
-) {
-    let status = derec_proto::StatusEnum::from(error);
-    let memo = error.to_string();
-
-    let sent = match &responder {
-        FailureResponder::StoreShare(r) => {
-            sharing::reject(stores, local, exchange, r, status, &memo).await
-        }
-        FailureResponder::VerifyShare(r) => {
-            verification::reject(stores, local, exchange, r, status, &memo).await
-        }
-        FailureResponder::Discovery(r) => {
-            discovery::reject(stores, local, exchange, r, status, &memo).await
-        }
-        FailureResponder::GetShare(r) => {
-            recovery::reject(stores, local, exchange, r, status, &memo).await
-        }
-        FailureResponder::Unpair(r) => {
-            unpairing::reject(stores, local, exchange, r, status, &memo).await
-        }
-        FailureResponder::UpdateChannelInfo => {
-            update_channel_info::reject(stores, local, exchange, status, &memo).await
-        }
-    };
-
-    if let Err(_send_error) = sent {
-        #[cfg(feature = "logging")]
-        tracing::warn!(
-            channel_id = exchange.channel_id.0,
-            error = %_send_error,
-            "auto_respond_on_failure could not deliver the failure response; \
-             the original error is still returned to the caller",
-        );
-    }
-}
-
 /// T4 of the replica-group spec: `replica_id` presence discriminates the two
 /// paths, and a mismatch is a protocol error rather than a silent misroute.
 #[cfg(test)]
 mod replica_id_discrimination_tests {
     use super::*;
     use crate::protocol::DeRecChannelStore as _;
-    use crate::protocol::test::{StoreRig, run_async};
+    use crate::protocol::tests::{StoreRig, run_async};
     use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel};
     use crate::types::ChannelId;
 
@@ -309,6 +288,7 @@ mod replica_id_discrimination_tests {
                         peer_role: derec_proto::SenderKind::Helper,
                         status: ChannelStatus::Paired,
                         created_at: 0,
+                        weight: 1,
                     }),
                 )
                 .await
@@ -341,6 +321,195 @@ mod replica_id_discrimination_tests {
                 matches!(err, Error::InvalidInput(_)),
                 "expected an InvalidInput protocol error, got {err:?}"
             );
+        });
+    }
+}
+
+/// The envelope and the inner message carry one timestamp, the send time.
+/// A channel message whose two copies disagree is dropped before dispatch.
+#[cfg(test)]
+mod timestamp_binding_tests {
+    use crate::protocol::builder::DeRecProtocolBuilder;
+    use crate::protocol::tests::{
+        InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+        InMemUserSecretStore, RecordingTransport, run_async,
+    };
+    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, SecretValue};
+    use crate::protocol::{
+        AutoAcceptPolicy, DeRecChannelStore as _, DeRecEvent, DeRecProtocol, DeRecSecretStore as _,
+        IgnoreReason,
+    };
+    use crate::types::ChannelId;
+    use prost::Message as _;
+
+    const SECRET_ID: u64 = 0x7153;
+    const CHANNEL: ChannelId = ChannelId(4242);
+    const SHARED_KEY: crate::types::SharedKey = [5u8; 32];
+    const TRACE: u64 = 99;
+    const ORIGINAL_URI: &str = "https://peer.example.com/derec";
+    const MOVED_URI: &str = "https://moved.example.com/derec";
+
+    fn endpoint(uri: &str) -> derec_proto::TransportProtocol {
+        derec_proto::TransportProtocol {
+            uri: uri.to_owned(),
+            protocol: derec_proto::Protocol::Https as i32,
+        }
+    }
+
+    async fn seed(channels: &mut InMemChannelStore, secrets: &mut InMemSecretStore) {
+        channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id: CHANNEL,
+                    transports: vec![endpoint(ORIGINAL_URI)],
+                    communication_info: std::collections::HashMap::new(),
+                    status: ChannelStatus::Paired,
+                    created_at: crate::utils::now_secs(),
+                    peer_role: derec_proto::SenderKind::Helper,
+                    weight: 1,
+                }),
+            )
+            .await
+            .expect("seed channel");
+        secrets
+            .save(SECRET_ID, CHANNEL, SecretValue::SharedKey(SHARED_KEY))
+            .await
+            .expect("seed shared key");
+    }
+
+    fn build(
+        channels: InMemChannelStore,
+        secrets: InMemSecretStore,
+        transport: RecordingTransport,
+    ) -> DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemStateStore,
+        RecordingTransport,
+    > {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(channels)
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(secrets)
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(transport)
+            .with_state_store(InMemStateStore)
+            .with_own_transports(["https://helper.example.com"])
+            .with_threshold(2)
+            .with_auto_accept(AutoAcceptPolicy::all())
+            .with_auto_respond_on_failure(true)
+            .build()
+            .expect("test protocol builds")
+    }
+
+    /// An update-channel-info request that, if processed, would rewrite the
+    /// stored endpoint and send a response.
+    fn update_request(
+        envelope_ts: prost_types::Timestamp,
+        inner_ts: prost_types::Timestamp,
+    ) -> Vec<u8> {
+        crate::derec_message::DeRecMessageBuilder::channel()
+            .channel_id(CHANNEL)
+            .timestamp(envelope_ts)
+            .trace_id(TRACE)
+            .message_body(derec_proto::MessageBody::UpdateChannelInfoRequest(
+                derec_proto::UpdateChannelInfoRequestMessage {
+                    communication_info: None,
+                    supported_transports: vec![endpoint(MOVED_URI)],
+                    timestamp: Some(inner_ts),
+                },
+            ))
+            .encrypt(&SHARED_KEY)
+            .expect("encrypt")
+            .build()
+            .expect("build")
+            .encode_to_vec()
+    }
+
+    fn stored_uris(channels: &InMemChannelStore) -> Vec<String> {
+        channels
+            .helper_rows
+            .lock()
+            .unwrap()
+            .get(&(SECRET_ID, CHANNEL.0))
+            .expect("channel row")
+            .transports
+            .iter()
+            .map(|t| t.uri.clone())
+            .collect()
+    }
+
+    #[test]
+    fn inbound_message_with_mismatched_timestamps_is_ignored() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let transport = RecordingTransport::default();
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed(&mut c, &mut s).await;
+            let secrets_before = secrets.data.lock().unwrap().len();
+
+            let envelope_ts = crate::derec_message::current_timestamp();
+            let inner_ts = prost_types::Timestamp {
+                seconds: envelope_ts.seconds - 1,
+                nanos: envelope_ts.nanos,
+            };
+            let mut protocol = build(channels.clone(), secrets.clone(), transport.clone());
+            let events = protocol
+                .process(&update_request(envelope_ts, inner_ts))
+                .await
+                .expect("an ignored message is not an error");
+
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [DeRecEvent::MessageIgnored {
+                        channel_id: CHANNEL,
+                        reason: IgnoreReason::TimestampMismatch,
+                        trace_id: TRACE,
+                    }]
+                ),
+                "expected one MessageIgnored(TimestampMismatch), got {events:?}"
+            );
+            assert!(transport.sent_envelopes().is_empty(), "nothing is sent");
+            assert_eq!(stored_uris(&channels), vec![ORIGINAL_URI.to_owned()]);
+            assert_eq!(secrets.data.lock().unwrap().len(), secrets_before);
+        });
+    }
+
+    #[test]
+    fn inbound_message_with_matching_timestamps_is_processed() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let transport = RecordingTransport::default();
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed(&mut c, &mut s).await;
+
+            let ts = crate::derec_message::current_timestamp();
+            let mut protocol = build(channels.clone(), secrets, transport.clone());
+            let events = protocol
+                .process(&update_request(ts, ts))
+                .await
+                .expect("processed");
+
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::ChannelInfoUpdated { channel_id } if *channel_id == CHANNEL)),
+                "expected ChannelInfoUpdated, got {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::MessageIgnored { .. })),
+                "{events:?}"
+            );
+            assert_eq!(transport.sent_envelopes().len(), 1);
+            assert_eq!(stored_uris(&channels), vec![MOVED_URI.to_owned()]);
         });
     }
 }

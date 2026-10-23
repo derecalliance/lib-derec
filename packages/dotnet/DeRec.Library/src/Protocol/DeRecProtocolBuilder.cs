@@ -7,6 +7,17 @@ using System.Collections.Generic;
 namespace DeRec.Library.Orchestrator;
 
 /// <summary>
+/// The five stores <see cref="DeRecProtocolBuilder.Build"/> requires,
+/// bundled for <see cref="DeRecProtocolBuilder.WithStores"/>.
+/// </summary>
+public sealed record DeRecStores(
+    IChannelStore ChannelStore,
+    IShareStore ShareStore,
+    ISecretStore SecretStore,
+    IUserSecretStore UserSecretStore,
+    IStateStore StateStore);
+
+/// <summary>
 /// Fluent builder for <see cref="DeRecProtocol"/>. Mirrors the Rust
 /// <c>DeRecProtocolBuilder</c> method-for-method so a developer who
 /// already knows one SDK can move between them without reaching for
@@ -15,13 +26,14 @@ namespace DeRec.Library.Orchestrator;
 /// <para>
 /// Required setters: <see cref="WithChannelStore"/>,
 /// <see cref="WithShareStore"/>, <see cref="WithSecretStore"/>,
-/// <see cref="WithUserSecretStore"/>, <see cref="WithStateStore"/>,
-/// <see cref="WithTransport"/>, and <see cref="WithOwnTransports"/>.
-/// Calling <see cref="Build"/> without one of the six stores and transport
-/// throws <see cref="InvalidOperationException"/>; without at least one own
-/// transport, the library refuses the build with a
-/// <see cref="DeRecException"/> (<c>InvalidInput</c>), since a node with no
-/// endpoint cannot be reached by any peer.
+/// <see cref="WithUserSecretStore"/>, <see cref="WithStateStore"/>, and
+/// <see cref="WithTransport"/>. Calling <see cref="Build"/> without one of
+/// these six throws <see cref="InvalidOperationException"/>. Own transports
+/// come from <see cref="WithOwnTransports"/> or a config applied with
+/// <see cref="WithConfig"/>; without at least one own transport, the
+/// library refuses the build with a <see cref="DeRecException"/>
+/// (<c>InvalidInput</c>), since a node with no endpoint cannot be reached
+/// by any peer.
 /// </para>
 ///
 /// <para>
@@ -29,7 +41,8 @@ namespace DeRec.Library.Orchestrator;
 /// <see cref="WithTimeouts"/> (library defaults), <see cref="WithCommunicationInfo"/> (empty),
 /// <see cref="WithAutoRespondOnFailure"/> (false),
 /// <see cref="WithUnpairAck"/> (<see cref="UnpairAck.Required"/>),
-/// <see cref="WithAutoReplyTo"/> (false), <see cref="WithReplicaId"/> (unset).
+/// <see cref="WithAutoReplyTo"/> (false), <see cref="WithReplicaId"/> (unset),
+/// <see cref="WithMaxSubshares"/> (unset, no cap).
 /// </para>
 /// </summary>
 public sealed class DeRecProtocolBuilder
@@ -41,17 +54,7 @@ public sealed class DeRecProtocolBuilder
     private IUserSecretStore? _userSecretStore;
     private IStateStore? _stateStore;
     private ITransport? _transport;
-    private IReadOnlyList<TransportProtocol>? _ownTransports;
-    private int? _threshold;
-    private Dictionary<string, string> _communicationInfo = new();
-    private bool? _autoRespondOnFailure;
-    private UnpairAck? _unpairAck;
-    private bool? _autoReplyTo;
-    private AutoAcceptPolicy? _autoAccept;
-    private ulong? _replicaId = null;
-    private ParameterRange? _parameterRange = null;
-    private Timeouts? _timeouts = null;
-    private bool? _unsafeConnection;
+    private DeRecProtocolConfig _config = new();
 
     /// <summary>
     /// Construct a builder bound to a specific secret.
@@ -100,6 +103,23 @@ public sealed class DeRecProtocolBuilder
         return this;
     }
 
+    /// <summary>
+    /// Set every store in one call. Forwards to <see cref="WithChannelStore"/>,
+    /// <see cref="WithShareStore"/>, <see cref="WithSecretStore"/>,
+    /// <see cref="WithUserSecretStore"/> and <see cref="WithStateStore"/> in
+    /// turn, so calling one of them again afterwards replaces just that
+    /// store.
+    /// </summary>
+    public DeRecProtocolBuilder WithStores(DeRecStores stores)
+    {
+        if (stores is null) throw new ArgumentNullException(nameof(stores));
+        return WithChannelStore(stores.ChannelStore)
+            .WithShareStore(stores.ShareStore)
+            .WithSecretStore(stores.SecretStore)
+            .WithUserSecretStore(stores.UserSecretStore)
+            .WithStateStore(stores.StateStore);
+    }
+
     /// <summary>Set the transport implementation. Required.</summary>
     public DeRecProtocolBuilder WithTransport(ITransport transport)
     {
@@ -121,17 +141,26 @@ public sealed class DeRecProtocolBuilder
     public DeRecProtocolBuilder WithOwnTransports(IEnumerable<TransportProtocol> transports)
     {
         if (transports is null) throw new ArgumentNullException(nameof(transports));
-        _ownTransports = new List<TransportProtocol>(transports);
+        _config = _config with { OwnTransports = new List<TransportProtocol>(transports) };
         return this;
     }
 
     /// <summary>
-    /// Minimum number of shares required to reconstruct the secret.
+    /// The starting threshold: the minimum number of subshares required to
+    /// reconstruct the secret, for a secret with no threshold stored.
     /// Not calling this leaves the Rust library's default (3) in force.
     /// </summary>
+    /// <remarks>
+    /// Every publish stores the threshold it used
+    /// (<see cref="UserSecrets.Threshold"/>), the roster carries it, and
+    /// <c>RestoreAsync</c> and replica hydration put it back. A round splits
+    /// at <see cref="ProtectSecretParams.Threshold"/>, otherwise at the stored
+    /// threshold, and only otherwise at this value, so changing it later does
+    /// not change a stored threshold.
+    /// </remarks>
     public DeRecProtocolBuilder WithThreshold(int threshold)
     {
-        _threshold = threshold;
+        _config = _config with { Threshold = threshold };
         return this;
     }
 
@@ -150,7 +179,7 @@ public sealed class DeRecProtocolBuilder
     /// </remarks>
     public DeRecProtocolBuilder WithTimeouts(Timeouts timeouts)
     {
-        _timeouts = timeouts;
+        _config = _config with { Timeouts = timeouts };
         return this;
     }
 
@@ -180,7 +209,7 @@ public sealed class DeRecProtocolBuilder
     /// </remarks>
     public DeRecProtocolBuilder WithUnsafeConnection(bool allow)
     {
-        _unsafeConnection = allow;
+        _config = _config with { UnsafeConnection = allow };
         return this;
     }
 
@@ -190,17 +219,20 @@ public sealed class DeRecProtocolBuilder
     /// </summary>
     public DeRecProtocolBuilder WithCommunicationInfo(Dictionary<string, string> info)
     {
-        _communicationInfo = info ?? throw new ArgumentNullException(nameof(info));
+        if (info is null) throw new ArgumentNullException(nameof(info));
+        _config = _config with { CommunicationInfo = info };
         return this;
     }
 
     /// <summary>
-    /// Whether the protocol auto-replies on failed inbound processing.
-    /// Default: false.
+    /// Who answers an inbound request whose handling failed. <c>true</c>: the
+    /// library sends the response itself. <c>false</c>: nothing is sent, and
+    /// the <see cref="RequestFailedEvent"/> carries a token to pass to
+    /// <c>RejectAsync</c>. Default: false.
     /// </summary>
     public DeRecProtocolBuilder WithAutoRespondOnFailure(bool enabled)
     {
-        _autoRespondOnFailure = enabled;
+        _config = _config with { AutoRespondOnFailure = enabled };
         return this;
     }
 
@@ -210,7 +242,7 @@ public sealed class DeRecProtocolBuilder
     /// </summary>
     public DeRecProtocolBuilder WithUnpairAck(UnpairAck ack)
     {
-        _unpairAck = ack;
+        _config = _config with { UnpairAck = ack };
         return this;
     }
 
@@ -220,7 +252,7 @@ public sealed class DeRecProtocolBuilder
     /// </summary>
     public DeRecProtocolBuilder WithAutoReplyTo(bool enabled)
     {
-        _autoReplyTo = enabled;
+        _config = _config with { AutoReplyTo = enabled };
         return this;
     }
 
@@ -235,7 +267,8 @@ public sealed class DeRecProtocolBuilder
     /// </summary>
     public DeRecProtocolBuilder WithAutoAccept(AutoAcceptPolicy policy)
     {
-        _autoAccept = policy ?? throw new ArgumentNullException(nameof(policy));
+        if (policy is null) throw new ArgumentNullException(nameof(policy));
+        _config = _config with { AutoAccept = policy };
         return this;
     }
 
@@ -249,7 +282,7 @@ public sealed class DeRecProtocolBuilder
     /// </remarks>
     public DeRecProtocolBuilder WithReplicaId(ulong id)
     {
-        _replicaId = id;
+        _config = _config with { ReplicaId = id };
         return this;
     }
 
@@ -268,13 +301,94 @@ public sealed class DeRecProtocolBuilder
     /// <remarks>
     /// Embedded in outbound <c>PairRequest</c>/<c>PairResponse</c> envelopes
     /// and checked against the peer's range on inbound ones: a range that
-    /// fails to intersect rejects the pairing with
-    /// <see cref="DeRecCode.IncompatibleParameterRange"/>. Default: unset —
-    /// no constraints advertised, every peer range accepted.
+    /// fails to intersect refuses the pairing. A responder answers with
+    /// <c>INCOMPATIBLE_PARAMETER_RANGE</c> and reports a
+    /// <see cref="PairingRefusedEvent"/>; an initiator fails, with
+    /// <see cref="DeRecCode.IncompatibleParameterRange"/> when it finds the
+    /// mismatch itself. Default: unset — no constraints advertised, every
+    /// peer range accepted.
+    /// </remarks>
+    /// <remarks>
+    /// Share size is enforced by the helper; frequency limits are enforced
+    /// by the app's share store (refuse from <c>Save</c>/
+    /// <c>RecordVerification</c>); the deletion and deactivation timeouts
+    /// are checked at pairing only.
     /// </remarks>
     public DeRecProtocolBuilder WithParameterRange(ParameterRange range)
     {
-        _parameterRange = range;
+        _config = _config with { ParameterRange = range };
+        return this;
+    }
+
+    /// <summary>
+    /// Cap the total number of subshares one sharing round may split the
+    /// secret into — the sum of every helper's weight. Default: unset, no cap.
+    /// </summary>
+    /// <remarks>
+    /// Checked only by <c>start(ProtectSecret)</c>, including the publishes
+    /// the library starts itself: a round over the cap fails with
+    /// <see cref="DeRecCode.TooManySubshares"/> before anything is sent.
+    /// Recovery applies no cap. Recovering costs time that grows
+    /// quadratically with the total number of subshares, so the cap bounds
+    /// what a later recovery must do. A cap below the threshold makes
+    /// <see cref="Build"/> throw a <see cref="DeRecException"/>
+    /// (<c>InvalidInput</c>).
+    /// </remarks>
+    public DeRecProtocolBuilder WithMaxSubshares(ulong max)
+    {
+        _config = _config with { MaxSubshares = max };
+        return this;
+    }
+
+    /// <summary>
+    /// Apply every setting <paramref name="config"/> sets over this builder's
+    /// current values; a setting it leaves unset is untouched. Mirrors the
+    /// Rust <c>with_config</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Layering is last-write-wins per setting: a general config, then a
+    /// per-user config, then individual <c>WithX</c> calls. Timeouts layer per
+    /// timeout, so a later config that sets only
+    /// <see cref="Timeouts.InboundMessage"/> keeps the
+    /// <see cref="Timeouts.SharingRound"/> an earlier config or
+    /// <see cref="WithTimeouts"/> set. Every other nested value replaces the
+    /// current one as a whole.
+    /// </para>
+    /// <para>
+    /// Nothing is validated here. The library checks the result at
+    /// <see cref="Build"/>, exactly as it checks the same value set through
+    /// its <c>WithX</c> method.
+    /// </para>
+    /// </remarks>
+    public DeRecProtocolBuilder WithConfig(DeRecProtocolConfig config)
+    {
+        if (config is null) throw new ArgumentNullException(nameof(config));
+        var current = _config;
+        _config = new DeRecProtocolConfig
+        {
+            Threshold = config.Threshold ?? current.Threshold,
+            MaxSubshares = config.MaxSubshares ?? current.MaxSubshares,
+            Timeouts = (config.Timeouts, current.Timeouts) switch
+            {
+                (null, var held) => held,
+                (var set, null) => set,
+                (var set, var held) => new Timeouts(
+                    InboundMessage: set.InboundMessage ?? held.InboundMessage,
+                    SharingRound: set.SharingRound ?? held.SharingRound,
+                    UnpairAck: set.UnpairAck ?? held.UnpairAck,
+                    ExpiredChannels: set.ExpiredChannels ?? held.ExpiredChannels),
+            },
+            ParameterRange = config.ParameterRange ?? current.ParameterRange,
+            AutoAccept = config.AutoAccept ?? current.AutoAccept,
+            AutoRespondOnFailure = config.AutoRespondOnFailure ?? current.AutoRespondOnFailure,
+            AutoReplyTo = config.AutoReplyTo ?? current.AutoReplyTo,
+            UnpairAck = config.UnpairAck ?? current.UnpairAck,
+            UnsafeConnection = config.UnsafeConnection ?? current.UnsafeConnection,
+            CommunicationInfo = config.CommunicationInfo ?? current.CommunicationInfo,
+            OwnTransports = config.OwnTransports ?? current.OwnTransports,
+            ReplicaId = config.ReplicaId ?? current.ReplicaId,
+        };
         return this;
     }
 
@@ -300,16 +414,6 @@ public sealed class DeRecProtocolBuilder
             userSecretStore: _userSecretStore,
             stateStore: _stateStore,
             transport: _transport,
-            ownTransports: _ownTransports ?? Array.Empty<TransportProtocol>(),
-            threshold: _threshold,
-            communicationInfo: _communicationInfo,
-            autoRespondOnFailure: _autoRespondOnFailure,
-            unpairAck: _unpairAck,
-            autoReplyTo: _autoReplyTo,
-            autoAccept: _autoAccept,
-            replicaId: _replicaId,
-            parameterRange: _parameterRange,
-            timeouts: _timeouts,
-            unsafeConnection: _unsafeConnection);
+            config: _config);
     }
 }

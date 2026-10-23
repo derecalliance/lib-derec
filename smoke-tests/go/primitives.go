@@ -32,6 +32,7 @@ func runPrimitives() {
 	runPairingFlow()
 	runNoKeysPairingFlow()
 	runSharingFlow()
+	runWeightedSplit()
 	runVerificationFlow()
 	runRecoveryFlow()
 	runDiscoveryFlow()
@@ -244,7 +245,8 @@ func runSharingFlow() {
 	const threshold = 2
 	const version = uint32(1)
 
-	shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold, version)
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 1}, {ChannelID: 3, Weight: 1}}
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
 	must(err, "sharing.Request.Split")
 	assertTrue(len(shares) == len(channelIDs), "expected one share per channel, got %d", len(shares))
 
@@ -278,6 +280,35 @@ func runSharingFlow() {
 	fmt.Println("Sharing flow test passed.")
 }
 
+// runWeightedSplit mirrors a weighted Split call: channel 1 gets two
+// subshares, channel 2 gets three, and channel 3 (weight 1) gets the
+// unweighted default of one, decoded from the committed share's
+// DeRecShare.subshares count.
+func runWeightedSplit() {
+	fmt.Println("=== Weighted split test ===")
+
+	const secretID = uint64(0x0102_0304_05ff)
+	secretData := []byte{5, 6, 7, 8, 255}
+	channelIDs := []uint64{1, 2, 3}
+	const threshold = 4
+	const version = uint32(1)
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 2}, {ChannelID: 2, Weight: 3}, {ChannelID: 3, Weight: 1}}
+
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
+	must(err, "sharing.Request.Split (weighted)")
+
+	wantSubshares := map[uint64]int{1: 2, 2: 3, 3: 1}
+	for _, id := range channelIDs {
+		var committed derecpb.CommittedDeRecShare
+		must(proto.Unmarshal(shares[id], &committed), fmt.Sprintf("decode CommittedDeRecShare channel %d", id))
+		var share derecpb.DeRecShare
+		must(proto.Unmarshal(committed.GetDeRecShare(), &share), fmt.Sprintf("decode DeRecShare channel %d", id))
+		assertTrue(len(share.GetSubshares()) == wantSubshares[id], "channel %d: expected %d subshares, got %d", id, wantSubshares[id], len(share.GetSubshares()))
+	}
+
+	fmt.Println("Weighted split test passed.")
+}
+
 // runVerificationFlow mirrors run_verification_flow_test in
 // smoke-tests/rust/src/primitives.rs: challenge channel 1 for its share of a
 // split secret, confirm a response proving possession of the exact share
@@ -288,14 +319,14 @@ func runVerificationFlow() {
 
 	const secretID = uint64(0x0102_0304_05ff)
 	secretData := []byte{5, 6, 7, 8, 255}
-	channelIDs := []uint64{1, 2, 3}
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 1}, {ChannelID: 3, Weight: 1}}
 	const threshold = 2
 	const version = uint32(1)
 	const channel1, channel2 = uint64(1), uint64(2)
 
 	sharedKey := sharedKeyFill(1)
 
-	shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold, version)
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
 	must(err, "sharing.Request.Split")
 	shareContent1 := shares[channel1]
 	shareContent2 := shares[channel2]
@@ -339,11 +370,11 @@ func runRecoveryFlow() {
 
 	const secretID = uint64(0x0102_0304_05ff)
 	secretData := []byte{5, 6, 7, 8, 255}
-	channelIDs := []uint64{1, 2, 3}
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 1}, {ChannelID: 3, Weight: 1}}
 	const threshold = 2
 	const version = uint32(1)
 
-	shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold, version)
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
 	must(err, "sharing.Request.Split")
 
 	keys := map[uint64][]byte{1: sharedKeyFill(1), 2: sharedKeyFill(2), 3: sharedKeyFill(3)}

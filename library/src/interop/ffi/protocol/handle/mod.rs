@@ -9,7 +9,6 @@
 //! `start` / `process` / `accept` / `reject` event-loop surface.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use prost::Message as _;
 
@@ -23,11 +22,11 @@ use crate::interop::ffi::protocol::stores::{
     DotnetStateStore, DotnetTransport, DotnetUserSecretStore, SecretStoreCallbacks,
     ShareStoreCallbacks, StateStoreCallbacks, TransportCallbacks, UserSecretStoreCallbacks,
 };
-use crate::protocol::DeRecProtocolBuilder;
+use crate::protocol::{DeRecProtocolBuilder, DeRecProtocolConfig};
 
-mod config;
-mod flow;
-mod pairing;
+pub(in crate::interop::ffi) mod config;
+pub(in crate::interop::ffi) mod flow;
+pub(in crate::interop::ffi) mod pairing;
 
 pub(super) type Protocol = crate::protocol::DeRecProtocol<
     DotnetChannelStore,
@@ -107,242 +106,90 @@ impl From<DeRecError> for DeRecProtocolNewResult {
     }
 }
 
-/// Per-flow auto-accept policy as decoded from JSON by
-/// [`derec_protocol_new`]. One boolean per flow (`true` = the
-/// protocol auto-accepts that flow's incoming requests instead of
-/// surfacing them as `ActionRequired`).
+/// Split [`derec_protocol_new`]'s config JSON into the per-instance
+/// `secret_id` and the [`DeRecProtocolConfig`] every binding shares, parsed
+/// through the config's own canonical JSON (unknown keys refused).
 ///
-/// Every field is optional: an absent flow takes its value from
-/// [`crate::protocol::AutoAcceptPolicy::default()`] through this struct's
-/// `Default` impl, so a binding forwards only the flows its caller named.
-#[derive(serde::Deserialize)]
-#[serde(default)]
-struct AutoAcceptConfig {
-    pairing: bool,
-    pre_pair: bool,
-    store_share: bool,
-    verify_share: bool,
-    discovery: bool,
-    get_share: bool,
-    unpair: bool,
-    update_channel_info: bool,
-}
+/// Two values the config refuses while parsing keep the codes this entry
+/// point has always reported for them: an `unpair_ack` code or name outside
+/// the enum is `DEREC_CODE_FFI_INVALID_ENUM`, and an own transport whose
+/// `protocol` discriminant names no protocol is
+/// `DEREC_CODE_TRANSPORT_INVALID`. Every other malformed value is
+/// `DEREC_CODE_FFI_BAD_PROTO`.
+fn parse_config(json: &[u8]) -> Result<(u64, DeRecProtocolConfig), DeRecError> {
+    use serde_json::Value;
 
-/// Mirrors [`crate::protocol::AutoAcceptPolicy::default()`] field for
-/// field rather than repeating the "every flow off" literal here — the
-/// policy's own `Default` impl is the single source of truth for what an
-/// absent `"auto_accept"` key means.
-impl Default for AutoAcceptConfig {
-    fn default() -> Self {
-        let p = crate::protocol::AutoAcceptPolicy::default();
-        Self {
-            pairing: p.pairing,
-            pre_pair: p.pre_pair,
-            store_share: p.store_share,
-            verify_share: p.verify_share,
-            discovery: p.discovery,
-            get_share: p.get_share,
-            unpair: p.unpair,
-            update_channel_info: p.update_channel_info,
-        }
-    }
-}
+    let not_valid = |e: &dyn std::fmt::Display| {
+        ffi_error(
+            DEREC_CODE_FFI_BAD_PROTO,
+            format!("config_json is not valid: {e}"),
+        )
+    };
+    let mut map = match serde_json::from_slice::<Value>(json).map_err(|e| not_valid(&e))? {
+        Value::Object(map) => map,
+        _ => return Err(not_valid(&"expected a JSON object")),
+    };
 
-impl From<AutoAcceptConfig> for crate::protocol::AutoAcceptPolicy {
-    fn from(p: AutoAcceptConfig) -> Self {
-        Self {
-            pairing: p.pairing,
-            pre_pair: p.pre_pair,
-            store_share: p.store_share,
-            verify_share: p.verify_share,
-            discovery: p.discovery,
-            get_share: p.get_share,
-            unpair: p.unpair,
-            update_channel_info: p.update_channel_info,
-        }
-    }
-}
-
-/// Automatic expired-channel cleanup, as carried in the
-/// [`derec_protocol_new`] config JSON under `"timeouts"."expired_channels"`.
-///
-/// Both fields are always transported. Deciding that a disabled policy
-/// ignores its timeout is a protocol decision and happens in
-/// [`crate::protocol::ExpiredChannelCleanup::new`], not here — this shim
-/// only marshals.
-#[derive(serde::Deserialize)]
-struct RemoveExpiredChannelsConfig {
-    enabled: bool,
-    timeout_in_secs: u64,
-}
-
-/// The four waiting periods, as carried in the [`derec_protocol_new`] config
-/// JSON under `"timeouts"`.
-///
-/// Every field is optional and **absent means "use the library default"** —
-/// the defaults live in [`crate::protocol::types::Timeouts`], not here, so a
-/// binding that omits a field gets whatever the protocol currently considers
-/// right rather than a value frozen into the shim.
-#[derive(serde::Deserialize, Default)]
-struct TimeoutsConfig {
-    #[serde(default)]
-    inbound_message_secs: Option<u64>,
-    #[serde(default)]
-    sharing_round_secs: Option<u64>,
-    #[serde(default)]
-    unpair_ack_secs: Option<u64>,
-    #[serde(default)]
-    expired_channels: Option<RemoveExpiredChannelsConfig>,
-}
-
-impl TimeoutsConfig {
-    fn to_timeouts(&self) -> crate::protocol::types::Timeouts {
-        let d = crate::protocol::types::Timeouts::default();
-        crate::protocol::types::Timeouts {
-            inbound_message: self
-                .inbound_message_secs
-                .map_or(d.inbound_message, Duration::from_secs),
-            sharing_round: self
-                .sharing_round_secs
-                .map_or(d.sharing_round, Duration::from_secs),
-            unpair_ack: self
-                .unpair_ack_secs
-                .map_or(d.unpair_ack, Duration::from_secs),
-            expired_channels: self
-                .expired_channels
-                .as_ref()
-                .map_or(d.expired_channels, |e| {
-                    crate::protocol::ExpiredChannelCleanup::new(e.enabled, e.timeout_in_secs)
-                }),
-        }
-    }
-}
-
-/// The `parameter_range` object in [`ProtocolConfig`]. Mirrors
-/// [`derec_proto::ParameterRange`] field for field.
-///
-/// Every field is optional and defaults to `0`, which is what the proto's
-/// own default is: an unset bound advertises no constraint on that
-/// dimension. Omitting the whole object advertises no constraints at all and
-/// accepts any peer range, matching the builder's default.
-///
-/// Each bound is accepted either as a JSON number or as a decimal string.
-/// The string form carries the full `i64` range through JSON encoders whose
-/// numbers are `f64`, which round anything beyond 2^53.
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-struct ParameterRangeConfig {
-    #[serde(deserialize_with = "i64_from_number_or_decimal")]
-    min_share_size: i64,
-    #[serde(deserialize_with = "i64_from_number_or_decimal")]
-    max_share_size: i64,
-    #[serde(deserialize_with = "i64_from_number_or_decimal")]
-    min_time_between_verifications: i64,
-    #[serde(deserialize_with = "i64_from_number_or_decimal")]
-    max_time_between_verifications: i64,
-    #[serde(deserialize_with = "i64_from_number_or_decimal")]
-    min_time_between_share_updates: i64,
-    #[serde(deserialize_with = "i64_from_number_or_decimal")]
-    max_time_between_share_updates: i64,
-    #[serde(deserialize_with = "i64_from_number_or_decimal")]
-    min_unresponsive_deletion_timeout: i64,
-    #[serde(deserialize_with = "i64_from_number_or_decimal")]
-    max_unresponsive_deletion_timeout: i64,
-    #[serde(deserialize_with = "i64_from_number_or_decimal")]
-    min_unresponsive_deactivation_timeout: i64,
-    #[serde(deserialize_with = "i64_from_number_or_decimal")]
-    max_unresponsive_deactivation_timeout: i64,
-}
-
-/// Reads an `i64` written either as a JSON number or as a decimal string.
-fn i64_from_number_or_decimal<'de, D>(de: D) -> Result<i64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum NumberOrDecimal {
-        Number(i64),
-        Decimal(String),
-    }
-    match <NumberOrDecimal as serde::Deserialize>::deserialize(de)? {
-        NumberOrDecimal::Number(n) => Ok(n),
-        NumberOrDecimal::Decimal(s) => s
+    let secret_id = match map.remove("secret_id") {
+        Some(Value::String(s)) => s
             .parse()
-            .map_err(|_| serde::de::Error::custom(format!("{s:?} is not a decimal i64"))),
-    }
-}
+            .map_err(|_| ffi_error(DEREC_CODE_FFI_BAD_PROTO, "secret_id is not a valid u64"))?,
+        Some(_) => {
+            return Err(not_valid(
+                &"secret_id must be a u64 written as a decimal string",
+            ));
+        }
+        None => return Err(not_valid(&"missing field `secret_id`")),
+    };
 
-impl From<&ParameterRangeConfig> for derec_proto::ParameterRange {
-    fn from(c: &ParameterRangeConfig) -> Self {
-        Self {
-            min_share_size: c.min_share_size,
-            max_share_size: c.max_share_size,
-            min_time_between_verifications: c.min_time_between_verifications,
-            max_time_between_verifications: c.max_time_between_verifications,
-            min_time_between_share_updates: c.min_time_between_share_updates,
-            max_time_between_share_updates: c.max_time_between_share_updates,
-            min_unresponsive_deletion_timeout: c.min_unresponsive_deletion_timeout,
-            max_unresponsive_deletion_timeout: c.max_unresponsive_deletion_timeout,
-            min_unresponsive_deactivation_timeout: c.min_unresponsive_deactivation_timeout,
-            max_unresponsive_deactivation_timeout: c.max_unresponsive_deactivation_timeout,
+    if let Some(e) = unpair_ack_out_of_range(map.get("unpair_ack")) {
+        return Err(e);
+    }
+    if let Some(Value::Array(entries)) = map.get("own_transports") {
+        for entry in entries {
+            let Some(discriminant) = entry
+                .get("protocol")
+                .and_then(Value::as_i64)
+                .and_then(|d| i32::try_from(d).ok())
+            else {
+                continue;
+            };
+            if derec_proto::Protocol::try_from(discriminant).is_err() {
+                let uri = entry.get("uri").and_then(Value::as_str).unwrap_or_default();
+                validate_transport(uri, discriminant)?;
+            }
         }
     }
+
+    let config = serde_json::from_value(Value::Object(map)).map_err(|e| not_valid(&e))?;
+    Ok((secret_id, config))
 }
 
-/// One entry of the `own_transports` array in [`ProtocolConfig`]:
-/// `{uri, protocol}`, with `protocol` as its name (`"https"`, `"grpc"`) or
-/// its `derec_proto::Protocol` discriminant.
-#[derive(serde::Deserialize)]
-struct OwnTransportConfig {
-    uri: String,
-    #[serde(
-        deserialize_with = "crate::interop::protocol_names::protocol_from_name_or_discriminant"
-    )]
-    protocol: i32,
-}
-
-/// JSON configuration shape accepted by [`derec_protocol_new`].
-///
-/// `secret_id` and `replica_id` are decimal strings rather than JSON
-/// numbers: `u64` values above 2^53 lose precision once round-tripped
-/// through JSON's `f64`-backed number type in common encoders
-/// (including Go's `encoding/json`).
-#[derive(serde::Deserialize)]
-struct ProtocolConfig {
-    secret_id: String,
-    /// Every endpoint this application serves, in preference order. Absent
-    /// or empty is refused at construction.
-    #[serde(default)]
-    own_transports: Vec<OwnTransportConfig>,
-    #[serde(default = "default_threshold")]
-    threshold: u32,
-    #[serde(default)]
-    auto_respond_on_failure: bool,
-    #[serde(default)]
-    unpair_ack: Option<UnpairAckConfig>,
-    #[serde(default)]
-    auto_reply_to: bool,
-    #[serde(default)]
-    auto_accept: AutoAcceptConfig,
-    #[serde(default)]
-    timeouts: TimeoutsConfig,
-    /// Accept plaintext transport endpoints — `http://` and `grpc://`.
-    /// Absent means `false`.
-    #[serde(default)]
-    unsafe_connection: bool,
-    // Absent or `null` means "no replica id".
-    #[serde(default)]
-    replica_id: Option<String>,
-    #[serde(default)]
-    parameter_range: Option<ParameterRangeConfig>,
-    /// This node's `communication_info` map, as the same flat string-to-string
-    /// JSON object `derec_protocol_set_communication_info` takes. Absent means
-    /// "not set here". Supplying it together with a non-empty
-    /// `communication_info` proto buffer argument is rejected rather than
-    /// resolved by precedence.
-    #[serde(default)]
-    communication_info: Option<HashMap<String, String>>,
+/// The `DEREC_CODE_FFI_INVALID_ENUM` error for an `unpair_ack` that is a
+/// code or a name but not one of [`crate::protocol::UnpairAck`]'s: `0` /
+/// `"required"` or `1` / `"not_required"`. `None` for a valid value, an
+/// absent one, or one of another JSON type, which fails to parse instead.
+fn unpair_ack_out_of_range(value: Option<&serde_json::Value>) -> Option<DeRecError> {
+    let shown = match value? {
+        serde_json::Value::Number(n) => {
+            let code = n.as_i64().and_then(|c| i32::try_from(c).ok())?;
+            if code == 0 || code == 1 {
+                return None;
+            }
+            code.to_string()
+        }
+        serde_json::Value::String(name) => {
+            if crate::interop::protocol_names::unpair_ack_from_name(name).is_some() {
+                return None;
+            }
+            format!("{name:?}")
+        }
+        _ => return None,
+    };
+    Some(ffi_error(
+        DEREC_CODE_FFI_INVALID_ENUM,
+        format!("invalid unpair_ack: {shown}"),
+    ))
 }
 
 /// Constructs a [`crate::protocol::DeRecProtocol`] with scalar config
@@ -355,13 +202,15 @@ struct ProtocolConfig {
 /// are still passed as individual pointers, since purego marshals
 /// pointer-sized arguments natively.
 ///
-/// `config_json` must deserialize to [`ProtocolConfig`] — all field names
-/// `snake_case`. `secret_id` is the only required field. Every other field
-/// may be omitted, in which case the value matches
-/// [`crate::protocol::DeRecProtocolBuilder::new`]'s own default for that
-/// setting: [`ProtocolConfig`]'s field-level `#[serde(default)]` attributes
-/// read the same constants the builder does. A field that is present is
-/// used as given, including `0`, and validated by the builder.
+/// `config_json` is a JSON object holding `secret_id` plus the canonical
+/// [`DeRecProtocolConfig`] JSON, all field names `snake_case`. `secret_id`
+/// is the only required field. The rest is parsed as a
+/// [`DeRecProtocolConfig`] and applied with
+/// [`crate::protocol::DeRecProtocolBuilder::with_config`]: an omitted field
+/// keeps [`crate::protocol::DeRecProtocolBuilder::new`]'s own default for
+/// that setting, and a field that is present is used as given, including
+/// `0`, and validated by the builder. A key the config does not define is
+/// rejected with `DEREC_CODE_FFI_BAD_PROTO` rather than ignored.
 ///
 /// ```json
 /// {
@@ -400,7 +249,8 @@ struct ProtocolConfig {
 ///     "max_unresponsive_deletion_timeout": 0,
 ///     "min_unresponsive_deactivation_timeout": 0,
 ///     "max_unresponsive_deactivation_timeout": 0
-///   }
+///   },
+///   "max_subshares": null
 /// }
 /// ```
 ///
@@ -409,9 +259,10 @@ struct ProtocolConfig {
 ///   preference order — the order decides which of a peer's offered
 ///   endpoints is used. `protocol` is its name (`"https"`, `"grpc"`) or
 ///   its `derec_proto::Protocol` discriminant (`0`, `1`). Each entry is validated, and
-///   two entries of the same protocol are rejected. Required: an absent or
-///   empty list is refused, since a node with no endpoint cannot be reached
-///   by any peer.
+///   two entries of the same protocol are rejected. An unknown discriminant
+///   or an invalid URI is rejected with `DEREC_CODE_TRANSPORT_INVALID`.
+///   Required: an absent or empty list is refused, since a node with no
+///   endpoint cannot be reached by any peer.
 /// - `threshold`: omitted means [`crate::protocol::DEFAULT_THRESHOLD`]. A
 ///   `threshold` below `2` is rejected with `DEREC_CODE_INVALID_INPUT`.
 /// - `unpair_ack`: `0` / `"required"` = Required, `1` / `"not_required"` =
@@ -437,6 +288,11 @@ struct ProtocolConfig {
 ///   string values. Mutually exclusive with a non-empty
 ///   `communication_info_ptr` buffer; omitted with an empty buffer means
 ///   no entries.
+/// - `max_subshares`: decimal-string `u64` capping the total subshares one
+///   sharing round may split the secret into, or absent/`null` for no cap.
+///   A cap below `threshold` is rejected by the builder with
+///   `DEREC_CODE_INVALID_INPUT`; a round over the cap fails with
+///   `DEREC_CODE_TOO_MANY_SUBSHARES`.
 ///
 /// # Safety
 ///
@@ -465,49 +321,14 @@ pub unsafe extern "C" fn derec_protocol_new(
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "config_json_ptr is null").into();
     }
     let json_bytes = unsafe { std::slice::from_raw_parts(config_json_ptr, config_json_len) };
-    let config: ProtocolConfig = match serde_json::from_slice(json_bytes) {
-        Ok(c) => c,
-        Err(e) => {
-            return ffi_error(
-                DEREC_CODE_FFI_BAD_PROTO,
-                format!("config_json is not valid: {e}"),
-            )
-            .into();
-        }
+    let (secret_id, mut config) = match parse_config(json_bytes) {
+        Ok(parsed) => parsed,
+        Err(e) => return e.into(),
     };
-
-    let secret_id: u64 = match config.secret_id.parse() {
-        Ok(id) => id,
-        Err(_) => {
-            return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "secret_id is not a valid u64").into();
-        }
-    };
-
-    let replica_id: Option<u64> = match config.replica_id {
-        Some(s) => match s.parse() {
-            Ok(id) => Some(id),
-            Err(_) => {
-                return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "replica_id is not a valid u64").into();
-            }
-        },
-        None => None,
-    };
-
-    // Every entry is validated so the protocol can't be constructed with a
-    // malformed or downgraded endpoint that would then be propagated to peers
-    // via pairing. An empty list reaches the builder, which refuses it: a node
-    // with no endpoint cannot be reached by any peer.
-    let mut own_transports = Vec::with_capacity(config.own_transports.len());
-    for entry in config.own_transports {
-        match validate_transport(&entry.uri, entry.protocol) {
-            Ok(tp) => own_transports.push(tp),
-            Err(e) => return e.into(),
-        }
-    }
 
     let info = match unsafe {
         resolve_communication_info(
-            config.communication_info,
+            config.communication_info.take(),
             communication_info_ptr,
             communication_info_len,
         )
@@ -515,29 +336,12 @@ pub unsafe extern "C" fn derec_protocol_new(
         Ok(i) => i,
         Err(e) => return e.into(),
     };
-
-    let unpair_ack_value = match config.unpair_ack.map(UnpairAckConfig::resolve) {
-        None => crate::protocol::UnpairAck::default(),
-        Some(Ok(ack)) => ack,
-        Some(Err(e)) => return e.into(),
-    };
-
-    let unsafe_connection = config.unsafe_connection;
+    config.communication_info = Some(info);
 
     unsafe {
         construct_protocol(
             secret_id,
-            own_transports,
-            config.threshold,
-            info,
-            config.timeouts.to_timeouts(),
-            unsafe_connection,
-            config.auto_respond_on_failure,
-            unpair_ack_value,
-            config.auto_reply_to,
-            config.auto_accept.into(),
-            replica_id,
-            config.parameter_range.as_ref().map(Into::into),
+            config,
             channel_store_cb,
             secret_store_cb,
             share_store_cb,
@@ -631,12 +435,11 @@ unsafe fn decode_communication_info(
     }
 }
 
-/// Construction logic for [`derec_protocol_new`]: takes the
-/// already-parsed/validated scalar configuration plus the 6
-/// store/transport callback pointers,
-/// reads each callback struct, builds the [`DeRecProtocolBuilder`],
-/// and wraps the result in a handle bound to a fresh single-thread
-/// tokio runtime.
+/// Construction logic for [`derec_protocol_new`]: takes the parsed
+/// `secret_id` and [`DeRecProtocolConfig`] plus the 6 store/transport
+/// callback pointers, reads each callback struct, builds the
+/// [`DeRecProtocolBuilder`], and wraps the result in a handle bound to a
+/// fresh single-thread tokio runtime.
 ///
 /// # Safety
 ///
@@ -647,17 +450,7 @@ unsafe fn decode_communication_info(
 #[allow(clippy::too_many_arguments)]
 unsafe fn construct_protocol(
     secret_id: u64,
-    own_transports: Vec<crate::transport::TransportProtocol>,
-    threshold: u32,
-    communication_info: HashMap<String, String>,
-    timeouts: crate::protocol::types::Timeouts,
-    unsafe_connection: bool,
-    auto_respond_on_failure: bool,
-    unpair_ack: crate::protocol::UnpairAck,
-    auto_reply_to: bool,
-    auto_accept: crate::protocol::AutoAcceptPolicy,
-    replica_id: Option<u64>,
-    parameter_range: Option<derec_proto::ParameterRange>,
+    config: DeRecProtocolConfig,
     channel_store_cb: *const ChannelStoreCallbacks,
     secret_store_cb: *const SecretStoreCallbacks,
     share_store_cb: *const ShareStoreCallbacks,
@@ -698,29 +491,14 @@ unsafe fn construct_protocol(
         cb: unsafe { std::ptr::read(transport_cb) },
     };
 
-    let mut builder = DeRecProtocolBuilder::new(secret_id)
+    let builder = DeRecProtocolBuilder::new(secret_id)
         .with_channel_store(channel_store)
         .with_share_store(share_store)
         .with_secret_store(secret_store)
         .with_user_secret_store(user_secret_store)
         .with_state_store(state_store)
         .with_transport(transport)
-        .with_own_transports(own_transports)
-        .with_threshold(threshold as usize)
-        .with_communication_info(communication_info)
-        .with_timeouts(timeouts)
-        .with_unsafe_connection(unsafe_connection)
-        .with_auto_respond_on_failure(auto_respond_on_failure)
-        .with_unpair_ack(unpair_ack)
-        .with_auto_reply_to(auto_reply_to)
-        .with_auto_accept(auto_accept);
-
-    if let Some(replica_id) = replica_id {
-        builder = builder.with_replica_id(replica_id);
-    }
-    if let Some(parameter_range) = parameter_range {
-        builder = builder.with_parameter_range(parameter_range);
-    }
+        .with_config(config);
 
     let inner = match builder.build() {
         Ok(p) => p,
@@ -748,182 +526,180 @@ unsafe fn construct_protocol(
     }
 }
 
-/// [`crate::protocol::DEFAULT_THRESHOLD`], narrowed to the FFI config's
-/// wire type. Read by serde's `#[serde(default = "...")]` on
-/// [`ProtocolConfig::threshold`] so an absent key resolves to the same
-/// constant [`crate::protocol::DeRecProtocolBuilder::new`] uses.
-fn default_threshold() -> u32 {
-    crate::protocol::DEFAULT_THRESHOLD as u32
-}
-
-/// The `unpair_ack` config value: either the discriminant (`0` = Required,
-/// `1` = NotRequired) or the name every binding exposes (`"required"`,
-/// `"not_required"`). Absent means [`crate::protocol::UnpairAck::default()`].
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum UnpairAckConfig {
-    Code(i32),
-    Name(String),
-}
-
-impl UnpairAckConfig {
-    fn resolve(self) -> Result<crate::protocol::UnpairAck, DeRecError> {
-        let resolved = match &self {
-            Self::Code(0) => Some(crate::protocol::UnpairAck::Required),
-            Self::Code(1) => Some(crate::protocol::UnpairAck::NotRequired),
-            Self::Code(_) => None,
-            Self::Name(name) => crate::interop::protocol_names::unpair_ack_from_name(name),
-        };
-        resolved.ok_or_else(|| {
-            let shown = match self {
-                Self::Code(code) => code.to_string(),
-                Self::Name(name) => format!("{name:?}"),
-            };
-            ffi_error(
-                DEREC_CODE_FFI_INVALID_ENUM,
-                format!("invalid unpair_ack: {shown}"),
-            )
-        })
-    }
-}
-
-#[cfg(test)]
-mod protocol_config_defaults_tests {
-    use super::*;
-
-    /// A config JSON carrying only the required `secret_id`
-    /// deserializes, and every omitted field resolves to exactly the value
-    /// [`crate::protocol::DeRecProtocolBuilder::new`] would have used —
-    /// proving the FFI shim invents no defaults of its own.
-    #[test]
-    fn minimal_config_json_matches_builder_defaults() {
-        let minimal = r#"{
-            "secret_id": "1"
-        }"#;
-        let config: ProtocolConfig =
-            serde_json::from_str(minimal).expect("minimal config must deserialize");
-
-        assert_eq!(config.threshold, crate::protocol::DEFAULT_THRESHOLD as u32);
-        assert!(!config.auto_respond_on_failure);
-        assert!(config.unpair_ack.is_none());
-        assert!(!config.auto_reply_to);
-        assert_eq!(
-            crate::protocol::AutoAcceptPolicy::from(config.auto_accept),
-            crate::protocol::AutoAcceptPolicy::default()
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interop::ffi::error::DEREC_CODE_TRANSPORT_INVALID;
+    use crate::protocol::UnpairAck;
 
-    /// `unpair_ack` takes the discriminant or the binding-facing name; any
-    /// other value is refused rather than defaulted.
-    #[test]
-    fn unpair_ack_accepts_code_or_name_and_refuses_the_rest() {
-        let resolve = |value: &str| {
-            let config: ProtocolConfig =
-                serde_json::from_str(&format!(r#"{{"secret_id": "1", "unpair_ack": {value}}}"#))
-                    .expect("parses");
-            config.unpair_ack.map(UnpairAckConfig::resolve)
+    /// The error's code and message, with the error released.
+    fn take(mut err: DeRecError) -> (i32, String) {
+        let message = if err.message.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(err.message) }
+                .to_string_lossy()
+                .into_owned()
         };
-        use crate::protocol::UnpairAck::{NotRequired, Required};
-        assert!(matches!(resolve("0"), Some(Ok(Required))));
-        assert!(matches!(resolve("1"), Some(Ok(NotRequired))));
-        assert!(matches!(resolve(r#""required""#), Some(Ok(Required))));
-        assert!(matches!(
-            resolve(r#""not_required""#),
-            Some(Ok(NotRequired))
-        ));
-        for bad in ["2", "-1", r#""Required""#, r#""notrequired""#] {
-            match resolve(bad) {
-                Some(Err(e)) => assert_eq!(e.code, DEREC_CODE_FFI_INVALID_ENUM, "{bad}"),
-                _ => panic!("{bad} must be refused"),
-            }
+        let code = err.code;
+        unsafe { crate::interop::ffi::error::derec_free_error(&mut err) };
+        (code, message)
+    }
+
+    fn parse(json: &str) -> Result<(u64, DeRecProtocolConfig), (i32, String)> {
+        parse_config(json.as_bytes()).map_err(take)
+    }
+
+    fn parsed(json: &str) -> DeRecProtocolConfig {
+        match parse(json) {
+            Ok((_, config)) => config,
+            Err((code, message)) => panic!("{json} refused with {code}: {message}"),
         }
     }
 
-    /// `unsafe_connection` is read when present and defaults to `false`.
-    #[test]
-    fn config_json_reads_the_plaintext_flag() {
-        let set: ProtocolConfig = serde_json::from_str(
-            r#"{
-                "secret_id": "1",
-                "unsafe_connection": true
-            }"#,
-        )
-        .expect("parses");
-        assert!(set.unsafe_connection);
-
-        let absent: ProtocolConfig = serde_json::from_str(
-            r#"{
-                "secret_id": "1"
-            }"#,
-        )
-        .expect("parses");
-        assert!(!absent.unsafe_connection);
+    fn refused(json: &str) -> (i32, String) {
+        match parse(json) {
+            Ok(_) => panic!("{json} must be refused"),
+            Err(e) => e,
+        }
     }
 
-    fn config_with(extra: &str) -> ProtocolConfig {
-        let json = format!(
-            r#"{{
-                "secret_id": "1",
-                "own_transport_uri": "",
-                "own_transport_protocol": 1
-                {extra}
-            }}"#
-        );
-        serde_json::from_str(&json).expect("config parses")
+    /// `secret_id` alone is a valid config: every other setting is left to
+    /// the builder's own default.
+    #[test]
+    fn secret_id_alone_leaves_every_setting_unset() {
+        let (secret_id, config) = parse(r#"{"secret_id": "18446744073709551615"}"#)
+            .unwrap_or_else(|(c, m)| panic!("{c}: {m}"));
+        assert_eq!(secret_id, u64::MAX);
+        assert_eq!(config, DeRecProtocolConfig::default());
     }
 
-    /// A partial `auto_accept` object leaves every unnamed flow at the
-    /// policy's own default instead of failing to deserialize.
+    /// `secret_id` is required and is a decimal-string `u64`.
     #[test]
-    fn partial_auto_accept_defaults_each_absent_flow() {
-        let config = config_with(r#", "auto_accept": { "pairing": true }"#);
-        let policy = crate::protocol::AutoAcceptPolicy::from(config.auto_accept);
-        let expected = crate::protocol::AutoAcceptPolicy {
-            pairing: true,
-            ..crate::protocol::AutoAcceptPolicy::default()
+    fn secret_id_is_a_required_decimal_string() {
+        for bad in [
+            r#"{}"#,
+            r#"{"secret_id": 1}"#,
+            r#"{"secret_id": null}"#,
+            r#"{"secret_id": "12x"}"#,
+            r#"{"secret_id": "-1"}"#,
+        ] {
+            let (code, message) = refused(bad);
+            assert_eq!(code, DEREC_CODE_FFI_BAD_PROTO, "{bad}: {message}");
+            assert!(message.contains("secret_id"), "{bad}: {message}");
+        }
+        let (code, _) = refused("not json");
+        assert_eq!(code, DEREC_CODE_FFI_BAD_PROTO);
+        let (code, _) = refused(r#"["secret_id"]"#);
+        assert_eq!(code, DEREC_CODE_FFI_BAD_PROTO);
+    }
+
+    /// A key the canonical config does not define is refused, at the top
+    /// level and inside nested objects, instead of being ignored.
+    #[test]
+    fn unknown_keys_are_refused() {
+        for bad in [
+            r#"{"secret_id": "1", "own_transport_uri": "", "own_transport_protocol": 1}"#,
+            r#"{"secret_id": "1", "treshold": 3}"#,
+            r#"{"secret_id": "1", "timeouts": {"sharing_round": 30}}"#,
+            r#"{"secret_id": "1", "auto_accept": {"pair": true}}"#,
+            r#"{"secret_id": "1", "own_transports": [{"uri": "https://a.example", "protocol": "https", "weight": 1}]}"#,
+        ] {
+            let (code, message) = refused(bad);
+            assert_eq!(code, DEREC_CODE_FFI_BAD_PROTO, "{bad}: {message}");
+            assert!(message.contains("unknown field"), "{bad}: {message}");
+        }
+    }
+
+    /// `unpair_ack` takes the discriminant or the binding-facing name; any
+    /// other code or name is refused as an invalid enum value.
+    #[test]
+    fn unpair_ack_accepts_code_or_name_and_refuses_the_rest() {
+        let ack = |value: &str| {
+            parsed(&format!(r#"{{"secret_id": "1", "unpair_ack": {value}}}"#)).unpair_ack
         };
-        assert_eq!(policy, expected);
+        assert_eq!(ack("0"), Some(UnpairAck::Required));
+        assert_eq!(ack("1"), Some(UnpairAck::NotRequired));
+        assert_eq!(ack(r#""required""#), Some(UnpairAck::Required));
+        assert_eq!(ack(r#""not_required""#), Some(UnpairAck::NotRequired));
+        assert_eq!(ack("null"), None);
+        for bad in ["2", "-1", r#""Required""#, r#""notrequired""#] {
+            let (code, message) = refused(&format!(r#"{{"secret_id": "1", "unpair_ack": {bad}}}"#));
+            assert_eq!(code, DEREC_CODE_FFI_INVALID_ENUM, "{bad}: {message}");
+            assert!(message.contains("invalid unpair_ack"), "{bad}: {message}");
+        }
+        let (code, _) = refused(r#"{"secret_id": "1", "unpair_ack": true}"#);
+        assert_eq!(code, DEREC_CODE_FFI_BAD_PROTO);
+    }
 
-        let empty = config_with(r#", "auto_accept": {}"#);
-        assert_eq!(
-            crate::protocol::AutoAcceptPolicy::from(empty.auto_accept),
-            crate::protocol::AutoAcceptPolicy::default()
+    /// An own transport's `protocol` is its name or a known discriminant. An
+    /// unknown discriminant is an invalid transport; an unknown name does not
+    /// parse.
+    #[test]
+    fn own_transport_protocols_take_a_name_or_a_known_discriminant() {
+        let config = parsed(
+            r#"{"secret_id": "1", "own_transports": [
+                {"uri": "https://a.example/derec", "protocol": 0},
+                {"uri": "grpcs://a.example:443", "protocol": "GRPC"}
+            ]}"#,
         );
+        let transports = config.own_transports.expect("set");
+        assert_eq!(transports[0].protocol, derec_proto::Protocol::Https);
+        assert_eq!(transports[1].protocol, derec_proto::Protocol::Grpc);
+
+        let (code, message) = refused(
+            r#"{"secret_id": "1", "own_transports": [{"uri": "https://a.example", "protocol": 99}]}"#,
+        );
+        assert_eq!(code, DEREC_CODE_TRANSPORT_INVALID, "{message}");
+
+        let (code, message) = refused(
+            r#"{"secret_id": "1", "own_transports": [{"uri": "https://a.example", "protocol": "smtp"}]}"#,
+        );
+        assert_eq!(code, DEREC_CODE_FFI_BAD_PROTO, "{message}");
+    }
+
+    /// The `u64` settings are decimal strings; anything else does not parse.
+    #[test]
+    fn u64_settings_are_decimal_strings() {
+        let config = parsed(
+            r#"{"secret_id": "1", "max_subshares": "18446744073709551615", "replica_id": "9007199254740993"}"#,
+        );
+        assert_eq!(config.max_subshares, Some(u64::MAX));
+        assert_eq!(config.replica_id, Some(9_007_199_254_740_993));
+        let config = parsed(r#"{"secret_id": "1", "max_subshares": null, "replica_id": null}"#);
+        assert_eq!(config.max_subshares, None);
+        assert_eq!(config.replica_id, None);
+        for bad in [
+            r#"{"secret_id": "1", "max_subshares": "12x"}"#,
+            r#"{"secret_id": "1", "max_subshares": 12}"#,
+            r#"{"secret_id": "1", "replica_id": "12x"}"#,
+            r#"{"secret_id": "1", "replica_id": 5}"#,
+        ] {
+            let (code, message) = refused(bad);
+            assert_eq!(code, DEREC_CODE_FFI_BAD_PROTO, "{bad}: {message}");
+        }
     }
 
     /// Parameter-range bounds keep full `i64` precision when written as
     /// decimal strings, still accept JSON numbers, and default to `0`.
     #[test]
     fn parameter_range_accepts_decimal_strings_and_numbers() {
-        let config = config_with(
-            r#", "parameter_range": {
+        let config = parsed(
+            r#"{"secret_id": "1", "parameter_range": {
                 "min_share_size": "9007199254740993",
                 "max_share_size": 4096,
                 "max_unresponsive_deactivation_timeout": "-9223372036854775808"
-            }"#,
+            }}"#,
         );
-        let range = derec_proto::ParameterRange::from(
-            config.parameter_range.as_ref().expect("range present"),
-        );
+        let range = config.parameter_range.expect("range present");
         assert_eq!(range.min_share_size, 9_007_199_254_740_993);
         assert_eq!(range.max_share_size, 4096);
         assert_eq!(range.max_unresponsive_deactivation_timeout, i64::MIN);
         assert_eq!(range.min_time_between_verifications, 0);
 
-        let bad = serde_json::from_str::<ProtocolConfig>(
-            r#"{
-                "secret_id": "1",
-                "own_transport_uri": "",
-                "own_transport_protocol": 1,
-                "parameter_range": { "min_share_size": "12x" }
-            }"#,
-        );
-        assert!(bad.is_err());
+        let (code, _) =
+            refused(r#"{"secret_id": "1", "parameter_range": {"min_share_size": "12x"}}"#);
+        assert_eq!(code, DEREC_CODE_FFI_BAD_PROTO);
     }
 
     /// `communication_info` in the config JSON is used as-is, the proto
@@ -931,7 +707,7 @@ mod tests {
     /// is rejected.
     #[test]
     fn communication_info_comes_from_exactly_one_source() {
-        let config = config_with(r#", "communication_info": { "name": "alice" }"#);
+        let config = parsed(r#"{"secret_id": "1", "communication_info": {"name": "alice"}}"#);
         let from_json =
             unsafe { resolve_communication_info(config.communication_info, std::ptr::null(), 0) }
                 .unwrap_or_else(|e| panic!("json map refused: {}", e.code));
@@ -951,8 +727,128 @@ mod tests {
         let both = unsafe {
             resolve_communication_info(Some(HashMap::new()), proto.as_ptr(), proto.len())
         };
-        let mut err = both.expect_err("both sources rejected");
-        assert_eq!(err.code, DEREC_CODE_FFI_BAD_PROTO);
-        unsafe { crate::interop::ffi::error::derec_free_error(&mut err) };
+        let (code, _) = take(both.expect_err("both sources rejected"));
+        assert_eq!(code, DEREC_CODE_FFI_BAD_PROTO);
+    }
+
+    type InMemProtocol = crate::protocol::DeRecProtocol<
+        crate::protocol::tests::InMemChannelStore,
+        crate::protocol::tests::InMemShareStore,
+        crate::protocol::tests::InMemSecretStore,
+        crate::protocol::tests::InMemUserSecretStore,
+        crate::protocol::tests::InMemStateStore,
+        crate::protocol::tests::NoopTransport,
+    >;
+
+    /// Builds through the same path as [`derec_protocol_new`], with the
+    /// in-memory store doubles in place of the host's callback tables.
+    fn build_from(json: &str) -> crate::Result<InMemProtocol> {
+        use crate::protocol::tests::{
+            InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+            InMemUserSecretStore, NoopTransport,
+        };
+        let (secret_id, config) = parse(json).unwrap_or_else(|(c, m)| panic!("{c}: {m}"));
+        DeRecProtocolBuilder::new(secret_id)
+            .with_channel_store(InMemChannelStore::default())
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(InMemSecretStore::default())
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_state_store(InMemStateStore)
+            .with_transport(NoopTransport)
+            .with_config(config)
+            .build()
+    }
+
+    /// A JSON config naming every field builds, and each field lands on the
+    /// resulting protocol with the value the JSON gave it.
+    #[test]
+    fn a_full_json_config_builds_with_every_field_applied() {
+        let protocol = build_from(
+            r#"{
+                "secret_id": "12345678901234567890",
+                "own_transports": [{ "uri": "https://example.com/derec", "protocol": "https" }],
+                "threshold": 3,
+                "auto_respond_on_failure": false,
+                "unpair_ack": 0,
+                "auto_reply_to": false,
+                "auto_accept": {
+                    "pairing": false, "pre_pair": false, "store_share": false,
+                    "verify_share": false, "discovery": false, "get_share": false,
+                    "unpair": false, "update_channel_info": false
+                },
+                "timeouts": {
+                    "inbound_message_secs": 300,
+                    "sharing_round_secs": 60,
+                    "unpair_ack_secs": 60,
+                    "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
+                },
+                "unsafe_connection": false,
+                "replica_id": null,
+                "parameter_range": {
+                    "min_share_size": 0, "max_share_size": 0,
+                    "min_time_between_verifications": 0, "max_time_between_verifications": 0,
+                    "min_time_between_share_updates": 0, "max_time_between_share_updates": 0,
+                    "min_unresponsive_deletion_timeout": 0, "max_unresponsive_deletion_timeout": 0,
+                    "min_unresponsive_deactivation_timeout": 0,
+                    "max_unresponsive_deactivation_timeout": 0
+                },
+                "max_subshares": null
+            }"#,
+        )
+        .expect("documented config builds");
+        assert_eq!(protocol.secret_id(), 12_345_678_901_234_567_890);
+        assert_eq!(protocol.replica_id, None);
+        assert_eq!(protocol.max_subshares, None);
+        assert_eq!(
+            protocol.own_transports[0].uri,
+            "https://example.com/derec".to_owned()
+        );
+    }
+
+    /// A config with no own transports is refused when the protocol is
+    /// built, as before.
+    #[test]
+    fn a_config_without_own_transports_does_not_build() {
+        match build_from(r#"{"secret_id": "1"}"#) {
+            Err(crate::Error::InvalidInput(message)) => {
+                assert!(message.contains("own transports"), "{message}")
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("a config without own transports must not build"),
+        }
+    }
+
+    /// An own transport whose URI fails validation is refused at build with
+    /// the transport error the FFI reports as `DEREC_CODE_TRANSPORT_INVALID`.
+    #[test]
+    fn an_invalid_own_transport_uri_is_a_transport_error() {
+        let err = match build_from(
+            r#"{"secret_id": "1", "own_transports": [{"uri": "not a uri", "protocol": "https"}]}"#,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("an invalid URI must not build"),
+        };
+        let (code, _) = take(crate::interop::ffi::error::from_lib_error(err));
+        assert_eq!(code, DEREC_CODE_TRANSPORT_INVALID);
+    }
+
+    /// Both configs of the shared fixture every SDK loads build through the
+    /// FFI path once a `secret_id` is added.
+    #[test]
+    fn the_shared_fixture_configs_build() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../tests/fixtures/protocol_config.json"
+        ))
+        .expect("fixture is JSON");
+        for name in ["full", "minimal"] {
+            let mut config = fixture[name].clone();
+            config
+                .as_object_mut()
+                .expect("config is an object")
+                .insert("secret_id".to_owned(), "7".into());
+            let protocol = build_from(&config.to_string())
+                .unwrap_or_else(|e| panic!("`{name}` fixture does not build: {e:?}"));
+            assert_eq!(protocol.secret_id(), 7);
+        }
     }
 }

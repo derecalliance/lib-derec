@@ -226,3 +226,16 @@ pub async fn snapshot_version(client: &SharedClient, secret_id: u64) -> Option<u
         .expect("snapshot_version failed")
         .map(|r| r.get::<_, i64>(0) as u32)
 }
+
+/// The `threshold` column of the snapshot row: `None` when there is no row
+/// or the column is NULL.
+pub async fn snapshot_threshold(client: &SharedClient, secret_id: u64) -> Option<i64> {
+    client
+        .query_opt(
+            "SELECT threshold FROM user_secrets WHERE secret_id = $1",
+            &[&u64_to_sql(secret_id)],
+        )
+        .await
+        .expect("snapshot_threshold failed")
+        .and_then(|r| r.get::<_, Option<i64>>(0))
+}

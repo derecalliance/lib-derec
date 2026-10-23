@@ -301,3 +301,54 @@ describe('NoKeys pre-pair and fingerprint', () => {
     expect(find('pairing_fingerprint').args).toEqual([key]);
   });
 });
+
+describe('sharing.request.split', () => {
+  // decodeCommittedShareEntries reads a leading u32 count; a four zero-byte
+  // reply is an empty, well-formed committed-share map.
+  beforeEach(() => {
+    replies.protect_secret = new Uint8Array([0, 0, 0, 0]).buffer;
+  });
+
+  it('marshals weighted channels into aligned id and weight arrays', () => {
+    primitives.sharing.request.split(
+      [
+        [1n, 2],
+        [2n, 3],
+      ],
+      5n,
+      1,
+      new Uint8Array([9]),
+      2,
+    );
+    const { args } = find('protect_secret');
+    expect(args).toHaveLength(6);
+    expect(args[0]).toBe(5n);
+    expect(args[2]).toEqual([1n, 2n]);
+    expect(args[3]).toEqual([2, 3]);
+    expect(args[4]).toBe(2);
+    expect(args[5]).toBe(1);
+  });
+
+  it('marshals a single unweighted channel', () => {
+    primitives.sharing.request.split([[1n, 1]], 5n, 1, new Uint8Array([9]), 1);
+    const { args } = find('protect_secret');
+    expect(args[2]).toEqual([1n]);
+    expect(args[3]).toEqual([1]);
+  });
+
+  it('marshals string channel ids to the same payload as bigint ids', () => {
+    primitives.sharing.request.split(
+      [
+        ['1', 2],
+        ['2', 3],
+      ],
+      5n,
+      1,
+      new Uint8Array([9]),
+      2,
+    );
+    const { args } = find('protect_secret');
+    expect(args[2]).toEqual([1n, 2n]);
+    expect(args[3]).toEqual([2, 3]);
+  });
+});

@@ -43,7 +43,8 @@
           ],
           "communication_info": {
             "foo": "bar"
-          }
+          },
+          "weight": 1
         },
         {
           "channel_id": "22",
@@ -81,7 +82,8 @@
             2,
             1,
             0
-          ]
+          ],
+          "weight": 2
         }
       ],
       "secrets": [
@@ -164,7 +166,8 @@
           1,
           0
         ]
-      }
+      },
+      "threshold": 3
     }
   },
   "protect_secret": {
@@ -220,5 +223,115 @@
       }
     ],
     "description": "capture description"
+  },
+  "protect_secret_threshold": {
+    "secrets": [
+      {
+        "id": [
+          1
+        ],
+        "name": "wallet",
+        "data": [
+          99,
+          111,
+          114,
+          114,
+          101,
+          99,
+          116,
+          32,
+          104,
+          111,
+          114,
+          115,
+          101,
+          32,
+          98,
+          97,
+          116,
+          116,
+          101,
+          114,
+          121,
+          32,
+          115,
+          116,
+          97,
+          112,
+          108,
+          101
+        ]
+      },
+      {
+        "id": [
+          2,
+          3
+        ],
+        "name": "seed",
+        "data": [
+          222,
+          173,
+          190,
+          239
+        ]
+      }
+    ],
+    "description": "capture description",
+    "threshold": 3
+  },
+  "protect_secret_weighted": {
+    "secrets": [
+      {
+        "id": [
+          1
+        ],
+        "name": "wallet",
+        "data": [
+          99,
+          111,
+          114,
+          114,
+          101,
+          99,
+          116,
+          32,
+          104,
+          111,
+          114,
+          115,
+          101,
+          32,
+          98,
+          97,
+          116,
+          116,
+          101,
+          114,
+          121,
+          32,
+          115,
+          116,
+          97,
+          112,
+          108,
+          101
+        ]
+      },
+      {
+        "id": [
+          2,
+          3
+        ],
+        "name": "seed",
+        "data": [
+          222,
+          173,
+          190,
+          239
+        ]
+      }
+    ],
+    "description": "capture description",
+    "weights": {"7": 2, "12": 3}
   }
 }

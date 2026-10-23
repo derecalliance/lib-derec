@@ -177,6 +177,24 @@ public static class DeRecCode
     public const int EmptySecretData = 63;
     public const int VssShareFailed = 64;
 
+    /// <summary>
+    /// A weight given to <c>start(ProtectSecret)</c> or
+    /// <c>Sharing.Request.Split</c> is invalid: every weight must satisfy
+    /// <c>1 &lt;= weight &lt; threshold</c> and name a channel the secret is
+    /// being shared with. <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Sharing"/>.
+    /// </summary>
+    public const int InvalidWeight = 65;
+
+    /// <summary>
+    /// A sharing round's weights total more subshares than the cap set with
+    /// <c>DeRecProtocolBuilder.WithMaxSubshares</c>. Raised by
+    /// <c>start(ProtectSecret)</c> before anything is sent.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Sharing"/>.
+    /// </summary>
+    public const int TooManySubshares = 66;
+
     public const int EmptyResponses = 80;
     public const int EmptyCommittedDeRecShare = 81;
     public const int DecodeCommittedDeRecShare = 82;

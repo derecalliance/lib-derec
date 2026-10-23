@@ -84,7 +84,12 @@ impl<
             DeRecFlow::ProtectSecret {
                 secrets,
                 description,
-            } => self.start_protect_secret(secrets, description, round).await,
+                weights,
+                threshold,
+            } => {
+                self.start_protect_secret(secrets, description, Some(weights), threshold, round)
+                    .await
+            }
             DeRecFlow::VerifyShares {
                 secret_id,
                 version,
@@ -137,25 +142,68 @@ impl<
     /// application, which shows it to the user, or asks them, before calling
     /// `restore`. Only `restore` commits it to this device.
     ///
+    /// # Restore or join
+    ///
+    /// When [`Secret::replicas`](crate::protocol::types::Secret::replicas)
+    /// names a group that still has live members, `restore` is the wrong
+    /// path: offer the user to join that group as a new replica instead. Pair
+    /// with a live member, confirm the fingerprint, then run
+    /// [`DeRecFlow::ReplicaDiscovery`]. With no live member left, restore is
+    /// the path.
+    ///
+    /// - Neither path gives this device the proofs of earlier versions. A
+    ///   restore writes none, and a joining device gets only the share map of
+    ///   the one version each push or catch-up carries, so it can verify that
+    ///   version and the ones it receives later. The live members keep the
+    ///   proofs they hold.
+    /// - A restored device cannot take part in the group by itself: it cannot
+    ///   publish, or answer a member's catch-up, until the application
+    ///   configures a `replica_id` the roster names (see *Verification needs
+    ///   one publish first*).
+    /// - Joining keeps the group consistent: the device enters it as a new
+    ///   member. Restoring next to live replicas, and then taking the lost
+    ///   device's `replica_id`, makes a second device claim that member's
+    ///   role.
+    ///
+    /// See
+    /// [Restore or join](https://derec-alliance.gitbook.io/docs/concepts/replicas/restore-or-join).
+    ///
     /// # Caller flow
     ///
+    /// Call `restore` on the same `DeRecProtocol` instance that ran
+    /// recovery — it is the one holding the recovery-mode channels this
+    /// call unpairs:
+    ///
     /// ```text
-    /// fresh DeRecProtocol → empty stores
-    ///   → re-pair with helpers on a fresh channel-id namespace
+    /// re-pair with helpers on a fresh channel-id namespace
     ///   → start(RecoverSecret { secret_id, version })
     ///   → SecretRecovered { secret } event arrives
     ///   → DeRecProtocol::restore(&secret, version)
     /// ```
     ///
+    /// What `restore` actually requires is a `secret_id` namespace with
+    /// no user-secret snapshot and no channels at the roster ids it is
+    /// about to write — i.e. a device that lost its state, not
+    /// necessarily a newly-constructed value. See the precondition
+    /// errors below for exactly what is checked.
+    ///
     /// On success: canonical helper channels are persisted with their
     /// `SharedKey`; canonical replica channels are persisted
     /// with the group key from `secret.replicas.shared_key`;
-    /// the user-secret snapshot is committed at `recovered_version`;
+    /// the user-secret snapshot is committed at `recovered_version`
+    /// with the roster's threshold
+    /// ([`Secret::threshold`](crate::protocol::types::Secret::threshold));
     /// every channel under `self.secret_id` at no roster id (i.e. the
-    /// recovery-mode channels) is unpaired (request sent to the helper,
-    /// local state dropped). The protocol resumes normal operation
-    /// immediately — the next `start(ProtectSecret)` publishes
-    /// `recovered_version + 1` to the restored helpers.
+    /// recovery-mode channels) is unpaired as `start(`[`DeRecFlow::Unpair`]`)`
+    /// would, under the configured
+    /// [`with_unpair_ack`](crate::protocol::DeRecProtocolBuilder::with_unpair_ack):
+    /// the returned events carry an `UnpairStarted` per channel, and under
+    /// `UnpairAck::Required` its `Unpaired` arrives later, from `process`
+    /// on the helper's answer or from the timeout sweep. The protocol
+    /// resumes normal operation immediately — the next
+    /// `start(ProtectSecret)` publishes `recovered_version + 1` to the
+    /// restored helpers only, since a channel still being unpaired is
+    /// never a publish target.
     ///
     /// A helper or replica member whose `transports` is empty gets no
     /// channel — there would be nothing to send to. It is reported as
@@ -172,13 +220,37 @@ impl<
     ///
     /// No owner-side tracking share is written, so
     /// `start(`[`DeRecFlow::VerifyShares`]`)` at `recovered_version`
-    /// fails with [`crate::Error::InvalidInput`]: a `VerifyShare` proof
+    /// sends no challenge and reports each channel as
+    /// [`DeRecEvent::VerifySharesFailed`]
+    /// with [`VerifyFailureReason::NoProof`](crate::protocol::VerifyFailureReason::NoProof):
+    /// a `VerifyShare` proof
     /// is `SHA-384(share ‖ nonce)` over the exact bytes a Helper holds,
     /// and recovery cannot attribute a collected share to a canonical
     /// Helper channel, so this device has no reference bytes for that
     /// version. Run `start(`[`DeRecFlow::ProtectSecret`]`)` once —
     /// it publishes `recovered_version + 1` and writes the tracking
     /// shares that make verification work from then on.
+    ///
+    /// Pass that publish the stored weights unchanged: restore has written
+    /// each Helper's roster weight into its
+    /// [`HelperChannel::weight`](crate::protocol::types::HelperChannel::weight),
+    /// and the map replaces every stored weight, so a Helper left out
+    /// returns to `1`.
+    ///
+    /// Restore puts the threshold back too: it writes the roster's `t` into
+    /// [`UserSecrets::threshold`](crate::protocol::types::UserSecrets::threshold),
+    /// and every later publish splits at it, whatever the builder's
+    /// [`with_threshold`](crate::protocol::DeRecProtocolBuilder::with_threshold)
+    /// says. Pass no `threshold` on the follow-up publish to keep it; to
+    /// change it, pass `threshold` on `start(`[`DeRecFlow::ProtectSecret`]`)`.
+    /// A roster written before the threshold was recorded carries none, and
+    /// the builder's threshold applies.
+    ///
+    /// If the restored weights do not reach the threshold —
+    /// a roster recovered mid-reconfiguration, for instance — that publish
+    /// still advances the version and records the restored snapshot as
+    /// latest, without sending any Helper a share; see
+    /// [`DeRecFlow::ProtectSecret`] for that case.
     ///
     /// When `secret.replicas` carries a group, that publish additionally
     /// requires a configured `replica_id` the roster names: restore
@@ -198,9 +270,9 @@ impl<
     ///   at the helper / replica ids restore is about to write.
     /// - [`RestoreError::Invariant`](crate::protocol::RestoreError::Invariant) when the recovered `Secret`
     ///   is internally inconsistent (e.g. non-empty `replicas` with
-    ///   empty `replicas.shared_key`, or a helper key that is not 32
-    ///   bytes). Every roster entry is checked, including one skipped for
-    ///   having no endpoint.
+    ///   empty `replicas.shared_key`, a helper key that is not 32
+    ///   bytes, or a threshold below `2`). Every roster entry is checked,
+    ///   including one skipped for having no endpoint.
     ///
     /// Store I/O failures mid-restore propagate as the underlying
     /// [`crate::Error::ChannelStore`] or [`crate::Error::SecretStore`]
@@ -218,6 +290,7 @@ impl<
             &local!(self),
             secret,
             recovered_version,
+            self.unpair_ack,
         )
         .await
     }
@@ -227,15 +300,35 @@ impl<
     /// embedded, and fan both out. A no-op (silent return) when no paired
     /// Helpers or Replicas exist.
     ///
+    /// Below `threshold`, the split is skipped and no event is returned for
+    /// any Helper; paired Replicas, if any, still get a secret-only
+    /// composite and their usual events. With no Replicas paired either,
+    /// this returns `Ok` with an empty vec — the version still advanced and
+    /// the snapshot is saved, so the omission is silent on purpose, not a
+    /// dropped round.
+    ///
     /// Only targets whose dispatch succeeded join the round's pending set: a
     /// peer that could not be reached will never answer, so counting it would
     /// hold the round open until its timeout. Such a peer is reported once
     /// here, where the transport error is still in hand, and settles as
     /// `behind`.
+    ///
+    /// `weights` is the full assignment for an explicit
+    /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret):
+    /// every paired Helper it does not name gets `1`. Publishes the library
+    /// starts on its own pass `None`, which reuses each Helper's stored
+    /// weight. Each Helper's dispatch event reports the weight it was given.
+    ///
+    /// `threshold` is the explicit threshold of a
+    /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret).
+    /// Publishes the library starts on its own pass `None`, which reuses the
+    /// stored threshold, or the builder's when none is stored.
     pub(super) async fn start_protect_secret(
         &mut self,
         secrets: Vec<crate::protocol::types::UserSecret>,
         description: Option<String>,
+        weights: Option<HashMap<ChannelId, u32>>,
+        threshold: Option<u32>,
         round: &Round<'_>,
     ) -> Result<Vec<DeRecEvent>> {
         let Some(result) = handlers::sharing::start(
@@ -243,7 +336,10 @@ impl<
             &local!(self),
             secrets,
             description,
+            weights.as_ref(),
+            threshold,
             self.threshold,
+            self.max_subshares,
             round,
         )
         .await?
@@ -293,6 +389,8 @@ impl<
                         synced_replicas: HashSet::new(),
                         behind_replicas,
                         started_at: now_secs(),
+                        keep_list: result.keep_list.clone(),
+                        threshold: result.threshold,
                     })),
                 )
                 .await?;
@@ -301,17 +399,22 @@ impl<
         let mut started: Vec<DeRecEvent> = result
             .outcomes
             .into_iter()
-            .map(|(channel_id, res)| match res {
-                Ok(()) => DeRecEvent::ProtectSecretStarted {
-                    channel_id,
-                    version,
-                    trace_id: round.trace_id,
-                },
-                Err(e) => DeRecEvent::ProtectSecretFailed {
-                    channel_id,
-                    version,
-                    error: e.to_string(),
-                },
+            .map(|(channel_id, res)| {
+                let weight = result.weights.get(&channel_id).copied().unwrap_or(1);
+                match res {
+                    Ok(()) => DeRecEvent::ProtectSecretStarted {
+                        channel_id,
+                        version,
+                        trace_id: round.trace_id,
+                        weight,
+                    },
+                    Err(e) => DeRecEvent::ProtectSecretFailed {
+                        channel_id,
+                        version,
+                        error: e.to_string(),
+                        weight,
+                    },
+                }
             })
             .collect();
         started.append(&mut undeliverable);
@@ -422,8 +525,8 @@ impl<
 
     /// Emits `UnpairStarted`. When the channel needs no acknowledgement the
     /// handler returns `Unpaired` immediately, interleaved after it; otherwise
-    /// `Unpaired` arrives later, from [`process`](Self::process) on the
-    /// response or from the timeout sweep.
+    /// the channel is `Unpairing` and `Unpaired` arrives later, from
+    /// [`process`](Self::process) on the response or from the timeout sweep.
     async fn start_unpair(
         &mut self,
         channel_id: ChannelId,
@@ -437,23 +540,16 @@ impl<
                 derec_proto::SenderKind::Helper,
             )
             .await?;
-        let mut events = vec![DeRecEvent::UnpairStarted {
+        handlers::unpairing::start(
+            &mut borrow_stores!(self),
+            &local!(self),
             channel_id,
-            trace_id: round.trace_id,
-        }];
-        events.extend(
-            handlers::unpairing::start(
-                &mut borrow_stores!(self),
-                &local!(self),
-                channel_id,
-                memo,
-                self.unpair_ack,
-                now_secs(),
-                round,
-            )
-            .await?,
-        );
-        Ok(events)
+            memo,
+            self.unpair_ack,
+            now_secs(),
+            round,
+        )
+        .await
     }
 
     async fn start_update_channel_info(
@@ -479,12 +575,12 @@ impl<
 mod tests {
     use super::*;
     use crate::protocol::builder::DeRecProtocolBuilder;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, StoreRig, run_async,
     };
     use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, SecretValue};
-    use crate::protocol::{DeRecChannelStore, DeRecSecretStore};
+    use crate::protocol::{DeRecChannelStore, DeRecSecretStore, DeRecShareStore};
 
     const SECRET_ID: u64 = 0x7E57;
 
@@ -508,6 +604,7 @@ mod tests {
                     peer_role: derec_proto::SenderKind::Helper,
                     status: ChannelStatus::Paired,
                     created_at: 0,
+                    weight: 1,
                 }),
             )
             .await
@@ -652,14 +749,31 @@ mod tests {
                         peer_role: derec_proto::SenderKind::Helper,
                         status: ChannelStatus::Pending,
                         created_at: 0,
+                        weight: 1,
                     }),
                 )
                 .await
                 .expect("seed pending helper");
 
+            let mut shares = InMemShareStore::default();
+            shares
+                .save(
+                    SECRET_ID,
+                    ChannelId(11),
+                    crate::protocol::types::Share {
+                        secret_id: SECRET_ID,
+                        version: 1,
+                        bytes: vec![0x11; 8],
+                        subshares: None,
+                        threshold: None,
+                    },
+                )
+                .await
+                .expect("seed the proof VerifyShares checks the answer against");
+
             let mut protocol = DeRecProtocolBuilder::new(SECRET_ID)
                 .with_channel_store(channels)
-                .with_share_store(InMemShareStore::default())
+                .with_share_store(shares)
                 .with_secret_store(secrets)
                 .with_user_secret_store(InMemUserSecretStore::default())
                 .with_state_store(InMemPersistedStateStore::default())
@@ -771,7 +885,7 @@ mod tests {
 /// regression net for the attribute itself.
 #[cfg(all(test, feature = "logging"))]
 mod trace_id_span_tests {
-    use crate::protocol::test::{StoreRig, run_async};
+    use crate::protocol::tests::{StoreRig, run_async};
     use std::io;
     use std::sync::{Arc, Mutex};
 
@@ -813,7 +927,7 @@ mod trace_id_span_tests {
         tracing::subscriber::with_default(subscriber, || {
             run_async(async {
                 let mut rig = StoreRig::new();
-                let lf = crate::protocol::test::LocalFixture::with_replica(0x5EC, 1001);
+                let lf = crate::protocol::tests::LocalFixture::with_replica(0x5EC, 1001);
                 // No peers, so the flow returns immediately — the span is
                 // still entered, which is all this asserts.
                 let _ = super::super::handlers::replicas::discovery::start(
@@ -851,9 +965,9 @@ mod trace_id_span_tests {
                 let rig = StoreRig::new();
                 let mut protocol = crate::protocol::builder::DeRecProtocolBuilder::new(0x5EC)
                     .with_channel_store(rig.channels.clone())
-                    .with_share_store(crate::protocol::test::InMemShareStore::default())
+                    .with_share_store(crate::protocol::tests::InMemShareStore::default())
                     .with_secret_store(rig.secrets.clone())
-                    .with_user_secret_store(crate::protocol::test::InMemUserSecretStore::default())
+                    .with_user_secret_store(crate::protocol::tests::InMemUserSecretStore::default())
                     .with_state_store(rig.state.clone())
                     .with_transport(rig.transport.clone())
                     .with_own_transports(["https://owner.example"])

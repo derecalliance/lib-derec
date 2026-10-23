@@ -23,5 +23,5 @@ pub enum DeRecMessageBuilderError {
     Encryption(#[from] derec_cryptography::channel::DerecChannelError),
 
     #[error(transparent)]
-    PairingEncryption(#[from] derec_cryptography::pairing::envelope::DerecEncryptionError),
+    PairingEncryption(#[from] derec_cryptography::pairing::DerecEncryptionError),
 }

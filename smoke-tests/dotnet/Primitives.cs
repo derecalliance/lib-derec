@@ -8,6 +8,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using DeRec.Library;
 using DeRec.Library.Primitives;
 using Proto = Org.Derecalliance.Derec.Protobuf;
@@ -25,6 +26,7 @@ internal static class Primitives
         RunPairingFlowHashedKeysTest();
         RunPairingFlowNoKeysTest();
         RunSharingFlowTest();
+        RunWeightedSharingSplitTest();
         RunVerificationFlowTest();
         RunRecoveryFlowTest();
         RunDiscoveryFlowTest();
@@ -564,8 +566,9 @@ internal static class Primitives
         ulong[] channelIds = new ulong[] { 1, 2, 3 };
         ulong threshold = 2;
         uint version = 1;
+        var channels = Array.ConvertAll(channelIds, id => new Sharing.WeightedChannel(id, 1));
 
-        var splitResult = Sharing.Request.Split(secretId, secretData, channelIds, threshold, version);
+        var splitResult = Sharing.Request.Split(secretId, secretData, channels, threshold, version);
         var shares = splitResult.DeserializeShares();
 
         if (shares.Count != channelIds.Length)
@@ -647,6 +650,50 @@ internal static class Primitives
         Console.WriteLine("Sharing flow test passed.");
     }
 
+    /// <summary>
+    /// A channel listed in <c>Split</c>'s <c>channels</c> with weight 2 gets
+    /// that many subshares in its committed share; a channel with weight 1
+    /// gets exactly one. Channel 3 sorts last among the inputs, which
+    /// exercises weight assignment by channel ID rather than slice position.
+    /// </summary>
+    private static void RunWeightedSharingSplitTest()
+    {
+        Console.WriteLine("=== Weighted sharing split test ===");
+
+        ulong secretId = 1;
+        byte[] secretData = Encoding.UTF8.GetBytes("super_secret_value");
+        ulong threshold = 3;
+        uint version = 1;
+        var channels = new[]
+        {
+            new Sharing.WeightedChannel(3UL, 2),
+            new Sharing.WeightedChannel(1UL, 1),
+            new Sharing.WeightedChannel(2UL, 1),
+        };
+
+        var shares = Sharing.Request.Split(secretId, secretData, channels, threshold, version)
+            .DeserializeShares();
+
+        static int SubshareCount(byte[] committedShareBytes)
+        {
+            var committed = Proto.CommittedDeRecShare.Parser.ParseFrom(committedShareBytes);
+            var inner = Proto.DeRecShare.Parser.ParseFrom(committed.DeRecShare.ToByteArray());
+            return inner.Subshares.Count;
+        }
+
+        var expectedSubshares = new Dictionary<ulong, int> { [3UL] = 2, [1UL] = 1, [2UL] = 1 };
+        foreach (var (channelId, expected) in expectedSubshares)
+        {
+            int actual = SubshareCount(shares[channelId]);
+            if (actual != expected)
+                throw new InvalidOperationException(
+                    $"channel {channelId} must hold {expected} subshare(s), got {actual}");
+        }
+        Console.WriteLine("  weighted channel holds 2 subshares, unweighted channels hold 1 each  ✓");
+
+        Console.WriteLine("Weighted sharing split test passed.");
+    }
+
     private static void RunVerificationFlowTest()
     {
         Console.WriteLine("=== Verification flow test ===");
@@ -659,7 +706,8 @@ internal static class Primitives
 
         var sharedKeys = CreateChannelSharedKeys(channels);
 
-        var shares = Sharing.Request.Split(secretId, secretData, channels, threshold, version)
+        var weightedChannels = Array.ConvertAll(channels, id => new Sharing.WeightedChannel(id, 1));
+        var shares = Sharing.Request.Split(secretId, secretData, weightedChannels, threshold, version)
             .DeserializeShares();
 
         ulong channel1 = 1;
@@ -722,7 +770,8 @@ internal static class Primitives
 
         var sharedKeys = CreateChannelSharedKeys(channels);
 
-        var shares = Sharing.Request.Split(secretId, secretData, channels, threshold, version)
+        var weightedChannels = Array.ConvertAll(channels, id => new Sharing.WeightedChannel(id, 1));
+        var shares = Sharing.Request.Split(secretId, secretData, weightedChannels, threshold, version)
             .DeserializeShares();
 
         ulong channel1 = 1;

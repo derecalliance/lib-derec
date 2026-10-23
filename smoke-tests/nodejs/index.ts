@@ -6,6 +6,7 @@
 // protocol tests (higher-level DeRecProtocol orchestrator).
 
 import { runChannelFilterConformance } from "./channelFilterConformance.js";
+import { runEventFixtureConformance } from "./eventFixture.js";
 import { runPrimitivesSmoke } from "./primitives.js";
 import { runProtocolSmoke } from "./protocol.js";
 import { runProtocolVersionSmoke } from "./protocolVersion.js";
@@ -15,6 +16,8 @@ console.log("║  DeRec Node.js Smoke Tests               ║");
 console.log("╚══════════════════════════════════════════╝\n");
 
 runChannelFilterConformance();
+
+runEventFixtureConformance();
 
 runProtocolVersionSmoke();
 

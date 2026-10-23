@@ -13,6 +13,7 @@
 //! application must satisfy as small as it was.
 
 use crate::protocol::{DeRecChannelStore, DeRecTransport};
+use crate::transport::TransportPolicy;
 use crate::{
     Error, Result,
     derec_message::{DeRecMessageBuilder, current_timestamp},
@@ -178,14 +179,26 @@ pub(crate) trait ChannelStoreExt: DeRecChannelStore {
     /// endpoints may belong to a different peer entirely (a replica talking
     /// to a helper paired with a sibling), so falling back to them would
     /// misroute rather than fail over.
+    ///
+    /// `reply_to` is peer-supplied and is filtered through `policy` first —
+    /// the same rule every other peer-supplied endpoint is held to. An entry
+    /// the policy refuses is dropped rather than used, and if nothing
+    /// survives, this falls back to the channel's recorded endpoints exactly
+    /// as it would had `reply_to` been empty: a `reply_to` offering only
+    /// refused endpoints has, for routing purposes, offered nothing. Without
+    /// this, a peer could steer a response — including the failure response
+    /// to its own refused request — to an endpoint this device's policy
+    /// exists to keep it off.
     async fn resolve_response_endpoints(
         &self,
         secret_id: u64,
         channel_id: ChannelId,
+        policy: TransportPolicy,
         reply_to: &[TransportProtocol],
     ) -> Result<Vec<TransportProtocol>> {
-        if !reply_to.is_empty() {
-            return Ok(reply_to.to_vec());
+        let allowed = filter_reply_to(policy, reply_to);
+        if !allowed.is_empty() {
+            return Ok(allowed);
         }
         self.peer_endpoints(secret_id, channel_id).await
     }
@@ -220,6 +233,28 @@ pub(crate) trait ChannelStoreExt: DeRecChannelStore {
 
 impl<T: DeRecChannelStore> ChannelStoreExt for T {}
 
+/// Narrow a peer-supplied `reply_to` to the entries `policy` accepts,
+/// preserving order.
+///
+/// `reply_to` is used immediately rather than recorded, but it is still
+/// peer-supplied input, so the rule is the same one
+/// [`TransportPolicy::admit_peer_endpoints`](crate::transport::TransportPolicy::admit_peer_endpoints)
+/// applies before an endpoint is stored: a refused entry is dropped, not
+/// used. Shared by [`ChannelStoreExt::resolve_response_endpoints`] and the
+/// replica-group answer paths, which address a [`ReplicaMember`] directly
+/// rather than through a channel query and so cannot route through that
+/// method.
+pub(crate) fn filter_reply_to(
+    policy: TransportPolicy,
+    reply_to: &[TransportProtocol],
+) -> Vec<TransportProtocol> {
+    reply_to
+        .iter()
+        .filter(|endpoint| policy.check_peer(endpoint).is_ok())
+        .cloned()
+        .collect()
+}
+
 /// Build and dispatch an encrypted channel-mode response envelope.
 ///
 /// `inbound_trace_id` is the `trace_id` read off the request envelope that
@@ -227,20 +262,37 @@ impl<T: DeRecChannelStore> ChannelStoreExt for T {}
 /// requester can correlate (see the field doc on `DeRecMessage.traceId`).
 /// Pass `0` when there is no inbound to echo from (e.g. unsolicited messages
 /// that don't carry a meaningful correlation handle).
+///
+/// The envelope and `body` are stamped with one timestamp, read here: the
+/// send time. Any timestamp `body` already carries is overwritten, so the
+/// receiver's envelope-vs-inner check holds.
+///
+/// `body` answers the request `obligation` stands for, with `status` and
+/// `memo`, the result `body` carries; it is
+/// sent through [`deliver`](crate::protocol::obligation::deliver), so a
+/// request is never answered twice.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &Ch,
     transport: &T,
     secret_id: u64,
     channel_id: ChannelId,
-    body: MessageBody,
+    mut body: MessageBody,
     shared_key: &SharedKey,
     inbound_trace_id: u64,
+    policy: TransportPolicy,
     reply_to: &[TransportProtocol],
+    obligation: Option<&crate::protocol::obligation::Obligation>,
+    status: derec_proto::StatusEnum,
+    memo: &str,
 ) -> Result<()> {
+    use crate::extensions::message_body::MessageBodyExt as _;
+
+    let timestamp = current_timestamp();
+    body.set_timestamp(timestamp);
     let envelope = DeRecMessageBuilder::channel()
         .channel_id(channel_id)
-        .timestamp(current_timestamp())
+        .timestamp(timestamp)
         .message_body(body)
         .trace_id(inbound_trace_id)
         .encrypt(shared_key)?
@@ -248,10 +300,10 @@ pub(crate) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
 
     let wire_bytes = envelope.encode_to_vec();
     let endpoint = channel_store
-        .resolve_response_endpoints(secret_id, channel_id, reply_to)
+        .resolve_response_endpoints(secret_id, channel_id, policy, reply_to)
         .await?;
-    transport.send(&endpoint, wire_bytes).await?;
-    Ok(())
+    crate::protocol::obligation::deliver(obligation, transport, &endpoint, wire_bytes, status, memo)
+        .await
 }
 
 /// Drop rows the store returned that the filter excluded.
@@ -288,7 +340,7 @@ fn retain_matching<T>(rows: Vec<T>, listing: &str, keep: impl Fn(&T) -> bool) ->
 #[cfg(test)]
 mod defiant_store_tests {
     use super::*;
-    use crate::protocol::test::{InMemChannelStore, run_async};
+    use crate::protocol::tests::{InMemChannelStore, run_async};
     use crate::protocol::traits::{ChannelStoreFuture, DeRecChannelStore};
     use crate::protocol::types::{
         ChannelQuery, ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole,
@@ -496,6 +548,184 @@ mod defiant_store_tests {
 
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].replica_id.0, 2);
+        });
+    }
+}
+
+#[cfg(test)]
+mod send_channel_message_tests {
+    use super::*;
+    use crate::extensions::derec_result::DeRecResultExt as _;
+    use crate::extensions::message_body::MessageBodyExt as _;
+    use crate::protocol::tests::{InMemChannelStore, RecordingTransport, run_async};
+    use crate::protocol::types::{ChannelRecord, HelperChannel};
+
+    const SECRET_ID: u64 = 0x5E4D;
+    const CHANNEL: ChannelId = ChannelId(77);
+    const KEY: SharedKey = [3u8; 32];
+
+    /// The body arrives here already carrying a timestamp of its own; the
+    /// envelope and the body must leave with one value, the send time.
+    #[test]
+    fn send_channel_message_stamps_envelope_and_body_with_one_timestamp() {
+        run_async(async {
+            let mut channels = InMemChannelStore::default();
+            channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Helper(HelperChannel {
+                        channel_id: CHANNEL,
+                        transports: vec![TransportProtocol {
+                            uri: "https://peer.example".to_owned(),
+                            protocol: derec_proto::Protocol::Https as i32,
+                        }],
+                        communication_info: std::collections::HashMap::new(),
+                        peer_role: SenderKind::Owner,
+                        status: ChannelStatus::Paired,
+                        created_at: 0,
+                        weight: 1,
+                    }),
+                )
+                .await
+                .expect("seed channel");
+            let transport = RecordingTransport::default();
+
+            let body = MessageBody::UpdateChannelInfoResponse(
+                derec_proto::UpdateChannelInfoResponseMessage {
+                    result: Some(derec_proto::DeRecResult::ok()),
+                    timestamp: Some(prost_types::Timestamp {
+                        seconds: 1,
+                        nanos: 0,
+                    }),
+                },
+            );
+
+            send_channel_message(
+                &channels,
+                &transport,
+                SECRET_ID,
+                CHANNEL,
+                body,
+                &KEY,
+                0,
+                TransportPolicy::new(false),
+                &[],
+                None,
+                derec_proto::StatusEnum::Ok,
+                "",
+            )
+            .await
+            .expect("send");
+
+            let sent = transport.sent_envelopes();
+            assert_eq!(sent.len(), 1);
+            let envelope = derec_proto::DeRecMessage::decode(sent[0].as_slice()).expect("decode");
+            let inner = crate::derec_message::extract_inner_message(&envelope.message, &KEY)
+                .expect("decrypt");
+            assert!(envelope.timestamp.is_some());
+            assert_eq!(envelope.timestamp.as_ref(), inner.timestamp());
+        });
+    }
+}
+
+/// A `reply_to` is peer-supplied, so [`ChannelStoreExt::resolve_response_endpoints`]
+/// must apply the same transport policy to it that every other peer-supplied
+/// endpoint is held to — including when it is standing in as the address for
+/// a courtesy failure response.
+#[cfg(test)]
+mod resolve_response_endpoints_tests {
+    use super::*;
+    use crate::protocol::tests::{InMemChannelStore, run_async};
+    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel};
+    use crate::transport::TransportPolicy;
+    use derec_proto::Protocol;
+
+    const SECRET_ID: u64 = 0x1234;
+    const CHANNEL: ChannelId = ChannelId(42);
+    const STRICT: TransportPolicy = TransportPolicy::new(false);
+
+    fn endpoint(uri: &str) -> TransportProtocol {
+        TransportProtocol {
+            uri: uri.to_owned(),
+            protocol: Protocol::Https as i32,
+        }
+    }
+
+    async fn seeded_store() -> InMemChannelStore {
+        let mut store = InMemChannelStore::default();
+        store
+            .save(
+                SECRET_ID,
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id: CHANNEL,
+                    transports: vec![endpoint("https://recorded.example")],
+                    communication_info: std::collections::HashMap::new(),
+                    peer_role: SenderKind::Owner,
+                    status: ChannelStatus::Paired,
+                    created_at: 0,
+                    weight: 1,
+                }),
+            )
+            .await
+            .expect("seed channel");
+        store
+    }
+
+    /// A refused entry is dropped; an allowed sibling in the same `reply_to`
+    /// still carries the response, and the recorded endpoint is never
+    /// consulted.
+    #[test]
+    fn mixed_reply_to_keeps_only_the_allowed_entries() {
+        run_async(async {
+            let store = seeded_store().await;
+            let reply_to = vec![
+                endpoint("http://peer.example"),
+                endpoint("https://peer.example"),
+            ];
+
+            let resolved = store
+                .resolve_response_endpoints(SECRET_ID, CHANNEL, STRICT, &reply_to)
+                .await
+                .expect("resolve");
+
+            assert_eq!(resolved, vec![endpoint("https://peer.example")]);
+        });
+    }
+
+    /// Every `reply_to` entry refused is the same as a `reply_to` that was
+    /// never supplied: the channel's recorded endpoints answer instead.
+    #[test]
+    fn all_refused_falls_back_to_recorded_endpoints() {
+        run_async(async {
+            let store = seeded_store().await;
+            let reply_to = vec![endpoint("http://peer.example")];
+
+            let resolved = store
+                .resolve_response_endpoints(SECRET_ID, CHANNEL, STRICT, &reply_to)
+                .await
+                .expect("resolve");
+
+            assert_eq!(resolved, vec![endpoint("https://recorded.example")]);
+        });
+    }
+
+    /// Every `reply_to` entry allowed is used as-is, matching the
+    /// unfiltered behaviour this policy-aware path must preserve.
+    #[test]
+    fn all_allowed_reply_to_is_used_unfiltered() {
+        run_async(async {
+            let store = seeded_store().await;
+            let reply_to = vec![
+                endpoint("https://peer-a.example"),
+                endpoint("https://peer-b.example"),
+            ];
+
+            let resolved = store
+                .resolve_response_endpoints(SECRET_ID, CHANNEL, STRICT, &reply_to)
+                .await
+                .expect("resolve");
+
+            assert_eq!(resolved, reply_to);
         });
     }
 }

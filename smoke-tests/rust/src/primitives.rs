@@ -312,7 +312,8 @@ fn run_sharing_flow_test() {
     let threshold = 2_usize;
     let version: u32 = 1;
 
-    let split_result = share_request::split(&channels, secret_id, version, secret_data, threshold)
+    let weighted: Vec<_> = channels.iter().map(|&c| (c, 1)).collect();
+    let split_result = share_request::split(&weighted, secret_id, version, secret_data, threshold)
         .expect("share_request::split failed");
 
     assert_eq!(
@@ -396,7 +397,8 @@ fn run_verification_flow_test() {
 
     let shared_keys = make_shared_keys(&channels);
 
-    let sharing = share_request::split(&channels, secret_id, version, secret_data, threshold)
+    let weighted: Vec<_> = channels.iter().map(|&c| (c, 1)).collect();
+    let sharing = share_request::split(&weighted, secret_id, version, secret_data, threshold)
         .expect("share_request::split failed");
 
     let channel_1 = ChannelId(1);
@@ -503,7 +505,8 @@ fn run_recovery_flow_test() {
 
     let shared_keys = make_shared_keys(&channels);
 
-    let sharing = share_request::split(&channels, secret_id, version, secret_data, threshold)
+    let weighted: Vec<_> = channels.iter().map(|&c| (c, 1)).collect();
+    let sharing = share_request::split(&weighted, secret_id, version, secret_data, threshold)
         .expect("share_request::split failed");
 
     let channel_1 = ChannelId(1);

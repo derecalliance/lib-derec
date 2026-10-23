@@ -140,6 +140,8 @@ _test-native: _packages
 	# file Go's build graph does not see, so a cached run can report a stale
 	# pass after the fixture changes underneath it.
 	cd $(ROOT)/packages/go && CGO_ENABLED=0 go test -count=1 ./...
+	$(call section,"Go binding smoke")
+	cd $(ROOT)/smoke-tests/go && CGO_ENABLED=0 go run .
 	$(call section,"C++ tests")
 	$(ROOT)/packages/react-native/cpp/tests/run_tests.sh
 	$(call section,".NET binding smoke")

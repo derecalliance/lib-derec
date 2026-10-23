@@ -34,8 +34,10 @@ wire, distribute a threshold-split secret, and prove possession of it:
 **Pairing fewer than `threshold` helpers stores nothing, and tells you
 nothing.** `start(ProtectSecret)` returns `Ok(())`, no helper is contacted,
 and no `ShareStored` or `ShareConfirmed` event ever arrives. The flow just
-does not happen. The library gates the split on `helpers.len() >=
-threshold`; below that it skips distribution entirely and raises no error.
+does not happen. The library gates the split on the paired helpers' total
+subshares — one each here, since this test passes no weights — being
+`>= threshold`; below that it skips distribution entirely and raises no
+error.
 
 That is the clause that costs an afternoon, because there is nothing to
 debug — no exception, no failed event, no log line. If a `ProtectSecret`

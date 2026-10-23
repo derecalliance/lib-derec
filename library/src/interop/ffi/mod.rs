@@ -16,3 +16,6 @@ pub mod replica_id;
 pub mod sharing;
 pub mod unpairing;
 pub mod verification;
+
+#[cfg(test)]
+mod tests;

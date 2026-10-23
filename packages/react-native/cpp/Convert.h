@@ -60,14 +60,20 @@ std::vector<uint8_t> decodeSecretValueBytes(const uint8_t* ptr, size_t len);
 
 /// A `ShareRecord` as `ShareStore.save` receives it. `secretId` is the
 /// record's own `secret_id`, kept as the decimal string Rust wrote.
+/// `subshares` is the owner-side subshare count and `threshold` the
+/// owner-side threshold the version was split with, each empty when Rust
+/// wrote none.
 struct DecodedShare {
   std::string secretId;
   uint32_t version;
   std::vector<uint8_t> bytes;
+  std::optional<uint32_t> subshares;
+  std::optional<uint32_t> threshold;
 };
 
-/// Decode `{"secret_id":"...","version":<n>,"bytes":[<n>,...]}`. Empty when
-/// any of the three fields is absent.
+/// Decode `{"secret_id":"...","version":<n>,"bytes":[<n>,...],"subshares":<n>,"threshold":<n>}`.
+/// Empty when any of the first three fields is absent; `subshares` and
+/// `threshold` are optional, and absent or `null` decodes as none.
 std::optional<DecodedShare> decodeShareRecord(const uint8_t* ptr, size_t len);
 
 }  // namespace derec

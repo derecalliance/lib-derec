@@ -86,6 +86,7 @@ impl<
             auto_accept: AutoAcceptPolicy::default(),
             replica_id: None,
             parameter_range: None,
+            max_subshares: None,
             secret_id,
         })
     }
@@ -282,7 +283,7 @@ impl<
 mod own_transport_setter_tests {
     use super::*;
     use crate::protocol::builder::DeRecProtocolBuilder;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, NoopTransport,
     };
@@ -421,7 +422,7 @@ mod transport_gate_tests {
     use super::*;
     use crate::extensions::message_body::MessageBodyExt as _;
     use crate::protocol::builder::DeRecProtocolBuilder;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };

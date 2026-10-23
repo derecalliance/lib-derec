@@ -47,8 +47,12 @@ struct HelperIn {
     #[serde(default)]
     transports: Option<Vec<EndpointIn>>,
     shared_key: Vec<u8>,
+    /// Absent, `null` or `{}` decode to an empty map.
     #[serde(default)]
-    communication_info: HashMap<String, String>,
+    communication_info: Option<HashMap<String, String>>,
+    /// The Helper's subshare count. Absent or `null` is `1`.
+    #[serde(default)]
+    weight: Option<u32>,
 }
 
 #[derive(serde::Deserialize)]
@@ -59,8 +63,9 @@ struct ReplicaIn {
     transports: Option<Vec<EndpointIn>>,
     /// `"Source"` or `"Destination"`.
     role: String,
+    /// Absent, `null` or `{}` decode to an empty map, as on [`HelperIn`].
     #[serde(default)]
-    communication_info: HashMap<String, String>,
+    communication_info: Option<HashMap<String, String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -89,6 +94,9 @@ pub(crate) struct RecoveredSecretIn {
     secrets: Vec<UserSecretIn>,
     #[serde(default)]
     replicas: Option<ReplicasIn>,
+    /// The threshold the secret was split with. Absent or `null` is none.
+    #[serde(default)]
+    threshold: Option<u32>,
 }
 
 fn endpoints(transports: Option<Vec<EndpointIn>>) -> Vec<derec_proto::TransportProtocol> {
@@ -117,11 +125,17 @@ impl RecoveredSecretIn {
             .helpers
             .into_iter()
             .map(|h| -> Result<_, String> {
+                let weight = match h.weight {
+                    None => 1,
+                    Some(0) => return Err("helper.weight must be at least 1, got 0".to_owned()),
+                    Some(w) => w,
+                };
                 Ok(HelperInfo {
                     channel_id: parse_decimal_u64(&h.channel_id, "helper.channel_id")?,
                     transports: endpoints(h.transports),
                     shared_key: h.shared_key,
-                    communication_info: h.communication_info,
+                    communication_info: h.communication_info.unwrap_or_default(),
+                    weight,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -146,7 +160,7 @@ impl RecoveredSecretIn {
                             replica_id: parse_decimal_u64(&r.replica_id, "replica.replica_id")?,
                             transports: endpoints(r.transports),
                             role: role as i32,
-                            communication_info: r.communication_info,
+                            communication_info: r.communication_info.unwrap_or_default(),
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
@@ -168,10 +182,16 @@ impl RecoveredSecretIn {
             })
             .collect();
 
+        let threshold = match self.threshold {
+            Some(t) if t < 2 => return Err(format!("threshold must be at least 2, got {t}")),
+            other => other,
+        };
+
         Ok(Secret {
             helpers,
             secrets,
             replicas,
+            threshold,
         })
     }
 }
@@ -288,6 +308,97 @@ mod tests {
                 secret.replicas.unwrap().members[0].transports.is_empty(),
                 "{transports}"
             );
+        }
+    }
+
+    /// `communication_info` absent, `null` and `{}` all decode to an empty
+    /// map on both a Helper and a replica member; a populated map is kept.
+    #[test]
+    fn absent_null_empty_and_populated_communication_info_decode() {
+        for (info, expected) in [
+            (r#""#, 0),
+            (r#""communication_info":null,"#, 0),
+            (r#""communication_info":{},"#, 0),
+            (r#""communication_info":{"name":"Alice"},"#, 1),
+        ] {
+            let json = format!(
+                r#"{{"helpers":[{{"channel_id":"1",{info}"shared_key":{KEY}}}],
+                    "replicas":{{"channel_id":"21","shared_key":{KEY},"members":[
+                    {{"replica_id":"7",{info}"role":"Source"}}]}}}}"#
+            );
+            let secret = decode(&json).unwrap_or_else(|e| panic!("{info}: {e}"));
+            let helper = &secret.helpers[0].communication_info;
+            let member = &secret.replicas.unwrap().members[0].communication_info;
+            assert_eq!(helper.len(), expected, "{info}");
+            assert_eq!(member.len(), expected, "{info}");
+            if expected == 1 {
+                assert_eq!(helper.get("name").map(String::as_str), Some("Alice"));
+                assert_eq!(member.get("name").map(String::as_str), Some("Alice"));
+            }
+        }
+    }
+
+    /// `weight` is the roster's subshare count: absent or `null` reads as
+    /// `1`, the value `SecretRecovered` omits nothing for, and `0` is
+    /// malformed.
+    #[test]
+    fn a_helper_weight_decodes_and_defaults_to_one() {
+        let with = |weight: &str| {
+            format!(
+                r#"{{"helpers":[{{"channel_id":"1","transports":[],"shared_key":{KEY}{weight}}}]}}"#
+            )
+        };
+        assert_eq!(decode(&with("")).unwrap().helpers[0].weight, 1);
+        assert_eq!(
+            decode(&with(r#","weight":null"#)).unwrap().helpers[0].weight,
+            1
+        );
+        assert_eq!(
+            decode(&with(r#","weight":3"#)).unwrap().helpers[0].weight,
+            3
+        );
+        assert!(
+            decode(&with(r#","weight":0"#))
+                .unwrap_err()
+                .contains("helper.weight")
+        );
+    }
+
+    /// The restore params every SDK builds byte-for-byte decode here with the
+    /// weights and the threshold they carry.
+    #[test]
+    fn the_shared_restore_golden_carries_its_weights() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/wire_golden.json"))
+                .expect("fixture parses");
+        let secret = serde_json::from_value::<RecoveredSecretIn>(
+            fixture["restore"]["recovered_secret"].clone(),
+        )
+        .expect("golden decodes")
+        .into_secret()
+        .expect("golden is well formed");
+        let weights: Vec<u32> = secret.helpers.iter().map(|h| h.weight).collect();
+        assert_eq!(weights, vec![1, 2]);
+        assert_eq!(secret.threshold, Some(3));
+    }
+
+    /// `threshold` is the `t` the secret was split with: absent or `null` is
+    /// none, and a value below `2` is malformed.
+    #[test]
+    fn a_threshold_decodes_and_a_value_below_two_is_rejected() {
+        let with = |threshold: &str| format!(r#"{{"helpers":[]{threshold}}}"#);
+        assert_eq!(decode(&with("")).unwrap().threshold, None);
+        assert_eq!(
+            decode(&with(r#","threshold":null"#)).unwrap().threshold,
+            None
+        );
+        assert_eq!(
+            decode(&with(r#","threshold":3"#)).unwrap().threshold,
+            Some(3)
+        );
+        for bad in ["0", "1"] {
+            let err = decode(&with(&format!(r#","threshold":{bad}"#))).unwrap_err();
+            assert!(err.contains("threshold"), "{err}");
         }
     }
 

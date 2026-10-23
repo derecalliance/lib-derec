@@ -84,7 +84,16 @@ impl<
     /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret). A device holding no snapshot still
     /// publishes an empty one to a promoted Destination, since the payload
     /// carries the roster; a promoted helper, for which an empty payload is
-    /// inert, is sent nothing.
+    /// inert, is sent nothing. That publish reuses every Helper's stored
+    /// weight, and a newly promoted Helper is at `1`. A stored weight that is
+    /// invalid under the round's threshold fails it with
+    /// [`SharingError::InvalidWeight`](crate::primitives::sharing::SharingError::InvalidWeight)
+    /// before anything is sent, and this returns that error. The promotion
+    /// has already been saved and stands, so calling `verify_fingerprint`
+    /// again returns `Ok(true)` and publishes nothing: the promoted peer
+    /// receives nothing until
+    /// `start(`[`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret)`)`
+    /// runs with valid weights.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(channel_id = channel_id.0)))]
     pub async fn verify_fingerprint(
         &mut self,
@@ -165,6 +174,8 @@ impl<
                 self.start_protect_secret(
                     secrets,
                     description,
+                    None,
+                    None,
                     &Round {
                         reply_to: &reply_to,
                         trace_id: crate::derec_message::fresh_trace_id(),
@@ -190,7 +201,7 @@ impl<
 mod tests {
     use super::*;
     use crate::protocol::builder::DeRecProtocolBuilder;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
@@ -224,6 +235,7 @@ mod tests {
                     status,
                     created_at: now_secs(),
                     peer_role: derec_proto::SenderKind::Helper,
+                    weight: 1,
                 }),
             )
             .await
@@ -367,7 +379,7 @@ mod tests {
     #[test]
     fn the_confirmation_publish_sends_the_app_keep_list() {
         run_async(async {
-            use crate::protocol::test::RecordingTransport;
+            use crate::protocol::tests::RecordingTransport;
             const OTHER: ChannelId = ChannelId(78);
             let mut channels = InMemChannelStore::default();
             let mut secrets = InMemSecretStore::default();
@@ -382,6 +394,7 @@ mod tests {
                         status: ChannelStatus::Paired,
                         created_at: now_secs(),
                         peer_role: derec_proto::SenderKind::Helper,
+                        weight: 1,
                     }),
                 )
                 .await
@@ -399,6 +412,7 @@ mod tests {
                         secrets: Vec::new(),
                         description: None,
                         author_replica_id: None,
+                        threshold: None,
                     },
                 )
                 .await

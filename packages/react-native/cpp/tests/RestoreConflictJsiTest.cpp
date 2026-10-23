@@ -72,6 +72,7 @@ int32_t shSave(void*, uint64_t, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t shRemove(void*, uint64_t, uint64_t) { return 0; }
 int32_t shRemoveVersions(void*, uint64_t, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t shKeepList(void*, uint64_t, uint32_t, uint8_t**, size_t*) { return 1; }
+int32_t shRecordVerification(void*, uint64_t, uint64_t, uint32_t) { return 0; }
 
 int32_t usLoad(void*, uint64_t, uint8_t**, size_t*) { return 1; }
 int32_t usSave(void*, uint64_t, const uint8_t*, size_t) { return 0; }
@@ -93,7 +94,8 @@ ChannelStoreCallbacks channelStore{nullptr, chLoad, chSave, chRemove, chListHelp
                                    chListReplicas, chLink, chLinked, freeBytes};
 SecretStoreCallbacks secretStore{nullptr, seLoad, seLoadMany, seSave, seRemove, freeBytes};
 ShareStoreCallbacks shareStore{nullptr, shLoad,   shLoadMany,       shLoadAll,  shLatest,
-                               shSave,  shRemove, shRemoveVersions, shKeepList, freeBytes};
+                               shSave,  shRemove, shRemoveVersions, shKeepList,
+                               shRecordVerification, freeBytes};
 UserSecretStoreCallbacks userSecretStore{nullptr, usLoad, usSave, usRemove, freeBytes};
 StateStoreCallbacks stateStore{nullptr, stSave, stLoad, stRemove, stLoadAll, freeBytes};
 TransportCallbacks transport{nullptr, trSend};

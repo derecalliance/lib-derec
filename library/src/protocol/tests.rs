@@ -231,6 +231,9 @@ pub(crate) struct InMemShareStore {
     /// Every `(secret_id, version)` [`DeRecShareStore::keep_list`] was asked
     /// about, in call order.
     pub(crate) keep_list_calls: Arc<Mutex<Vec<(u64, u32)>>>,
+    /// When set, every [`DeRecShareStore::keep_list`] fails with a backend
+    /// error.
+    pub(crate) keep_list_error: Arc<Mutex<bool>>,
 }
 
 impl DeRecShareStore for InMemShareStore {
@@ -299,8 +302,146 @@ impl DeRecShareStore for InMemShareStore {
     }
     fn keep_list(&self, sid: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
         self.keep_list_calls.lock().unwrap().push((sid, version));
+        if *self.keep_list_error.lock().unwrap() {
+            return Box::pin(std::future::ready(Err(
+                crate::protocol::ShareStoreError::Backend(
+                    "share store backend unavailable".to_owned().into(),
+                ),
+            )));
+        }
         let keep = self.keep.lock().unwrap().clone();
         Box::pin(std::future::ready(Ok(keep)))
+    }
+}
+
+/// An in-memory share store that can be told to refuse (or fail) the
+/// next `save` and/or `record_verification`, for exercising
+/// [`crate::protocol::ShareStoreError::Refused`] and ordinary backend
+/// failures through the `sharing`/`verification` handlers without a
+/// bespoke store per test.
+#[derive(Default, Clone)]
+pub(crate) struct RefusingShareStore {
+    pub(crate) inner: InMemShareStore,
+    save_refusal: Arc<Mutex<Option<crate::protocol::Refusal>>>,
+    save_backend_error: Arc<Mutex<bool>>,
+    verification_refusal: Arc<Mutex<Option<crate::protocol::Refusal>>>,
+    verification_backend_error: Arc<Mutex<bool>>,
+    /// Every `(secret_id, channel_id, version)` `record_verification` was
+    /// called with, in call order.
+    #[allow(clippy::type_complexity)]
+    verification_calls: Arc<Mutex<Vec<(u64, ChannelId, u32)>>>,
+}
+
+impl RefusingShareStore {
+    pub(crate) fn set_refusal(&self, refusal: Option<crate::protocol::Refusal>) {
+        *self.save_refusal.lock().unwrap() = refusal;
+    }
+
+    pub(crate) fn set_backend_error(&self, fail: bool) {
+        *self.save_backend_error.lock().unwrap() = fail;
+    }
+
+    pub(crate) fn set_verification_refusal(&self, refusal: Option<crate::protocol::Refusal>) {
+        *self.verification_refusal.lock().unwrap() = refusal;
+    }
+
+    pub(crate) fn set_verification_backend_error(&self, fail: bool) {
+        *self.verification_backend_error.lock().unwrap() = fail;
+    }
+
+    pub(crate) fn verification_calls(&self) -> Vec<(u64, ChannelId, u32)> {
+        self.verification_calls.lock().unwrap().clone()
+    }
+}
+
+impl DeRecShareStore for RefusingShareStore {
+    fn load(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
+        self.inner.load(secret_id, channel_id, versions)
+    }
+    fn load_many(
+        &self,
+        secret_id: u64,
+        channel_ids: &[ChannelId],
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
+        self.inner.load_many(secret_id, channel_ids, versions)
+    }
+    fn load_all(
+        &self,
+        secret_id: u64,
+        channel_ids: &[ChannelId],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
+        self.inner.load_all(secret_id, channel_ids)
+    }
+    fn latest_version(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<u32>> {
+        self.inner.latest_version(secret_id)
+    }
+    fn save(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        share: Share,
+    ) -> ShareStoreFuture<'_, ()> {
+        if let Some(refusal) = *self.save_refusal.lock().unwrap() {
+            return Box::pin(std::future::ready(Err(
+                crate::protocol::ShareStoreError::Refused(refusal),
+            )));
+        }
+        if *self.save_backend_error.lock().unwrap() {
+            return Box::pin(std::future::ready(Err(
+                crate::protocol::ShareStoreError::Backend(
+                    "share store backend unavailable".to_owned().into(),
+                ),
+            )));
+        }
+        self.inner.save(secret_id, channel_id, share)
+    }
+    fn remove_channel(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ShareStoreFuture<'_, ()> {
+        self.inner.remove_channel(secret_id, channel_id)
+    }
+    fn remove_versions(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, ()> {
+        self.inner.remove_versions(secret_id, channel_id, versions)
+    }
+    fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+        self.inner.keep_list(secret_id, version)
+    }
+    fn record_verification(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        version: u32,
+    ) -> ShareStoreFuture<'_, ()> {
+        self.verification_calls
+            .lock()
+            .unwrap()
+            .push((secret_id, channel_id, version));
+        if let Some(refusal) = *self.verification_refusal.lock().unwrap() {
+            return Box::pin(std::future::ready(Err(
+                crate::protocol::ShareStoreError::Refused(refusal),
+            )));
+        }
+        if *self.verification_backend_error.lock().unwrap() {
+            return Box::pin(std::future::ready(Err(
+                crate::protocol::ShareStoreError::Backend(
+                    "share store backend unavailable".to_owned().into(),
+                ),
+            )));
+        }
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 
@@ -428,6 +569,11 @@ impl RecordingTransport {
             .iter()
             .map(|(endpoints, _)| endpoints.clone())
             .collect()
+    }
+
+    /// Forget every envelope sent so far.
+    pub(crate) fn clear(&self) {
+        self.sent.lock().unwrap().clear();
     }
 
     /// Raw envelopes sent so far, in send order.
@@ -600,6 +746,7 @@ pub(crate) struct LocalFixture {
     pub(crate) own_transports: Vec<TransportProtocol>,
     pub(crate) policy: crate::transport::TransportPolicy,
     pub(crate) communication_info: std::collections::HashMap<String, String>,
+    pub(crate) parameter_range: Option<derec_proto::ParameterRange>,
 }
 
 impl LocalFixture {
@@ -614,6 +761,7 @@ impl LocalFixture {
             }],
             policy: crate::transport::TransportPolicy::new(false),
             communication_info: std::collections::HashMap::new(),
+            parameter_range: None,
         }
     }
 
@@ -625,6 +773,15 @@ impl LocalFixture {
         }
     }
 
+    /// The same, enforcing `range` as this device's helper-side share-size
+    /// limits.
+    pub(crate) fn with_parameter_range(secret_id: u64, range: derec_proto::ParameterRange) -> Self {
+        Self {
+            parameter_range: Some(range),
+            ..Self::new(secret_id)
+        }
+    }
+
     pub(crate) fn local(&self) -> crate::protocol::context::Local<'_> {
         crate::protocol::context::Local {
             secret_id: self.secret_id,
@@ -632,6 +789,34 @@ impl LocalFixture {
             own_transports: &self.own_transports,
             policy: self.policy,
             communication_info: &self.communication_info,
+            parameter_range: self.parameter_range.as_ref(),
         }
     }
+}
+
+/// A `DeRecShare` in the layout used before 0.0.9: `encryptedSecret = 1`,
+/// `x = 2`, `y = 3`, `secretId = 4`, `version = 5`. The current schema reads
+/// field 3 as `secretId`, a varint, so these bytes no longer decode.
+pub(crate) fn pre_0_0_9_derec_share(secret_id: u64, version: u32) -> Vec<u8> {
+    use prost::encoding::{bytes, uint32, uint64};
+    let mut buf = pre_0_0_9_fields_before_y();
+    bytes::encode(3, &vec![0x02_u8; 48], &mut buf);
+    uint64::encode(4, &secret_id, &mut buf);
+    uint32::encode(5, &version, &mut buf);
+    buf
+}
+
+/// Fields 1 and 2 of [`pre_0_0_9_derec_share`]. The old `x` (field 2) holds
+/// bytes that also parse as a current `Subshare`, so the only field that
+/// can fail to decode is the old `y` (field 3).
+pub(crate) fn pre_0_0_9_fields_before_y() -> Vec<u8> {
+    use prost::encoding::bytes;
+    let mut buf = Vec::new();
+    bytes::encode(1, &vec![0xAB_u8; 4], &mut buf);
+    let x = derec_proto::de_rec_share::Subshare {
+        x: vec![0x01; 48],
+        y: vec![0x03; 48],
+    };
+    bytes::encode(2, &prost::Message::encode_to_vec(&x), &mut buf);
+    buf
 }

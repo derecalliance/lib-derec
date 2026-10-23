@@ -4,6 +4,8 @@
 package native
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 	"unsafe"
 
@@ -21,23 +23,109 @@ type shareStore interface {
 	RemoveChannel(secretID, channelID uint64) error
 	RemoveVersions(secretID, channelID uint64, versions []uint32) error
 	KeepList(secretID uint64, version uint32) ([]uint32, bool, error)
+	RecordVerification(secretID, channelID uint64, version uint32) error
 }
 
 // ShareStoreCallbacks mirrors #[repr(C)] struct ShareStoreCallbacks in
 // library/src/interop/ffi/protocol/stores.rs field-for-field. channel_ids[]/
 // versions[] cross the FFI as JSON-array byte buffers, matching stores.rs's
-// doc comment on the struct.
+// doc comment on the struct. RecordVerification sits after KeepList and
+// before FreeBuffer, matching the Rust struct's field order exactly — a
+// different position here is a runtime crash, not a compile error.
 type ShareStoreCallbacks struct {
-	UserData       uintptr
-	Load           uintptr
-	LoadMany       uintptr
-	LoadAll        uintptr
-	LatestVersion  uintptr
-	Save           uintptr
-	RemoveChannel  uintptr
-	RemoveVersions uintptr
-	KeepList       uintptr
-	FreeBuffer     uintptr
+	UserData           uintptr
+	Load               uintptr
+	LoadMany           uintptr
+	LoadAll            uintptr
+	LatestVersion      uintptr
+	Save               uintptr
+	RemoveChannel      uintptr
+	RemoveVersions     uintptr
+	KeepList           uintptr
+	RecordVerification uintptr
+	FreeBuffer         uintptr
+}
+
+// ShareStoreRefusal is the reason a ShareStoreRefusedError refuses a
+// ShareStore.Save or ShareStore.RecordVerification call. Declared here —
+// not in package derec, which already imports this package, nor in package
+// protocol, which imports both — so every Go SDK layer can reference one
+// definition without a dependency cycle; mirrors why Error is declared in
+// error.go instead of package derec. derec and protocol each alias this
+// type rather than redeclaring it.
+type ShareStoreRefusal int32
+
+const (
+	// RefusalTooFrequent refuses a share update or verification that
+	// arrived before the application's own frequency policy allows.
+	RefusalTooFrequent ShareStoreRefusal = iota
+	// RefusalSizeLimitExceeded refuses a share update whose size the
+	// application's own store rejects, independent of the library's
+	// own ParameterRange check on StoreShareRequest.
+	RefusalSizeLimitExceeded
+	// RefusalRejected refuses the call for any other application-chosen
+	// reason.
+	RefusalRejected
+)
+
+// String names the way r appears in log/error output. Branch on the
+// Refusal field itself, never this string.
+func (r ShareStoreRefusal) String() string {
+	switch r {
+	case RefusalTooFrequent:
+		return "too_frequent"
+	case RefusalSizeLimitExceeded:
+		return "size_limit_exceeded"
+	case RefusalRejected:
+		return "rejected"
+	default:
+		return fmt.Sprintf("unknown(%d)", int32(r))
+	}
+}
+
+// ffiCode maps r to the FFI return code documented on
+// ShareStoreCallbacks.Save/RecordVerification in stores.rs — the
+// StatusEnum numbers DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED/
+// _TOO_FREQUENT/_REJECTED name in library/src/interop/ffi/error.rs. The
+// library chooses the wire status from this code; the application only
+// chose the reason via Refusal.
+func (r ShareStoreRefusal) ffiCode() int32 {
+	switch r {
+	case RefusalSizeLimitExceeded:
+		return 3
+	case RefusalTooFrequent:
+		return 4
+	case RefusalRejected:
+		return 10
+	default:
+		return ffiStatusFailure
+	}
+}
+
+// ShareStoreRefusedError is returned from ShareStore.Save or
+// ShareStore.RecordVerification to refuse the write or verification with
+// Refusal. dispatchShareSave/dispatchShareRecordVerification turn this into
+// the matching protocol status answered to the owner, rather than treating
+// it as a backend failure; any other error is an ordinary backend failure.
+type ShareStoreRefusedError struct {
+	Refusal ShareStoreRefusal
+}
+
+// Error implements the error interface.
+func (e *ShareStoreRefusedError) Error() string {
+	return fmt.Sprintf("derec: share store refused: %s", e.Refusal)
+}
+
+// shareRefusalCode extracts the FFI return code from err via errors.As,
+// when err (or something it wraps) is a *ShareStoreRefusedError. ok is
+// false for a plain backend error, which the caller answers with the
+// existing failure code instead.
+func shareRefusalCode(err error) (code int32, ok bool) {
+	var refused *ShareStoreRefusedError
+	if errors.As(err, &refused) {
+		return refused.Refusal.ffiCode(), true
+	}
+	return 0, false
 }
 
 // --- Dispatch ---------------------------------------------------------------
@@ -113,6 +201,26 @@ func dispatchShareSave(s *storeSet, secretID, channelID uint64, shareJSON []byte
 		return ffiStatusFailure
 	}
 	if err := s.share.Save(secretID, channelID, share); err != nil {
+		if code, ok := shareRefusalCode(err); ok {
+			return code
+		}
+		return ffiStatusFailure
+	}
+	return ffiStatusOK
+}
+
+// dispatchShareRecordVerification is called once per accepted verification
+// challenge, after the challenged share is found and before the helper
+// answers — see DeRecShareStore::record_verification on the Rust side. A
+// *ShareStoreRefusedError from the application's store refuses the
+// verification with the matching protocol status; any other error is an
+// ordinary backend failure.
+func dispatchShareRecordVerification(s *storeSet, secretID, channelID uint64, version uint32) (status int32) {
+	defer recoverInto(&status)
+	if err := s.share.RecordVerification(secretID, channelID, version); err != nil {
+		if code, ok := shareRefusalCode(err); ok {
+			return code
+		}
 		return ffiStatusFailure
 	}
 	return ffiStatusOK
@@ -125,8 +233,6 @@ func dispatchShareRemoveChannel(s *storeSet, secretID, channelID uint64) (status
 	}
 	return ffiStatusOK
 }
-
-// --- C-facing callbacks ------------------------------------------------------
 
 func dispatchShareRemoveVersions(s *storeSet, secretID, channelID uint64, versionsJSON []byte) (status int32) {
 	defer recoverInto(&status)
@@ -155,6 +261,8 @@ func dispatchShareKeepList(s *storeSet, secretID uint64, version uint32) (status
 	}
 	return ffiStatusOK, encoded
 }
+
+// --- C-facing callbacks ------------------------------------------------------
 
 func shareLoadCallback(userData uintptr, secretID, channelID uint64, versionsPtr *byte, versionsLen uintptr, outPtr, outLen *uintptr) (status int32) {
 	defer recoverInto(&status)
@@ -230,12 +338,6 @@ func shareRemoveChannelCallback(userData uintptr, secretID, channelID uint64) (s
 	return dispatchShareRemoveChannel(s, secretID, channelID)
 }
 
-// shareCallbackPtrs holds the purego.NewCallback address for every
-// ShareStoreCallbacks fn-pointer field except FreeBuffer (shared package-
-// wide via sharedFreeBufferCallback). These six functions are stateless
-// package-level funcs, so each needs exactly one registration total — see
-// registerChannelCallbacks in callbacks_channel.go for why per-call
-// registration would exhaust purego's 2000-slot callback table.
 func shareRemoveVersionsCallback(userData uintptr, secretID, channelID uint64, versionsPtr *byte, versionsLen uintptr) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
@@ -259,10 +361,25 @@ func shareKeepListCallback(userData uintptr, secretID uint64, version uint32, ou
 	return ffiStatusOK
 }
 
+func shareRecordVerificationCallback(userData uintptr, secretID, channelID uint64, version uint32) (status int32) {
+	defer recoverInto(&status)
+	s, ok := lookupStores(storeHandle(userData))
+	if !ok {
+		return ffiStatusFailure
+	}
+	return dispatchShareRecordVerification(s, secretID, channelID, version)
+}
+
+// shareCallbackPtrs holds the purego.NewCallback address for every
+// ShareStoreCallbacks fn-pointer field except FreeBuffer (shared package-
+// wide via sharedFreeBufferCallback). These nine functions are stateless
+// package-level funcs, so each needs exactly one registration total — see
+// registerChannelCallbacks in callbacks_channel.go for why per-call
+// registration would exhaust purego's 2000-slot callback table.
 var (
 	shareCallbacksOnce sync.Once
 	shareCallbackPtrs  struct {
-		load, loadMany, loadAll, latestVersion, save, removeChannel, removeVersions, keepList uintptr
+		load, loadMany, loadAll, latestVersion, save, removeChannel, removeVersions, keepList, recordVerification uintptr
 	}
 )
 
@@ -276,6 +393,7 @@ func registerShareCallbacks() {
 		shareCallbackPtrs.removeChannel = purego.NewCallback(shareRemoveChannelCallback)
 		shareCallbackPtrs.removeVersions = purego.NewCallback(shareRemoveVersionsCallback)
 		shareCallbackPtrs.keepList = purego.NewCallback(shareKeepListCallback)
+		shareCallbackPtrs.recordVerification = purego.NewCallback(shareRecordVerificationCallback)
 	})
 }
 
@@ -285,15 +403,16 @@ func registerShareCallbacks() {
 func buildShareStoreCallbacks(h storeHandle) ShareStoreCallbacks {
 	registerShareCallbacks()
 	return ShareStoreCallbacks{
-		UserData:       uintptr(h),
-		Load:           shareCallbackPtrs.load,
-		LoadMany:       shareCallbackPtrs.loadMany,
-		LoadAll:        shareCallbackPtrs.loadAll,
-		LatestVersion:  shareCallbackPtrs.latestVersion,
-		Save:           shareCallbackPtrs.save,
-		RemoveChannel:  shareCallbackPtrs.removeChannel,
-		RemoveVersions: shareCallbackPtrs.removeVersions,
-		KeepList:       shareCallbackPtrs.keepList,
-		FreeBuffer:     sharedFreeBufferCallback(),
+		UserData:           uintptr(h),
+		Load:               shareCallbackPtrs.load,
+		LoadMany:           shareCallbackPtrs.loadMany,
+		LoadAll:            shareCallbackPtrs.loadAll,
+		LatestVersion:      shareCallbackPtrs.latestVersion,
+		Save:               shareCallbackPtrs.save,
+		RemoveChannel:      shareCallbackPtrs.removeChannel,
+		RemoveVersions:     shareCallbackPtrs.removeVersions,
+		KeepList:           shareCallbackPtrs.keepList,
+		RecordVerification: shareCallbackPtrs.recordVerification,
+		FreeBuffer:         sharedFreeBufferCallback(),
 	}
 }

@@ -11,7 +11,7 @@ use crate::{
 };
 use derec_cryptography::vss;
 use derec_proto::{
-    CommittedDeRecShare, DeRecMessage, DeRecResult, DeRecShare, MessageBody,
+    CommittedDeRecShare, DeRecMessage, DeRecResult, DeRecShare, MessageBody, StatusEnum,
     StoreShareRequestMessage, StoreShareResponseMessage,
 };
 use prost::Message;
@@ -93,9 +93,10 @@ pub struct ExtractResult {
 /// use derec_library::primitives::sharing::{request, response};
 /// use derec_library::types::ChannelId;
 ///
-/// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
-/// let request::SplitResult { shares } = request::split(&channels, 1, 1, b"super_secret_value", 2)
-///     .expect("split failed");
+/// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
+/// let request::SplitResult { shares } =
+///     request::split(&channels, 1, 1, b"super_secret_value", 2)
+///         .expect("split failed");
 ///
 /// let channel_id = ChannelId(1);
 /// let shared_key = [42u8; 32];
@@ -211,9 +212,10 @@ pub fn produce(
 /// use derec_library::primitives::sharing::{request, response};
 /// use derec_library::types::ChannelId;
 ///
-/// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
-/// let request::SplitResult { shares } = request::split(&channels, 1, 1, b"super_secret_value", 2)
-///     .expect("split failed");
+/// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
+/// let request::SplitResult { shares } =
+///     request::split(&channels, 1, 1, b"super_secret_value", 2)
+///         .expect("split failed");
 ///
 /// let channel_id = ChannelId(1);
 /// let shared_key = [42u8; 32];
@@ -301,9 +303,10 @@ pub fn extract(
 /// use derec_library::primitives::sharing::{request, response};
 /// use derec_library::types::ChannelId;
 ///
-/// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
-/// let request::SplitResult { shares } = request::split(&channels, 1, 1, b"super_secret_value", 2)
-///     .expect("split failed");
+/// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
+/// let request::SplitResult { shares } =
+///     request::split(&channels, 1, 1, b"super_secret_value", 2)
+///         .expect("split failed");
 ///
 /// let channel_id = ChannelId(1);
 /// let shared_key = [42u8; 32];
@@ -358,27 +361,88 @@ pub fn process(version: u32, response: &StoreShareResponseMessage) -> Result<(),
 fn validate_produce_inputs(
     request: &StoreShareRequestMessage,
 ) -> Result<(CommittedDeRecShare, u64), crate::Error> {
-    if request.share.is_empty() {
+    validate_share(request).map_err(|fault| fault.error)
+}
+
+/// Why a Helper refuses the `share` of an inbound
+/// [`StoreShareRequestMessage`]: the status and memo it answers the Owner
+/// with.
+#[derive(Debug)]
+pub(crate) struct ShareFault {
+    /// `FORMAT_ERROR` for a share that does not decode, `VERIFICATION_FAILED`
+    /// for one that decodes but does not verify against its commitment.
+    pub(crate) status: StatusEnum,
+    /// Human-readable reason sent to the Owner.
+    pub(crate) memo: &'static str,
+    /// The same failure as [`produce`] reports it.
+    error: crate::Error,
+}
+
+impl ShareFault {
+    fn format(memo: &'static str, error: crate::Error) -> Self {
+        Self {
+            status: StatusEnum::FormatError,
+            memo,
+            error,
+        }
+    }
+}
+
+/// The single rule set a Helper applies to the `share` of an inbound
+/// [`StoreShareRequestMessage`] before storing it.
+///
+/// - `FORMAT_ERROR`: `share` is empty, is not a [`CommittedDeRecShare`],
+///   lacks `de_rec_share`, `commitment` or `merkle_path`, or its
+///   `de_rec_share` is not a [`DeRecShare`].
+/// - `VERIFICATION_FAILED`: the share does not verify against `commitment`
+///   — it carries no subshares, repeats an `x`, or its Merkle path does not
+///   lead to the commitment.
+///
+/// On success returns the decoded committed share and the `secret_id` of
+/// its inner [`DeRecShare`].
+pub(crate) fn validate_share(
+    request: &StoreShareRequestMessage,
+) -> Result<(CommittedDeRecShare, u64), ShareFault> {
+    validate_committed_share(&request.share)
+}
+
+/// [`validate_share`] over the serialized [`CommittedDeRecShare`] alone.
+///
+/// The same rule set applies wherever a committed share is accepted: a
+/// Helper storing one, and a group member taking a copy of the share map
+/// its source tracks.
+pub(crate) fn validate_committed_share(
+    share: &[u8],
+) -> Result<(CommittedDeRecShare, u64), ShareFault> {
+    const EMPTY: &str = "committed share is empty";
+    const NOT_COMMITTED: &str = "share is not a valid CommittedDeRecShare";
+    const NOT_DEREC_SHARE: &str = "CommittedDeRecShare.de_rec_share is not a valid DeRecShare";
+    const UNVERIFIED: &str = "CommittedDeRecShare Merkle proof verification failed";
+
+    if share.is_empty() {
         #[cfg(feature = "logging")]
-        tracing::warn!("share field is empty in StoreShareRequestMessage");
-        return Err(crate::Error::Invariant(
-            "share field is empty in StoreShareRequestMessage",
-        ));
+        tracing::warn!("committed share is empty");
+        return Err(ShareFault::format(EMPTY, crate::Error::Invariant(EMPTY)));
     }
 
-    let committed_share = CommittedDeRecShare::decode(request.share.as_slice())
-        .map_err(crate::Error::ProtobufDecode)?;
+    let committed_share = CommittedDeRecShare::decode(share)
+        .map_err(|e| ShareFault::format(NOT_COMMITTED, crate::Error::ProtobufDecode(e)))?;
 
-    committed_share.validate()?;
+    committed_share.validate().map_err(|error| {
+        let memo = match error {
+            crate::Error::Invariant(memo) => memo,
+            _ => NOT_COMMITTED,
+        };
+        ShareFault::format(memo, error)
+    })?;
 
     let inner_share = DeRecShare::decode(committed_share.de_rec_share.as_slice())
-        .map_err(crate::Error::ProtobufDecode)?;
+        .map_err(|e| ShareFault::format(NOT_DEREC_SHARE, crate::Error::ProtobufDecode(e)))?;
 
     let secret_id = inner_share.secret_id;
 
     let vss_share = vss::VSSShare {
-        x: inner_share.x,
-        y: inner_share.y,
+        subshares: crate::extensions::derec_share::into_vss_subshares(inner_share.subshares),
         encrypted_secret: inner_share.encrypted_secret,
         commitment: committed_share.commitment.clone(),
         merkle_path: committed_share
@@ -391,9 +455,11 @@ fn validate_produce_inputs(
     if !vss::verify(&vss_share) {
         #[cfg(feature = "logging")]
         tracing::warn!("Merkle proof verification failed");
-        return Err(crate::Error::Invariant(
-            "CommittedDeRecShare Merkle proof verification failed",
-        ));
+        return Err(ShareFault {
+            status: StatusEnum::VerificationFailed,
+            memo: UNVERIFIED,
+            error: crate::Error::Invariant(UNVERIFIED),
+        });
     }
 
     Ok((committed_share, secret_id))

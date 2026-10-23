@@ -82,6 +82,36 @@ static void shareRecordKeepsItsOwnSecretId() {
   expect(decoded->bytes == std::vector<uint8_t>({1, 2, 255}), "share bytes decode");
 }
 
+static void shareRecordCarriesItsSubshareCount() {
+  auto json = bytesOf("{\"secret_id\":\"7\",\"version\":2,\"bytes\":[1],\"subshares\":3}");
+  auto decoded = decodeShareRecord(json.data(), json.size());
+  expect(decoded.has_value() && decoded->subshares == std::optional<uint32_t>(3),
+         "a recorded subshare count decodes");
+  for (const char* text : {"{\"secret_id\":\"7\",\"version\":2,\"bytes\":[1]}",
+                           "{\"secret_id\":\"7\",\"version\":2,\"bytes\":[1],\"subshares\":null}"}) {
+    auto bare = bytesOf(text);
+    auto none = decodeShareRecord(bare.data(), bare.size());
+    expect(none.has_value() && !none->subshares.has_value(),
+           std::string("an absent or null count decodes as none: ") + text);
+  }
+}
+
+static void shareRecordCarriesItsThreshold() {
+  auto json = bytesOf("{\"secret_id\":\"7\",\"version\":2,\"bytes\":[1],\"subshares\":1,\"threshold\":3}");
+  auto decoded = decodeShareRecord(json.data(), json.size());
+  expect(decoded.has_value() && decoded->threshold == std::optional<uint32_t>(3),
+         "a recorded threshold decodes");
+  expect(decoded.has_value() && decoded->subshares == std::optional<uint32_t>(1),
+         "the count next to it still decodes");
+  for (const char* text : {"{\"secret_id\":\"7\",\"version\":2,\"bytes\":[1]}",
+                           "{\"secret_id\":\"7\",\"version\":2,\"bytes\":[1],\"threshold\":null}"}) {
+    auto bare = bytesOf(text);
+    auto none = decodeShareRecord(bare.data(), bare.size());
+    expect(none.has_value() && !none->threshold.has_value(),
+           std::string("an absent or null threshold decodes as none: ") + text);
+  }
+}
+
 static void shareRecordWithoutSecretIdIsRejected() {
   auto json = bytesOf("{\"version\":3,\"bytes\":[1]}");
   expect(!decodeShareRecord(json.data(), json.size()).has_value(),
@@ -144,6 +174,8 @@ static void rustRejectsTheUnknownDiscriminant() {
 
 int main() {
   derec::testing::run("shareRecordKeepsItsOwnSecretId", shareRecordKeepsItsOwnSecretId);
+  derec::testing::run("shareRecordCarriesItsSubshareCount", shareRecordCarriesItsSubshareCount);
+  derec::testing::run("shareRecordCarriesItsThreshold", shareRecordCarriesItsThreshold);
   derec::testing::run("shareRecordWithoutSecretIdIsRejected",
                       shareRecordWithoutSecretIdIsRejected);
   derec::testing::run("grpcEndpointIsNamedGrpc", grpcEndpointIsNamedGrpc);

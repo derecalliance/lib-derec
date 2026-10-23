@@ -7,7 +7,804 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
-### Unreleased
+### 0.0.9
+
+Share commitments use a domain-separated Merkle hash, so one malicious helper
+can no longer block a recovery without being identified. Every request on an
+authenticated channel is answered exactly once, even when handling it fails.
+Verification ends every challenged channel in exactly one verdict event, the
+owner keeps proofs only for shares that are confirmed or still in an open
+round, one builder call sets every store, and the envelope and inner-message
+timestamps are one value, checked on receipt.
+
+- **Fixed (security): a forged share could pass verification.**
+  *(bug fix; every SDK)*
+
+  Leaf and internal-node hashes had the same form, the split between a
+  share's `x` and `y` was not bound, and a Merkle path of any length was
+  accepted. A helper could return the two children of an internal node as a
+  share's `(x, y)`, with the shorter path from that node to the root: it
+  passed verification, recovery used it, reconstruction failed, and nothing
+  named the helper. Leaves are now tagged `0x00` and length-prefix every
+  coordinate (exact encoding in the next entry), internal nodes are
+  `SHA-256(0x02 ‖ left ‖ right)`, unused leaf slots are leaf
+  hashes of random bytes, and a share verifies only with a path of exactly
+  the tree depth (7). A forged share now fails verification and is reported
+  as an invalid proof.
+
+  **Breaking — shares made before 0.0.9 are no longer readable.** The
+  `DeRecShare` wire format changed (see the next entry), so an old share no
+  longer decodes: a helper still holding one cannot answer a recovery
+  request for that version, and an old share that reaches an owner is
+  reported as malformed. After upgrading, an owner must share again
+  (publish a new version) so every helper holds a share in the new format,
+  before relying on recovery.
+
+- **Fixed (security): a response could go to a `reply_to` the transport
+  policy refused.** *(bug fix; every SDK)*
+
+  A request whose `reply_to` failed the local transport policy (for
+  example a plaintext endpoint without `unsafe_connection`) was refused,
+  but the failure response was then sent to that same refused endpoint.
+  Every response now uses only the `reply_to` endpoints the policy allows,
+  and falls back to the channel's recorded endpoints when none remain.
+
+- **Changed: every authenticated request is answered exactly once.**
+  *(breaking; every SDK)*
+
+  A request that arrives on an authenticated channel now gets exactly one
+  response, even when handling it fails. A request counts as answered once
+  its response is handed to the transport, and nothing the library does in
+  that call sends on it again. That fixes the paths inside one call that
+  could answer twice: a replica copy whose cleanup
+  failed after the `OK` was sent, a refusal or replica answer whose send
+  reported an error after delivering, and an accepted unpair or pairing that
+  failed after its response and was then rejected by the application. The
+  failure is reported as the new event `RequestFailed { channel_id,
+  action_kind, responded, status, memo, error_code, message, action }` (.NET
+  `RequestFailedEvent`, Go `EventTypeRequestFailed`, `"RequestFailed"` in
+  TypeScript and React Native), and the call's other events, `AutoAccepted`
+  included, are kept. `status` and `memo` are always present: the status
+  and wire-safe memo sent, or that would have been; `error_code` and
+  `message` describe the local error and never go on the wire.
+
+  `auto_respond_on_failure` decides who answers. With it on, the library
+  does: a failure with a protocol meaning keeps its status and memo
+  (`REJECTED` for a role mismatch, `UNSUPPORTED_TRANSPORT_PROTOCOL`, an
+  invalid update, an unknown share version, every refusal), and anything
+  else (a store backend error, an internal error) is `FAIL` with the generic
+  memo `"request could not be processed"`, so local error text no longer
+  reaches the peer. Protocol refusals (`ShareRefused`,
+  `ReplicaSecretRefused`, `PairingRefused`) are still answered in both
+  modes. With it off (the default), nothing is sent: `responded`
+  is `false` and `action` holds the new `PendingAction::RespondToFailure`
+  token, of the new kind `PendingActionKind::Failed` (`"Failed"` in the
+  SDKs). Pass it to `reject` with the status and memo to send; the event's
+  own `status` and `memo` send exactly what the library would have sent
+  with the option on. `accept`
+  refuses it with `InvalidInput`, and no `AutoAcceptPolicy` covers it. With
+  it on, the token is also handed over when no reply target could be
+  resolved before any send. Two failures are reported without a token,
+  because `reject` could never answer one: a request on a replica group
+  channel that names no member and carries no `reply_to`, which has no
+  reply target at all, and, with the option off, a replica copy that hands
+  this device the group key and fails before `hydrate` stores that key. The
+  library never expires a pending action, so a token nobody answers leaves
+  its sender to time out. The library is also stateless, so resolving each
+  token once is the application's part: rejecting the same token twice, or
+  rejecting a copy of an action already accepted, sends a second response.
+
+  A message that decrypts under the channel key but whose body does not
+  decode, or that carries a `PairRequest` or `PrePairRequest` on a paired
+  channel, is a request too. It is answered with an `ErrorResponseMessage`
+  carrying `FORMAT_ERROR` and the memo `"message body could not be
+  decoded"` (with `auto_respond_on_failure` off, through its token). A
+  message that fails to decrypt, an expired message (older than the
+  `inbound_message` window, which is the library's replay bound), a
+  response, the pairing handshake and a replica group's removal notice are
+  still never answered.
+
+  `accept` now re-checks a persisted action before acting on it. A channel
+  that is gone or no longer `Paired` fails the call with `InvalidInput`, and
+  nothing is stored or sent; a peer that no longer holds the role the flow
+  requires is a failed request with status `REJECTED`. In Rust,
+  `PendingAction` is now `Clone`, so an application can keep a copy of an
+  action it passes to `accept`.
+
+  **Breaking — `process` and `accept` no longer fail for an answerable
+  request.** A store error, a role mismatch, an undecodable body or any
+  other failure of a request on an authenticated channel used to be an
+  error from `process` (or `accept`); it is now `RequestFailed` in a
+  successful result. An application that handled these failures in its
+  error path must read them from the events, and, with
+  `auto_respond_on_failure` off, pass each token to `reject`, or the sender
+  is never answered. An application matching events or `PendingActionKind`
+  exhaustively must handle the new values.
+
+  **Behavior change — a responder whose `PairResponse` could not be sent
+  completes the pairing.** The responder now reports `PairingCompleted`
+  followed by `RequestFailed { action_kind: Pairing, responded: true }` when
+  its `PairResponse` send fails, or when dropping the pairing secret after
+  it fails, instead of failing `process()` with the channel persisted and no
+  events. An application that reacted to that error must read the events
+  instead.
+
+  **Breaking (Rust): `From<&Error> for StatusEnum` is removed.** Mapping a
+  local error to a wire status is the library's, applied when it answers a
+  failed request; an application calling `reject` chooses its status
+  itself.
+
+- **Added: `ErrorResponseMessage` carries a timestamp, and a received one is
+  an event.** *(breaking wire change; every SDK)*
+
+  `ErrorResponseMessage` gains `google.protobuf.Timestamp timestamp = 2`,
+  set to the envelope's timestamp like every other message. Without it,
+  every received `ErrorResponse` failed the timestamp check and was ignored
+  as `TimestampMismatch`. A received `ErrorResponseMessage` is now reported
+  as `ErrorResponseReceived { channel_id, status, memo }` (.NET
+  `ErrorResponseReceivedEvent`, Go `EventTypeErrorResponseReceived`,
+  `"ErrorResponseReceived"` in TypeScript and React Native) and never
+  answered.
+
+  **Breaking — the `derec-proto` struct has a new field.** Rust code that
+  builds an `ErrorResponseMessage` literal must set `timestamp` (or use
+  `..Default::default()`). An `ErrorResponse` from a 0.0.8 peer carries no
+  timestamp and is still ignored as `TimestampMismatch`.
+
+- **Changed: a refused pairing is an event.** *(breaking; every SDK)*
+
+  A `PairRequest` refused under a protocol rule, a parameter range that does
+  not overlap this device's (`INCOMPATIBLE_PARAMETER_RANGE`) or a replica id
+  already in the group (`REPLICA_ID_CONFLICT`), is still answered with that
+  status whatever `auto_accept` or `auto_respond_on_failure` says, and no
+  channel is created. The responder's `process` now returns `PairingRefused
+  { channel_id, status, memo, error_code, message }` (.NET
+  `PairingRefusedEvent`, Go `EventTypePairingRefused`, `"PairingRefused"` in
+  TypeScript and React Native). `memo` is what the requester reads, written
+  from its side; for a parameter range it names the field, the requester's
+  range and the accepted one, as in
+  `` `shareSize` range [10, 500] does not overlap the accepted range [1000, 5000] ``.
+  `error_code` (`incompatible_parameter_range` or `replica_id_conflict`) and
+  `message`, the full local description, carry the reason to the
+  responder's application as `RequestFailed` does; neither is sent to the
+  requester. Once the refusal is handed to the transport it is reported,
+  even when that send or the cleanup of the pairing secret after it fails:
+  the failure follows as `RequestFailed` with `action_kind` `Pairing` and
+  `responded: true`. The initiator is unchanged: it fails with
+  `non_ok_status` when the `PairResponse` arrives, carrying the refusal's
+  status and memo. Any other failure of an inbound
+  `PairRequest` is still an error, since no channel exists to answer on.
+
+  **Breaking — the responder's refusal is no longer an error.** It used to
+  fail `process` with `IncompatibleParameterRange` or `ReplicaIdConflict`;
+  handle `PairingRefused` instead. An application matching events
+  exhaustively must handle the new event.
+
+- **Changed: a share carries a list of subshares.**
+  *(breaking wire and `derec-cryptography` API change; no behavior change)*
+
+  A share is what one helper holds; a subshare is one Shamir `(x, y)` pair,
+  `y = f(x)`. A share now carries one or more subshares instead of exactly
+  one pair, and the threshold `t` counts subshares.
+
+  This prepares weighted helpers: an owner who trusts one helper more can
+  give it more subshares, so it and fewer others can recover, while no single
+  helper ever holds enough subshares to recover alone. This format change on
+  its own gives every helper exactly one subshare; choosing weights is
+  described in "Added: weighted helpers" below.
+
+  - Wire: `DeRecShare.x` and `DeRecShare.y` are replaced by
+    `repeated Subshare subshares = 2` (`Subshare { bytes x = 1; bytes y = 2; }`),
+    and `secretId` and `version` move to 3 and 4.
+  - Merkle leaf: one leaf per share, committing to its subshares in order:
+    `SHA-256(0x00 ‖ u64_be(k) ‖ for each subshare: u64_be(len(x)) ‖ x ‖ u64_be(len(y)) ‖ y)`,
+    with `k` the number of subshares. Internal nodes are unchanged.
+  - `derec-cryptography`: `vss::share(threshold, weights: &[u64], msg, entropy)`
+    returns one `VSSShare` per weight; `VSSShare` carries
+    `subshares: Vec<Subshare>` in place of `x` and `y`. Every weight must be
+    in `1..threshold`. There are at most 128 shares (one Merkle leaf each,
+    tree depth 7); the weights' sum and the threshold are not themselves
+    capped, so `2 <= threshold <= sum(weights)`. `verify` rejects a share
+    with no subshares or a repeated x-coordinate.
+
+- **Added: weighted helpers.** *(feature; every SDK)*
+
+  `DeRecFlow::ProtectSecret` gains `weights`, a map from channel id to the
+  number of subshares that helper receives. **Breaking (Rust source):** the
+  field is required, so a `DeRecFlow::ProtectSecret { .. }` literal without
+  it stops compiling; pass an empty map for every helper at one subshare. The
+  map is the full assignment, not a patch: a paired helper not named in it
+  gets one subshare, so an empty (or absent) map gives every helper one, as
+  before, and resets any weights recorded earlier.
+
+  Weights are sticky. Each round writes the weight it resolved for every
+  paired helper to that helper's channel record, before anything is sent.
+  Weights change only through `start(ProtectSecret)`; there is no getter or
+  setter. The intended flow:
+  - Weights are the user's choice. Before `start(ProtectSecret)`, the app
+    shows the user each paired helper's current weight, pre-filled from its
+    own channel store (the stored `HelperChannel.weight`), and passes the
+    user's final choice as the whole map. Reading the stored weights first
+    is the normal flow.
+  - Every other `start(ProtectSecret)` the app makes, such as a republish
+    after editing the secrets or the follow-up after `restore`, must pass
+    the stored weights unchanged. A helper left out returns to `1`, which
+    silently undoes the user's choice.
+  - Only the publishes the library starts on its own (after pairing
+    completes, after a fingerprint is confirmed) reuse the stored weights by
+    themselves; a newly paired helper starts at `1`.
+
+  - `HelperChannel` gains `weight: u32`, its last field.
+    **Breaking (Rust source):** `HelperChannel` has no `Default`, so every
+    struct literal must set `weight` (`1` for an ordinary helper) or it stops
+    compiling. A record stored
+    before this change reads as `1`, and so does a stored `0`, which only a
+    writer that predates the field produces (for example a Go struct built
+    without `Weight`); the channel record schema stays at version 3. .NET's
+    `HelperChannel` and Go's `native.HelperChannel` gain a typed `Weight`,
+    passed to and from the core unchanged. Node, web and
+    React Native store the record as opaque bytes and need no change. Parsing
+    a stored helper record to read `Helper.weight` is safe: it is a small
+    integer, and the channel id comes from the store call's argument. What
+    the `ChannelStore` warning forbids is re-serialising a parsed record;
+    persist the original bytes.
+  - The roster carries the weight: `HelperInfo` gains `weight` (protobuf tag
+    7) and the v3 secret JSON a `weight` key per helper, omitted when `1`. An
+    absent key decodes as `1` and a `0` is malformed. The v3 major does not
+    change, and secrets encoded before this change decode unchanged.
+    `restore` and replica hydration write each helper's roster weight into
+    the `HelperChannel` they create, so a recovered or replica device
+    publishes with the same weights. The `SecretRecovered` /
+    `ReplicaSecretInstalled` / `ReplicaSecretReceived` events' `secret`
+    carries `weight` on every helper, and `restore` reads it back (absent
+    means `1`); the .NET, Go and TypeScript `Helper` types gain it.
+  - Every resolved weight is checked against the current threshold before
+    anything is written or sent, the stored ones included. Lowering
+    `with_threshold` to or below a stored weight makes the next publish fail
+    with `SharingError::InvalidWeight` and zero messages sent, for explicit
+    and library-initiated publishes alike. The pairing-time publish returns
+    the error from `process` (as a `ProcessError` carrying the message's
+    events) or `accept`; the fingerprint-time publish returns it from
+    `verify_fingerprint`, after the channel has been promoted. From
+    `accept` the pairing has completed and its response was sent, but
+    `PairingCompleted` is not returned; a retried `verify_fingerprint`
+    returns `true` and publishes nothing. In every case
+    `start(ProtectSecret)` with valid weights publishes.
+  - After `restore`, the first `start(ProtectSecret)` passes the stored
+    weights unchanged: `restore` wrote each roster `helpers[].weight` into
+    the channel records, and a helper left out returns to `1`.
+
+  `with_threshold` (`t`) now counts subshares, not helpers — with no
+  weights the two are the same, as before. The split runs when the paired
+  helpers' total weight is `>= t`; below that, helpers get nothing and
+  replicas still get the secret-only composite, exactly as before.
+  `SharingComplete.threshold_met` is `true` when the confirmed helpers'
+  combined weight (not their count) is `>= t`; `confirmed_count` and
+  `failed_count` keep counting helpers.
+
+  Below `t`, `start(ProtectSecret)` still advances the version and saves the
+  snapshot as latest — unchanged behavior, now documented. No helper gets a
+  `ProtectSecretStarted` / `ProtectSecretFailed`, and with no replica paired
+  either the call returns `Ok` with no events; it is not an error. An app
+  can tell this apart from an actual round by summing the weights it is
+  about to assign (or the stored weights, for a library-initiated publish)
+  against `t` before calling, or by counting the returned helper events
+  after calling. Weighted helpers make this more reachable than before: a
+  configuration that relies on heavier helpers, e.g. two helpers at weight
+  2 against `t = 3` (total weight 4), drops below threshold if a publish
+  leaves both out of the weights map, resetting each to weight 1 under the
+  full-assignment rule above, for a total of 2 — a restore follow-up
+  publish that does not pass the stored weights unchanged is a typical
+  case.
+
+  Validation runs in `start`, before anything is sent or a version is
+  consumed: every key must be a currently paired helper channel of this
+  secret, and every weight must satisfy `1 <= weight < threshold`. An
+  invalid entry fails the call as `SharingError::InvalidWeight { channel_id,
+  weight }` (FFI/error code 65, `invalid_weight`), run even when the
+  weights sum to less than the threshold.
+
+  Recovery cost grows quadratically with the total number of subshares
+  (measured in release mode on a laptop: about 0.2 s at 200, 5.5 s at 1,000
+  and 87 s at 4,000 subshares per attempt), while splitting stays cheap, so
+  nothing at sharing time reveals it. The new builder option
+  `with_max_subshares(max)` caps a round's total: a `ProtectSecret` round
+  above it — library-initiated publishes included, at their stored weights
+  — fails in `start`, before anything is sent or a version is
+  consumed, as `SharingError::TooManySubshares { subshares, max }`
+  (FFI/error code 66, `too_many_subshares`). Unset means no cap, as before;
+  a cap below the threshold fails `build()` with `InvalidInput`. Recovery
+  applies no cap, since a recovering device cannot know the one the secret
+  was shared under. The `vss::share` / `recover` and `request::split`
+  primitives apply none either; callers bound the total themselves. Each SDK
+  exposes the option as `WithMaxSubshares(ulong)` in .NET,
+  `Config.MaxSubshares` (`*uint64`) in Go and `withMaxSubshares(bigint |
+  number)` in Node/web/React Native, and the code as
+  `DeRecCode.TooManySubshares` / `derec.CodeTooManySubshares`. The FFI
+  `derec_protocol_new` config JSON carries it as `max_subshares`, a
+  decimal-string `u64`; absent or `null` means no cap.
+
+  `ProtectSecretStarted` and `ProtectSecretFailed` gain `weight`: the number
+  of subshares sent (or meant to be sent) to that channel this round, which
+  is also the weight now stored for it: its map entry, `1` for a helper the
+  map does not name, or the stored weight on a library-initiated publish.
+
+  The stateless `request::split` primitive takes its channels as
+  `&[WeightedChannel]`, where `WeightedChannel = (ChannelId, u32)` pairs each
+  channel with its weight; the caller lists every channel, an ordinary
+  helper at weight `1`. Every weight must be in `1..threshold`. The FFI
+  `protect_secret` export takes the same list as aligned `channels_ptr` /
+  `weights_ptr` arrays of `channels_len` entries, and the WASM `split`
+  export as an array of `[channelId, weight]` tuples. Each SDK carries the
+  same pairing under a `WeightedChannel` type: a `[channelId, weight]`
+  tuple in Node/web/React Native, a `WeightedChannel(ChannelId, Weight)`
+  record struct in .NET, a `WeightedChannel{ChannelID, Weight}` struct in
+  Go. `split`'s `threshold > channel_count` check is now
+  `threshold > total subshares`.
+
+  At recovery, the owner now applies its own configured `max_share_size` to
+  each received share before decoding it, exactly as a helper already does
+  for an inbound `StoreShareRequest`. An oversized share is reported as
+  `RecoveryShareCorrupted { reason: Malformed }` and set aside; recovery
+  still completes from the shares that fit. No configured limit means no
+  cap, as before.
+
+- **Added: the owner records each share's subshare count.**
+  *(feature; every SDK)*
+
+  A helper's weight can change between versions, and `HelperChannel.weight`
+  only describes the latest round. The owner now records, on each share it
+  stores, how many subshares that share carries, so it can tell how many
+  subshares each verified helper holds for any version.
+
+  - `Share` gains `subshares: Option<u32>`, its last field. The library sets
+    it on every share the owner side saves: the copy it keeps of what it sent
+    each helper, and the copies a replica Destination mirrors from its
+    Source. It is always `None` on a helper's stored share; a helper has no
+    notion of how many subshares it was given.
+  - Owner shares stored before this change read back as `None`, meaning the
+    count was not recorded. The library never backfills them; recomputing
+    one from the stored bytes is the application's choice.
+  - `ShareVerified` gains `subshares: Option<u32>`: the count on the owner's
+    stored share for that channel and version, so it is the weight of the
+    round that published the version, not the helper's current weight, and
+    `None` when that share predates the field.
+  - **Judging a version's recoverability:** sum `subshares` over the
+    `ShareVerified` events for that version and compare the sum with their
+    `ShareVerified.threshold` (see *the threshold is recorded*). If either
+    value is `None` on any of those events, the result is unknown: a `None`
+    count is not `0` or `1`.
+  - Store records: the FFI/WASM share record gains `subshares`, omitted when
+    there is none; absent or `null` reads as none. Every share store must
+    persist it as given and return it unchanged (a nullable column in SQL).
+    .NET's `Share` gains `uint? Subshares` (an optional, last positional
+    parameter) and `ShareVerifiedEvent` `uint? Subshares`; Go's `Share` gains
+    `Subshares *uint32` and `protocol.Event` `Subshares *uint32`; the Node,
+    web and React Native `Share` gain `subshares?: number | null` and the
+    `ShareVerified` event `subshares?: number`.
+
+  **Breaking (Rust source):** a `Share { .. }` struct literal must set
+  `subshares` (`None` when it is not an owner-side share) or it stops
+  compiling, and a pattern that lists `ShareVerified`'s fields without `..`
+  must name `subshares`.
+
+- **Added: the threshold is recorded.**
+  *(feature; every SDK)*
+
+  The threshold `t` a version was split with used to be builder
+  configuration only. No store held it and the roster did not carry it, so a
+  restored device split its next publish at whatever its own configuration
+  said, and an owner verifying an old version had no `t` to compare its
+  verified subshares with. `t` is now data, like the helper weights.
+
+  - **The round's `t`:** `DeRecFlow::ProtectSecret` gains
+    `threshold: Option<u32>`. A round splits at that value when given,
+    otherwise at the stored `UserSecrets::threshold`, otherwise at the
+    builder's `with_threshold`, which is now the starting `t` for a secret
+    with nothing stored. Apps that never pass `threshold` behave as before
+    until something is stored. Publishes the library starts on its own never
+    pass one, so they use the stored `t`.
+  - **Validation:** the resolved `t` must be at least `2`
+    (`SharingError::InvalidThreshold`), above every resolved weight
+    (`SharingError::InvalidWeight`) and no greater than a
+    `with_max_subshares` cap (`Error::InvalidInput`). Every check runs
+    before a version is chosen; a failing round writes and sends nothing.
+    The below-threshold rule (no split, the version still advances) and
+    `SharingComplete.threshold_met` are judged against the round's own `t`.
+  - **Stored `t`:** `UserSecrets` gains `threshold: Option<u32>`. Every
+    publish writes the `t` it used on its own snapshot, saved after
+    distribution, and no earlier snapshot is rewritten: a round that fails
+    before its snapshot is saved leaves the previous `t` in place. A snapshot
+    written before this change reads as `None`. The round state (`SharingRoundState`, and
+    `StateItemRecord` on the wire) gains `threshold`, absent on rows written
+    before this change, which are judged against the builder's `t`.
+  - **Roster:** `Secret` gains `threshold: Option<u32>` (prost tag 4). In the
+    v3 JSON encoding it is `threshold`, omitted when absent; a value below `2`
+    is malformed. The v3 major stays and existing goldens are unchanged; a new
+    golden vector holds a roster with a threshold. `SecretRecovered.secret`
+    carries it, and every SDK passes it back to `restore`.
+  - **Restore and hydration:** `restore` writes the roster's `t` into the
+    snapshot, so the publish after a restore keeps it; pass `threshold` on
+    `start(ProtectSecret)` to change it. A roster written before this change
+    carries none, and the builder's `t` applies. Replica hydration writes the
+    roster's `t` the same way, and a roster threshold below `2` is refused.
+  - **Per version:** `Share` gains `threshold: Option<u32>`, with the same
+    rules as `subshares`: set on owner-side shares only (the round's `t` on
+    what the owner sends, the roster's `t` on a replica Destination's
+    mirrored copies), `None` on a helper's share and on rows written before
+    this change, and never backfilled. `ShareVerified` gains
+    `threshold: Option<u32>`, read from the same owner row, so verifying an
+    old version reports its own `t`.
+  - **Store records and SDKs:** the FFI/WASM share and user-secret records
+    gain `threshold`, omitted when there is none; absent or `null` reads as
+    none. Every share and user-secret store must persist it as given (a
+    nullable column in SQL), and a state store that maps `StateItemRecord`
+    fields one by one must add `threshold`. .NET gains `Share.Threshold`,
+    `UserSecrets.Threshold`, `StateItem.Threshold`,
+    `ProtectSecretParams.Threshold`, `ShareVerifiedEvent.Threshold` and
+    `Secret.Threshold`; Go gains the same fields as `*uint32`; Node, web and
+    React Native gain `threshold` on `Share`, `UserSecrets`,
+    `ProtectSecretParams`, the `ShareVerified` event and the recovered
+    `secret`.
+  - .NET now reads each helper's `weight` from a recovered secret, so
+    `RestoreAsync` hands the roster's weights back instead of resetting every
+    helper to 1.
+
+  **Breaking (Rust source):** a `DeRecFlow::ProtectSecret { .. }` struct
+  literal must set `threshold` (`None` keeps the stored or builder `t`); a
+  `Share { .. }`, `UserSecrets { .. }`, `SharingRoundState { .. }` or
+  `Secret { .. }` literal must set `threshold`; and a pattern that lists the
+  fields of `ProtectSecret` or `ShareVerified` without `..` must name
+  `threshold`.
+
+- **Fixed: `restore` refused an explicit `null` `communication_info`.**
+  *(bug fix; Node.js, web, every FFI SDK)*
+
+  The recovered secret's helper and replica-member `communication_info` now
+  read an explicit `null` as an empty map, as an absent key already was, so
+  it follows the same rule as `transports` and `weight` beside it.
+
+- **Fixed: a helper being unpaired could still receive a share.**
+  *(behavior change; every SDK)*
+
+  Under `UnpairAck::Required` (the default) an owner's helper channel kept
+  the status `Paired` while the unpair awaited the helper's answer, so a
+  `ProtectSecret` started in that window sent the departing helper a share
+  and named it in the roster, and the helper then deleted it. The channel is
+  now `ChannelStatus::Unpairing` from the moment the request is sent until the
+  helper answers or the acknowledgement window elapses. It keeps its key, so
+  the answer is read as before, but no flow selects it: not sharing,
+  recovery, verification or channel-info updates. A non-`Ok` answer emits
+  `UnpairRejected` and returns the channel to `Paired`. `start(Pairing)` on
+  an `Unpairing` channel fails with `ChannelAlreadyPaired`, as on a `Paired`
+  one. A channel still `Pending` is left as it is. `Unpairing` was already
+  in every SDK's `ChannelStatus` for replica members; a channel store or UI
+  that lists helper channels can now see it on a helper row too.
+
+- **Changed: `restore` unpairs its recovery channels like any other
+  unpair.** *(behavior change; every SDK)*
+
+  `restore` forced `UnpairAck::NotRequired` on its recovery channels and
+  dropped them as the requests went out, so each recovery helper's answer
+  arrived on a channel that no longer existed and `process` failed with
+  "unknown channel_id". It now follows the configured `unpair_ack`, through
+  the same path as `start(Unpair)`. It returns an `UnpairStarted` per
+  recovery channel; under the default `UnpairAck::Required` each channel is
+  `Unpairing`, and its `Unpaired` arrives later, from `process` on the
+  helper's answer or from the timeout sweep, instead of in `restore`'s
+  return value. The publish that follows `restore` still reaches only the
+  restored helpers. A request that cannot be sent is handled as before:
+  `UnpairFailed`, then `Unpaired`, in `restore`'s events. With
+  `UnpairAck::NotRequired` configured, `restore` behaves as it did.
+
+- **Fixed (Go): `Restore` refused a helper built without a `Weight`.**
+  *(bug fix; Go)*
+
+  `protocol.Helper` sent an unset `Weight` as `0`, which restore refuses.
+  It now leaves a zero `Weight` out, so restore reads it as `1`, as it does
+  an omitted weight from every other SDK. A roster passed back from
+  `SecretRecovered` is unaffected: it always carries its weights.
+
+- **Changed: `build()` validates the configured parameter range.**
+  *(behavior change; every SDK)*
+
+  A value of `0` in a `ParameterRange` field means "no bound". For each of
+  `shareSize`, `timeBetweenVerifications`, `timeBetweenShareUpdates`,
+  `unresponsiveDeletionTimeout` and `unresponsiveDeactivationTimeout`, `min`
+  and `max` must be `>= 0`, and `min <= max` unless `max` is `0` (no upper
+  bound). A range that breaks either rule now fails `build()` with an
+  `InvalidInput` error naming the field.
+
+  **Behavior change — some ranges accepted before now fail.** A range with a
+  negative value, or with `min` greater than a non-zero `max`, used to build
+  and is now rejected; correct the range before upgrading.
+
+- **Changed: pairing treats `0` as no bound and rejects a malformed peer range.**
+  *(behavior change; every SDK)*
+
+  The parameter-range overlap check now follows the same convention as
+  `build()`: a `max` of `0` means no upper bound, so it overlaps any `min` on
+  the other side (a `min` of `0` already meant no lower bound). A peer range
+  that is malformed under the `build()` rules (a negative value, or `min`
+  greater than a non-zero `max`) now fails pairing as
+  `IncompatibleParameterRange` naming the field, with both sides' raw values;
+  a responder reports it as `PairingRefused` (see "a refused pairing is an
+  event" above).
+
+  **Behavior change — some pairings flip.** A pairing that used to fail now
+  succeeds when the only conflict was a `max` of `0`, e.g. a peer advertising
+  `maxShareSize = 0` against a local `minShareSize > 0`. A pairing that used to
+  pass now fails when the peer's range is malformed.
+
+- **Added: helpers enforce share size, and the share store can refuse a share or a verification.**
+  *(feature; every SDK)*
+
+  A helper configured with a parameter range now checks each inbound
+  `StoreShareRequest` against its own `minShareSize`/`maxShareSize` (inclusive;
+  a `max` of `0` means no upper bound) and answers a share outside it with
+  `SIZE_LIMIT_EXCEEDED`, memo `"share size is outside the helper's accepted
+  range"`. The check runs before `ActionRequired` and before auto-accept, so
+  the user is never asked. No configured range means no check.
+
+  Frequency limits stay with the application, enforced through its share
+  store. On a helper channel, `save` (reached only for a new share version; an
+  idempotent re-send never calls it) and the new `record_verification` (called
+  once per accepted verification challenge, after the challenged share is
+  found) may refuse with a `Refusal`. The library answers the owner with the
+  mapped status, and the helper's call returns `[NoOp]`:
+
+  | `Refusal` | Status | Memo |
+  |---|---|---|
+  | `TooFrequent` | `TOO_FREQUENT` | `"refused by the helper: too frequent"` |
+  | `SizeLimitExceeded` | `SIZE_LIMIT_EXCEEDED` | `"refused by the helper: size limit exceeded"` |
+  | `Rejected` | `REJECTED` | `"refused by the helper"` |
+
+  The owner sees `ShareRejected` or `ShareVerifyRejected` with that status. Any
+  other store error is a failed request, reported as `RequestFailed` (see
+  "every authenticated request is answered exactly once" above). How each
+  SDK refuses:
+  - **Rust:** return `Err(ShareStoreError::Refused(Refusal::TooFrequent))`.
+  - **.NET:** throw `new ShareStoreRefusedException(ShareStoreRefusal.TooFrequent)`.
+  - **Go:** return `&protocol.ShareStoreRefusedError{Refusal: protocol.RefusalTooFrequent}`.
+  - **TypeScript (Node.js, web) and React Native:** throw or reject with
+    `shareStoreRefusal("too_frequent")` (also `"size_limit_exceeded"`,
+    `"rejected"`).
+  - **FFI:** `save` and `record_verification` return `3`
+    (`SizeLimitExceeded`), `4` (`TooFrequent`) or `10` (`Rejected`) to refuse;
+    `0` is success and any other non-zero value a backend failure.
+
+- **Breaking: share stores implement `record_verification`.**
+  *(breaking; .NET, Go, TypeScript, React Native, FFI)*
+
+  - **Rust:** `DeRecShareStore::record_verification` has a default body that
+    accepts every verification; nothing to change.
+  - **.NET:** add `void RecordVerification(ulong secretId, ulong channelId, uint version)`
+    to every `IShareStore`.
+  - **Go:** add `RecordVerification(secretID, channelID uint64, version uint32) error`
+    to every `protocol.ShareStore`.
+  - **TypeScript (Node.js, web) and React Native:** add
+    `recordVerification(secretId: string, channelId: string, version: number): Promise<void>`
+    to every `ShareStore`. In a plain-JS (non-TypeScript) app, nothing enforces
+    this at compile time: a `ShareStore` without `recordVerification` makes
+    every verification a store failure: with the default
+    `auto_respond_on_failure = false`, the helper gets `RequestFailed`, and
+    unless it answers the token the owner sees its challenges time out.
+  - **FFI:** `ShareStoreCallbacks` gains a `record_verification` slot right
+    after `keep_list`; every later field moves. `save`'s return codes `3`,
+    `4` and `10` now mean a refusal (`SizeLimitExceeded`/`TooFrequent`/
+    `Rejected`) rather than a backend failure; an FFI application that
+    returned one of those values for a backend failure must change it.
+
+  An application with no verification limit returns success.
+
+- **Changed: one timestamp per message, checked on receipt.**
+  *(behavior change; every SDK)*
+
+  Every channel message now carries one timestamp, its send time, in both the
+  outer envelope and the encrypted inner message; replies included. After
+  decrypting, the receiver ignores a message whose two timestamps differ, or
+  where either or both are absent, as `MessageIgnored` with the new reason
+  `TimestampMismatch` (`IgnoreReason::TimestampMismatch` in Rust,
+  `IgnoreReason.TimestampMismatch` in .NET, `IgnoreReasonTimestampMismatch`
+  in Go, `"TimestampMismatch"` in TypeScript and React Native). Nothing is
+  stored and nothing is sent back. `ErrorResponseMessage` carries the
+  timestamp too (see its entry above).
+
+  **Breaking — 0.0.8 peers' replies are ignored.** A 0.0.8 peer stamps the
+  inner message of its replies separately from the envelope, so a 0.0.9 peer
+  ignores them as `TimestampMismatch` and the flow they answer never
+  completes. Upgrade both sides together. An application matching
+  `IgnoreReason` exhaustively must handle the new value.
+
+- **Fixed: the owner kept proofs of shares its helpers never confirmed.**
+  *(bug fix; every SDK)*
+
+  The owner stores a proof of each helper's share (the exact bytes it sent)
+  to check that helper's verification answers. When a sharing round settled
+  a channel as failed, the helper rejected the share (`ShareRejected`) or the
+  round timed out, the proof stayed, so a later verification challenged a
+  helper for a share it never held. The owner now deletes that channel's
+  proof for the round's version when the round settles it as failed. A
+  stored proof is now either confirmed by its helper or part of a round still
+  open, and a late `ShareConfirmed` after the round settled is still emitted
+  but stores nothing. A replica Destination never sees `SharingComplete`
+  and keeps its proofs (next entry).
+
+  **What an application must do:** verify only versions whose round
+  completed (`SharingComplete`). A channel with no proof at the requested
+  version now reports `VerifySharesFailed` with `NoProof` (next entry).
+
+- **Fixed: the owner kept proofs of versions its helpers had dropped.**
+  *(bug fix; every SDK)*
+
+  A helper that stores a version deletes every other version the request's
+  `keepList` leaves out, but the owner kept its proofs of those versions.
+  Verifying one challenged helpers that no longer held it, and they answered
+  `ShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`). Now, when a helper
+  confirms a version, the owner deletes its proofs for that channel whose
+  versions the `keepList` sent in that round leaves out; the confirmed
+  version always stays. Verifying a dropped version reports
+  `VerifySharesFailed` with `NoProof` and sends no challenge. A helper that
+  rejects the round or never answers keeps its older versions, and the owner
+  keeps their proofs. With no keep list (`keep_list` returns `None`) nothing
+  is deleted, as before.
+
+  The owner errs towards keeping a proof when the order is uncertain: a
+  confirmation removes nothing while the owner holds a newer proof for that
+  channel (the helper ignores an older request's `keepList`), and a version
+  whose round still waits on that helper keeps its proof. Such a proof goes
+  with a later confirmation whose `keepList` leaves it out.
+
+  A replica Destination never sees the helpers' answers, and it keeps every
+  proof it receives: it never deletes one on its own, and freeing that
+  storage is the application's concern. Verifying there a version that a
+  helper refused, or later dropped under the `keepList`, gets
+  `ShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`) from that helper, where the
+  Source reports `NoProof`. An application may delete such rows from the
+  Destination's share store; verifying a version whose rows are gone then
+  reports `VerifySharesFailed` with `NoProof`.
+
+  The sharing-round state row carries the round's keep list, as `keep_list`
+  in the state JSON (`StateItem.KeepList` in .NET and Go). A row written by
+  an earlier version decodes with an empty list, so a round open across the
+  upgrade removes no proof when it settles. A custom state store that keeps
+  rows as opaque JSON needs no change; one that maps fields must carry
+  `keep_list`.
+
+- **Fixed: a helper stored an invalid share and never answered.**
+  *(bug fix; every SDK)*
+
+  A helper checked an inbound share's encoding and Merkle proof only after
+  storing it and applying its `keepList`. A share that did not decode or did
+  not verify was therefore kept, could remove the valid versions the
+  `keepList` left out, and made `process` return an error: the owner got no
+  `StoreShareResponse` and waited out the round, and the batch's other events
+  (`AutoAccepted` included) were lost. The share is now checked before
+  `ActionRequired` is raised and again when a `StoreShare` action is
+  accepted, before anything is stored or removed. A share that does not
+  decode is answered with `FORMAT_ERROR`, one that does not verify against
+  its commitment (no subshares, a repeated `x`, or a wrong Merkle path) with
+  `VERIFICATION_FAILED`, whatever `auto_respond_on_failure` says, and
+  `process` returns normally. The owner sees `ShareRejected` with that status.
+
+  The helper now reports every refusal the library makes on a share with the
+  new event `ShareRefused { channel_id, version, status, memo }` (.NET
+  `ShareRefusedEvent`, Go `EventTypeShareRefused`, `"ShareRefused"` in
+  TypeScript and React Native), carrying what the owner was sent. Besides the
+  two cases above, that covers a share outside the helper's size range
+  (`SIZE_LIMIT_EXCEEDED`) and a different share at an already-stored version
+  (`VERSION_CONFLICT`), which used to return `[NoOp]`. A refusal from the
+  application's own share store still returns `[NoOp]`. An application
+  matching events exhaustively must handle the new event.
+
+- **Fixed: a group member applied part of a malformed copy of the secret and
+  never answered.** *(bug fix; every SDK)*
+
+  A member receiving a copy of the secret from another member wrote the
+  roster's helper channels and keys before finding that its share map named a
+  helper the roster did not list, leaving a partial copy behind, and stored
+  the share map's entries without checking them. A copy that did not decode,
+  or whose version or group key disagreed with the request, made `process`
+  return an error: the publisher got an answer only with
+  `auto_respond_on_failure` on, and the batch's events were lost. The whole
+  copy is now checked before anything is written, each share map entry by the
+  rule set a helper applies to a share. A copy that does not decode or is not
+  self-consistent is answered with `FORMAT_ERROR`, one carrying a share that
+  does not verify with `VERIFICATION_FAILED`, whatever
+  `auto_respond_on_failure` says, and `process` returns normally. The
+  publisher sees `ReplicaSyncRejected` with that status; a member refusing
+  its admission handover answers on the group channel, under the group key
+  the handover carried, since the admitter no longer holds the pairing key. A
+  copy served by a catch-up is checked the same way; when refused, nothing is
+  written, nothing is answered, and `process` returns normally.
+
+  The receiving member reports the refusal with the new event
+  `ReplicaSecretRefused { channel_id, from_replica_id, secret_id, version, status, memo }`
+  (.NET `ReplicaSecretRefusedEvent`, Go `EventTypeReplicaSecretRefused`,
+  `"ReplicaSecretRefused"` in TypeScript and React Native), carrying what the
+  publisher was sent. An application matching events exhaustively must handle
+  the new event.
+
+- **Changed: every verification challenge ends in exactly one verdict event.**
+  *(breaking; every SDK)*
+
+  Each challenged channel now ends with exactly one of:
+
+  | Event | Meaning |
+  |---|---|
+  | `ShareVerified { channel_id, version, subshares, threshold }` | The helper proved it holds the exact share. `subshares` is described under *the owner records each share's subshare count*, `threshold` under *the threshold is recorded*. |
+  | `ShareVerifyInvalid { channel_id, version }` | **New.** The helper's proof does not match the share this device stored. |
+  | `ShareVerifyRejected { channel_id, version, status, memo }` | The helper refused the challenge with a non-OK status. |
+  | `VerifySharesFailed { channel_id, version, reason, error }` | No verdict could be reached on this device. |
+
+  `VerifySharesFailed` gains `reason`, one of `"NoSharedKey"` (the channel
+  has no shared key), `"NoProof"` (this device holds no proof of that
+  channel's share at that version) or `"DispatchFailed"` (the challenge could
+  not be sent, or the proof could not be loaded). Starting verification on a
+  channel with no proof sends nothing and emits `VerifySharesFailed` with
+  `NoProof` immediately; so does a response that arrives after the proof was
+  removed. A non-OK response is `ShareVerifyRejected` whether or not a proof
+  is held. A late response to an earlier challenge that a newer one replaced
+  is ignored as `MessageIgnored` with the new reason `StaleResponse`, and the
+  current challenge stays open, so its own answer still completes it. A
+  response missing its `result` is still an error.
+
+  **Breaking — a stale response used to be an error.** A response that did
+  not bind to the outstanding challenge used to return `ProtocolViolation`
+  (code 7) and consume the challenge; it is now `MessageIgnored { reason:
+  StaleResponse }` and the challenge is kept.
+
+  **Breaking — an invalid proof is an event, not an error.** `process()`
+  used to fail on a proof that did not match; it now returns
+  `ShareVerifyInvalid`. Treat it as a sign of a damaged or dishonest helper,
+  where the old error handler did.
+
+  **Breaking — `VerifySharesFailed.reason`.** The new field is
+  `VerifyFailureReason` in Rust, a `VerifyFailureReason` string constant on
+  `VerifySharesFailedEvent.Reason` in .NET, a `VerifyFailureReason*`
+  constant on `Event.Reason` in Go, and the `VerifyFailureReason` union in
+  TypeScript and React Native. A Rust application that destructures
+  `VerifySharesFailed` must add `reason` or `..`, and an application
+  matching `IgnoreReason` exhaustively must handle `StaleResponse`.
+
+- **Added: one builder call sets every store.** *(feature; every SDK)*
+
+  The five stores `build()` requires can be set in one call. Each individual
+  store setter remains, and may be called again: the last call for a store
+  wins, including one made after the bundle.
+  - **Rust:** `with_stores(DeRecStores { channels, shares, secrets,
+    user_secrets, state })`.
+  - **.NET:** `WithStores(new DeRecStores(channelStore, shareStore,
+    secretStore, userSecretStore, stateStore))`.
+  - **TypeScript (Node.js, web) and React Native:** `withStores({
+    channelStore, shareStore, secretStore, userSecretStore, stateStore })`,
+    typed as the new `StoresInit` interface.
+  - **Go:** see the next entry.
+
+- **Breaking (Go): `protocol.New` takes a `protocol.Stores`.** *(breaking; Go)*
+
+  `protocol.New(channelStore, shareStore, secretStore, userSecretStore,
+  stateStore, transport, cfg)` is now `protocol.New(stores, transport, cfg)`.
+  Migrate by bundling the five stores:
+
+  ```go
+  p, err := protocol.New(protocol.Stores{
+  	Channel:    channelStore,
+  	Share:      shareStore,
+  	Secret:     secretStore,
+  	UserSecret: userSecretStore,
+  	State:      stateStore,
+  }, transport, cfg)
+  ```
+
+- **Docs: the transport callouts say which answer is matched by trace id.**
+  *(docs; every SDK)*
+
+  The README transport notes now say that matching a reply by `trace_id`
+  applies only to the `200 OK` answer on the same connection; a push carries
+  no reply to match. `derecmessage.proto` now states the timestamp check, and
+  `VerifyShares` after `restore` is documented as reporting `NoProof` per
+  channel, not `InvalidInput`.
 
 - **Added (Go): the gRPC transport service descriptor.** *(Go)*
 
@@ -25,8 +822,9 @@ all of them unless it names a specific binding.
     current v3 schema (`transports`, `role` as `"Source"` / `"Destination"`),
     what changed from v2, and that majors 3 and 2 decode.
   - **Builder setters:** `with_auto_respond_on_failure` now says only
-    failures after decryption are answered, with the status each maps to,
-    and that `process` still returns the error. `with_auto_reply_to` names
+    failures after decryption are answered, with the status each maps to
+    (the full contract is in "every authenticated request is answered
+    exactly once" above). `with_auto_reply_to` names
     `replyToTransports`. `with_own_transports` says the library does not rank
     endpoints; peers try them in the listed order.
   - **`UpdateChannelInfo`:** reaches helper channels only, and replica
@@ -43,6 +841,161 @@ all of them unless it names a specific binding.
   - **`SecretKind::PairingContact`:** is written by the party that scans a
     contact and by the creator of a `NoKeys` contact.
   - **TypeScript `DeRecError.channel_ids`:** refers to `restore_conflict`.
+
+- **Added: `DeRecProtocolConfig` and `with_config`.** *(feature; every SDK)*
+
+  Applications load settings as a whole: general settings from the
+  environment or a config file, per-user settings from a user record.
+  `DeRecProtocolConfig` is one serializable struct holding every builder
+  data setting (threshold, max subshares, timeouts, parameter range,
+  auto-accept, auto-respond-on-failure, auto-reply-to, unpair-ack,
+  unsafe-connection, communication info, own transports, replica id), with
+  every field optional. `with_config(config)` applies only the fields that
+  are set; the per-option setters (`with_threshold`, `with_timeouts`, …)
+  stay and still work one value at a time.
+
+  **Canonical JSON**, shared by every SDK — the shape the FFI's
+  `derec_protocol_new` already accepted, minus `secret_id`: keys are
+  `snake_case`; `replica_id` and `max_subshares` (`u64`) are decimal
+  strings; `timeouts` fields are whole seconds, each independently
+  optional; nested objects (`timeouts`, `parameter_range`, `auto_accept`,
+  `own_transports` entries) use their existing shapes. **Unknown keys are
+  rejected at every nesting level**, so a misspelled key fails to parse
+  instead of being silently ignored — Rust and WASM reject it where the
+  config is parsed (`with_config`/`withConfig`, and the FFI's
+  `derec_protocol_new`); .NET and Go reject it in their own JSON readers
+  (`JsonException` / `json: unknown field`); React Native forwards every
+  key as given and relies on the library's rejection at `build()`. `null`
+  now means "unset" for every key, where the FFI's `derec_protocol_new`
+  previously treated `null` as a parse error for some of them.
+
+  **Layering:** a general config, then a per-user config, then individual
+  setter calls — last write wins, per field. A nested object (e.g.
+  `auto_accept`) is replaced as a whole unit by a later config that sets
+  it, except `timeouts`, whose per-field seconds merge individually, so a
+  later config that sets only `inbound_message_secs` keeps the
+  `sharing_round_secs` an earlier config set.
+
+  **Validation happens in `build()`**, with the same rules as the
+  per-option setters — a `threshold` of `1` from a config fails exactly as
+  `with_threshold(1)` does.
+
+  Per SDK: Rust `DeRecProtocolBuilder::with_config(DeRecProtocolConfig)`;
+  WASM, Node, web and React Native `withConfig(config)`; .NET
+  `WithConfig(DeRecProtocolConfig)`; Go has no builder — `protocol.Config`
+  embeds `DeRecProtocolConfig` (`Config{SecretID, DeRecProtocolConfig}`),
+  and layering is `json.Unmarshal` of each layer into
+  `cfg.DeRecProtocolConfig` in turn (not `Config`, which also carries
+  `SecretID`), last write wins per field through a custom
+  `UnmarshalJSON`.
+
+- **Changed (breaking, Rust): `own_transports` leaves the builder's
+  typestate.** *(breaking; Rust)*
+
+  `DeRecProtocolBuilder` now has 6 type parameters, down from 7 — the
+  `OwnTransport` slot is gone. `with_own_transports` is now an ordinary
+  setter, callable repeatedly (the last call wins) and reachable from
+  `with_config`. `build()` enforces the requirement at run time instead of
+  compile time: no own transports set, or an empty list, now returns
+  `InvalidInput("own transports must not be empty: …")` (the message is
+  unchanged) rather than failing to compile. This matches what .NET, Go,
+  TypeScript and React Native already did at run time. Code that names the
+  builder's type parameters (in a type annotation, a type alias or a
+  function signature) must drop the removed `OwnTransport` parameter.
+
+- **Changed (breaking, Go): `Config`'s optional fields are now
+  pointers.** *(breaking; Go)*
+
+  The data fields of `protocol.Config` moved into an embedded
+  `DeRecProtocolConfig`, so a struct literal must name it:
+  `Config{SecretID: id, DeRecProtocolConfig: DeRecProtocolConfig{…}}`;
+  promoted fields (`cfg.Threshold`, …) still read the same. `AutoAccept`,
+  `UnpairAck`, `AutoRespondOnFailure`, `AutoReplyTo` and `UnsafeConnection`
+  are now `*AutoAcceptPolicy` / `*UnpairAck` / `*bool`, so a layer can
+  express "unset" — a config that used to set one of these to its
+  zero value must now take its address.
+
+- **Changed (breaking, TypeScript source): `SenderKind`, `ContactMode`,
+  `FlowKind` and `StatusEnum` are declared as the frozen objects they are.**
+  *(breaking; Node.js, Web)*
+
+  The declarations said `enum`, which promises a reverse mapping
+  (`StatusEnum[8]`) that the shipped objects never had, so the lookup
+  type-checked and returned `undefined`. Each is now a `const` object plus a
+  type of its values: `StatusEnum.Rejected` works as a value and as a type,
+  `StatusEnum[8]` no longer compiles, and assigning an arbitrary `number` to
+  a `StatusEnum` no longer compiles. React Native is unchanged: its enums
+  are real TypeScript enums and keep the reverse mapping.
+
+- **Changed (breaking, Rust): pairing import paths are shorter.**
+  *(breaking; `derec-cryptography`)*
+
+  `derec_cryptography::pairing::pairing_ecies` is now
+  `derec_cryptography::pairing::ecies`, `pairing::pairing_mlkem` is now
+  `pairing::mlkem`, and `pairing::envelope::DerecEncryptionError` is now
+  `pairing::DerecEncryptionError`, next to `DerecPairingError`. Their
+  contents are unchanged; only the import paths move. The SDKs do not expose
+  these items and are unaffected.
+
+- **Fixed: Node.js and Web events now match their declarations.**
+  *(bug fix; Node.js, Web)*
+
+  Byte fields on events (`ActionRequired.action`, `RequestFailed.action`, a
+  recovered or synced secret's `shared_key`, `id` and `data`, a share's
+  `committed_share`) arrived as plain arrays of numbers although
+  `index.d.ts` declares `Uint8Array`; they are now `Uint8Array`. An absent
+  `author_replica_id`, `held_author_replica_id` or
+  `incoming_author_replica_id` arrived as `undefined` although it is declared
+  `string | null`; it is now `null`, as it already was in React Native. Code
+  that compared those fields with `=== undefined`, or treated byte fields as
+  arrays, must be updated.
+
+- **Changed: the Node.js and Web bindings reject malformed input instead of
+  coercing it.** *(breaking; Node.js, Web)*
+
+  Numeric arguments (`withThreshold`, `restore`'s version, `createContact`'s
+  contact mode, `start`'s flow kind, `reject`'s status) must be integers in
+  range: `withThreshold(-1)` and `withThreshold(2.7)` used to become
+  4294967295 and 2, and now fail with `decode_error`. A `ProtectSecret`
+  secret missing `id`, `name` or `data`, a `secrets` value that is not an
+  array, and a non-string `description` or unpair `memo` are errors rather
+  than empty or dropped values. The same applies to what an application's
+  stores return: a version that is not a `u32`, a user-secret entry missing a
+  field, a non-string `description` or `author_replica_id`, or a non-boolean
+  from `ChannelStore.remove` or `StateStore.remove` is a store error. The FFI
+  bindings already rejected all of these.
+
+- **Changed: React Native primitives range-check their numeric arguments.**
+  *(breaking; React Native)*
+
+  Versions, thresholds, contact modes, message kinds, sender kinds and 64-bit
+  ids passed to the primitives must be integers in range; a negative,
+  fractional or out-of-range `number` (or an out-of-range `bigint`) is an
+  error instead of being truncated.
+
+- **Changed: secret material is wiped from memory after use.** *(hardening;
+  every SDK)*
+
+  `derec-cryptography` now zeroizes the intermediate secrets it handles: the
+  AES key and seeds a split derives, the Shamir polynomial, a reconstructed
+  key and its field elements, the ML-KEM and ECDH halves of a pairing key,
+  and the ECDH scalar and shared point. Recovery also borrows subshares
+  instead of copying them. `ml-kem`, `aes` and `aes-gcm` are built with their
+  `zeroize` feature, so decapsulation keys and AES key schedules are wiped
+  when dropped. Outputs are byte-for-byte unchanged; secrets returned to the
+  caller remain the caller's to wipe.
+
+- **Removed: expanded ML-KEM decapsulation keys.** *(breaking; every SDK)*
+
+  0.0.8 deprecated the 3168-byte expanded form of a stored decapsulation
+  key, which releases before 0.0.8 wrote, and planned its removal for
+  0.0.13. It is removed now: `mlkem::decapsulate` accepts only the 64-byte
+  seed form and returns `InvalidSize { expected: 64, got: 3168 }` for an
+  expanded key. A pairing whose initiator stored its secret before 0.0.8 can
+  no longer be finished by that initiator; start a new pairing.
+  `mlkem::EXPANDED_DECAPSULATION_KEY_SIZE_IN_BYTES` is gone, and so is
+  `DerecPairingError::MLKemDecapsulationError`, which only an invalid
+  expanded key produced.
 
 ### 0.0.8
 
@@ -1097,7 +2050,7 @@ helpers of holding corrupt data. Nothing here changes an API.
   and web packages shipped none at all. Anyone writing a gRPC transport, or
   generating types for a language with no DeRec SDK, had to copy the files
   out of a `lib-derec` checkout and keep them in step by hand — which is what
-  the reference application ended up doing with fifteen of them.
+  consuming applications ended up doing, one of them with fifteen files.
 
   **Rust.** A default-off `descriptor` feature on `derec-proto` exposes the
   schema as a compiled file descriptor set: `descriptor::FILE_DESCRIPTOR_SET`

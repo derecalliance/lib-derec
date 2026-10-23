@@ -99,9 +99,9 @@ pub enum Error {
     },
 
     /// `start(Pairing)` was called for a `channel_id` that already has
-    /// a `Paired` channel record. Re-pairing would silently overwrite
-    /// the stored `SharedKey`; the caller must skip the call or unpair
-    /// first.
+    /// a `Paired` or `Unpairing` channel record. Re-pairing would silently
+    /// overwrite the stored `SharedKey`; the caller must skip the call, or
+    /// unpair first and wait for [`DeRecEvent::Unpaired`](crate::protocol::DeRecEvent::Unpaired).
     #[error("channel {channel_id:?} is already paired")]
     ChannelAlreadyPaired { channel_id: crate::types::ChannelId },
 
@@ -124,6 +124,12 @@ pub enum Error {
     /// other's row and make every acknowledgement ambiguous. Raised before
     /// fingerprint verification: there is no point asking a user to confirm a
     /// pairing that cannot complete.
+    ///
+    /// Raised by the initiator, which learns the responder's id from its
+    /// `PairResponse`. A responder that receives a colliding `PairRequest`
+    /// instead refuses it with a `PairResponse` carrying `REPLICA_ID_CONFLICT`
+    /// and reports
+    /// [`DeRecEvent::PairingRefused`](crate::protocol::DeRecEvent::PairingRefused).
     ///
     /// `replica_id` is assigned by the application, so this is a
     /// configuration fault — most often the same identity reused on two

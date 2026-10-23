@@ -341,11 +341,11 @@ impl DeRecMessageBuilder<NotEncrypted, PairingMode> {
         self,
         public_key: impl AsRef<[u8]>,
     ) -> Result<DeRecMessageBuilder<Encrypted, PairingMode>, DeRecMessageBuilderError> {
-        if self.message.is_none() {
-            return Err(DeRecMessageBuilderError::MissingMessage);
-        }
+        let message = self
+            .message
+            .ok_or(DeRecMessageBuilderError::MissingMessage)?;
 
-        let encoded = self.message.unwrap().encode_to_vec();
+        let encoded = message.encode_to_vec();
         let encrypted =
             derec_cryptography::pairing::envelope::encrypt(&encoded, public_key.as_ref())?;
 
@@ -421,9 +421,9 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
         self,
         shared_key: &[u8; 32],
     ) -> Result<DeRecMessageBuilder<Encrypted, ChannelMode>, DeRecMessageBuilderError> {
-        if self.message.is_none() {
-            return Err(DeRecMessageBuilderError::MissingMessage);
-        }
+        let message = self
+            .message
+            .ok_or(DeRecMessageBuilderError::MissingMessage)?;
 
         let channel_id = self
             .channel_id
@@ -432,7 +432,7 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
         let mut nonce = [0u8; 32];
         rand::Rng::fill_bytes(&mut crate::utils::os_rng(), &mut nonce[..12]);
 
-        let encoded = self.message.unwrap().encode_to_vec();
+        let encoded = message.encode_to_vec();
         let encrypted = derec_cryptography::channel::encrypt_message(&encoded, shared_key, &nonce)?;
 
         Ok(DeRecMessageBuilder {
@@ -479,27 +479,28 @@ impl<Mode> DeRecMessageBuilder<Encrypted, Mode> {
     pub fn build(self) -> Result<DeRecMessage, DeRecMessageBuilderError> {
         let protocol_version = ProtocolVersion::current();
 
-        if self.timestamp.is_none() {
-            return Err(DeRecMessageBuilderError::MissingTimestamp);
-        }
-
-        if self.encrypted.is_empty() {
+        let message = if self.encrypted.is_empty() {
             return Err(DeRecMessageBuilderError::MissingMessage);
-        }
+        } else {
+            self.encrypted
+        };
+
+        let channel_id = self
+            .channel_id
+            .ok_or(DeRecMessageBuilderError::MissingChannelId)?;
+
+        let timestamp = Some(
+            self.timestamp
+                .ok_or(DeRecMessageBuilderError::MissingTimestamp)?,
+        );
 
         Ok(DeRecMessage {
             protocol_version_major: protocol_version.major,
             protocol_version_minor: protocol_version.minor,
             sequence: self.sequence.unwrap_or_default(),
-            channel_id: self
-                .channel_id
-                .ok_or(DeRecMessageBuilderError::MissingChannelId)?
-                .into(),
-            timestamp: Some(
-                self.timestamp
-                    .ok_or(DeRecMessageBuilderError::MissingTimestamp)?,
-            ),
-            message: self.encrypted,
+            channel_id: channel_id.into(),
+            timestamp,
+            message,
             trace_id: self.trace_id.unwrap_or_default(),
         })
     }

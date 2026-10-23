@@ -13,6 +13,7 @@ package derecpb
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -73,7 +74,13 @@ type ErrorResponseMessage struct {
 	// Result describing the error encountered while processing the request.
 	//
 	// This field encodes the error type and any associated status information.
-	Result        *DeRecResult `protobuf:"bytes,1,opt,name=result,proto3" json:"result,omitempty"`
+	Result *DeRecResult `protobuf:"bytes,1,opt,name=result,proto3" json:"result,omitempty"`
+	// Timestamp indicating when this message was created.
+	//
+	// This value is expressed in UTC and can be used for observability,
+	// replay detection, and timeout handling. The envelope carries the same
+	// value, and a receiver rejects a message whose two copies differ.
+	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -115,13 +122,21 @@ func (x *ErrorResponseMessage) GetResult() *DeRecResult {
 	return nil
 }
 
+func (x *ErrorResponseMessage) GetTimestamp() *timestamppb.Timestamp {
+	if x != nil {
+		return x.Timestamp
+	}
+	return nil
+}
+
 var File_error_proto protoreflect.FileDescriptor
 
 const file_error_proto_rawDesc = "" +
 	"\n" +
-	"\verror.proto\x12 org.derecalliance.derec.protobuf\x1a\fresult.proto\"]\n" +
+	"\verror.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\"\x97\x01\n" +
 	"\x14ErrorResponseMessage\x12E\n" +
-	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06resultb\x06proto3"
+	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x128\n" +
+	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestampb\x06proto3"
 
 var (
 	file_error_proto_rawDescOnce sync.Once
@@ -137,16 +152,18 @@ func file_error_proto_rawDescGZIP() []byte {
 
 var file_error_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_error_proto_goTypes = []any{
-	(*ErrorResponseMessage)(nil), // 0: org.derecalliance.derec.protobuf.ErrorResponseMessage
-	(*DeRecResult)(nil),          // 1: org.derecalliance.derec.protobuf.DeRecResult
+	(*ErrorResponseMessage)(nil),  // 0: org.derecalliance.derec.protobuf.ErrorResponseMessage
+	(*DeRecResult)(nil),           // 1: org.derecalliance.derec.protobuf.DeRecResult
+	(*timestamppb.Timestamp)(nil), // 2: google.protobuf.Timestamp
 }
 var file_error_proto_depIdxs = []int32{
 	1, // 0: org.derecalliance.derec.protobuf.ErrorResponseMessage.result:type_name -> org.derecalliance.derec.protobuf.DeRecResult
-	1, // [1:1] is the sub-list for method output_type
-	1, // [1:1] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	2, // 1: org.derecalliance.derec.protobuf.ErrorResponseMessage.timestamp:type_name -> google.protobuf.Timestamp
+	2, // [2:2] is the sub-list for method output_type
+	2, // [2:2] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_error_proto_init() }

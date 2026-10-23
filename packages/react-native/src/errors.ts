@@ -36,9 +36,74 @@ export const DEREC_ERROR_CATEGORIES = [
 
 export type DeRecErrorCategory = (typeof DEREC_ERROR_CATEGORIES)[number];
 
+/**
+ * Every code `derec_error_code_name` can return, and no others.
+ *
+ * Held to the shared enum fixture by a test, like {@link DEREC_ERROR_CATEGORIES}.
+ * Unlike the WASM bindings, this SDK raises no marshalling-level codes of its
+ * own before a value reaches the library, so this list is exactly the Rust
+ * `Code` table in `library/src/interop/error_codes.rs`.
+ */
+export const DEREC_ERROR_CODES = [
+  "ok",
+  "non_ok_status",
+  "version_mismatch",
+  "invariant",
+  "invalid_input",
+  "protobuf_decode",
+  "protobuf_encode",
+  "protocol_violation",
+  "store_error",
+  "builder_error",
+  "missing_shared_key",
+  "role_mismatch",
+  "replica_id_not_configured",
+  "channel_already_paired",
+  "already_restored",
+  "restore_conflict",
+  "replica_id_conflict",
+  "encryption",
+  "keygen",
+  "finish_pairing_initiator",
+  "finish_pairing_responder",
+  "empty_transport_uri",
+  "invalid_contact_message",
+  "invalid_pair_request_message",
+  "invalid_pair_response_message",
+  "prepair_hash_mismatch",
+  "missing_replica_id",
+  "unexpected_replica_id",
+  "incompatible_parameter_range",
+  "empty_channels",
+  "duplicate_channel_id",
+  "invalid_threshold",
+  "empty_secret_data",
+  "vss_share_failed",
+  "invalid_weight",
+  "too_many_subshares",
+  "empty_responses",
+  "empty_committed_derec_share",
+  "decode_committed_derec_share",
+  "decode_derec_share",
+  "secret_id_mismatch",
+  "reconstruction_failed",
+  "malformed_recovered_secret",
+  "ffi_null_ptr",
+  "ffi_bad_length",
+  "ffi_bad_utf8",
+  "ffi_bad_proto",
+  "ffi_invalid_enum",
+  "ffi_bad_shared_key",
+  "ffi_nul_in_string",
+  "transport_invalid",
+  "no_usable_endpoint",
+] as const;
+
+export type DeRecErrorCode = (typeof DEREC_ERROR_CODES)[number];
+
 export interface DeRecError {
   category: DeRecErrorCategory;
-  code: string;
+  code: DeRecErrorCode;
   message: string;
   status?: number;
   memo?: string;

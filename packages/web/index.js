@@ -10,6 +10,7 @@ import {
   envelope_read_trace_id,
   protocol_version as protocolVersionImpl,
   generate_replica_id as generateReplicaIdImpl,
+  shareStoreRefusal as shareStoreRefusalImpl,
 } from "./derec_library.js";
 
 /**
@@ -47,6 +48,10 @@ export function protocol_version() {
 
 export function generate_replica_id() {
   return generateReplicaIdImpl();
+}
+
+export function shareStoreRefusal(reason) {
+  return shareStoreRefusalImpl(reason);
 }
 
 export function sequentialFailover(dialer) {

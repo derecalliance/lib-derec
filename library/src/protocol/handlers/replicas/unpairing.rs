@@ -348,8 +348,8 @@ async fn on_request<S: StoreSet>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::test::LocalFixture;
-    use crate::protocol::test::{InMemChannelStore, InMemSecretStore, StoreRig, run_async};
+    use crate::protocol::tests::LocalFixture;
+    use crate::protocol::tests::{InMemChannelStore, InMemSecretStore, StoreRig, run_async};
     use crate::protocol::types::{HelperChannel, SecretValue, UserSecrets};
     use crate::protocol::{DeRecSecretStore, DeRecUserSecretStore};
 
@@ -501,6 +501,7 @@ mod tests {
                         peer_role: derec_proto::SenderKind::Helper,
                         status: ChannelStatus::Paired,
                         created_at: 0,
+                        weight: 1,
                     }),
                 )
                 .await
@@ -606,6 +607,7 @@ mod tests {
                         peer_role: derec_proto::SenderKind::Helper,
                         status: ChannelStatus::Paired,
                         created_at: 0,
+                        weight: 1,
                     }),
                 )
                 .await
@@ -622,6 +624,7 @@ mod tests {
                         secrets: Vec::new(),
                         description: None,
                         author_replica_id: None,
+                        threshold: None,
                     },
                 )
                 .await
@@ -688,7 +691,7 @@ mod tests {
     fn removing_the_source_promotes_a_remaining_member() {
         run_async(async {
             let lf = LocalFixture::with_replica(SECRET_ID, 1002);
-            let mut rig = StoreRig::with_transport(crate::protocol::test::NoopTransport);
+            let mut rig = StoreRig::with_transport(crate::protocol::tests::NoopTransport);
             seed_group_key(&mut rig.secrets).await;
             seed_member(
                 &mut rig.channels,
@@ -730,7 +733,7 @@ mod tests {
     fn a_departing_member_is_not_eligible_to_succeed() {
         run_async(async {
             let lf = LocalFixture::with_replica(SECRET_ID, 1003);
-            let mut rig = StoreRig::with_transport(crate::protocol::test::NoopTransport);
+            let mut rig = StoreRig::with_transport(crate::protocol::tests::NoopTransport);
             seed_group_key(&mut rig.secrets).await;
             seed_member(
                 &mut rig.channels,
@@ -769,7 +772,7 @@ mod tests {
     fn a_sole_source_leaves_no_successor() {
         run_async(async {
             let lf = LocalFixture::with_replica(SECRET_ID, 1001);
-            let mut rig = StoreRig::with_transport(crate::protocol::test::NoopTransport);
+            let mut rig = StoreRig::with_transport(crate::protocol::tests::NoopTransport);
             seed_group_key(&mut rig.secrets).await;
             seed_member(
                 &mut rig.channels,
@@ -797,7 +800,7 @@ mod tests {
     fn removing_a_destination_promotes_nobody() {
         run_async(async {
             let lf = LocalFixture::with_replica(SECRET_ID, 1001);
-            let mut rig = StoreRig::with_transport(crate::protocol::test::NoopTransport);
+            let mut rig = StoreRig::with_transport(crate::protocol::tests::NoopTransport);
             seed_group_key(&mut rig.secrets).await;
             seed_member(
                 &mut rig.channels,
