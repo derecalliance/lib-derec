@@ -4871,7 +4871,7 @@ mod weighted_round_tests {
                 .protocol
                 .verify_fingerprint(ChannelId(53), &fingerprint)
                 .await;
-            assert!(matches!(retry, Ok(true)), "got {retry:?}");
+            assert!(matches!(retry, Ok(())), "got {retry:?}");
             assert!(
                 rig.protocol.transport.sent_envelopes().is_empty(),
                 "a retry does not publish"

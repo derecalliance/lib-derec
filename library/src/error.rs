@@ -139,6 +139,17 @@ pub enum Error {
     #[error("replica id {replica_id} is already in use by another member of the group")]
     ReplicaIdConflict { replica_id: u64 },
 
+    /// The fingerprint compared out of band does not match the one derived
+    /// from the channel key.
+    ///
+    /// The two sides hold different keys, which is what a man-in-the-middle
+    /// on the pairing produces. A `Pending` pairing is revoked: its records,
+    /// its channel key and its pairing material are deleted, so the channel
+    /// can never be used. Pairing again is the only way forward. A channel
+    /// already `Paired` is left as it is; removing it is an unpair.
+    #[error("fingerprint does not match channel {channel_id:?}: possible man-in-the-middle")]
+    FingerprintMismatch { channel_id: crate::types::ChannelId },
+
     /// A peer advertised no endpoint this library will record.
     ///
     /// Every endpoint it offered failed [`TransportPolicy`] — typically all

@@ -7,6 +7,55 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
+### Unreleased
+
+A body naming a group member is accepted only on that member's own channel,
+so a paired helper can no longer act as a replica. A failed fingerprint
+comparison revokes the pairing, and no channel key outlives an unconfirmed
+pairing.
+
+- **Fixed (security): a paired helper could overwrite an owner's stored
+  secret.** *(bug fix; every SDK)*
+
+  Whether a message came from a replica-group member was decided by the
+  `replica_id` in its body, which the sender writes, and a member was looked
+  up by that id alone, never against the channel the message arrived on. A
+  helper could put any `replica_id` in a `GetShareResponse` on its own
+  channel and have it hydrated as a catch-up: the owner's snapshot replaced,
+  and helpers and keys of the helper's choosing stored as `Paired`, after
+  which every `ProtectSecret` sent them a share. The same lookup let a
+  helper push a copy of the secret with `StoreShareRequest`, flag a real
+  member for eviction with `UnpairRequest`, or answer a replica discovery.
+  A message naming a member is now refused unless that member is recorded on
+  the channel it arrived on.
+
+- **Fixed (security): a failed fingerprint comparison left a usable
+  channel.** *(bug fix; every SDK)*
+
+  A mismatch changed nothing, and the expired-channel sweep removed a
+  `Pending` channel's record but not its key, so the channel decrypted the
+  peer's messages again once the record was gone. A mismatch now revokes the
+  `Pending` pairing — its records, channel key and pairing material are
+  deleted — and the sweep removes the channel key with the record. For a
+  replica channel the key goes once no member is recorded on it, and this
+  device's own `Pending` row goes with it when no peer remains. A channel
+  already `Paired` is never touched by a comparison; removing it is an
+  unpair.
+
+- **Changed: `verify_fingerprint` reports a mismatch as an error.**
+  *(breaking; every SDK)*
+
+  A mismatch fails with `FingerprintMismatch` (code `17`,
+  `fingerprint_mismatch`, category `pairing`) — a possible
+  man-in-the-middle — instead of returning `false`, and success returns
+  nothing: Rust `Result<()>`, .NET `Task`, Go `error`, TypeScript
+  `Promise<void>`. The C ABI drops the `out_matched` parameter of
+  `derec_protocol_verify_fingerprint`.
+
+  **Migration:** replace a check of the returned boolean with handling of
+  the error. After a mismatch the `Pending` pairing no longer exists, so
+  retrying the comparison on it fails; the devices must pair again.
+
 ### 0.0.9
 
 Share commitments use a domain-separated Merkle hash, so one malicious helper

@@ -666,9 +666,13 @@ fingerprint derived from the shared key:
 const localFp = await owner.getFingerprint(channelId);
 const peerFp  = await destination.getFingerprint(channelId); // out of band
 
-await owner.verifyFingerprint(channelId, peerFp);             // → true
-await destination.verifyFingerprint(channelId, localFp);      // → true
+await owner.verifyFingerprint(channelId, peerFp);
+await destination.verifyFingerprint(channelId, localFp);
 ```
+
+A mismatch rejects with code `fingerprint_mismatch` — a possible
+man-in-the-middle. The `Pending` pairing is revoked (its records, channel key
+and pairing material are deleted), so the devices must pair again.
 
 Once paired, the Source includes the Destination as a `ProtectSecret`
 target alongside helpers. Helpers receive the usual VSS share via

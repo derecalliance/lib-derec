@@ -776,21 +776,17 @@ async fn admit_replica(
         "[{}] both devices must show the same fingerprint",
         replica.peer.label
     );
-    assert!(
-        owner
-            .session()
-            .verify_fingerprint(channel, &replica_fp)
-            .await
-            .expect("owner verify_fingerprint")
-    );
-    assert!(
-        replica
-            .peer
-            .session()
-            .verify_fingerprint(channel, &owner_fp)
-            .await
-            .expect("replica verify_fingerprint")
-    );
+    owner
+        .session()
+        .verify_fingerprint(channel, &replica_fp)
+        .await
+        .expect("owner verify_fingerprint");
+    replica
+        .peer
+        .session()
+        .verify_fingerprint(channel, &owner_fp)
+        .await
+        .expect("replica verify_fingerprint");
 
     // Admission triggers the sync that carries the new member to the current
     // version. That publish is a full round: every helper and every member
@@ -1151,20 +1147,16 @@ async fn confirm_fingerprint_if_needed(
         helper.label
     );
 
-    assert!(
-        owner
-            .session()
-            .verify_fingerprint(channel, &helper_fp)
-            .await
-            .expect("owner verify_fingerprint")
-    );
-    assert!(
-        helper
-            .session()
-            .verify_fingerprint(channel, &owner_fp)
-            .await
-            .expect("helper verify_fingerprint")
-    );
+    owner
+        .session()
+        .verify_fingerprint(channel, &helper_fp)
+        .await
+        .expect("owner verify_fingerprint");
+    helper
+        .session()
+        .verify_fingerprint(channel, &owner_fp)
+        .await
+        .expect("helper verify_fingerprint");
 
     // Confirmation is the moment this channel becomes a publish target, so the
     // owner republishes here rather than at handshake time. That round is on

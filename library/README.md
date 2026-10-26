@@ -1213,13 +1213,17 @@ side calls `verify_fingerprint`:
 let local = source.get_fingerprint(channel_id).await?;
 let peer  = destination.get_fingerprint(channel_id).await?; // out of band
 
-source.verify_fingerprint(channel_id, &peer).await?;        // → true
-destination.verify_fingerprint(channel_id, &local).await?;  // → true
+source.verify_fingerprint(channel_id, &peer).await?;
+destination.verify_fingerprint(channel_id, &local).await?;
 ```
 
-`verify_fingerprint` returns `true` on match and transitions the channel
-to `Paired`. A mismatch returns `false` and leaves the channel `Pending`
-so the app can retry.
+`verify_fingerprint` succeeds on a match and transitions the channel to
+`Paired`. A mismatch fails with `Error::FingerprintMismatch` (code
+`fingerprint_mismatch`): the two sides hold different keys, which is what a
+man-in-the-middle on the pairing produces. The comparison is authoritative,
+so the `Pending` pairing is revoked — its records, channel key and pairing
+material are deleted — and the two devices must pair again. A channel already
+`Paired` is left as it is; removing it is an unpair.
 
 Confirmation is also the moment the peer becomes reachable, so the current
 snapshot is published to it then — a `NoKeys` helper was not an eligible
@@ -1230,7 +1234,7 @@ group's vault. Once the channel is `Paired`, the source's publish is
 installed into this device's stores as it arrives, with no further prompt.
 Ask the user whether to adopt the vault before calling `verify_fingerprint`;
 to decline, never confirm, and the channel stays `Pending`, unused, until
-expired-channel cleanup removes it.
+expired-channel cleanup removes it together with its key.
 
 ### Secret distribution
 

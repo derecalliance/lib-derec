@@ -807,12 +807,8 @@ func runEveryContactModePairs() {
 			must(err, "helper GetFingerprint")
 			assertTrue(ownerFP == helperFP, "both sides must derive one fingerprint")
 
-			matched, err := owner.proto.VerifyFingerprint(channelID, helperFP)
-			must(err, "owner VerifyFingerprint")
-			assertTrue(matched, "owner VerifyFingerprint must match")
-			matched, err = helper.proto.VerifyFingerprint(channelID, ownerFP)
-			must(err, "helper VerifyFingerprint")
-			assertTrue(matched, "helper VerifyFingerprint must match")
+			must(owner.proto.VerifyFingerprint(channelID, helperFP), "owner VerifyFingerprint")
+			must(helper.proto.VerifyFingerprint(channelID, ownerFP), "helper VerifyFingerprint")
 
 			for _, side := range []struct {
 				label string
@@ -1538,6 +1534,178 @@ func runExpiredChannelCleanup() {
 	fmt.Println("Protocol expired-channel cleanup test passed.")
 }
 
+// testSharedKey is the 32-byte channel key the seeded-store flows plant
+// alongside a channel record.
+func testSharedKey() []byte {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte((i*11 + 5) & 0xff)
+	}
+	return key
+}
+
+// hasSharedKey reports whether p's SecretStore still holds a SharedKey for
+// channelID.
+func hasSharedKey(p *peer, channelID uint64) bool {
+	_, ok, err := p.secretStore.Load(protocolSecretID, channelID, protocol.SecretKindSharedKey)
+	must(err, fmt.Sprintf("[%s] secretStore.Load(%d)", p.label, channelID))
+	return ok
+}
+
+// hasChannelRecord reports whether p's ChannelStore still holds the record
+// addressed by (channelID, replicaID).
+func hasChannelRecord(p *peer, channelID, replicaID uint64) bool {
+	_, ok, err := p.channelStore.Load(protocolSecretID, channelID, replicaID)
+	must(err, fmt.Sprintf("[%s] channelStore.Load(%d, %d)", p.label, channelID, replicaID))
+	return ok
+}
+
+// assertFingerprintMismatch checks that err is the Pairing-category
+// FingerprintMismatch a rejected VerifyFingerprint returns.
+func assertFingerprintMismatch(err error, label string) {
+	var fpErr *derec.Error
+	assertTrue(errors.As(err, &fpErr) && fpErr.Code == derec.CodeFingerprintMismatch && fpErr.Category == derec.CategoryPairing,
+		"%s must fail with Pairing/CodeFingerprintMismatch (17), got %v", label, err)
+}
+
+// runFingerprintMismatch: VerifyFingerprint(wrong) on a still-Pending channel
+// is the man-in-the-middle case. It must fail with FingerprintMismatch and
+// revoke the pairing, so neither the member record nor the channel key
+// survives.
+func runFingerprintMismatch() {
+	fmt.Println("=== Protocol fingerprint mismatch test ===")
+
+	const channelID = uint64(5151)
+	const replicaID = uint64(0xcafe)
+
+	node := newPeer("owner", "https://owner-fp-mismatch.example.com", 2)
+	defer node.proto.Close()
+
+	// The post-replica-pair state: a Pending member and its shared key,
+	// awaiting the fingerprint confirmation that would make it Paired.
+	must(node.channelStore.Save(protocolSecretID, protocol.ChannelRecord{Replica: &protocol.ReplicaMember{
+		ChannelID:         channelID,
+		ReplicaID:         replicaID,
+		Transports:        []protocol.TransportEndpoint{{URI: "https://peer.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		CommunicationInfo: map[string]string{},
+		Role:              protocol.ReplicaRoleDestination,
+		Status:            protocol.ChannelStatusPending,
+		CreatedAt:         1700000000,
+	}}), "seed replica member")
+	must(node.secretStore.Save(protocolSecretID, channelID, protocol.SecretValue{Kind: protocol.SecretKindSharedKey, Bytes: testSharedKey()}),
+		"seed shared key")
+
+	assertFingerprintMismatch(node.proto.VerifyFingerprint(channelID, "0000-0000-0000-0000"), "VerifyFingerprint(wrong)")
+	fmt.Println("  verifyFingerprint(wrong) fails with FingerprintMismatch  ✓")
+
+	assertTrue(!hasChannelRecord(node, channelID, replicaID), "VerifyFingerprint(wrong) must remove the member record")
+	assertTrue(!hasSharedKey(node, channelID), "VerifyFingerprint(wrong) must remove the channel key")
+	fmt.Println("  member record and channel key removed  ✓")
+
+	fmt.Println("Protocol fingerprint mismatch test passed.")
+}
+
+// runNoKeysFingerprintMismatch drives the same rejection over a real NoKeys
+// pairing: the owner refuses the fingerprint before either side confirmed it.
+// Only the rejecting side revokes; the helper's Pending channel is its own
+// and stays until it confirms or rejects on its side.
+func runNoKeysFingerprintMismatch() {
+	fmt.Println("=== Protocol NoKeys fingerprint mismatch test ===")
+
+	owner := newPeer("owner", "https://owner-nokeys-mismatch.example.com", 2)
+	helper := newPeer("helper", "https://helper-nokeys-mismatch.example.com", 2)
+	defer owner.proto.Close()
+	defer helper.proto.Close()
+
+	channelID := pairPeersWithMode(owner, helper, 920, protocol.ContactModeNoKeys)
+
+	assertFingerprintMismatch(owner.proto.VerifyFingerprint(channelID, "0000-0000-0000-0000"), "owner VerifyFingerprint(wrong)")
+	fmt.Println("  owner verifyFingerprint(wrong) fails with FingerprintMismatch  ✓")
+
+	assertTrue(!hasChannelRecord(owner, channelID, 0), "owner must drop the rejected helper channel")
+	_, err := owner.proto.GetFingerprint(channelID)
+	assertTrue(err != nil, "owner GetFingerprint must fail once the channel key is gone")
+	fmt.Println("  owner channel record and key removed  ✓")
+
+	rec, ok, err := helper.channelStore.Load(protocolSecretID, channelID, 0)
+	must(err, "helper channelStore.Load")
+	assertTrue(ok && rec.Helper.Status == protocol.ChannelStatusPending,
+		"helper channel must remain Pending, got ok=%v record=%+v", ok, rec.Helper)
+	_, err = helper.proto.GetFingerprint(channelID)
+	must(err, "helper GetFingerprint after owner rejection")
+	fmt.Println("  helper channel untouched: still Pending, fingerprint derivable  ✓")
+
+	fmt.Println("Protocol NoKeys fingerprint mismatch test passed.")
+}
+
+// runExpiredPendingPairingLosesItsKey checks that the expired-channel sweep
+// takes a Pending channel's SharedKey with its record, for helper channels and
+// replica members alike, while a Paired channel is never swept.
+func runExpiredPendingPairingLosesItsKey() {
+	fmt.Println("=== Protocol expired Pending channel key cleanup test ===")
+
+	node, err := newPeerWithConfig("owner", "https://owner-expired-key.example.com", protocol.Config{
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold: proto.Uint32(2),
+			Timeouts: &protocol.Timeouts{
+				ExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{
+					Enabled:       false,
+					TimeoutInSecs: 900,
+				},
+			},
+		},
+	})
+	must(err, "protocol.New(expired-key)")
+	defer node.proto.Close()
+
+	const (
+		pendingHelper  = uint64(6161)
+		pendingReplica = uint64(6162)
+		pairedHelper   = uint64(6163)
+		replicaID      = uint64(0xbeef)
+	)
+	transports := []protocol.TransportEndpoint{{URI: "https://peer.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}}
+
+	for _, rec := range []protocol.ChannelRecord{
+		{Helper: &protocol.HelperChannel{
+			ChannelID: pendingHelper, Transports: transports, CommunicationInfo: map[string]string{},
+			PeerRole: protocol.SenderKindHelper, Status: protocol.ChannelStatusPending, CreatedAt: 1700000000, Weight: 1,
+		}},
+		{Replica: &protocol.ReplicaMember{
+			ChannelID: pendingReplica, ReplicaID: replicaID, Transports: transports, CommunicationInfo: map[string]string{},
+			Role: protocol.ReplicaRoleDestination, Status: protocol.ChannelStatusPending, CreatedAt: 1700000000,
+		}},
+		{Helper: &protocol.HelperChannel{
+			ChannelID: pairedHelper, Transports: transports, CommunicationInfo: map[string]string{},
+			PeerRole: protocol.SenderKindHelper, Status: protocol.ChannelStatusPaired, CreatedAt: 1700000000, Weight: 1,
+		}},
+	} {
+		must(node.channelStore.Save(protocolSecretID, rec), "seed channel record")
+	}
+	for _, cid := range []uint64{pendingHelper, pendingReplica, pairedHelper} {
+		must(node.secretStore.Save(protocolSecretID, cid, protocol.SecretValue{Kind: protocol.SecretKindSharedKey, Bytes: testSharedKey()}),
+			fmt.Sprintf("seed shared key %d", cid))
+	}
+
+	removed, err := node.proto.RemoveExpiredChannels(60)
+	must(err, "RemoveExpiredChannels(60)")
+	assertTrue(slices.Contains(removed, pendingHelper) && slices.Contains(removed, pendingReplica) && !slices.Contains(removed, pairedHelper),
+		"RemoveExpiredChannels must report %d and %d but not %d, got %v", pendingHelper, pendingReplica, pairedHelper, removed)
+	fmt.Printf("  sweep removed %v, Paired %d kept  ✓\n", removed, pairedHelper)
+
+	assertTrue(!hasChannelRecord(node, pendingHelper, 0) && !hasSharedKey(node, pendingHelper),
+		"expired Pending helper channel %d must lose its record and SharedKey", pendingHelper)
+	assertTrue(!hasChannelRecord(node, pendingReplica, replicaID) && !hasSharedKey(node, pendingReplica),
+		"expired Pending replica channel %d must lose its record and SharedKey", pendingReplica)
+	fmt.Println("  expired Pending channels lost their record and SharedKey  ✓")
+
+	assertTrue(hasChannelRecord(node, pairedHelper, 0) && hasSharedKey(node, pairedHelper),
+		"Paired channel %d must keep its record and SharedKey", pairedHelper)
+	fmt.Println("  Paired channel kept its record and SharedKey  ✓")
+
+	fmt.Println("Protocol expired Pending channel key cleanup test passed.")
+}
+
 // runUnsafeConnection proves the unsafe_connection setting survives the JSON
 // config boundary and actually changes behaviour.
 //
@@ -1746,9 +1914,7 @@ func runUnconfirmedDestination() {
 
 	destinationFp, err := destination.proto.GetFingerprint(replicaChannel)
 	must(err, "destination.GetFingerprint")
-	ok, err := source.proto.VerifyFingerprint(replicaChannel, destinationFp)
-	must(err, "source.VerifyFingerprint")
-	assertTrue(ok, "the source must accept the matching fingerprint")
+	must(source.proto.VerifyFingerprint(replicaChannel, destinationFp), "source.VerifyFingerprint")
 
 	var ignored bool
 	for _, ev := range pump(source, destination) {
@@ -1765,9 +1931,7 @@ func runUnconfirmedDestination() {
 
 	sourceFp, err := source.proto.GetFingerprint(replicaChannel)
 	must(err, "source.GetFingerprint")
-	ok, err = destination.proto.VerifyFingerprint(replicaChannel, sourceFp)
-	must(err, "destination.VerifyFingerprint")
-	assertTrue(ok, "the destination must accept the matching fingerprint")
+	must(destination.proto.VerifyFingerprint(replicaChannel, sourceFp), "destination.VerifyFingerprint")
 	_, err = destination.proto.Start(protocol.FlowKindReplicaDiscovery, nil)
 	must(err, "destination.Start(ReplicaDiscovery)")
 

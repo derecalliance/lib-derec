@@ -666,7 +666,7 @@ case nothing is sent:
 - `AcceptAsync` throws. The pairing has completed and its response was sent,
   but `PairingCompletedEvent` is not returned.
 - `VerifyFingerprintAsync` throws. The promotion stands: calling it again
-  returns `true` and publishes nothing.
+  succeeds and publishes nothing.
 
 Call `StartAsync` with `ProtectSecretParams` and valid `Weights` to publish
 to every helper.
@@ -1010,9 +1010,13 @@ fingerprint derived from the shared key:
 string localFp = await source.GetFingerprintAsync(channelId);
 string peerFp  = await destination.GetFingerprintAsync(channelId); // out of band
 
-await source.VerifyFingerprintAsync(channelId, peerFp);            // → true
-await destination.VerifyFingerprintAsync(channelId, localFp);      // → true
+await source.VerifyFingerprintAsync(channelId, peerFp);
+await destination.VerifyFingerprintAsync(channelId, localFp);
 ```
+
+A mismatch throws `DeRecException` with `DeRecCode.FingerprintMismatch` — a
+possible man-in-the-middle. The `Pending` pairing is revoked (its records,
+channel key and pairing material are deleted), so the devices must pair again.
 
 The Source's confirmation publishes the current secret to every paired peer
 straight away, and every later `ProtectSecret` round includes the
@@ -1153,7 +1157,7 @@ channel: `ProcessAsync` changes no store, sends nothing back, and returns a
 with `ChannelId` and `TraceId`. This matters most for a replica destination.
 The source's own confirmation publishes the vault immediately, so that copy
 usually arrives before the destination's user has confirmed. Confirming does
-not replay it: once the destination's `VerifyFingerprintAsync` returns `true`,
+not replay it: once the destination's `VerifyFingerprintAsync` succeeds,
 call `StartAsync(FlowKind.ReplicaDiscovery, new ReplicaDiscoveryParams())` to
 pull the copy from the source.
 

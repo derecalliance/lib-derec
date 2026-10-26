@@ -1941,22 +1941,26 @@ export declare class DeRecProtocol {
 
   /**
    * Verify `fingerprint` against the channel's locally-derived one. On
-   * match, the channel transitions from `Pending` to `Paired`. Returns
-   * `true` on confirmation, `false` on mismatch.
+   * match, the channel transitions from `Pending` to `Paired`.
+   *
+   * A mismatch rejects with code `fingerprint_mismatch` — a possible
+   * man-in-the-middle. A `Pending` pairing is revoked: its records, channel
+   * key and pairing material are deleted, so pair again. A channel already
+   * `Paired` is left as it is.
    *
    * On a replica destination, confirming is also the decision to adopt the
    * group's vault: the source's publish is then installed as it arrives,
    * with no further prompt. Ask the user before calling this; to decline,
-   * never confirm.
+   * never confirm: expired-channel cleanup removes the channel and its key.
    *
    * On a promotion the current snapshot is published to the promoted peer,
    * reusing the stored helper weights. If one is no longer valid under the
    * current threshold, that publish fails with `invalid_weight` before
    * anything is sent and this throws. The promotion stands: calling this
-   * again resolves `true` and publishes nothing, so call `start` with
+   * again resolves and publishes nothing, so call `start` with
    * `ProtectSecret` and valid weights to reach the promoted peer.
    */
-  verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<boolean>;
+  verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<void>;
   /**
    * Remove `Pending` channels older than `olderThanSecs`, along with their
    * pairing keys. Resolves to the removed channel ids as decimal strings.
@@ -2471,6 +2475,7 @@ export type DeRecErrorCode =
   | "already_restored"
   | "restore_conflict"
   | "replica_id_conflict"
+  | "fingerprint_mismatch"
   | "encryption"
   | "keygen"
   | "finish_pairing_initiator"

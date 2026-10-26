@@ -118,6 +118,15 @@ public static class DeRecCode
     /// </summary>
     public const int ReplicaIdConflict = 16;
 
+    /// <summary>
+    /// <c>VerifyFingerprintAsync</c>: the fingerprint compared out of band does
+    /// not match the channel key — a possible man-in-the-middle. A
+    /// <c>Pending</c> pairing has been revoked; pair again.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Pairing"/>.
+    /// </summary>
+    public const int FingerprintMismatch = 17;
+
     public const int Encryption = 20;
     public const int Keygen = 21;
     public const int FinishPairingInitiator = 22;

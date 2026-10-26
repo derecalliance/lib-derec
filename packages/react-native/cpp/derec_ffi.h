@@ -180,6 +180,13 @@
  */
 #define DEREC_CODE_REPLICA_ID_CONFLICT 16
 
+/**
+ * `derec_protocol_verify_fingerprint`: the fingerprint compared out of band
+ * does not match the channel key — a possible man-in-the-middle. A `Pending`
+ * pairing has been revoked; pair again. `DEREC_CATEGORY_PAIRING`.
+ */
+#define DEREC_CODE_FINGERPRINT_MISMATCH 17
+
 #define DEREC_CODE_ENCRYPTION 20
 
 #define DEREC_CODE_KEYGEN 21
@@ -2111,34 +2118,23 @@ struct DeRecProtocolFingerprintResult derec_protocol_get_fingerprint(struct DeRe
  * Verify a fingerprint against the channel's locally-derived one. See
  * [`crate::protocol::DeRecProtocol::verify_fingerprint`].
  *
- * Writes `*out_matched = 1` if and only if the comparison
- * affirmatively succeeded. On every other outcome — null-pointer
- * rejection, malformed UTF-8 in `fingerprint_ptr`, a backend error,
- * or a legitimate mismatch — `*out_matched` is set to `0`. Callers
- * MUST also inspect the returned [`DeRecError`] to distinguish a
- * successful mismatch from a failure that could not produce a
- * verdict; treating `out_matched == 0` as "definitely not matched"
- * is safe only after confirming the envelope reports
- * [`DEREC_CATEGORY_OK`](crate::interop::ffi::error::DEREC_CATEGORY_OK).
- *
- * The fail-closed write happens immediately after the null-pointer
- * check, so a caller that allocates the output on the stack and
- * reads it without checking the error envelope still gets `0`,
- * never a stale `1` from uninitialized memory. This neutralizes
- * the "sloppy caller skips the error envelope and reads stale
- * stack" footgun on the MITM-protection gate.
+ * Success means the comparison matched and the channel is confirmed. Every
+ * other outcome is an error envelope; a mismatch is
+ * [`DEREC_CODE_FINGERPRINT_MISMATCH`](crate::interop::ffi::error::DEREC_CODE_FINGERPRINT_MISMATCH),
+ * after which a `Pending` pairing has been revoked. There is no verdict to
+ * read apart from the envelope, so a caller cannot mistake a failure for a
+ * match.
  *
  * # Safety
  *
- * `handle` and `out_matched` must be valid pointers. `fingerprint_ptr`
- * must be a valid pointer to a NUL-terminated C string. Concurrent
- * calls on the same handle from different threads are safe: the
- * handle's internal mutex serializes them.
+ * `handle` must be a valid pointer. `fingerprint_ptr` must be a valid
+ * pointer to a NUL-terminated C string. Concurrent calls on the same handle
+ * from different threads are safe: the handle's internal mutex serializes
+ * them.
  */
 struct DeRecError derec_protocol_verify_fingerprint(struct DeRecProtocolHandle *handle,
                                                     uint64_t channel_id,
-                                                    const char *fingerprint_ptr,
-                                                    uint32_t *out_matched);
+                                                    const char *fingerprint_ptr);
 
 /**
  * Generate an out-of-band contact message used to bootstrap pairing.

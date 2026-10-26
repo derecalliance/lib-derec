@@ -278,7 +278,7 @@ internal static class Protocol
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecError derec_protocol_verify_fingerprint(
-        IntPtr handle, ulong channelId, byte[] fingerprintUtf8, out uint outMatched);
+        IntPtr handle, ulong channelId, byte[] fingerprintUtf8);
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct DeRecRemovedChannelsResult

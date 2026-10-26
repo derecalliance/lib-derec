@@ -62,6 +62,7 @@ export const DEREC_ERROR_CODES = [
   "already_restored",
   "restore_conflict",
   "replica_id_conflict",
+  "fingerprint_mismatch",
   "encryption",
   "keygen",
   "finish_pairing_initiator",

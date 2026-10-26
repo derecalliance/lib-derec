@@ -252,34 +252,40 @@ public sealed class DeRecProtocol : IDisposable
     /// <summary>
     /// Verify <paramref name="fingerprint"/> against the locally-derived
     /// one. On match, transitions the channel from <c>Pending</c> to
-    /// <c>Paired</c>. Returns <c>true</c> on match, <c>false</c> on
-    /// mismatch.
+    /// <c>Paired</c>.
+    /// <para>
+    /// A mismatch throws <see cref="DeRecException"/> with
+    /// <see cref="DeRecCode.FingerprintMismatch"/> — a possible
+    /// man-in-the-middle. A <c>Pending</c> pairing is revoked: its records,
+    /// channel key and pairing material are deleted, so pair again. A channel
+    /// already <c>Paired</c> is left as it is.
+    /// </para>
     /// <para>
     /// On a replica destination, confirming is also the decision to adopt
     /// the group's vault: the source's publish is then installed as it
     /// arrives, with no further prompt. Ask the user before calling this; to
-    /// decline, never confirm.
+    /// decline, never confirm: expired-channel cleanup removes the channel
+    /// and its key.
     /// </para>
     /// <para>
     /// On a promotion the current snapshot is published to the promoted peer,
     /// reusing the stored helper weights. If one is no longer valid under the
     /// current threshold, that publish fails with
     /// <see cref="DeRecCode.InvalidWeight"/> before anything is sent and this
-    /// throws. The promotion stands: calling this again returns <c>true</c>
-    /// and publishes nothing, so call <see cref="StartAsync"/> with
+    /// throws. The promotion stands: calling this again succeeds and
+    /// publishes nothing, so call <see cref="StartAsync"/> with
     /// <see cref="ProtectSecretParams"/> and valid weights to reach the
     /// promoted peer.
     /// </para>
     /// </summary>
-    public Task<bool> VerifyFingerprintAsync(ulong channelId, string fingerprint)
+    public Task VerifyFingerprintAsync(ulong channelId, string fingerprint)
     {
         EnsureNotDisposed();
         byte[] fpBytes = Encoding.UTF8.GetBytes(fingerprint + '\0');
         return Task.Run(() =>
         {
-            var err = NP.derec_protocol_verify_fingerprint(_handle, channelId, fpBytes, out uint matched);
+            var err = NP.derec_protocol_verify_fingerprint(_handle, channelId, fpBytes);
             ThrowOnError(err);
-            return matched != 0;
         });
     }
 

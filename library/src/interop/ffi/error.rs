@@ -110,6 +110,11 @@ pub const DEREC_CODE_RESTORE_CONFLICT: i32 = 15;
 /// `DEREC_CATEGORY_INVALID_INPUT`.
 pub const DEREC_CODE_REPLICA_ID_CONFLICT: i32 = 16;
 
+/// `derec_protocol_verify_fingerprint`: the fingerprint compared out of band
+/// does not match the channel key — a possible man-in-the-middle. A `Pending`
+/// pairing has been revoked; pair again. `DEREC_CATEGORY_PAIRING`.
+pub const DEREC_CODE_FINGERPRINT_MISMATCH: i32 = 17;
+
 pub const DEREC_CODE_ENCRYPTION: i32 = 20;
 pub const DEREC_CODE_KEYGEN: i32 = 21;
 pub const DEREC_CODE_FINISH_PAIRING_INITIATOR: i32 = 22;

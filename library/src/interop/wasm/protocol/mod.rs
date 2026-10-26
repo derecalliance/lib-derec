@@ -749,15 +749,15 @@ impl DeRecProtocolWasm {
     }
 
     /// Verify a fingerprint against the channel's locally-derived one. On
-    /// match, the channel transitions from `Pending` to `Paired`. Returns
-    /// `true` when the fingerprint matches and the channel is confirmed,
-    /// `false` otherwise.
+    /// match, the channel transitions from `Pending` to `Paired`. A mismatch
+    /// rejects with code `fingerprint_mismatch` — a possible man-in-the-middle
+    /// — after which a `Pending` pairing has been revoked.
     #[wasm_bindgen(js_name = "verifyFingerprint")]
     pub async fn verify_fingerprint(
         &self,
         channel_id: JsValue,
         fingerprint: String,
-    ) -> Result<bool, JsValue> {
+    ) -> Result<(), JsValue> {
         let id = js_value_to_u64(channel_id)?;
         self.inner
             .lock()

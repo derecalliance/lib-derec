@@ -714,10 +714,10 @@ async function runPairingFlow(): Promise<void> {
 
 
 /**
- * `verifyFingerprint(wrong)` on a still-`Pending` channel must (a)
- * return `false` and (b) leave `Channel.status` as `"Pending"`. The
- * protocol must not downgrade or otherwise mutate the channel on a
- * failed match.
+ * `verifyFingerprint(wrong)` on a still-`Pending` channel is the
+ * man-in-the-middle case: it must reject with `fingerprint_mismatch` and
+ * revoke the pairing, so neither the member record nor the channel key
+ * survives.
  */
 async function runFingerprintMismatchFlow(): Promise<void> {
   console.log("=== [Protocol] Fingerprint mismatch ===\n");
@@ -752,28 +752,214 @@ async function runFingerprintMismatchFlow(): Promise<void> {
   );
   await node.secretStore.save(nodeSid, String(channelId), 0, sharedKey);
 
-  const unmatched = await node.protocol.verifyFingerprint(channelId, "0000-0000-0000-0000");
-  if (unmatched) {
-    throw new Error("verifyFingerprint must return false for a wrong fingerprint");
+  let caught: { code?: string; category?: string } | null = null;
+  try {
+    await node.protocol.verifyFingerprint(channelId, "0000-0000-0000-0000");
+  } catch (e) {
+    caught = e as { code?: string; category?: string };
+  }
+  if (caught?.code !== "fingerprint_mismatch" || caught.category !== "pairing") {
+    throw new Error(
+      `verifyFingerprint(wrong) must fail with pairing/fingerprint_mismatch, got ${JSON.stringify(caught)}`,
+    );
   }
 
-  // Critical invariant for 5.1: the stored channel record must still
-  // report Pending; the protocol must not have touched it.
   const storedBytes = await node.channelStore.load(
     nodeSid,
     String(channelId),
     String(replicaId),
   );
-  if (!storedBytes) throw new Error("member record missing after verify");
-  const stored = JSON.parse(utf8Decode(storedBytes)).Replica;
-  if (stored.status !== "Pending") {
+  if (storedBytes) throw new Error("verifyFingerprint(wrong) must remove the member record");
+  const storedKey = await node.secretStore.load(nodeSid, String(channelId), 0);
+  if (storedKey) throw new Error("verifyFingerprint(wrong) must remove the channel key");
+  console.log("  verifyFingerprint(wrong) fails with fingerprint_mismatch  ✓");
+  console.log("  member record and channel key removed  ✓");
+  console.log("\n✓ Fingerprint mismatch passed.\n");
+}
+
+
+/**
+ * A `NoKeys` pairing holds the long-term channel `Pending` until the
+ * fingerprints are compared out of band. A wrong fingerprint on that side
+ * revokes the pairing there — channel record and SharedKey both go — while
+ * the peer, which has not compared anything yet, keeps its own `Pending`
+ * channel intact.
+ */
+async function runNoKeysFingerprintMismatchFlow(): Promise<void> {
+  console.log("=== [Protocol] NoKeys fingerprint mismatch ===\n");
+
+  const owner = makeNode("Owner", "https://owner.example.com");
+  const helper = makeNode("Helper", "https://helper.example.com");
+  const { longTermChannelId } = await doPairViaPrePair(
+    helper,
+    owner,
+    4n,
+    "NoKeysMismatch",
+    ContactMode.NoKeys,
+  );
+
+  const ownerSid = String(owner.protocol.secretId());
+  const helperSid = String(helper.protocol.secretId());
+
+  let caught: { code?: string; category?: string } | null = null;
+  try {
+    await owner.protocol.verifyFingerprint(BigInt(longTermChannelId), "0000-0000-0000-0000");
+  } catch (e) {
+    caught = e as { code?: string; category?: string };
+  }
+  if (caught?.code !== "fingerprint_mismatch" || caught.category !== "pairing") {
     throw new Error(
-      `verifyFingerprint(wrong) must leave the member status as Pending; got ${stored.status}`,
+      `NoKeys verifyFingerprint(wrong) must fail with pairing/fingerprint_mismatch, got ${JSON.stringify(caught)}`,
     );
   }
-  console.log("  verifyFingerprint(wrong) returns false  ✓");
-  console.log("  Channel.status stays Pending after mismatch  ✓");
-  console.log("\n✓ Fingerprint mismatch passed.\n");
+  console.log("  verifyFingerprint(wrong) fails with fingerprint_mismatch  ✓");
+
+  const ownerRecord = await owner.channelStore.load(ownerSid, longTermChannelId, "0");
+  if (ownerRecord) {
+    throw new Error("NoKeys verifyFingerprint(wrong) must remove the owner's channel record");
+  }
+  const ownerKey = await owner.secretStore.load(ownerSid, longTermChannelId, 0);
+  if (ownerKey) {
+    throw new Error("NoKeys verifyFingerprint(wrong) must remove the owner's SharedKey");
+  }
+  console.log("  owner channel record and SharedKey removed  ✓");
+
+  const helperRecord = await helper.channelStore.load(helperSid, longTermChannelId, "0");
+  if (!helperRecord) {
+    throw new Error("NoKeys verifyFingerprint(wrong) must not touch the helper's channel record");
+  }
+  const helperStatus = JSON.parse(utf8Decode(helperRecord)).Helper.status;
+  if (helperStatus !== "Pending") {
+    throw new Error(
+      `NoKeys verifyFingerprint(wrong): helper channel must stay Pending; got ${helperStatus}`,
+    );
+  }
+  const helperKey = await helper.secretStore.load(helperSid, longTermChannelId, 0);
+  if (!helperKey) {
+    throw new Error("NoKeys verifyFingerprint(wrong) must not touch the helper's SharedKey");
+  }
+  console.log("  helper channel still Pending with its SharedKey  ✓");
+
+  console.log("\n✓ NoKeys fingerprint mismatch passed.\n");
+}
+
+
+/**
+ * Sweeping an expired `Pending` channel deletes its SharedKey along with the
+ * record, for a helper channel and for a replica channel once no member
+ * remains on it. A `Paired` channel is never swept, however old.
+ */
+async function runExpiredPendingPairingLosesItsKeyFlow(): Promise<void> {
+  console.log("=== [Protocol] Expired Pending pairing loses its key ===\n");
+
+  const channelStore = new InMemoryChannelStore();
+  const secretStore = new InMemorySecretStore();
+  const protocol = new DeRecProtocolBuilder(DEFAULT_TEST_SECRET_ID)
+    .withChannelStore(channelStore)
+    .withShareStore(new InMemoryShareStore())
+    .withSecretStore(secretStore)
+    .withUserSecretStore(new InMemoryUserSecretStore())
+    .withStateStore(new InMemoryStateStore())
+    .withTransport(new RecordingTransport())
+    .withOwnTransports([{ uri: "https://sweep.example.com", protocol: "https" }])
+    .withThreshold(THRESHOLD)
+    .withTimeouts({ expired_channels: { enabled: false, timeout_in_secs: 900 } })
+    .build();
+  const sid = String(protocol.secretId());
+
+  const sharedKey = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) sharedKey[i] = (i * 7 + 3) & 0xff;
+  const transports = [{ uri: "https://peer.example.com", protocol: 0 }];
+  const helperRecord = (channelId: number, status: string) => ({
+    Helper: {
+      channel_id: channelId,
+      transports,
+      communication_info: {},
+      peer_role: "Helper",
+      status,
+      created_at: 1700000000,
+    },
+  });
+
+  const pendingHelper = "6161";
+  const pendingReplica = "6162";
+  const pairedHelper = "6163";
+  const replicaId = String(0xbeef);
+
+  await channelStore.save(
+    sid,
+    pendingHelper,
+    "0",
+    utf8Encode(JSON.stringify(helperRecord(6161, "Pending"))),
+  );
+  await secretStore.save(sid, pendingHelper, 0, sharedKey);
+
+  await channelStore.save(
+    sid,
+    pendingReplica,
+    replicaId,
+    utf8Encode(
+      JSON.stringify({
+        Replica: {
+          channel_id: 6162,
+          replica_id: 0xbeef,
+          transports,
+          communication_info: {},
+          role: "Destination",
+          status: "Pending",
+          created_at: 1700000000,
+        },
+      }),
+    ),
+  );
+  await secretStore.save(sid, pendingReplica, 0, sharedKey);
+
+  await channelStore.save(
+    sid,
+    pairedHelper,
+    "0",
+    utf8Encode(JSON.stringify(helperRecord(6163, "Paired"))),
+  );
+  await secretStore.save(sid, pairedHelper, 0, sharedKey);
+
+  const removed = await protocol.removeExpiredChannels(60);
+  if (!removed.includes(pendingHelper) || !removed.includes(pendingReplica)) {
+    throw new Error(
+      `removeExpiredChannels must report both expired Pending channels, got ${JSON.stringify(removed)}`,
+    );
+  }
+  if (removed.includes(pairedHelper)) {
+    throw new Error(
+      `removeExpiredChannels must never sweep a Paired channel, got ${JSON.stringify(removed)}`,
+    );
+  }
+  console.log("  removeExpiredChannels reports the Pending channels, not the Paired one  ✓");
+
+  if (await channelStore.load(sid, pendingHelper, "0")) {
+    throw new Error("expired Pending helper channel record must be removed");
+  }
+  if (await secretStore.load(sid, pendingHelper, 0)) {
+    throw new Error("expired Pending helper channel must lose its SharedKey");
+  }
+  console.log("  expired helper channel: record and SharedKey removed  ✓");
+
+  if (await channelStore.load(sid, pendingReplica, replicaId)) {
+    throw new Error("expired Pending replica member record must be removed");
+  }
+  if (await secretStore.load(sid, pendingReplica, 0)) {
+    throw new Error("expired Pending replica channel must lose its SharedKey");
+  }
+  console.log("  expired replica channel: member record and SharedKey removed  ✓");
+
+  if (!(await channelStore.load(sid, pairedHelper, "0"))) {
+    throw new Error("Paired helper channel record must survive the sweep");
+  }
+  if (!(await secretStore.load(sid, pairedHelper, 0))) {
+    throw new Error("Paired helper channel must keep its SharedKey");
+  }
+  console.log("  Paired channel: record and SharedKey kept  ✓");
+
+  console.log("\n✓ Expired Pending pairing loses its key passed.\n");
 }
 
 
@@ -974,12 +1160,8 @@ async function runNoKeysPairingFlow(): Promise<void> {
   if (ownerFingerprint !== helperFingerprint) {
     throw new Error("NoKeys pairing: both sides must derive one fingerprint");
   }
-  if (!(await owner.protocol.verifyFingerprint(BigInt(longTermChannelId), helperFingerprint))) {
-    throw new Error("NoKeys pairing: owner verifyFingerprint must match");
-  }
-  if (!(await helper.protocol.verifyFingerprint(BigInt(longTermChannelId), ownerFingerprint))) {
-    throw new Error("NoKeys pairing: helper verifyFingerprint must match");
-  }
+  await owner.protocol.verifyFingerprint(BigInt(longTermChannelId), helperFingerprint);
+  await helper.protocol.verifyFingerprint(BigInt(longTermChannelId), ownerFingerprint);
 
   for (const [label, node, sid] of [
     ["owner", owner, ownerSid],
@@ -2259,13 +2441,8 @@ async function runReplicaPairingAndSecretSyncFlow(): Promise<void> {
       `replica fingerprint mismatch: owner=${ownerFp} dest=${destFp}`,
     );
   }
-  const ownerConfirmed = await owner.protocol.verifyFingerprint(rekeyedDestChannel, destFp);
-  const destConfirmed = await destination.protocol.verifyFingerprint(rekeyedDestChannel, ownerFp);
-  if (!ownerConfirmed || !destConfirmed) {
-    throw new Error(
-      `verifyFingerprint must return true on both sides (owner=${ownerConfirmed}, dest=${destConfirmed})`,
-    );
-  }
+  await owner.protocol.verifyFingerprint(rekeyedDestChannel, destFp);
+  await destination.protocol.verifyFingerprint(rekeyedDestChannel, ownerFp);
   console.log(`  fingerprint cross-confirmed (${ownerFp.length} chars)  ✓`);
 
   // verifyFingerprint auto-publishes an empty-secret roster snapshot
@@ -3231,9 +3408,7 @@ async function runReplicaSecretRefusedFlow(): Promise<void> {
   // source publishes on confirming its own side is ignored.
   const { rekeyed } = await pairReplicaHandshake(source, destination, 93n);
   const destinationFp = await destination.node.protocol.getFingerprint(rekeyed);
-  if (!(await source.node.protocol.verifyFingerprint(rekeyed, destinationFp))) {
-    throw new Error("source.verifyFingerprint must return true");
-  }
+  await source.node.protocol.verifyFingerprint(rekeyed, destinationFp);
   await pumpAll([source, destination, helperA, helperB]);
 
   const latest = await source.node.userSecretStore.loadLatest(secretId.toString());
@@ -3246,9 +3421,7 @@ async function runReplicaSecretRefusedFlow(): Promise<void> {
   await source.node.shareStore.save(secretId.toString(), channelA, { ...stored, bytes: corrupted });
 
   const sourceFp = await source.node.protocol.getFingerprint(rekeyed);
-  if (!(await destination.node.protocol.verifyFingerprint(rekeyed, sourceFp))) {
-    throw new Error("destination.verifyFingerprint must return true");
-  }
+  await destination.node.protocol.verifyFingerprint(rekeyed, sourceFp);
   await destination.node.protocol.start(FlowKind.ReplicaDiscovery);
   const catchUp = await pumpAll([destination, source]);
   const refused = catchUp.filter(
@@ -3368,6 +3541,8 @@ export async function runProtocolSmoke(): Promise<void> {
   await runPairingFlow();
   await runPairingRefusalFlow();
   await runFingerprintMismatchFlow();
+  await runNoKeysFingerprintMismatchFlow();
+  await runExpiredPendingPairingLosesItsKeyFlow();
   await runHashedKeysPairingFlow();
   await runNoKeysPairingFlow();
   runUnsafeConnectionConfigFlow();
@@ -3755,9 +3930,7 @@ async function runUnconfirmedDestinationIgnoresTheCopyFlow(): Promise<void> {
 
   const { rekeyed } = await pairReplicaHandshake(source, destination, 31n);
   const destinationFp = await destination.node.protocol.getFingerprint(rekeyed);
-  if (!(await source.node.protocol.verifyFingerprint(rekeyed, destinationFp))) {
-    throw new Error("source.verifyFingerprint must return true");
-  }
+  await source.node.protocol.verifyFingerprint(rekeyed, destinationFp);
 
   const early = await pumpAll([source, destination]);
   const ignored = early.find(
@@ -3784,9 +3957,7 @@ async function runUnconfirmedDestinationIgnoresTheCopyFlow(): Promise<void> {
   console.log("  copy sent before the destination confirmed was ignored  ✓");
 
   const sourceFp = await source.node.protocol.getFingerprint(rekeyed);
-  if (!(await destination.node.protocol.verifyFingerprint(rekeyed, sourceFp))) {
-    throw new Error("destination.verifyFingerprint must return true");
-  }
+  await destination.node.protocol.verifyFingerprint(rekeyed, sourceFp);
   await destination.node.protocol.start(FlowKind.ReplicaDiscovery);
   const catchUp = await pumpAll([destination, source]);
   if (!catchUp.some((e) => e.type === "ReplicaSecretInstalled")) {
@@ -3835,12 +4006,8 @@ async function crossConfirmFingerprint(owner: Node, replica: Node, channelId: bi
   if (ownerFp !== replicaFp) {
     throw new Error(`fingerprint mismatch: owner=${ownerFp} replica=${replicaFp}`);
   }
-  if (!(await owner.protocol.verifyFingerprint(channelId, replicaFp))) {
-    throw new Error("owner.verifyFingerprint must return true");
-  }
-  if (!(await replica.protocol.verifyFingerprint(channelId, ownerFp))) {
-    throw new Error("replica.verifyFingerprint must return true");
-  }
+  await owner.protocol.verifyFingerprint(channelId, replicaFp);
+  await replica.protocol.verifyFingerprint(channelId, ownerFp);
 }
 
 async function helperStartPair(owner: Node, helper: Node, channelId: bigint) {

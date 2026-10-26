@@ -96,6 +96,10 @@ const (
 	// is the application's, so this is a configuration fault: assign a
 	// distinct id and pair again.
 	CodeReplicaIDConflict int32 = 16
+	// CodeFingerprintMismatch: VerifyFingerprint was given a fingerprint that
+	// does not match the channel key — a possible man-in-the-middle. A
+	// Pending pairing has been revoked; pair again.
+	CodeFingerprintMismatch int32 = 17
 
 	CodeEncryption             int32 = 20
 	CodeKeygen                 int32 = 21

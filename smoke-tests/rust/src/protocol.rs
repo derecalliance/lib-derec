@@ -26,6 +26,8 @@ pub async fn run_all() {
     run_pairing_flow().await;
     run_hashed_keys_pairing_flow().await;
     run_no_keys_pairing_flow().await;
+    run_no_keys_fingerprint_mismatch_flow().await;
+    run_fingerprint_mismatch_flow().await;
     run_replica_id_wiring_flow().await;
     run_protect_secret_with_replica_targets_flow().await;
     run_protect_secret_per_target_failure_flow().await;
@@ -53,6 +55,7 @@ pub async fn run_all() {
     run_start_pairing_rejects_already_paired_channel().await;
     run_pairing_rejects_incompatible_parameter_range().await;
     run_expired_channel_cleanup_flow().await;
+    run_expired_pending_pairing_loses_its_key_flow().await;
     run_own_transport_set_rules().await;
 }
 
@@ -1298,6 +1301,46 @@ async fn pair_no_keys(
         .expect("NoKeys handshake must emit PairingCompleted for the transient channel_id")
 }
 
+/// A wrong comparison is the MITM case — the two sides derived different
+/// shared keys — so it revokes the pairing: no record and no key of it remain,
+/// and the channel can never be used.
+async fn run_no_keys_fingerprint_mismatch_flow() {
+    println!("=== Protocol NoKeys fingerprint mismatch flow test ===");
+
+    let mut owner = Peer::new("owner", "https://owner.example.com");
+    let mut helper = Peer::new("helper", "https://helper.example.com");
+    let channel_id = pair_no_keys(&mut owner, &mut helper, ChannelId(4322), 1235).await;
+    let owner_sid = owner.protocol.secret_id();
+
+    let err = owner
+        .protocol
+        .verify_fingerprint(channel_id, "0000-0000-0000-0000")
+        .await
+        .expect_err("a mismatched fingerprint must not verify");
+    assert!(
+        matches!(err, derec_library::Error::FingerprintMismatch { channel_id: c } if c == channel_id),
+        "expected FingerprintMismatch, got {err:?}"
+    );
+    println!("  verify_fingerprint(wrong) fails with FingerprintMismatch  ✓");
+
+    assert!(
+        owner
+            .protocol
+            .channel_store
+            .load(owner_sid, ChannelQuery::Helper { channel_id })
+            .await
+            .expect("owner channel_store.load failed")
+            .is_none(),
+        "a failed comparison must remove the channel record"
+    );
+    assert!(
+        owner.protocol.get_fingerprint(channel_id).await.is_err(),
+        "a failed comparison must remove the channel key"
+    );
+    println!("  channel record and key removed  ✓");
+    println!("Protocol NoKeys fingerprint mismatch flow test passed.");
+}
+
 async fn run_no_keys_pairing_flow() {
     println!("=== Protocol NoKeys pairing flow test ===");
 
@@ -1391,47 +1434,17 @@ async fn run_no_keys_pairing_flow() {
         "owner and helper fingerprints must match after NoKeys pairing"
     );
 
-    // A wrong comparison must not open the gate — this is the MITM case, where
-    // the two sides derived different shared keys and so different
-    // fingerprints.
-    assert!(
-        !owner
-            .protocol
-            .verify_fingerprint(channel_id, "0000-0000-0000-0000")
-            .await
-            .expect("owner verify_fingerprint failed"),
-        "a mismatched fingerprint must not verify"
-    );
-    let still_pending = owner
-        .protocol
-        .channel_store
-        .load(owner_sid, ChannelQuery::Helper { channel_id })
-        .await
-        .expect("owner channel_store.load failed")
-        .expect("owner channel present");
-    assert_eq!(
-        still_pending.status(),
-        ChannelStatus::Pending,
-        "a failed comparison must leave the channel inert"
-    );
-
     // The real comparison opens it, on both sides independently.
-    assert!(
-        owner
-            .protocol
-            .verify_fingerprint(channel_id, &helper_fp)
-            .await
-            .expect("owner verify_fingerprint failed"),
-        "matching fingerprints must verify on the owner side"
-    );
-    assert!(
-        helper
-            .protocol
-            .verify_fingerprint(channel_id, &owner_fp)
-            .await
-            .expect("helper verify_fingerprint failed"),
-        "matching fingerprints must verify on the helper side"
-    );
+    owner
+        .protocol
+        .verify_fingerprint(channel_id, &helper_fp)
+        .await
+        .expect("matching fingerprints must verify on the owner side");
+    helper
+        .protocol
+        .verify_fingerprint(channel_id, &owner_fp)
+        .await
+        .expect("matching fingerprints must verify on the helper side");
 
     for (label, peer, sid) in [
         ("owner", &mut owner, owner_sid),
@@ -1796,20 +1809,16 @@ async fn run_protect_secret_with_replica_targets_flow() {
         owner_fp, replica_fp,
         "owner and replica must derive the same fingerprint from K_replica"
     );
-    let confirmed_owner = owner
+    owner
         .protocol
         .verify_fingerprint(replica_channel, &replica_fp)
         .await
         .expect("owner verify_fingerprint");
-    let confirmed_replica = replica
+    replica
         .protocol
         .verify_fingerprint(replica_channel, &owner_fp)
         .await
         .expect("replica verify_fingerprint");
-    assert!(
-        confirmed_owner && confirmed_replica,
-        "both sides must accept the matching fingerprint",
-    );
 
     let auto_publish = owner.transport.drain();
     assert_eq!(
@@ -2419,14 +2428,11 @@ async fn run_unconfirmed_destination_ignores_the_copy_flow() {
         .get_fingerprint(replica_channel)
         .await
         .expect("destination fingerprint");
-    assert!(
-        source
-            .protocol
-            .verify_fingerprint(replica_channel, &destination_fp)
-            .await
-            .expect("source verify_fingerprint"),
-        "the source must accept the matching fingerprint"
-    );
+    source
+        .protocol
+        .verify_fingerprint(replica_channel, &destination_fp)
+        .await
+        .expect("the source must accept the matching fingerprint");
 
     let early = pump(&mut source, &mut destination).await;
     assert!(
@@ -2456,14 +2462,11 @@ async fn run_unconfirmed_destination_ignores_the_copy_flow() {
         .get_fingerprint(replica_channel)
         .await
         .expect("source fingerprint");
-    assert!(
-        destination
-            .protocol
-            .verify_fingerprint(replica_channel, &source_fp)
-            .await
-            .expect("destination verify_fingerprint"),
-        "the destination must accept the matching fingerprint"
-    );
+    destination
+        .protocol
+        .verify_fingerprint(replica_channel, &source_fp)
+        .await
+        .expect("the destination must accept the matching fingerprint");
     destination
         .protocol
         .start(DeRecFlow::ReplicaDiscovery)
@@ -2543,19 +2546,16 @@ async fn run_replica_mirror_then_verify_flow() {
         .get_fingerprint(replica_channel)
         .await
         .expect("destination fingerprint");
-    assert!(
-        source
-            .protocol
-            .verify_fingerprint(replica_channel, &destination_fp)
-            .await
-            .expect("source verify_fingerprint")
-            && destination
-                .protocol
-                .verify_fingerprint(replica_channel, &source_fp)
-                .await
-                .expect("destination verify_fingerprint"),
-        "both sides must accept the matching fingerprint"
-    );
+    source
+        .protocol
+        .verify_fingerprint(replica_channel, &destination_fp)
+        .await
+        .expect("source verify_fingerprint");
+    destination
+        .protocol
+        .verify_fingerprint(replica_channel, &source_fp)
+        .await
+        .expect("destination verify_fingerprint");
 
     // The pair-completion auto-publish is not the round under test.
     let _ = pump_many(&mut [&mut source, &mut helper_a, &mut helper_b, &mut destination]).await;
@@ -2957,19 +2957,15 @@ async fn run_replica_verifies_only_synced_versions_flow() {
         .get_fingerprint(replica_channel)
         .await
         .expect("bob fingerprint");
-    assert!(
-        alice
-            .protocol
-            .verify_fingerprint(replica_channel, &bob_fp)
-            .await
-            .expect("alice verify_fingerprint")
-            && bob
-                .protocol
-                .verify_fingerprint(replica_channel, &alice_fp)
-                .await
-                .expect("bob verify_fingerprint"),
-        "both sides must accept the matching fingerprint"
-    );
+    alice
+        .protocol
+        .verify_fingerprint(replica_channel, &bob_fp)
+        .await
+        .expect("alice verify_fingerprint");
+    bob.protocol
+        .verify_fingerprint(replica_channel, &alice_fp)
+        .await
+        .expect("bob verify_fingerprint");
 
     let joined = pump_many(&mut [&mut alice, &mut h1, &mut h2, &mut h3, &mut bob]).await;
     let (v2, synced_secret) = joined
@@ -5448,17 +5444,16 @@ async fn cross_confirm_fingerprint(owner: &mut Peer, replica: &mut Peer, channel
     let owner_fp = owner.protocol.get_fingerprint(channel_id).await.unwrap();
     let replica_fp = replica.protocol.get_fingerprint(channel_id).await.unwrap();
     assert_eq!(owner_fp, replica_fp);
-    let ok_o = owner
+    owner
         .protocol
         .verify_fingerprint(channel_id, &replica_fp)
         .await
-        .unwrap();
-    let ok_r = replica
+        .expect("cross-fingerprint verification must succeed");
+    replica
         .protocol
         .verify_fingerprint(channel_id, &owner_fp)
         .await
-        .unwrap();
-    assert!(ok_o && ok_r, "cross-fingerprint verification must succeed");
+        .expect("cross-fingerprint verification must succeed");
 }
 
 /// Drive only the helper-side `start(Pairing { kind: Helper })`. The
@@ -5943,6 +5938,189 @@ async fn run_pairing_rejects_incompatible_parameter_range() {
 /// Replica pairing is the scenario that motivates the option — both sides
 /// sit in `Pending` until an out-of-band fingerprint comparison, which is
 /// paced by a human rather than the protocol.
+fn seeded_endpoint() -> TransportProtocol {
+    TransportProtocol {
+        uri: "https://peer.example.com".to_owned(),
+        protocol: Protocol::Https as i32,
+    }
+}
+
+fn seeded_member(channel_id: u64, replica_id: u64) -> ChannelRecord {
+    ChannelRecord::Replica(ReplicaMember {
+        channel_id: ChannelId(channel_id),
+        replica_id: ReplicaId(replica_id),
+        transports: vec![seeded_endpoint()],
+        communication_info: HashMap::new(),
+        role: ReplicaRole::Destination,
+        status: derec_library::protocol::types::ChannelStatus::Pending,
+        created_at: 1_700_000_000,
+    })
+}
+
+fn seeded_helper(
+    channel_id: u64,
+    status: derec_library::protocol::types::ChannelStatus,
+) -> ChannelRecord {
+    ChannelRecord::Helper(HelperChannel {
+        channel_id: ChannelId(channel_id),
+        transports: vec![seeded_endpoint()],
+        communication_info: HashMap::new(),
+        status,
+        created_at: 1_700_000_000,
+        peer_role: SenderKind::Helper,
+        weight: 1,
+    })
+}
+
+async fn seed_channel(peer: &mut Peer, record: ChannelRecord) {
+    let sid = peer.protocol.secret_id();
+    let channel_id = record.channel_id();
+    peer.protocol
+        .channel_store
+        .save(sid, record)
+        .await
+        .expect("seed channel record");
+    peer.protocol
+        .secret_store
+        .save(
+            sid,
+            channel_id,
+            SecretValue::SharedKey(std::array::from_fn(|i| (i * 11 + 5) as u8)),
+        )
+        .await
+        .expect("seed channel key");
+}
+
+async fn has_channel_key(peer: &Peer, channel_id: u64) -> bool {
+    peer.protocol
+        .secret_store
+        .load(
+            peer.protocol.secret_id(),
+            ChannelId(channel_id),
+            SecretKind::SharedKey,
+        )
+        .await
+        .expect("secret_store.load")
+        .is_some()
+}
+
+/// A wrong comparison on a `Pending` replica pairing revokes it: neither the
+/// member record nor the channel key survives.
+async fn run_fingerprint_mismatch_flow() {
+    println!("=== Protocol fingerprint mismatch flow test ===");
+
+    let mut node = Peer::new("owner", "https://owner.example.com");
+    seed_channel(&mut node, seeded_member(5151, 0xcafe)).await;
+
+    let err = node
+        .protocol
+        .verify_fingerprint(ChannelId(5151), "0000-0000-0000-0000")
+        .await
+        .expect_err("a mismatched fingerprint must not verify");
+    assert!(
+        matches!(err, derec_library::Error::FingerprintMismatch { .. }),
+        "expected FingerprintMismatch, got {err:?}"
+    );
+    println!("  verify_fingerprint(wrong) fails with FingerprintMismatch  ✓");
+
+    let member = node
+        .protocol
+        .channel_store
+        .load(
+            node.protocol.secret_id(),
+            ChannelQuery::Replica {
+                channel_id: ChannelId(5151),
+                replica_id: ReplicaId(0xcafe),
+            },
+        )
+        .await
+        .expect("channel_store.load");
+    assert!(
+        member.is_none(),
+        "a failed comparison must remove the member record"
+    );
+    assert!(
+        !has_channel_key(&node, 5151).await,
+        "a failed comparison must remove the channel key"
+    );
+    println!("  member record and channel key removed  ✓");
+    println!("Protocol fingerprint mismatch flow test passed.");
+}
+
+/// An expired `Pending` pairing goes with its channel key, for a helper and
+/// for a replica peer alike; a `Paired` channel of the same age is kept.
+async fn run_expired_pending_pairing_loses_its_key_flow() {
+    use derec_library::protocol::types::ChannelStatus;
+    println!("=== Protocol expired pending pairing loses its key flow test ===");
+
+    let mut owner = Peer::with_expired_channel_cleanup(
+        "owner",
+        "https://owner.example.com",
+        13,
+        ExpiredChannelCleanup::Disabled,
+    );
+    seed_channel(&mut owner, seeded_helper(6161, ChannelStatus::Pending)).await;
+    seed_channel(&mut owner, seeded_member(6162, 0xbeef)).await;
+    seed_channel(&mut owner, seeded_helper(6163, ChannelStatus::Paired)).await;
+
+    let removed = owner
+        .protocol
+        .remove_expired_channels(60)
+        .await
+        .expect("remove_expired_channels");
+    assert!(
+        removed.contains(&ChannelId(6161)) && removed.contains(&ChannelId(6162)),
+        "both expired pending pairings must be swept, got {removed:?}"
+    );
+    assert!(
+        !removed.contains(&ChannelId(6163)),
+        "a paired channel is never swept"
+    );
+
+    let sid = owner.protocol.secret_id();
+    for channel_id in [6161, 6162] {
+        assert!(
+            !has_channel_key(&owner, channel_id).await,
+            "channel {channel_id}: an expired pending pairing must not leave its key"
+        );
+    }
+    assert!(
+        owner
+            .protocol
+            .channel_store
+            .load(
+                sid,
+                ChannelQuery::Replica {
+                    channel_id: ChannelId(6162),
+                    replica_id: ReplicaId(0xbeef),
+                },
+            )
+            .await
+            .expect("channel_store.load")
+            .is_none(),
+        "the expired member record must be removed"
+    );
+    assert!(
+        owner
+            .protocol
+            .channel_store
+            .load(
+                sid,
+                ChannelQuery::Helper {
+                    channel_id: ChannelId(6163)
+                },
+            )
+            .await
+            .expect("channel_store.load")
+            .is_some()
+            && has_channel_key(&owner, 6163).await,
+        "the paired channel keeps its record and key"
+    );
+    println!("  expired pending helper and replica pairings swept with their keys  ✓");
+    println!("  paired channel of the same age kept  ✓");
+    println!("Protocol expired pending pairing loses its key flow test passed.");
+}
+
 async fn run_expired_channel_cleanup_flow() {
     let mut owner = Peer::with_expired_channel_cleanup(
         "owner",

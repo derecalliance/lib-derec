@@ -120,6 +120,7 @@ var fixtureErrorCodes = map[string]int32{
 	"AlreadyRestored":            derec.CodeAlreadyRestored,
 	"RestoreConflict":            derec.CodeRestoreConflict,
 	"ReplicaIdConflict":          derec.CodeReplicaIDConflict,
+	"FingerprintMismatch":        derec.CodeFingerprintMismatch,
 	"Encryption":                 derec.CodeEncryption,
 	"Keygen":                     derec.CodeKeygen,
 	"FinishPairingInitiator":     derec.CodeFinishPairingInitiator,

@@ -108,6 +108,7 @@ vocabulary! {
         AlreadyRestored = 14 => "already_restored",
         RestoreConflict = 15 => "restore_conflict",
         ReplicaIdConflict = 16 => "replica_id_conflict",
+        FingerprintMismatch = 17 => "fingerprint_mismatch",
         Encryption = 20 => "encryption",
         Keygen = 21 => "keygen",
         FinishPairingInitiator = 22 => "finish_pairing_initiator",
@@ -181,6 +182,7 @@ pub(crate) fn classify(err: &crate::Error) -> (Category, Code) {
         E::ReplicaIdNotConfigured => (Category::InvalidInput, Code::ReplicaIdNotConfigured),
         E::ReplicaIdConflict { .. } => (Category::InvalidInput, Code::ReplicaIdConflict),
         E::ChannelAlreadyPaired { .. } => (Category::InvalidInput, Code::ChannelAlreadyPaired),
+        E::FingerprintMismatch { .. } => (Category::Pairing, Code::FingerprintMismatch),
         E::Restore(e) => {
             use crate::protocol::RestoreError;
             match e {

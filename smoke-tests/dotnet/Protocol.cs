@@ -66,6 +66,7 @@ internal static class Protocol
     {
         RunOrchestratorFingerprintTest();
         RunOrchestratorFingerprintMismatchTest();
+        RunOrchestratorExpiredPendingPairingLosesItsKeyTest();
         RunOrchestratorPairFlowTest();
         RunOrchestratorPairingRefusalTest();
         RunOrchestratorCommunicationInfoPairTest();
@@ -87,6 +88,7 @@ internal static class Protocol
         RunLibraryDefaultThresholdTest();
         RunOrchestratorHashedKeysPairFlowTest();
         RunOrchestratorNoKeysPairFlowTest();
+        RunOrchestratorNoKeysFingerprintMismatchTest();
         RunUnsafeConnectionConfigTest();
         RunNewFlowParamsTest();
         RunOrchestratorShareAndDiscoverFlowTest();
@@ -458,22 +460,23 @@ internal static class Protocol
 
         // verifyFingerprint round-trip: the same fingerprint must match,
         // a clearly-wrong one must not.
-        bool matched = protocol.VerifyFingerprintAsync(channelId, fingerprint).GetAwaiter().GetResult();
-        if (!matched)
-            throw new InvalidOperationException("Orchestrator fingerprint test failed: verify returned false for the locally-derived fingerprint.");
-        bool unmatched = protocol.VerifyFingerprintAsync(channelId, "0000-0000-0000-0000").GetAwaiter().GetResult();
-        if (unmatched)
-            throw new InvalidOperationException("Orchestrator fingerprint test failed: verify returned true for a clearly-wrong fingerprint.");
+        protocol.VerifyFingerprintAsync(channelId, fingerprint).GetAwaiter().GetResult();
+        try
+        {
+            protocol.VerifyFingerprintAsync(channelId, "0000-0000-0000-0000").GetAwaiter().GetResult();
+            throw new InvalidOperationException("Orchestrator fingerprint test failed: verify accepted a clearly-wrong fingerprint.");
+        }
+        catch (DeRecException e) when (e.Code == DeRecCode.FingerprintMismatch) { }
         Console.WriteLine("  verifyFingerprint matches local / rejects wrong  ✓");
 
         Console.WriteLine("Orchestrator getFingerprint test passed.");
     }
 
     /// <summary>
-    /// <c>verifyFingerprint(wrong)</c> on a still-<c>Pending</c> channel
-    /// must (a) return <c>false</c> and (b) leave
-    /// <c>Channel.Status</c> as <c>Pending</c>. The protocol must not
-    /// downgrade or otherwise mutate the channel on a failed match.
+    /// <c>verifyFingerprint(wrong)</c> on a still-<c>Pending</c> channel is
+    /// the man-in-the-middle case: it must throw with
+    /// <see cref="DeRecCode.FingerprintMismatch"/> and revoke the pairing,
+    /// so neither the member record nor the channel key survives.
     /// </summary>
     private static void RunOrchestratorFingerprintMismatchTest()
     {
@@ -498,22 +501,23 @@ internal static class Protocol
             CreatedAt: 1700000000UL)));
         node.SecretStore.Save(node.Protocol.SecretId, channelId, new SecretValue(SecretKind.SharedKey, sharedKey));
 
-        bool unmatched = node.Protocol
-            .VerifyFingerprintAsync(channelId, "0000-0000-0000-0000")
-            .GetAwaiter().GetResult();
-        if (unmatched)
+        try
+        {
+            node.Protocol
+                .VerifyFingerprintAsync(channelId, "0000-0000-0000-0000")
+                .GetAwaiter().GetResult();
             throw new InvalidOperationException(
-                "verifyFingerprint must return false for a wrong fingerprint");
+                "verifyFingerprint must fail for a wrong fingerprint");
+        }
+        catch (DeRecException e) when (e.Code == DeRecCode.FingerprintMismatch
+                                       && e.Category == DeRecCategory.Pairing) { }
 
-        // Critical invariant: the stored channel record must still
-        // report Pending; the protocol must not have touched it.
-        var stored = node.ChannelStore.Load(node.Protocol.SecretId, channelId, 0xcafeUL)
-            ?? throw new InvalidOperationException("member record missing after verify");
-        if (stored.Status != ChannelStatus.Pending)
-            throw new InvalidOperationException(
-                $"verifyFingerprint(wrong) must leave the member Status as Pending; got {stored.Status}");
-        Console.WriteLine("  verifyFingerprint(wrong) returns false  ✓");
-        Console.WriteLine("  Channel.Status stays Pending after mismatch  ✓");
+        if (node.ChannelStore.Load(node.Protocol.SecretId, channelId, 0xcafeUL) is not null)
+            throw new InvalidOperationException("verifyFingerprint(wrong) must remove the member record");
+        if (node.SecretStore.Load(node.Protocol.SecretId, channelId, SecretKind.SharedKey) is not null)
+            throw new InvalidOperationException("verifyFingerprint(wrong) must remove the channel key");
+        Console.WriteLine("  verifyFingerprint(wrong) fails with FingerprintMismatch  ✓");
+        Console.WriteLine("  member record and channel key removed  ✓");
 
         Console.WriteLine("Orchestrator fingerprint mismatch test passed.");
     }
@@ -2786,10 +2790,8 @@ internal static class Protocol
         string destFp = destination.Protocol.GetFingerprintAsync(destId).GetAwaiter().GetResult();
         if (ownerFp != destFp)
             throw new InvalidOperationException($"replica fingerprint mismatch: owner={ownerFp} dest={destFp}");
-        if (!owner.Protocol.VerifyFingerprintAsync(destId, destFp).GetAwaiter().GetResult())
-            throw new InvalidOperationException("owner.VerifyFingerprint must return true");
-        if (!destination.Protocol.VerifyFingerprintAsync(destId, ownerFp).GetAwaiter().GetResult())
-            throw new InvalidOperationException("destination.VerifyFingerprint must return true");
+        owner.Protocol.VerifyFingerprintAsync(destId, destFp).GetAwaiter().GetResult();
+        destination.Protocol.VerifyFingerprintAsync(destId, ownerFp).GetAwaiter().GetResult();
         Console.WriteLine($"  fingerprint cross-confirmed ({ownerFp.Length} chars)  ✓");
 
         // verify_fingerprint auto-publishes an empty-secret roster
@@ -3098,10 +3100,8 @@ internal static class Protocol
         if (helperFingerprint != ownerFingerprint)
             throw new InvalidOperationException("both sides must derive one fingerprint after a NoKeys pair");
 
-        if (!helper.Protocol.VerifyFingerprintAsync(rekeyedId, ownerFingerprint).GetAwaiter().GetResult())
-            throw new InvalidOperationException("helper verifyFingerprint must match");
-        if (!owner.Protocol.VerifyFingerprintAsync(rekeyedId, helperFingerprint).GetAwaiter().GetResult())
-            throw new InvalidOperationException("owner verifyFingerprint must match");
+        helper.Protocol.VerifyFingerprintAsync(rekeyedId, ownerFingerprint).GetAwaiter().GetResult();
+        owner.Protocol.VerifyFingerprintAsync(rekeyedId, helperFingerprint).GetAwaiter().GetResult();
 
         foreach (var (label, node) in new[] { ("helper", helper), ("owner", owner) })
         {
@@ -3114,6 +3114,80 @@ internal static class Protocol
         Console.WriteLine("  confirming the fingerprint opens the channel on both sides  ✓");
 
         Console.WriteLine("Orchestrator NoKeys pair flow test passed.");
+    }
+
+    /// <summary>
+    /// A NoKeys pairing ends with both sides holding the channel Pending
+    /// until the fingerprints are compared. A wrong fingerprint at that
+    /// point revokes the pairing on the side that checked it: its channel
+    /// record and channel key are removed, while the peer is untouched.
+    /// </summary>
+    private static void RunOrchestratorNoKeysFingerprintMismatchTest()
+    {
+        Console.WriteLine("=== Orchestrator NoKeys fingerprint mismatch test ===");
+
+        const ulong channelId = 202UL;
+
+        using var helper = MakeNode("Helper", "https://helper.nokeys-mismatch.example.com");
+        using var owner = MakeNode("Owner", "https://owner.nokeys-mismatch.example.com");
+
+        byte[] contactBytes = helper.Protocol.CreateContactAsync(channelId, ContactMode.NoKeys)
+            .GetAwaiter().GetResult();
+
+        owner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
+        {
+            Kind = Pairing.SenderKind.Owner,
+            Contact = contactBytes,
+        }).GetAwaiter().GetResult();
+
+        byte[] prePairRequest = owner.Transport.DrainOne();
+        helper.Protocol.ProcessAndAcceptAllAsync(prePairRequest).GetAwaiter().GetResult();
+
+        byte[] prePairResponse = helper.Transport.DrainOne();
+        owner.Protocol.ProcessAndAcceptAllAsync(prePairResponse).GetAwaiter().GetResult();
+
+        byte[] pairRequest = owner.Transport.DrainOne();
+        var helperEvents = helper.Protocol.ProcessAndAcceptAllAsync(pairRequest).GetAwaiter().GetResult();
+        var helperPairing = helperEvents.OfType<PairingCompletedEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException("helper must emit PairingCompleted");
+
+        byte[] pairResponse = helper.Transport.DrainOne();
+        var ownerEvents = owner.Protocol.ProcessAndAcceptAllAsync(pairResponse).GetAwaiter().GetResult();
+        var ownerPairing = ownerEvents.OfType<PairingCompletedEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException("owner must emit PairingCompleted");
+
+        if (helperPairing.ChannelId != ownerPairing.ChannelId)
+            throw new InvalidOperationException("NoKeys pair: channel id mismatch on both sides");
+        ulong longTermId = ownerPairing.ChannelId;
+
+        try
+        {
+            owner.Protocol
+                .VerifyFingerprintAsync(longTermId, "0000-0000-0000-0000")
+                .GetAwaiter().GetResult();
+            throw new InvalidOperationException(
+                "verifyFingerprint must fail for a wrong fingerprint");
+        }
+        catch (DeRecException e) when (e.Code == DeRecCode.FingerprintMismatch
+                                       && e.Category == DeRecCategory.Pairing) { }
+        Console.WriteLine("  verifyFingerprint(wrong) on a Pending NoKeys channel fails with FingerprintMismatch  ✓");
+
+        if (owner.ChannelStore.Load(owner.Protocol.SecretId, longTermId, 0) is not null)
+            throw new InvalidOperationException("verifyFingerprint(wrong) must remove the owner's channel record");
+        if (owner.SecretStore.Load(owner.Protocol.SecretId, longTermId, SecretKind.SharedKey) is not null)
+            throw new InvalidOperationException("verifyFingerprint(wrong) must remove the owner's channel key");
+        Console.WriteLine("  owner channel record and channel key removed  ✓");
+
+        var helperChannel = helper.ChannelStore.Load(helper.Protocol.SecretId, longTermId, 0)
+            ?? throw new InvalidOperationException("the helper's channel record must be untouched");
+        if (helperChannel.Status != ChannelStatus.Pending)
+            throw new InvalidOperationException(
+                $"the helper's channel must still be Pending; got {helperChannel.Status}");
+        if (helper.SecretStore.Load(helper.Protocol.SecretId, longTermId, SecretKind.SharedKey) is null)
+            throw new InvalidOperationException("the helper's channel key must be untouched");
+        Console.WriteLine("  helper side still Pending with its channel key  ✓");
+
+        Console.WriteLine("Orchestrator NoKeys fingerprint mismatch test passed.");
     }
 
     /// <summary>
@@ -3754,8 +3828,7 @@ internal static class Protocol
 
         ulong channel = PairReplicaHandshake(source, destination, 31);
         string destinationFp = destination.Protocol.GetFingerprintAsync(channel).GetAwaiter().GetResult();
-        if (!source.Protocol.VerifyFingerprintAsync(channel, destinationFp).GetAwaiter().GetResult())
-            throw new InvalidOperationException("source.VerifyFingerprint must return true");
+        source.Protocol.VerifyFingerprintAsync(channel, destinationFp).GetAwaiter().GetResult();
 
         var early = PumpAll(scope);
         if (!early.OfType<MessageIgnoredEvent>().Any(e =>
@@ -3770,8 +3843,7 @@ internal static class Protocol
         Console.WriteLine("  copy sent before the destination confirmed was ignored  ✓");
 
         string sourceFp = source.Protocol.GetFingerprintAsync(channel).GetAwaiter().GetResult();
-        if (!destination.Protocol.VerifyFingerprintAsync(channel, sourceFp).GetAwaiter().GetResult())
-            throw new InvalidOperationException("destination.VerifyFingerprint must return true");
+        destination.Protocol.VerifyFingerprintAsync(channel, sourceFp).GetAwaiter().GetResult();
         destination.Protocol.StartAsync(FlowKind.ReplicaDiscovery, new ReplicaDiscoveryParams())
             .GetAwaiter().GetResult();
 
@@ -3842,10 +3914,8 @@ internal static class Protocol
         string replicaFp = replica.Protocol.GetFingerprintAsync(channelId).GetAwaiter().GetResult();
         if (ownerFp != replicaFp)
             throw new InvalidOperationException($"fingerprint mismatch: owner={ownerFp} replica={replicaFp}");
-        if (!owner.Protocol.VerifyFingerprintAsync(channelId, replicaFp).GetAwaiter().GetResult())
-            throw new InvalidOperationException("owner.VerifyFingerprint must return true");
-        if (!replica.Protocol.VerifyFingerprintAsync(channelId, ownerFp).GetAwaiter().GetResult())
-            throw new InvalidOperationException("replica.VerifyFingerprint must return true");
+        owner.Protocol.VerifyFingerprintAsync(channelId, replicaFp).GetAwaiter().GetResult();
+        replica.Protocol.VerifyFingerprintAsync(channelId, ownerFp).GetAwaiter().GetResult();
     }
 
     private static void HelperStartPair(Node owner, Node helper, ulong channelId)
@@ -4167,6 +4237,100 @@ internal static class Protocol
             builder = builder.WithAutoRespondOnFailure(autoRespond);
 
         return new Node(builder.Build(), transport, channelStore, shareStore, secretStore, userSecretStore, stateStore);
+    }
+
+    /// <summary>
+    /// The expired-channel sweep removes Pending channels older than the
+    /// cutoff together with their channel keys, for both helper channels and
+    /// replica members. Paired channels are never swept.
+    /// </summary>
+    private static void RunOrchestratorExpiredPendingPairingLosesItsKeyTest()
+    {
+        Console.WriteLine("=== Protocol expired Pending pairing loses its key test ===");
+
+        const ulong pendingHelperId = 6161UL;
+        const ulong pendingReplicaId = 6162UL;
+        const ulong pairedHelperId = 6163UL;
+        const ulong replicaId = 0xbeefUL;
+
+        var channelStore = new InMemoryChannelStore();
+        var secretStore = new InMemorySecretStore();
+
+        using var protocol = new DeRecProtocolBuilder(DefaultTestSecretId)
+            .WithChannelStore(channelStore)
+            .WithShareStore(new InMemoryShareStore())
+            .WithSecretStore(secretStore)
+            .WithUserSecretStore(new InMemoryUserSecretStore())
+            .WithStateStore(new InMemoryStateStore())
+            .WithTransport(new RecordingTransport())
+            .WithOwnTransports(new[] { new TransportProtocol("https://sweep.example.com") })
+            .WithThreshold(DefaultThreshold)
+            .WithTimeouts(new Timeouts(
+                ExpiredChannels: new RemoveExpiredChannelsPolicy(Enabled: false, TimeoutInSecs: 900)))
+            .Build();
+
+        byte[] Key(byte seed)
+        {
+            var k = new byte[32];
+            for (int i = 0; i < 32; i++) k[i] = (byte)(i * 13 + seed);
+            return k;
+        }
+
+        channelStore.Save(DefaultTestSecretId, ChannelRecord.Of(new HelperChannel(
+            ChannelId: pendingHelperId,
+            Transports: new[] { new TransportProtocol("https://pending-helper.example.com") },
+            CommunicationInfo: new Dictionary<string, string>(),
+            Status: ChannelStatus.Pending,
+            CreatedAt: 1700000000UL,
+            PeerRole: Pairing.SenderKind.Helper)));
+        secretStore.Save(DefaultTestSecretId, pendingHelperId, new SecretValue(SecretKind.SharedKey, Key(1)));
+
+        channelStore.Save(DefaultTestSecretId, ChannelRecord.Of(new ReplicaMember(
+            ChannelId: pendingReplicaId,
+            ReplicaId: replicaId,
+            Transports: new[] { new TransportProtocol("https://pending-replica.example.com") },
+            CommunicationInfo: new Dictionary<string, string>(),
+            Role: ReplicaRole.Destination,
+            Status: ChannelStatus.Pending,
+            CreatedAt: 1700000000UL)));
+        secretStore.Save(DefaultTestSecretId, pendingReplicaId, new SecretValue(SecretKind.SharedKey, Key(2)));
+
+        channelStore.Save(DefaultTestSecretId, ChannelRecord.Of(new HelperChannel(
+            ChannelId: pairedHelperId,
+            Transports: new[] { new TransportProtocol("https://paired-helper.example.com") },
+            CommunicationInfo: new Dictionary<string, string>(),
+            Status: ChannelStatus.Paired,
+            CreatedAt: 1700000000UL,
+            PeerRole: Pairing.SenderKind.Helper)));
+        secretStore.Save(DefaultTestSecretId, pairedHelperId, new SecretValue(SecretKind.SharedKey, Key(3)));
+
+        var removed = protocol.RemoveExpiredChannelsAsync(60).GetAwaiter().GetResult();
+        if (!removed.Contains(pendingHelperId) || !removed.Contains(pendingReplicaId))
+            throw new InvalidOperationException(
+                $"both expired Pending channels must be reported removed; got [{string.Join(", ", removed)}]");
+        if (removed.Contains(pairedHelperId))
+            throw new InvalidOperationException("a Paired channel must never be swept");
+        Console.WriteLine("  sweep reports both expired Pending channels and not the Paired one  ✓");
+
+        if (channelStore.Load(DefaultTestSecretId, pendingHelperId, 0) is not null)
+            throw new InvalidOperationException("the expired Pending helper channel record must be removed");
+        if (secretStore.Load(DefaultTestSecretId, pendingHelperId, SecretKind.SharedKey) is not null)
+            throw new InvalidOperationException("the expired Pending helper channel key must be removed");
+        if (channelStore.Load(DefaultTestSecretId, pendingReplicaId, replicaId) is not null)
+            throw new InvalidOperationException("the expired Pending replica member record must be removed");
+        if (secretStore.Load(DefaultTestSecretId, pendingReplicaId, SecretKind.SharedKey) is not null)
+            throw new InvalidOperationException("the expired Pending replica channel key must be removed");
+        Console.WriteLine("  expired Pending records and their channel keys removed  ✓");
+
+        var paired = channelStore.Load(DefaultTestSecretId, pairedHelperId, 0)
+            ?? throw new InvalidOperationException("the Paired channel record must remain");
+        if (paired.Status != ChannelStatus.Paired)
+            throw new InvalidOperationException($"the Paired channel must stay Paired; got {paired.Status}");
+        if (secretStore.Load(DefaultTestSecretId, pairedHelperId, SecretKind.SharedKey) is null)
+            throw new InvalidOperationException("the Paired channel key must remain");
+        Console.WriteLine("  Paired channel record and key remain  ✓");
+
+        Console.WriteLine("Protocol expired Pending pairing loses its key test passed.");
     }
 
     /// <summary>
