@@ -236,6 +236,16 @@
  */
 #define DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE 47
 
+/**
+ * The fingerprint nonce in a `PairResponseMessage` does not open the
+ * commitment the contact creator published with its keys. Surfaced as
+ * [`DEREC_CATEGORY_PAIRING`]; the pairing does not complete. Either the
+ * response or the keys did not come from the party that made the
+ * commitment, so applications can treat it as a possible
+ * man-in-the-middle.
+ */
+#define DEREC_CODE_FINGERPRINT_COMMITMENT_MISMATCH 48
+
 #define DEREC_CODE_EMPTY_CHANNELS 60
 
 #define DEREC_CODE_DUPLICATE_CHANNEL_ID 61
@@ -249,6 +259,8 @@
 #define DEREC_CODE_INVALID_WEIGHT 65
 
 #define DEREC_CODE_TOO_MANY_SUBSHARES 66
+
+#define DEREC_CODE_INVALID_KEEP_VERSION 67
 
 #define DEREC_CODE_EMPTY_RESPONSES 80
 
@@ -711,6 +723,12 @@ typedef struct ProcessPrePairResponseMessageResult {
    * Nonce echoed from the original `ContactMessage`. Zero on failure.
    */
   uint64_t nonce;
+  /**
+   * The creator's 32-byte commitment to its fingerprint nonce. Carry it
+   * into the contact the pair request is built from, in
+   * `fingerprint_commitment`, alongside the two keys.
+   */
+  struct DeRecBuffer fingerprint_commitment;
 } ProcessPrePairResponseMessageResult;
 
 typedef struct PairingFingerprintResult {
@@ -872,10 +890,9 @@ typedef struct SecretStoreCallbacks {
  * is none, and absent or `null` reads as none. Store them as given and return
  * them unchanged.
  *
- * `keep_list` returns the JSON encoding of the application's answer:
- * `null` for no list (the owner sends an empty `keepList` and helpers keep
- * every version) or an array of version numbers. An empty buffer or return code `1` also
- * means `null`.
+ * `keep_version` writes the application's answer to `out_version`: the one
+ * version, other than `version`, every helper keeps, or `0` to keep no
+ * other version. Any non-zero return code is a backend failure.
  *
  * `save` and `record_verification` share a return-code convention: `0` is
  * success; `3`/`4`/`10` (the
@@ -927,11 +944,10 @@ typedef struct ShareStoreCallbacks {
                              uint64_t channel_id,
                              const uint8_t *versions_json_ptr,
                              size_t versions_json_len);
-  int32_t (*keep_list)(void *user_data,
-                       uint64_t secret_id,
-                       uint32_t version,
-                       uint8_t **out_ptr,
-                       size_t *out_len);
+  int32_t (*keep_version)(void *user_data,
+                          uint64_t secret_id,
+                          uint32_t version,
+                          uint32_t *out_version);
   int32_t (*record_verification)(void *user_data,
                                  uint64_t secret_id,
                                  uint64_t channel_id,
@@ -2306,8 +2322,7 @@ struct ProduceStoreShareRequestMessageResult produce_store_share_request_message
                                                                                  uint64_t secret_id,
                                                                                  const uint8_t *committed_share_ptr,
                                                                                  size_t committed_share_len,
-                                                                                 const uint32_t *keep_list_ptr,
-                                                                                 size_t keep_list_len,
+                                                                                 uint32_t keep_version,
                                                                                  const uint8_t *description_ptr,
                                                                                  size_t description_len,
                                                                                  const uint8_t *shared_key_ptr,

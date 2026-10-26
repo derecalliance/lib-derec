@@ -366,8 +366,8 @@ type PairResponseMessage struct {
 	// ```
 	//
 	// where `originalChannelId` is the channelId from the contact / pairing
-	// envelopes and `sharedKeyBytes` is the freshly-derived pairing shared
-	// key.
+	// envelopes and `sharedKeyBytes` is the channel key derived as described
+	// on `fingerprintNonce`.
 	//
 	// # Validation
 	//
@@ -385,9 +385,32 @@ type PairResponseMessage struct {
 	// subsequent envelopes on this channel — including the
 	// UpdateChannelInfo handover for the long-term transport — route on the
 	// new id.
-	ChannelId     uint64 `protobuf:"varint,8,opt,name=channelId,proto3" json:"channelId,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ChannelId uint64 `protobuf:"varint,8,opt,name=channelId,proto3" json:"channelId,omitempty"`
+	// The 32-byte fingerprint nonce the creator committed to in
+	// `fingerprintCommitment` (on the `ContactMessage` in `INLINE_KEYS` mode,
+	// on the `PrePairResponseMessage` otherwise). Present only when
+	// `result.status == OK`.
+	//
+	// The requester MUST recompute the commitment from the creator's keys and
+	// this nonce, and reject the response (closing the would-be channel) if
+	// it does not match.
+	//
+	// # Channel key
+	//
+	// Both parties derive the channel key from the handshake key and this
+	// nonce:
+	//
+	// ```text
+	// SHA-256("DeRec channel key v1" || handshakeKey || fingerprintNonce)
+	// ```
+	//
+	// where `handshakeKey` is the ML-KEM shared secret XOR the ECDH shared
+	// secret. The channel key encrypts every later message, feeds the
+	// `channelId` derivation above, and is what the fingerprint is computed
+	// from.
+	FingerprintNonce []byte `protobuf:"bytes,9,opt,name=fingerprintNonce,proto3,oneof" json:"fingerprintNonce,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *PairResponseMessage) Reset() {
@@ -462,6 +485,13 @@ func (x *PairResponseMessage) GetChannelId() uint64 {
 	return 0
 }
 
+func (x *PairResponseMessage) GetFingerprintNonce() []byte {
+	if x != nil {
+		return x.FingerprintNonce
+	}
+	return nil
+}
+
 var File_pair_proto protoreflect.FileDescriptor
 
 const file_pair_proto_rawDesc = "" +
@@ -479,14 +509,16 @@ const file_pair_proto_rawDesc = "" +
 	"\x0eparameterRange\x18\a \x01(\v20.org.derecalliance.derec.protobuf.ParameterRangeR\x0eparameterRange\x128\n" +
 	"\ttimestamp\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12e\n" +
 	"\x13supportedTransports\x18\n" +
-	" \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x13supportedTransportsJ\x04\b\b\x10\tR\x11transportProtocol\"\x87\x03\n" +
+	" \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x13supportedTransportsJ\x04\b\b\x10\tR\x11transportProtocol\"\xcd\x03\n" +
 	"\x13PairResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x12a\n" +
 	"\x11communicationInfo\x18\x04 \x01(\v23.org.derecalliance.derec.protobuf.CommunicationInfoR\x11communicationInfo\x12\x14\n" +
 	"\x05nonce\x18\x05 \x01(\x04R\x05nonce\x12X\n" +
 	"\x0eparameterRange\x18\x06 \x01(\v20.org.derecalliance.derec.protobuf.ParameterRangeR\x0eparameterRange\x128\n" +
 	"\ttimestamp\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x1c\n" +
-	"\tchannelId\x18\b \x01(\x04R\tchannelId*P\n" +
+	"\tchannelId\x18\b \x01(\x04R\tchannelId\x12/\n" +
+	"\x10fingerprintNonce\x18\t \x01(\fH\x00R\x10fingerprintNonce\x88\x01\x01B\x13\n" +
+	"\x11_fingerprintNonce*P\n" +
 	"\n" +
 	"SenderKind\x12\t\n" +
 	"\x05OWNER\x10\x00\x12\n" +
@@ -545,6 +577,7 @@ func file_pair_proto_init() {
 	file_parameterrange_proto_init()
 	file_result_proto_init()
 	file_transportprotocol_proto_init()
+	file_pair_proto_msgTypes[1].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

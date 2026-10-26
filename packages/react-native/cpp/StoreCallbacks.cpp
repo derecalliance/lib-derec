@@ -335,38 +335,27 @@ CallResult toStateLoadAllResult(jsi::Runtime& rt, const jsi::Value& value) {
   return CallResult{0, std::vector<uint8_t>(text.begin(), text.end())};
 }
 
-/// `ShareStore.keepList(): Promise<number[] | null | undefined>`. Encodes the
-/// resolved value as the wire's `Option<Vec<u32>>` JSON: `null` for
-/// `null`/`undefined`, otherwise the array of versions.
+/// `ShareStore.keepVersion(): Promise<number>`. Encodes the resolved version
+/// as 4 little-endian bytes so the calling function can rebuild
+/// `out_version`.
 ///
-/// Anything else, or an entry that is not an integer in `0..=4294967295`, is
-/// a backend failure: reading it as `null` would silently send an empty
-/// keepList, so helpers would keep every version instead of the list the
-/// application meant to send.
-CallResult toKeepListResult(jsi::Runtime& rt, const jsi::Value& value) {
-  if (value.isNull() || value.isUndefined()) {
-    return CallResult{0, {'n', 'u', 'l', 'l'}};
-  }
-  if (!value.isObject() || !value.asObject(rt).isArray(rt)) {
+/// Anything other than an integer in `0..=4294967295` is a backend failure:
+/// reading it as `0` would silently tell helpers to keep no other version.
+CallResult toKeepVersionResult(jsi::Runtime&, const jsi::Value& value) {
+  if (!value.isNumber()) {
     return CallResult{kBackendFailure, {}};
   }
-  jsi::Array arr = value.asObject(rt).asArray(rt);
-  size_t n = arr.size(rt);
-  std::string text = "[";
-  for (size_t i = 0; i < n; ++i) {
-    jsi::Value entry = arr.getValueAtIndex(rt, i);
-    if (!entry.isNumber()) {
-      return CallResult{kBackendFailure, {}};
-    }
-    double version = entry.asNumber();
-    if (!(version >= 0 && version <= 4294967295.0) || version != static_cast<double>(static_cast<uint32_t>(version))) {
-      return CallResult{kBackendFailure, {}};
-    }
-    if (i != 0) text += ',';
-    text += std::to_string(static_cast<uint32_t>(version));
+  double raw = value.asNumber();
+  if (!(raw >= 0 && raw <= 4294967295.0) || raw != static_cast<double>(static_cast<uint32_t>(raw))) {
+    return CallResult{kBackendFailure, {}};
   }
-  text += ']';
-  return CallResult{0, std::vector<uint8_t>(text.begin(), text.end())};
+  auto version = static_cast<uint32_t>(raw);
+  std::vector<uint8_t> bytes(4);
+  bytes[0] = static_cast<uint8_t>(version & 0xFF);
+  bytes[1] = static_cast<uint8_t>((version >> 8) & 0xFF);
+  bytes[2] = static_cast<uint8_t>((version >> 16) & 0xFF);
+  bytes[3] = static_cast<uint8_t>((version >> 24) & 0xFF);
+  return CallResult{0, bytes};
 }
 
 /// Reads the `refusal` property a `ShareStore.save`/`recordVerification`
@@ -951,29 +940,28 @@ extern "C" int32_t shareStoreRemoveVersions(void* userData, uint64_t secretId, u
   return result.code;
 }
 
-/// `ShareStore.keepList(secretId, version) -> number[] | null`
-extern "C" int32_t shareStoreKeepList(void* userData, uint64_t secretId, uint32_t version, uint8_t** outPtr,
-                                       size_t* outLen) {
+/// `ShareStore.keepVersion(secretId, version) -> number`
+extern "C" int32_t shareStoreKeepVersion(void* userData, uint64_t secretId, uint32_t version,
+                                          uint32_t* outVersion) {
   auto* self = static_cast<StoreBindings*>(userData);
   auto keepAlive = self->shared_from_this();
   CallResult result =
       keepAlive->bridge().callSync([keepAlive, secretId, version](std::function<void(CallResult)> settle) {
         jsi::Runtime& rt = keepAlive->runtime();
         auto store = keepAlive->shareStore();
-        auto method = store->getPropertyAsFunction(rt, "keepList");
+        auto method = store->getPropertyAsFunction(rt, "keepVersion");
         jsi::Value promise =
             method.callWithThis(rt, *store, idVal(rt, secretId), jsi::Value(static_cast<double>(version)));
-        keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toKeepListResult);
+        keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toKeepVersionResult);
       });
-  if (result.code == 0) {
-    if (!writeOut(result.bytes, outPtr, outLen)) {
-      return kBackendFailure;
-    }
-  } else {
-    *outPtr = nullptr;
-    *outLen = 0;
+  if (result.code == 0 && result.bytes.size() == 4) {
+    *outVersion = static_cast<uint32_t>(result.bytes[0]) | (static_cast<uint32_t>(result.bytes[1]) << 8) |
+                  (static_cast<uint32_t>(result.bytes[2]) << 16) |
+                  (static_cast<uint32_t>(result.bytes[3]) << 24);
+    return 0;
   }
-  return result.code;
+  *outVersion = 0;
+  return result.code == 0 ? kBackendFailure : result.code;
 }
 
 /// `UserSecretStore.loadLatest(secretId) -> UserSecrets | null`
@@ -1302,7 +1290,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
       shareStoreSave,               // save
       shareStoreRemoveChannel,      // remove_channel
       shareStoreRemoveVersions,     // remove_versions
-      shareStoreKeepList,           // keep_list
+      shareStoreKeepVersion,        // keep_version
       shareStoreRecordVerification, // record_verification
       storeFreeBuffer,              // free_buffer
   };
@@ -1351,7 +1339,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
   requireField(rt, bindings->shareCallbacks_.save, "ShareStoreCallbacks.save");
   requireField(rt, bindings->shareCallbacks_.remove_channel, "ShareStoreCallbacks.remove_channel");
   requireField(rt, bindings->shareCallbacks_.remove_versions, "ShareStoreCallbacks.remove_versions");
-  requireField(rt, bindings->shareCallbacks_.keep_list, "ShareStoreCallbacks.keep_list");
+  requireField(rt, bindings->shareCallbacks_.keep_version, "ShareStoreCallbacks.keep_version");
   requireField(rt, bindings->shareCallbacks_.record_verification,
                "ShareStoreCallbacks.record_verification");
   requireField(rt, bindings->shareCallbacks_.free_buffer, "ShareStoreCallbacks.free_buffer");

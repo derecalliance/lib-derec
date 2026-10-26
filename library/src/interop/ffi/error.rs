@@ -148,6 +148,13 @@ pub const DEREC_CODE_UNEXPECTED_REPLICA_ID: i32 = 46;
 /// [`DeRecError::message`](DeRecError) carries the field name and
 /// both `(min, max)` pairs.
 pub const DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE: i32 = 47;
+/// The fingerprint nonce in a `PairResponseMessage` does not open the
+/// commitment the contact creator published with its keys. Surfaced as
+/// [`DEREC_CATEGORY_PAIRING`]; the pairing does not complete. Either the
+/// response or the keys did not come from the party that made the
+/// commitment, so applications can treat it as a possible
+/// man-in-the-middle.
+pub const DEREC_CODE_FINGERPRINT_COMMITMENT_MISMATCH: i32 = 48;
 
 pub const DEREC_CODE_EMPTY_CHANNELS: i32 = 60;
 pub const DEREC_CODE_DUPLICATE_CHANNEL_ID: i32 = 61;
@@ -156,6 +163,7 @@ pub const DEREC_CODE_EMPTY_SECRET_DATA: i32 = 63;
 pub const DEREC_CODE_VSS_SHARE_FAILED: i32 = 64;
 pub const DEREC_CODE_INVALID_WEIGHT: i32 = 65;
 pub const DEREC_CODE_TOO_MANY_SUBSHARES: i32 = 66;
+pub const DEREC_CODE_INVALID_KEEP_VERSION: i32 = 67;
 
 pub const DEREC_CODE_EMPTY_RESPONSES: i32 = 80;
 pub const DEREC_CODE_EMPTY_COMMITTED_DEREC_SHARE: i32 = 81;

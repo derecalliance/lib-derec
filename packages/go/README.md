@@ -103,13 +103,15 @@ The `ContactMessage` is exchanged out-of-band (QR codes, existing messaging chan
 
 | Mode | What the contact carries | Use when |
 |---|---|---|
-| `ContactModeInlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry the keys (NFC, messaging). |
+| `ContactModeInlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key + fingerprint commitment | Out-of-band channel can carry the keys (NFC, messaging). |
 | `ContactModeHashedKeys` | Only a SHA-384 commitment to the keys | Channel is size-constrained (QR codes). Scanner fetches the actual keys via a plaintext `PrePair` round-trip and verifies them against the hash. |
 | `ContactModeNoKeys` | No key material and no hash | The contact must be small enough for a person to read out or type. The creator generates keys when a `PrePair` request arrives (`Response.ProducePrePairNoKeys` / `Response.ProcessPrePairNoKeys`). Nothing binds those keys to the contact, so the pairing must be confirmed by comparing fingerprints out of band before use — the orchestrator keeps the channel `Pending` until `VerifyFingerprint` succeeds. |
 
 `pairing.Request.EncodeContact` turns a typed `pairing.ContactMessage` into the bytes that travel out of band, and `pairing.Request.DecodeContact` turns them back. Both refuse a contact whose fields do not match its mode.
 
-After the handshake completes, **both modes** rekey the channel id: the responder derives a new id from the shared key, includes it in the encrypted pairing response, and both sides switch their local state to it. The new id never appears in plaintext on the wire.
+In every mode the contact creator commits to a random 32-byte fingerprint nonce before it sees the scanner's keys: the 32-byte `FingerprintCommitment` travels with its keys (in the contact for `InlineKeys`, in the `PrePair` response otherwise) and the pairing response reveals the nonce. `pairing.Response.Process` refuses a response whose nonce does not open the commitment with `derec.CodeFingerprintCommitmentMismatch` — the response or the keys did not come from the party that made the commitment, a possible man-in-the-middle. A response without the nonce, or a `PrePair` response without the commitment, is refused with `derec.CodeInvalidPairResponseMessage`.
+
+After the handshake completes, **every mode** rekeys the channel id: the responder derives a new id from the shared key, includes it in the encrypted pairing response, and both sides switch their local state to it. The new id never appears in plaintext on the wire.
 
 ### `InlineKeys` flow
 
@@ -192,8 +194,27 @@ if err != nil {
 	}
 	return err
 }
-// validated.MlkemEncapsulationKey / validated.EciesPublicKey / validated.Nonce
+
+// Synthesize the InlineKeys-shaped contact the pairing request is built from.
+// FingerprintCommitment MUST be copied alongside the two keys, or the pairing
+// response cannot be processed.
+contact, err := pairing.Request.DecodeContact(created.ContactWireBytes)
+if err != nil {
+	return err
+}
+contact.ContactMode = pairing.ContactModeInlineKeys
+contact.MlkemEncapsulationKey = validated.MlkemEncapsulationKey
+contact.EciesPublicKey = validated.EciesPublicKey
+contact.FingerprintCommitment = validated.FingerprintCommitment
+contact.ContactBindingHash = nil
+filledIn, err := pairing.Request.EncodeContact(contact)
+if err != nil {
+	return err
+}
+// filledIn feeds pairing.Request.Produce exactly like an InlineKeys contact.
 ```
+
+`ContactModeNoKeys` fills the contact in the same way from `pairing.Response.ProcessPrePairNoKeys`.
 
 The transport URI used for the `PrePair` leg **must** be ephemeral — `PrePair` envelopes are plaintext. Swap to a long-term endpoint via an `UpdateChannelInfo` flow once pairing completes. The repository's end-to-end tests carry a complete, compiling handshake — see [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
@@ -351,7 +372,7 @@ For applications that don't want to drive the primitive produce/extract/process 
 
 - `protocol.ChannelStore` — channel records, keyed by `(secretID, channelID, replicaID)`. A `replicaID` of `0` addresses the helper channel; any other value addresses that member of the replica group
 - `protocol.SecretStore` — pairing/session secret material
-- `protocol.ShareStore` — stored shares. On an owner, `KeepList` chooses which versions helpers keep, and `ok=false` sends no keepList so helpers keep every version; see [the owner's keep list](https://github.com/derecalliance/lib-derec/tree/main/library#share-store-the-owners-keep-list)
+- `protocol.ShareStore` — stored shares. On an owner, `KeepVersion` chooses the one older version helpers keep besides the version being shared (`0` keeps none); every other version is deleted, and an answer equal to or greater than the shared version fails the round with `derec.CodeInvalidKeepVersion` before anything is sent; see [the owner's keep version](https://github.com/derecalliance/lib-derec/tree/main/library#share-store-the-owners-keep-version)
 - `protocol.UserSecretStore` — the latest user-facing secret snapshot per `secretID`
 - `protocol.StateStore` — in-flight orchestrator state (pending verification/recovery/unpair/sharing rounds)
 - `protocol.Transport` — outbound delivery (`Send(endpoints []protocol.Endpoint, message []byte) error`). Implement `protocol.SendOne` for a single endpoint and wrap it in `protocol.SequentialFailover` (or `protocol.SingleEndpointTransport`); when every endpoint fails, the adapter returns the last dialer error unchanged, so `errors.Is` / `errors.As` against your own dialer errors keep working
@@ -627,7 +648,7 @@ The intended flow. Weights are the user's choice: before `Start`, show the user 
 - `EventTypeShareVerifyRejected` — the helper refused the challenge; `Status` and `Memo` say why.
 - `EventTypeVerifySharesFailed` — no verdict could be reached on this device. `Reason` is one of `VerifyFailureReasonNoSharedKey`, `VerifyFailureReasonNoProof` or `VerifyFailureReasonDispatchFailed`, and `Error` carries the cause.
 
-A stored proof is either confirmed by its helper or part of a sharing round still open: when a round settles a channel as failed (a rejection or a timeout), that channel's proof is deleted. A confirmation also deletes the proofs of versions the helper dropped: a helper that stores a version deletes every other version that round's keepList leaves out, so when it confirms, its proofs for those versions are deleted here too (the confirmed version stays). A helper that rejects the round keeps its older versions, and so do their proofs; with no keep list nothing is deleted. A replica Destination never sees the helpers' answers, and it keeps every proof it receives: it never deletes one on its own, and freeing that storage is the app's concern. Verifying on a Destination a version that a helper refused, or later dropped under the `keepList`, gets `EventTypeShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`) from that helper, where the Source reports `NoProof`. The app may delete such rows from the Destination's share store; verifying a version whose rows are gone then gives `EventTypeVerifySharesFailed` with `VerifyFailureReasonNoProof`. Verify only versions whose round completed (`EventTypeSharingComplete`). Starting verification on a channel with no proof sends nothing and returns `EventTypeVerifySharesFailed` with `VerifyFailureReasonNoProof` at once. A late response to an earlier challenge is ignored as `EventTypeMessageIgnored` with `IgnoreReasonStaleResponse`, and the current challenge stays open; a response missing its `result` is still an error.
+A stored proof is either confirmed by its helper or part of a sharing round still open: when a round settles a channel as failed (a rejection or a timeout), that channel's proof is deleted. A confirmation also deletes the proofs of versions the helper dropped: a helper that stores a version deletes every other version except that round's `keepVersion`, so when it confirms, its proofs for those versions are deleted here too (the confirmed version and the `keepVersion` stay). A helper that rejects the round keeps its older versions, and so do their proofs. A replica Destination never sees the helpers' answers, and it keeps every proof it receives: it never deletes one on its own, and freeing that storage is the app's concern. Verifying on a Destination a version that a helper refused, or later dropped under a `keepVersion`, gets `EventTypeShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`) from that helper, where the Source reports `NoProof`. The app may delete such rows from the Destination's share store; verifying a version whose rows are gone then gives `EventTypeVerifySharesFailed` with `VerifyFailureReasonNoProof`. Verify only versions whose round completed (`EventTypeSharingComplete`). Starting verification on a channel with no proof sends nothing and returns `EventTypeVerifySharesFailed` with `VerifyFailureReasonNoProof` at once. A late response to an earlier challenge is ignored as `EventTypeMessageIgnored` with `IgnoreReasonStaleResponse`, and the current challenge stays open; a response missing its `result` is still an error.
 
 Every channel message carries one timestamp, its send time, in both the envelope and the inner message. A message whose two timestamps differ, or where either or both are absent, is ignored as `EventTypeMessageIgnored` with `IgnoreReasonTimestampMismatch`; this includes replies from 0.0.8 peers.
 

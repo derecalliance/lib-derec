@@ -786,7 +786,7 @@ mod replica_channel_binding_tests {
                     version: 2,
                     version_description: String::new(),
                     share_algorithm: 0,
-                    keep_list: Vec::new(),
+                    keep_version: 0,
                     replica_id: Some(MEMBER),
                     reply_to_transports: Vec::new(),
                     timestamp: Some(ts),

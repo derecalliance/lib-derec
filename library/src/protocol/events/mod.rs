@@ -71,7 +71,8 @@ pub enum VerifyFailureReason {
     ///
     /// The publishing device removes a proof when the Helper failed to store
     /// that version, or when the Helper confirmed a later version whose
-    /// `keepList` left it out, since the Helper has then removed it too.
+    /// `keepVersion` was another version, since the Helper has then removed
+    /// it too.
     NoProof,
     /// A local store or transport failure while preparing or sending the
     /// challenge; `error` names the cause.

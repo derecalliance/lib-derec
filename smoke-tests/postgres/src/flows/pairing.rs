@@ -7,6 +7,7 @@ use derec_library::protocol::types::{
 use derec_library::protocol::{
     DeRecChannelStore, DeRecSecretStore, ExpiredChannelCleanup, SecretKind, SecretValue,
 };
+use derec_library::protocol::{DeRecEvent, DeRecFlow};
 use derec_library::types::{ChannelId, ReplicaId};
 use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
 use std::collections::{HashMap, HashSet};
@@ -14,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use crate::db::Database;
 use crate::flows::assertions::{channel_exists, count_channels, count_secrets};
 use crate::flows::helpers::{pair_owner_helper, pair_owner_helper_with_mode};
-use crate::peer::{DEFAULT_TEST_SECRET_ID, Peer, PeerOptions};
+use crate::peer::{DEFAULT_TEST_SECRET_ID, Peer, PeerOptions, pump_many};
 use crate::stores::{PostgresChannelStore, PostgresSecretStore};
 
 pub async fn run() {
@@ -143,6 +144,7 @@ pub async fn run() {
     every_contact_mode_pairs_and_persists().await;
     no_keys_fingerprint_mismatch_revokes_the_pairing().await;
     expired_pending_pairing_loses_its_key().await;
+    the_fingerprint_nonce_survives_a_creator_restart().await;
 
     println!("✓ Pairing flow passed.\n");
 }
@@ -449,4 +451,69 @@ async fn has_shared_key(secrets: &PostgresSecretStore, channel_id: ChannelId) ->
         .await
         .expect("SharedKey load failed")
         .is_some()
+}
+
+/// The creator commits to its fingerprint nonce when it publishes its keys
+/// and reveals it only when the pair request arrives, so the nonce has to
+/// outlive the process that drew it. Restart the creator in between: the
+/// handshake must still complete with both sides on one fingerprint.
+async fn the_fingerprint_nonce_survives_a_creator_restart() {
+    for (i, mode) in [ContactMode::InlineKeys, ContactMode::HashedKeys]
+        .into_iter()
+        .enumerate()
+    {
+        let owner_db = Database::open_isolated().await;
+        let helper_db = Database::open_isolated().await;
+        let contact = {
+            let mut owner = Peer::new(owner_db.client(), "Owner", "https://owner.example.com");
+            owner
+                .protocol
+                .create_contact(Some(ChannelId(950 + i as u64)), mode, None)
+                .await
+                .expect("owner.create_contact failed")
+        };
+
+        let mut owner = Peer::new(
+            owner_db.client(),
+            "Owner-Restarted",
+            "https://owner.example.com",
+        );
+        let mut helper = Peer::new(helper_db.client(), "Helper", "https://helper.example.com");
+        helper
+            .protocol
+            .start(DeRecFlow::Pairing {
+                kind: SenderKind::Helper,
+                contact,
+                peer_communication_info: HashMap::from([("name".to_owned(), "Helper".to_owned())]),
+            })
+            .await
+            .expect("helper.start(Pairing) failed");
+
+        let channel = pump_many(&mut [&mut owner, &mut helper])
+            .await
+            .into_iter()
+            .find_map(|e| match e {
+                DeRecEvent::PairingCompleted { channel_id, .. } => Some(channel_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("{mode:?}: pairing must complete after the creator restarts")
+            });
+
+        let owner_fp = owner
+            .protocol
+            .get_fingerprint(channel)
+            .await
+            .expect("owner get_fingerprint");
+        let helper_fp = helper
+            .protocol
+            .get_fingerprint(channel)
+            .await
+            .expect("helper get_fingerprint");
+        assert_eq!(
+            owner_fp, helper_fp,
+            "{mode:?}: both sides derive one fingerprint"
+        );
+    }
+    println!("  the creator's fingerprint nonce survives a restart (InlineKeys, HashedKeys)  ✓");
 }

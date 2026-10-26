@@ -33,13 +33,23 @@ namespace DeRec.Library;
 /// <see cref="ContactMode"/> is <see cref="ContactMode.HashedKeys"/>. Validated
 /// by the scanner after it receives the keys via <c>PrePair</c>.
 /// </param>
+/// <param name="FingerprintCommitment">
+/// The creator's 32-byte SHA-256 commitment to the fingerprint nonce its
+/// <c>PairResponse</c> reveals, computed over
+/// <see cref="MlkemEncapsulationKey"/> and <see cref="EciesPublicKey"/>.
+/// Present only when <see cref="ContactMode"/> is
+/// <see cref="ContactMode.InlineKeys"/>. For the other modes it arrives with
+/// the keys in the <c>PrePair</c> response and MUST be copied here, alongside
+/// the two keys, when filling in the contact a pair request is built from.
+/// </param>
 public sealed record ContactMessage(
     ulong ChannelId,
     ContactMode ContactMode,
     ulong Nonce,
     byte[]? MlkemEncapsulationKey,
     byte[]? EciesPublicKey,
-    byte[]? ContactBindingHash
+    byte[]? ContactBindingHash,
+    byte[]? FingerprintCommitment
 )
 {
     /// <summary>
@@ -87,6 +97,7 @@ public sealed record ContactMessage(
             WriteBytes(writer, "mlkem_encapsulation_key", MlkemEncapsulationKey);
             WriteBytes(writer, "ecies_public_key", EciesPublicKey);
             WriteBytes(writer, "contact_binding_hash", ContactBindingHash);
+            WriteBytes(writer, "fingerprint_commitment", FingerprintCommitment);
             if (Timestamp is { } ts)
             {
                 writer.WriteStartObject("timestamp");
@@ -119,7 +130,8 @@ public sealed record ContactMessage(
             Nonce: ulong.Parse(root.GetProperty("nonce").GetString()!, CultureInfo.InvariantCulture),
             MlkemEncapsulationKey: ReadBytes(root, "mlkem_encapsulation_key"),
             EciesPublicKey: ReadBytes(root, "ecies_public_key"),
-            ContactBindingHash: ReadBytes(root, "contact_binding_hash")
+            ContactBindingHash: ReadBytes(root, "contact_binding_hash"),
+            FingerprintCommitment: ReadBytes(root, "fingerprint_commitment")
         )
         {
             SupportedTransports = root.GetProperty("supported_transports")

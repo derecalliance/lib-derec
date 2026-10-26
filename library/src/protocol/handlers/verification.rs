@@ -95,7 +95,7 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 /// the channel gets `VerifySharesFailed` with
 /// [`VerifyFailureReason::NoProof`] and no challenge is sent. The publishing
 /// device holds no proof for a version the channel's Helper failed to store,
-/// nor for one it removed under a later round's `keepList` once it confirmed
+/// nor for one it removed under a later round's `keepVersion` once it confirmed
 /// that round. A missing
 /// shared key or a dispatch failure is reported the same way, with its own
 /// reason. Each failure is isolated to its channel rather than
@@ -1018,7 +1018,7 @@ mod tests {
                 share: b"a plausible committed share payload".to_vec(),
                 share_algorithm: 0,
                 version,
-                keep_list: Vec::new(),
+                keep_version: 0,
                 version_description: String::new(),
                 timestamp: None,
                 secret_id: REC_SECRET_ID,

@@ -107,7 +107,7 @@ pub struct RecoverResult {
 ///         .expect("split failed");
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 /// let sharing::request::ProduceResult { envelope: share_envelope } =
-///     sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
+///     sharing::request::produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
 ///         .expect("share produce failed");
 /// let sharing::request::ExtractResult { request: stored_share_request } =
 ///     sharing::request::extract(&share_envelope, &shared_key).expect("share extract failed");
@@ -229,7 +229,7 @@ pub fn produce(
 ///         .expect("split failed");
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 /// let sharing::request::ProduceResult { envelope: share_envelope } =
-///     sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
+///     sharing::request::produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
 ///         .expect("share produce failed");
 /// let sharing::request::ExtractResult { request: stored_share_request } =
 ///     sharing::request::extract(&share_envelope, &shared_key).expect("share extract failed");
@@ -347,7 +347,7 @@ pub fn extract(
 /// for &(channel_id, _) in &channels[..2] {
 ///     let committed_share = shares.get(&channel_id).expect("missing share");
 ///     let sharing::request::ProduceResult { envelope } =
-///         sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
+///         sharing::request::produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
 ///             .expect("share produce failed");
 ///     let sharing::request::ExtractResult { request } =
 ///         sharing::request::extract(&envelope, &shared_key).expect("share extract failed");

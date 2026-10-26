@@ -95,14 +95,13 @@ public static partial class Sharing
             uint version,
             ulong secretId,
             byte[] committedShare,
-            uint[] keepList,
+            uint keepVersion,
             string description,
             byte[] sharedKey,
             IReadOnlyList<TransportProtocol>? replyTo = null
         )
         {
             ArgumentNullException.ThrowIfNull(committedShare);
-            ArgumentNullException.ThrowIfNull(keepList);
             ArgumentNullException.ThrowIfNull(sharedKey);
 
             byte[] descriptionBytes = System.Text.Encoding.UTF8.GetBytes(description ?? string.Empty);
@@ -118,8 +117,7 @@ public static partial class Sharing
                     secretId,
                     committedShare,
                     (UIntPtr)committedShare.Length,
-                    keepList,
-                    (UIntPtr)keepList.Length,
+                    keepVersion,
                     descriptionBytes,
                     (UIntPtr)descriptionBytes.Length,
                     sharedKey,

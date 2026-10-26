@@ -50,7 +50,7 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.ShareStoreSaveDelegate _shareSave;
     private readonly NP.ShareStoreRemoveChannelDelegate _shareRemoveChannel;
     private readonly NP.ShareStoreRemoveVersionsDelegate _shareRemoveVersions;
-    private readonly NP.ShareStoreKeepListDelegate _shareKeepList;
+    private readonly NP.ShareStoreKeepVersionDelegate _shareKeepVersion;
     private readonly NP.ShareStoreRecordVerificationDelegate _shareRecordVerification;
     private readonly NP.FreeBufferDelegate _shareFreeBuffer;
     private readonly NP.UserSecretStoreLoadLatestDelegate _userSecretLoadLatest;
@@ -128,7 +128,7 @@ public sealed class DeRecProtocol : IDisposable
         _shareSave = ShareSaveImpl;
         _shareRemoveChannel = ShareRemoveChannelImpl;
         _shareRemoveVersions = ShareRemoveVersionsImpl;
-        _shareKeepList = ShareKeepListImpl;
+        _shareKeepVersion = ShareKeepVersionImpl;
         _shareRecordVerification = ShareRecordVerificationImpl;
         _shareFreeBuffer = FreeBufferImpl;
 
@@ -176,7 +176,7 @@ public sealed class DeRecProtocol : IDisposable
             Save = Marshal.GetFunctionPointerForDelegate(_shareSave),
             RemoveChannel = Marshal.GetFunctionPointerForDelegate(_shareRemoveChannel),
             RemoveVersions = Marshal.GetFunctionPointerForDelegate(_shareRemoveVersions),
-            KeepList = Marshal.GetFunctionPointerForDelegate(_shareKeepList),
+            KeepVersion = Marshal.GetFunctionPointerForDelegate(_shareKeepVersion),
             RecordVerification = Marshal.GetFunctionPointerForDelegate(_shareRecordVerification),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_shareFreeBuffer),
         };
@@ -1074,19 +1074,18 @@ public sealed class DeRecProtocol : IDisposable
         catch { return -1; }
     }
 
-    private int ShareKeepListImpl(
+    private int ShareKeepVersionImpl(
         IntPtr userData, ulong secretId, uint version,
-        out IntPtr outPtr, out UIntPtr outLen)
+        out uint outVersion)
     {
         try
         {
-            byte[] json = JsonSerializer.SerializeToUtf8Bytes(_shareStore.KeepList(secretId, version), JsonOpts);
-            return WriteOut(json, out outPtr, out outLen);
+            outVersion = _shareStore.KeepVersion(secretId, version);
+            return 0;
         }
         catch
         {
-            outPtr = IntPtr.Zero;
-            outLen = UIntPtr.Zero;
+            outVersion = 0;
             return -1;
         }
     }
@@ -1171,7 +1170,7 @@ public sealed class DeRecProtocol : IDisposable
         uint? local_version,
         ReplicaDiscoveryReportDto[]? reported,
         string[]? share_channels,
-        uint[]? keep_list,
+        uint? keep_version,
         uint? threshold);
 
     private sealed record ReplicaDiscoveryReportDto(string replica_id, uint version);
@@ -1203,7 +1202,7 @@ public sealed class DeRecProtocol : IDisposable
             .Select(r => new ReplicaDiscoveryReportDto(r.Key.ToString(), r.Value))
             .ToArray(),
         item.ShareChannels?.Select(c => c.ToString()).ToArray(),
-        item.KeepList,
+        item.KeepVersion,
         item.Threshold);
 
     private static StateItem FromDto(StateItemDto dto)
@@ -1245,7 +1244,7 @@ public sealed class DeRecProtocol : IDisposable
         return new StateItem(
             kind, channelId, secretId, dto.version, startedAt, dto.bytes, dto.shares,
             pending, confirmed, failed, pendingReplicas, syncedReplicas, behindReplicas,
-            dto.local_version, reported, shareChannels, dto.keep_list, dto.threshold);
+            dto.local_version, reported, shareChannels, dto.keep_version, dto.threshold);
     }
 
     private static StateKey ParseKeyBuffer(IntPtr ptr, UIntPtr len)

@@ -292,30 +292,33 @@ export interface ShareStore {
    * `versions`. Idempotent: a version that is not stored is skipped, and
    * an empty array is a no-op.
    *
-   * A helper calls this to apply `StoreShareRequestMessage.keepList`, the
-   * complete set of versions the owner wants retained: every stored
-   * version outside it is removed once the incoming share is persisted.
+   * A helper calls this to apply `StoreShareRequestMessage.keepVersion`:
+   * once the incoming share is persisted, every version stored on the
+   * channel other than the incoming one and `keepVersion` is removed.
    * Shares under other channels or partitions must be left untouched.
    */
   removeVersions(secretId: string, channelId: string, versions: number[]): Promise<void>;
   /**
-   * Owner only: the versions every helper keeps after the owner distributes
-   * `version`. Asked once per sharing round, before anything is sent,
-   * including the rounds the library starts itself; the answer becomes
-   * `keepList` for every helper.
+   * Owner only: the one older version every helper keeps after the owner
+   * distributes `version`. Asked once per sharing round, before anything is
+   * sent, including the rounds the library starts itself; the answer
+   * becomes `keepVersion` for every helper.
    *
-   * Return `null` or `undefined` to send no `keepList` (it goes out empty):
-   * helpers then keep every version they hold. An app that wants to cap how
-   * many versions helpers retain returns that cap here. A returned list is
-   * used as is, plus `version`, which the library always adds. Helpers
-   * delete every version that is not listed, so list every version that
-   * could still become the latest: those that committed (for example, whose
-   * `SharingComplete` reported `threshold_met`) and those whose round is
-   * still open. Leave out only versions whose round failed or that the user
-   * rolled back; a list that leaves out too much can make the secret
-   * unrecoverable.
+   * Resolve to an integer in `0..=4294967295`. A helper that stores
+   * `version` keeps it and the returned version, and deletes every other
+   * version it holds; `0` keeps no other version. An answer equal to or
+   * greater than `version` fails the round with `invalid_keep_version`
+   * before anything is sent.
+   *
+   * Return the last valid version: the newest one whose `SharingComplete`
+   * reported `threshold_met`. A version whose round is still open is
+   * deleted from every helper that stores `version` unless it is the one
+   * returned here. Only the application knows which versions committed.
+   * When a helper confirms `version`, the library also removes this
+   * device's rows for that channel other than `version` and the returned
+   * version.
    */
-  keepList(secretId: string, version: number): Promise<number[] | null | undefined>;
+  keepVersion(secretId: string, version: number): Promise<number>;
   /**
    * Record a verification challenge the helper is about to answer for
    * `(secretId, channelId, version)`. Called once per accepted challenge,
@@ -569,7 +572,10 @@ export declare namespace SenderKind {
  *   are ignored. A man-in-the-middle on the plaintext `PrePair` leg leaves
  *   the two sides with different shared keys and so different fingerprints,
  *   which is what the comparison catches — the role `contact_binding_hash`
- *   plays for `HashedKeys`.
+ *   plays for `HashedKeys`. The creator's `PrePair` response also carries a
+ *   commitment to a nonce it reveals only in its `PairResponse`, and the
+ *   channel key depends on that nonce, so whoever answers the scanner cannot
+ *   search offline for keys that make the two fingerprints agree.
  */
 export declare const ContactMode: {
   readonly InlineKeys: 0;
@@ -668,6 +674,14 @@ export interface ContactMessage {
   /** Present only when `contact_mode === ContactMode.HashedKeys`. SHA-384 digest (48 bytes). */
   contact_binding_hash?: Uint8Array;
   timestamp?: Timestamp;
+  /**
+   * Present only when `contact_mode === ContactMode.InlineKeys`. The
+   * creator's 32-byte commitment to the fingerprint nonce its
+   * `PairResponseMessage` reveals. For the other modes it arrives with the
+   * keys in the `PrePairResponseMessage`; a contact filled in from a
+   * `ProcessPrePairResult` must carry it alongside the two keys.
+   */
+  fingerprint_commitment?: Uint8Array;
   /** Every transport endpoint the creator of this contact can be reached
    *  on, in its own preference order. */
   supported_transports: TransportProtocol[];
@@ -2182,6 +2196,11 @@ export interface PairResponseMessage {
    * its own derivation. Zero on rejection (non-Ok `result.status`).
    */
   channel_id: bigint;
+  /**
+   * Present only when `result.status === Ok`. The 32-byte fingerprint nonce
+   * the contact creator committed to in `fingerprint_commitment`.
+   */
+  fingerprint_nonce?: Uint8Array;
 }
 
 export interface PrePairRequestMessage {
@@ -2202,6 +2221,12 @@ export interface PrePairResponseMessage {
   ecies_public_key?: Uint8Array;
   nonce: bigint;
   timestamp?: Timestamp;
+  /**
+   * Present only when `result.status === Ok`. The creator's 32-byte
+   * commitment to the fingerprint nonce its `PairResponseMessage` reveals,
+   * covering the two keys above.
+   */
+  fingerprint_commitment?: Uint8Array;
 }
 
 export interface GetShareRequestMessage {
@@ -2251,7 +2276,7 @@ export interface StoreShareRequestMessage {
   share: Uint8Array;
   share_algorithm: number;
   version: number;
-  keep_list: number[];
+  keep_version: number;
   version_description: string;
   timestamp?: Timestamp;
   secret_id: bigint;
@@ -2408,6 +2433,10 @@ export interface ProcessPrePairResult {
 
   /** Nonce echoed from the original `ContactMessage`. */
   nonce: bigint;
+
+  /** The creator's 32-byte commitment to its fingerprint nonce. Copy it into
+   * the contact the pair request is built from, alongside the two keys. */
+  fingerprint_commitment: Uint8Array;
 }
 
 /**
@@ -2490,6 +2519,7 @@ export type DeRecErrorCode =
   | "missing_replica_id"
   | "unexpected_replica_id"
   | "incompatible_parameter_range"
+  | "fingerprint_commitment_mismatch"
   | "empty_channels"
   | "duplicate_channel_id"
   | "invalid_threshold"
@@ -2497,6 +2527,7 @@ export type DeRecErrorCode =
   | "vss_share_failed"
   | "invalid_weight"
   | "too_many_subshares"
+  | "invalid_keep_version"
   | "empty_responses"
   | "empty_committed_derec_share"
   | "decode_committed_derec_share"
@@ -2798,7 +2829,7 @@ export declare const primitives: {
         version: number,
         secret_id: bigint,
         committed_share: CommittedDeRecShare,
-        keep_list: number[],
+        keep_version: number,
         description: string,
         shared_key: Uint8Array,
         /** See `discovery.request.produce.reply_to`. */

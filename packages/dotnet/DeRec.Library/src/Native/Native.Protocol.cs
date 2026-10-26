@@ -141,9 +141,9 @@ internal static class Protocol
         IntPtr versionsJsonPtr, UIntPtr versionsJsonLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    internal delegate int ShareStoreKeepListDelegate(
+    internal delegate int ShareStoreKeepVersionDelegate(
         IntPtr userData, ulong secretId, uint version,
-        out IntPtr outPtr, out UIntPtr outLen);
+        out uint outVersion);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ShareStoreRecordVerificationDelegate(
@@ -160,7 +160,7 @@ internal static class Protocol
         public IntPtr Save;
         public IntPtr RemoveChannel;
         public IntPtr RemoveVersions;
-        public IntPtr KeepList;
+        public IntPtr KeepVersion;
         public IntPtr RecordVerification;
         public IntPtr FreeBuffer;
     }

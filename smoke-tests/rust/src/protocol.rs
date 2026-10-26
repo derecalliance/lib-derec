@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use derec_library::primitives::sharing::SharingError;
 use derec_library::protocol::types::{
     ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember,
     ReplicaRole, Target, UserSecret, UserSecrets,
@@ -32,6 +33,9 @@ pub async fn run_all() {
     run_protect_secret_with_replica_targets_flow().await;
     run_protect_secret_per_target_failure_flow().await;
     run_sharing_flow().await;
+    run_helper_keep_version_flow().await;
+    run_owner_keep_version_across_a_missed_round_flow().await;
+    run_invalid_keep_version_flow().await;
     run_verification_flow().await;
     run_replica_mirror_then_verify_flow().await;
     run_replica_roster_describes_every_member_flow().await;
@@ -277,11 +281,18 @@ fn clone_secret_value(v: &SecretValue) -> SecretValue {
 ///
 /// `refuse_saves` / `refuse_verifications` make the store refuse with
 /// [`Refusal::TooFrequent`], the way an application's rate limit would.
+///
+/// `keep_version` answers `keep` when set and otherwise the version
+/// distributed before, recording every version it is asked about in
+/// `keep_version_calls`; `removed` records every `remove_versions` call.
 #[derive(Default)]
 struct InMemoryShareStore {
     data: HashMap<(u64, u64, u32), Share>,
     refuse_saves: bool,
     refuse_verifications: bool,
+    keep: Option<u32>,
+    keep_version_calls: Mutex<Vec<u32>>,
+    removed: Vec<Vec<u32>>,
 }
 
 impl DeRecShareStore for InMemoryShareStore {
@@ -398,13 +409,16 @@ impl DeRecShareStore for InMemoryShareStore {
         versions: &[u32],
     ) -> ShareStoreFuture<'_, ()> {
         let cid = channel_id.0;
+        self.removed.push(versions.to_vec());
         self.data
             .retain(|(c, s, v), _| !(*c == cid && *s == secret_id && versions.contains(v)));
         Box::pin(std::future::ready(Ok(())))
     }
 
-    fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
-        Box::pin(std::future::ready(Ok(None)))
+    fn keep_version(&self, _: u64, version: u32) -> ShareStoreFuture<'_, u32> {
+        self.keep_version_calls.lock().unwrap().push(version);
+        let keep = self.keep.unwrap_or(version.saturating_sub(1));
+        Box::pin(std::future::ready(Ok(keep)))
     }
 
     fn record_verification(&mut self, _: u64, _: ChannelId, _: u32) -> ShareStoreFuture<'_, ()> {
@@ -2319,6 +2333,186 @@ async fn run_sharing_flow() {
     );
 
     println!("Protocol sharing flow test passed.");
+}
+
+/// Start one `ProtectSecret` round on `owner` and return the version it
+/// distributes. Nothing is delivered.
+async fn start_protect_round(owner: &mut Peer, round: u32) -> u32 {
+    owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![3],
+                name: "kept".to_owned(),
+                data: format!("round-{round}").into_bytes(),
+            }],
+            description: Some(format!("round {round}")),
+            weights: HashMap::new(),
+            threshold: None,
+        })
+        .await
+        .expect("owner start(ProtectSecret) failed")
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ProtectSecretStarted { version, .. } => Some(*version),
+            _ => None,
+        })
+        .expect("the round must report the version it distributes")
+}
+
+/// The versions `helper` holds on `channel_id`, ascending.
+async fn held_versions(helper: &Peer, channel_id: ChannelId) -> Vec<u32> {
+    let mut versions: Vec<u32> = helper
+        .protocol
+        .share_store
+        .load(helper.protocol.secret_id(), channel_id, &[])
+        .await
+        .expect("helper share load failed")
+        .into_iter()
+        .map(|share| share.version)
+        .collect();
+    versions.sort_unstable();
+    versions
+}
+
+/// A Helper applies each request's `keepVersion` through
+/// `DeRecShareStore::remove_versions`. The owner keeps the version before for
+/// v1 to v3 and names v2 for v4, so v4 leaves every helper holding exactly v2
+/// and v4, and v3 reaches the helper's store as the version to remove.
+async fn run_helper_keep_version_flow() {
+    println!("=== Protocol helper keepVersion flow test ===");
+
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 43);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(21)).await;
+    let channel_b = pair(&mut owner, &mut helper_b, ChannelId(22)).await;
+
+    for round in 1..=4 {
+        owner.protocol.share_store.keep = (round == 4).then_some(2);
+        start_protect_round(&mut owner, round).await;
+        pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+    }
+
+    for (helper, channel_id) in [(&helper_a, channel_a), (&helper_b, channel_b)] {
+        assert_eq!(
+            held_versions(helper, channel_id).await,
+            vec![2, 4],
+            "[{}] must keep exactly versions [2, 4]",
+            helper.label
+        );
+        assert!(
+            helper.protocol.share_store.removed.contains(&vec![3]),
+            "[{}] remove_versions must reach the store with [3]",
+            helper.label
+        );
+        println!("  [{}] v4 keepVersion 2 removed v3  ✓", helper.label);
+    }
+
+    println!("Protocol helper keepVersion flow test passed.");
+}
+
+/// v2 reaches only HelperA and never becomes valid, so the owner keeps v1
+/// when it sends v3. HelperA drops v2 and HelperB had nothing to drop: both
+/// end up holding exactly v1 and v3.
+async fn run_owner_keep_version_across_a_missed_round_flow() {
+    println!("=== Protocol owner keepVersion across a missed round flow test ===");
+
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 44);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(31)).await;
+    let channel_b = pair(&mut owner, &mut helper_b, ChannelId(32)).await;
+
+    owner.protocol.share_store.keep = Some(0);
+    assert_eq!(start_protect_round(&mut owner, 1).await, 1);
+    pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+
+    owner.protocol.share_store.keep = Some(1);
+    assert_eq!(start_protect_round(&mut owner, 2).await, 2);
+    for (endpoint, bytes) in owner.drain() {
+        if endpoint.uri == helper_a.uri {
+            deliver(&mut helper_a, &bytes).await;
+        }
+    }
+    pump_many(&mut [&mut owner, &mut helper_a]).await;
+    assert_eq!(held_versions(&helper_a, channel_a).await, vec![1, 2]);
+    assert_eq!(held_versions(&helper_b, channel_b).await, vec![1]);
+    println!("  v2 reached HelperA only  ✓");
+
+    assert_eq!(start_protect_round(&mut owner, 3).await, 3);
+    pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+
+    assert_eq!(
+        *owner
+            .protocol
+            .share_store
+            .keep_version_calls
+            .lock()
+            .unwrap(),
+        vec![1, 2, 3],
+        "keep_version must be asked once per round with the version being sent"
+    );
+    println!("  keep_version asked once per round with the version being sent  ✓");
+    for (helper, channel_id) in [(&helper_a, channel_a), (&helper_b, channel_b)] {
+        assert_eq!(
+            held_versions(helper, channel_id).await,
+            vec![1, 3],
+            "[{}] must hold exactly [1, 3] after the v3 round",
+            helper.label
+        );
+        println!(
+            "  [{}] holds exactly [1, 3] after the v3 round  ✓",
+            helper.label
+        );
+    }
+
+    println!("Protocol owner keepVersion across a missed round flow test passed.");
+}
+
+/// A `keepVersion` that is not below the version being sent fails the round
+/// before any helper is written to.
+async fn run_invalid_keep_version_flow() {
+    println!("=== Protocol invalid keepVersion flow test ===");
+
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 45);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    pair(&mut owner, &mut helper_a, ChannelId(41)).await;
+    pair(&mut owner, &mut helper_b, ChannelId(42)).await;
+
+    start_protect_round(&mut owner, 1).await;
+    pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+
+    owner.protocol.share_store.keep = Some(2);
+    let err = owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![3],
+                name: "kept".to_owned(),
+                data: b"round-2".to_vec(),
+            }],
+            description: None,
+            weights: HashMap::new(),
+            threshold: None,
+        })
+        .await
+        .expect_err("a keepVersion equal to the new version must fail the round");
+    assert!(
+        matches!(
+            err,
+            derec_library::Error::Sharing(SharingError::InvalidKeepVersion {
+                keep_version: 2,
+                version: 2,
+            })
+        ),
+        "unexpected error: {err:?}"
+    );
+    assert!(owner.drain().is_empty(), "no envelope may be sent");
+    println!("  keepVersion 2 for v2 refused before anything was sent  ✓");
+
+    println!("Protocol invalid keepVersion flow test passed.");
 }
 
 /// An Owner challenges its Helpers to prove they still hold the shares it

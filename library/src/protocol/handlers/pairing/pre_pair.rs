@@ -221,6 +221,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         ecies_public_key: None,
         nonce: request.nonce,
         timestamp: Some(timestamp),
+        fingerprint_commitment: None,
     };
 
     use crate::protocol_version::ProtocolVersion;
@@ -310,11 +311,12 @@ pub(in crate::protocol) async fn on_response<S: StoreSet>(
         Err(e) => return Err(e),
     };
 
-    // The keys have arrived, so the contact is now inline-keys-shaped and can
-    // drive `request::produce` like any other.
+    // The keys and the fingerprint commitment have arrived, so the contact is
+    // now inline-keys-shaped and can drive `request::produce` like any other.
     let filled_in_contact = ContactMessage {
         mlkem_encapsulation_key: Some(validated.mlkem_encapsulation_key),
         ecies_public_key: Some(validated.ecies_public_key),
+        fingerprint_commitment: Some(validated.fingerprint_commitment),
         contact_mode: ContactMode::InlineKeys as i32,
         contact_binding_hash: None,
         ..original_contact.clone()
@@ -327,7 +329,7 @@ pub(in crate::protocol) async fn on_response<S: StoreSet>(
     // inlined keys are worth. For `NoKeys` nothing verified them, and calling
     // the contact `InlineKeys` would claim a trust level the flow never
     // earned. This value never reaches the wire and is dropped on rekey;
-    // `response::process` reads only the key fields from it.
+    // `response::process` reads only the keys and the commitment from it.
     let stored_contact = ContactMessage {
         contact_mode: original_contact.contact_mode,
         ..filled_in_contact.clone()

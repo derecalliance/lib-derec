@@ -389,7 +389,7 @@ impl<
                         synced_replicas: HashSet::new(),
                         behind_replicas,
                         started_at: now_secs(),
-                        keep_list: result.keep_list.clone(),
+                        keep_version: result.keep_version,
                         threshold: result.threshold,
                     })),
                 )

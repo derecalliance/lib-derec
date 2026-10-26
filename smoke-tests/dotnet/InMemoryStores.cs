@@ -186,14 +186,18 @@ internal sealed class InMemoryShareStore : IShareStore
         foreach (var v in versions) _data.Remove((secretId, channelId, v));
     }
 
-    public uint[]? Keep { get; set; }
+    /// <summary>
+    /// Overrides the answer <see cref="KeepVersion"/> gives; unset, the
+    /// store keeps the previous version.
+    /// </summary>
+    public uint? Keep { get; set; }
 
-    public List<(ulong SecretId, uint Version)> KeepListCalls { get; } = new();
+    public List<(ulong SecretId, uint Version)> KeepVersionCalls { get; } = new();
 
-    public uint[]? KeepList(ulong secretId, uint version)
+    public uint KeepVersion(ulong secretId, uint version)
     {
-        KeepListCalls.Add((secretId, version));
-        return Keep;
+        KeepVersionCalls.Add((secretId, version));
+        return Keep ?? version - 1;
     }
 
     public void RecordVerification(ulong secretId, ulong channelId, uint version)

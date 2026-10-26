@@ -30,6 +30,11 @@ pub enum SharingError {
     #[error("too many subshares ({subshares}) for the configured cap ({max})")]
     TooManySubshares { subshares: u64, max: u64 },
 
+    /// `keep_version` names the version being shared or a later one. It must
+    /// be below `version`, or `0` to keep no other version.
+    #[error("keep_version {keep_version} must be below the shared version {version}")]
+    InvalidKeepVersion { keep_version: u32, version: u32 },
+
     #[error("secret_data is empty")]
     EmptySecretData,
 

@@ -1361,12 +1361,13 @@ pub struct SharingRoundState {
     /// Members that refused, timed out, or could not be reached.
     pub behind_replicas: std::collections::HashSet<ReplicaId>,
     pub started_at: u64,
-    /// The `keepList` every Helper received in this round. A Helper that
-    /// confirms the round has removed every other version it held on that
-    /// channel, the confirmed one aside, so the owner removes its proofs of
-    /// those versions too. Empty when the round asked Helpers to keep every
-    /// version, or when it sent no share.
-    pub keep_list: Vec<u32>,
+    /// The `keepVersion` every Helper received in this round. A Helper that
+    /// confirms the round has removed every version it held on that channel
+    /// other than the confirmed one and this one, so the owner removes its
+    /// proofs of those versions too. `None` when the round sent no share, or
+    /// on a row written before the field existed; the owner then removes no
+    /// proof.
+    pub keep_version: Option<u32>,
     /// The threshold `t` this round split at, which `SharingComplete.threshold_met`
     /// is judged against. `None` on a round written before the threshold was
     /// recorded; the builder's threshold then applies.

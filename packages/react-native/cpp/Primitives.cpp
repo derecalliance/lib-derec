@@ -209,8 +209,7 @@ std::vector<uint64_t> asU64Array(jsi::Runtime& rt, const char* name, const jsi::
 }
 
 /// Read a JS array of `number` elements as a `uint32_t` vector. Used for
-/// `protect_secret`'s `weights` and
-/// `produce_store_share_request_message`'s `keep_list` arguments.
+/// `protect_secret`'s `weights` argument.
 std::vector<uint32_t> asU32Array(jsi::Runtime& rt, const char* name, const jsi::Value& value) {
   std::vector<uint32_t> out;
   if (value.isNull() || value.isUndefined()) {
@@ -761,7 +760,7 @@ jsi::Value extractPrePairResponse(jsi::Runtime& rt,
 
 /// `process_pre_pair_response_message(contactMessage: ArrayBuffer,
 ///   responseProto: ArrayBuffer) -> { mlkem_encapsulation_key,
-///   ecies_public_key, nonce }`
+///   ecies_public_key, nonce, fingerprint_commitment }`
 jsi::Value processPrePairResponseMessage(jsi::Runtime& rt,
                                          const jsi::Value&,
                                          const jsi::Value* args,
@@ -777,6 +776,7 @@ jsi::Value processPrePairResponseMessage(jsi::Runtime& rt,
   }
   std::vector<uint8_t> mlkemKey = takeBuffer(result.mlkem_encapsulation_key);
   std::vector<uint8_t> eciesKey = takeBuffer(result.ecies_public_key);
+  std::vector<uint8_t> commitment = takeBuffer(result.fingerprint_commitment);
   auto payload = jsi::Object(rt);
   payload.setProperty(rt, "mlkem_encapsulation_key",
                       toArrayBuffer(rt, mlkemKey.data(), mlkemKey.size()));
@@ -784,6 +784,8 @@ jsi::Value processPrePairResponseMessage(jsi::Runtime& rt,
                       toArrayBuffer(rt, eciesKey.data(), eciesKey.size()));
   payload.setProperty(rt, "nonce",
                       jsi::Value(rt, jsi::BigInt::fromUint64(rt, result.nonce)));
+  payload.setProperty(rt, "fingerprint_commitment",
+                      toArrayBuffer(rt, commitment.data(), commitment.size()));
   return jsi::Value(rt, payload);
 }
 
@@ -816,7 +818,7 @@ jsi::Value producePrePairNoKeysResponseMessage(jsi::Runtime& rt,
 
 /// `process_pre_pair_no_keys_response_message(contactMessage: ArrayBuffer,
 ///   responseProto: ArrayBuffer) -> { mlkem_encapsulation_key,
-///   ecies_public_key, nonce }`
+///   ecies_public_key, nonce, fingerprint_commitment }`
 jsi::Value processPrePairNoKeysResponseMessage(jsi::Runtime& rt,
                                                const jsi::Value&,
                                                const jsi::Value* args,
@@ -834,6 +836,7 @@ jsi::Value processPrePairNoKeysResponseMessage(jsi::Runtime& rt,
   }
   std::vector<uint8_t> mlkemKey = takeBuffer(result.mlkem_encapsulation_key);
   std::vector<uint8_t> eciesKey = takeBuffer(result.ecies_public_key);
+  std::vector<uint8_t> commitment = takeBuffer(result.fingerprint_commitment);
   auto payload = jsi::Object(rt);
   payload.setProperty(rt, "mlkem_encapsulation_key",
                       toArrayBuffer(rt, mlkemKey.data(), mlkemKey.size()));
@@ -841,6 +844,8 @@ jsi::Value processPrePairNoKeysResponseMessage(jsi::Runtime& rt,
                       toArrayBuffer(rt, eciesKey.data(), eciesKey.size()));
   payload.setProperty(rt, "nonce",
                       jsi::Value(rt, jsi::BigInt::fromUint64(rt, result.nonce)));
+  payload.setProperty(rt, "fingerprint_commitment",
+                      toArrayBuffer(rt, commitment.data(), commitment.size()));
   return jsi::Value(rt, payload);
 }
 
@@ -1004,7 +1009,7 @@ jsi::Value protectSecret(jsi::Runtime& rt,
 }
 
 /// `produce_store_share_request_message(channelId: bigint, version: number,
-///   secretId: bigint, committedShare: ArrayBuffer, keepList: number[],
+///   secretId: bigint, committedShare: ArrayBuffer, keepVersion: number,
 ///   description: ArrayBuffer, sharedKey: ArrayBuffer, replyTo:
 ///   ArrayBuffer|null) -> ArrayBuffer`
 jsi::Value produceStoreShareRequestMessage(jsi::Runtime& rt,
@@ -1017,14 +1022,15 @@ jsi::Value produceStoreShareRequestMessage(jsi::Runtime& rt,
       rt, "produce_store_share_request_message", "version", args[1], std::numeric_limits<uint32_t>::max()));
   uint64_t secretId = asU64(rt, args[2]);
   ByteView committedShare = asBytes(rt, args[3]);
-  std::vector<uint32_t> keepList = asU32Array(rt, "produce_store_share_request_message", args[4]);
+  auto keepVersion = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_store_share_request_message", "keep_version", args[4], std::numeric_limits<uint32_t>::max()));
   ByteView description = asBytes(rt, args[5]);
   ByteView sharedKey = asBytes(rt, args[6]);
   ByteView replyTo = asBytes(rt, args[7]);
   ProduceStoreShareRequestMessageResult result =
       produce_store_share_request_message(
           channelId, version, secretId, committedShare.ptr,
-          committedShare.len, keepList.data(), keepList.size(),
+          committedShare.len, keepVersion,
           description.ptr, description.len, sharedKey.ptr, sharedKey.len,
           replyTo.ptr, replyTo.len);
   if (result.error.code != 0) {

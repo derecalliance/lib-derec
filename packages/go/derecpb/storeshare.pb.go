@@ -40,26 +40,25 @@ const (
 // The Owner sends this message to each Helper to:
 //
 // - store (or replace) a specific share version
-// - update the set of versions that must be retained (keepList)
+// - name the one older version that must be retained (keepVersion)
 //
 // # Semantics
 //
-// This message may carry two independent instructions:
+// This message carries two instructions:
 //
 // 1. Share storage/update:
 //   - If `share` is present, the Helper MUST store this share under the
 //     specified `version`
 //   - If the version already exists, the Helper MUST replace it
 //
-// 2. Retention policy update:
-//   - If `keepList` is present, it defines the complete set of versions
-//     that MUST be retained
-//   - Any stored version not in `keepList` SHOULD be deleted
+// 2. Retention:
+//   - Once the share is stored, the Helper MUST delete every version it
+//     holds for this secret on this channel other than `version` and
+//     `keepVersion`
+//   - `keepVersion = 0` retains no version other than `version`
 //
-// If `keepList` is absent:
-//
-// - The Helper MUST preserve the existing keepList
-// - The Helper MUST add the new `version` to the retained set
+// A Helper therefore holds at most two versions of a secret: the one being
+// shared and the last version the Owner considers valid.
 //
 // # Consistency Requirements
 //
@@ -75,7 +74,7 @@ const (
 // To prevent replay attacks:
 //
 //   - If `version` is less than the latest stored version,
-//     the Helper MUST ignore the `keepList` field
+//     the Helper MUST ignore the `keepVersion` field
 //
 // This ensures that stale messages cannot cause deletion of newer shares.
 //
@@ -89,7 +88,7 @@ const (
 // This message is idempotent:
 //
 // - Re-sending the same (version, share) pair SHOULD result in the same state
-// - Re-applying the same keepList SHOULD not change state after the first time
+// - Re-applying the same keepVersion SHOULD not change state after the first time
 type StoreShareRequestMessage struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Share bytes to be stored by the Helper.
@@ -116,18 +115,18 @@ type StoreShareRequestMessage struct {
 	//
 	// Each resharing event increments this value.
 	Version uint32 `protobuf:"varint,4,opt,name=version,proto3" json:"version,omitempty"`
-	// List of share versions that MUST be retained by the Helper.
+	// The one version, other than `version`, that the Helper MUST retain.
 	//
-	// Any stored version not included in this list SHOULD be deleted.
+	// The Owner sets it to the last version it considers valid, which is never
+	// the version being shared. Every other stored version MUST be deleted
+	// once the share is stored. `0` retains no other version.
 	//
-	// If absent, the Helper MUST:
-	//
-	// - retain the existing keepList
-	// - add the current `version` to the retained set
+	// A value equal to or greater than `version` is invalid: the Helper MUST
+	// reject the request and store nothing.
 	//
 	// This field MUST be ignored if `version` is older than the latest
 	// version already stored, to prevent replay attacks.
-	KeepList []uint32 `protobuf:"varint,5,rep,packed,name=keepList,proto3" json:"keepList,omitempty"`
+	KeepVersion uint32 `protobuf:"varint,5,opt,name=keepVersion,proto3" json:"keepVersion,omitempty"`
 	// Optional human-readable description of this share version.
 	//
 	// This field is visible to the Helper and is not intended to carry
@@ -251,11 +250,11 @@ func (x *StoreShareRequestMessage) GetVersion() uint32 {
 	return 0
 }
 
-func (x *StoreShareRequestMessage) GetKeepList() []uint32 {
+func (x *StoreShareRequestMessage) GetKeepVersion() uint32 {
 	if x != nil {
-		return x.KeepList
+		return x.KeepVersion
 	}
-	return nil
+	return 0
 }
 
 func (x *StoreShareRequestMessage) GetVersionDescription() string {
@@ -293,7 +292,7 @@ func (x *StoreShareRequestMessage) GetReplicaId() uint64 {
 // This message indicates whether the Helper successfully:
 //
 // - stored or updated the requested share version
-// - applied the retention policy (keepList)
+// - applied the retention policy (keepVersion)
 //
 // # Idempotency
 //
@@ -406,13 +405,13 @@ var File_storeshare_proto protoreflect.FileDescriptor
 
 const file_storeshare_proto_rawDesc = "" +
 	"\n" +
-	"\x10storeshare.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xb7\x03\n" +
+	"\x10storeshare.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xbd\x03\n" +
 	"\x18StoreShareRequestMessage\x12\x14\n" +
 	"\x05share\x18\x01 \x01(\fR\x05share\x12&\n" +
 	"\x0eshareAlgorithm\x18\x02 \x01(\x05R\x0eshareAlgorithm\x12\x1a\n" +
 	"\bsecretId\x18\x03 \x01(\x04R\bsecretId\x12\x18\n" +
-	"\aversion\x18\x04 \x01(\rR\aversion\x12\x1a\n" +
-	"\bkeepList\x18\x05 \x03(\rR\bkeepList\x12.\n" +
+	"\aversion\x18\x04 \x01(\rR\aversion\x12 \n" +
+	"\vkeepVersion\x18\x05 \x01(\rR\vkeepVersion\x12.\n" +
 	"\x12versionDescription\x18\x06 \x01(\tR\x12versionDescription\x128\n" +
 	"\ttimestamp\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12a\n" +
 	"\x11replyToTransports\x18\n" +

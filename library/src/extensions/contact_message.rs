@@ -4,7 +4,7 @@
 use crate::derec_message::current_timestamp;
 use crate::primitives::pairing::PairingError;
 use crate::types::ChannelId;
-use derec_cryptography::pairing::PairingContactMessageMaterial;
+use derec_cryptography::pairing::{FingerprintCommitment, PairingContactMessageMaterial};
 use derec_proto::{ContactMessage, ContactMode, TransportProtocol};
 
 /// Extension trait that attaches structural validation as a method on
@@ -25,17 +25,22 @@ pub(crate) trait ContactMessageExt {
     /// - The declared `contact_mode` must be a known [`ContactMode`]
     ///   value.
     /// - [`ContactMode::InlineKeys`]: `mlkem_encapsulation_key` and
-    ///   `ecies_public_key` MUST be present and non-empty;
+    ///   `ecies_public_key` MUST be present and non-empty, and
+    ///   `fingerprint_commitment` MUST be present with exactly 32 bytes;
     ///   `contact_binding_hash` MUST be absent (would mean the contact
     ///   is misshaped — keys present AND a commitment).
-    /// - [`ContactMode::HashedKeys`]: both inline-key fields MUST be
-    ///   absent, and `contact_binding_hash` MUST be present with
-    ///   exactly 48 bytes (SHA-384 digest size).
-    /// - [`ContactMode::NoKeys`]: all three of
-    ///   `mlkem_encapsulation_key`, `ecies_public_key`, and
-    ///   `contact_binding_hash` MUST be absent. The contact carries
+    /// - [`ContactMode::HashedKeys`]: both inline-key fields and
+    ///   `fingerprint_commitment` MUST be absent, and
+    ///   `contact_binding_hash` MUST be present with exactly 48 bytes
+    ///   (SHA-384 digest size).
+    /// - [`ContactMode::NoKeys`]: all of `mlkem_encapsulation_key`,
+    ///   `ecies_public_key`, `contact_binding_hash` and
+    ///   `fingerprint_commitment` MUST be absent. The contact carries
     ///   only `channel_id`, `nonce`, and `transport_protocol`; any
     ///   key-shaped field on a NoKeys contact is a protocol misuse.
+    ///
+    /// The two modes with a PrePair leg receive the fingerprint
+    /// commitment with their keys, in the `PrePairResponse`.
     ///
     /// The bidirectional check matters most for `HashedKeys` and
     /// `NoKeys`: a malformed `HashedKeys` contact that carried inline
@@ -75,7 +80,9 @@ pub(crate) trait ContactMessageExt {
     fn requires_pre_pair(&self) -> bool;
 
     /// Build a [`ContactMode::InlineKeys`] [`ContactMessage`] carrying
-    /// the given ML-KEM + ECIES public key material verbatim.
+    /// the given ML-KEM + ECIES public key material verbatim, and the
+    /// creator's commitment to the fingerprint nonce it reveals in the
+    /// pairing response.
     ///
     /// `own` is every endpoint the contact creator serves, in its own
     /// preference order. It fills `supported_transports` wholesale; callers
@@ -89,6 +96,7 @@ pub(crate) trait ContactMessageExt {
         nonce: u64,
         own: Vec<TransportProtocol>,
         pk: PairingContactMessageMaterial,
+        fingerprint_commitment: FingerprintCommitment,
     ) -> ContactMessage;
 
     /// Build a [`ContactMode::HashedKeys`] [`ContactMessage`]: no key
@@ -146,18 +154,24 @@ impl ContactMessageExt for ContactMessage {
             .contact_binding_hash
             .as_ref()
             .is_some_and(|v| !v.is_empty());
+        let commitment = self.fingerprint_commitment.as_deref();
 
         match mode {
             ContactMode::InlineKeys => {
-                check_inline_keys_fields(mlkem_present, ecies_present, hash_present)?
+                check_inline_keys_fields(mlkem_present, ecies_present, hash_present)?;
+                check_fingerprint_commitment(commitment)?;
             }
-            ContactMode::HashedKeys => check_hashed_keys_fields(
-                mlkem_present,
-                ecies_present,
-                self.contact_binding_hash.as_deref(),
-            )?,
+            ContactMode::HashedKeys => {
+                check_hashed_keys_fields(
+                    mlkem_present,
+                    ecies_present,
+                    self.contact_binding_hash.as_deref(),
+                )?;
+                check_no_fingerprint_commitment(commitment)?;
+            }
             ContactMode::NoKeys => {
-                check_no_keys_fields(mlkem_present, ecies_present, hash_present)?
+                check_no_keys_fields(mlkem_present, ecies_present, hash_present)?;
+                check_no_fingerprint_commitment(commitment)?;
             }
         }
 
@@ -201,6 +215,7 @@ impl ContactMessageExt for ContactMessage {
         nonce: u64,
         own: Vec<TransportProtocol>,
         pk: PairingContactMessageMaterial,
+        fingerprint_commitment: FingerprintCommitment,
     ) -> ContactMessage {
         ContactMessage {
             channel_id: channel_id.into(),
@@ -211,6 +226,7 @@ impl ContactMessageExt for ContactMessage {
             nonce,
             timestamp: Some(current_timestamp()),
             supported_transports: own,
+            fingerprint_commitment: Some(fingerprint_commitment.to_vec()),
         }
     }
 
@@ -236,6 +252,7 @@ impl ContactMessageExt for ContactMessage {
             nonce,
             timestamp: Some(current_timestamp()),
             supported_transports: own,
+            fingerprint_commitment: None,
         }
     }
 
@@ -249,6 +266,7 @@ impl ContactMessageExt for ContactMessage {
             nonce,
             timestamp: Some(current_timestamp()),
             supported_transports: own,
+            fingerprint_commitment: None,
         }
     }
 }
@@ -305,6 +323,35 @@ fn check_hashed_keys_fields(
     Ok(())
 }
 
+/// [`ContactMode::InlineKeys`]: the fingerprint commitment travels with the
+/// keys, so it is present and is a SHA-256 digest.
+fn check_fingerprint_commitment(commitment: Option<&[u8]>) -> Result<(), crate::Error> {
+    const COMMITMENT_LEN: usize = 32;
+    match commitment {
+        Some(c) if c.len() == COMMITMENT_LEN => Ok(()),
+        Some(_) => Err(PairingError::InvalidContactMessage(
+            "inline_keys fingerprint_commitment is not a SHA-256 digest",
+        )
+        .into()),
+        None => Err(PairingError::InvalidContactMessage(
+            "inline_keys contact missing fingerprint_commitment",
+        )
+        .into()),
+    }
+}
+
+/// [`ContactMode::HashedKeys`] and [`ContactMode::NoKeys`]: the commitment
+/// arrives in the `PrePairResponse`, with the keys, never in the contact.
+fn check_no_fingerprint_commitment(commitment: Option<&[u8]>) -> Result<(), crate::Error> {
+    if commitment.is_some() {
+        return Err(PairingError::InvalidContactMessage(
+            "only an inline_keys contact carries fingerprint_commitment",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// [`ContactMode::NoKeys`]: no key material and no binding hash.
 fn check_no_keys_fields(
     mlkem_present: bool,
@@ -350,6 +397,7 @@ mod tests {
                 uri: "https://relay.example/alice".to_owned(),
                 protocol: Protocol::Https.into(),
             }],
+            fingerprint_commitment: Some(vec![3; 32]),
         }
     }
 
@@ -366,6 +414,7 @@ mod tests {
                 uri: "https://relay.example/alice/ephemeral".to_owned(),
                 protocol: Protocol::Https.into(),
             }],
+            fingerprint_commitment: None,
         }
     }
 
@@ -382,6 +431,7 @@ mod tests {
                 uri: "https://institution.example/pair".to_owned(),
                 protocol: Protocol::Https.into(),
             }],
+            fingerprint_commitment: None,
         }
     }
 
@@ -510,6 +560,46 @@ mod tests {
         assert_invalid_contact(
             c.validate(),
             "no_keys contact must not carry contact_binding_hash",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_inline_missing_fingerprint_commitment() {
+        let mut c = well_formed_inline_keys_contact();
+        c.fingerprint_commitment = None;
+        assert_invalid_contact(
+            c.validate(),
+            "inline_keys contact missing fingerprint_commitment",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_inline_short_fingerprint_commitment() {
+        let mut c = well_formed_inline_keys_contact();
+        c.fingerprint_commitment = Some(vec![3; 31]);
+        assert_invalid_contact(
+            c.validate(),
+            "inline_keys fingerprint_commitment is not a SHA-256 digest",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_hashed_with_fingerprint_commitment() {
+        let mut c = well_formed_hashed_keys_contact();
+        c.fingerprint_commitment = Some(vec![3; 32]);
+        assert_invalid_contact(
+            c.validate(),
+            "only an inline_keys contact carries fingerprint_commitment",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_no_keys_with_fingerprint_commitment() {
+        let mut c = well_formed_no_keys_contact();
+        c.fingerprint_commitment = Some(vec![3; 32]);
+        assert_invalid_contact(
+            c.validate(),
+            "only an inline_keys contact carries fingerprint_commitment",
         );
     }
 }

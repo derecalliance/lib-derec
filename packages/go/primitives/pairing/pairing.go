@@ -12,8 +12,8 @@
 // obtained first via the plaintext PrePair exchange (Request.ProducePrePair
 // / Request.ExtractPrePair / Response.ProducePrePair /
 // Response.ExtractPrePair / Response.ProcessPrePair), after which the
-// caller republishes the validated keys into an INLINE_KEYS-shaped contact
-// and proceeds with the normal handshake. ContactModeNoKeys runs the same
+// caller republishes the validated keys and the creator's fingerprint
+// commitment into an INLINE_KEYS-shaped contact and proceeds with the normal handshake. ContactModeNoKeys runs the same
 // PrePair exchange with Response.ProducePrePairNoKeys and
 // Response.ProcessPrePairNoKeys; nothing binds those keys to the contact, so
 // the resulting pairing MUST be confirmed by comparing Fingerprint out of
@@ -84,9 +84,9 @@ type Timestamp struct {
 // serializes. Mirrors org.derecalliance.derec.protobuf.ContactMessage.
 //
 // The key fields present depend on ContactMode: ContactModeInlineKeys
-// carries MlkemEncapsulationKey and EciesPublicKey, ContactModeHashedKeys
-// carries ContactBindingHash, and ContactModeNoKeys carries neither. A nil
-// slice is an absent field.
+// carries MlkemEncapsulationKey, EciesPublicKey and FingerprintCommitment,
+// ContactModeHashedKeys carries ContactBindingHash, and ContactModeNoKeys
+// carries none of them. A nil slice is an absent field.
 type ContactMessage struct {
 	ChannelID             uint64
 	Nonce                 uint64
@@ -94,6 +94,12 @@ type ContactMessage struct {
 	MlkemEncapsulationKey []byte
 	EciesPublicKey        []byte
 	ContactBindingHash    []byte
+	// FingerprintCommitment is the creator's 32-byte commitment to the
+	// fingerprint nonce its pairing response reveals. For
+	// ContactModeHashedKeys and ContactModeNoKeys it arrives with the keys in
+	// the PrePair response (ProcessedPrePair.FingerprintCommitment) and MUST
+	// be copied into the INLINE_KEYS-shaped contact alongside them.
+	FingerprintCommitment []byte
 	// Timestamp is when the creator produced the contact; nil if unset.
 	Timestamp *Timestamp
 	// SupportedTransports is every endpoint the creator can be reached on,
@@ -111,6 +117,7 @@ type contactMessageWire struct {
 	MlkemEncapsulationKey *native.JSONByteArray `json:"mlkem_encapsulation_key,omitempty"`
 	EciesPublicKey        *native.JSONByteArray `json:"ecies_public_key,omitempty"`
 	ContactBindingHash    *native.JSONByteArray `json:"contact_binding_hash,omitempty"`
+	FingerprintCommitment *native.JSONByteArray `json:"fingerprint_commitment,omitempty"`
 	Timestamp             *timestampWire        `json:"timestamp"`
 	SupportedTransports   []endpointWire        `json:"supported_transports"`
 }
@@ -141,6 +148,7 @@ func (c ContactMessage) toWire() contactMessageWire {
 		MlkemEncapsulationKey: optionalBytesWire(c.MlkemEncapsulationKey),
 		EciesPublicKey:        optionalBytesWire(c.EciesPublicKey),
 		ContactBindingHash:    optionalBytesWire(c.ContactBindingHash),
+		FingerprintCommitment: optionalBytesWire(c.FingerprintCommitment),
 		SupportedTransports:   make([]endpointWire, 0, len(c.SupportedTransports)),
 	}
 	if c.Timestamp != nil {
@@ -166,6 +174,9 @@ func (w contactMessageWire) toContact() ContactMessage {
 	}
 	if w.ContactBindingHash != nil {
 		c.ContactBindingHash = []byte(*w.ContactBindingHash)
+	}
+	if w.FingerprintCommitment != nil {
+		c.FingerprintCommitment = []byte(*w.FingerprintCommitment)
 	}
 	if w.Timestamp != nil {
 		c.Timestamp = &Timestamp{Seconds: w.Timestamp.Seconds, Nanos: w.Timestamp.Nanos}
@@ -301,6 +312,12 @@ type ProcessedPrePair struct {
 	EciesPublicKey []byte
 	// Nonce is echoed from the original ContactMessage.
 	Nonce uint64
+	// FingerprintCommitment is the contact creator's 32-byte commitment to
+	// the fingerprint nonce its pairing response reveals. Copy it into the
+	// INLINE_KEYS-shaped contact the pair request is built from, alongside
+	// the two keys: Response.Process refuses a response whose nonce does not
+	// open it.
+	FingerprintCommitment []byte
 }
 
 type requestAPI struct{}
@@ -456,7 +473,10 @@ func (responseAPI) Extract(response, secretKeyMaterial []byte) (ExtractedRespons
 // validated rekeyed channel id. parameterRange is the optional serialized
 // ParameterRange this side accepts (nil for none); a response advertising a
 // range that does not overlap it is refused with
-// derec.CodeIncompatibleParameterRange before any key is derived.
+// derec.CodeIncompatibleParameterRange before any key is derived. A response
+// whose fingerprint nonce does not open contactMessage's
+// FingerprintCommitment is refused with
+// derec.CodeFingerprintCommitmentMismatch.
 func (responseAPI) Process(contactMessage, responseProto, secretKeyMaterial, parameterRange []byte) (ProcessedResponse, error) {
 	sharedKey, channelID, err := native.ProcessPairResponse(contactMessage, responseProto, secretKeyMaterial, parameterRange)
 	if err != nil {
@@ -497,7 +517,7 @@ func (responseAPI) ExtractPrePair(envelope []byte) (ExtractedPrePairResponse, er
 // derec.CodePrepairHashMismatch — the caller MUST NOT proceed to build an
 // INLINE_KEYS contact from unvalidated keys.
 func (responseAPI) ProcessPrePair(contactMessage, responseProto []byte) (ProcessedPrePair, error) {
-	mlkemEncapsulationKey, eciesPublicKey, nonce, err := native.ProcessPrePairResponse(contactMessage, responseProto)
+	mlkemEncapsulationKey, eciesPublicKey, nonce, fingerprintCommitment, err := native.ProcessPrePairResponse(contactMessage, responseProto)
 	if err != nil {
 		return ProcessedPrePair{}, err
 	}
@@ -505,6 +525,7 @@ func (responseAPI) ProcessPrePair(contactMessage, responseProto []byte) (Process
 		MlkemEncapsulationKey: mlkemEncapsulationKey,
 		EciesPublicKey:        eciesPublicKey,
 		Nonce:                 nonce,
+		FingerprintCommitment: fingerprintCommitment,
 	}, nil
 }
 
@@ -530,7 +551,7 @@ func (responseAPI) ProducePrePairNoKeys(channelID uint64, requestProto []byte) (
 // binds these keys to the contact, so the resulting pairing MUST be
 // confirmed by comparing Fingerprint out of band before use.
 func (responseAPI) ProcessPrePairNoKeys(contactMessage, responseProto []byte) (ProcessedPrePair, error) {
-	mlkemEncapsulationKey, eciesPublicKey, nonce, err := native.ProcessPrePairNoKeysResponse(contactMessage, responseProto)
+	mlkemEncapsulationKey, eciesPublicKey, nonce, fingerprintCommitment, err := native.ProcessPrePairNoKeysResponse(contactMessage, responseProto)
 	if err != nil {
 		return ProcessedPrePair{}, err
 	}
@@ -538,6 +559,7 @@ func (responseAPI) ProcessPrePairNoKeys(contactMessage, responseProto []byte) (P
 		MlkemEncapsulationKey: mlkemEncapsulationKey,
 		EciesPublicKey:        eciesPublicKey,
 		Nonce:                 nonce,
+		FingerprintCommitment: fingerprintCommitment,
 	}, nil
 }
 

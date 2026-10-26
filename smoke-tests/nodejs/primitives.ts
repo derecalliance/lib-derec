@@ -71,7 +71,7 @@ export function runPrimitivesSmoke(): void {
     if (!committedShare) throw new Error(`no committed share for channel ${id}`);
 
     const requestEnvelope = primitives.sharing.request.produce(
-      id, version, secretId, committedShare, [], "", key,
+      id, version, secretId, committedShare, 0, "", key,
     );
     console.log(`  [request.produce] channel=${id} envelope=${requestEnvelope.envelope.length}B`);
 
@@ -79,6 +79,9 @@ export function runPrimitivesSmoke(): void {
     const { request } = primitives.sharing.request.extract(
       requestEnvelope.envelope, key,
     );
+    if (request.keep_version !== 0) {
+      throw new Error(`keep_version mismatch on channel ${id}: ${request.keep_version}`);
+    }
     storedShareRequests.set(id, request);
 
     const responseResult = primitives.sharing.response.produce(id, request, key);
@@ -138,7 +141,7 @@ export function runPrimitivesSmoke(): void {
     const key = weightedKeys.get(id)!;
     const committedShare = weightedShares.get(id)!;
     const requestEnvelope = primitives.sharing.request.produce(
-      id, weightedVersion, weightedSecretId, committedShare, [], "", key,
+      id, weightedVersion, weightedSecretId, committedShare, 0, "", key,
     );
     const { request } = primitives.sharing.request.extract(requestEnvelope.envelope, key);
     weightedStoredRequests.set(id, request);
@@ -501,6 +504,7 @@ export function runPrimitivesSmoke(): void {
     contact_mode: ContactMode.InlineKeys,
     mlkem_encapsulation_key: validated.mlkem_encapsulation_key,
     ecies_public_key: validated.ecies_public_key,
+    fingerprint_commitment: validated.fingerprint_commitment,
   };
 
   const hkPairingRequest = primitives.pairing.request.produce(
@@ -617,6 +621,7 @@ export function runPrimitivesSmoke(): void {
     contact_mode: ContactMode.InlineKeys,
     mlkem_encapsulation_key: nkAccepted.mlkem_encapsulation_key,
     ecies_public_key: nkAccepted.ecies_public_key,
+    fingerprint_commitment: nkAccepted.fingerprint_commitment,
   };
 
   const nkPairingRequest = primitives.pairing.request.produce(
@@ -675,6 +680,212 @@ export function runPrimitivesSmoke(): void {
   console.log(`  31-byte key refused  ✓`);
 
   console.log("✓ Pairing flow (NO_KEYS + PrePair + fingerprint) passed.\n");
+
+  // Every contact mode commits to a fingerprint nonce before the scanner
+  // contributes its keys: an InlineKeys contact carries the commitment, a
+  // HashedKeys or NoKeys PrePair response carries it with the keys, and the
+  // accepted PairResponse reveals the nonce. The channel key mixes the nonce
+  // in, so a nonce that does not open the commitment is refused.
+  {
+    const sameBytes = (a: Uint8Array, b: Uint8Array): boolean =>
+      a.length === b.length && a.every((x, i) => x === b[i]);
+    const expectPairingError = (what: string, code: string, f: () => unknown): void => {
+      try {
+        f();
+      } catch (e) {
+        const { category, code: got } = e as { category?: string; code?: string };
+        if (category !== "pairing" || got !== code) {
+          throw new Error(`${what}: expected pairing/${code}, got ${category}/${got}`);
+        }
+        console.log(`  ${what} refused (pairing/${code})  ✓`);
+        return;
+      }
+      throw new Error(`${what}: expected pairing/${code}, nothing was thrown`);
+    };
+
+    // An InlineKeys handshake up to the scanner holding the decoded pair
+    // response.
+    const inlineKeysHandshake = () => {
+      const fpChannelId = 31n;
+      const fpContact = primitives.pairing.request.create_contact(
+        fpChannelId,
+        ContactMode.InlineKeys,
+        [{ protocol: 0, uri: "https://example.com/alice" }],
+      );
+      const fpPairingRequest = primitives.pairing.request.produce(
+        SenderKind.Helper,
+        [{ protocol: 0, uri: "https://example.com/helper" }],
+        fpContact.contact_message,
+        null,
+        null,
+      );
+      const { request: fpRequest } = primitives.pairing.request.extract(
+        fpPairingRequest.envelope, fpContact.secret_key, null,
+      );
+      const fpProduced = primitives.pairing.response.produce(
+        fpChannelId, fpRequest, fpContact.secret_key, null, null,
+      );
+      const { response: fpResponse } = primitives.pairing.response.extract(
+        fpProduced.envelope, fpPairingRequest.secret_key,
+      );
+      return {
+        contact: fpPairingRequest.initiator_contact_message as ContactMessage,
+        response: fpResponse,
+        scannerSecret: fpPairingRequest.secret_key,
+        creatorKey: fpProduced.shared_key,
+      };
+    };
+
+    // A NoKeys contact, a PrePair request for it, and the creator's answer.
+    const noKeysPrePairAnswer = () => {
+      const nkFpContact = primitives.pairing.request.create_contact(
+        32n,
+        ContactMode.NoKeys,
+        [{ protocol: 0, uri: "https://example.com/alice/ephemeral" }],
+        4321n,
+      ).contact_message;
+      const { request: nkFpRequest } = primitives.pairing.request.extract_pre_pair(
+        primitives.pairing.request.produce_pre_pair(
+          [{ protocol: 0, uri: "https://example.com/helper/ephemeral" }],
+          nkFpContact,
+        ).envelope,
+      );
+      const answer = primitives.pairing.response.produce_pre_pair_no_keys(32n, nkFpRequest);
+      const { response: nkFpResponse } =
+        primitives.pairing.response.extract_pre_pair(answer.envelope);
+      return { contact: nkFpContact, request: nkFpRequest, response: nkFpResponse };
+    };
+
+    console.log("=== [Primitives] Fingerprint nonce opens the creator's commitment ===");
+    {
+      const { contact: fpContact, response, scannerSecret, creatorKey } = inlineKeysHandshake();
+      if (fpContact.fingerprint_commitment?.length !== 32) {
+        throw new Error("an InlineKeys contact must carry a 32-byte fingerprint commitment");
+      }
+      if (response.fingerprint_nonce?.length !== 32) {
+        throw new Error("an accepted pair response must reveal a 32-byte fingerprint nonce");
+      }
+      console.log("  contact commits, pair response reveals a 32-byte nonce  ✓");
+      const fpProcessed = primitives.pairing.response.process(
+        fpContact, response, scannerSecret, null,
+      );
+      if (!sameBytes(fpProcessed.shared_key, creatorKey)) {
+        throw new Error("fingerprint nonce: both sides must derive the same channel key");
+      }
+      const creatorFp = primitives.pairing.fingerprint(creatorKey);
+      const scannerFp = primitives.pairing.fingerprint(fpProcessed.shared_key);
+      if (creatorFp !== scannerFp) {
+        throw new Error(`fingerprint nonce: fingerprints differ (creator=${creatorFp} scanner=${scannerFp})`);
+      }
+      console.log(`  shared keys and fingerprints match (${creatorFp})  ✓`);
+    }
+    console.log("✓ Fingerprint nonce opens the creator's commitment passed.\n");
+
+    console.log("=== [Primitives] Tampered fingerprint nonce is refused ===");
+    {
+      const { contact: fpContact, response, scannerSecret } = inlineKeysHandshake();
+      const tampered = Uint8Array.from(response.fingerprint_nonce!);
+      tampered[0] = tampered[0]! ^ 1;
+      expectPairingError("response.process(tampered fingerprint nonce)", "fingerprint_commitment_mismatch", () =>
+        primitives.pairing.response.process(
+          fpContact, { ...response, fingerprint_nonce: tampered }, scannerSecret, null,
+        ),
+      );
+    }
+    console.log("✓ Tampered fingerprint nonce is refused passed.\n");
+
+    console.log("=== [Primitives] PrePair response without a fingerprint commitment is refused ===");
+    {
+      const hkFpContact = primitives.pairing.request.create_contact(
+        33n,
+        ContactMode.HashedKeys,
+        [{ protocol: 0, uri: "https://example.com/alice/ephemeral" }],
+      );
+      const { request: hkFpRequest } = primitives.pairing.request.extract_pre_pair(
+        primitives.pairing.request.produce_pre_pair(
+          [{ protocol: 0, uri: "https://example.com/helper/ephemeral" }],
+          hkFpContact.contact_message,
+        ).envelope,
+      );
+      const { response: hkFpResponse } = primitives.pairing.response.extract_pre_pair(
+        primitives.pairing.response.produce_pre_pair(
+          33n, hkFpRequest, hkFpContact.secret_key,
+        ).envelope,
+      );
+      if (hkFpResponse.fingerprint_commitment?.length !== 32) {
+        throw new Error("a HASHED_KEYS PrePair response must carry a 32-byte fingerprint commitment");
+      }
+      const { fingerprint_commitment: _hkOmitCommitment, ...hkUncommitted } = hkFpResponse;
+      expectPairingError("process_pre_pair(no commitment)", "invalid_pair_response_message", () =>
+        primitives.pairing.response.process_pre_pair(hkFpContact.contact_message, hkUncommitted),
+      );
+
+      const { contact: nkFpContact, response: nkFpResponse } = noKeysPrePairAnswer();
+      if (nkFpResponse.fingerprint_commitment?.length !== 32) {
+        throw new Error("a NO_KEYS PrePair response must carry a 32-byte fingerprint commitment");
+      }
+      const { fingerprint_commitment: _nkOmitCommitment, ...nkUncommitted } = nkFpResponse;
+      expectPairingError("process_pre_pair_no_keys(no commitment)", "invalid_pair_response_message", () =>
+        primitives.pairing.response.process_pre_pair_no_keys(nkFpContact, nkUncommitted),
+      );
+    }
+    console.log("✓ PrePair response without a fingerprint commitment is refused passed.\n");
+
+    // A relay on the NoKeys PrePair leg answers with its own keys and copies
+    // the creator's commitment, the only one it has seen. That commitment
+    // covers the creator's keys and opens only with the creator's nonce, so
+    // the relay's own nonce cannot open it.
+    console.log("=== [Primitives] Relay reusing the creator's commitment is refused ===");
+    {
+      const { contact: nkFpContact, request: nkFpRequest, response: creatorAnswer } =
+        noKeysPrePairAnswer();
+      const relay = primitives.pairing.response.produce_pre_pair_no_keys(32n, nkFpRequest);
+      const { response: relayed } = primitives.pairing.response.extract_pre_pair(relay.envelope);
+      const creatorCommitment = creatorAnswer.fingerprint_commitment;
+      if (!creatorCommitment) {
+        throw new Error("the creator's NO_KEYS PrePair response must carry a fingerprint commitment");
+      }
+
+      // Nothing binds NoKeys keys to the contact, so the scanner accepts them.
+      const relayValidated = primitives.pairing.response.process_pre_pair_no_keys(
+        nkFpContact,
+        { ...relayed, fingerprint_commitment: creatorCommitment },
+      );
+      const relayFilledIn: ContactMessage = {
+        ...nkFpContact,
+        contact_mode: ContactMode.InlineKeys,
+        mlkem_encapsulation_key: relayValidated.mlkem_encapsulation_key,
+        ecies_public_key: relayValidated.ecies_public_key,
+        fingerprint_commitment: relayValidated.fingerprint_commitment,
+      };
+
+      const relayPairingRequest = primitives.pairing.request.produce(
+        SenderKind.Helper,
+        [{ protocol: 0, uri: "https://example.com/helper" }],
+        relayFilledIn,
+        null,
+        null,
+      );
+      const { request: relayRequest } = primitives.pairing.request.extract(
+        relayPairingRequest.envelope, relay.secret_key_material, null,
+      );
+      const relayProduced = primitives.pairing.response.produce(
+        32n, relayRequest, relay.secret_key_material, null, null,
+      );
+      const { response: relayResponse } = primitives.pairing.response.extract(
+        relayProduced.envelope, relayPairingRequest.secret_key,
+      );
+      expectPairingError("response.process(relay's nonce)", "fingerprint_commitment_mismatch", () =>
+        primitives.pairing.response.process(
+          relayPairingRequest.initiator_contact_message as ContactMessage,
+          relayResponse,
+          relayPairingRequest.secret_key,
+          null,
+        ),
+      );
+    }
+    console.log("✓ Relay reusing the creator's commitment is refused passed.\n");
+  }
 
   console.log("━━━ [Primitives] All passed. ━━━\n");
 }

@@ -233,6 +233,20 @@ type memShareStore struct {
 	// failSaves fails every save with a plain error, the way an unavailable
 	// storage backend would.
 	failSaves bool
+
+	// keep, when set, is every KeepVersion answer; unset, the store keeps
+	// the previous version (version - 1), the way an application whose
+	// every round commits would.
+	keep                *uint32
+	keepVersionCalls    []uint32
+	removeVersionsCalls []removeVersionsCall
+}
+
+// removeVersionsCall is one RemoveVersions call as the store received it.
+type removeVersionsCall struct {
+	secretID  uint64
+	channelID uint64
+	versions  []uint32
 }
 
 func newMemShareStore() *memShareStore {
@@ -333,14 +347,43 @@ func (s *memShareStore) RemoveChannel(secretID, channelID uint64) error {
 func (s *memShareStore) RemoveVersions(secretID, channelID uint64, versions []uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.removeVersionsCalls = append(s.removeVersionsCalls, removeVersionsCall{secretID, channelID, append([]uint32(nil), versions...)})
 	for _, v := range versions {
 		delete(s.data, shareStoreKey{channelID, secretID, v})
 	}
 	return nil
 }
 
-func (s *memShareStore) KeepList(secretID uint64, version uint32) ([]uint32, bool, error) {
-	return nil, false, nil
+func (s *memShareStore) KeepVersion(secretID uint64, version uint32) (uint32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keepVersionCalls = append(s.keepVersionCalls, version)
+	if s.keep != nil {
+		return *s.keep, nil
+	}
+	return version - 1, nil
+}
+
+// setKeep sets the answer KeepVersion gives; nil restores the
+// previous-version default.
+func (s *memShareStore) setKeep(keep *uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keep = keep
+}
+
+// storedVersions returns, sorted, every version stored for secretID.
+func (s *memShareStore) storedVersions(secretID uint64) []uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var versions []uint32
+	for k := range s.data {
+		if k.secretID == secretID {
+			versions = append(versions, k.version)
+		}
+	}
+	slices.Sort(versions)
+	return versions
 }
 
 func (s *memShareStore) RecordVerification(secretID, channelID uint64, version uint32) error {
@@ -1119,7 +1162,9 @@ func runProtocolWeightedProtectSecret() {
 	fmt.Println("  a pairing publish reuses the stored weights; the new helper gets 1  ✓")
 
 	// Re-weight: B now holds 2 and A 1. Verifying v1 still reports the counts
-	// of the round that published it.
+	// of the round that published it. The pairing publish was v2, so the
+	// round keeps v1 to leave it on the helpers.
+	owner.shareStore.setKeep(&v1)
 	_, err = owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
 		Secrets: []protocol.UserSecret{{ID: []byte{7}, Name: "weighted secret", Data: []byte("re-weighted")}},
 		Weights: map[uint64]uint32{channelB: 2},
@@ -1319,6 +1364,157 @@ func runProtocolMaxSubshares() {
 	assertTrue(len(owner.drain()) == 0, "a round over the cap must send nothing")
 	fmt.Println("  Start(ProtectSecret) over the cap fails with CodeTooManySubshares and sends nothing  ✓")
 	fmt.Println("Protocol max-subshares cap test passed.")
+}
+
+// startKeepRound starts one ProtectSecret round on owner, its payload tagged
+// with round so every round distributes a new version.
+func startKeepRound(owner *peer, secretTag byte, round int) error {
+	_, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{secretTag}, Name: "kept", Data: []byte(fmt.Sprintf("round-%d", round))}},
+	})
+	return err
+}
+
+// deliverKeepRound delivers every envelope owner sent to the helper it is
+// addressed to, skipping any addressed to skip, and hands each helper's
+// answer back to owner.
+func deliverKeepRound(owner *peer, helpers []*peer, skip *peer) {
+	for _, entry := range owner.drain() {
+		var target *peer
+		for _, h := range helpers {
+			if h.uri == entry.uri {
+				target = h
+			}
+		}
+		if target == nil {
+			fail("no peer for destination uri %s", entry.uri)
+		}
+		if target == skip {
+			continue
+		}
+		deliver(target, entry.message)
+		for _, answer := range target.drain() {
+			deliver(owner, answer.message)
+		}
+	}
+}
+
+// runHelperKeepVersionPrunesShareStore: a helper applies each request's
+// keepVersion through ShareStore.RemoveVersions. The owner's KeepVersion
+// keeps the previous version for v1 to v3 and answers 2 for v4, so the v4
+// publish removes v3 and each helper ends up holding exactly v2 and v4.
+func runHelperKeepVersionPrunesShareStore() {
+	fmt.Println("=== Helper keepVersion prunes the share store ===")
+
+	const threshold = 2
+	owner := newPeer("owner", "https://owner-keep-prune.example.com", threshold)
+	helperA := newPeer("helper-a", "https://helper-a-keep-prune.example.com", threshold)
+	helperB := newPeer("helper-b", "https://helper-b-keep-prune.example.com", threshold)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+	pairPeers(owner, helperA, 21)
+	pairPeers(owner, helperB, 22)
+	owner.drain()
+
+	helpers := []*peer{helperA, helperB}
+	for round := 1; round <= 4; round++ {
+		if round == 4 {
+			owner.shareStore.setKeep(proto.Uint32(2))
+		}
+		must(startKeepRound(owner, 0x03, round), fmt.Sprintf("round %d Start(ProtectSecret)", round))
+		deliverKeepRound(owner, helpers, nil)
+	}
+
+	for _, h := range helpers {
+		versions := h.shareStore.storedVersions(protocolSecretID)
+		assertTrue(slices.Equal(versions, []uint32{2, 4}), "[%s] must keep exactly versions [2 4], got %v", h.label, versions)
+		h.shareStore.mu.Lock()
+		removedV3 := slices.ContainsFunc(h.shareStore.removeVersionsCalls, func(c removeVersionsCall) bool {
+			return c.secretID == protocolSecretID && slices.Equal(c.versions, []uint32{3})
+		})
+		h.shareStore.mu.Unlock()
+		assertTrue(removedV3, "[%s] RemoveVersions must reach the app store with [3]", h.label)
+	}
+	fmt.Println("  v4 with keepVersion 2 removed v3 via RemoveVersions on both helpers  ✓")
+	fmt.Println("Helper keepVersion test passed.")
+}
+
+// runOwnerKeepVersionAcrossMissedRound: the owner asks KeepVersion once per
+// round and sends its answer to every helper. v1 reaches both helpers, v2
+// reaches only helper-a, and v3 keeps v1: helper-a drops v2 and helper-b,
+// which never stored v2, keeps v1, so both hold exactly v1 and v3.
+func runOwnerKeepVersionAcrossMissedRound() {
+	fmt.Println("=== Owner keepVersion across a missed round ===")
+
+	const threshold = 2
+	owner := newPeer("owner", "https://owner-keep-missed.example.com", threshold)
+	helperA := newPeer("helper-a", "https://helper-a-keep-missed.example.com", threshold)
+	helperB := newPeer("helper-b", "https://helper-b-keep-missed.example.com", threshold)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+	pairPeers(owner, helperA, 31)
+	pairPeers(owner, helperB, 32)
+	owner.drain()
+
+	helpers := []*peer{helperA, helperB}
+	for round := 1; round <= 3; round++ {
+		keep := uint32(1)
+		if round == 1 {
+			keep = 0
+		}
+		owner.shareStore.setKeep(&keep)
+		must(startKeepRound(owner, 0x04, round), fmt.Sprintf("round %d Start(ProtectSecret)", round))
+		var skip *peer
+		if round == 2 {
+			skip = helperB
+		}
+		deliverKeepRound(owner, helpers, skip)
+	}
+
+	owner.shareStore.mu.Lock()
+	calls := append([]uint32(nil), owner.shareStore.keepVersionCalls...)
+	owner.shareStore.mu.Unlock()
+	assertTrue(slices.Equal(calls, []uint32{1, 2, 3}), "KeepVersion must be asked once per round, got versions %v", calls)
+	fmt.Println("  KeepVersion asked once per round with the version being sent  ✓")
+
+	for _, h := range helpers {
+		versions := h.shareStore.storedVersions(protocolSecretID)
+		assertTrue(slices.Equal(versions, []uint32{1, 3}), "[%s] must keep exactly versions [1 3], got %v", h.label, versions)
+	}
+	fmt.Println("  both helpers hold exactly [1 3] after the v3 round  ✓")
+	fmt.Println("Owner keepVersion test passed.")
+}
+
+// runInvalidKeepVersionFailsRound: a keepVersion equal to or greater than
+// the version being shared fails Start(ProtectSecret) with
+// CodeInvalidKeepVersion before anything is sent.
+func runInvalidKeepVersionFailsRound() {
+	fmt.Println("=== Invalid keepVersion fails the round ===")
+
+	const threshold = 2
+	owner := newPeer("owner", "https://owner-keep-invalid.example.com", threshold)
+	helperA := newPeer("helper-a", "https://helper-a-keep-invalid.example.com", threshold)
+	helperB := newPeer("helper-b", "https://helper-b-keep-invalid.example.com", threshold)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+	pairPeers(owner, helperA, 41)
+	pairPeers(owner, helperB, 42)
+	owner.drain()
+
+	must(startKeepRound(owner, 0x05, 1), "round 1 Start(ProtectSecret)")
+	deliverKeepRound(owner, []*peer{helperA, helperB}, nil)
+
+	owner.shareStore.setKeep(proto.Uint32(2))
+	var startErr *derec.Error
+	err := startKeepRound(owner, 0x05, 2)
+	assertTrue(errors.As(err, &startErr) && startErr.Code == derec.CodeInvalidKeepVersion,
+		"keepVersion 2 for v2 must fail with CodeInvalidKeepVersion (67), got %v", err)
+	assertTrue(len(owner.drain()) == 0, "a round with an invalid keepVersion must send nothing")
+	fmt.Println("  Start(ProtectSecret) with keepVersion 2 for v2 fails with CodeInvalidKeepVersion and sends nothing  ✓")
+	fmt.Println("Invalid keepVersion test passed.")
 }
 
 // runShareStoreRefusal has a helper's share store refuse with
@@ -1881,6 +2077,12 @@ func runConfigSurface() {
 		"CodeNoUsableEndpoint must be 121, got %d", derec.CodeNoUsableEndpoint)
 	assertTrue(derec.CodeTooManySubshares == 66,
 		"CodeTooManySubshares must be 66, got %d", derec.CodeTooManySubshares)
+	assertTrue(derec.CodeInvalidKeepVersion == 67,
+		"CodeInvalidKeepVersion must be 67, got %d", derec.CodeInvalidKeepVersion)
+	assertTrue((&derec.Error{Code: derec.CodeInvalidKeepVersion}).CodeName() == "invalid_keep_version",
+		"CodeInvalidKeepVersion must be named invalid_keep_version, got %q", (&derec.Error{Code: derec.CodeInvalidKeepVersion}).CodeName())
+	assertTrue(derec.CodeFingerprintCommitmentMismatch == 48,
+		"CodeFingerprintCommitmentMismatch must be 48, got %d", derec.CodeFingerprintCommitmentMismatch)
 	assertTrue(derec.CategoryStateStore == 15,
 		"CategoryStateStore must be 15, got %d", derec.CategoryStateStore)
 	fmt.Println("  error code/category values match the FFI  ✓")

@@ -328,12 +328,12 @@ class InMemoryShareStore implements ShareStore {
     for (const v of versions) byVersion.delete(v);
   }
 
-  keep: number[] | null = null;
-  readonly keepListCalls: Array<{ secretId: string; version: number }> = [];
+  keep: number | null = null;
+  readonly keepVersionCalls: Array<{ secretId: string; version: number }> = [];
 
-  async keepList(secretId: string, version: number): Promise<number[] | null> {
-    this.keepListCalls.push({ secretId, version });
-    return this.keep;
+  async keepVersion(secretId: string, version: number): Promise<number> {
+    this.keepVersionCalls.push({ secretId, version });
+    return this.keep ?? version - 1;
   }
 
   async latestVersion(secretId: string): Promise<number | null> {
@@ -1969,107 +1969,160 @@ async function runWeightedHelpersStringIdFlow(): Promise<void> {
   console.log("\n✓ Weighted helpers flow (string channel ids) passed.\n");
 }
 
-// A helper applies each request's keepList through `ShareStore.removeVersions`.
-// The owner's `keepList` returns null for v1 to v3, which sends an empty
-// keepList, and [2, 3] for v4, so the v4 publish carries keepList [2, 3, 4]
-// and v1 must leave every helper's store and nothing else may.
-async function runHelperKeepListFlow(): Promise<void> {
-  console.log("=== [Protocol] Helper keepList Flow ===\n");
-
-  const secretId = 43n;
+/**
+ * Pairs an owner with HelperA and HelperB under `secretId` and returns the
+ * helpers keyed by the endpoint the owner addresses them on.
+ */
+async function pairKeepVersionHelpers(
+  secretId: bigint,
+  channelA: bigint,
+  channelB: bigint,
+): Promise<{ owner: Node; helpersByUri: Map<string, [Node, string, string]> }> {
   const owner = makeNode("Owner", "https://owner.example.com", { secretId });
   const helperA = makeNode("HelperA", "https://helper-a.example.com", { secretId });
   const helperB = makeNode("HelperB", "https://helper-b.example.com", { secretId });
-  const pairedA = await doPair(helperA, owner, 21n, "Owner↔HelperA");
-  const pairedB = await doPair(helperB, owner, 22n, "Owner↔HelperB");
-
+  const pairedA = await doPair(helperA, owner, channelA, "Owner↔HelperA");
+  const pairedB = await doPair(helperB, owner, channelB, "Owner↔HelperB");
+  owner.transport.drain();
   const helpersByUri = new Map<string, [Node, string, string]>([
     ["https://helper-a.example.com", [helperA, "HelperA", pairedA.longTermChannelId]],
     ["https://helper-b.example.com", [helperB, "HelperB", pairedB.longTermChannelId]],
   ]);
-  for (let round = 1; round <= 4; round++) {
-    owner.shareStore.keep = round === 4 ? [2, 3] : null;
-    await owner.protocol.start(FlowKind.ProtectSecret, {
-      secrets: [{ id: new Uint8Array([3]), name: "kept", data: new TextEncoder().encode(`round-${round}`) }],
-      description: `round ${round}`,
-    });
-    for (const { endpoint, message } of owner.transport.drain()) {
-      const [helper, label] = helpersByUri.get(endpoint.uri)!;
-      requireEvent(await processAll(helper, message), "ShareStored", label);
-      await owner.protocol.process(drainOne(helper, label));
-    }
-  }
-
-  for (const [helper, label, channelId] of helpersByUri.values()) {
-    const versions = (await helper.shareStore.load(secretId.toString(), channelId, []))
-      .map((share) => share.version)
-      .sort((a, b) => a - b);
-    if (versions.join(",") !== "2,3,4") {
-      throw new Error(`[${label}] must keep exactly versions [2, 3, 4]; got [${versions.join(", ")}]`);
-    }
-    const reached = helper.shareStore.removeVersionsCalls.some(
-      (c) => c.secretId === secretId.toString() && c.versions.join(",") === "1",
-    );
-    if (!reached) {
-      throw new Error(`[${label}] removeVersions must reach the app store with [1]`);
-    }
-    console.log(`  [${label}] v4 keepList removed v1 via removeVersions  ✓`);
-  }
-
-  console.log("\n✓ Helper keepList flow passed.\n");
+  return { owner, helpersByUri };
 }
 
 /**
- * The owner asks `ShareStore.keepList` once per round and sends its answer,
- * plus the new version, to every helper. The app rolls back v2 by listing
- * only v1 for v3, so both helpers end up holding exactly v1 and v3.
+ * Runs one ProtectSecret round. Every envelope addressed to a helper in
+ * `deliverTo` is stored and answered; the rest are dropped.
  */
-async function runOwnerKeepListFlow(): Promise<void> {
-  console.log("=== [Protocol] Owner keepList Flow ===\n");
+async function runKeepVersionRound(
+  owner: Node,
+  helpersByUri: Map<string, [Node, string, string]>,
+  round: number,
+  deliverTo: string[],
+): Promise<void> {
+  await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([3]), name: "kept", data: new TextEncoder().encode(`round-${round}`) }],
+    description: `round ${round}`,
+  });
+  for (const { endpoint, message } of owner.transport.drain()) {
+    const [helper, label] = helpersByUri.get(endpoint.uri)!;
+    if (!deliverTo.includes(label)) continue;
+    requireEvent(await processAll(helper, message), "ShareStored", label);
+    await owner.protocol.process(drainOne(helper, label));
+  }
+}
 
-  const secretId = 44n;
-  const owner = makeNode("Owner", "https://owner.example.com", { secretId });
-  const helperA = makeNode("HelperA", "https://helper-a.example.com", { secretId });
-  const helperB = makeNode("HelperB", "https://helper-b.example.com", { secretId });
-  const pairedA = await doPair(helperA, owner, 31n, "Owner↔HelperA");
-  const pairedB = await doPair(helperB, owner, 32n, "Owner↔HelperB");
+/** Throws unless the helper holds exactly `expected` on its channel. */
+async function assertHeldVersions(
+  helper: Node,
+  label: string,
+  secretId: bigint,
+  channelId: string,
+  expected: number[],
+): Promise<void> {
+  const versions = (await helper.shareStore.load(secretId.toString(), channelId, []))
+    .map((share) => share.version)
+    .sort((a, b) => a - b);
+  if (versions.join(",") !== expected.join(",")) {
+    throw new Error(`[${label}] must hold exactly versions [${expected.join(", ")}]; got [${versions.join(", ")}]`);
+  }
+}
 
-  const helpersByUri = new Map<string, [Node, string, string]>([
-    ["https://helper-a.example.com", [helperA, "HelperA", pairedA.longTermChannelId]],
-    ["https://helper-b.example.com", [helperB, "HelperB", pairedB.longTermChannelId]],
-  ]);
-  for (let round = 1; round <= 3; round++) {
-    owner.shareStore.keep = round === 3 ? [1] : null;
-    await owner.protocol.start(FlowKind.ProtectSecret, {
-      secrets: [{ id: new Uint8Array([4]), name: "kept", data: new TextEncoder().encode(`round-${round}`) }],
-      description: `round ${round}`,
-    });
-    for (const { endpoint, message } of owner.transport.drain()) {
-      const [helper, label] = helpersByUri.get(endpoint.uri)!;
-      requireEvent(await processAll(helper, message), "ShareStored", label);
-      await owner.protocol.process(drainOne(helper, label));
-    }
+/**
+ * A helper that stores version V keeps V and the request's `keepVersion`, and
+ * applies the rest through `ShareStore.removeVersions`. Rounds 1 to 3 keep
+ * the previous version; round 4 keeps v2, so v3 must leave every helper's
+ * store and v2 and v4 must stay.
+ */
+async function runHelperKeepVersionFlow(): Promise<void> {
+  console.log("=== [Protocol] Helper keepVersion Flow ===\n");
+
+  const secretId = 43n;
+  const { owner, helpersByUri } = await pairKeepVersionHelpers(secretId, 21n, 22n);
+  for (let round = 1; round <= 4; round++) {
+    owner.shareStore.keep = round === 4 ? 2 : null;
+    await runKeepVersionRound(owner, helpersByUri, round, ["HelperA", "HelperB"]);
   }
 
-  const asked = owner.shareStore.keepListCalls
+  for (const [helper, label, channelId] of helpersByUri.values()) {
+    await assertHeldVersions(helper, label, secretId, channelId, [2, 4]);
+    const reached = helper.shareStore.removeVersionsCalls.some(
+      (c) => c.secretId === secretId.toString() && c.channelId === channelId && c.versions.join(",") === "3",
+    );
+    if (!reached) {
+      throw new Error(`[${label}] removeVersions must reach the app store with [3]`);
+    }
+    console.log(`  [${label}] v4 with keepVersion 2 holds [2, 4] and removed v3 via removeVersions  ✓`);
+  }
+
+  console.log("\n✓ Helper keepVersion flow passed.\n");
+}
+
+/**
+ * The owner asks `ShareStore.keepVersion` once per round and sends the same
+ * answer to every helper. HelperB misses the v2 round, so after v3 (keeping
+ * v1) both helpers hold exactly v1 and v3: HelperA drops the v2 it stored.
+ */
+async function runOwnerKeepVersionMissedRoundFlow(): Promise<void> {
+  console.log("=== [Protocol] Owner keepVersion Across a Missed Round ===\n");
+
+  const secretId = 44n;
+  const { owner, helpersByUri } = await pairKeepVersionHelpers(secretId, 31n, 32n);
+  owner.shareStore.keep = 0;
+  await runKeepVersionRound(owner, helpersByUri, 1, ["HelperA", "HelperB"]);
+  owner.shareStore.keep = 1;
+  await runKeepVersionRound(owner, helpersByUri, 2, ["HelperA"]);
+  console.log("  [Owner]  v2 reached HelperA only  ✓");
+  await runKeepVersionRound(owner, helpersByUri, 3, ["HelperA", "HelperB"]);
+
+  const asked = owner.shareStore.keepVersionCalls
     .filter((c) => c.secretId === secretId.toString())
     .map((c) => c.version);
   if (asked.join(",") !== "1,2,3") {
-    throw new Error(`keepList must be asked once per round; got versions [${asked.join(", ")}]`);
+    throw new Error(`keepVersion must be asked once per round; got versions [${asked.join(", ")}]`);
   }
-  console.log("  keepList asked once per round with the version being sent  ✓");
+  console.log("  keepVersion asked once per round with the version being sent  ✓");
 
   for (const [helper, label, channelId] of helpersByUri.values()) {
-    const versions = (await helper.shareStore.load(secretId.toString(), channelId, []))
-      .map((share) => share.version)
-      .sort((a, b) => a - b);
-    if (versions.join(",") !== "1,3") {
-      throw new Error(`[${label}] must keep exactly versions [1, 3]; got [${versions.join(", ")}]`);
-    }
+    await assertHeldVersions(helper, label, secretId, channelId, [1, 3]);
     console.log(`  [${label}] holds exactly [1, 3] after the v3 round  ✓`);
   }
 
-  console.log("\n✓ Owner keepList flow passed.\n");
+  console.log("\n✓ Owner keepVersion across a missed round passed.\n");
+}
+
+/**
+ * A `keepVersion` equal to or greater than the version being shared fails
+ * `start(ProtectSecret)` with `invalid_keep_version` before anything is sent.
+ */
+async function runInvalidKeepVersionFlow(): Promise<void> {
+  console.log("=== [Protocol] Invalid keepVersion Fails the Round ===\n");
+
+  const secretId = 47n;
+  const { owner, helpersByUri } = await pairKeepVersionHelpers(secretId, 41n, 42n);
+  await runKeepVersionRound(owner, helpersByUri, 1, ["HelperA", "HelperB"]);
+
+  owner.shareStore.keep = 2;
+  let error: DeRecError | undefined;
+  try {
+    await owner.protocol.start(FlowKind.ProtectSecret, {
+      secrets: [{ id: new Uint8Array([3]), name: "kept", data: new TextEncoder().encode("round-2") }],
+      description: "round 2",
+    });
+  } catch (e) {
+    error = e as DeRecError;
+  }
+  if (error?.code !== "invalid_keep_version" || error.category !== "sharing") {
+    throw new Error(`keepVersion 2 for v2 must fail with invalid_keep_version, got ${JSON.stringify(error)}`);
+  }
+  const sent = owner.transport.drain();
+  if (sent.length !== 0) {
+    throw new Error(`a round with an invalid keepVersion must send nothing; sent ${sent.length}`);
+  }
+  console.log("  [Owner]  keepVersion 2 for v2 → invalid_keep_version, nothing sent  ✓");
+
+  console.log("\n✓ Invalid keepVersion flow passed.\n");
 }
 
 // VSS sharing requires threshold ≥ 2, so this scenario pairs the Owner with
@@ -3795,8 +3848,9 @@ export async function runProtocolSmoke(): Promise<void> {
   await runVerifyNoProofFlow();
   await runVerificationVerdictsFlow();
   await runInvalidWeightFlow();
-  await runHelperKeepListFlow();
-  await runOwnerKeepListFlow();
+  await runHelperKeepVersionFlow();
+  await runOwnerKeepVersionMissedRoundFlow();
+  await runInvalidKeepVersionFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();
   await runUpdateChannelInfoFlow();

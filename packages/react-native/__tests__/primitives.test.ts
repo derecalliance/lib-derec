@@ -281,6 +281,7 @@ describe('NoKeys pre-pair and fingerprint', () => {
       mlkem_encapsulation_key: new Uint8Array([1]).buffer,
       ecies_public_key: new Uint8Array([2]).buffer,
       nonce: 424242n,
+      fingerprint_commitment: new Uint8Array([9]).buffer,
     };
     const result = primitives.pairing.response.process_pre_pair_no_keys(
       { channel_id: 3n, contact_mode: 2, nonce: 424242n } as never,
@@ -292,6 +293,7 @@ describe('NoKeys pre-pair and fingerprint', () => {
     expect(Array.from(result.mlkem_encapsulation_key)).toEqual([1]);
     expect(Array.from(result.ecies_public_key)).toEqual([2]);
     expect(result.nonce).toBe(424242n);
+    expect(Array.from(result.fingerprint_commitment)).toEqual([9]);
   });
 
   it('forwards the shared key to pairing_fingerprint and returns its string', () => {

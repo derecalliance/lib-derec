@@ -72,7 +72,7 @@ pub fn produce(
     version: u32,
     secret_id: u64,
     committed_share: JsValue,
-    keep_list: JsValue,
+    keep_version: u32,
     description: String,
     shared_key: &[u8],
     // Optional `TransportProtocol` (serialized JS object) telling the
@@ -84,14 +84,13 @@ pub fn produce(
     let shared_key = parse_shared_key(shared_key)?;
     let committed_share: CommittedDeRecShare = from_js(committed_share)?;
     let committed_share_proto: derec_proto::CommittedDeRecShare = committed_share.into();
-    let keep_list_raw: Vec<u32> = from_js(keep_list)?;
     let reply_to_proto = parse_transport_protocol_list(reply_to)?;
     let result = request::produce(
         ChannelId(channel_id),
         version,
         secret_id,
         &committed_share_proto,
-        &keep_list_raw,
+        keep_version,
         description,
         &shared_key,
         &reply_to_proto,

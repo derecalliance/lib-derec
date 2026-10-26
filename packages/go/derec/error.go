@@ -114,6 +114,12 @@ const (
 	CodeMissingReplicaID           int32 = 45
 	CodeUnexpectedReplicaID        int32 = 46
 	CodeIncompatibleParameterRange int32 = 47
+	// CodeFingerprintCommitmentMismatch: the fingerprint nonce in a pairing
+	// response does not open the commitment the contact creator published
+	// with its keys, so the response or the keys did not come from the
+	// party that made the commitment — a possible man-in-the-middle. The
+	// pairing does not complete.
+	CodeFingerprintCommitmentMismatch int32 = 48
 
 	CodeEmptyChannels      int32 = 60
 	CodeDuplicateChannelID int32 = 61
@@ -129,6 +135,11 @@ const (
 	// than the cap set with protocol.Config.MaxSubshares. Raised by
 	// Start(ProtectSecret) before anything is sent.
 	CodeTooManySubshares int32 = 66
+	// CodeInvalidKeepVersion: the keepVersion of a sharing round is equal
+	// to or greater than the version being shared (0 keeps no other
+	// version and is always valid). Raised by Start(ProtectSecret), and by
+	// Sharing.Request.Produce, before anything is sent.
+	CodeInvalidKeepVersion int32 = 67
 
 	CodeEmptyResponses            int32 = 80
 	CodeEmptyCommittedDeRecShare  int32 = 81

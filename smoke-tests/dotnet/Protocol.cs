@@ -77,8 +77,9 @@ internal static class Protocol
         RunStickyThresholdTest();
         RunChannelStatusRequiredOnDecodeTest();
         RunOrchestratorMaxSubsharesTest();
-        RunHelperKeepListPrunesShareStoreTest();
-        RunOwnerKeepListReachesHelpersTest();
+        RunHelperKeepVersionPrunesShareStoreTest();
+        RunOwnerKeepVersionAcrossMissedRoundTest();
+        RunInvalidKeepVersionFailsRoundTest();
         RunShareStoreRefusalTest();
         RunRequestFailedTokenTest();
         RunAutoRespondOnFailureTest();
@@ -1251,16 +1252,15 @@ internal static class Protocol
     }
 
     /// <summary>
-    /// A helper applies each request's <c>keepList</c> through
+    /// A helper applies each request's <c>keepVersion</c> through
     /// <see cref="IShareStore.RemoveVersions"/>. The owner's
-    /// <see cref="IShareStore.KeepList"/> returns <c>null</c> for v1 to v3,
-    /// which sends an empty <c>keepList</c>, and <c>[2, 3]</c> for v4, so the
-    /// v4 publish carries <c>keepList [2, 3, 4]</c> and v1 must leave the
-    /// helper's store and nothing else may.
+    /// <see cref="IShareStore.KeepVersion"/> keeps the previous version for
+    /// v1 to v3 and answers <c>2</c> for v4, so the v4 publish removes v3
+    /// and each helper ends up holding exactly v2 and v4.
     /// </summary>
-    private static void RunHelperKeepListPrunesShareStoreTest()
+    private static void RunHelperKeepVersionPrunesShareStoreTest()
     {
-        Console.WriteLine("=== Helper keepList prunes the share store ===");
+        Console.WriteLine("=== Helper keepVersion prunes the share store ===");
 
         const ulong secretId = 0x6262UL;
         using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions(SecretId: secretId));
@@ -1276,15 +1276,8 @@ internal static class Protocol
         };
         for (var round = 1; round <= 4; round++)
         {
-            owner.ShareStore.Keep = round == 4 ? new uint[] { 2, 3 } : null;
-            owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
-            {
-                Secrets = new[]
-                {
-                    new UserSecret { Id = new byte[] { 0x03 }, Name = "kept", Data = Encoding.UTF8.GetBytes($"round-{round}") },
-                },
-                Description = $"round {round}",
-            }).GetAwaiter().GetResult();
+            owner.ShareStore.Keep = round == 4 ? 2u : null;
+            StartKeepRound(owner, 0x03, round);
             foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
             {
                 var h = helpersByUri[uri];
@@ -1296,26 +1289,26 @@ internal static class Protocol
         foreach (var h in new[] { helperA, helperB })
         {
             var versions = h.ShareStore.StoredVersions(secretId);
-            if (!versions.SequenceEqual(new uint[] { 2, 3, 4 }))
+            if (!versions.SequenceEqual(new uint[] { 2, 4 }))
                 throw new InvalidOperationException(
-                    $"helper must keep exactly versions [2, 3, 4]; got [{string.Join(", ", versions)}]");
-            if (!h.ShareStore.RemoveVersionsCalls.Any(c => c.SecretId == secretId && c.Versions.SequenceEqual(new uint[] { 1 })))
-                throw new InvalidOperationException("RemoveVersions must reach the app store with [1]");
+                    $"helper must keep exactly versions [2, 4]; got [{string.Join(", ", versions)}]");
+            if (!h.ShareStore.RemoveVersionsCalls.Any(c => c.SecretId == secretId && c.Versions.SequenceEqual(new uint[] { 3 })))
+                throw new InvalidOperationException("RemoveVersions must reach the app store with [3]");
         }
-        Console.WriteLine("  v4 keepList removed v1 via RemoveVersions on both helpers  ✓");
+        Console.WriteLine("  v4 with keepVersion 2 removed v3 via RemoveVersions on both helpers  ✓");
 
-        Console.WriteLine("Helper keepList test passed.\n");
+        Console.WriteLine("Helper keepVersion test passed.\n");
     }
 
     /// <summary>
-    /// The owner asks <see cref="IShareStore.KeepList"/> once per round and
-    /// sends its answer, plus the new version, to every helper. The app
-    /// rolls back v2 by listing only v1 for v3, so both helpers end up
-    /// holding exactly v1 and v3.
+    /// The owner asks <see cref="IShareStore.KeepVersion"/> once per round
+    /// and sends its answer to every helper. v1 reaches both helpers, v2
+    /// reaches only HelperA, and v3 keeps v1: HelperA drops v2 and HelperB,
+    /// which never stored v2, keeps v1, so both hold exactly v1 and v3.
     /// </summary>
-    private static void RunOwnerKeepListReachesHelpersTest()
+    private static void RunOwnerKeepVersionAcrossMissedRoundTest()
     {
-        Console.WriteLine("=== Owner keepList reaches every helper ===");
+        Console.WriteLine("=== Owner keepVersion across a missed round ===");
 
         const ulong secretId = 0x6363UL;
         using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions(SecretId: secretId));
@@ -1331,28 +1324,22 @@ internal static class Protocol
         };
         for (var round = 1; round <= 3; round++)
         {
-            owner.ShareStore.Keep = round == 3 ? new uint[] { 1 } : null;
-            owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
-            {
-                Secrets = new[]
-                {
-                    new UserSecret { Id = new byte[] { 0x04 }, Name = "kept", Data = Encoding.UTF8.GetBytes($"round-{round}") },
-                },
-                Description = $"round {round}",
-            }).GetAwaiter().GetResult();
+            owner.ShareStore.Keep = round == 1 ? 0u : 1u;
+            StartKeepRound(owner, 0x04, round);
             foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
             {
+                if (round == 2 && uri == "https://helper-b.example.com") continue;
                 var h = helpersByUri[uri];
                 h.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
                 owner.Protocol.ProcessAndAcceptAllAsync(h.Transport.DrainOne()).GetAwaiter().GetResult();
             }
         }
 
-        var calls = owner.ShareStore.KeepListCalls.Where(c => c.SecretId == secretId).Select(c => c.Version).ToArray();
+        var calls = owner.ShareStore.KeepVersionCalls.Where(c => c.SecretId == secretId).Select(c => c.Version).ToArray();
         if (!calls.SequenceEqual(new uint[] { 1, 2, 3 }))
             throw new InvalidOperationException(
-                $"KeepList must be asked once per round; got versions [{string.Join(", ", calls)}]");
-        Console.WriteLine("  KeepList asked once per round with the version being sent  ✓");
+                $"KeepVersion must be asked once per round; got versions [{string.Join(", ", calls)}]");
+        Console.WriteLine("  KeepVersion asked once per round with the version being sent  ✓");
 
         foreach (var h in new[] { helperA, helperB })
         {
@@ -1363,8 +1350,66 @@ internal static class Protocol
         }
         Console.WriteLine("  both helpers hold exactly [1, 3] after the v3 round  ✓");
 
-        Console.WriteLine("Owner keepList test passed.\n");
+        Console.WriteLine("Owner keepVersion test passed.\n");
     }
+
+    /// <summary>
+    /// A <c>keepVersion</c> equal to or greater than the version being
+    /// shared fails <c>start(ProtectSecret)</c> with
+    /// <see cref="DeRecCode.InvalidKeepVersion"/> before anything is sent.
+    /// </summary>
+    private static void RunInvalidKeepVersionFailsRoundTest()
+    {
+        Console.WriteLine("=== Invalid keepVersion fails the round ===");
+
+        const ulong secretId = 0x6464UL;
+        using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions(SecretId: secretId));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com", new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com", new NodeOptions(SecretId: secretId));
+        DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 41UL);
+        DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 42UL);
+
+        var helpersByUri = new Dictionary<string, Node>
+        {
+            ["https://helper-a.example.com"] = helperA,
+            ["https://helper-b.example.com"] = helperB,
+        };
+        StartKeepRound(owner, 0x05, 1);
+        foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
+        {
+            var h = helpersByUri[uri];
+            h.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+            owner.Protocol.ProcessAndAcceptAllAsync(h.Transport.DrainOne()).GetAwaiter().GetResult();
+        }
+
+        owner.ShareStore.Keep = 2;
+        int startCode = 0;
+        try
+        {
+            StartKeepRound(owner, 0x05, 2);
+        }
+        catch (DeRecException e)
+        {
+            startCode = e.Code;
+        }
+        if (startCode != DeRecCode.InvalidKeepVersion)
+            throw new InvalidOperationException($"keepVersion 2 for v2 must fail with InvalidKeepVersion, got code {startCode}");
+        if (owner.Transport.DrainAll().Count != 0)
+            throw new InvalidOperationException("a round with an invalid keepVersion must send nothing");
+        Console.WriteLine("  start(ProtectSecret) with keepVersion 2 for v2 fails with InvalidKeepVersion and sends nothing  ✓");
+
+        Console.WriteLine("Invalid keepVersion test passed.\n");
+    }
+
+    private static void StartKeepRound(Node owner, byte secretTag, int round) =>
+        owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret { Id = new byte[] { secretTag }, Name = "kept", Data = Encoding.UTF8.GetBytes($"round-{round}") },
+            },
+            Description = $"round {round}",
+        }).GetAwaiter().GetResult();
 
     /// <summary>
     /// A helper's share store throws
@@ -4608,6 +4653,7 @@ internal static class Protocol
             || DeRecCode.TransportInvalid != 120
             || DeRecCode.InvalidWeight != 65
             || DeRecCode.TooManySubshares != 66
+            || DeRecCode.InvalidKeepVersion != 67
             || DeRecCategory.StateStore != 15)
         {
             throw new Exception("error code/category values drifted from the FFI");
@@ -4848,6 +4894,7 @@ internal static class Protocol
         Expect(DeRecCode.Name(DeRecCode.InvalidContactMessage), "invalid_contact_message", "code 41");
         Expect(DeRecCode.Name(DeRecCode.InvalidWeight), "invalid_weight", "code 65");
         Expect(DeRecCode.Name(DeRecCode.TooManySubshares), "too_many_subshares", "code 66");
+        Expect(DeRecCode.Name(DeRecCode.InvalidKeepVersion), "invalid_keep_version", "code 67");
         Expect(DeRecCode.Name(9999), "unknown", "unknown code");
         Expect(DeRecCategory.Name(DeRecCategory.Pairing), "pairing", "category 2");
         Expect(DeRecCategory.Name(DeRecCategory.InvalidInput), "input", "category 12");
@@ -4902,6 +4949,8 @@ internal static class Protocol
             throw new Exception("InlineKeys contact must carry both public keys");
         if (contact.ContactBindingHash is not null)
             throw new Exception("InlineKeys contact must not carry a binding hash");
+        if (contact.FingerprintCommitment is not { Length: 32 })
+            throw new Exception("InlineKeys contact must carry a 32-byte fingerprint commitment");
         if (contact.Timestamp is not { Seconds: > 0 })
             throw new Exception("contact must carry its creation timestamp");
         var endpoints = contact.AdvertisedEndpoints();
@@ -4918,7 +4967,10 @@ internal static class Protocol
         {
             byte[] coreBytes = helper.Protocol.CreateContactAsync(channelId + (ulong)mode, mode, nonce: 777UL)
                 .GetAwaiter().GetResult();
-            if (!Pairing.Request.EncodeContact(Pairing.Request.DecodeContact(coreBytes)).SequenceEqual(coreBytes))
+            var decoded = Pairing.Request.DecodeContact(coreBytes);
+            if (decoded.FingerprintCommitment is not null)
+                throw new Exception($"{mode}: contact must not carry a fingerprint commitment");
+            if (!Pairing.Request.EncodeContact(decoded).SequenceEqual(coreBytes))
                 throw new Exception($"{mode}: re-encoding must reproduce the core's bytes");
         }
         Console.WriteLine("  HashedKeys and NoKeys contacts round-trip to the core's bytes  ✓");
@@ -4936,6 +4988,20 @@ internal static class Protocol
         if (!refusedOnEncode)
             throw new Exception("an InlineKeys contact carrying a binding hash must be refused on encode");
         Console.WriteLine("  InlineKeys + binding hash refused on encode  ✓");
+
+        var uncommitted = contact with { FingerprintCommitment = null };
+        var refusedUncommitted = false;
+        try
+        {
+            Pairing.Request.EncodeContact(uncommitted);
+        }
+        catch (DeRecException e)
+        {
+            refusedUncommitted = e.Code == DeRecCode.InvalidContactMessage;
+        }
+        if (!refusedUncommitted)
+            throw new Exception("an InlineKeys contact without a fingerprint commitment must be refused on encode");
+        Console.WriteLine("  InlineKeys without fingerprint commitment refused on encode  ✓");
 
         var proto = Org.Derecalliance.Derec.Protobuf.ContactMessage.Parser.ParseFrom(bytes);
         proto.ContactBindingHash = Google.Protobuf.ByteString.CopyFrom(new byte[48]);

@@ -41,21 +41,31 @@ fn an_expanded_decapsulation_key_is_rejected() {
 }
 
 #[test]
-fn an_old_initiator_cannot_finish_but_an_old_responder_can() {
+fn an_old_initiator_no_longer_loads_but_an_old_responder_still_finishes() {
     let contact: PairingContactMessageMaterial = decode(fixture::CONTACT);
-    let initiator: InitiatorSecretKeyMaterial = decode(fixture::INITIATOR_SECRET);
-    let request: PairingRequestMessageMaterial = decode(fixture::REQUEST);
     let responder: ResponderSecretKeyMaterial = decode(fixture::RESPONDER_SECRET);
 
-    assert!(matches!(
-        pairing::finish_pairing_initiator(&initiator, &request),
-        Err(DerecPairingError::InvalidSize { got: 3168, .. })
-    ));
+    // Initiator material from before the fingerprint nonce lacks that field.
+    assert!(
+        InitiatorSecretKeyMaterial::deserialize_uncompressed(
+            bytes(fixture::INITIATOR_SECRET).as_slice()
+        )
+        .is_err()
+    );
+    let _: PairingRequestMessageMaterial = decode(fixture::REQUEST);
+
+    let nonce = [9u8; 32];
+    let commitment = pairing::fingerprint_commitment(
+        &contact.mlkem_encapsulation_key,
+        &contact.ecies_public_key,
+        &nonce,
+    );
+    let handshake_key: [u8; 32] = bytes(fixture::PAIRING_SHARED_KEY)
+        .try_into()
+        .expect("fixture key is 32 bytes");
     assert_eq!(
-        pairing::finish_pairing_responder(&responder, &contact)
-            .unwrap()
-            .to_vec(),
-        bytes(fixture::PAIRING_SHARED_KEY)
+        pairing::finish_pairing_responder(&responder, &contact, &commitment, &nonce).unwrap(),
+        pairing::channel_key(&handshake_key, &nonce)
     );
 }
 

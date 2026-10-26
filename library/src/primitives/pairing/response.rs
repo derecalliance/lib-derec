@@ -11,7 +11,8 @@ use crate::protocol_version::ProtocolVersion;
 use crate::types::ChannelId;
 use crate::utils::verify_timestamps;
 use derec_cryptography::pairing::{
-    self as cryptography_pairing, PairingSecretKeyMaterial, PairingSharedKey,
+    self as cryptography_pairing, DerecPairingError, FingerprintCommitment, FingerprintNonce,
+    PairingSecretKeyMaterial, PairingSharedKey,
 };
 use derec_proto::{
     CommunicationInfo, ContactMessage, ContactMode, DeRecMessage, DeRecResult, MessageBody,
@@ -80,6 +81,11 @@ pub struct ProcessPrePairResult {
     pub mlkem_encapsulation_key: Vec<u8>,
     pub ecies_public_key: Vec<u8>,
     pub nonce: u64,
+    /// The creator's 32-byte commitment to the fingerprint nonce it reveals
+    /// in the pairing response. Carry it into the contact the pairing
+    /// request is built from, in `fingerprint_commitment`, alongside the
+    /// two keys: [`process`] refuses a response whose nonce does not open it.
+    pub fingerprint_commitment: Vec<u8>,
 }
 
 /// Produces a pairing response envelope and derives the final pairing shared key on the
@@ -90,8 +96,10 @@ pub struct ProcessPrePairResult {
 /// 1. Validates the provided [`derec_proto::PairRequestMessage`] contents
 /// 2. Finalizes the initiator-side pairing computation using its previously stored
 ///    [`derec_cryptography::pairing::PairingSecretKeyMaterial`]
-/// 3. Derives the final 256-bit [`derec_cryptography::pairing::PairingSharedKey`]
-/// 4. Constructs a [`derec_proto::PairResponseMessage`] with an `Ok` status
+/// 3. Derives the 256-bit channel key ([`derec_cryptography::pairing::PairingSharedKey`])
+///    from the handshake key and its own fingerprint nonce
+/// 4. Constructs a [`derec_proto::PairResponseMessage`] with an `Ok` status, revealing
+///    that fingerprint nonce
 /// 5. Encrypts the serialized inner response message to the responder's ECIES public key
 /// 6. Wraps the encrypted inner bytes into a plain [`derec_proto::DeRecMessage`] envelope
 ///
@@ -271,6 +279,7 @@ pub fn produce(
         parameter_range,
         timestamp: Some(timestamp),
         channel_id: rekeyed_channel_id.into(),
+        fingerprint_nonce: Some(initiator_material.fingerprint_nonce.to_vec()),
     };
 
     let envelope = DeRecMessageBuilder::pairing()
@@ -366,6 +375,7 @@ pub fn produce_pre_pair(
         ecies_public_key: Some(initiator_material.ecies_public_key.clone()),
         nonce: request.nonce,
         timestamp: Some(timestamp),
+        fingerprint_commitment: Some(initiator_material.fingerprint_commitment().to_vec()),
     };
 
     let protocol_version = ProtocolVersion::current();
@@ -453,6 +463,7 @@ pub fn produce_pre_pair_no_keys(
         ecies_public_key: Some(pk.ecies_public_key.clone()),
         nonce: request.nonce,
         timestamp: Some(timestamp),
+        fingerprint_commitment: Some(secret_key.fingerprint_commitment().to_vec()),
     };
 
     let protocol_version = ProtocolVersion::current();
@@ -850,12 +861,21 @@ pub fn process(
         validate_process_inputs(contact_message, response, pairing_secret_key_material)?;
 
     let pairing_contact_key_material = build_pairing_contact_material(contact_message);
+    let (fingerprint_commitment, fingerprint_nonce) =
+        fingerprint_opening(contact_message, response)?;
 
     let shared_key = cryptography_pairing::finish_pairing_responder(
         responder_material,
         &pairing_contact_key_material,
+        &fingerprint_commitment,
+        &fingerprint_nonce,
     )
-    .map_err(|e| PairingError::FinishPairingResponder { source: e })?;
+    .map_err(|e| match e {
+        DerecPairingError::FingerprintCommitmentMismatch => {
+            PairingError::FingerprintCommitmentMismatch
+        }
+        source => PairingError::FinishPairingResponder { source },
+    })?;
 
     let expected_channel_id =
         validate_rekeyed_channel_id(response, ChannelId(contact_message.channel_id), &shared_key)?;
@@ -936,6 +956,10 @@ pub fn process_pre_pair(
         mlkem_encapsulation_key,
         ecies_public_key,
         nonce: response.nonce,
+        fingerprint_commitment: response
+            .fingerprint_commitment
+            .clone()
+            .expect("validate_process_pre_pair_inputs guarantees fingerprint_commitment is Some"),
     })
 }
 
@@ -998,6 +1022,10 @@ pub fn process_pre_pair_no_keys(
         mlkem_encapsulation_key,
         ecies_public_key,
         nonce: response.nonce,
+        fingerprint_commitment: response
+            .fingerprint_commitment
+            .clone()
+            .expect("validate_process_pre_pair_inputs guarantees fingerprint_commitment is Some"),
     })
 }
 
@@ -1055,6 +1083,30 @@ fn validate_process_inputs<'a>(
         )
         .into()),
     }
+}
+
+/// The creator's commitment, carried in the contact, and the nonce the
+/// response reveals. Both are 32 bytes; a response without its nonce, or a
+/// contact without the commitment, cannot complete pairing.
+fn fingerprint_opening(
+    contact_message: &ContactMessage,
+    response: &PairResponseMessage,
+) -> Result<(FingerprintCommitment, FingerprintNonce), crate::Error> {
+    let commitment = contact_message
+        .fingerprint_commitment
+        .as_deref()
+        .and_then(|c| FingerprintCommitment::try_from(c).ok())
+        .ok_or(PairingError::InvalidContactMessage(
+            "contact carries no 32-byte fingerprint_commitment",
+        ))?;
+    let nonce = response
+        .fingerprint_nonce
+        .as_deref()
+        .and_then(|n| FingerprintNonce::try_from(n).ok())
+        .ok_or(PairingError::InvalidPairResponseMessage(
+            "pair response carries no 32-byte fingerprint_nonce",
+        ))?;
+    Ok((commitment, nonce))
 }
 
 fn build_pairing_contact_material(
@@ -1141,6 +1193,19 @@ fn validate_process_pre_pair_inputs(
         #[cfg(feature = "logging")]
         tracing::warn!("PrePair response missing ecies_public_key");
         return Err(PairingError::InvalidPairResponseMessage("ecies_public_key is empty").into());
+    }
+
+    if response
+        .fingerprint_commitment
+        .as_ref()
+        .is_none_or(|c| c.len() != 32)
+    {
+        #[cfg(feature = "logging")]
+        tracing::warn!("PrePair response carries no 32-byte fingerprint_commitment");
+        return Err(PairingError::InvalidPairResponseMessage(
+            "fingerprint_commitment is not a SHA-256 digest",
+        )
+        .into());
     }
 
     if response.nonce != contact_message.nonce {

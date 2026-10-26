@@ -297,7 +297,8 @@ async fn step_4_rotate_helpers(
     }
 
     // Admitting a helper republishes, so the newcomer is never left holding
-    // nothing. Each pairing is therefore a version:
+    // nothing. Each pairing is therefore a version, and each keeps the one
+    // before it:
     //   v3 goes to the 3 survivors + spare #6   → 4 rows
     //   v4 goes to those 4 + spare #7           → 5 rows
     // The recovered v2 left the owner no rows of its own.
@@ -321,9 +322,10 @@ async fn step_4_rotate_helpers(
         "one version per admission; the recovered v2 has none"
     );
 
-    // Each helper holds exactly the versions published since it joined: the
-    // survivors have all four, spare #6 has v3 and v4, spare #7 only v4.
-    let expected_shares = [4, 4, 4, 2, 1];
+    // Each helper holds the newest version and the one kept with it: v4
+    // keeps v3, so the survivors dropped v1 and v2, spare #6 holds v3 and v4,
+    // and spare #7 joined at v4 alone.
+    let expected_shares = [2, 2, 2, 2, 1];
     for (helper, shares) in helpers.iter().zip(expected_shares) {
         assert_tables(
             &helper.peer.client(),
@@ -402,7 +404,8 @@ async fn step_5_admit_first_replica(
         "the replica is at the owner's version after admission"
     );
     // The owner gains a sixth `secrets` row — the group channel key — and the
-    // admission publish (v5) adds one share row per helper.
+    // admission publish (v5), which keeps v4, adds one share row per helper
+    // and drops the v3 rows.
     assert_tables(
         &owner.client(),
         SECRET_ID,
@@ -412,14 +415,14 @@ async fn step_5_admit_first_replica(
             channels: 5,
             replica_members: 2,
             secrets: 6,
-            shares: 9 + 5,
+            shares: 5 + 5,
             user_secrets: 1,
             ..Default::default()
         },
     )
     .await;
     assert_replica(replica, "step 5", 2, 5).await;
-    assert_helpers(helpers, "step 5", 1).await;
+    assert_helpers(helpers, "step 5").await;
     println!("  step 5: replica admitted — roster of 2 on both devices, replica synced  ✓");
 }
 
@@ -478,7 +481,7 @@ async fn step_6_recover_with_a_replica_in_the_roster(
         },
     )
     .await;
-    assert_helpers(helpers, "step 6", 1).await;
+    assert_helpers(helpers, "step 6").await;
     for replica in replicas.iter() {
         assert_replica(replica, "step 6", 2, 5).await;
     }
@@ -545,7 +548,7 @@ async fn step_7_admit_remaining_replicas(
     for (replica, shares) in replicas.iter().zip([15, 10, 5]) {
         assert_replica(replica, "step 7", 4, shares).await;
     }
-    assert_helpers(helpers, "step 7", 3).await;
+    assert_helpers(helpers, "step 7").await;
     println!("  step 7: two more replicas admitted — all 4 devices share one roster  ✓");
 }
 
@@ -606,7 +609,7 @@ async fn step_8_protect_more_secrets(
             channels: 5,
             replica_members: 4,
             secrets: 6,
-            shares: 10 + 5,
+            shares: 5 + 5,
             user_secrets: 1,
             ..Default::default()
         },
@@ -615,7 +618,7 @@ async fn step_8_protect_more_secrets(
     for (replica, shares) in replicas.iter().zip([20, 15, 10]) {
         assert_replica(replica, "step 8", 4, shares).await;
     }
-    assert_helpers(helpers, "step 8", 4).await;
+    assert_helpers(helpers, "step 8").await;
     println!(
         "  step 8: 5 secrets published at v{version} — all 5 helpers and all 3 replicas current  ✓"
     );
@@ -691,7 +694,7 @@ async fn step_9_remove_a_replica(
             channels: 5,
             replica_members: 3,
             secrets: 6,
-            shares: 15 + 5,
+            shares: 5 + 5,
             user_secrets: 1,
             ..Default::default()
         },
@@ -700,7 +703,7 @@ async fn step_9_remove_a_replica(
     for (replica, shares) in replicas.iter().zip([25, 20]) {
         assert_replica(replica, "step 9", 3, shares).await;
     }
-    assert_helpers(helpers, "step 9", 5).await;
+    assert_helpers(helpers, "step 9").await;
     println!(
         "  step 9: replica removed — roster of 3 on every remaining device, \
          evicted device holds nothing  ✓"
@@ -1411,14 +1414,11 @@ fn assert_secrets_round_tripped(recovered: &Secret, expected: &[UserSecret], ste
     }
 }
 
-/// Share rows each helper holds as of step 4, in `helpers` order: the three
-/// survivors carry every version, spare #6 joined at v3 and spare #7 at v4.
-const HELPER_BASE_SHARES: [i64; 5] = [4, 4, 4, 2, 1];
-
 /// Assert every helper at once. Publishing is always a full round reaching all
-/// five, so each publish since step 4 adds exactly one row to each.
-async fn assert_helpers(helpers: &[HelperDevice], step: &str, publishes_since_step_4: i64) {
-    for (i, helper) in helpers.iter().enumerate() {
+/// five, and each round keeps the version before it, so from step 5 on every
+/// helper holds exactly two versions.
+async fn assert_helpers(helpers: &[HelperDevice], step: &str) {
+    for helper in helpers.iter() {
         assert_tables(
             &helper.peer.client(),
             SECRET_ID,
@@ -1427,7 +1427,7 @@ async fn assert_helpers(helpers: &[HelperDevice], step: &str, publishes_since_st
             Tables {
                 channels: 1,
                 secrets: 1,
-                shares: HELPER_BASE_SHARES[i] + publishes_since_step_4,
+                shares: 2,
                 ..Default::default()
             },
         )

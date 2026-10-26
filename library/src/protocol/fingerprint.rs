@@ -499,9 +499,9 @@ mod tests {
     }
 
     /// The publish a confirmation triggers is an ordinary sharing round, so
-    /// the application's keep list governs it like any other.
+    /// the application's `keepVersion` governs it like any other.
     #[test]
-    fn the_confirmation_publish_sends_the_app_keep_list() {
+    fn the_confirmation_publish_sends_the_app_keep_version() {
         run_async(async {
             use crate::protocol::tests::RecordingTransport;
             const OTHER: ChannelId = ChannelId(78);
@@ -542,7 +542,7 @@ mod tests {
                 .await
                 .expect("seed snapshot");
             let shares = InMemShareStore::default();
-            *shares.keep.lock().unwrap() = Some(vec![2]);
+            *shares.keep.lock().unwrap() = Some(2);
             let transport = RecordingTransport::default();
 
             let mut protocol = DeRecProtocolBuilder::new(SECRET_ID)
@@ -566,20 +566,20 @@ mod tests {
                 .expect("verify_fingerprint");
 
             assert_eq!(
-                *shares.keep_list_calls.lock().unwrap(),
+                *shares.keep_version_calls.lock().unwrap(),
                 vec![(SECRET_ID, 5)]
             );
-            let keep_lists: Vec<Vec<u32>> = transport
+            let keep_versions: Vec<u32> = transport
                 .sent_envelopes()
                 .iter()
                 .map(|envelope| {
                     crate::primitives::sharing::request::extract(envelope, &[7u8; 32])
                         .expect("extract store-share request")
                         .request
-                        .keep_list
+                        .keep_version
                 })
                 .collect();
-            assert_eq!(keep_lists, vec![vec![2, 5], vec![2, 5]]);
+            assert_eq!(keep_versions, vec![2, 2]);
         });
     }
 }

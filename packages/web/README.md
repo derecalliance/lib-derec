@@ -109,7 +109,7 @@ material is delivered:
 
 | Mode | What the contact carries | Use when |
 |---|---|---|
-| `InlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry the keys (NFC, messaging). |
+| `InlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key + a 32-byte fingerprint commitment | Out-of-band channel can carry the keys (NFC, messaging). |
 | `HashedKeys` | Only a SHA-384 commitment to the keys | Channel is size-constrained (QR codes). Scanner fetches the actual keys via a plaintext `PrePair` round-trip and verifies them against the hash. |
 
 After the handshake completes, **both modes** rekey the channel id. The
@@ -224,7 +224,8 @@ async function main() {
     primitives.pairing.response.extract_pre_pair(prePairRespEnv.envelope);
 
   // Scanner validates the published keys against contact.contact_binding_hash.
-  // Throws on mismatch (returns the keys + echoed nonce on match).
+  // Throws on mismatch (returns the keys, echoed nonce and fingerprint
+  // commitment on match).
   const validated = primitives.pairing.response.process_pre_pair(
     contact.contact_message, prePairResp,
   );
@@ -232,6 +233,9 @@ async function main() {
   // Synthesize a "filled-in" contact and run the regular pairing flow. The
   // mode flip is required — `primitives.pairing.request.produce` enforces
   // `InlineKeys` and rejects a contact that still advertises `HashedKeys`.
+  // The fingerprint commitment travels with the keys:
+  // `primitives.pairing.response.process` checks the nonce the creator
+  // reveals in its PairResponse against it (`fingerprint_commitment_mismatch`).
   const { contact_binding_hash: _omitBindingHash, ...contactBase } =
     contact.contact_message;
   const filledInContact: ContactMessage = {
@@ -239,6 +243,7 @@ async function main() {
     contact_mode: ContactMode.InlineKeys,
     mlkem_encapsulation_key: validated.mlkem_encapsulation_key,
     ecies_public_key: validated.ecies_public_key,
+    fingerprint_commitment: validated.fingerprint_commitment,
   };
   // ... continue with primitives.pairing.request.produce / extract /
   // primitives.pairing.response.produce / process against `filledInContact`
@@ -625,13 +630,13 @@ A stored proof is either confirmed by its helper or part of a sharing round
 still open: when a round settles a channel as failed (a rejection or a
 timeout), that channel's proof is deleted. A confirmation also deletes the
 proofs of versions the helper dropped: a helper that stores a version
-deletes every other version that round's `keepList` leaves out, so when it
+deletes every other version except that round's `keepVersion`, so when it
 confirms, its proofs for those versions are deleted here too (the confirmed
-version stays). A helper that rejects the round keeps its older versions, and
-so do their proofs; with no keep list nothing is deleted. A replica Destination never sees the helpers' answers, and it keeps every
+version and `keepVersion` stay). A helper that rejects the round keeps its
+older versions, and so do their proofs. A replica Destination never sees the helpers' answers, and it keeps every
 proof it receives: it never deletes one on its own, and freeing that storage
 is the app's concern. Verifying on a Destination a version that a helper
-refused, or later dropped under the `keepList`, gets `ShareVerifyRejected`
+refused, or later dropped under a `keepVersion`, gets `ShareVerifyRejected`
 (`UNKNOWN_SHARE_VERSION`) from that helper, where the Source reports
 `NoProof`. The app may delete such rows from the Destination's share store;
 verifying a version whose rows are gone then gives `VerifySharesFailed` with

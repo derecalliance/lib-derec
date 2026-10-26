@@ -458,10 +458,9 @@ pub struct SecretStoreCallbacks {
 /// is none, and absent or `null` reads as none. Store them as given and return
 /// them unchanged.
 ///
-/// `keep_list` returns the JSON encoding of the application's answer:
-/// `null` for no list (the owner sends an empty `keepList` and helpers keep
-/// every version) or an array of version numbers. An empty buffer or return code `1` also
-/// means `null`.
+/// `keep_version` writes the application's answer to `out_version`: the one
+/// version, other than `version`, every helper keeps, or `0` to keep no
+/// other version. Any non-zero return code is a backend failure.
 ///
 /// `save` and `record_verification` share a return-code convention: `0` is
 /// success; `3`/`4`/`10` (the
@@ -526,12 +525,11 @@ pub struct ShareStoreCallbacks {
         versions_json_ptr: *const u8,
         versions_json_len: usize,
     ) -> i32,
-    pub keep_list: extern "C" fn(
+    pub keep_version: extern "C" fn(
         user_data: *mut c_void,
         secret_id: u64,
         version: u32,
-        out_ptr: *mut *mut u8,
-        out_len: *mut usize,
+        out_version: *mut u32,
     ) -> i32,
     pub record_verification:
         extern "C" fn(user_data: *mut c_void, secret_id: u64, channel_id: u64, version: u32) -> i32,
@@ -1339,17 +1337,24 @@ impl DeRecShareStore for DotnetShareStore {
         })
     }
 
-    fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
-        let result = self
-            .fetch_bytes(|p, l| (self.cb.keep_list)(self.cb.user_data, secret_id, version, p, l));
-        let res = match result {
-            Err(e) => Err(ShareStoreError::Backend(boxed_err(e))),
-            Ok(None) => Ok(None),
-            Ok(Some(bytes)) if bytes.is_empty() => Ok(None),
-            Ok(Some(bytes)) => serde_json::from_slice::<Option<Vec<u32>>>(&bytes)
-                .map_err(|e| ShareStoreError::Backend(boxed_err(format!("keep list JSON: {e}")))),
-        };
-        Box::pin(async move { res })
+    fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32> {
+        let cb = &self.cb;
+        let mut keep_version: u32 = 0;
+        let rc = (cb.keep_version)(
+            cb.user_data,
+            secret_id,
+            version,
+            &mut keep_version as *mut _,
+        );
+        Box::pin(async move {
+            if rc != 0 {
+                Err(ShareStoreError::Backend(boxed_err(format!(
+                    "keep_version failed (rc={rc})"
+                ))))
+            } else {
+                Ok(keep_version)
+            }
+        })
     }
 
     fn record_verification(
@@ -1999,12 +2004,11 @@ mod share_store_refusal_tests {
         0
     }
 
-    extern "C" fn unused_keep_list(
+    extern "C" fn unused_keep_version(
         _user_data: *mut c_void,
         _secret_id: u64,
         _version: u32,
-        _out_ptr: *mut *mut u8,
-        _out_len: *mut usize,
+        _out_version: *mut u32,
     ) -> i32 {
         1
     }
@@ -2042,7 +2046,7 @@ mod share_store_refusal_tests {
             save: stub_save,
             remove_channel: unused_remove_channel,
             remove_versions: unused_remove_versions,
-            keep_list: unused_keep_list,
+            keep_version: unused_keep_version,
             record_verification: stub_record_verification,
             free_buffer: noop_free_buffer,
         }

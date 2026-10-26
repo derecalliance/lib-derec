@@ -186,8 +186,34 @@ type ContactMessage struct {
 	// transport, so substituting one secure transport for another is not a
 	// loss of confidentiality or authenticity.
 	SupportedTransports []*TransportProtocol `protobuf:"bytes,9,rep,name=supportedTransports,proto3" json:"supportedTransports,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// The creator's commitment to the fingerprint nonce it reveals in
+	// `PairResponseMessage.fingerprintNonce`:
+	//
+	// ```text
+	// SHA-256("DeRec fingerprint commitment v1"
+	//
+	//	|| mlkemEncapsulationKey || eciesPublicKey || fingerprintNonce)
+	//
+	// ```
+	//
+	// Present, exactly 32 bytes, in `INLINE_KEYS` mode only. In
+	// `HASHED_KEYS` and `NO_KEYS` mode the commitment travels with the keys,
+	// in `PrePairResponseMessage.fingerprintCommitment`, and this field MUST
+	// be absent.
+	//
+	// # Why the creator commits
+	//
+	// The responder picks every random input of the handshake key after it
+	// has seen the creator's keys. Without a commitment, whoever answers the
+	// creator's keys can try handshake contributions offline until one
+	// yields the fingerprint it needs, and send only that one. The creator
+	// therefore fixes a random nonce before the responder contributes, and
+	// reveals it only after the responder's `PairRequestMessage` has fixed
+	// the handshake key. The channel key, and so the fingerprint, depends on
+	// both, so no contribution can be chosen to match a target fingerprint.
+	FingerprintCommitment []byte `protobuf:"bytes,10,opt,name=fingerprintCommitment,proto3,oneof" json:"fingerprintCommitment,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *ContactMessage) Reset() {
@@ -276,11 +302,18 @@ func (x *ContactMessage) GetSupportedTransports() []*TransportProtocol {
 	return nil
 }
 
+func (x *ContactMessage) GetFingerprintCommitment() []byte {
+	if x != nil {
+		return x.FingerprintCommitment
+	}
+	return nil
+}
+
 var File_contact_proto protoreflect.FileDescriptor
 
 const file_contact_proto_rawDesc = "" +
 	"\n" +
-	"\rcontact.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17transportprotocol.proto\"\xb0\x04\n" +
+	"\rcontact.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17transportprotocol.proto\"\x85\x05\n" +
 	"\x0eContactMessage\x12O\n" +
 	"\vcontactMode\x18\x01 \x01(\x0e2-.org.derecalliance.derec.protobuf.ContactModeR\vcontactMode\x129\n" +
 	"\x15mlkemEncapsulationKey\x18\x02 \x01(\fH\x00R\x15mlkemEncapsulationKey\x88\x01\x01\x12+\n" +
@@ -289,10 +322,13 @@ const file_contact_proto_rawDesc = "" +
 	"\tchannelId\x18\x05 \x01(\x04R\tchannelId\x12\x14\n" +
 	"\x05nonce\x18\x06 \x01(\x04R\x05nonce\x128\n" +
 	"\ttimestamp\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12e\n" +
-	"\x13supportedTransports\x18\t \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x13supportedTransportsB\x18\n" +
+	"\x13supportedTransports\x18\t \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x13supportedTransports\x129\n" +
+	"\x15fingerprintCommitment\x18\n" +
+	" \x01(\fH\x03R\x15fingerprintCommitment\x88\x01\x01B\x18\n" +
 	"\x16_mlkemEncapsulationKeyB\x11\n" +
 	"\x0f_eciesPublicKeyB\x15\n" +
-	"\x13_contactBindingHashJ\x04\b\a\x10\bR\x11transportProtocol*<\n" +
+	"\x13_contactBindingHashB\x18\n" +
+	"\x16_fingerprintCommitmentJ\x04\b\a\x10\bR\x11transportProtocol*<\n" +
 	"\vContactMode\x12\x0f\n" +
 	"\vINLINE_KEYS\x10\x00\x12\x0f\n" +
 	"\vHASHED_KEYS\x10\x01\x12\v\n" +
