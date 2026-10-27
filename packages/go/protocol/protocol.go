@@ -311,8 +311,8 @@ func (p *DeRecProtocol) VerifyFingerprint(channelID uint64, fingerprint string) 
 }
 
 // RemoveExpiredChannels removes Pending channels older than
-// olderThanSecs, along with their pairing keys, returning the ids
-// removed.
+// olderThanSecs, along with their channel keys and pairing keys,
+// returning the ids removed.
 //
 // Independent of Config.Timeouts.ExpiredChannels — this sweeps at the
 // age given even when that policy is disabled. The age comparison

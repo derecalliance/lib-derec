@@ -21,7 +21,7 @@ namespace DeRec.Library;
 /// Random nonce that binds the pairing request to this contact exchange.
 /// </param>
 /// <param name="MlkemEncapsulationKey">
-/// Serialized ML-KEM-768 encapsulation key. Present only when
+/// Serialized ML-KEM-1024 encapsulation key. Present only when
 /// <see cref="ContactMode"/> is <see cref="ContactMode.InlineKeys"/>.
 /// </param>
 /// <param name="EciesPublicKey">

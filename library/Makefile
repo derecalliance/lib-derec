@@ -17,7 +17,7 @@
 # developer sees; nothing outside this file should depend on them.
 
 .PHONY: all check-descriptor _preflight _lint _docs _test-rust _build _packages \
-        _test-packaging _test-native _test-js _smoke _verify-versions
+        _test-packaging _test-native _test-js _smoke _smoke-rust _verify-versions
 
 ROOT := ..
 VERSION := $(shell $(ROOT)/scripts/get-version.sh)
@@ -26,7 +26,7 @@ define section
 	@printf '\n\033[1m── %s\033[0m\n' $(1)
 endef
 
-all: _preflight _lint _docs _test-rust _build _packages _test-packaging _test-native _test-js _smoke check-descriptor _verify-versions
+all: _preflight _lint _docs _test-rust _smoke-rust _build _packages _test-packaging _test-native _test-js _smoke check-descriptor _verify-versions
 	$(call section,"Release build complete")
 	@printf 'Every package built and verified at version %s.\n' '$(VERSION)'
 	@printf 'Staged for publication:\n'
@@ -42,11 +42,12 @@ check-descriptor:
 # whichever tool happens to be missing.
 _preflight:
 	$(call section,"Preflight")
-	@for tool in cargo rustup cargo-shear wasm-pack cbindgen cargo-ndk dotnet go node npx rsync lipo xcodebuild; do \
+	@for tool in cargo rustup cargo-shear wasm-pack cbindgen cargo-ndk dotnet go node npx rsync lipo xcodebuild docker; do \
 	  command -v $$tool >/dev/null 2>&1 || { echo "missing required tool: $$tool" >&2; exit 1; }; \
 	done
 	@test -n "$$ANDROID_NDK_HOME" || { echo "ANDROID_NDK_HOME is not set" >&2; exit 1; }
 	@test -d "$$ANDROID_NDK_HOME" || { echo "ANDROID_NDK_HOME does not exist: $$ANDROID_NDK_HOME" >&2; exit 1; }
+	@docker info >/dev/null 2>&1 || { echo "docker daemon is not running (needed by the Postgres smoke suite)" >&2; exit 1; }
 	@test -n '$(VERSION)' || { echo "scripts/get-version.sh produced no version" >&2; exit 1; }
 	@echo "tools present; building version $(VERSION)"
 
@@ -99,6 +100,21 @@ _test-rust:
 # resolver keeps build-dependency features separate from normal ones, so
 # `--workspace` compiles that test file to zero tests. It needs its own run.
 	cargo test -p derec-proto --features descriptor
+
+# The Rust smoke suites are binaries: `cargo test` compiles them and runs
+# zero tests, so only `cargo run` exercises them. The SQL crates are outside
+# the workspace and need their own runs. Postgres runs in a throwaway
+# container (tmpfs data dir), torn down whether the suite passes or not.
+_smoke-rust:
+	$(call section,"Rust binding smoke")
+	cd $(ROOT) && cargo run -p derec-rust-binding-smoke-test
+	$(call section,"gRPC transport smoke")
+	cd $(ROOT) && cargo run -p derec-grpc-transport-smoke-test
+	$(call section,"SQLite smoke")
+	cd $(ROOT)/smoke-tests/sqlite && cargo run
+	$(call section,"Postgres smoke")
+	cd $(ROOT)/smoke-tests/postgres && docker compose up -d --wait && \
+	  { cargo run; rc=$$?; docker compose down; exit $$rc; }
 
 _build:
 	$(call section,"Native build")

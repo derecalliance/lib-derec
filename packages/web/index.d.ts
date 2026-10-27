@@ -1979,7 +1979,8 @@ export declare class DeRecProtocol {
   verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<void>;
   /**
    * Remove `Pending` channels older than `olderThanSecs`, along with their
-   * pairing keys. Resolves to the removed channel ids as decimal strings.
+   * channel keys and pairing keys. Resolves to the removed channel ids as
+   * decimal strings.
    *
    * Independent of the configured cleanup policy — this sweeps at the
    * threshold given even when that policy is disabled. The age comparison

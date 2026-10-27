@@ -291,7 +291,8 @@ public sealed class DeRecProtocol : IDisposable
 
     /// <summary>
     /// Remove <c>Pending</c> channels older than <paramref name="olderThanSecs"/>,
-    /// along with their pairing keys, and return the ids removed.
+    /// along with their channel keys and pairing keys, and return the ids
+    /// removed.
     /// </summary>
     /// <remarks>
     /// Independent of the cleanup policy the protocol was constructed with —

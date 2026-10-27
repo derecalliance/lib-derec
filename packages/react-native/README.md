@@ -178,6 +178,18 @@ proof sends nothing and returns `VerifySharesFailed` with
 ignored as `MessageIgnored` with `reason: 'StaleResponse'`, and the current
 challenge stays open; a response missing its `result` is still an error.
 
+Matching responses to requests is the app's concern. The library applies a
+response that changes stored state only against the flow that asked for it,
+and reports the rest as they arrive without matching them: `ShareConfirmed`
+and `ShareRejected` (a sharing round counts only the helpers it is waiting
+for), `SecretsDiscovered`, `ChannelInfoUpdated`, `ChannelInfoUpdateRejected`
+and `ErrorResponseReceived`. An app that acts on these should record what it
+started and match each event against it, and decide which versions committed
+from `SharingComplete` with `threshold_met` rather than by counting
+`ShareConfirmed`, since a helper can confirm twice or unasked. See [Matching
+responses to requests is the application's
+job](https://github.com/derecalliance/lib-derec/tree/main/library#matching-responses-to-requests-is-the-applications-job).
+
 **After recovery: restore or join.** `SecretRecovered` writes nothing, so
 decide before calling `restore`. When `secret.replicas?.members` names live
 members other than the lost device, do not restore: tell the user and offer

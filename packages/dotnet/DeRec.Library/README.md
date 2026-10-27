@@ -770,6 +770,19 @@ A late response to an earlier challenge is ignored as `MessageIgnoredEvent`
 with `IgnoreReason.StaleResponse`, and the current challenge stays open. A
 response missing its `result` is still an error.
 
+Matching responses to requests is the app's concern. The library applies a
+response that changes stored state only against the flow that asked for it,
+and reports the rest as they arrive without matching them:
+`ShareConfirmedEvent` and `ShareRejectedEvent` (a sharing round counts only
+the helpers it is waiting for), `SecretsDiscoveredEvent`,
+`ChannelInfoUpdatedEvent`, `ChannelInfoUpdateRejectedEvent` and
+`ErrorResponseReceivedEvent`. An app that acts on these should record what it
+started and match each event against it, and decide which versions committed
+from `SharingCompleteEvent` with `ThresholdMet` rather than by counting
+`ShareConfirmedEvent`, since a helper can confirm twice or unasked. See
+[Matching responses to requests is the application's
+job](https://github.com/derecalliance/lib-derec/tree/main/library#matching-responses-to-requests-is-the-applications-job).
+
 Every channel message carries one timestamp, its send time, in both the
 envelope and the inner message. A message whose two timestamps differ, or
 where either or both are absent, is ignored as `MessageIgnoredEvent` with

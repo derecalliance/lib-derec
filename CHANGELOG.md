@@ -7,7 +7,7 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
-### Unreleased
+### 0.0.10
 
 A body naming a group member is accepted only on that member's own channel,
 so a paired helper can no longer act as a replica. A failed fingerprint

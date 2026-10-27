@@ -96,7 +96,7 @@ public static partial class Pairing
         public sealed class ProcessPrePairResult
         {
             /// <summary>
-            /// Initiator's ML-KEM-768 encapsulation key. Validated against the
+            /// Initiator's ML-KEM-1024 encapsulation key. Validated against the
             /// contact's <c>contactBindingHash</c> by <see cref="ProcessPrePair"/>;
             /// unbound for <see cref="ProcessPrePairNoKeys"/>.
             /// </summary>

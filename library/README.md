@@ -1400,6 +1400,39 @@ The same helpers are surfaced as `envelope.apply_trace_id` /
 the dotnet package). The encrypted inner message is never touched, so
 re-stamping has no crypto cost.
 
+### Matching responses to requests is the application's job
+
+The library does not check that a response answers a request this device
+sent. Every response arrives on a channel authenticated with its channel key,
+from the peer paired on it, and the library acts on it only as far as its own
+state needs:
+
+- A response that would change stored state is applied only against the
+  state the matching flow left behind: `GetShareResponse` against a recovery
+  in progress for that secret and version, `VerifyShareResponse` against the
+  outstanding challenge on that channel, `UnpairResponse` against an unpair
+  this side started, and a replica discovery answer against a discovery in
+  progress. Anything else is dropped as `NoOp`.
+- A sharing round counts a `StoreShareResponse` only while that round is open
+  and still waiting on that helper.
+- A replica catch-up (`GetShareResponse` from a group member) is applied by
+  the same rule as a pushed copy: only when it is newer than what this device
+  holds.
+- Every other response is reported as it arrives, without being matched:
+  `ShareConfirmed` and `ShareRejected` (whether or not a round counts them),
+  `SecretsDiscovered`, `ChannelInfoUpdated`, `ChannelInfoUpdateRejected` and
+  `ErrorResponseReceived`.
+
+Keeping track of what it asked, and pairing each answer with its request, is
+the application's concern. An application that acts on these events should
+record what it started (the flow, channel, secret and version) and match each
+event against that record, using `traceId` (above) where it needs an exact
+pairing. In particular, decide which versions committed from
+`SharingComplete { threshold_met }`, which counts each helper of the round at
+most once, rather than by counting `ShareConfirmed` events: a helper can send
+the same confirmation twice, or one nobody asked for. This is the answer
+[`keep_version`](#share-store-the-owners-keep-version) needs.
+
 ### `replyTo` — ephemeral response routing
 
 `replyTo` is an optional `TransportProtocol` on **request bodies**

@@ -1293,6 +1293,13 @@ pub enum DeRecEvent {
     },
 
     /// A Helper confirmed it stored our share (Owner side).
+    ///
+    /// Reported as the response arrives, without matching it to a request
+    /// this device sent: pairing it with what was asked is the application's
+    /// concern.
+    /// A sharing round counts a confirmation only while it is open and still
+    /// waiting on that Helper, so decide which versions committed from
+    /// [`Self::SharingComplete`], not by counting these.
     ShareConfirmed { channel_id: ChannelId, version: u32 },
 
     /// A Helper rejected or failed to store our share (Owner side).
@@ -1300,6 +1307,10 @@ pub enum DeRecEvent {
     /// The protocol absorbs sharing failures and converts them to events
     /// so the application can display per-participant progress. `status` and
     /// `memo` come from the Helper's response (or are synthetic for timeouts).
+    ///
+    /// Reported as the response arrives, without matching it to a request
+    /// this device sent: pairing it with what was asked is the application's
+    /// concern.
     ShareRejected {
         channel_id: ChannelId,
         version: u32,
@@ -1412,6 +1423,10 @@ pub enum DeRecEvent {
     /// The application should persist this list and, once enough Helpers have
     /// responded, call [`super::DeRecProtocol::start`] with
     /// [`DeRecFlow::RecoverSecret`] for the desired `(secret_id, version)`.
+    ///
+    /// Reported as the response arrives, without matching it to a request
+    /// this device sent: pairing it with what was asked is the application's
+    /// concern.
     SecretsDiscovered {
         channel_id: ChannelId,
         /// All secrets and their stored versions the Helper holds for this channel.
@@ -1610,6 +1625,10 @@ pub enum DeRecEvent {
     /// Reported only once the message passes the envelope timestamp binding,
     /// like any other body. It is never answered, in either
     /// `auto_respond_on_failure` mode, so two peers cannot trade them.
+    ///
+    /// Reported as the response arrives, without matching it to a request
+    /// this device sent: pairing it with what was asked is the application's
+    /// concern.
     ErrorResponseReceived {
         channel_id: ChannelId,
         /// The `StatusEnum` value from the peer's response.
@@ -1702,11 +1721,19 @@ pub enum DeRecEvent {
     /// [`crate::protocol::types::HelperChannel`] by the time the event fires;
     /// applications that care about the post-update state read it from
     /// the channel store directly.
+    ///
+    /// On the initiator it is reported as the response arrives, without
+    /// matching it to a request this device sent: pairing it with what was
+    /// asked is the application's concern.
     ChannelInfoUpdated { channel_id: ChannelId },
 
     /// The peer answered an outbound `UpdateChannelInfo` request with a
     /// non-`Ok` status. The peer's stored state is unchanged. The initiator's
     /// own state is also unaffected.
+    ///
+    /// Reported as the response arrives, without matching it to a request
+    /// this device sent: pairing it with what was asked is the application's
+    /// concern.
     ChannelInfoUpdateRejected {
         channel_id: ChannelId,
         /// The `StatusEnum` value from the peer's response.
