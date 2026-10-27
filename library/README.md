@@ -576,26 +576,25 @@ channel's proof for the round's version is deleted, and a late
 `ShareConfirmed` for it is still emitted but stores nothing.
 
 A confirmation also deletes the proofs of versions the helper dropped. A
-helper that stores a version applies that round's `keepList` and deletes
-every other version it holds that the list leaves out (see
-[the owner's keep list](#share-store-the-owners-keep-list)). So when a helper
-confirms, this device deletes its proofs for that channel whose versions the
-`keepList` sent in that round leaves out; the confirmed version always stays.
-A helper that rejects the round or never answers keeps its older versions,
-and this device keeps their proofs. With no keep list (`None`) nothing is
-deleted.
+helper that stores a version applies that round's `keepVersion` and deletes
+every other version it holds (see
+[the owner's keep version](#share-store-the-owners-keep-version)). So when a
+helper confirms, this device deletes its proofs for that channel other than
+the confirmed version and that round's `keepVersion`. A helper that rejects
+the round or never answers keeps its older versions, and this device keeps
+their proofs.
 
 A replica Destination never sees the helpers' answers, and it keeps every
 proof it receives: it never deletes one on its own, and freeing that storage
 is the application's concern. Verifying on a Destination a version that a
-helper refused, or later dropped under the keep list, gets
+helper refused, or later dropped under a `keepVersion`, gets
 `ShareVerifyRejected` (`UNKNOWN_SHARE_VERSION`) from that helper, where the
 Source reports `NoProof`. The application may delete such rows from the
 Destination's share store; verifying a version whose rows are gone then gives
 `VerifySharesFailed` with `NoProof`.
 
-So verify only versions whose round completed (`SharingComplete`) and that
-the latest keep list still names. A channel with no proof at the requested
+So verify only versions whose round completed (`SharingComplete`): the
+latest one, and the one the latest round kept. A channel with no proof at the requested
 version gets `VerifySharesFailed` with `NoProof`, and no challenge is sent to
 it.
 
@@ -1206,20 +1205,35 @@ A `Pending` channel fails closed: nothing is published to it, it is not used
 as a recovery source, and inbound messages on it are ignored.
 
 The protocol derives a deterministic human-readable fingerprint from the
-shared key — same on both devices — that users compare visually before each
+channel key — same on both devices — that users compare visually before each
 side calls `verify_fingerprint`:
 
 ```rust
 let local = source.get_fingerprint(channel_id).await?;
 let peer  = destination.get_fingerprint(channel_id).await?; // out of band
 
-source.verify_fingerprint(channel_id, &peer).await?;        // → true
-destination.verify_fingerprint(channel_id, &local).await?;  // → true
+source.verify_fingerprint(channel_id, &peer).await?;
+destination.verify_fingerprint(channel_id, &local).await?;
 ```
 
-`verify_fingerprint` returns `true` on match and transitions the channel
-to `Paired`. A mismatch returns `false` and leaves the channel `Pending`
-so the app can retry.
+`verify_fingerprint` succeeds on a match and transitions the channel to
+`Paired`. A mismatch fails with `Error::FingerprintMismatch` (code
+`fingerprint_mismatch`): the two sides hold different keys, which is what a
+man-in-the-middle on the pairing produces. The comparison is authoritative,
+so the `Pending` pairing is revoked — its records, channel key and pairing
+material are deleted — and the two devices must pair again. A channel already
+`Paired` is left as it is; removing it is an unpair.
+
+A man-in-the-middle cannot make the two fingerprints agree by searching
+offline. The responder fixes every random input of the handshake key after
+it sees the creator's keys, so the creator draws a random fingerprint nonce,
+publishes a commitment to it with those keys (inline in an `InlineKeys`
+contact, in the `PrePairResponse` otherwise) and reveals it only in the pair
+response, after the handshake key is fixed. The channel key, and so the
+fingerprint, is derived from both. A pair response whose nonce does not open
+the commitment fails with `PairingError::FingerprintCommitmentMismatch`
+(code `fingerprint_commitment_mismatch`) and the pairing does not complete.
+This holds in every contact mode.
 
 Confirmation is also the moment the peer becomes reachable, so the current
 snapshot is published to it then — a `NoKeys` helper was not an eligible
@@ -1230,7 +1244,7 @@ group's vault. Once the channel is `Paired`, the source's publish is
 installed into this device's stores as it arrives, with no further prompt.
 Ask the user whether to adopt the vault before calling `verify_fingerprint`;
 to decline, never confirm, and the channel stays `Pending`, unused, until
-expired-channel cleanup removes it.
+expired-channel cleanup removes it together with its key.
 
 ### Secret distribution
 
@@ -1386,6 +1400,39 @@ The same helpers are surfaced as `envelope.apply_trace_id` /
 the dotnet package). The encrypted inner message is never touched, so
 re-stamping has no crypto cost.
 
+### Matching responses to requests is the application's job
+
+The library does not check that a response answers a request this device
+sent. Every response arrives on a channel authenticated with its channel key,
+from the peer paired on it, and the library acts on it only as far as its own
+state needs:
+
+- A response that would change stored state is applied only against the
+  state the matching flow left behind: `GetShareResponse` against a recovery
+  in progress for that secret and version, `VerifyShareResponse` against the
+  outstanding challenge on that channel, `UnpairResponse` against an unpair
+  this side started, and a replica discovery answer against a discovery in
+  progress. Anything else is dropped as `NoOp`.
+- A sharing round counts a `StoreShareResponse` only while that round is open
+  and still waiting on that helper.
+- A replica catch-up (`GetShareResponse` from a group member) is applied by
+  the same rule as a pushed copy: only when it is newer than what this device
+  holds.
+- Every other response is reported as it arrives, without being matched:
+  `ShareConfirmed` and `ShareRejected` (whether or not a round counts them),
+  `SecretsDiscovered`, `ChannelInfoUpdated`, `ChannelInfoUpdateRejected` and
+  `ErrorResponseReceived`.
+
+Keeping track of what it asked, and pairing each answer with its request, is
+the application's concern. An application that acts on these events should
+record what it started (the flow, channel, secret and version) and match each
+event against that record, using `traceId` (above) where it needs an exact
+pairing. In particular, decide which versions committed from
+`SharingComplete { threshold_met }`, which counts each helper of the round at
+most once, rather than by counting `ShareConfirmed` events: a helper can send
+the same confirmation twice, or one nobody asked for. This is the answer
+[`keep_version`](#share-store-the-owners-keep-version) needs.
+
 ### `replyTo` — ephemeral response routing
 
 `replyTo` is an optional `TransportProtocol` on **request bodies**
@@ -1472,56 +1519,57 @@ what `ShareVerified.threshold` reports. `UserSecrets::threshold: Option<u32>`
 is the stored threshold the next publish splits at; persist it with the
 snapshot, including `None`.
 
-### Share store: the owner's keep list
+### Share store: the owner's keep version
 
-Every `StoreShareRequestMessage` carries a `keepList`: the complete set of
-versions the helper keeps. A helper deletes every stored version not on it
-(through `remove_versions`) once the incoming share is stored. An empty
-`keepList` deletes nothing: the helper keeps every version it holds.
+Every `StoreShareRequestMessage` carries a `keepVersion`: the one version,
+other than the one being shared, that the helper keeps. Once the incoming
+share is stored, the helper deletes every other version it holds on that
+channel (through `remove_versions`). `keepVersion = 0` keeps no other version,
+so a helper holds at most two versions of a secret.
 
-The owner builds that list by asking its share store once per sharing round,
+The owner chooses it by asking its share store once per sharing round,
 before anything is sent, through
-[`DeRecShareStore::keep_list`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html#tymethod.keep_list)`(secret_id, version)`,
+[`DeRecShareStore::keep_version`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html#tymethod.keep_version)`(secret_id, version)`,
 where `version` is the version about to be distributed. Every round asks,
 whether the application started it with `ProtectSecret` or the library did
 (the pair-completion and fingerprint-confirmation publishes), and every
-helper in the round receives the same list.
+helper in the round receives the same answer. An answer equal to or greater
+than `version` fails the round with `SharingError::InvalidKeepVersion`
+(`invalid_keep_version`, code 67) before anything is sent; a helper that
+receives one refuses the request with `FORMAT_ERROR` and stores nothing.
 
-- `Some(list)`: helpers keep exactly `list` plus `version`. The library always
-  adds `version`, removes duplicates and sorts the list.
-- `None`: no `keepList` is sent (it goes out empty), so helpers keep every
-  version they hold. An application that wants to cap how many versions
-  helpers retain returns that cap from `keep_list` as a list.
+Return the last version that is valid: the newest one whose
+`SharingComplete` reported `threshold_met`. The version being sent has not
+committed yet when `keep_version` is asked, and its round may never reach
+threshold, so the last committed version must stay. Only the application
+knows which versions committed; nothing in the stores records it.
 
-Only the application knows which versions committed: it learns that from
-`SharingComplete { threshold_met }` and `ShareConfirmed`, and nothing in the
-stores records it. The rule for a list is to keep every version that could
-still become the latest:
+For example, an owner with seven helpers:
 
-- **List every version that committed**, such as those whose
-  `SharingComplete` reported `threshold_met`. The version being sent has not
-  committed yet when `keep_list` is asked, and its round may never reach
-  threshold, so the latest committed version must stay listed.
-- **List every version whose round is still open.** If the owner sends v5
-  while v4's round is open and leaves v4 out, helpers delete v4's share. If
-  v5 then fails and v4 commits, the version the owner considers latest is
-  gone from those helpers.
-- **Leave out only versions whose round failed, or that the user rolled
-  back.**
+1. Sends v1 with `keepVersion = 0`. Every helper stores it and answers.
+2. Sends v2 with `keepVersion = 1`. Only three helpers answer, so v2 never
+   reaches threshold. Those three hold v1 and v2.
+3. Sends v3 with `keepVersion = 1`, since v1 is still the last valid version.
+   Every helper answers. The three that hold v2 delete it; the other four
+   hold only v1, which they keep. Every helper ends with v1 and v3.
+
+A version whose round is still open when the next one starts is deleted from
+every helper that stores the next one, unless it is the version returned. A
+helper that receives a request older than the latest version it holds on the
+channel ignores that request's `keepVersion`, so a replayed or delayed
+request never deletes a newer share.
 
 A replica member publishing as the source cannot tell which versions it
-mirrored had committed on the previous source. Listing every mirrored version
-it holds is safe: at worst helpers keep a version that was rolled back.
+mirrored had committed on the previous source. Returning the newest version it
+mirrored is the closest it can get. Replica pushes never consult
+`keep_version`, and a replica Destination never deletes a version because of
+it.
 
-Helpers delete everything that is not listed, so a list that leaves out too
-much can make the secret unrecoverable. Replica pushes never consult `keep_list` and always
-send an empty `keepList`.
-
-The list governs this device's own rows too. When a helper confirms the
+The answer governs this device's own rows too. When a helper confirms the
 round, the library deletes, through `remove_versions`, this device's proofs
-for that channel whose versions the list leaves out, since the helper has
-deleted those shares. A helper that rejects the round keeps its older
-versions, and so does this device.
+for that channel other than the confirmed version and the returned one,
+since the helper has deleted those shares. A helper that rejects the round
+keeps its older versions, and so does this device.
 
 ### Transport: implement `SendOne`, not `send`
 
@@ -2119,16 +2167,19 @@ let response::PrePairExtractResult { response: pre_pair_resp } =
     response::extract_pre_pair(&pre_pair_resp_env).unwrap();
 
 // Scanner validates the published keys against `contact.contact_binding_hash`;
-// returns the keys + nonce on match, errors with
-// `PairingError::PrePairHashMismatch` on mismatch.
+// returns the keys, the nonce and the creator's fingerprint commitment on
+// match, errors with `PairingError::PrePairHashMismatch` on mismatch.
 let validated = response::process_pre_pair(&contact, &pre_pair_resp).unwrap();
 
 // Synthesize a "filled-in" contact and run the regular pairing flow. The
 // mode flip is required — `request::produce` enforces `InlineKeys` and
-// rejects a contact that still advertises `HashedKeys`.
+// rejects a contact that still advertises `HashedKeys`. The commitment
+// travels with the keys: `response::process` refuses a pair response whose
+// fingerprint nonce does not open it.
 let filled_in_contact = ContactMessage {
     mlkem_encapsulation_key: Some(validated.mlkem_encapsulation_key),
     ecies_public_key: Some(validated.ecies_public_key),
+    fingerprint_commitment: Some(validated.fingerprint_commitment),
     contact_mode: ContactMode::InlineKeys as i32,
     contact_binding_hash: None,
     ..contact.clone()

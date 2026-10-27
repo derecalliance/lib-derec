@@ -50,7 +50,7 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.ShareStoreSaveDelegate _shareSave;
     private readonly NP.ShareStoreRemoveChannelDelegate _shareRemoveChannel;
     private readonly NP.ShareStoreRemoveVersionsDelegate _shareRemoveVersions;
-    private readonly NP.ShareStoreKeepListDelegate _shareKeepList;
+    private readonly NP.ShareStoreKeepVersionDelegate _shareKeepVersion;
     private readonly NP.ShareStoreRecordVerificationDelegate _shareRecordVerification;
     private readonly NP.FreeBufferDelegate _shareFreeBuffer;
     private readonly NP.UserSecretStoreLoadLatestDelegate _userSecretLoadLatest;
@@ -128,7 +128,7 @@ public sealed class DeRecProtocol : IDisposable
         _shareSave = ShareSaveImpl;
         _shareRemoveChannel = ShareRemoveChannelImpl;
         _shareRemoveVersions = ShareRemoveVersionsImpl;
-        _shareKeepList = ShareKeepListImpl;
+        _shareKeepVersion = ShareKeepVersionImpl;
         _shareRecordVerification = ShareRecordVerificationImpl;
         _shareFreeBuffer = FreeBufferImpl;
 
@@ -176,7 +176,7 @@ public sealed class DeRecProtocol : IDisposable
             Save = Marshal.GetFunctionPointerForDelegate(_shareSave),
             RemoveChannel = Marshal.GetFunctionPointerForDelegate(_shareRemoveChannel),
             RemoveVersions = Marshal.GetFunctionPointerForDelegate(_shareRemoveVersions),
-            KeepList = Marshal.GetFunctionPointerForDelegate(_shareKeepList),
+            KeepVersion = Marshal.GetFunctionPointerForDelegate(_shareKeepVersion),
             RecordVerification = Marshal.GetFunctionPointerForDelegate(_shareRecordVerification),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_shareFreeBuffer),
         };
@@ -252,40 +252,47 @@ public sealed class DeRecProtocol : IDisposable
     /// <summary>
     /// Verify <paramref name="fingerprint"/> against the locally-derived
     /// one. On match, transitions the channel from <c>Pending</c> to
-    /// <c>Paired</c>. Returns <c>true</c> on match, <c>false</c> on
-    /// mismatch.
+    /// <c>Paired</c>.
+    /// <para>
+    /// A mismatch throws <see cref="DeRecException"/> with
+    /// <see cref="DeRecCode.FingerprintMismatch"/> — a possible
+    /// man-in-the-middle. A <c>Pending</c> pairing is revoked: its records,
+    /// channel key and pairing material are deleted, so pair again. A channel
+    /// already <c>Paired</c> is left as it is.
+    /// </para>
     /// <para>
     /// On a replica destination, confirming is also the decision to adopt
     /// the group's vault: the source's publish is then installed as it
     /// arrives, with no further prompt. Ask the user before calling this; to
-    /// decline, never confirm.
+    /// decline, never confirm: expired-channel cleanup removes the channel
+    /// and its key.
     /// </para>
     /// <para>
     /// On a promotion the current snapshot is published to the promoted peer,
     /// reusing the stored helper weights. If one is no longer valid under the
     /// current threshold, that publish fails with
     /// <see cref="DeRecCode.InvalidWeight"/> before anything is sent and this
-    /// throws. The promotion stands: calling this again returns <c>true</c>
-    /// and publishes nothing, so call <see cref="StartAsync"/> with
+    /// throws. The promotion stands: calling this again succeeds and
+    /// publishes nothing, so call <see cref="StartAsync"/> with
     /// <see cref="ProtectSecretParams"/> and valid weights to reach the
     /// promoted peer.
     /// </para>
     /// </summary>
-    public Task<bool> VerifyFingerprintAsync(ulong channelId, string fingerprint)
+    public Task VerifyFingerprintAsync(ulong channelId, string fingerprint)
     {
         EnsureNotDisposed();
         byte[] fpBytes = Encoding.UTF8.GetBytes(fingerprint + '\0');
         return Task.Run(() =>
         {
-            var err = NP.derec_protocol_verify_fingerprint(_handle, channelId, fpBytes, out uint matched);
+            var err = NP.derec_protocol_verify_fingerprint(_handle, channelId, fpBytes);
             ThrowOnError(err);
-            return matched != 0;
         });
     }
 
     /// <summary>
     /// Remove <c>Pending</c> channels older than <paramref name="olderThanSecs"/>,
-    /// along with their pairing keys, and return the ids removed.
+    /// along with their channel keys and pairing keys, and return the ids
+    /// removed.
     /// </summary>
     /// <remarks>
     /// Independent of the cleanup policy the protocol was constructed with —
@@ -1068,19 +1075,18 @@ public sealed class DeRecProtocol : IDisposable
         catch { return -1; }
     }
 
-    private int ShareKeepListImpl(
+    private int ShareKeepVersionImpl(
         IntPtr userData, ulong secretId, uint version,
-        out IntPtr outPtr, out UIntPtr outLen)
+        out uint outVersion)
     {
         try
         {
-            byte[] json = JsonSerializer.SerializeToUtf8Bytes(_shareStore.KeepList(secretId, version), JsonOpts);
-            return WriteOut(json, out outPtr, out outLen);
+            outVersion = _shareStore.KeepVersion(secretId, version);
+            return 0;
         }
         catch
         {
-            outPtr = IntPtr.Zero;
-            outLen = UIntPtr.Zero;
+            outVersion = 0;
             return -1;
         }
     }
@@ -1165,7 +1171,7 @@ public sealed class DeRecProtocol : IDisposable
         uint? local_version,
         ReplicaDiscoveryReportDto[]? reported,
         string[]? share_channels,
-        uint[]? keep_list,
+        uint? keep_version,
         uint? threshold);
 
     private sealed record ReplicaDiscoveryReportDto(string replica_id, uint version);
@@ -1197,7 +1203,7 @@ public sealed class DeRecProtocol : IDisposable
             .Select(r => new ReplicaDiscoveryReportDto(r.Key.ToString(), r.Value))
             .ToArray(),
         item.ShareChannels?.Select(c => c.ToString()).ToArray(),
-        item.KeepList,
+        item.KeepVersion,
         item.Threshold);
 
     private static StateItem FromDto(StateItemDto dto)
@@ -1239,7 +1245,7 @@ public sealed class DeRecProtocol : IDisposable
         return new StateItem(
             kind, channelId, secretId, dto.version, startedAt, dto.bytes, dto.shares,
             pending, confirmed, failed, pendingReplicas, syncedReplicas, behindReplicas,
-            dto.local_version, reported, shareChannels, dto.keep_list, dto.threshold);
+            dto.local_version, reported, shareChannels, dto.keep_version, dto.threshold);
     }
 
     private static StateKey ParseKeyBuffer(IntPtr ptr, UIntPtr len)

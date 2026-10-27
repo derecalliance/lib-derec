@@ -104,7 +104,7 @@ material is delivered:
 
 | Mode | What the contact carries | Use when |
 |---|---|---|
-| `ContactMode.InlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry the keys (NFC, messaging). |
+| `ContactMode.InlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key + a 32-byte fingerprint commitment | Out-of-band channel can carry the keys (NFC, messaging). |
 | `ContactMode.HashedKeys` | Only a SHA-384 commitment to the keys | Channel is size-constrained (QR codes). Scanner fetches the actual keys via a plaintext `PrePair` round-trip and verifies them against the hash. |
 | `ContactMode.NoKeys` | Neither keys nor a commitment — only channel id, nonce and transports | Contact must be hand-typed or dictated, over a fully trusted out-of-band channel. Keys arrive via `PrePair` with nothing to check them against, so both sides confirm a fingerprint before the channel is usable. |
 
@@ -204,19 +204,22 @@ var prePairResp = Pairing.Response.ExtractPrePair(prePairRespEnv.Envelope);
 
 // Scanner validates the published keys against contact.ContactBindingHash.
 // Throws DeRecException with Category=Pairing, Code=PrePairHashMismatch on
-// mismatch (returns the keys + echoed nonce on match).
+// mismatch (returns the keys, echoed nonce and fingerprint commitment on match).
 var validated = Pairing.Response.ProcessPrePair(
     contact.ContactMessage, prePairResp.ResponseProtoBytes);
 
 // Synthesize a "filled-in" contact and run the regular pairing flow. The
 // mode flip is required — `Pairing.Request.Produce` enforces `InlineKeys`
-// and rejects a contact that still advertises `HashedKeys`.
+// and rejects a contact that still advertises `HashedKeys`. The fingerprint
+// commitment travels with the keys: `Pairing.Response.Process` checks the
+// nonce the creator reveals in its PairResponse against it.
 var filledInContact = contact.ContactMessage with
 {
     ContactMode = ContactMode.InlineKeys,
     MlkemEncapsulationKey = validated.MlkemEncapsulationKey,
     EciesPublicKey = validated.EciesPublicKey,
     ContactBindingHash = null,
+    FingerprintCommitment = validated.FingerprintCommitment,
 };
 // ... continue with Pairing.Request.Produce / Extract /
 // Pairing.Response.Produce / Process against `filledInContact` exactly as
@@ -257,6 +260,11 @@ generates its keys only when the request arrives, and the scanner has no
 commitment to check them against. A man-in-the-middle on the plaintext leg
 leaves the two sides with different shared keys, so both sides compare a
 fingerprint of the shared key out of band before trusting the channel.
+The creator's `PrePair` response also carries a commitment to a nonce it
+reveals only in its `PairResponse`, and the channel key depends on that
+nonce, so whoever answers the scanner cannot search offline for keys that
+make the two fingerprints agree. `Pairing.Response.Process` refuses a nonce
+that does not open the commitment with `DeRecCode.FingerprintCommitmentMismatch`.
 
 ```csharp
 using DeRec.Library;
@@ -296,6 +304,7 @@ var filledInContact = contact.ContactMessage with
     MlkemEncapsulationKey = accepted.MlkemEncapsulationKey,
     EciesPublicKey = accepted.EciesPublicKey,
     ContactBindingHash = null,
+    FingerprintCommitment = accepted.FingerprintCommitment,
 };
 // ... continue with the regular pairing flow against `filledInContact`,
 // using `initiatorKeyMaterial` on the initiator side.
@@ -364,7 +373,7 @@ foreach (var (channelId, committedShare) in shares)
         version,
         secretId,
         committedShare,
-        keepList: Array.Empty<uint>(),
+        keepVersion: 0,
         description: string.Empty,
         sharedKey: sharedKeys[channelId]);
 
@@ -666,7 +675,7 @@ case nothing is sent:
 - `AcceptAsync` throws. The pairing has completed and its response was sent,
   but `PairingCompletedEvent` is not returned.
 - `VerifyFingerprintAsync` throws. The promotion stands: calling it again
-  returns `true` and publishes nothing.
+  succeeds and publishes nothing.
 
 Call `StartAsync` with `ProtectSecretParams` and valid `Weights` to publish
 to every helper.
@@ -742,13 +751,13 @@ A stored proof is either confirmed by its helper or part of a sharing round
 still open: when a round settles a channel as failed (a rejection or a
 timeout), that channel's proof is deleted. A confirmation also deletes the
 proofs of versions the helper dropped: a helper that stores a version
-deletes every other version that round's `keepList` leaves out, so when it
+deletes every other version except that round's `keepVersion`, so when it
 confirms, its proofs for those versions are deleted here too (the confirmed
-version stays). A helper that rejects the round keeps its older versions, and
-so do their proofs; with no keep list nothing is deleted. A replica Destination never sees the helpers' answers, and it keeps every
+version and `keepVersion` stay). A helper that rejects the round keeps its
+older versions, and so do their proofs. A replica Destination never sees the helpers' answers, and it keeps every
 proof it receives: it never deletes one on its own, and freeing that storage
 is the app's concern. Verifying on a Destination a version that a helper
-refused, or later dropped under the `keepList`, gets
+refused, or later dropped under a `keepVersion`, gets
 `ShareVerifyRejectedEvent` (`UNKNOWN_SHARE_VERSION`) from that helper, where
 the Source reports `NoProof`. The app may delete such rows from the
 Destination's share store; verifying a version whose rows are gone then
@@ -760,6 +769,19 @@ no proof sends nothing and returns `VerifySharesFailedEvent` with
 A late response to an earlier challenge is ignored as `MessageIgnoredEvent`
 with `IgnoreReason.StaleResponse`, and the current challenge stays open. A
 response missing its `result` is still an error.
+
+Matching responses to requests is the app's concern. The library applies a
+response that changes stored state only against the flow that asked for it,
+and reports the rest as they arrive without matching them:
+`ShareConfirmedEvent` and `ShareRejectedEvent` (a sharing round counts only
+the helpers it is waiting for), `SecretsDiscoveredEvent`,
+`ChannelInfoUpdatedEvent`, `ChannelInfoUpdateRejectedEvent` and
+`ErrorResponseReceivedEvent`. An app that acts on these should record what it
+started and match each event against it, and decide which versions committed
+from `SharingCompleteEvent` with `ThresholdMet` rather than by counting
+`ShareConfirmedEvent`, since a helper can confirm twice or unasked. See
+[Matching responses to requests is the application's
+job](https://github.com/derecalliance/lib-derec/tree/main/library#matching-responses-to-requests-is-the-applications-job).
 
 Every channel message carries one timestamp, its send time, in both the
 envelope and the inner message. A message whose two timestamps differ, or
@@ -802,9 +824,13 @@ App-side responsibilities (mirrors the other SDKs):
   same-connection answer needs matching: pick the reply that echoes the
   request's trace id with `Envelope.ReadTraceId`. See
   [Transports](https://derec-alliance.gitbook.io/docs/protocol-specification/transports).
-- On an owner, `IShareStore.KeepList` chooses which versions helpers keep;
-  returning `null` sends no keepList, so helpers keep every version;
-  see [the owner's keep list](https://github.com/derecalliance/lib-derec/tree/main/library#share-store-the-owners-keep-list).
+- On an owner, `IShareStore.KeepVersion` chooses the one older version
+  helpers keep besides the version being shared: return the newest version
+  whose `SharingCompleteEvent` reported `ThresholdMet`, or `0` to keep no
+  other version. An answer equal to or greater than the version being shared
+  fails the round with `DeRecCode.InvalidKeepVersion` (67) before anything is
+  sent; see
+  [`DeRecShareStore::keep_version`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html#tymethod.keep_version).
 - After pairing, link old↔new channel IDs on the helper side
   (`channelStore.LinkChannel(secretId, oldId, newId)`) so recovery can fan
   out on the new pair while still surfacing shares stored under the old one.
@@ -1010,9 +1036,13 @@ fingerprint derived from the shared key:
 string localFp = await source.GetFingerprintAsync(channelId);
 string peerFp  = await destination.GetFingerprintAsync(channelId); // out of band
 
-await source.VerifyFingerprintAsync(channelId, peerFp);            // → true
-await destination.VerifyFingerprintAsync(channelId, localFp);      // → true
+await source.VerifyFingerprintAsync(channelId, peerFp);
+await destination.VerifyFingerprintAsync(channelId, localFp);
 ```
+
+A mismatch throws `DeRecException` with `DeRecCode.FingerprintMismatch` — a
+possible man-in-the-middle. The `Pending` pairing is revoked (its records,
+channel key and pairing material are deleted), so the devices must pair again.
 
 The Source's confirmation publishes the current secret to every paired peer
 straight away, and every later `ProtectSecret` round includes the
@@ -1153,7 +1183,7 @@ channel: `ProcessAsync` changes no store, sends nothing back, and returns a
 with `ChannelId` and `TraceId`. This matters most for a replica destination.
 The source's own confirmation publishes the vault immediately, so that copy
 usually arrives before the destination's user has confirmed. Confirming does
-not replay it: once the destination's `VerifyFingerprintAsync` returns `true`,
+not replay it: once the destination's `VerifyFingerprintAsync` succeeds,
 call `StartAsync(FlowKind.ReplicaDiscovery, new ReplicaDiscoveryParams())` to
 pull the copy from the source.
 

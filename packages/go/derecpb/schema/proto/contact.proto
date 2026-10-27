@@ -92,12 +92,14 @@ package org.derecalliance.derec.protobuf;
 //  channel MUST NOT be used until the pair is confirmed out of band. An
 //  implementation MUST hold it unusable — no secrets sent, inbound
 //  messages ignored — until both sides compare the human-readable
-//  fingerprint derived from the established shared key and it matches. A
-//  man-in-the-middle on the `PrePair` leg yields two different shared
+//  fingerprint derived from the established channel key and it matches. A
+//  man-in-the-middle on the `PrePair` leg yields two different channel
 //  keys and therefore two different fingerprints, so this comparison is
 //  what `HASHED_KEYS` gets from its `contactBindingHash` and `NO_KEYS`
 //  can get no other way. This is a requirement of the mode, not a
-//  deployment choice.
+//  deployment choice. The creator's `fingerprintCommitment` is what keeps
+//  the man-in-the-middle from searching offline for a key pair whose two
+//  fingerprints agree.
 //
 // The mode selector and the per-mode field-presence invariants are enforced
 // by the implementation; mixing fields across modes is a protocol error.
@@ -228,4 +230,29 @@ message ContactMessage {
   // transport, so substituting one secure transport for another is not a
   // loss of confidentiality or authenticity.
   repeated TransportProtocol supportedTransports = 9;
+
+  // The creator's commitment to the fingerprint nonce it reveals in
+  // `PairResponseMessage.fingerprintNonce`:
+  //
+  // ```text
+  // SHA-256("DeRec fingerprint commitment v1"
+  //         || mlkemEncapsulationKey || eciesPublicKey || fingerprintNonce)
+  // ```
+  //
+  // Present, exactly 32 bytes, in `INLINE_KEYS` mode only. In
+  // `HASHED_KEYS` and `NO_KEYS` mode the commitment travels with the keys,
+  // in `PrePairResponseMessage.fingerprintCommitment`, and this field MUST
+  // be absent.
+  //
+  // # Why the creator commits
+  //
+  // The responder picks every random input of the handshake key after it
+  // has seen the creator's keys. Without a commitment, whoever answers the
+  // creator's keys can try handshake contributions offline until one
+  // yields the fingerprint it needs, and send only that one. The creator
+  // therefore fixes a random nonce before the responder contributes, and
+  // reveals it only after the responder's `PairRequestMessage` has fixed
+  // the handshake key. The channel key, and so the fingerprint, depends on
+  // both, so no contribution can be chosen to match a target fingerprint.
+  optional bytes fingerprintCommitment = 10;
 }

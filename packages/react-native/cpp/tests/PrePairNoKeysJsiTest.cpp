@@ -106,6 +106,8 @@ static void noKeysPrePairRoundTrips() {
          "the scanner receives the ECIES public key");
   expect(property(*rt, processed, "nonce").asBigInt(*rt).asUint64(*rt) == kNonce,
          "the contact's nonce is echoed");
+  expect(bytesOf(*rt, property(*rt, processed, "fingerprint_commitment")).size() == 32,
+         "the scanner receives the creator's 32-byte fingerprint commitment");
 }
 
 /// The host `pairing_fingerprint` returns exactly what the C ABI derives, and

@@ -233,6 +233,20 @@ type memShareStore struct {
 	// failSaves fails every save with a plain error, the way an unavailable
 	// storage backend would.
 	failSaves bool
+
+	// keep, when set, is every KeepVersion answer; unset, the store keeps
+	// the previous version (version - 1), the way an application whose
+	// every round commits would.
+	keep                *uint32
+	keepVersionCalls    []uint32
+	removeVersionsCalls []removeVersionsCall
+}
+
+// removeVersionsCall is one RemoveVersions call as the store received it.
+type removeVersionsCall struct {
+	secretID  uint64
+	channelID uint64
+	versions  []uint32
 }
 
 func newMemShareStore() *memShareStore {
@@ -333,14 +347,43 @@ func (s *memShareStore) RemoveChannel(secretID, channelID uint64) error {
 func (s *memShareStore) RemoveVersions(secretID, channelID uint64, versions []uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.removeVersionsCalls = append(s.removeVersionsCalls, removeVersionsCall{secretID, channelID, append([]uint32(nil), versions...)})
 	for _, v := range versions {
 		delete(s.data, shareStoreKey{channelID, secretID, v})
 	}
 	return nil
 }
 
-func (s *memShareStore) KeepList(secretID uint64, version uint32) ([]uint32, bool, error) {
-	return nil, false, nil
+func (s *memShareStore) KeepVersion(secretID uint64, version uint32) (uint32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keepVersionCalls = append(s.keepVersionCalls, version)
+	if s.keep != nil {
+		return *s.keep, nil
+	}
+	return version - 1, nil
+}
+
+// setKeep sets the answer KeepVersion gives; nil restores the
+// previous-version default.
+func (s *memShareStore) setKeep(keep *uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keep = keep
+}
+
+// storedVersions returns, sorted, every version stored for secretID.
+func (s *memShareStore) storedVersions(secretID uint64) []uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var versions []uint32
+	for k := range s.data {
+		if k.secretID == secretID {
+			versions = append(versions, k.version)
+		}
+	}
+	slices.Sort(versions)
+	return versions
 }
 
 func (s *memShareStore) RecordVerification(secretID, channelID uint64, version uint32) error {
@@ -807,12 +850,8 @@ func runEveryContactModePairs() {
 			must(err, "helper GetFingerprint")
 			assertTrue(ownerFP == helperFP, "both sides must derive one fingerprint")
 
-			matched, err := owner.proto.VerifyFingerprint(channelID, helperFP)
-			must(err, "owner VerifyFingerprint")
-			assertTrue(matched, "owner VerifyFingerprint must match")
-			matched, err = helper.proto.VerifyFingerprint(channelID, ownerFP)
-			must(err, "helper VerifyFingerprint")
-			assertTrue(matched, "helper VerifyFingerprint must match")
+			must(owner.proto.VerifyFingerprint(channelID, helperFP), "owner VerifyFingerprint")
+			must(helper.proto.VerifyFingerprint(channelID, ownerFP), "helper VerifyFingerprint")
 
 			for _, side := range []struct {
 				label string
@@ -1123,7 +1162,9 @@ func runProtocolWeightedProtectSecret() {
 	fmt.Println("  a pairing publish reuses the stored weights; the new helper gets 1  ✓")
 
 	// Re-weight: B now holds 2 and A 1. Verifying v1 still reports the counts
-	// of the round that published it.
+	// of the round that published it. The pairing publish was v2, so the
+	// round keeps v1 to leave it on the helpers.
+	owner.shareStore.setKeep(&v1)
 	_, err = owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
 		Secrets: []protocol.UserSecret{{ID: []byte{7}, Name: "weighted secret", Data: []byte("re-weighted")}},
 		Weights: map[uint64]uint32{channelB: 2},
@@ -1323,6 +1364,157 @@ func runProtocolMaxSubshares() {
 	assertTrue(len(owner.drain()) == 0, "a round over the cap must send nothing")
 	fmt.Println("  Start(ProtectSecret) over the cap fails with CodeTooManySubshares and sends nothing  ✓")
 	fmt.Println("Protocol max-subshares cap test passed.")
+}
+
+// startKeepRound starts one ProtectSecret round on owner, its payload tagged
+// with round so every round distributes a new version.
+func startKeepRound(owner *peer, secretTag byte, round int) error {
+	_, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{secretTag}, Name: "kept", Data: []byte(fmt.Sprintf("round-%d", round))}},
+	})
+	return err
+}
+
+// deliverKeepRound delivers every envelope owner sent to the helper it is
+// addressed to, skipping any addressed to skip, and hands each helper's
+// answer back to owner.
+func deliverKeepRound(owner *peer, helpers []*peer, skip *peer) {
+	for _, entry := range owner.drain() {
+		var target *peer
+		for _, h := range helpers {
+			if h.uri == entry.uri {
+				target = h
+			}
+		}
+		if target == nil {
+			fail("no peer for destination uri %s", entry.uri)
+		}
+		if target == skip {
+			continue
+		}
+		deliver(target, entry.message)
+		for _, answer := range target.drain() {
+			deliver(owner, answer.message)
+		}
+	}
+}
+
+// runHelperKeepVersionPrunesShareStore: a helper applies each request's
+// keepVersion through ShareStore.RemoveVersions. The owner's KeepVersion
+// keeps the previous version for v1 to v3 and answers 2 for v4, so the v4
+// publish removes v3 and each helper ends up holding exactly v2 and v4.
+func runHelperKeepVersionPrunesShareStore() {
+	fmt.Println("=== Helper keepVersion prunes the share store ===")
+
+	const threshold = 2
+	owner := newPeer("owner", "https://owner-keep-prune.example.com", threshold)
+	helperA := newPeer("helper-a", "https://helper-a-keep-prune.example.com", threshold)
+	helperB := newPeer("helper-b", "https://helper-b-keep-prune.example.com", threshold)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+	pairPeers(owner, helperA, 21)
+	pairPeers(owner, helperB, 22)
+	owner.drain()
+
+	helpers := []*peer{helperA, helperB}
+	for round := 1; round <= 4; round++ {
+		if round == 4 {
+			owner.shareStore.setKeep(proto.Uint32(2))
+		}
+		must(startKeepRound(owner, 0x03, round), fmt.Sprintf("round %d Start(ProtectSecret)", round))
+		deliverKeepRound(owner, helpers, nil)
+	}
+
+	for _, h := range helpers {
+		versions := h.shareStore.storedVersions(protocolSecretID)
+		assertTrue(slices.Equal(versions, []uint32{2, 4}), "[%s] must keep exactly versions [2 4], got %v", h.label, versions)
+		h.shareStore.mu.Lock()
+		removedV3 := slices.ContainsFunc(h.shareStore.removeVersionsCalls, func(c removeVersionsCall) bool {
+			return c.secretID == protocolSecretID && slices.Equal(c.versions, []uint32{3})
+		})
+		h.shareStore.mu.Unlock()
+		assertTrue(removedV3, "[%s] RemoveVersions must reach the app store with [3]", h.label)
+	}
+	fmt.Println("  v4 with keepVersion 2 removed v3 via RemoveVersions on both helpers  ✓")
+	fmt.Println("Helper keepVersion test passed.")
+}
+
+// runOwnerKeepVersionAcrossMissedRound: the owner asks KeepVersion once per
+// round and sends its answer to every helper. v1 reaches both helpers, v2
+// reaches only helper-a, and v3 keeps v1: helper-a drops v2 and helper-b,
+// which never stored v2, keeps v1, so both hold exactly v1 and v3.
+func runOwnerKeepVersionAcrossMissedRound() {
+	fmt.Println("=== Owner keepVersion across a missed round ===")
+
+	const threshold = 2
+	owner := newPeer("owner", "https://owner-keep-missed.example.com", threshold)
+	helperA := newPeer("helper-a", "https://helper-a-keep-missed.example.com", threshold)
+	helperB := newPeer("helper-b", "https://helper-b-keep-missed.example.com", threshold)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+	pairPeers(owner, helperA, 31)
+	pairPeers(owner, helperB, 32)
+	owner.drain()
+
+	helpers := []*peer{helperA, helperB}
+	for round := 1; round <= 3; round++ {
+		keep := uint32(1)
+		if round == 1 {
+			keep = 0
+		}
+		owner.shareStore.setKeep(&keep)
+		must(startKeepRound(owner, 0x04, round), fmt.Sprintf("round %d Start(ProtectSecret)", round))
+		var skip *peer
+		if round == 2 {
+			skip = helperB
+		}
+		deliverKeepRound(owner, helpers, skip)
+	}
+
+	owner.shareStore.mu.Lock()
+	calls := append([]uint32(nil), owner.shareStore.keepVersionCalls...)
+	owner.shareStore.mu.Unlock()
+	assertTrue(slices.Equal(calls, []uint32{1, 2, 3}), "KeepVersion must be asked once per round, got versions %v", calls)
+	fmt.Println("  KeepVersion asked once per round with the version being sent  ✓")
+
+	for _, h := range helpers {
+		versions := h.shareStore.storedVersions(protocolSecretID)
+		assertTrue(slices.Equal(versions, []uint32{1, 3}), "[%s] must keep exactly versions [1 3], got %v", h.label, versions)
+	}
+	fmt.Println("  both helpers hold exactly [1 3] after the v3 round  ✓")
+	fmt.Println("Owner keepVersion test passed.")
+}
+
+// runInvalidKeepVersionFailsRound: a keepVersion equal to or greater than
+// the version being shared fails Start(ProtectSecret) with
+// CodeInvalidKeepVersion before anything is sent.
+func runInvalidKeepVersionFailsRound() {
+	fmt.Println("=== Invalid keepVersion fails the round ===")
+
+	const threshold = 2
+	owner := newPeer("owner", "https://owner-keep-invalid.example.com", threshold)
+	helperA := newPeer("helper-a", "https://helper-a-keep-invalid.example.com", threshold)
+	helperB := newPeer("helper-b", "https://helper-b-keep-invalid.example.com", threshold)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+	pairPeers(owner, helperA, 41)
+	pairPeers(owner, helperB, 42)
+	owner.drain()
+
+	must(startKeepRound(owner, 0x05, 1), "round 1 Start(ProtectSecret)")
+	deliverKeepRound(owner, []*peer{helperA, helperB}, nil)
+
+	owner.shareStore.setKeep(proto.Uint32(2))
+	var startErr *derec.Error
+	err := startKeepRound(owner, 0x05, 2)
+	assertTrue(errors.As(err, &startErr) && startErr.Code == derec.CodeInvalidKeepVersion,
+		"keepVersion 2 for v2 must fail with CodeInvalidKeepVersion (67), got %v", err)
+	assertTrue(len(owner.drain()) == 0, "a round with an invalid keepVersion must send nothing")
+	fmt.Println("  Start(ProtectSecret) with keepVersion 2 for v2 fails with CodeInvalidKeepVersion and sends nothing  ✓")
+	fmt.Println("Invalid keepVersion test passed.")
 }
 
 // runShareStoreRefusal has a helper's share store refuse with
@@ -1538,6 +1730,178 @@ func runExpiredChannelCleanup() {
 	fmt.Println("Protocol expired-channel cleanup test passed.")
 }
 
+// testSharedKey is the 32-byte channel key the seeded-store flows plant
+// alongside a channel record.
+func testSharedKey() []byte {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte((i*11 + 5) & 0xff)
+	}
+	return key
+}
+
+// hasSharedKey reports whether p's SecretStore still holds a SharedKey for
+// channelID.
+func hasSharedKey(p *peer, channelID uint64) bool {
+	_, ok, err := p.secretStore.Load(protocolSecretID, channelID, protocol.SecretKindSharedKey)
+	must(err, fmt.Sprintf("[%s] secretStore.Load(%d)", p.label, channelID))
+	return ok
+}
+
+// hasChannelRecord reports whether p's ChannelStore still holds the record
+// addressed by (channelID, replicaID).
+func hasChannelRecord(p *peer, channelID, replicaID uint64) bool {
+	_, ok, err := p.channelStore.Load(protocolSecretID, channelID, replicaID)
+	must(err, fmt.Sprintf("[%s] channelStore.Load(%d, %d)", p.label, channelID, replicaID))
+	return ok
+}
+
+// assertFingerprintMismatch checks that err is the Pairing-category
+// FingerprintMismatch a rejected VerifyFingerprint returns.
+func assertFingerprintMismatch(err error, label string) {
+	var fpErr *derec.Error
+	assertTrue(errors.As(err, &fpErr) && fpErr.Code == derec.CodeFingerprintMismatch && fpErr.Category == derec.CategoryPairing,
+		"%s must fail with Pairing/CodeFingerprintMismatch (17), got %v", label, err)
+}
+
+// runFingerprintMismatch: VerifyFingerprint(wrong) on a still-Pending channel
+// is the man-in-the-middle case. It must fail with FingerprintMismatch and
+// revoke the pairing, so neither the member record nor the channel key
+// survives.
+func runFingerprintMismatch() {
+	fmt.Println("=== Protocol fingerprint mismatch test ===")
+
+	const channelID = uint64(5151)
+	const replicaID = uint64(0xcafe)
+
+	node := newPeer("owner", "https://owner-fp-mismatch.example.com", 2)
+	defer node.proto.Close()
+
+	// The post-replica-pair state: a Pending member and its shared key,
+	// awaiting the fingerprint confirmation that would make it Paired.
+	must(node.channelStore.Save(protocolSecretID, protocol.ChannelRecord{Replica: &protocol.ReplicaMember{
+		ChannelID:         channelID,
+		ReplicaID:         replicaID,
+		Transports:        []protocol.TransportEndpoint{{URI: "https://peer.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		CommunicationInfo: map[string]string{},
+		Role:              protocol.ReplicaRoleDestination,
+		Status:            protocol.ChannelStatusPending,
+		CreatedAt:         1700000000,
+	}}), "seed replica member")
+	must(node.secretStore.Save(protocolSecretID, channelID, protocol.SecretValue{Kind: protocol.SecretKindSharedKey, Bytes: testSharedKey()}),
+		"seed shared key")
+
+	assertFingerprintMismatch(node.proto.VerifyFingerprint(channelID, "0000-0000-0000-0000"), "VerifyFingerprint(wrong)")
+	fmt.Println("  verifyFingerprint(wrong) fails with FingerprintMismatch  ✓")
+
+	assertTrue(!hasChannelRecord(node, channelID, replicaID), "VerifyFingerprint(wrong) must remove the member record")
+	assertTrue(!hasSharedKey(node, channelID), "VerifyFingerprint(wrong) must remove the channel key")
+	fmt.Println("  member record and channel key removed  ✓")
+
+	fmt.Println("Protocol fingerprint mismatch test passed.")
+}
+
+// runNoKeysFingerprintMismatch drives the same rejection over a real NoKeys
+// pairing: the owner refuses the fingerprint before either side confirmed it.
+// Only the rejecting side revokes; the helper's Pending channel is its own
+// and stays until it confirms or rejects on its side.
+func runNoKeysFingerprintMismatch() {
+	fmt.Println("=== Protocol NoKeys fingerprint mismatch test ===")
+
+	owner := newPeer("owner", "https://owner-nokeys-mismatch.example.com", 2)
+	helper := newPeer("helper", "https://helper-nokeys-mismatch.example.com", 2)
+	defer owner.proto.Close()
+	defer helper.proto.Close()
+
+	channelID := pairPeersWithMode(owner, helper, 920, protocol.ContactModeNoKeys)
+
+	assertFingerprintMismatch(owner.proto.VerifyFingerprint(channelID, "0000-0000-0000-0000"), "owner VerifyFingerprint(wrong)")
+	fmt.Println("  owner verifyFingerprint(wrong) fails with FingerprintMismatch  ✓")
+
+	assertTrue(!hasChannelRecord(owner, channelID, 0), "owner must drop the rejected helper channel")
+	_, err := owner.proto.GetFingerprint(channelID)
+	assertTrue(err != nil, "owner GetFingerprint must fail once the channel key is gone")
+	fmt.Println("  owner channel record and key removed  ✓")
+
+	rec, ok, err := helper.channelStore.Load(protocolSecretID, channelID, 0)
+	must(err, "helper channelStore.Load")
+	assertTrue(ok && rec.Helper.Status == protocol.ChannelStatusPending,
+		"helper channel must remain Pending, got ok=%v record=%+v", ok, rec.Helper)
+	_, err = helper.proto.GetFingerprint(channelID)
+	must(err, "helper GetFingerprint after owner rejection")
+	fmt.Println("  helper channel untouched: still Pending, fingerprint derivable  ✓")
+
+	fmt.Println("Protocol NoKeys fingerprint mismatch test passed.")
+}
+
+// runExpiredPendingPairingLosesItsKey checks that the expired-channel sweep
+// takes a Pending channel's SharedKey with its record, for helper channels and
+// replica members alike, while a Paired channel is never swept.
+func runExpiredPendingPairingLosesItsKey() {
+	fmt.Println("=== Protocol expired Pending channel key cleanup test ===")
+
+	node, err := newPeerWithConfig("owner", "https://owner-expired-key.example.com", protocol.Config{
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold: proto.Uint32(2),
+			Timeouts: &protocol.Timeouts{
+				ExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{
+					Enabled:       false,
+					TimeoutInSecs: 900,
+				},
+			},
+		},
+	})
+	must(err, "protocol.New(expired-key)")
+	defer node.proto.Close()
+
+	const (
+		pendingHelper  = uint64(6161)
+		pendingReplica = uint64(6162)
+		pairedHelper   = uint64(6163)
+		replicaID      = uint64(0xbeef)
+	)
+	transports := []protocol.TransportEndpoint{{URI: "https://peer.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}}
+
+	for _, rec := range []protocol.ChannelRecord{
+		{Helper: &protocol.HelperChannel{
+			ChannelID: pendingHelper, Transports: transports, CommunicationInfo: map[string]string{},
+			PeerRole: protocol.SenderKindHelper, Status: protocol.ChannelStatusPending, CreatedAt: 1700000000, Weight: 1,
+		}},
+		{Replica: &protocol.ReplicaMember{
+			ChannelID: pendingReplica, ReplicaID: replicaID, Transports: transports, CommunicationInfo: map[string]string{},
+			Role: protocol.ReplicaRoleDestination, Status: protocol.ChannelStatusPending, CreatedAt: 1700000000,
+		}},
+		{Helper: &protocol.HelperChannel{
+			ChannelID: pairedHelper, Transports: transports, CommunicationInfo: map[string]string{},
+			PeerRole: protocol.SenderKindHelper, Status: protocol.ChannelStatusPaired, CreatedAt: 1700000000, Weight: 1,
+		}},
+	} {
+		must(node.channelStore.Save(protocolSecretID, rec), "seed channel record")
+	}
+	for _, cid := range []uint64{pendingHelper, pendingReplica, pairedHelper} {
+		must(node.secretStore.Save(protocolSecretID, cid, protocol.SecretValue{Kind: protocol.SecretKindSharedKey, Bytes: testSharedKey()}),
+			fmt.Sprintf("seed shared key %d", cid))
+	}
+
+	removed, err := node.proto.RemoveExpiredChannels(60)
+	must(err, "RemoveExpiredChannels(60)")
+	assertTrue(slices.Contains(removed, pendingHelper) && slices.Contains(removed, pendingReplica) && !slices.Contains(removed, pairedHelper),
+		"RemoveExpiredChannels must report %d and %d but not %d, got %v", pendingHelper, pendingReplica, pairedHelper, removed)
+	fmt.Printf("  sweep removed %v, Paired %d kept  ✓\n", removed, pairedHelper)
+
+	assertTrue(!hasChannelRecord(node, pendingHelper, 0) && !hasSharedKey(node, pendingHelper),
+		"expired Pending helper channel %d must lose its record and SharedKey", pendingHelper)
+	assertTrue(!hasChannelRecord(node, pendingReplica, replicaID) && !hasSharedKey(node, pendingReplica),
+		"expired Pending replica channel %d must lose its record and SharedKey", pendingReplica)
+	fmt.Println("  expired Pending channels lost their record and SharedKey  ✓")
+
+	assertTrue(hasChannelRecord(node, pairedHelper, 0) && hasSharedKey(node, pairedHelper),
+		"Paired channel %d must keep its record and SharedKey", pairedHelper)
+	fmt.Println("  Paired channel kept its record and SharedKey  ✓")
+
+	fmt.Println("Protocol expired Pending channel key cleanup test passed.")
+}
+
 // runUnsafeConnection proves the unsafe_connection setting survives the JSON
 // config boundary and actually changes behaviour.
 //
@@ -1713,6 +2077,12 @@ func runConfigSurface() {
 		"CodeNoUsableEndpoint must be 121, got %d", derec.CodeNoUsableEndpoint)
 	assertTrue(derec.CodeTooManySubshares == 66,
 		"CodeTooManySubshares must be 66, got %d", derec.CodeTooManySubshares)
+	assertTrue(derec.CodeInvalidKeepVersion == 67,
+		"CodeInvalidKeepVersion must be 67, got %d", derec.CodeInvalidKeepVersion)
+	assertTrue((&derec.Error{Code: derec.CodeInvalidKeepVersion}).CodeName() == "invalid_keep_version",
+		"CodeInvalidKeepVersion must be named invalid_keep_version, got %q", (&derec.Error{Code: derec.CodeInvalidKeepVersion}).CodeName())
+	assertTrue(derec.CodeFingerprintCommitmentMismatch == 48,
+		"CodeFingerprintCommitmentMismatch must be 48, got %d", derec.CodeFingerprintCommitmentMismatch)
 	assertTrue(derec.CategoryStateStore == 15,
 		"CategoryStateStore must be 15, got %d", derec.CategoryStateStore)
 	fmt.Println("  error code/category values match the FFI  ✓")
@@ -1746,9 +2116,7 @@ func runUnconfirmedDestination() {
 
 	destinationFp, err := destination.proto.GetFingerprint(replicaChannel)
 	must(err, "destination.GetFingerprint")
-	ok, err := source.proto.VerifyFingerprint(replicaChannel, destinationFp)
-	must(err, "source.VerifyFingerprint")
-	assertTrue(ok, "the source must accept the matching fingerprint")
+	must(source.proto.VerifyFingerprint(replicaChannel, destinationFp), "source.VerifyFingerprint")
 
 	var ignored bool
 	for _, ev := range pump(source, destination) {
@@ -1765,9 +2133,7 @@ func runUnconfirmedDestination() {
 
 	sourceFp, err := source.proto.GetFingerprint(replicaChannel)
 	must(err, "source.GetFingerprint")
-	ok, err = destination.proto.VerifyFingerprint(replicaChannel, sourceFp)
-	must(err, "destination.VerifyFingerprint")
-	assertTrue(ok, "the destination must accept the matching fingerprint")
+	must(destination.proto.VerifyFingerprint(replicaChannel, sourceFp), "destination.VerifyFingerprint")
 	_, err = destination.proto.Start(protocol.FlowKindReplicaDiscovery, nil)
 	must(err, "destination.Start(ReplicaDiscovery)")
 

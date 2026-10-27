@@ -188,7 +188,7 @@ pub async fn run() {
                 name: "smoke".to_owned(),
                 data: format!("sqlite-shared-secret-v{version}").into_bytes(),
             },
-            "empty keepList publish",
+            "keepVersion publish",
         )
         .await;
     }
@@ -207,27 +207,27 @@ pub async fn run() {
         versions.sort_unstable();
         assert_eq!(
             versions,
-            vec![1, 2, 3, 4],
-            "{name}: the store's keep_list returns None, so v4 carries an empty keepList and every version stays"
+            vec![3, 4],
+            "{name}: the store's keep_version keeps the version before, so v4 carries keepVersion 3 and v1 and v2 are removed"
         );
 
         let mut store = store;
         store
-            .remove_versions(DEFAULT_TEST_SECRET_ID, channel_id, &[2, 99])
+            .remove_versions(DEFAULT_TEST_SECRET_ID, channel_id, &[3, 99])
             .await
             .expect("remove_versions failed");
         store
-            .remove_versions(DEFAULT_TEST_SECRET_ID, channel_id, &[2])
+            .remove_versions(DEFAULT_TEST_SECRET_ID, channel_id, &[3])
             .await
             .expect("remove_versions must be idempotent");
         assert_eq!(
             count_shares_for_channel(&db, DEFAULT_TEST_SECRET_ID, channel_id.0),
-            3,
+            1,
             "{name}: remove_versions drops exactly the listed stored versions"
         );
     }
     println!(
-        "  empty keepList kept every version on every helper; remove_versions is idempotent  ✓"
+        "  keepVersion left exactly v3 and v4 on every helper; remove_versions is idempotent  ✓"
     );
 
     println!("✓ Sharing flow passed.\n");

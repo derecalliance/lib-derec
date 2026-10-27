@@ -148,7 +148,8 @@ fn generated() -> serde_json::Value {
             error,
             mlkem_encapsulation_key,
             ecies_public_key,
-            nonce
+            nonce,
+            fingerprint_commitment
         },
         super::protocol::handle::config::DeRecRemovedChannelsResult { error, channels },
         super::protocol::handle::flow::DeRecProtocolEventsResult { error, events_json },
@@ -197,7 +198,7 @@ fn generated() -> serde_json::Value {
             save,
             remove_channel,
             remove_versions,
-            keep_list,
+            keep_version,
             record_verification,
             free_buffer
         },

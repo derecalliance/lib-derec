@@ -155,8 +155,7 @@ pub extern "C" fn produce_store_share_request_message(
     secret_id: u64,
     committed_share_ptr: *const u8,
     committed_share_len: usize,
-    keep_list_ptr: *const u32,
-    keep_list_len: usize,
+    keep_version: u32,
     description_ptr: *const u8,
     description_len: usize,
     shared_key_ptr: *const u8,
@@ -182,14 +181,6 @@ pub extern "C" fn produce_store_share_request_message(
     ) {
         Ok(b) => b,
         Err(e) => return with_err(e),
-    };
-    if keep_list_ptr.is_null() && keep_list_len > 0 {
-        return with_err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "keep_list_ptr is null"));
-    }
-    let keep_list: &[u32] = if keep_list_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(keep_list_ptr, keep_list_len) }
     };
     let description_bytes = match parse_buffer(description_ptr, description_len, "description_ptr")
     {
@@ -230,7 +221,7 @@ pub extern "C" fn produce_store_share_request_message(
         version,
         secret_id,
         &committed_share,
-        keep_list,
+        keep_version,
         description,
         &shared_key,
         &reply_to,

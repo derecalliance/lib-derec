@@ -296,7 +296,7 @@ pub(in crate::protocol) fn check<'a>(
 /// proofs and never deletes one, so freeing that storage is the application's
 /// concern. The map is what the source sent, not what the Helpers kept. The
 /// source later drops its proofs for a Helper that refuses or fails a round,
-/// and for versions a confirmed `keepList` had the Helper remove; a
+/// and for versions a confirmed `keepVersion` had the Helper remove; a
 /// destination sees neither answer. Verifying such a version here therefore
 /// challenges the Helper, which answers `ShareVerifyRejected`
 /// (`UNKNOWN_SHARE_VERSION`), where the source reports
@@ -1375,7 +1375,7 @@ mod tests {
                     version,
                     version_description: String::new(),
                     share_algorithm: 0,
-                    keep_list: Vec::new(),
+                    keep_version: 0,
                     replica_id: Some(OWNER),
                     reply_to_transports: Vec::new(),
                     timestamp: None,
@@ -1496,7 +1496,7 @@ mod tests {
                 version: payload.version,
                 version_description: String::new(),
                 share_algorithm: 0,
-                keep_list: Vec::new(),
+                keep_version: 0,
                 replica_id: Some(sender),
                 reply_to_transports: Vec::new(),
                 timestamp: None,
@@ -1990,7 +1990,7 @@ mod tests {
                 version: VERSION,
                 version_description: String::new(),
                 share_algorithm: 0,
-                keep_list: Vec::new(),
+                keep_version: 0,
                 replica_id: Some(OWNER),
                 reply_to_transports: Vec::new(),
                 timestamp: None,
@@ -2109,7 +2109,7 @@ mod tests {
                     version: 1,
                     version_description: String::new(),
                     share_algorithm: 0,
-                    keep_list: Vec::new(),
+                    keep_version: 0,
                     replica_id: Some(OWNER),
                     reply_to_transports: Vec::new(),
                     timestamp: None,
@@ -2205,7 +2205,7 @@ mod tests {
                     version: 5,
                     version_description: String::new(),
                     share_algorithm: 0,
-                    keep_list: Vec::new(),
+                    keep_version: 0,
                     replica_id: Some(OWNER),
                     reply_to_transports: Vec::new(),
                     timestamp: None,

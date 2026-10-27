@@ -5,6 +5,7 @@ package pairing_test
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"math"
 	"testing"
@@ -176,6 +177,13 @@ func TestContactCodecRoundTripsEveryMode(t *testing.T) {
 		if contact.Timestamp == nil {
 			t.Fatalf("DecodeContact(%d): timestamp missing", mode)
 		}
+		wantCommitment := 0
+		if mode == pairing.ContactModeInlineKeys {
+			wantCommitment = 32
+		}
+		if len(contact.FingerprintCommitment) != wantCommitment {
+			t.Fatalf("DecodeContact(%d): fingerprint commitment is %d bytes, want %d", mode, len(contact.FingerprintCommitment), wantCommitment)
+		}
 		encoded, err := pairing.Request.EncodeContact(contact)
 		if err != nil {
 			t.Fatalf("EncodeContact(%d): %v", mode, err)
@@ -197,6 +205,7 @@ func TestContactCodecRefusesAnInvalidContact(t *testing.T) {
 		MlkemEncapsulationKey: []byte{1, 2, 3},
 		EciesPublicKey:        []byte{4, 5, 6},
 		ContactBindingHash:    make([]byte, 48),
+		FingerprintCommitment: make([]byte, 32),
 		SupportedTransports:   []pairing.Endpoint{{URI: "https://example.com/alice"}},
 	}
 	_, err := pairing.Request.EncodeContact(invalid)
@@ -212,6 +221,7 @@ func TestContactCodecRefusesAnInvalidContact(t *testing.T) {
 		MlkemEncapsulationKey: []byte{1, 2, 3},
 		EciesPublicKey:        []byte{4, 5, 6},
 		ContactBindingHash:    make([]byte, 48),
+		FingerprintCommitment: make([]byte, 32),
 		SupportedTransports:   []*derecpb.TransportProtocol{{Uri: "https://example.com/alice"}},
 	})
 	if err != nil {
@@ -407,6 +417,13 @@ func TestPairingHashedKeysPrePairRoundTrip(t *testing.T) {
 	}
 	if processed.Nonce != expectedNonce {
 		t.Fatalf("Response.ProcessPrePair nonce = %d, want echoed contact nonce %d", processed.Nonce, expectedNonce)
+	}
+	var respMsg derecpb.PrePairResponseMessage
+	if err := proto.Unmarshal(extractedResp.ResponseProto, &respMsg); err != nil {
+		t.Fatalf("decode PrePairResponseMessage: %v", err)
+	}
+	if len(processed.FingerprintCommitment) != 32 || !bytes.Equal(processed.FingerprintCommitment, respMsg.GetFingerprintCommitment()) {
+		t.Fatalf("Response.ProcessPrePair fingerprint commitment = %x, want the response's %x", processed.FingerprintCommitment, respMsg.GetFingerprintCommitment())
 	}
 }
 
@@ -612,8 +629,9 @@ func TestPairingNoKeysPrePairRoundTrip(t *testing.T) {
 	}
 }
 
-// inlineContactWithKeys rewrites a NO_KEYS contact into the INLINE_KEYS
-// shape Request.Produce requires, carrying the keys PrePair returned.
+// inlineContactWithKeys rewrites a NO_KEYS or HASHED_KEYS contact into the
+// INLINE_KEYS shape Request.Produce requires, carrying the keys and the
+// fingerprint commitment PrePair returned.
 func inlineContactWithKeys(t *testing.T, contactWireBytes []byte, keys pairing.ProcessedPrePair) []byte {
 	t.Helper()
 	var contact derecpb.ContactMessage
@@ -623,10 +641,244 @@ func inlineContactWithKeys(t *testing.T, contactWireBytes []byte, keys pairing.P
 	contact.ContactMode = derecpb.ContactMode_INLINE_KEYS
 	contact.MlkemEncapsulationKey = keys.MlkemEncapsulationKey
 	contact.EciesPublicKey = keys.EciesPublicKey
+	contact.FingerprintCommitment = keys.FingerprintCommitment
 	contact.ContactBindingHash = nil
 	out, err := proto.Marshal(&contact)
 	if err != nil {
 		t.Fatalf("encode ContactMessage: %v", err)
 	}
 	return out
+}
+
+func requireCode(t *testing.T, what string, err error, want int32) {
+	t.Helper()
+	var derr *derec.Error
+	if !errors.As(err, &derr) || derr.Code != want {
+		t.Fatalf("%s: want code %d, got %#v", what, want, err)
+	}
+}
+
+// inlineKeysHandshake runs one INLINE_KEYS handshake up to the scanner
+// holding the decrypted pair response. It returns the creator's contact, the
+// contact the scanner processes the response against, the response proto,
+// the scanner's secret key material, and the key the creator derived.
+func inlineKeysHandshake(t *testing.T) (contact, initiatorContact, responseProto, scannerSecret, creatorKey []byte) {
+	t.Helper()
+	const channelID = uint64(42)
+	created, err := pairing.Request.CreateContact(channelID, pairing.ContactModeInlineKeys, encodeTransportList("https://relay.example/alice"), nil)
+	if err != nil {
+		t.Fatalf("CreateContact: %v", err)
+	}
+	req, err := pairing.Request.Produce(pairing.SenderKindHelper, encodeTransportList("https://relay.example/bob"), created.ContactWireBytes, nil, nil)
+	if err != nil {
+		t.Fatalf("Request.Produce: %v", err)
+	}
+	extractedReq, err := pairing.Request.Extract(req.Envelope, created.SecretKeyMaterial, nil)
+	if err != nil {
+		t.Fatalf("Request.Extract: %v", err)
+	}
+	produced, err := pairing.Response.Produce(channelID, extractedReq.RequestProto, created.SecretKeyMaterial, nil, nil, false)
+	if err != nil {
+		t.Fatalf("Response.Produce: %v", err)
+	}
+	extractedResp, err := pairing.Response.Extract(produced.Envelope, req.SecretKeyMaterial)
+	if err != nil {
+		t.Fatalf("Response.Extract: %v", err)
+	}
+	return created.ContactWireBytes, req.InitiatorContactMessage, extractedResp.ResponseProto, req.SecretKeyMaterial, produced.SharedKey
+}
+
+func decodePairResponse(t *testing.T, responseProto []byte) *derecpb.PairResponseMessage {
+	t.Helper()
+	var msg derecpb.PairResponseMessage
+	if err := proto.Unmarshal(responseProto, &msg); err != nil {
+		t.Fatalf("decode PairResponseMessage: %v", err)
+	}
+	return &msg
+}
+
+func encodeProto(t *testing.T, msg proto.Message) []byte {
+	t.Helper()
+	out, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatalf("proto.Marshal: %v", err)
+	}
+	return out
+}
+
+// TestPairResponseRevealsTheNonceTheContactCommittedTo: the nonce an
+// accepted response reveals opens the commitment the contact published,
+// SHA-256("DeRec fingerprint commitment v1" || mlkemEK || eciesPK || nonce).
+func TestPairResponseRevealsTheNonceTheContactCommittedTo(t *testing.T) {
+	contactWire, _, responseProto, _, _ := inlineKeysHandshake(t)
+	contact, err := pairing.Request.DecodeContact(contactWire)
+	if err != nil {
+		t.Fatalf("DecodeContact: %v", err)
+	}
+	nonce := decodePairResponse(t, responseProto).GetFingerprintNonce()
+	if len(nonce) != 32 {
+		t.Fatalf("pair response fingerprint nonce is %d bytes, want 32", len(nonce))
+	}
+	h := sha256.New()
+	h.Write([]byte("DeRec fingerprint commitment v1"))
+	h.Write(contact.MlkemEncapsulationKey)
+	h.Write(contact.EciesPublicKey)
+	h.Write(nonce)
+	if !bytes.Equal(h.Sum(nil), contact.FingerprintCommitment) {
+		t.Fatal("the revealed nonce must open the contact's fingerprint commitment")
+	}
+}
+
+// TestBothSidesDeriveTheChannelKeyFromTheRevealedNonce: the honest response
+// completes pairing with the creator's key and fingerprint.
+func TestBothSidesDeriveTheChannelKeyFromTheRevealedNonce(t *testing.T) {
+	_, initiatorContact, responseProto, scannerSecret, creatorKey := inlineKeysHandshake(t)
+	processed, err := pairing.Response.Process(initiatorContact, responseProto, scannerSecret, nil)
+	if err != nil {
+		t.Fatalf("Response.Process: %v", err)
+	}
+	if !bytes.Equal(processed.SharedKey, creatorKey) {
+		t.Fatal("both sides must derive the same channel key")
+	}
+	creatorFP, err := pairing.Fingerprint(creatorKey)
+	if err != nil {
+		t.Fatalf("Fingerprint (creator): %v", err)
+	}
+	scannerFP, err := pairing.Fingerprint(processed.SharedKey)
+	if err != nil {
+		t.Fatalf("Fingerprint (scanner): %v", err)
+	}
+	if creatorFP != scannerFP {
+		t.Fatalf("fingerprints differ: creator=%q scanner=%q", creatorFP, scannerFP)
+	}
+}
+
+func TestPairResponseWhoseNonceDoesNotOpenTheCommitmentIsRefused(t *testing.T) {
+	_, initiatorContact, responseProto, scannerSecret, _ := inlineKeysHandshake(t)
+	msg := decodePairResponse(t, responseProto)
+	msg.FingerprintNonce[0] ^= 1
+	_, err := pairing.Response.Process(initiatorContact, encodeProto(t, msg), scannerSecret, nil)
+	requireCode(t, "Response.Process", err, derec.CodeFingerprintCommitmentMismatch)
+}
+
+func TestPairResponseWithoutAFingerprintNonceIsRefused(t *testing.T) {
+	_, initiatorContact, responseProto, scannerSecret, _ := inlineKeysHandshake(t)
+	msg := decodePairResponse(t, responseProto)
+	msg.FingerprintNonce = nil
+	_, err := pairing.Response.Process(initiatorContact, encodeProto(t, msg), scannerSecret, nil)
+	requireCode(t, "Response.Process", err, derec.CodeInvalidPairResponseMessage)
+}
+
+// prePairLeg runs the PrePair exchange for a fresh contact of mode and
+// returns the contact, the PrePair request proto, and the creator's
+// response proto.
+func prePairLeg(t *testing.T, mode pairing.ContactMode) (contact, requestProto, responseProto []byte) {
+	t.Helper()
+	const channelID = uint64(7)
+	nonce := uint64(4321)
+	created, err := pairing.Request.CreateContact(channelID, mode, encodeTransportList("https://relay.example/alice"), &nonce)
+	if err != nil {
+		t.Fatalf("CreateContact: %v", err)
+	}
+	req, err := pairing.Request.ProducePrePair(encodeTransportList("https://relay.example/bob"), created.ContactWireBytes)
+	if err != nil {
+		t.Fatalf("Request.ProducePrePair: %v", err)
+	}
+	extractedReq, err := pairing.Request.ExtractPrePair(req.Envelope)
+	if err != nil {
+		t.Fatalf("Request.ExtractPrePair: %v", err)
+	}
+	var envelope []byte
+	if mode == pairing.ContactModeNoKeys {
+		answer, err := pairing.Response.ProducePrePairNoKeys(channelID, extractedReq.RequestProto)
+		if err != nil {
+			t.Fatalf("Response.ProducePrePairNoKeys: %v", err)
+		}
+		envelope = answer.Envelope
+	} else {
+		answer, err := pairing.Response.ProducePrePair(channelID, extractedReq.RequestProto, created.SecretKeyMaterial)
+		if err != nil {
+			t.Fatalf("Response.ProducePrePair: %v", err)
+		}
+		envelope = answer.Envelope
+	}
+	extractedResp, err := pairing.Response.ExtractPrePair(envelope)
+	if err != nil {
+		t.Fatalf("Response.ExtractPrePair: %v", err)
+	}
+	return created.ContactWireBytes, extractedReq.RequestProto, extractedResp.ResponseProto
+}
+
+func withoutPrePairCommitment(t *testing.T, responseProto []byte) []byte {
+	t.Helper()
+	var msg derecpb.PrePairResponseMessage
+	if err := proto.Unmarshal(responseProto, &msg); err != nil {
+		t.Fatalf("decode PrePairResponseMessage: %v", err)
+	}
+	msg.FingerprintCommitment = nil
+	return encodeProto(t, &msg)
+}
+
+func TestHashedKeysPrePairResponseWithoutACommitmentIsRefused(t *testing.T) {
+	contact, _, responseProto := prePairLeg(t, pairing.ContactModeHashedKeys)
+	_, err := pairing.Response.ProcessPrePair(contact, withoutPrePairCommitment(t, responseProto))
+	requireCode(t, "Response.ProcessPrePair", err, derec.CodeInvalidPairResponseMessage)
+}
+
+func TestNoKeysPrePairResponseWithoutACommitmentIsRefused(t *testing.T) {
+	contact, _, responseProto := prePairLeg(t, pairing.ContactModeNoKeys)
+	_, err := pairing.Response.ProcessPrePairNoKeys(contact, withoutPrePairCommitment(t, responseProto))
+	requireCode(t, "Response.ProcessPrePairNoKeys", err, derec.CodeInvalidPairResponseMessage)
+}
+
+// TestRelayCannotPassOffTheCreatorsCommitmentAsItsOwn: a relay on the
+// PrePair leg answers the scanner with its own keys and copies the creator's
+// commitment. That commitment covers the creator's keys and opens only with
+// the creator's nonce, so the relay's pairing response is refused.
+func TestRelayCannotPassOffTheCreatorsCommitmentAsItsOwn(t *testing.T) {
+	const channelID = uint64(7)
+	contact, requestProto, creatorAnswer := prePairLeg(t, pairing.ContactModeNoKeys)
+	var creatorMsg derecpb.PrePairResponseMessage
+	if err := proto.Unmarshal(creatorAnswer, &creatorMsg); err != nil {
+		t.Fatalf("decode PrePairResponseMessage: %v", err)
+	}
+
+	relay, err := pairing.Response.ProducePrePairNoKeys(channelID, requestProto)
+	if err != nil {
+		t.Fatalf("relay Response.ProducePrePairNoKeys: %v", err)
+	}
+	relayedResp, err := pairing.Response.ExtractPrePair(relay.Envelope)
+	if err != nil {
+		t.Fatalf("Response.ExtractPrePair (relayed): %v", err)
+	}
+	var relayed derecpb.PrePairResponseMessage
+	if err := proto.Unmarshal(relayedResp.ResponseProto, &relayed); err != nil {
+		t.Fatalf("decode PrePairResponseMessage: %v", err)
+	}
+	relayed.FingerprintCommitment = creatorMsg.GetFingerprintCommitment()
+
+	validated, err := pairing.Response.ProcessPrePairNoKeys(contact, encodeProto(t, &relayed))
+	if err != nil {
+		t.Fatalf("Response.ProcessPrePairNoKeys must accept unbound NO_KEYS keys: %v", err)
+	}
+	filledIn := inlineContactWithKeys(t, contact, validated)
+
+	req, err := pairing.Request.Produce(pairing.SenderKindHelper, encodeTransportList("https://relay.example/bob"), filledIn, nil, nil)
+	if err != nil {
+		t.Fatalf("Request.Produce: %v", err)
+	}
+	extractedReq, err := pairing.Request.Extract(req.Envelope, relay.SecretKeyMaterial, nil)
+	if err != nil {
+		t.Fatalf("relay Request.Extract: %v", err)
+	}
+	produced, err := pairing.Response.Produce(channelID, extractedReq.RequestProto, relay.SecretKeyMaterial, nil, nil, false)
+	if err != nil {
+		t.Fatalf("relay Response.Produce: %v", err)
+	}
+	extractedResp, err := pairing.Response.Extract(produced.Envelope, req.SecretKeyMaterial)
+	if err != nil {
+		t.Fatalf("Response.Extract: %v", err)
+	}
+	_, err = pairing.Response.Process(req.InitiatorContactMessage, extractedResp.ResponseProto, req.SecretKeyMaterial, nil)
+	requireCode(t, "Response.Process", err, derec.CodeFingerprintCommitmentMismatch)
 }

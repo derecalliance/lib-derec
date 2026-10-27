@@ -617,15 +617,46 @@ func TestOrchestrator_UpdateChannelInfoAnnouncesEndpointsByName(t *testing.T) {
 	}
 }
 
+// TestOrchestrator_InvalidKeepVersionFailsTheRound has the owner answer
+// KeepVersion with the version being shared: Start(ProtectSecret) fails
+// with CodeInvalidKeepVersion and nothing is sent.
+func TestOrchestrator_InvalidKeepVersionFailsTheRound(t *testing.T) {
+	const threshold = 2
+
+	owner := newOrchestratorPeer(t, "owner", "https://owner.example.com", threshold)
+	helperA := newOrchestratorPeer(t, "helper-a", "https://helper-a.example.com", threshold)
+	helperB := newOrchestratorPeer(t, "helper-b", "https://helper-b.example.com", threshold)
+	pairOrchestratorPeers(t, owner, helperA, 1)
+	pairOrchestratorPeers(t, owner, helperB, 2)
+
+	secrets := []UserSecret{{ID: []byte{5}, Name: "kept", Data: []byte("round-1")}}
+	if _, err := owner.protocol.Start(FlowKindProtectSecret, ProtectSecretParams{Secrets: secrets}); err != nil {
+		t.Fatalf("round 1 Start(ProtectSecret): %v", err)
+	}
+	pumpOrchestratorPeersMany(t, []*orchestratorPeer{owner, helperA, helperB})
+
+	owner.shareStore.mu.Lock()
+	owner.shareStore.keep, owner.shareStore.keepSet = 2, true
+	owner.shareStore.mu.Unlock()
+	_, err := owner.protocol.Start(FlowKindProtectSecret, ProtectSecretParams{Secrets: secrets})
+	var derecErr *derec.Error
+	if !errors.As(err, &derecErr) || derecErr.Code != derec.CodeInvalidKeepVersion {
+		t.Fatalf("keepVersion equal to the version must fail with CodeInvalidKeepVersion, got %v", err)
+	}
+	if sent := owner.transport.drain(); len(sent) != 0 {
+		t.Fatalf("an invalid keepVersion must send nothing, got %d envelopes", len(sent))
+	}
+}
+
 // TestOrchestrator_SecretStoreLoadManyServesTheWholeBroadcast checks that a
 // broadcast to several helpers reads every SharedKey through one
 // SecretStore.LoadMany call, and that a nil entry is judged by the
 // library's missing-entry policy: discovery needs a key for every target,
 // so it fails with CodeMissingSharedKey naming the channel without one.
-// TestOrchestrator_OwnerKeepListReachesHelpers has the owner roll back v2
-// by listing only v1 for the v3 round: KeepList is asked once per round,
+// TestOrchestrator_OwnerKeepVersionReachesHelpers has the owner roll back
+// v2 by keeping v1 for the v3 round: KeepVersion is asked once per round,
 // and both helpers end up holding exactly v1 and v3.
-func TestOrchestrator_OwnerKeepListReachesHelpers(t *testing.T) {
+func TestOrchestrator_OwnerKeepVersionReachesHelpers(t *testing.T) {
 	const threshold = 2
 
 	owner := newOrchestratorPeer(t, "owner", "https://owner.example.com", threshold)
@@ -637,7 +668,7 @@ func TestOrchestrator_OwnerKeepListReachesHelpers(t *testing.T) {
 	for round := 1; round <= 3; round++ {
 		if round == 3 {
 			owner.shareStore.mu.Lock()
-			owner.shareStore.keep, owner.shareStore.keepOK = []uint32{1}, true
+			owner.shareStore.keep, owner.shareStore.keepSet = 1, true
 			owner.shareStore.mu.Unlock()
 		}
 		if _, err := owner.protocol.Start(FlowKindProtectSecret, ProtectSecretParams{
@@ -648,8 +679,8 @@ func TestOrchestrator_OwnerKeepListReachesHelpers(t *testing.T) {
 		pumpOrchestratorPeersMany(t, []*orchestratorPeer{owner, helperA, helperB})
 	}
 
-	if got := owner.shareStore.keepListCalls; !slices.Equal(got, []uint32{1, 2, 3}) {
-		t.Fatalf("KeepList must be asked once per round with the version being sent, got %v", got)
+	if got := owner.shareStore.keepVersionCalls; !slices.Equal(got, []uint32{1, 2, 3}) {
+		t.Fatalf("KeepVersion must be asked once per round with the version being sent, got %v", got)
 	}
 	for _, check := range []struct {
 		label     string

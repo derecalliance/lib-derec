@@ -557,10 +557,10 @@
           ]
         },
         {
-          "rust": "keep_list",
-          "dotnet": "KeepList",
-          "go": "KeepList",
-          "ts": "keepList",
+          "rust": "keep_version",
+          "dotnet": "KeepVersion",
+          "go": "KeepVersion",
+          "ts": "keepVersion",
           "rust_params": [
             "secret_id",
             "version"

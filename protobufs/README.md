@@ -234,7 +234,7 @@ significant, and all three kinds of change below affect the encoding.
 | --- | --- | --- |
 | `secretId` | *(absent — read from the enclosing `DeRecMessage`)* | `uint64` = 3 |
 | `version` | `int32` = 3 | `uint32` = 4 |
-| `keepList` | `repeated int32` = 4 | `repeated uint32` = 5 |
+| `keepList` → `keepVersion` | `repeated int32` = 4 | `uint32` = 5 |
 | `versionDescription` | = 5 | = 6 |
 | `timestamp` | = 6 | = 7 |
 

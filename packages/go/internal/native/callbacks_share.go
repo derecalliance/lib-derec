@@ -22,14 +22,14 @@ type shareStore interface {
 	Save(secretID, channelID uint64, share Share) error
 	RemoveChannel(secretID, channelID uint64) error
 	RemoveVersions(secretID, channelID uint64, versions []uint32) error
-	KeepList(secretID uint64, version uint32) ([]uint32, bool, error)
+	KeepVersion(secretID uint64, version uint32) (uint32, error)
 	RecordVerification(secretID, channelID uint64, version uint32) error
 }
 
 // ShareStoreCallbacks mirrors #[repr(C)] struct ShareStoreCallbacks in
 // library/src/interop/ffi/protocol/stores.rs field-for-field. channel_ids[]/
 // versions[] cross the FFI as JSON-array byte buffers, matching stores.rs's
-// doc comment on the struct. RecordVerification sits after KeepList and
+// doc comment on the struct. RecordVerification sits after KeepVersion and
 // before FreeBuffer, matching the Rust struct's field order exactly — a
 // different position here is a runtime crash, not a compile error.
 type ShareStoreCallbacks struct {
@@ -41,7 +41,7 @@ type ShareStoreCallbacks struct {
 	Save               uintptr
 	RemoveChannel      uintptr
 	RemoveVersions     uintptr
-	KeepList           uintptr
+	KeepVersion        uintptr
 	RecordVerification uintptr
 	FreeBuffer         uintptr
 }
@@ -246,20 +246,13 @@ func dispatchShareRemoveVersions(s *storeSet, secretID, channelID uint64, versio
 	return ffiStatusOK
 }
 
-func dispatchShareKeepList(s *storeSet, secretID uint64, version uint32) (status int32, out []byte) {
+func dispatchShareKeepVersion(s *storeSet, secretID uint64, version uint32) (status int32, keepVersion uint32) {
 	defer recoverInto(&status)
-	versions, ok, err := s.share.KeepList(secretID, version)
+	keep, err := s.share.KeepVersion(secretID, version)
 	if err != nil {
-		return ffiStatusFailure, nil
+		return ffiStatusFailure, 0
 	}
-	if !ok {
-		return ffiStatusOK, []byte("null")
-	}
-	encoded, err := EncodeUint32Array(versions)
-	if err != nil {
-		return ffiStatusFailure, nil
-	}
-	return ffiStatusOK, encoded
+	return ffiStatusOK, keep
 }
 
 // --- C-facing callbacks ------------------------------------------------------
@@ -347,18 +340,17 @@ func shareRemoveVersionsCallback(userData uintptr, secretID, channelID uint64, v
 	return dispatchShareRemoveVersions(s, secretID, channelID, unsafe.Slice(versionsPtr, versionsLen))
 }
 
-func shareKeepListCallback(userData uintptr, secretID uint64, version uint32, outPtr, outLen *uintptr) (status int32) {
+func shareKeepVersionCallback(userData uintptr, secretID uint64, version uint32, outVersion *uint32) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
 	if !ok {
 		return ffiStatusFailure
 	}
-	st, out := dispatchShareKeepList(s, secretID, version)
-	if st != ffiStatusOK {
-		return st
+	st, keep := dispatchShareKeepVersion(s, secretID, version)
+	if st == ffiStatusOK {
+		*outVersion = keep
 	}
-	writeOutBuffer(out, outPtr, outLen)
-	return ffiStatusOK
+	return st
 }
 
 func shareRecordVerificationCallback(userData uintptr, secretID, channelID uint64, version uint32) (status int32) {
@@ -379,7 +371,7 @@ func shareRecordVerificationCallback(userData uintptr, secretID, channelID uint6
 var (
 	shareCallbacksOnce sync.Once
 	shareCallbackPtrs  struct {
-		load, loadMany, loadAll, latestVersion, save, removeChannel, removeVersions, keepList, recordVerification uintptr
+		load, loadMany, loadAll, latestVersion, save, removeChannel, removeVersions, keepVersion, recordVerification uintptr
 	}
 )
 
@@ -392,7 +384,7 @@ func registerShareCallbacks() {
 		shareCallbackPtrs.save = purego.NewCallback(shareSaveCallback)
 		shareCallbackPtrs.removeChannel = purego.NewCallback(shareRemoveChannelCallback)
 		shareCallbackPtrs.removeVersions = purego.NewCallback(shareRemoveVersionsCallback)
-		shareCallbackPtrs.keepList = purego.NewCallback(shareKeepListCallback)
+		shareCallbackPtrs.keepVersion = purego.NewCallback(shareKeepVersionCallback)
 		shareCallbackPtrs.recordVerification = purego.NewCallback(shareRecordVerificationCallback)
 	})
 }
@@ -411,7 +403,7 @@ func buildShareStoreCallbacks(h storeHandle) ShareStoreCallbacks {
 		Save:               shareCallbackPtrs.save,
 		RemoveChannel:      shareCallbackPtrs.removeChannel,
 		RemoveVersions:     shareCallbackPtrs.removeVersions,
-		KeepList:           shareCallbackPtrs.keepList,
+		KeepVersion:        shareCallbackPtrs.keepVersion,
 		RecordVerification: shareCallbackPtrs.recordVerification,
 		FreeBuffer:         sharedFreeBufferCallback(),
 	}

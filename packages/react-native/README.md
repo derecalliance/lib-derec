@@ -161,13 +161,13 @@ A stored proof is either confirmed by its helper or part of a sharing round
 still open: when a round settles a channel as failed (a rejection or a
 timeout), that channel's proof is deleted. A confirmation also deletes the
 proofs of versions the helper dropped: a helper that stores a version
-deletes every other version that round's `keepList` leaves out, so when it
+deletes every other version except that round's `keepVersion`, so when it
 confirms, its proofs for those versions are deleted here too (the confirmed
-version stays). A helper that rejects the round keeps its older versions, and
-so do their proofs; with no keep list nothing is deleted. A replica Destination never sees the helpers' answers, and it keeps every
+version and `keepVersion` stay). A helper that rejects the round keeps its
+older versions, and so do their proofs. A replica Destination never sees the helpers' answers, and it keeps every
 proof it receives: it never deletes one on its own, and freeing that storage
 is the app's concern. Verifying on a Destination a version that a helper
-refused, or later dropped under the `keepList`, gets `ShareVerifyRejected`
+refused, or later dropped under a `keepVersion`, gets `ShareVerifyRejected`
 (`UNKNOWN_SHARE_VERSION`) from that helper, where the Source reports
 `NoProof`. The app may delete such rows from the Destination's share store;
 verifying a version whose rows are gone then gives `VerifySharesFailed` with
@@ -177,6 +177,18 @@ proof sends nothing and returns `VerifySharesFailed` with
 `reason: 'NoProof'` at once. A late response to an earlier challenge is
 ignored as `MessageIgnored` with `reason: 'StaleResponse'`, and the current
 challenge stays open; a response missing its `result` is still an error.
+
+Matching responses to requests is the app's concern. The library applies a
+response that changes stored state only against the flow that asked for it,
+and reports the rest as they arrive without matching them: `ShareConfirmed`
+and `ShareRejected` (a sharing round counts only the helpers it is waiting
+for), `SecretsDiscovered`, `ChannelInfoUpdated`, `ChannelInfoUpdateRejected`
+and `ErrorResponseReceived`. An app that acts on these should record what it
+started and match each event against it, and decide which versions committed
+from `SharingComplete` with `threshold_met` rather than by counting
+`ShareConfirmed`, since a helper can confirm twice or unasked. See [Matching
+responses to requests is the application's
+job](https://github.com/derecalliance/lib-derec/tree/main/library#matching-responses-to-requests-is-the-applications-job).
 
 **After recovery: restore or join.** `SecretRecovered` writes nothing, so
 decide before calling `restore`. When `secret.replicas?.members` names live
@@ -303,9 +315,10 @@ declared in `src/types.ts`:
 - **`ChannelStore`** — pairing state: helper channels and replica-group
   membership, keyed by `(channelId, replicaId)`.
 - **`ShareStore`** — versioned VSS shares this device holds as a helper.
-  On an owner, `keepList` chooses which versions helpers keep; returning
-  `null` sends no keepList, so helpers keep every version; see
-  [the owner's keep list](https://github.com/derecalliance/lib-derec/tree/main/library#share-store-the-owners-keep-list).
+  On an owner, `keepVersion` chooses the one older version helpers keep
+  besides the one being shared (`0` keeps none); an answer equal to or
+  greater than that version fails the round with `invalid_keep_version`; see
+  [`DeRecShareStore::keep_version`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html#tymethod.keep_version).
 - **`SecretStore`** — small per-channel key material (shared keys, etc.),
   distinct from share bytes.
 - **`UserSecretStore`** — the most recent user-facing secret snapshot per

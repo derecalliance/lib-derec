@@ -643,10 +643,14 @@
         {
           "name": "nonce",
           "offset": 72
+        },
+        {
+          "name": "fingerprint_commitment",
+          "offset": 80
         }
       ],
       "name": "ProcessPrePairResponseMessageResult",
-      "size": 80
+      "size": 96
     },
     {
       "align": 8,
@@ -1043,7 +1047,7 @@
           "offset": 56
         },
         {
-          "name": "keep_list",
+          "name": "keep_version",
           "offset": 64
         },
         {

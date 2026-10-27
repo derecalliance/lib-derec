@@ -83,10 +83,14 @@ func (requestAPI) Split(secretID uint64, secretData []byte, channels []WeightedC
 // Produce builds the wire-encoded DeRecMessage carrying committedShare for
 // storage at channelID under secretID/version, encrypted under sharedKey.
 //
+// keepVersion is the one older version the helper keeps besides version;
+// 0 keeps no other version. A keepVersion equal to or greater than version
+// fails with derec.CodeInvalidKeepVersion.
+//
 // replyTo lists the endpoints, in preference order, the peer should answer
 // on; nil or empty means answer on the endpoints recorded for the channel.
-func (requestAPI) Produce(channelID uint64, version uint32, secretID uint64, committedShare []byte, keepList []uint32, description string, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
-	return native.ProduceStoreShareRequest(channelID, version, secretID, committedShare, keepList, description, sharedKey, replyTo)
+func (requestAPI) Produce(channelID uint64, version uint32, secretID uint64, committedShare []byte, keepVersion uint32, description string, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
+	return native.ProduceStoreShareRequest(channelID, version, secretID, committedShare, keepVersion, description, sharedKey, replyTo)
 }
 
 // Extract decrypts a store-share request envelope and returns its channel id

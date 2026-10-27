@@ -374,8 +374,8 @@ type StateKey struct {
 //   - PendingUnpair: ChannelID, StartedAt (unix seconds).
 //   - SharingRound: Version, Pending/Confirmed/Failed (channel-id sets),
 //     PendingReplicas/SyncedReplicas/BehindReplicas (replica-id sets),
-//     StartedAt (unix seconds), KeepList (the versions every Helper was told
-//     to keep).
+//     StartedAt (unix seconds), KeepVersion (the older version every Helper
+//     was told to keep; nil when the round sent no share).
 //   - PendingReplicaDiscovery: LocalVersion, PendingReplicas (members still
 //     to answer), Reported (replicaID → version each member reported),
 //     StartedAt (unix seconds).
@@ -404,9 +404,10 @@ type StateItem struct {
 	SyncedReplicas []uint64
 	// BehindReplicas are members that refused, timed out, or were unreachable.
 	BehindReplicas []uint64
-	// KeepList is the keepList every Helper of a sharing round received.
-	// Rows written before 0.0.9 carry none, which the library reads as empty.
-	KeepList []uint32
+	// KeepVersion is the keepVersion every Helper of a sharing round
+	// received. Nil when the round sent no share; such a round removes no
+	// owner proof when its Helpers confirm.
+	KeepVersion *uint32
 	// Threshold is the threshold a sharing round split at. Rows written
 	// before 0.0.9 carry none, and the library judges such a round against
 	// the builder's threshold.

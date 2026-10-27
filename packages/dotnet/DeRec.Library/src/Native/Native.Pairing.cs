@@ -116,6 +116,7 @@ internal static class Pairing
         public Buffer MlkemEncapsulationKey;
         public Buffer EciesPublicKey;
         public ulong Nonce;
+        public Buffer FingerprintCommitment;
     }
 
     [StructLayout(LayoutKind.Sequential)]

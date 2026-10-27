@@ -96,7 +96,7 @@ public static partial class Pairing
         public sealed class ProcessPrePairResult
         {
             /// <summary>
-            /// Initiator's ML-KEM-768 encapsulation key. Validated against the
+            /// Initiator's ML-KEM-1024 encapsulation key. Validated against the
             /// contact's <c>contactBindingHash</c> by <see cref="ProcessPrePair"/>;
             /// unbound for <see cref="ProcessPrePairNoKeys"/>.
             /// </summary>
@@ -109,6 +109,14 @@ public static partial class Pairing
             public required byte[] EciesPublicKey { get; init; }
             /// <summary>Nonce echoed from the original <see cref="ContactMessage"/>.</summary>
             public required ulong Nonce { get; init; }
+            /// <summary>
+            /// The contact creator's 32-byte commitment to the fingerprint
+            /// nonce its <c>PairResponse</c> reveals, covering the two keys
+            /// above. Copy it into
+            /// <see cref="ContactMessage.FingerprintCommitment"/>, alongside the
+            /// keys, on the filled-in contact the pair request is built from.
+            /// </summary>
+            public required byte[] FingerprintCommitment { get; init; }
         }
 
         /// <summary>
@@ -199,7 +207,11 @@ public static partial class Pairing
         /// <c>ParameterRange</c> this side accepts, or null for none; a
         /// response advertising a range that does not overlap it is refused
         /// with <see cref="DeRecCode.IncompatibleParameterRange"/> before any
-        /// key is derived.
+        /// key is derived. A response whose fingerprint nonce does not open the
+        /// contact's <see cref="ContactMessage.FingerprintCommitment"/> is
+        /// refused with <see cref="DeRecCode.FingerprintCommitmentMismatch"/>;
+        /// one carrying no nonce with
+        /// <see cref="DeRecCode.InvalidPairResponseMessage"/>.
         /// </summary>
         public static ProcessResult Process(
             ContactMessage contactMessage,
@@ -301,9 +313,10 @@ public static partial class Pairing
 
         /// <summary>
         /// Scanner-side: validates the <c>PrePairResponse</c> against the
-        /// contact's SHA-384 binding hash. Returns the validated public keys
-        /// and echoed nonce on success; throws <see cref="DeRecException"/> on
-        /// non-Ok status, nonce mismatch, hash mismatch, or malformed fields.
+        /// contact's SHA-384 binding hash. Returns the validated public keys,
+        /// echoed nonce and fingerprint commitment on success; throws
+        /// <see cref="DeRecException"/> on non-Ok status, nonce mismatch, hash
+        /// mismatch, a missing fingerprint commitment, or malformed fields.
         /// </summary>
         public static ProcessPrePairResult ProcessPrePair(
             ContactMessage contactMessage,
@@ -328,12 +341,14 @@ public static partial class Pairing
                     MlkemEncapsulationKey = Utils.CopyBuffer(nativeResult.MlkemEncapsulationKey),
                     EciesPublicKey = Utils.CopyBuffer(nativeResult.EciesPublicKey),
                     Nonce = nativeResult.Nonce,
+                    FingerprintCommitment = Utils.CopyBuffer(nativeResult.FingerprintCommitment),
                 };
             }
             finally
             {
                 Utils.FreeBuffer(nativeResult.MlkemEncapsulationKey);
                 Utils.FreeBuffer(nativeResult.EciesPublicKey);
+                Utils.FreeBuffer(nativeResult.FingerprintCommitment);
             }
         }
     
@@ -383,9 +398,10 @@ public static partial class Pairing
 
         /// <summary>
         /// Scanner side of a <see cref="ContactMode.NoKeys"/> pairing: accepts
-        /// the contact creator's public keys and echoed nonce. Throws
-        /// <see cref="DeRecException"/> on non-Ok status, nonce mismatch, or
-        /// malformed fields.
+        /// the contact creator's public keys, echoed nonce and fingerprint
+        /// commitment. Throws <see cref="DeRecException"/> on non-Ok status,
+        /// nonce mismatch, a missing fingerprint commitment, or malformed
+        /// fields.
         /// </summary>
         /// <remarks>
         /// There is no binding hash to check the keys against, so the channel
@@ -415,12 +431,14 @@ public static partial class Pairing
                     MlkemEncapsulationKey = Utils.CopyBuffer(nativeResult.MlkemEncapsulationKey),
                     EciesPublicKey = Utils.CopyBuffer(nativeResult.EciesPublicKey),
                     Nonce = nativeResult.Nonce,
+                    FingerprintCommitment = Utils.CopyBuffer(nativeResult.FingerprintCommitment),
                 };
             }
             finally
             {
                 Utils.FreeBuffer(nativeResult.MlkemEncapsulationKey);
                 Utils.FreeBuffer(nativeResult.EciesPublicKey);
+                Utils.FreeBuffer(nativeResult.FingerprintCommitment);
             }
         }
     }

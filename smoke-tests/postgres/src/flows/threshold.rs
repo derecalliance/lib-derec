@@ -149,12 +149,12 @@ pub async fn run() {
     }
     println!("  the pairing publish (v3) splits at the stored t=3, not the builder's 2  ✓");
 
-    // NULL columns read back as no threshold.
+    // NULL columns read back as no threshold. v3 kept v2 and removed v1.
     owner_db
         .client()
         .execute(
             "UPDATE shares SET threshold = NULL \
-             WHERE secret_id = $1 AND channel_id = $2 AND version = 1",
+             WHERE secret_id = $1 AND channel_id = $2 AND version = 2",
             &[&(DEFAULT_TEST_SECRET_ID as i64), &(cid_a.0 as i64)],
         )
         .await
@@ -162,7 +162,7 @@ pub async fn run() {
     let verified = verify(
         &mut owner,
         &mut [&mut a, &mut b, &mut c, &mut d],
-        1,
+        2,
         Target::Single(cid_a),
     )
     .await;

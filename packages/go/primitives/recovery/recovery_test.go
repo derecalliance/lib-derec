@@ -49,7 +49,7 @@ func TestRecoverReconstructsOriginalSecret(t *testing.T) {
 	for _, channelID := range []uint64{1, 2} {
 		key := keys[channelID]
 
-		requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], nil, "", key, nil)
+		requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], 0, "", key, nil)
 		if err != nil {
 			t.Fatalf("channel %d: store request produce: %v", channelID, err)
 		}
@@ -121,7 +121,7 @@ func TestRecoverBelowThresholdFails(t *testing.T) {
 	channelID := uint64(1)
 	key := sharedKey(1)
 
-	requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], nil, "", key, nil)
+	requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], 0, "", key, nil)
 	if err != nil {
 		t.Fatalf("store request produce: %v", err)
 	}

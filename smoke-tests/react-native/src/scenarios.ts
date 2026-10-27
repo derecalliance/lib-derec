@@ -109,8 +109,8 @@ class EmptyShareStore implements ShareStore {
   }
   async removeChannel(): Promise<void> {}
   async removeVersions(): Promise<void> {}
-  async keepList(): Promise<null> {
-    return null;
+  async keepVersion(_secretId: string, version: number): Promise<number> {
+    return version - 1;
   }
   async recordVerification(): Promise<void> {}
 }

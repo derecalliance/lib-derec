@@ -76,7 +76,8 @@ pub struct PrePairExtractResult {
 /// * `channel_id` — Identifier embedded in the contact and copied into subsequent
 ///   pairing messages by the recipient.
 /// * `contact_mode` — Selects how the initiator's public pairing material is delivered:
-///   - [`ContactMode::InlineKeys`]: keys are embedded directly in the contact.
+///   - [`ContactMode::InlineKeys`]: keys are embedded directly in the contact, with
+///     the creator's fingerprint commitment.
 ///   - [`ContactMode::HashedKeys`]: only a SHA-384 binding hash is embedded; the peer
 ///     obtains the keys via a `PrePair` round-trip and verifies against the hash. The
 ///     transport endpoint advertised here MUST be ephemeral — the plaintext `PrePair*`
@@ -169,7 +170,8 @@ pub fn create_contact(
     let (contact_message, secret_key) = match contact_mode {
         ContactMode::InlineKeys => {
             let (pk, sk) = generate_pairing_keys()?;
-            let msg = ContactMessage::inline_keys(channel_id, nonce, own, pk);
+            let commitment = sk.fingerprint_commitment();
+            let msg = ContactMessage::inline_keys(channel_id, nonce, own, pk, commitment);
             (msg, Some(PairingSecretKeyMaterial::Initiator(sk)))
         }
         ContactMode::HashedKeys => {

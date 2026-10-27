@@ -104,8 +104,7 @@ var (
 
 	protocolVerifyFingerprintOnce sync.Once
 	protocolVerifyFingerprintFn   func(
-		handle uintptr, channelID uint64,
-		fingerprintPtr *byte, outMatched *uint32,
+		handle uintptr, channelID uint64, fingerprintPtr *byte,
 	) DeRecError
 
 	protocolRemoveExpiredChannelsOnce sync.Once
@@ -325,22 +324,15 @@ func (p *ProtocolInstance) RemoveExpiredChannels(olderThanSecs uint64) ([]byte, 
 
 // VerifyFingerprint wraps derec_protocol_verify_fingerprint: compares
 // fingerprint against channelID's locally-derived one. On match, the
-// channel transitions from Pending to Paired. The returned bool is only
-// meaningful when err == nil — every error path (including a legitimate
-// mismatch surfaced without error) already reports through err or a
-// false return, matching the FFI's fail-closed out_matched convention.
-func (p *ProtocolInstance) VerifyFingerprint(channelID uint64, fingerprint string) (bool, error) {
+// channel transitions from Pending to Paired. A mismatch is an error with
+// code CodeFingerprintMismatch.
+func (p *ProtocolInstance) VerifyFingerprint(channelID uint64, fingerprint string) error {
 	protocolVerifyFingerprintOnce.Do(func() {
 		purego.RegisterFunc(&protocolVerifyFingerprintFn, symbol("derec_protocol_verify_fingerprint"))
 	})
 	// NUL-terminated: the FFI reads fingerprint_ptr via CStr::from_ptr.
 	fpBytes := append([]byte(fingerprint), 0)
-	var matched uint32
-	res := protocolVerifyFingerprintFn(p.handle, channelID, bytePtr(fpBytes), &matched)
-	if err := errorFrom(res); err != nil {
-		return false, err
-	}
-	return matched != 0, nil
+	return errorFrom(protocolVerifyFingerprintFn(p.handle, channelID, bytePtr(fpBytes)))
 }
 
 // OwnTransport is one entry of the endpoint list SetOwnTransports takes.

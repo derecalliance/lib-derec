@@ -249,6 +249,7 @@ pub(super) async fn send_refusal<S: StoreSet>(
         parameter_range: None,
         timestamp: Some(timestamp),
         channel_id: 0,
+        fingerprint_nonce: None,
     };
 
     let envelope = DeRecMessageBuilder::pairing()

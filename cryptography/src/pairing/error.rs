@@ -15,6 +15,9 @@ pub enum DerecPairingError {
 
     #[error("invalid input size: expected {expected} bytes, got {got}")]
     InvalidSize { expected: usize, got: usize },
+
+    #[error("fingerprint nonce does not open the initiator's commitment")]
+    FingerprintCommitmentMismatch,
 }
 
 /// Failure of the ECIES pairing envelope ([`encrypt`](super::envelope::encrypt) and

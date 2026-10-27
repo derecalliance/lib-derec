@@ -207,9 +207,19 @@ type PrePairResponseMessage struct {
 	// Echoed from the request for session correlation.
 	Nonce uint64 `protobuf:"varint,4,opt,name=nonce,proto3" json:"nonce,omitempty"`
 	// Timestamp indicating when this message was created.
-	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Timestamp *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// The creator's commitment to the fingerprint nonce it reveals in
+	// `PairResponseMessage.fingerprintNonce`, computed over the two keys
+	// above exactly as `ContactMessage.fingerprintCommitment` defines.
+	// Present, exactly 32 bytes, only when `result.status == OK`.
+	//
+	// The receiver MUST refuse a response without one, and MUST later refuse
+	// a `PairResponseMessage` whose nonce does not open it. Because the
+	// commitment covers the keys, one made for another creator's keys cannot
+	// be replayed here.
+	FingerprintCommitment []byte `protobuf:"bytes,6,opt,name=fingerprintCommitment,proto3,oneof" json:"fingerprintCommitment,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *PrePairResponseMessage) Reset() {
@@ -277,6 +287,13 @@ func (x *PrePairResponseMessage) GetTimestamp() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *PrePairResponseMessage) GetFingerprintCommitment() []byte {
+	if x != nil {
+		return x.FingerprintCommitment
+	}
+	return nil
+}
+
 var File_prepair_proto protoreflect.FileDescriptor
 
 const file_prepair_proto_rawDesc = "" +
@@ -285,15 +302,17 @@ const file_prepair_proto_rawDesc = "" +
 	"\x15PrePairRequestMessage\x12\x14\n" +
 	"\x05nonce\x18\x01 \x01(\x04R\x05nonce\x128\n" +
 	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12e\n" +
-	"\x13supportedTransports\x18\x04 \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x13supportedTransportsJ\x04\b\x02\x10\x03R\x11transportProtocol\"\xc4\x02\n" +
+	"\x13supportedTransports\x18\x04 \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x13supportedTransportsJ\x04\b\x02\x10\x03R\x11transportProtocol\"\x99\x03\n" +
 	"\x16PrePairResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x129\n" +
 	"\x15mlkemEncapsulationKey\x18\x02 \x01(\fH\x00R\x15mlkemEncapsulationKey\x88\x01\x01\x12+\n" +
 	"\x0eeciesPublicKey\x18\x03 \x01(\fH\x01R\x0eeciesPublicKey\x88\x01\x01\x12\x14\n" +
 	"\x05nonce\x18\x04 \x01(\x04R\x05nonce\x128\n" +
-	"\ttimestamp\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestampB\x18\n" +
+	"\ttimestamp\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x129\n" +
+	"\x15fingerprintCommitment\x18\x06 \x01(\fH\x02R\x15fingerprintCommitment\x88\x01\x01B\x18\n" +
 	"\x16_mlkemEncapsulationKeyB\x11\n" +
-	"\x0f_eciesPublicKeyb\x06proto3"
+	"\x0f_eciesPublicKeyB\x18\n" +
+	"\x16_fingerprintCommitmentb\x06proto3"
 
 var (
 	file_prepair_proto_rawDescOnce sync.Once

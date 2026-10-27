@@ -54,7 +54,7 @@ fn make_request_with_mutated_share(
         share: committed_share.encode_to_vec(),
         share_algorithm: 0,
         version,
-        keep_list: vec![],
+        keep_version: 0,
         version_description: String::new(),
         timestamp: Some(timestamp),
         secret_id,
@@ -226,7 +226,7 @@ fn test_produce_store_share_request_message_valid() {
         version,
         secret_id,
         committed_share,
-        &[],
+        0,
         "",
         &shared_key,
         &[],
@@ -240,7 +240,7 @@ fn test_produce_store_share_request_message_valid() {
 }
 
 #[test]
-fn test_produce_store_share_request_message_with_keep_list_and_description() {
+fn test_produce_store_share_request_message_with_keep_version_and_description() {
     let secret_id: u64 = 1;
     let secret_data = b"super_secret_value";
     let channels = make_channel_ids(&[1, 2, 3]);
@@ -261,17 +261,67 @@ fn test_produce_store_share_request_message_with_keep_list_and_description() {
         version,
         secret_id,
         committed_share,
-        &[1, 2],
+        2,
         "initial share distribution",
         &shared_key,
         &[],
     )
     .expect("produce_store_share_request_message should succeed");
 
-    assert!(
-        !envelope.is_empty(),
-        "envelope wire bytes must not be empty"
-    );
+    let request = crate::primitives::sharing::request::extract(&envelope, &shared_key)
+        .expect("extract should succeed")
+        .request;
+    assert_eq!(request.keep_version, 2);
+}
+
+#[test]
+fn a_keep_version_at_or_above_the_shared_version_is_refused() {
+    let secret_id: u64 = 1;
+    let version = 3;
+    let shared_key = [7u8; 32];
+    let SplitResult { shares } = split(
+        &make_channel_ids(&[1, 2, 3]),
+        secret_id,
+        version,
+        b"super_secret_value",
+        2,
+    )
+    .expect("split should succeed");
+    let committed_share = shares.get(&ChannelId(1)).expect("missing share");
+
+    for keep_version in [version, version + 1] {
+        let err = produce_store_share_request_message(
+            ChannelId(1),
+            version,
+            secret_id,
+            committed_share,
+            keep_version,
+            "",
+            &shared_key,
+            &[],
+        )
+        .err()
+        .expect("keep_version not below version must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::Error::Sharing(SharingError::InvalidKeepVersion {
+                    keep_version: k,
+                    version: v,
+                }) if k == keep_version && v == version
+            ),
+            "{err:?}"
+        );
+    }
+}
+
+#[test]
+fn a_helper_refuses_a_keep_version_at_or_above_the_shared_version() {
+    let mut request = make_request_with_mutated_share(|_| {});
+    request.keep_version = request.version;
+    let fault = crate::primitives::sharing::response::validate_share(&request)
+        .expect_err("keep_version equal to version must be refused");
+    assert_eq!(fault.status, derec_proto::StatusEnum::FormatError);
 }
 
 #[test]
@@ -298,7 +348,7 @@ fn test_produce_store_share_response_message_valid() {
         version,
         secret_id,
         committed_share,
-        &[],
+        0,
         "",
         &shared_key,
         &[],
@@ -371,7 +421,7 @@ fn test_extract_store_share_request_wrong_key() {
         version,
         secret_id,
         committed_share,
-        &[],
+        0,
         "",
         &shared_key,
         &[],
@@ -444,7 +494,7 @@ fn test_process_store_share_response_message_valid() {
         version,
         secret_id,
         committed_share,
-        &[],
+        0,
         "",
         &shared_key,
         &[],
@@ -493,7 +543,7 @@ fn test_process_store_share_response_message_wrong_version() {
         version,
         secret_id,
         committed_share,
-        &[],
+        0,
         "",
         &shared_key,
         &[],
@@ -544,7 +594,7 @@ fn test_extract_store_share_response_wrong_key() {
         version,
         secret_id,
         committed_share,
-        &[],
+        0,
         "",
         &shared_key,
         &[],
@@ -714,7 +764,7 @@ fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
         version,
         secret_id,
         committed_share,
-        &[],
+        0,
         String::new(),
         &shared_key,
         std::slice::from_ref(&malicious_reply_to),
@@ -752,7 +802,7 @@ fn helper_bound_request_never_carries_a_replica_id() {
         version,
         secret_id,
         committed_share,
-        &[],
+        0,
         String::new(),
         &shared_key,
         &[],

@@ -212,9 +212,11 @@ type inMemoryShareStore struct {
 	mu   sync.Mutex
 	data map[shareStoreKey]Share
 
-	keep          []uint32
-	keepOK        bool
-	keepListCalls []uint32
+	// keep, when keepSet, is every KeepVersion answer; otherwise the store
+	// answers version-1, keeping the previous version.
+	keep             uint32
+	keepSet          bool
+	keepVersionCalls []uint32
 
 	// recordVerificationErr, when non-nil, is returned by every
 	// RecordVerification call instead of nil — lets a test inject a
@@ -321,11 +323,14 @@ func (s *inMemoryShareStore) RemoveVersions(secretID, channelID uint64, versions
 	return nil
 }
 
-func (s *inMemoryShareStore) KeepList(secretID uint64, version uint32) ([]uint32, bool, error) {
+func (s *inMemoryShareStore) KeepVersion(secretID uint64, version uint32) (uint32, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.keepListCalls = append(s.keepListCalls, version)
-	return s.keep, s.keepOK, nil
+	s.keepVersionCalls = append(s.keepVersionCalls, version)
+	if s.keepSet {
+		return s.keep, nil
+	}
+	return version - 1, nil
 }
 
 func (s *inMemoryShareStore) RecordVerification(secretID, channelID uint64, version uint32) error {
@@ -849,16 +854,11 @@ func TestGetFingerprint_UnpairedChannel(t *testing.T) {
 
 // TestVerifyFingerprint_UnpairedChannel mirrors
 // TestGetFingerprint_UnpairedChannel: verifying against a channel with no
-// shared key must fail closed (matched == false, non-nil error) instead
-// of crashing.
+// shared key must fail with an error instead of crashing.
 func TestVerifyFingerprint_UnpairedChannel(t *testing.T) {
 	p := newTestProtocol(t)
-	matched, err := p.VerifyFingerprint(42, "not-a-real-fingerprint")
-	if err == nil {
+	if err := p.VerifyFingerprint(42, "not-a-real-fingerprint"); err == nil {
 		t.Fatal("expected an error for an unpaired channel")
-	}
-	if matched {
-		t.Fatal("expected matched == false on error (fail-closed)")
 	}
 }
 
@@ -880,7 +880,7 @@ func TestVerifyFingerprint_ClosedProtocol(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if _, err := p.VerifyFingerprint(42, "fp"); err == nil {
+	if err := p.VerifyFingerprint(42, "fp"); err == nil {
 		t.Fatal("expected an error on a closed protocol")
 	}
 }
