@@ -230,7 +230,7 @@ fn valid_store_share() -> derec_proto::StoreShareRequestMessage {
     .expect("split");
     let committed = split.shares.get(&CHANNEL).expect("share for the channel");
     let produced =
-        request::produce(CHANNEL, 1, SECRET_ID, committed, &[], "", &KEY, &[]).expect("produce");
+        request::produce(CHANNEL, 1, SECRET_ID, committed, 0, "", &KEY, &[]).expect("produce");
     request::extract(&produced.envelope, &KEY)
         .expect("extract")
         .request

@@ -101,7 +101,11 @@ impl<
     }
 
     /// Remove `Pending` channels older than `older_than_secs`, along with
-    /// their pairing keys. Returns the ids that were removed.
+    /// their channel key and pairing material. Returns the ids that were
+    /// removed.
+    ///
+    /// No key outlives the pairing it was agreed for: without the record, the
+    /// key would decrypt the peer's messages again.
     ///
     /// This is **independent of**
     /// [`Timeouts::expired_channels`](crate::protocol::types::Timeouts::expired_channels): it sweeps at
@@ -126,8 +130,12 @@ impl<
     /// [`crate::protocol::ExpiredChannelCleanup::Enabled`].
     ///
     /// Replica rows are swept on the same clock: a replica pairing that never
-    /// completed leaves a `Pending` member row behind. This device's own row is
-    /// never a pending pairing, so it is exempt.
+    /// completed leaves a `Pending` member row behind. Members of a group share
+    /// one channel and one key, so the key goes only once no peer is recorded
+    /// on the channel. This device's own row is swept only when it is `Pending`
+    /// and no peer remains on its channel — the remainder of a pairing that
+    /// never completed; a `Paired` own row is its place in the group and is
+    /// never swept.
     pub async fn remove_expired_channels(
         &mut self,
         older_than_secs: u64,
@@ -156,22 +164,7 @@ impl<
                         },
                     )
                     .await?;
-                let _ = self
-                    .secret_store
-                    .remove(
-                        self.secret_id,
-                        channel.channel_id,
-                        SecretKind::PairingSecret,
-                    )
-                    .await;
-                let _ = self
-                    .secret_store
-                    .remove(
-                        self.secret_id,
-                        channel.channel_id,
-                        SecretKind::PairingContact,
-                    )
-                    .await;
+                self.remove_channel_secrets(channel.channel_id).await;
 
                 #[cfg(feature = "logging")]
                 tracing::info!(
@@ -220,7 +213,103 @@ impl<
                 }
             }
         }
+
+        if let Some(own) = self.own_member().await?
+            && own.status == crate::protocol::types::ChannelStatus::Pending
+            && now.saturating_sub(own.created_at) > timeout
+            && self.release_if_unused(own.channel_id).await?
+            && !removed.contains(&own.channel_id)
+        {
+            removed.push(own.channel_id);
+        }
+        for channel_id in removed.clone() {
+            self.release_if_unused(channel_id).await?;
+        }
         Ok(removed)
+    }
+
+    /// This device's own member row, whichever channel it is on.
+    async fn own_member(&self) -> Result<Option<crate::protocol::types::ReplicaMember>> {
+        let Some(own) = self.replica_id else {
+            return Ok(None);
+        };
+        Ok(self
+            .channel_store
+            .replicas_matching(
+                self.secret_id,
+                crate::protocol::types::ReplicaFilter {
+                    ids: vec![crate::types::ReplicaId(own)],
+                    ..Default::default()
+                },
+            )
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Drop what is left of a channel no peer is recorded on any more.
+    ///
+    /// A channel's key outlives no pairing: once no helper and no other member
+    /// is recorded on `channel_id`, a `Pending` own row there is the remainder
+    /// of an unconfirmed pairing and goes, and so do the channel key and the
+    /// pairing material. A `Paired` own row is the device's place in a group
+    /// and keeps the channel. Returns whether the channel was released.
+    pub(super) async fn release_if_unused(&mut self, channel_id: ChannelId) -> Result<bool> {
+        use crate::protocol::types::{ChannelQuery, ChannelStatus};
+
+        if self
+            .channel_store
+            .load(self.secret_id, ChannelQuery::Helper { channel_id })
+            .await?
+            .and_then(|r| r.as_helper().cloned())
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let on_channel: Vec<_> = self
+            .channel_store
+            .replicas_matching(self.secret_id, Default::default())
+            .await?
+            .into_iter()
+            .filter(|m| m.channel_id == channel_id)
+            .collect();
+        let own = self.replica_id.map(crate::types::ReplicaId);
+        if on_channel
+            .iter()
+            .any(|m| Some(m.replica_id) != own || m.status == ChannelStatus::Paired)
+        {
+            return Ok(false);
+        }
+        for member in on_channel {
+            self.channel_store
+                .remove(
+                    self.secret_id,
+                    ChannelQuery::Replica {
+                        channel_id,
+                        replica_id: member.replica_id,
+                    },
+                )
+                .await?;
+        }
+        self.remove_channel_secrets(channel_id).await;
+        Ok(true)
+    }
+
+    /// Remove the channel key and the pairing material held for `channel_id`.
+    ///
+    /// Absence is not an error: a pairing that never completed holds no key,
+    /// and one that completed holds no pairing material.
+    async fn remove_channel_secrets(&mut self, channel_id: ChannelId) {
+        for kind in [
+            SecretKind::SharedKey,
+            SecretKind::PairingSecret,
+            SecretKind::PairingContact,
+        ] {
+            let _ = self
+                .secret_store
+                .remove(self.secret_id, channel_id, kind)
+                .await;
+        }
     }
 
     /// The time-driven sweeps, shared by [`Self::tick`] and [`Self::process`]
@@ -286,15 +375,14 @@ impl<
     /// Drop the owner's proofs for the versions `channel_id` removed when it
     /// confirmed round `version`.
     ///
-    /// A Helper that accepts a share applies the request's `keepList`: it
-    /// removes every other version it holds on the channel, the accepted one
-    /// aside, so the owner's proofs of those versions can no longer be
-    /// answered. This mirrors that rule on the owner, and errs only towards
-    /// keeping a proof:
+    /// A Helper that accepts a share applies the request's `keepVersion`: it
+    /// removes every version it holds on the channel other than the accepted
+    /// one and `keepVersion`, so the owner's proofs of those versions can no
+    /// longer be answered. This mirrors that rule on the owner, and errs only
+    /// towards keeping a proof:
     ///
-    /// - An empty `keep_list` told the Helper to keep everything, so nothing
-    ///   is removed.
-    /// - A Helper ignores the `keepList` of a request older than a version it
+    /// - A round with no recorded `keep_version` removes nothing.
+    /// - A Helper ignores the `keepVersion` of a request older than a version it
     ///   already holds. When the owner holds a proof newer than `version` for
     ///   this channel the Helper may have accepted that one first, so nothing
     ///   is removed.
@@ -302,8 +390,8 @@ impl<
     ///   after `version` and be stored without pruning, so its proof stays.
     ///
     /// A proof left behind this way is removed by a later confirmation whose
-    /// `keepList` leaves it out. A confirmation arriving after its round has
-    /// closed carries no `keepList` to apply and removes nothing.
+    /// `keepVersion` is not that version. A confirmation arriving after its
+    /// round has closed carries no `keepVersion` to apply and removes nothing.
     ///
     /// A store error is logged and swallowed, as in
     /// [`Self::drop_failed_proofs`].
@@ -311,12 +399,12 @@ impl<
         &mut self,
         channel_id: ChannelId,
         version: u32,
-        keep_list: &[u32],
+        keep_version: Option<u32>,
         unanswered: &[(u32, std::collections::HashSet<ChannelId>)],
     ) {
-        if keep_list.is_empty() {
+        let Some(keep_version) = keep_version else {
             return;
-        }
+        };
         let stored = match self.share_store.load(self.secret_id, channel_id, &[]).await {
             Ok(stored) => stored,
             Err(_error) => {
@@ -325,7 +413,7 @@ impl<
                     channel_id = channel_id.0,
                     version,
                     error = %_error,
-                    "keep-list proof cleanup could not load the channel's proofs"
+                    "keep-version proof cleanup could not load the channel's proofs"
                 );
                 return;
             }
@@ -336,7 +424,7 @@ impl<
         let mut dropped: Vec<u32> = stored
             .iter()
             .map(|share| share.version)
-            .filter(|v| *v != version && !keep_list.contains(v))
+            .filter(|v| *v != version && *v != keep_version)
             .filter(|v| {
                 !unanswered
                     .iter()
@@ -358,7 +446,7 @@ impl<
                 channel_id = channel_id.0,
                 version,
                 error = %_error,
-                "keep-list proof cleanup failed; proofs left in store"
+                "keep-version proof cleanup failed; proofs left in store"
             );
         } else {
             #[cfg(feature = "logging")]
@@ -366,7 +454,7 @@ impl<
                 channel_id = channel_id.0,
                 version,
                 removed = ?dropped,
-                "owner proofs outside the confirmed keepList removed"
+                "owner proofs other than the confirmed keepVersion removed"
             );
         }
     }
@@ -444,7 +532,7 @@ impl<
                 mut synced_replicas,
                 mut behind_replicas,
                 started_at,
-                keep_list,
+                keep_version,
                 threshold,
             } = *round;
 
@@ -459,7 +547,7 @@ impl<
                 &mut synced_replicas,
                 &mut behind_replicas,
                 started_at,
-                keep_list,
+                keep_version,
                 threshold,
                 &unanswered,
             )
@@ -505,7 +593,7 @@ impl<
                 synced_replicas,
                 mut behind_replicas,
                 started_at,
-                keep_list,
+                keep_version,
                 threshold,
             } = *round;
 
@@ -561,7 +649,7 @@ impl<
                         synced_replicas,
                         behind_replicas,
                         started_at,
-                        keep_list,
+                        keep_version,
                         threshold,
                     })),
                 )
@@ -643,7 +731,7 @@ impl<
         synced_replicas: &mut std::collections::HashSet<crate::types::ReplicaId>,
         behind_replicas: &mut std::collections::HashSet<crate::types::ReplicaId>,
         started_at: u64,
-        keep_list: Vec<u32>,
+        keep_version: Option<u32>,
         threshold: Option<u32>,
         unanswered: &[(u32, std::collections::HashSet<ChannelId>)],
     ) {
@@ -708,7 +796,7 @@ impl<
 
         self.drop_failed_proofs(round_version, &newly_failed).await;
         for channel_id in newly_confirmed {
-            self.drop_pruned_proofs(channel_id, round_version, &keep_list, unanswered)
+            self.drop_pruned_proofs(channel_id, round_version, keep_version, unanswered)
                 .await;
         }
 
@@ -826,7 +914,7 @@ impl<
                         synced_replicas: std::mem::take(synced_replicas),
                         behind_replicas: std::mem::take(behind_replicas),
                         started_at,
-                        keep_list,
+                        keep_version,
                         threshold,
                     })),
                 )
@@ -1136,6 +1224,194 @@ mod expired_channel_sweep_tests {
             assert_eq!(channels.helper_rows.lock().unwrap().len(), 1);
         });
     }
+
+    fn build_with_secrets(
+        channels: InMemChannelStore,
+        secrets: InMemSecretStore,
+    ) -> DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemStateStore,
+        NoopTransport,
+    > {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(channels)
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(secrets)
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(NoopTransport)
+            .with_state_store(InMemStateStore)
+            .with_own_transports(["https://owner.example.com"])
+            .with_threshold(2)
+            .with_timeouts(crate::protocol::types::Timeouts {
+                expired_channels: ExpiredChannelCleanup::Disabled,
+                ..Default::default()
+            })
+            .build()
+            .expect("test protocol builds")
+    }
+
+    async fn seed_member_on(
+        channels: &mut InMemChannelStore,
+        channel_id: u64,
+        replica_id: u64,
+        status: ChannelStatus,
+        age_secs: u64,
+    ) {
+        channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Replica(ReplicaMember {
+                    channel_id: ChannelId(channel_id),
+                    replica_id: crate::types::ReplicaId(replica_id),
+                    transports: vec![endpoint()],
+                    communication_info: std::collections::HashMap::new(),
+                    role: ReplicaRole::Destination,
+                    status,
+                    created_at: now_secs().saturating_sub(age_secs),
+                }),
+            )
+            .await
+            .expect("seed member");
+    }
+
+    async fn seed_key(secrets: &mut InMemSecretStore, channel_id: u64) {
+        secrets
+            .save(
+                SECRET_ID,
+                ChannelId(channel_id),
+                SecretValue::SharedKey([3u8; 32]),
+            )
+            .await
+            .expect("seed shared key");
+    }
+
+    fn has_key(secrets: &InMemSecretStore, channel_id: u64) -> bool {
+        secrets.data.lock().unwrap().contains_key(&(
+            SECRET_ID,
+            channel_id,
+            SecretKind::SharedKey as u8,
+        ))
+    }
+
+    /// A pairing that expired unconfirmed leaves no channel key: with the
+    /// record gone, a retained key would decrypt the peer's messages again.
+    #[test]
+    fn an_expired_helper_pairing_loses_its_channel_key() {
+        run_async(async {
+            let (channels, secrets) = (InMemChannelStore::default(), InMemSecretStore::default());
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed(&mut c, 1, ChannelStatus::Pending, 600).await;
+            seed_key(&mut s, 1).await;
+
+            let mut protocol = build_with_secrets(channels, secrets.clone());
+            protocol
+                .remove_expired_channels(60)
+                .await
+                .expect("sweep succeeds");
+
+            assert!(!has_key(&secrets, 1));
+        });
+    }
+
+    /// A replica pairing whose only peer expired leaves no channel key.
+    #[test]
+    fn an_expired_replica_pairing_loses_its_channel_key() {
+        run_async(async {
+            let (channels, secrets) = (InMemChannelStore::default(), InMemSecretStore::default());
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed_member_on(&mut c, 9100, 7, ChannelStatus::Pending, 600).await;
+            seed_key(&mut s, 9100).await;
+
+            let mut protocol = build_with_secrets(channels, secrets.clone());
+            protocol
+                .remove_expired_channels(60)
+                .await
+                .expect("sweep succeeds");
+
+            assert!(!has_key(&secrets, 9100));
+        });
+    }
+
+    /// Members of a group share one channel and one key, so an expired
+    /// member does not take the key the remaining members still use.
+    #[test]
+    fn an_expired_member_leaves_the_key_of_a_channel_still_in_use() {
+        run_async(async {
+            let (channels, secrets) = (InMemChannelStore::default(), InMemSecretStore::default());
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed_member_on(&mut c, 9000, 7, ChannelStatus::Pending, 600).await;
+            seed_member_on(&mut c, 9000, 8, ChannelStatus::Paired, 600).await;
+            seed_key(&mut s, 9000).await;
+
+            let mut protocol = build_with_secrets(channels.clone(), secrets.clone());
+            protocol
+                .remove_expired_channels(60)
+                .await
+                .expect("sweep succeeds");
+
+            assert!(has_key(&secrets, 9000));
+            assert!(
+                channels
+                    .member_rows
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(SECRET_ID, 8))
+            );
+        });
+    }
+
+    /// This device's own `Pending` row belongs to the pairing, not to a
+    /// group: once no peer remains on its channel and it has expired, it goes
+    /// with the key.
+    #[test]
+    fn an_expired_own_row_with_no_peer_left_goes_with_the_key() {
+        run_async(async {
+            let (channels, secrets) = (InMemChannelStore::default(), InMemSecretStore::default());
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed_member_on(&mut c, 9100, 7, ChannelStatus::Pending, 600).await;
+            seed_member_on(&mut c, 9100, 9, ChannelStatus::Pending, 600).await;
+            seed_key(&mut s, 9100).await;
+
+            let mut protocol = build_with_secrets(channels.clone(), secrets.clone());
+            protocol.replica_id = Some(9);
+            protocol
+                .remove_expired_channels(60)
+                .await
+                .expect("sweep succeeds");
+
+            assert!(channels.member_rows.lock().unwrap().is_empty());
+            assert!(!has_key(&secrets, 9100));
+        });
+    }
+
+    /// An initiator waiting for its peer holds only its own `Pending` row; a
+    /// pairing that has not expired is not swept.
+    #[test]
+    fn a_fresh_own_row_awaiting_its_peer_survives() {
+        run_async(async {
+            let (channels, secrets) = (InMemChannelStore::default(), InMemSecretStore::default());
+            let mut c = channels.clone();
+            seed_member_on(&mut c, 9100, 9, ChannelStatus::Pending, 0).await;
+
+            let mut protocol = build_with_secrets(channels.clone(), secrets);
+            protocol.replica_id = Some(9);
+            protocol
+                .remove_expired_channels(60)
+                .await
+                .expect("sweep succeeds");
+
+            assert!(
+                channels
+                    .member_rows
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(SECRET_ID, 9))
+            );
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1196,7 +1472,7 @@ mod sharing_round_outcome_tests {
                     synced_replicas: HashSet::new(),
                     behind_replicas: HashSet::new(),
                     started_at: now_secs(),
-                    keep_list: Vec::new(),
+                    keep_version: None,
                     threshold: None,
                 })),
             )
@@ -1316,7 +1592,7 @@ mod sharing_round_outcome_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::new(),
                         started_at: now_secs().saturating_sub(600),
-                        keep_list: Vec::new(),
+                        keep_version: None,
                         threshold: None,
                     })),
                 )
@@ -1380,7 +1656,7 @@ mod sharing_round_outcome_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::new(),
                         started_at: now_secs().saturating_sub(600),
-                        keep_list: Vec::new(),
+                        keep_version: None,
                         threshold: None,
                     })),
                 )
@@ -1846,7 +2122,7 @@ mod sharing_round_outcome_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::from([ReplicaId(1003)]),
                         started_at: now_secs(),
-                        keep_list: Vec::new(),
+                        keep_version: None,
                         threshold: None,
                     })),
                 )
@@ -2125,7 +2401,7 @@ mod timeout_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::new(),
                         started_at: now_secs().saturating_sub(30),
-                        keep_list: Vec::new(),
+                        keep_version: None,
                         threshold: None,
                     })),
                 )
@@ -2234,12 +2510,8 @@ mod proof_cleanup_tests {
             }
             self.inner.remove_versions(secret_id, channel_id, versions)
         }
-        fn keep_list(
-            &self,
-            secret_id: u64,
-            version: u32,
-        ) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
-            self.inner.keep_list(secret_id, version)
+        fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32> {
+            self.inner.keep_version(secret_id, version)
         }
     }
 
@@ -2303,7 +2575,7 @@ mod proof_cleanup_tests {
                     synced_replicas: HashSet::new(),
                     behind_replicas: HashSet::new(),
                     started_at: now_secs(),
-                    keep_list: Vec::new(),
+                    keep_version: None,
                     threshold: None,
                 })),
             )
@@ -2391,7 +2663,7 @@ mod proof_cleanup_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::new(),
                         started_at: now_secs().saturating_sub(600),
-                        keep_list: Vec::new(),
+                        keep_version: None,
                         threshold: None,
                     })),
                 )
@@ -2562,7 +2834,7 @@ mod proof_cleanup_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::new(),
                         started_at: now_secs().saturating_sub(600),
-                        keep_list: Vec::new(),
+                        keep_version: None,
                         threshold: None,
                     })),
                 )
@@ -2601,7 +2873,7 @@ mod proof_cleanup_tests {
                         synced_replicas: HashSet::new(),
                         behind_replicas: HashSet::new(),
                         started_at: now_secs(),
-                        keep_list: Vec::new(),
+                        keep_version: None,
                         threshold: None,
                     })),
                 )
@@ -2729,7 +3001,7 @@ mod weighted_tally_tests {
                     synced_replicas: HashSet::new(),
                     behind_replicas: HashSet::new(),
                     started_at: now_secs(),
-                    keep_list: Vec::new(),
+                    keep_version: None,
                     threshold: round_threshold,
                 })),
             )
@@ -2844,11 +3116,11 @@ mod weighted_tally_tests {
     }
 }
 
-/// A Helper prunes the versions a `keepList` leaves out when it accepts the
+/// A Helper prunes every version other than the `keepVersion` when it accepts the
 /// version that carries it, so the owner's proofs for those versions follow
 /// the Helper's confirmation and never its refusal.
 #[cfg(test)]
-mod keep_list_proof_tests {
+mod keep_version_proof_tests {
     use super::*;
     use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
     use crate::protocol::DeRecFlow;
@@ -3029,10 +3301,10 @@ mod keep_list_proof_tests {
     /// v3 they hold only v3, and so does the owner. Verifying v1 is then a
     /// local condition, not a question for the Helpers.
     #[test]
-    fn confirmed_versions_outside_the_keep_list_lose_their_proofs() {
+    fn confirmed_versions_other_than_the_keep_version_lose_their_proofs() {
         run_async(async {
             let shares = InMemShareStore::default();
-            *shares.keep.lock().unwrap() = Some(Vec::new());
+            *shares.keep.lock().unwrap() = Some(0);
             let transport = RecordingTransport::default();
             let mut protocol = owner(shares.clone(), transport.clone()).await;
 
@@ -3086,7 +3358,7 @@ mod keep_list_proof_tests {
             round(&mut protocol, &transport, ok).await;
             assert_eq!(versions_held(&shares, B), vec![1, 2]);
 
-            *shares.keep.lock().unwrap() = Some(Vec::new());
+            *shares.keep.lock().unwrap() = Some(0);
             let version = round(&mut protocol, &transport, |channel| {
                 if channel == B {
                     derec_proto::StatusEnum::Fail
@@ -3106,17 +3378,17 @@ mod keep_list_proof_tests {
         });
     }
 
-    /// A version the keep list names is still held by the Helper, so its
-    /// proof stays.
+    /// The `keepVersion` is still held by the Helper, so its proof stays.
     #[test]
-    fn a_version_the_keep_list_names_keeps_its_proof() {
+    fn the_keep_version_keeps_its_proof() {
         run_async(async {
             let shares = InMemShareStore::default();
-            *shares.keep.lock().unwrap() = Some(vec![1]);
             let transport = RecordingTransport::default();
             let mut protocol = owner(shares.clone(), transport.clone()).await;
 
-            for _ in 1..=3 {
+            round(&mut protocol, &transport, ok).await;
+            *shares.keep.lock().unwrap() = Some(1);
+            for _ in 2..=3 {
                 round(&mut protocol, &transport, ok).await;
             }
 
@@ -3138,7 +3410,7 @@ mod keep_list_proof_tests {
         );
     }
 
-    async fn seed_open_round(protocol: &mut TestProtocol, version: u32, keep_list: Vec<u32>) {
+    async fn seed_open_round(protocol: &mut TestProtocol, version: u32, keep_version: Option<u32>) {
         protocol
             .state_store
             .save(
@@ -3152,7 +3424,7 @@ mod keep_list_proof_tests {
                     synced_replicas: Default::default(),
                     behind_replicas: Default::default(),
                     started_at: now_secs(),
-                    keep_list,
+                    keep_version,
                     threshold: None,
                 })),
             )
@@ -3160,7 +3432,7 @@ mod keep_list_proof_tests {
             .expect("seed round");
     }
 
-    /// A Helper ignores the `keepList` of a request older than a version it
+    /// A Helper ignores the `keepVersion` of a request older than a version it
     /// already holds. While the owner holds a newer proof for the channel,
     /// confirming the older round removes nothing.
     #[test]
@@ -3171,7 +3443,7 @@ mod keep_list_proof_tests {
                 seed_proof(&shares, A, version);
             }
             let mut protocol = owner(shares.clone(), RecordingTransport::default()).await;
-            seed_open_round(&mut protocol, 4, vec![4]).await;
+            seed_open_round(&mut protocol, 4, Some(0)).await;
 
             let mut events = vec![DeRecEvent::ShareConfirmed {
                 channel_id: ChannelId(A),
@@ -3193,8 +3465,8 @@ mod keep_list_proof_tests {
                 seed_proof(&shares, A, version);
             }
             let mut protocol = owner(shares.clone(), RecordingTransport::default()).await;
-            seed_open_round(&mut protocol, 4, vec![4]).await;
-            seed_open_round(&mut protocol, 5, vec![5]).await;
+            seed_open_round(&mut protocol, 4, Some(0)).await;
+            seed_open_round(&mut protocol, 5, Some(0)).await;
 
             let mut events = vec![DeRecEvent::ShareConfirmed {
                 channel_id: ChannelId(A),
@@ -3210,10 +3482,10 @@ mod keep_list_proof_tests {
         });
     }
 
-    /// With no list from the application every Helper keeps every version,
-    /// and so does the owner.
+    /// Keeping the version before each time leaves the owner the proofs of
+    /// the last two versions, as the Helpers hold.
     #[test]
-    fn no_keep_list_keeps_every_proof() {
+    fn keeping_the_previous_version_keeps_the_last_two_proofs() {
         run_async(async {
             let shares = InMemShareStore::default();
             let transport = RecordingTransport::default();
@@ -3223,8 +3495,30 @@ mod keep_list_proof_tests {
                 round(&mut protocol, &transport, ok).await;
             }
 
+            assert_eq!(versions_held(&shares, A), vec![2, 3]);
+            assert_eq!(versions_held(&shares, B), vec![2, 3]);
+        });
+    }
+
+    /// A round with no recorded `keep_version`, such as one persisted before
+    /// the field existed, removes no proof when its Helpers confirm.
+    #[test]
+    fn a_round_without_a_keep_version_removes_no_proof() {
+        run_async(async {
+            let shares = InMemShareStore::default();
+            for version in [1, 2, 3] {
+                seed_proof(&shares, A, version);
+            }
+            let mut protocol = owner(shares.clone(), RecordingTransport::default()).await;
+            seed_open_round(&mut protocol, 3, None).await;
+
+            let mut events = vec![DeRecEvent::ShareConfirmed {
+                channel_id: ChannelId(A),
+                version: 3,
+            }];
+            protocol.update_sharing_round(&mut events).await;
+
             assert_eq!(versions_held(&shares, A), vec![1, 2, 3]);
-            assert_eq!(versions_held(&shares, B), vec![1, 2, 3]);
         });
     }
 }

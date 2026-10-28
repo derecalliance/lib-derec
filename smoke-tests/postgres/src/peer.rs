@@ -76,7 +76,29 @@ impl Peer {
         uri: &str,
         policy: derec_library::protocol::AutoAcceptPolicy,
     ) -> Self {
-        Self::with_full_options(client, label, uri, PeerOptions::default(), policy)
+        Self::with_full_options(client, label, uri, PeerOptions::default(), policy, None)
+    }
+
+    /// Construct a peer whose `Pending` channels are swept only by the
+    /// caller-driven `remove_expired_channels`, never automatically.
+    pub fn with_expired_channel_cleanup(
+        client: SharedClient,
+        label: &'static str,
+        uri: &str,
+        options: PeerOptions,
+        policy: derec_library::protocol::ExpiredChannelCleanup,
+    ) -> Self {
+        Self::with_full_options(
+            client,
+            label,
+            uri,
+            options,
+            derec_library::protocol::AutoAcceptPolicy::default(),
+            Some(derec_library::protocol::types::Timeouts {
+                expired_channels: policy,
+                ..Default::default()
+            }),
+        )
     }
 
     pub fn with_options(
@@ -91,6 +113,7 @@ impl Peer {
             uri,
             options,
             derec_library::protocol::AutoAcceptPolicy::default(),
+            None,
         )
     }
 
@@ -100,6 +123,7 @@ impl Peer {
         uri: &str,
         options: PeerOptions,
         auto_accept: derec_library::protocol::AutoAcceptPolicy,
+        timeouts: Option<derec_library::protocol::types::Timeouts>,
     ) -> Self {
         let transport = InProcessTransport::new();
         let channel_store = PostgresChannelStore::new(client.clone());
@@ -120,6 +144,9 @@ impl Peer {
             .with_auto_accept(auto_accept);
         if let Some(rid) = options.replica_id {
             builder = builder.with_replica_id(rid);
+        }
+        if let Some(timeouts) = timeouts {
+            builder = builder.with_timeouts(timeouts);
         }
         let protocol = builder
             .build()

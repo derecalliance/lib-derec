@@ -209,6 +209,12 @@ pub(crate) trait ChannelStoreExt: DeRecChannelStore {
     /// Every member of a group answers on the same `channel_id`, so the
     /// channel alone cannot name the peer — the author does. A `0` is the
     /// wire's absent-value sentinel and never identifies a member.
+    ///
+    /// The author is sender-written, so it resolves only on the channel the
+    /// member is recorded on. A member is stored by `(secret_id, replica_id)`
+    /// and the store does not match `channel_id`; without this check, any peer
+    /// holding a channel key could name a member and reach the replica path on
+    /// its own channel.
     async fn load_replica_member(
         &self,
         secret_id: u64,
@@ -225,6 +231,7 @@ pub(crate) trait ChannelStoreExt: DeRecChannelStore {
         )
         .await?
         .and_then(|r| r.as_replica().cloned())
+        .filter(|member| member.channel_id == channel_id)
         .ok_or(Error::InvalidInput(
             "replica sync names a member that is not in the group",
         ))

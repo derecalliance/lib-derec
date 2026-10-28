@@ -1,6 +1,6 @@
 [package]
 name = "derec-cryptography"
-version = "0.0.9"
+version = "0.0.10"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -24,6 +24,7 @@ logging = ["dep:tracing"]
 [dependencies]
 tracing = { version = "0.1.44", default-features = false, features = ["attributes"], optional = true }
 sha2 = "0.11.0"
+subtle = "2.6.1"
 aead = "0.6.1"
 aes = { version = "0.9.1", features = ["zeroize"] }
 aes-gcm = { version = "0.11.0", features = ["zeroize"] }

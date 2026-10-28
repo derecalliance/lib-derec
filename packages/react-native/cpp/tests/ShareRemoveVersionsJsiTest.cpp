@@ -5,7 +5,7 @@
 // when a host Hermes build is available.
 //
 // `ShareStoreCallbacks.remove_versions` is how a helper applies a
-// `StoreShareRequestMessage.keepList`. It is driven here exactly as the
+// `StoreShareRequestMessage.keepVersion`. It is driven here exactly as the
 // library calls it, so the arguments the JS `ShareStore.removeVersions`
 // receives and the status a failing store reports are both checked.
 

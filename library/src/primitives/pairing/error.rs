@@ -26,6 +26,11 @@ pub enum PairingError {
     PrePairHashMismatch,
 
     #[error(
+        "fingerprint commitment mismatch: the revealed nonce does not open the creator's commitment"
+    )]
+    FingerprintCommitmentMismatch,
+
+    #[error(
         "replica-mode pairing (sender_kind={sender_kind:?}) missing the reserved `derec.replica_id` key"
     )]
     MissingReplicaId {

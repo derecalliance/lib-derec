@@ -154,6 +154,10 @@ pub struct ProcessPrePairResult {
     #[serde(with = "serde_bytes")]
     pub ecies_public_key: Vec<u8>,
     pub nonce: u64,
+    /// The creator's commitment to its fingerprint nonce. Carry it into the
+    /// contact the pair request is built from, alongside the two keys.
+    #[serde(with = "serde_bytes")]
+    pub fingerprint_commitment: Vec<u8>,
 }
 
 /// Contact-creator side: publish the actual public keys back to the scanner.
@@ -227,6 +231,7 @@ pub fn process_pre_pair(contact_message: JsValue, response: JsValue) -> Result<J
         mlkem_encapsulation_key: result.mlkem_encapsulation_key,
         ecies_public_key: result.ecies_public_key,
         nonce: result.nonce,
+        fingerprint_commitment: result.fingerprint_commitment,
     })
 }
 
@@ -251,6 +256,7 @@ pub fn process_pre_pair_no_keys(
         mlkem_encapsulation_key: result.mlkem_encapsulation_key,
         ecies_public_key: result.ecies_public_key,
         nonce: result.nonce,
+        fingerprint_commitment: result.fingerprint_commitment,
     })
 }
 

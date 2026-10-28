@@ -172,6 +172,10 @@ pub struct ProcessPrePairResponseMessageResult {
     pub ecies_public_key: DeRecBuffer,
     /// Nonce echoed from the original `ContactMessage`. Zero on failure.
     pub nonce: u64,
+    /// The creator's 32-byte commitment to its fingerprint nonce. Carry it
+    /// into the contact the pair request is built from, in
+    /// `fingerprint_commitment`, alongside the two keys.
+    pub fingerprint_commitment: DeRecBuffer,
 }
 
 /// Single entry point for all three modes:
@@ -997,6 +1001,7 @@ pub extern "C" fn process_pre_pair_no_keys_response_message(
         mlkem_encapsulation_key: empty_buffer(),
         ecies_public_key: empty_buffer(),
         nonce: 0,
+        fingerprint_commitment: empty_buffer(),
     };
 
     let contact_message_bytes = match parse_buffer(
@@ -1040,6 +1045,7 @@ pub extern "C" fn process_pre_pair_no_keys_response_message(
             mlkem_encapsulation_key: vec_into_buffer(r.mlkem_encapsulation_key),
             ecies_public_key: vec_into_buffer(r.ecies_public_key),
             nonce: r.nonce,
+            fingerprint_commitment: vec_into_buffer(r.fingerprint_commitment),
         },
         Err(e) => with_err(from_lib_error(e)),
     }
@@ -1100,6 +1106,7 @@ pub extern "C" fn process_pre_pair_response_message(
         mlkem_encapsulation_key: empty_buffer(),
         ecies_public_key: empty_buffer(),
         nonce: 0,
+        fingerprint_commitment: empty_buffer(),
     };
 
     let contact_message_bytes = match parse_buffer(
@@ -1140,6 +1147,7 @@ pub extern "C" fn process_pre_pair_response_message(
             mlkem_encapsulation_key: vec_into_buffer(r.mlkem_encapsulation_key),
             ecies_public_key: vec_into_buffer(r.ecies_public_key),
             nonce: r.nonce,
+            fingerprint_commitment: vec_into_buffer(r.fingerprint_commitment),
         },
         Err(e) => with_err(from_lib_error(e)),
     }
@@ -1362,6 +1370,7 @@ mod contact_message_json_tests {
         "contact_mode": 0,
         "mlkem_encapsulation_key": [1, 2, 3],
         "ecies_public_key": [4, 5, 6],
+        "fingerprint_commitment": [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
         "timestamp": { "seconds": 1700000000, "nanos": 42 }
     }"#;
 
@@ -1391,6 +1400,10 @@ mod contact_message_json_tests {
         );
         assert_eq!(value["ecies_public_key"], serde_json::json!([4, 5, 6]));
         assert!(value.get("contact_binding_hash").is_none());
+        assert_eq!(
+            value["fingerprint_commitment"],
+            serde_json::json!(vec![8; 32])
+        );
         assert_eq!(value["timestamp"]["seconds"], 1700000000);
         assert_eq!(value["timestamp"]["nanos"], 42);
 
@@ -1439,6 +1452,7 @@ mod contact_message_json_tests {
                 uri: "https://owner.example.com".to_owned(),
                 protocol: 0,
             }],
+            fingerprint_commitment: Some(vec![8; 32]),
         }
         .encode_to_vec();
 

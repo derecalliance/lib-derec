@@ -90,10 +90,36 @@ let plaintext = envelope::decrypt(&ciphertext, &receiver_sk).unwrap();
 
 ---
 
+## Pairing Channel Key
+
+`pairing` derives the 32-byte channel key in two steps. The handshake key is
+the ML-KEM shared secret XOR the ECDH shared secret. The channel key hashes it
+together with a random fingerprint nonce the initiator drew in
+`contact_message`:
+
+```text
+commitment  = SHA-256("DeRec fingerprint commitment v1"
+                      || mlkem_encapsulation_key || ecies_public_key || nonce)
+channel_key = SHA-256("DeRec channel key v1" || handshake_key || nonce)
+```
+
+The responder picks every random input of the handshake key after it has seen
+the initiator's public keys. The initiator therefore publishes the commitment
+with those keys and reveals the nonce only once the responder has fixed the
+handshake key. `finish_pairing_responder` takes the commitment and the
+revealed nonce, refuses a nonce that does not open the commitment
+(`DerecPairingError::FingerprintCommitmentMismatch`), and returns the channel
+key; `finish_pairing_initiator` binds its own nonce. Because the commitment
+covers the keys, one made for another initiator's keys does not open over
+these. Neither party can steer the channel key, and so the fingerprint below,
+by searching over its own contribution.
+
+---
+
 ## Replica Fingerprint
 
 The module `replica` derives a 16-digit decimal fingerprint from the 32-byte
-shared key established during Replica pairing. Both devices display this
+channel key established during pairing. Both devices display this
 fingerprint so the user can visually confirm they are pairing with the correct
 peer (similar to Bluetooth pairing).
 

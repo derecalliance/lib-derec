@@ -333,8 +333,9 @@ impl DeRecSecretStore for InMemSecretStore {
 pub struct InMemShareStore {
     #[allow(clippy::type_complexity)]
     pub data: Arc<Mutex<HashMap<(u64, u64, u32), Share>>>,
-    /// What [`DeRecShareStore::keep_list`] answers on every call.
-    pub keep: Arc<Mutex<Option<Vec<u32>>>>,
+    /// What [`DeRecShareStore::keep_version`] answers on every call; when
+    /// unset it answers `version - 1`, the version distributed before.
+    pub keep: Arc<Mutex<Option<u32>>>,
 }
 
 impl DeRecShareStore for InMemShareStore {
@@ -398,8 +399,12 @@ impl DeRecShareStore for InMemShareStore {
             .retain(|(s, c, v), _| !(*s == sid && *c == cid.0 && versions.contains(v)));
         Box::pin(std::future::ready(Ok(())))
     }
-    fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
-        let keep = self.keep.lock().unwrap().clone();
+    fn keep_version(&self, _: u64, version: u32) -> ShareStoreFuture<'_, u32> {
+        let keep = self
+            .keep
+            .lock()
+            .unwrap()
+            .unwrap_or(version.saturating_sub(1));
         Box::pin(std::future::ready(Ok(keep)))
     }
 }
@@ -508,8 +513,8 @@ impl DeRecShareStore for RefusingShareStore {
     ) -> ShareStoreFuture<'_, ()> {
         self.inner.remove_versions(secret_id, channel_id, versions)
     }
-    fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
-        self.inner.keep_list(secret_id, version)
+    fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32> {
+        self.inner.keep_version(secret_id, version)
     }
     fn record_verification(&mut self, _: u64, _: ChannelId, _: u32) -> ShareStoreFuture<'_, ()> {
         if *self.verification_backend_error.lock().unwrap() {

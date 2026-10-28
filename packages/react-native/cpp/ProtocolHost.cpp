@@ -538,16 +538,15 @@ jsi::Value ProtocolHost::get(jsi::Runtime& rt, const jsi::PropNameID& name) {
           DeRecProtocolHandle* handle = handle_;
 
           auto body = [handle, channelId, fingerprint]() -> std::vector<uint8_t> {
-            uint32_t matched = 0;
             DeRecError error = derec_protocol_verify_fingerprint(
-                handle, channelId, fingerprint.c_str(), &matched);
+                handle, channelId, fingerprint.c_str());
             if (error.code != DEREC_CODE_OK) {
               throw FfiFailure(error);
             }
-            return std::vector<uint8_t>{static_cast<uint8_t>(matched != 0 ? 1 : 0)};
+            return {};
           };
-          auto convert = [](jsi::Runtime&, std::vector<uint8_t>& bytes) {
-            return jsi::Value(!bytes.empty() && bytes[0] != 0);
+          auto convert = [](jsi::Runtime&, std::vector<uint8_t>&) {
+            return jsi::Value::undefined();
           };
           return runAsync(rt2, std::move(body), std::move(convert));
         });

@@ -460,11 +460,13 @@ const pairing = {
         mlkem_encapsulation_key: ArrayBuffer;
         ecies_public_key: ArrayBuffer;
         nonce: bigint;
+        fingerprint_commitment: ArrayBuffer;
       };
       return {
         mlkem_encapsulation_key: bytes(result.mlkem_encapsulation_key),
         ecies_public_key: bytes(result.ecies_public_key),
         nonce: result.nonce,
+        fingerprint_commitment: bytes(result.fingerprint_commitment),
       };
     },
 
@@ -495,11 +497,13 @@ const pairing = {
         mlkem_encapsulation_key: ArrayBuffer;
         ecies_public_key: ArrayBuffer;
         nonce: bigint;
+        fingerprint_commitment: ArrayBuffer;
       };
       return {
         mlkem_encapsulation_key: bytes(result.mlkem_encapsulation_key),
         ecies_public_key: bytes(result.ecies_public_key),
         nonce: result.nonce,
+        fingerprint_commitment: bytes(result.fingerprint_commitment),
       };
     },
   },
@@ -626,7 +630,7 @@ const sharing = {
       version: number,
       secret_id: bigint,
       committed_share: CommittedDeRecShare,
-      keep_list: number[],
+      keep_version: number,
       description: string,
       shared_key: Uint8Array,
       reply_to?: TransportProtocol[],
@@ -637,7 +641,7 @@ const sharing = {
         version,
         secret_id,
         encodeMessage(MessageKind.CommittedDeRecShare, committed_share),
-        keep_list,
+        keep_version,
         utf8Encode(description),
         shared_key,
         replyTo(reply_to),

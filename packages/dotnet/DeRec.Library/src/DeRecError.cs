@@ -118,6 +118,15 @@ public static class DeRecCode
     /// </summary>
     public const int ReplicaIdConflict = 16;
 
+    /// <summary>
+    /// <c>VerifyFingerprintAsync</c>: the fingerprint compared out of band does
+    /// not match the channel key — a possible man-in-the-middle. A
+    /// <c>Pending</c> pairing has been revoked; pair again.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Pairing"/>.
+    /// </summary>
+    public const int FingerprintMismatch = 17;
+
     public const int Encryption = 20;
     public const int Keygen = 21;
     public const int FinishPairingInitiator = 22;
@@ -171,6 +180,19 @@ public static class DeRecCode
     /// </summary>
     public const int IncompatibleParameterRange = 47;
 
+    /// <summary>
+    /// Returned by <c>Pairing.Response.Process</c> when the fingerprint nonce
+    /// revealed in the <c>PairResponse</c> does not open the fingerprint
+    /// commitment the contact creator published with its keys
+    /// (<see cref="ContactMessage.FingerprintCommitment"/>, or the one returned
+    /// by <c>Pairing.Response.ProcessPrePair</c> /
+    /// <c>ProcessPrePairNoKeys</c>). The response did not come from the party
+    /// that committed to those keys; the would-be channel MUST be dropped.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Pairing"/>.
+    /// </summary>
+    public const int FingerprintCommitmentMismatch = 48;
+
     public const int EmptyChannels = 60;
     public const int DuplicateChannelId = 61;
     public const int InvalidThreshold = 62;
@@ -194,6 +216,17 @@ public static class DeRecCode
     /// <see cref="DeRecCategory.Sharing"/>.
     /// </summary>
     public const int TooManySubshares = 66;
+
+    /// <summary>
+    /// The <c>keepVersion</c> chosen for a sharing round is equal to or
+    /// greater than the version being shared (and not <c>0</c>). Raised by
+    /// <c>start(ProtectSecret)</c>, and by every round the library starts
+    /// itself, before anything is sent, and by
+    /// <c>Sharing.Request.Produce</c>.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Sharing"/>.
+    /// </summary>
+    public const int InvalidKeepVersion = 67;
 
     public const int EmptyResponses = 80;
     public const int EmptyCommittedDeRecShare = 81;

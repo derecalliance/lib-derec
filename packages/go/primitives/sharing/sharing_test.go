@@ -95,7 +95,7 @@ func TestStoreShareRequestResponseRoundTrip(t *testing.T) {
 	for _, channelID := range channelIDs {
 		committedShare := shares[channelID]
 
-		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", key, nil)
+		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, 0, "", key, nil)
 		if err != nil {
 			t.Fatalf("channel %d: request produce: %v", channelID, err)
 		}
@@ -177,7 +177,7 @@ func produceAndExtractStoreShare(t *testing.T, rt []sharing.Endpoint) []byte {
 	if err != nil {
 		t.Fatalf("split: %v", err)
 	}
-	wire, err := sharing.Request.Produce(1, version, secretID, shares[1], nil, "", key, rt)
+	wire, err := sharing.Request.Produce(1, version, secretID, shares[1], 0, "", key, rt)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}

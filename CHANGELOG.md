@@ -7,6 +7,131 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
+### 0.0.10
+
+A body naming a group member is accepted only on that member's own channel,
+so a paired helper can no longer act as a replica. A failed fingerprint
+comparison revokes the pairing, and no channel key outlives an unconfirmed
+pairing. The contact creator now commits to a random nonce before the
+responder contributes to the channel key, so a man-in-the-middle can no
+longer search offline for a key whose fingerprint matches. A helper keeps at
+most two versions of a secret: the one being shared and the one the owner
+names in `keepVersion`, which replaces `keepList`.
+
+- **Fixed (security): a paired helper could overwrite an owner's stored
+  secret.** *(bug fix; every SDK)*
+
+  Whether a message came from a replica-group member was decided by the
+  `replica_id` in its body, which the sender writes, and a member was looked
+  up by that id alone, never against the channel the message arrived on. A
+  helper could put any `replica_id` in a `GetShareResponse` on its own
+  channel and have it hydrated as a catch-up: the owner's snapshot replaced,
+  and helpers and keys of the helper's choosing stored as `Paired`, after
+  which every `ProtectSecret` sent them a share. The same lookup let a
+  helper push a copy of the secret with `StoreShareRequest`, flag a real
+  member for eviction with `UnpairRequest`, or answer a replica discovery.
+  A message naming a member is now refused unless that member is recorded on
+  the channel it arrived on.
+
+- **Fixed (security): a failed fingerprint comparison left a usable
+  channel.** *(bug fix; every SDK)*
+
+  A mismatch changed nothing, and the expired-channel sweep removed a
+  `Pending` channel's record but not its key, so the channel decrypted the
+  peer's messages again once the record was gone. A mismatch now revokes the
+  `Pending` pairing — its records, channel key and pairing material are
+  deleted — and the sweep removes the channel key with the record. For a
+  replica channel the key goes once no member is recorded on it, and this
+  device's own `Pending` row goes with it when no peer remains. A channel
+  already `Paired` is never touched by a comparison; removing it is an
+  unpair.
+
+- **Changed: `verify_fingerprint` reports a mismatch as an error.**
+  *(breaking; every SDK)*
+
+  A mismatch fails with `FingerprintMismatch` (code `17`,
+  `fingerprint_mismatch`, category `pairing`) — a possible
+  man-in-the-middle — instead of returning `false`, and success returns
+  nothing: Rust `Result<()>`, .NET `Task`, Go `error`, TypeScript
+  `Promise<void>`. The C ABI drops the `out_matched` parameter of
+  `derec_protocol_verify_fingerprint`.
+
+  **Migration:** replace a check of the returned boolean with handling of
+  the error. After a mismatch the `Pending` pairing no longer exists, so
+  retrying the comparison on it fails; the devices must pair again.
+
+- **Fixed (security): a man-in-the-middle could search offline for a
+  matching fingerprint.** *(bug fix; wire change; every SDK)*
+
+  The responder chose every random input of the handshake key after it had
+  seen the creator's keys, and nothing fixed the creator's side first. On a
+  `NoKeys` pairing, where the fingerprint comparison is the only defence, a
+  man-in-the-middle could try key contributions locally and send the one
+  whose fingerprint matched its other pairing, so its chance grew with the
+  computation it spent instead of staying near 10⁻¹⁶ per attempt. The
+  creator now draws a random 32-byte fingerprint nonce, publishes
+  `SHA-256("DeRec fingerprint commitment v1" ‖ mlkemEncapsulationKey ‖
+  eciesPublicKey ‖ nonce)` with its keys, and reveals the nonce in the pair
+  response. The channel key is `SHA-256("DeRec channel key v1" ‖ handshakeKey
+  ‖ nonce)`, and the fingerprint is computed from it. This applies to every
+  contact mode; the fingerprint keeps its 16 digits.
+
+- **Changed: pairing messages carry a fingerprint commitment and nonce.**
+  *(breaking; wire change; every SDK)*
+
+  `ContactMessage.fingerprintCommitment` (field 10, `InlineKeys` contacts
+  only), `PrePairResponseMessage.fingerprintCommitment` (field 6) and
+  `PairResponseMessage.fingerprintNonce` (field 9) are new and required. A
+  pair response whose nonce does not open the commitment fails with
+  `FingerprintCommitmentMismatch` (code `48`,
+  `fingerprint_commitment_mismatch`, category `pairing`); a missing
+  commitment or nonce fails as an invalid message. The result of
+  `process_pre_pair` / `process_pre_pair_no_keys` gains
+  `fingerprint_commitment` (the C ABI's
+  `ProcessPrePairResponseMessageResult` gains a trailing
+  `fingerprint_commitment` buffer), and `derec_cryptography`'s
+  `finish_pairing_responder` takes the commitment and the revealed nonce.
+  Stored initiator pairing material gains the nonce, so pairing material
+  saved by an earlier version no longer loads.
+
+  **Migration:** both devices must run this version to pair; an older peer
+  cannot complete a handshake with a newer one. Pairings in progress during
+  the upgrade must be started again. Code that builds the inline-keys
+  contact from a PrePair result must also copy `fingerprint_commitment` into
+  it. Channels already paired keep working: only the handshake changed.
+
+- **Changed: `keepList` is replaced by a single `keepVersion`.**
+  *(breaking; wire change; every SDK)*
+
+  `StoreShareRequestMessage.keepList` (field 5, `repeated uint32`) becomes
+  `keepVersion` (field 5, `uint32`): the one version, other than the one
+  being shared, the helper keeps. Once the share is stored the helper deletes
+  every other version it holds on the channel; `0` keeps no other version, and
+  there is no longer a way to keep every version. A `keepVersion` that is not
+  below the shared version fails the owner's round before anything is sent
+  with `SharingError::InvalidKeepVersion` (code `67`, `invalid_keep_version`,
+  category `sharing`), and a helper that receives one refuses it with
+  `FORMAT_ERROR`. A request older than the helper's latest version on the
+  channel still has its `keepVersion` ignored. The owner's own proofs follow
+  the same rule when a helper confirms.
+
+  `DeRecShareStore::keep_list(secret_id, version) -> Option<Vec<u32>>` is
+  replaced by `keep_version(secret_id, version) -> u32` (.NET `KeepVersion`,
+  Go `KeepVersion`, TypeScript `keepVersion`). The C ABI's
+  `ShareStoreCallbacks.keep_list` becomes `keep_version`, which writes its
+  answer to an `out_version` pointer, and `produce_store_share_request_message`
+  takes one `keep_version` in place of `keep_list_ptr`/`keep_list_len`; the
+  `sharing::request::produce` primitive takes a `u32` in every SDK. The
+  sharing-round state row stores `keep_version` in place of `keep_list`
+  (`StateItem.KeepVersion` in .NET and Go); a row written earlier removes no
+  proof when it settles.
+
+  **Migration:** both devices must run this version; an older peer cannot
+  decode the new field. Implement `keep_version` to return the newest version
+  whose `SharingComplete` reported `threshold_met`, or `0` before any did. An
+  application that relied on helpers keeping every version (`None`) must
+  expect them to hold at most two from now on.
+
 ### 0.0.9
 
 Share commitments use a domain-separated Merkle hash, so one malicious helper

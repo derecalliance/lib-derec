@@ -532,11 +532,11 @@ pub trait DeRecShareStore {
     /// `versions`. Idempotent: a version that is not stored is skipped
     /// and is not an error, and an empty slice is a no-op.
     ///
-    /// Used by a Helper to apply `StoreShareRequestMessage.keepList`,
-    /// the complete set of versions the Owner wants retained: every
-    /// stored version outside it is removed once the incoming share is
-    /// persisted. Shares under other channels or other `secret_id`
-    /// partitions must be left untouched.
+    /// Used by a Helper to apply `StoreShareRequestMessage.keepVersion`:
+    /// once the incoming share is persisted, every version stored on the
+    /// channel other than the incoming one and `keepVersion` is removed.
+    /// Shares under other channels or other `secret_id` partitions must be
+    /// left untouched.
     fn remove_versions(
         &mut self,
         secret_id: u64,
@@ -544,55 +544,46 @@ pub trait DeRecShareStore {
         versions: &[u32],
     ) -> ShareStoreFuture<'_, ()>;
 
-    /// Choose the versions every Helper keeps after the Owner distributes
-    /// `version` of `secret_id`.
+    /// Choose the one older version every Helper keeps after the Owner
+    /// distributes `version` of `secret_id`.
     ///
     /// Called by the Owner once per sharing round, before anything is
     /// sent, on every round that distributes shares to Helpers: an
     /// application-started `ProtectSecret` and the library-started
     /// publishes (pair-completion and fingerprint confirmation) alike.
-    /// The answer becomes `StoreShareRequestMessage.keepList`, the same
-    /// list for every Helper in the round.
+    /// The answer becomes `StoreShareRequestMessage.keepVersion`, the same
+    /// value for every Helper in the round.
     ///
-    /// - `Some(list)`: the Helpers keep exactly `list` plus `version`.
-    ///   The library always adds `version`, removes duplicates and sorts
-    ///   ascending, so `list` may omit it.
-    /// - `None`: no `keepList` is sent (it goes out empty), and the
-    ///   Helpers keep every version they hold. An application that wants
-    ///   to cap how many versions Helpers retain returns that cap here as
-    ///   a list.
+    /// A Helper that stores `version` keeps it and the returned version, and
+    /// removes every other version it holds. `0` keeps no other version. An
+    /// answer equal to or greater than `version` fails the round with
+    /// [`SharingError::InvalidKeepVersion`](crate::primitives::sharing::SharingError::InvalidKeepVersion)
+    /// before anything is sent.
     ///
-    /// # The rule a list must follow
+    /// # Which version to return
     ///
-    /// Helpers delete every stored version that is not listed, so a list
-    /// that leaves out too much can make the secret unrecoverable. List
-    /// every version that could still become the latest:
-    ///
-    /// - versions that committed, such as those whose
-    ///   [`SharingComplete`](crate::protocol::DeRecEvent::SharingComplete)
-    ///   reported `threshold_met`;
-    /// - versions whose round is still open. Starting `version` does not
-    ///   settle them: if its round never reaches threshold, an open
-    ///   round that then commits is the latest, and helpers must still
-    ///   hold it.
-    ///
-    /// Leave out only versions whose round failed or that the user rolled
-    /// back. Only the application knows which versions committed; nothing
-    /// in the stores records it.
+    /// Return the last version that is valid: the newest one whose
+    /// [`SharingComplete`](crate::protocol::DeRecEvent::SharingComplete)
+    /// reported `threshold_met`. If `version` never reaches threshold, that
+    /// version is what the secret recovers from, so Helpers must still hold
+    /// it. A version whose round is still open when `version` starts is
+    /// removed from every Helper that stores `version`, unless it is the one
+    /// returned here. Only the application knows which versions committed;
+    /// nothing in the stores records it.
     ///
     /// # The owner's own proofs
     ///
-    /// The list also governs this store's owner-side rows. When a Helper
+    /// The answer also governs this store's owner-side rows. When a Helper
     /// confirms `version`, the library removes, through
     /// [`remove_versions`](Self::remove_versions), this device's rows for
-    /// that channel whose versions the list leaves out: the Helper has
-    /// removed those shares, so their proofs can no longer be answered. A
-    /// Helper that refuses `version` or never answers keeps its older
-    /// versions, and so do its rows here. `None` removes nothing.
+    /// that channel other than `version` and the returned version: the
+    /// Helper has removed those shares, so their proofs can no longer be
+    /// answered. A Helper that refuses `version` or never answers keeps its
+    /// older versions, and so do its rows here.
     ///
-    /// Replica pushes never consult this and always send an empty
-    /// `keepList`.
-    fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>>;
+    /// Replica pushes never consult this, and a replica Destination never
+    /// removes a version because of it.
+    fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32>;
 
     /// Record a verification challenge the helper is about to answer for
     /// `(secret_id, channel_id, version)`.
@@ -1053,8 +1044,8 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for Box<T> {
     ) -> ShareStoreFuture<'_, ()> {
         (**self).remove_versions(secret_id, channel_id, versions)
     }
-    fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
-        (**self).keep_list(secret_id, version)
+    fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32> {
+        (**self).keep_version(secret_id, version)
     }
     fn record_verification(
         &mut self,
@@ -1230,8 +1221,8 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for &mut T {
     ) -> ShareStoreFuture<'_, ()> {
         (**self).remove_versions(secret_id, channel_id, versions)
     }
-    fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
-        (**self).keep_list(secret_id, version)
+    fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32> {
+        (**self).keep_version(secret_id, version)
     }
     fn record_verification(
         &mut self,

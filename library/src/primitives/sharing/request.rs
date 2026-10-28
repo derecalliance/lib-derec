@@ -197,8 +197,8 @@ pub fn split(
 /// * `secret_id` - Identifier of the secret being distributed. Must match the value
 ///   passed to [`split`].
 /// * `committed_share` - The share for this channel, as returned by [`split`].
-/// * `keep_list` - Ordered list of version numbers the Helper should retain. Pass an empty
-///   slice to let the Helper apply its default retention policy.
+/// * `keep_version` - The one version, other than `version`, the Helper keeps; it removes
+///   every other version it holds on the channel. `0` keeps no other version.
 /// * `description` - Human-readable description of this share distribution. May be empty.
 /// * `shared_key` - Previously established 32-byte symmetric channel key used to
 ///   encrypt the inner request.
@@ -212,7 +212,8 @@ pub fn split(
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error`] if envelope construction or symmetric encryption fails.
+/// Returns [`SharingError::InvalidKeepVersion`] if `keep_version` is not below `version`,
+/// or [`crate::Error`] if envelope construction or symmetric encryption fails.
 ///
 /// # Example
 ///
@@ -229,7 +230,7 @@ pub fn split(
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =
-///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
+///     produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
 ///         .expect("produce failed");
 ///
 /// assert!(!envelope.is_empty());
@@ -244,11 +245,13 @@ pub fn produce(
     version: u32,
     secret_id: u64,
     committed_share: &CommittedDeRecShare,
-    keep_list: &[u32],
+    keep_version: u32,
     description: impl Into<String>,
     shared_key: &SharedKey,
     reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<ProduceResult, crate::Error> {
+    validate_keep_version(keep_version, version)?;
+
     let timestamp = current_timestamp();
 
     let reply_to_transports = reply_to.to_vec();
@@ -256,7 +259,7 @@ pub fn produce(
         share: committed_share.encode_to_vec(),
         share_algorithm: SHARE_ALGORITHM_VSS,
         version,
-        keep_list: keep_list.to_vec(),
+        keep_version,
         version_description: description.into(),
         timestamp: Some(timestamp),
         secret_id,
@@ -276,6 +279,18 @@ pub fn produce(
     tracing::info!("share request envelope produced");
 
     Ok(ProduceResult { envelope })
+}
+
+/// Checks that `keep_version` names a version older than `version`, the one
+/// being shared, or is `0`.
+pub(crate) fn validate_keep_version(keep_version: u32, version: u32) -> Result<(), SharingError> {
+    if keep_version >= version && keep_version != 0 {
+        return Err(SharingError::InvalidKeepVersion {
+            keep_version,
+            version,
+        });
+    }
+    Ok(())
 }
 
 /// Decrypts and decodes an incoming [`StoreShareRequestMessage`] from an outer envelope.
@@ -359,7 +374,7 @@ pub fn produce(
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =
-///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
+///     produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
 ///         .expect("produce failed");
 ///
 /// let ExtractResult { request } = extract(&envelope, &shared_key).expect("extract failed");

@@ -93,8 +93,9 @@ impl From<&StateKey> for StateKeyRecord {
 ///   unix-seconds)
 /// - `3` = SharingRound — `version`, `pending`, `confirmed`, `failed`
 ///   (each channel-id set is stringified u64s), `started_at`
-///   (stringified u64 unix-seconds), `keep_list` (the versions every Helper
-///   was told to keep, as plain numbers), `threshold` (the threshold the
+///   (stringified u64 unix-seconds), `keep_version` (the older version every
+///   Helper was told to keep, a plain number; absent when the round sent no
+///   share), `threshold` (the threshold the
 ///   round split at, a plain number; absent when not recorded)
 /// - `4` = PendingReplicaDiscovery — `local_version`, `started_at`,
 ///   `pending_replicas`, `reported`
@@ -148,11 +149,12 @@ pub struct StateItemRecord {
     /// have answered reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported: Option<Vec<ReplicaDiscoveryReport>>,
-    /// SharingRound only: the `keepList` every Helper received. Rows written
-    /// before 0.0.9 lack it and decode as an empty list, which removes no
-    /// owner proof when the round's Helpers confirm.
+    /// SharingRound only: the `keepVersion` every Helper received. Absent
+    /// when the round sent no share. A row written before the field existed
+    /// lacks it, and any `keep_list` it carries is ignored: the round then
+    /// removes no owner proof when its Helpers confirm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keep_list: Option<Vec<u32>>,
+    pub keep_version: Option<u32>,
     /// SharingRound only: the threshold the round split at. Absent on a row
     /// written before 0.0.9, or by a round with no recorded threshold; such a
     /// round is judged against the builder's threshold.
@@ -190,7 +192,7 @@ impl From<&StateItem> for StateItemRecord {
                 synced_replicas: None,
                 behind_replicas: None,
                 reported: None,
-                keep_list: None,
+                keep_version: None,
                 threshold: None,
             },
             StateItem::PendingRecovery {
@@ -214,7 +216,7 @@ impl From<&StateItem> for StateItemRecord {
                 synced_replicas: None,
                 behind_replicas: None,
                 reported: None,
-                keep_list: None,
+                keep_version: None,
                 threshold: None,
             },
             StateItem::PendingUnpair {
@@ -237,7 +239,7 @@ impl From<&StateItem> for StateItemRecord {
                 synced_replicas: None,
                 behind_replicas: None,
                 reported: None,
-                keep_list: None,
+                keep_version: None,
                 threshold: None,
             },
             StateItem::PendingReplicaDiscovery {
@@ -270,7 +272,7 @@ impl From<&StateItem> for StateItemRecord {
                         })
                         .collect(),
                 ),
-                keep_list: None,
+                keep_version: None,
                 threshold: None,
             },
             StateItem::SharingRound(round) => Self {
@@ -308,7 +310,7 @@ impl From<&StateItem> for StateItemRecord {
                         .collect(),
                 ),
                 reported: None,
-                keep_list: Some(round.keep_list.clone()),
+                keep_version: round.keep_version,
                 threshold: round.threshold,
             },
         }
@@ -449,7 +451,6 @@ impl StateItemRecord {
                     parse_replica_id_set(self.synced_replicas, "synced_replicas")?;
                 let behind_replicas =
                     parse_replica_id_set(self.behind_replicas, "behind_replicas")?;
-                let keep_list = self.keep_list.unwrap_or_default();
                 Ok(StateItem::SharingRound(Box::new(
                     crate::protocol::types::SharingRoundState {
                         version,
@@ -460,7 +461,7 @@ impl StateItemRecord {
                         synced_replicas,
                         behind_replicas,
                         started_at,
-                        keep_list,
+                        keep_version: self.keep_version,
                         threshold: self.threshold,
                     },
                 )))
@@ -535,7 +536,7 @@ mod tests {
                 synced_replicas: Default::default(),
                 behind_replicas: Default::default(),
                 started_at: 100,
-                keep_list: Vec::new(),
+                keep_version: None,
                 threshold: None,
             })),
         ]
@@ -652,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sharing_round_row_round_trips_its_keep_list() {
+    fn a_sharing_round_row_round_trips_its_keep_version() {
         let round = crate::protocol::types::SharingRoundState {
             version: 4,
             pending: [ChannelId(u64::MAX)].into_iter().collect(),
@@ -662,7 +663,7 @@ mod tests {
             synced_replicas: Default::default(),
             behind_replicas: Default::default(),
             started_at: 100,
-            keep_list: vec![2, 4],
+            keep_version: Some(2),
             threshold: None,
         };
         let item = StateItem::SharingRound(Box::new(round.clone()));
@@ -675,12 +676,12 @@ mod tests {
     }
 
     #[test]
-    fn a_sharing_round_row_from_before_0_0_9_decodes_with_an_empty_keep_list() {
-        let json = r#"{"kind":3,"version":4,"started_at":"100","pending":["7"],"confirmed":[],"failed":[],"pending_replicas":[],"synced_replicas":[],"behind_replicas":[]}"#;
+    fn a_sharing_round_row_with_a_keep_list_decodes_without_a_keep_version() {
+        let json = r#"{"kind":3,"version":4,"started_at":"100","pending":["7"],"confirmed":[],"failed":[],"pending_replicas":[],"synced_replicas":[],"behind_replicas":[],"keep_list":[2,4]}"#;
         let row: StateItemRecord = serde_json::from_str(json).expect("decodes");
         match row.into_item().expect("valid row") {
             StateItem::SharingRound(round) => {
-                assert!(round.keep_list.is_empty());
+                assert_eq!(round.keep_version, None);
                 assert!(round.pending.contains(&ChannelId(7)));
             }
             other => panic!("decoded as {other:?}"),
@@ -698,7 +699,7 @@ mod tests {
             synced_replicas: Default::default(),
             behind_replicas: Default::default(),
             started_at: 100,
-            keep_list: Vec::new(),
+            keep_version: None,
             threshold: Some(3),
         };
         let item = StateItem::SharingRound(Box::new(round.clone()));
@@ -713,7 +714,7 @@ mod tests {
 
     #[test]
     fn a_sharing_round_row_without_a_threshold_decodes_as_none() {
-        let json = r#"{"kind":3,"version":4,"started_at":"100","pending":["7"],"confirmed":[],"failed":[],"keep_list":[]}"#;
+        let json = r#"{"kind":3,"version":4,"started_at":"100","pending":["7"],"confirmed":[],"failed":[]}"#;
         let row: StateItemRecord = serde_json::from_str(json).expect("decodes");
         match row.into_item().expect("valid row") {
             StateItem::SharingRound(round) => assert_eq!(round.threshold, None),
@@ -728,7 +729,7 @@ mod tests {
             synced_replicas: Default::default(),
             behind_replicas: Default::default(),
             started_at: 100,
-            keep_list: Vec::new(),
+            keep_version: None,
             threshold: None,
         };
         let json = serde_json::to_value(StateItemRecord::from(&StateItem::SharingRound(Box::new(

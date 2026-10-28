@@ -22,15 +22,16 @@ func TestErrorCarriesCodeAndFormats(t *testing.T) {
 
 func TestCodeName(t *testing.T) {
 	cases := map[int32]string{
-		derec.CodeOK:               "ok",
-		derec.CodeNonOKStatus:      "non_ok_status",
-		derec.CodeFFIBadSharedKey:  "ffi_bad_shared_key",
-		derec.CodeTransportInvalid: "transport_invalid",
-		derec.CodeNoUsableEndpoint: "no_usable_endpoint",
-		derec.CodeInvalidWeight:    "invalid_weight",
-		derec.CodeTooManySubshares: "too_many_subshares",
-		122:                        "unknown",
-		9999:                       "unknown",
+		derec.CodeOK:                 "ok",
+		derec.CodeNonOKStatus:        "non_ok_status",
+		derec.CodeFFIBadSharedKey:    "ffi_bad_shared_key",
+		derec.CodeTransportInvalid:   "transport_invalid",
+		derec.CodeNoUsableEndpoint:   "no_usable_endpoint",
+		derec.CodeInvalidWeight:      "invalid_weight",
+		derec.CodeTooManySubshares:   "too_many_subshares",
+		derec.CodeInvalidKeepVersion: "invalid_keep_version",
+		122:                          "unknown",
+		9999:                         "unknown",
 	}
 	for code, want := range cases {
 		if got := (&derec.Error{Code: code}).CodeName(); got != want {

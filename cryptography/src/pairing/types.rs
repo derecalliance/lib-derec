@@ -36,6 +36,24 @@ pub struct InitiatorSecretKeyMaterial {
     /// ECIES public key — the public counterpart of `ecies_secret_key`. Same
     /// `PrePairResponse` purpose as `mlkem_encapsulation_key`.
     pub ecies_public_key: Vec<u8>,
+    /// Random value the initiator commits to alongside its public keys and
+    /// reveals only once the responder has fixed the handshake key. It is
+    /// mixed into the channel key in [`finish_pairing_initiator`](super::finish_pairing_initiator),
+    /// so the responder's contribution cannot be chosen to reach a target
+    /// fingerprint. See [`fingerprint_commitment`](super::fingerprint_commitment).
+    pub fingerprint_nonce: FingerprintNonce,
+}
+
+impl InitiatorSecretKeyMaterial {
+    /// The commitment to [`Self::fingerprint_nonce`] over this initiator's
+    /// public keys, published with those keys.
+    pub fn fingerprint_commitment(&self) -> FingerprintCommitment {
+        super::fingerprint_commitment(
+            &self.mlkem_encapsulation_key,
+            &self.ecies_public_key,
+            &self.fingerprint_nonce,
+        )
+    }
 }
 
 /// Secret key material held by the **responder** during pairing.
@@ -144,6 +162,14 @@ pub struct PairingRequestMessageMaterial {
 }
 
 pub type PairingSharedKey = [u8; 32];
+
+/// The initiator's random contribution to the channel key, revealed in the
+/// pairing response. See [`fingerprint_commitment`](super::fingerprint_commitment).
+pub type FingerprintNonce = [u8; 32];
+
+/// SHA-256 commitment to a [`FingerprintNonce`] and the public keys it is
+/// published with. See [`fingerprint_commitment`](super::fingerprint_commitment).
+pub type FingerprintCommitment = [u8; 32];
 
 /// The 32-byte secret an ML-KEM encapsulation produces and its decapsulation
 /// recovers — see [`super::mlkem`].

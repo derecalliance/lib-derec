@@ -622,43 +622,47 @@ func TestStateItemRoundTrip_SharingRound(t *testing.T) {
 	}
 }
 
-func TestStateItemRoundTrip_SharingRoundKeepList(t *testing.T) {
+func TestStateItemRoundTrip_SharingRoundKeepVersion(t *testing.T) {
 	ver := uint32(4)
 	sa := uint64(100)
+	keep := uint32(2)
 	wire, err := EncodeStateItem(StateItem{
-		Kind:      StateKindSharingRound,
-		Version:   &ver,
-		StartedAt: &sa,
-		KeepList:  []uint32{2, 4},
+		Kind:        StateKindSharingRound,
+		Version:     &ver,
+		StartedAt:   &sa,
+		KeepVersion: &keep,
 	})
 	if err != nil {
 		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	if !strings.Contains(string(wire), `"keep_version":2`) {
+		t.Fatalf("keep_version must be written as a plain number, got %s", wire)
 	}
 	got, err := DecodeStateItem(wire)
 	if err != nil {
 		t.Fatalf("DecodeStateItem: %v", err)
 	}
-	if len(got.KeepList) != 2 || got.KeepList[0] != 2 || got.KeepList[1] != 4 {
-		t.Fatalf("KeepList = %v", got.KeepList)
+	if got.KeepVersion == nil || *got.KeepVersion != 2 {
+		t.Fatalf("KeepVersion = %v", got.KeepVersion)
 	}
 }
 
-// A row written before 0.0.9 has no keep_list; it stays absent so the
-// library reads it as empty.
-func TestDecodeStateItem_SharingRoundWithoutKeepList(t *testing.T) {
+// A row with no keep_version (a round that sent no share) decodes with
+// KeepVersion absent, and stays absent when written back.
+func TestDecodeStateItem_SharingRoundWithoutKeepVersion(t *testing.T) {
 	item, err := DecodeStateItem([]byte(`{"kind":3,"version":5,"started_at":"1","pending":[],"confirmed":[],"failed":[]}`))
 	if err != nil {
 		t.Fatalf("DecodeStateItem: %v", err)
 	}
-	if item.KeepList != nil {
-		t.Fatalf("absent keep_list must stay absent, got %v", item.KeepList)
+	if item.KeepVersion != nil {
+		t.Fatalf("absent keep_version must stay absent, got %v", *item.KeepVersion)
 	}
 	wire, err := EncodeStateItem(item)
 	if err != nil {
 		t.Fatalf("EncodeStateItem: %v", err)
 	}
-	if strings.Contains(string(wire), "keep_list") {
-		t.Fatalf("absent keep_list must not be written, got %s", wire)
+	if strings.Contains(string(wire), "keep_version") {
+		t.Fatalf("absent keep_version must not be written, got %s", wire)
 	}
 }
 

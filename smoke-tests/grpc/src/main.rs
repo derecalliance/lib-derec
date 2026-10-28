@@ -394,8 +394,8 @@ impl DeRecShareStore for InMemoryShareStore {
         Box::pin(std::future::ready(Ok(())))
     }
 
-    fn keep_list(&self, _: u64, _: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
-        Box::pin(std::future::ready(Ok(None)))
+    fn keep_version(&self, _: u64, version: u32) -> ShareStoreFuture<'_, u32> {
+        Box::pin(std::future::ready(Ok(version.saturating_sub(1))))
     }
 }
 

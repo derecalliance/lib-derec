@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::types::{ChannelQuery, ChannelStatus};
-use derec_library::protocol::{DeRecChannelStore, SecretKind};
-use derec_library::types::ChannelId;
-use derec_proto::{ContactMode, SenderKind};
-use std::collections::HashSet;
+use derec_library::protocol::types::{
+    ChannelQuery, ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole,
+};
+use derec_library::protocol::{
+    DeRecChannelStore, DeRecSecretStore, ExpiredChannelCleanup, SecretKind, SecretValue,
+};
+use derec_library::protocol::{DeRecEvent, DeRecFlow};
+use derec_library::types::{ChannelId, ReplicaId};
+use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
+use std::collections::{HashMap, HashSet};
 
 use crate::db::Database;
 use crate::flows::assertions::{channel_exists, count_channels, count_secrets};
 use crate::flows::helpers::{pair_owner_helper, pair_owner_helper_with_mode};
-use crate::peer::{DEFAULT_TEST_SECRET_ID, Peer};
+use crate::peer::{DEFAULT_TEST_SECRET_ID, Peer, PeerOptions, pump_many};
 use crate::stores::{PostgresChannelStore, PostgresSecretStore};
 
 pub async fn run() {
@@ -78,7 +83,6 @@ pub async fn run() {
     }
     let owner_secrets = PostgresSecretStore::new(owner_db.client());
     let helper_secrets = PostgresSecretStore::new(helper_db.client());
-    use derec_library::protocol::{DeRecSecretStore, SecretValue};
     let SecretValue::SharedKey(owner_key) = owner_secrets
         .load(DEFAULT_TEST_SECRET_ID, final_id, SecretKind::SharedKey)
         .await
@@ -138,6 +142,9 @@ pub async fn run() {
     println!("  link_channel: undirected + idempotent + transitive (a—b—c → {{a,b,c}})  ✓");
 
     every_contact_mode_pairs_and_persists().await;
+    no_keys_fingerprint_mismatch_revokes_the_pairing().await;
+    expired_pending_pairing_loses_its_key().await;
+    the_fingerprint_nonce_survives_a_creator_restart().await;
 
     println!("✓ Pairing flow passed.\n");
 }
@@ -218,20 +225,16 @@ async fn every_contact_mode_pairs_and_persists() {
                 .expect("helper get_fingerprint");
             assert_eq!(owner_fp, helper_fp, "both sides derive one fingerprint");
 
-            assert!(
-                owner
-                    .protocol
-                    .verify_fingerprint(channel, &helper_fp)
-                    .await
-                    .expect("owner verify_fingerprint")
-            );
-            assert!(
-                helper
-                    .protocol
-                    .verify_fingerprint(channel, &owner_fp)
-                    .await
-                    .expect("helper verify_fingerprint")
-            );
+            owner
+                .protocol
+                .verify_fingerprint(channel, &helper_fp)
+                .await
+                .expect("owner verify_fingerprint");
+            helper
+                .protocol
+                .verify_fingerprint(channel, &owner_fp)
+                .await
+                .expect("helper verify_fingerprint");
 
             for (label, peer) in [("owner", &mut owner), ("helper", &mut helper)] {
                 assert_eq!(
@@ -254,4 +257,263 @@ async fn channel_status(peer: &mut Peer, channel_id: ChannelId) -> ChannelStatus
         .expect("channel_store.load")
         .expect("channel present")
         .status()
+}
+
+/// A wrong `NoKeys` comparison is the MITM case — the two sides derived
+/// different shared keys — so the comparing side revokes the pairing: neither
+/// its channel record nor any key of it survives in the database. The peer's
+/// side is untouched, since it has compared nothing.
+async fn no_keys_fingerprint_mismatch_revokes_the_pairing() {
+    let owner_db = Database::open_isolated().await;
+    let helper_db = Database::open_isolated().await;
+    let mut owner = Peer::new(owner_db.client(), "Owner", "https://owner.example.com");
+    let mut helper = Peer::new(helper_db.client(), "Helper", "https://helper.example.com");
+
+    let channel =
+        pair_owner_helper_with_mode(&mut owner, &mut helper, ChannelId(910), ContactMode::NoKeys)
+            .await;
+    assert_eq!(
+        channel_status(&mut owner, channel).await,
+        ChannelStatus::Pending,
+        "an unverified NoKeys channel is held Pending"
+    );
+
+    let err = owner
+        .protocol
+        .verify_fingerprint(channel, "0000-0000-0000-0000")
+        .await
+        .expect_err("a mismatched fingerprint must not verify");
+    assert!(
+        matches!(err, derec_library::Error::FingerprintMismatch { channel_id } if channel_id == channel),
+        "expected FingerprintMismatch, got {err:?}"
+    );
+    println!("  NoKeys verify_fingerprint(wrong) fails with FingerprintMismatch  ✓");
+
+    assert!(
+        !channel_exists(&owner_db.client(), DEFAULT_TEST_SECRET_ID, channel.0).await,
+        "a failed comparison must remove the owner's channel row"
+    );
+    assert_eq!(
+        count_secrets(&owner_db.client(), DEFAULT_TEST_SECRET_ID).await,
+        0,
+        "a failed comparison must remove the owner's SharedKey and pairing material"
+    );
+    assert!(
+        !has_shared_key(&PostgresSecretStore::new(owner_db.client()), channel).await,
+        "a failed comparison must remove the owner's SharedKey"
+    );
+    println!("  owner channel row and SharedKey removed from the database  ✓");
+
+    assert_eq!(
+        channel_status(&mut helper, channel).await,
+        ChannelStatus::Pending,
+        "the helper has compared nothing, so its channel stays Pending"
+    );
+    assert!(
+        has_shared_key(&PostgresSecretStore::new(helper_db.client()), channel).await,
+        "the helper keeps its SharedKey"
+    );
+    println!("  helper channel row (Pending) and SharedKey untouched  ✓");
+}
+
+/// An expired `Pending` pairing goes with its channel key, for a helper and
+/// for a replica peer alike; a `Paired` channel of the same age is kept.
+/// The automatic sweep is disabled so only the caller-driven one runs.
+async fn expired_pending_pairing_loses_its_key() {
+    let db = Database::open_isolated().await;
+    let mut owner = Peer::with_expired_channel_cleanup(
+        db.client(),
+        "Owner",
+        "https://owner.example.com",
+        PeerOptions {
+            replica_id: Some(13),
+            ..Default::default()
+        },
+        ExpiredChannelCleanup::Disabled,
+    );
+    seed_channel(&mut owner, seeded_helper(6161, ChannelStatus::Pending)).await;
+    seed_channel(&mut owner, seeded_member(6162, 0xbeef)).await;
+    seed_channel(&mut owner, seeded_helper(6163, ChannelStatus::Paired)).await;
+
+    let removed = owner
+        .protocol
+        .remove_expired_channels(60)
+        .await
+        .expect("remove_expired_channels");
+    assert!(
+        removed.contains(&ChannelId(6161)) && removed.contains(&ChannelId(6162)),
+        "both expired pending pairings must be swept, got {removed:?}"
+    );
+    assert!(
+        !removed.contains(&ChannelId(6163)),
+        "a paired channel is never swept, got {removed:?}"
+    );
+    println!("  remove_expired_channels(60) sweeps 6161 and 6162, keeps 6163  ✓");
+
+    let channels = PostgresChannelStore::new(db.client());
+    let secrets = PostgresSecretStore::new(db.client());
+    let helper_query = |id: u64| ChannelQuery::Helper {
+        channel_id: ChannelId(id),
+    };
+    let member_query = ChannelQuery::Replica {
+        channel_id: ChannelId(6162),
+        replica_id: ReplicaId(0xbeef),
+    };
+    for (channel_id, query) in [(6161, helper_query(6161)), (6162, member_query)] {
+        assert!(
+            channels
+                .load(DEFAULT_TEST_SECRET_ID, query)
+                .await
+                .expect("channel load failed")
+                .is_none(),
+            "channel {channel_id}: an expired pending pairing must not leave its row"
+        );
+        assert!(
+            !has_shared_key(&secrets, ChannelId(channel_id)).await,
+            "channel {channel_id}: an expired pending pairing must not leave its key"
+        );
+    }
+    println!("  rows and SharedKeys of 6161 and 6162 removed from the database  ✓");
+
+    assert!(
+        channels
+            .load(DEFAULT_TEST_SECRET_ID, helper_query(6163))
+            .await
+            .expect("channel load failed")
+            .is_some(),
+        "the paired channel keeps its row"
+    );
+    assert!(
+        has_shared_key(&secrets, ChannelId(6163)).await,
+        "the paired channel keeps its key"
+    );
+    assert_eq!(
+        count_secrets(&db.client(), DEFAULT_TEST_SECRET_ID).await,
+        1,
+        "only the paired channel's key remains"
+    );
+    println!("  paired channel 6163 of the same age keeps its row and SharedKey  ✓");
+}
+
+fn seeded_endpoint() -> TransportProtocol {
+    TransportProtocol {
+        uri: "https://peer.example.com".to_owned(),
+        protocol: Protocol::Https as i32,
+    }
+}
+
+fn seeded_helper(channel_id: u64, status: ChannelStatus) -> ChannelRecord {
+    ChannelRecord::Helper(HelperChannel {
+        channel_id: ChannelId(channel_id),
+        transports: vec![seeded_endpoint()],
+        communication_info: HashMap::new(),
+        status,
+        created_at: 1_700_000_000,
+        peer_role: SenderKind::Helper,
+        weight: 1,
+    })
+}
+
+fn seeded_member(channel_id: u64, replica_id: u64) -> ChannelRecord {
+    ChannelRecord::Replica(ReplicaMember {
+        channel_id: ChannelId(channel_id),
+        replica_id: ReplicaId(replica_id),
+        transports: vec![seeded_endpoint()],
+        communication_info: HashMap::new(),
+        role: ReplicaRole::Destination,
+        status: ChannelStatus::Pending,
+        created_at: 1_700_000_000,
+    })
+}
+
+/// Write a channel record and its SharedKey through the peer's SQL stores.
+async fn seed_channel(peer: &mut Peer, record: ChannelRecord) {
+    let channel_id = record.channel_id();
+    peer.protocol
+        .channel_store
+        .save(DEFAULT_TEST_SECRET_ID, record)
+        .await
+        .expect("seed channel record");
+    peer.protocol
+        .secret_store
+        .save(
+            DEFAULT_TEST_SECRET_ID,
+            channel_id,
+            SecretValue::SharedKey(std::array::from_fn(|i| (i * 11 + 5) as u8)),
+        )
+        .await
+        .expect("seed channel key");
+}
+
+async fn has_shared_key(secrets: &PostgresSecretStore, channel_id: ChannelId) -> bool {
+    secrets
+        .load(DEFAULT_TEST_SECRET_ID, channel_id, SecretKind::SharedKey)
+        .await
+        .expect("SharedKey load failed")
+        .is_some()
+}
+
+/// The creator commits to its fingerprint nonce when it publishes its keys
+/// and reveals it only when the pair request arrives, so the nonce has to
+/// outlive the process that drew it. Restart the creator in between: the
+/// handshake must still complete with both sides on one fingerprint.
+async fn the_fingerprint_nonce_survives_a_creator_restart() {
+    for (i, mode) in [ContactMode::InlineKeys, ContactMode::HashedKeys]
+        .into_iter()
+        .enumerate()
+    {
+        let owner_db = Database::open_isolated().await;
+        let helper_db = Database::open_isolated().await;
+        let contact = {
+            let mut owner = Peer::new(owner_db.client(), "Owner", "https://owner.example.com");
+            owner
+                .protocol
+                .create_contact(Some(ChannelId(950 + i as u64)), mode, None)
+                .await
+                .expect("owner.create_contact failed")
+        };
+
+        let mut owner = Peer::new(
+            owner_db.client(),
+            "Owner-Restarted",
+            "https://owner.example.com",
+        );
+        let mut helper = Peer::new(helper_db.client(), "Helper", "https://helper.example.com");
+        helper
+            .protocol
+            .start(DeRecFlow::Pairing {
+                kind: SenderKind::Helper,
+                contact,
+                peer_communication_info: HashMap::from([("name".to_owned(), "Helper".to_owned())]),
+            })
+            .await
+            .expect("helper.start(Pairing) failed");
+
+        let channel = pump_many(&mut [&mut owner, &mut helper])
+            .await
+            .into_iter()
+            .find_map(|e| match e {
+                DeRecEvent::PairingCompleted { channel_id, .. } => Some(channel_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("{mode:?}: pairing must complete after the creator restarts")
+            });
+
+        let owner_fp = owner
+            .protocol
+            .get_fingerprint(channel)
+            .await
+            .expect("owner get_fingerprint");
+        let helper_fp = helper
+            .protocol
+            .get_fingerprint(channel)
+            .await
+            .expect("helper get_fingerprint");
+        assert_eq!(
+            owner_fp, helper_fp,
+            "{mode:?}: both sides derive one fingerprint"
+        );
+    }
+    println!("  the creator's fingerprint nonce survives a restart (InlineKeys, HashedKeys)  ✓");
 }

@@ -72,48 +72,30 @@ pub unsafe extern "C" fn derec_protocol_get_fingerprint(
 /// Verify a fingerprint against the channel's locally-derived one. See
 /// [`crate::protocol::DeRecProtocol::verify_fingerprint`].
 ///
-/// Writes `*out_matched = 1` if and only if the comparison
-/// affirmatively succeeded. On every other outcome — null-pointer
-/// rejection, malformed UTF-8 in `fingerprint_ptr`, a backend error,
-/// or a legitimate mismatch — `*out_matched` is set to `0`. Callers
-/// MUST also inspect the returned [`DeRecError`] to distinguish a
-/// successful mismatch from a failure that could not produce a
-/// verdict; treating `out_matched == 0` as "definitely not matched"
-/// is safe only after confirming the envelope reports
-/// [`DEREC_CATEGORY_OK`](crate::interop::ffi::error::DEREC_CATEGORY_OK).
-///
-/// The fail-closed write happens immediately after the null-pointer
-/// check, so a caller that allocates the output on the stack and
-/// reads it without checking the error envelope still gets `0`,
-/// never a stale `1` from uninitialized memory. This neutralizes
-/// the "sloppy caller skips the error envelope and reads stale
-/// stack" footgun on the MITM-protection gate.
+/// Success means the comparison matched and the channel is confirmed. Every
+/// other outcome is an error envelope; a mismatch is
+/// [`DEREC_CODE_FINGERPRINT_MISMATCH`](crate::interop::ffi::error::DEREC_CODE_FINGERPRINT_MISMATCH),
+/// after which a `Pending` pairing has been revoked. There is no verdict to
+/// read apart from the envelope, so a caller cannot mistake a failure for a
+/// match.
 ///
 /// # Safety
 ///
-/// `handle` and `out_matched` must be valid pointers. `fingerprint_ptr`
-/// must be a valid pointer to a NUL-terminated C string. Concurrent
-/// calls on the same handle from different threads are safe: the
-/// handle's internal mutex serializes them.
+/// `handle` must be a valid pointer. `fingerprint_ptr` must be a valid
+/// pointer to a NUL-terminated C string. Concurrent calls on the same handle
+/// from different threads are safe: the handle's internal mutex serializes
+/// them.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn derec_protocol_verify_fingerprint(
     handle: *mut DeRecProtocolHandle,
     channel_id: u64,
     fingerprint_ptr: *const c_char,
-    out_matched: *mut u32,
 ) -> DeRecError {
-    if handle.is_null() || fingerprint_ptr.is_null() || out_matched.is_null() {
+    if handle.is_null() || fingerprint_ptr.is_null() {
         return ffi_error(
             DEREC_CODE_FFI_NULL_PTR,
             "null pointer in verify_fingerprint",
         );
-    }
-    // Fail-closed: zero the output BEFORE any fallible work so every
-    // error path below leaves the caller's slot at `0`. The success
-    // branch overwrites it with the actual verdict. This is the
-    // single most important line in this function for MITM safety.
-    unsafe {
-        *out_matched = 0;
     }
     let fingerprint = match unsafe { CStr::from_ptr(fingerprint_ptr) }.to_str() {
         Ok(s) => s.to_owned(),
@@ -127,12 +109,7 @@ pub unsafe extern "C" fn derec_protocol_verify_fingerprint(
         .runtime
         .block_on(inner.verify_fingerprint(ChannelId(channel_id), &fingerprint))
     {
-        Ok(matched) => {
-            unsafe {
-                *out_matched = if matched { 1 } else { 0 };
-            }
-            success()
-        }
+        Ok(()) => success(),
         Err(e) => from_lib_error(e),
     }
 }

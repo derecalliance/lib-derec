@@ -92,7 +92,7 @@ material is delivered:
 
 | Mode | What the contact carries | Use when |
 |---|---|---|
-| `InlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry the keys (NFC, messaging). |
+| `InlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key + a 32-byte fingerprint commitment | Out-of-band channel can carry the keys (NFC, messaging). |
 | `HashedKeys` | Only a SHA-384 commitment to the keys | Channel is size-constrained (QR codes). Scanner fetches the actual keys via a plaintext `PrePair` round-trip and verifies them against the hash. |
 
 After the handshake completes, **both modes** rekey the channel id. The
@@ -192,7 +192,8 @@ const { response: prePairResp } =
   primitives.pairing.response.extract_pre_pair(prePairRespEnv.envelope);
 
 // Scanner validates the published keys against contact.contact_binding_hash.
-// Throws on mismatch (returns the keys + echoed nonce on match).
+// Throws on mismatch (returns the keys, echoed nonce and fingerprint
+// commitment on match).
 const validated = primitives.pairing.response.process_pre_pair(
   contact.contact_message, prePairResp,
 );
@@ -200,6 +201,9 @@ const validated = primitives.pairing.response.process_pre_pair(
 // Synthesize a "filled-in" contact and run the regular pairing flow. The
 // mode flip is required — `primitives.pairing.request.produce` enforces
 // `InlineKeys` and rejects a contact that still advertises `HashedKeys`.
+// The fingerprint commitment travels with the keys:
+// `primitives.pairing.response.process` checks the nonce the creator
+// reveals in its PairResponse against it (`fingerprint_commitment_mismatch`).
 const { contact_binding_hash: _omitBindingHash, ...contactBase } =
   contact.contact_message;
 const filledInContact: ContactMessage = {
@@ -207,6 +211,7 @@ const filledInContact: ContactMessage = {
   contact_mode: ContactMode.InlineKeys,
   mlkem_encapsulation_key: validated.mlkem_encapsulation_key,
   ecies_public_key: validated.ecies_public_key,
+  fingerprint_commitment: validated.fingerprint_commitment,
 };
 // ... continue with primitives.pairing.request.produce / extract /
 // primitives.pairing.response.produce / process against `filledInContact`
@@ -573,13 +578,13 @@ A stored proof is either confirmed by its helper or part of a sharing round
 still open: when a round settles a channel as failed (a rejection or a
 timeout), that channel's proof is deleted. A confirmation also deletes the
 proofs of versions the helper dropped: a helper that stores a version
-deletes every other version that round's `keepList` leaves out, so when it
+deletes every other version except that round's `keepVersion`, so when it
 confirms, its proofs for those versions are deleted here too (the confirmed
-version stays). A helper that rejects the round keeps its older versions, and
-so do their proofs; with no keep list nothing is deleted. A replica Destination never sees the helpers' answers, and it keeps every
+version and `keepVersion` stay). A helper that rejects the round keeps its
+older versions, and so do their proofs. A replica Destination never sees the helpers' answers, and it keeps every
 proof it receives: it never deletes one on its own, and freeing that storage
 is the app's concern. Verifying on a Destination a version that a helper
-refused, or later dropped under the `keepList`, gets `ShareVerifyRejected`
+refused, or later dropped under a `keepVersion`, gets `ShareVerifyRejected`
 (`UNKNOWN_SHARE_VERSION`) from that helper, where the Source reports
 `NoProof`. The app may delete such rows from the Destination's share store;
 verifying a version whose rows are gone then gives `VerifySharesFailed` with
@@ -589,6 +594,18 @@ proof sends nothing and returns `VerifySharesFailed` with
 `reason: "NoProof"` at once. A late response to an earlier challenge is
 ignored as `MessageIgnored` with `reason: "StaleResponse"`, and the current
 challenge stays open; a response missing its `result` is still an error.
+
+Matching responses to requests is the app's concern. The library applies a
+response that changes stored state only against the flow that asked for it,
+and reports the rest as they arrive without matching them: `ShareConfirmed`
+and `ShareRejected` (a sharing round counts only the helpers it is waiting
+for), `SecretsDiscovered`, `ChannelInfoUpdated`, `ChannelInfoUpdateRejected`
+and `ErrorResponseReceived`. An app that acts on these should record what it
+started and match each event against it, and decide which versions committed
+from `SharingComplete` with `threshold_met` rather than by counting
+`ShareConfirmed`, since a helper can confirm twice or unasked. See [Matching
+responses to requests is the application's
+job](https://github.com/derecalliance/lib-derec/tree/main/library#matching-responses-to-requests-is-the-applications-job).
 
 Every channel message carries one timestamp, its send time, in both the
 envelope and the inner message. A message whose two timestamps differ, or
@@ -666,9 +683,13 @@ fingerprint derived from the shared key:
 const localFp = await owner.getFingerprint(channelId);
 const peerFp  = await destination.getFingerprint(channelId); // out of band
 
-await owner.verifyFingerprint(channelId, peerFp);             // → true
-await destination.verifyFingerprint(channelId, localFp);      // → true
+await owner.verifyFingerprint(channelId, peerFp);
+await destination.verifyFingerprint(channelId, localFp);
 ```
+
+A mismatch rejects with code `fingerprint_mismatch` — a possible
+man-in-the-middle. The `Pending` pairing is revoked (its records, channel key
+and pairing material are deleted), so the devices must pair again.
 
 Once paired, the Source includes the Destination as a `ProtectSecret`
 target alongside helpers. Helpers receive the usual VSS share via

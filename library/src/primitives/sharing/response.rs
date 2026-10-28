@@ -104,7 +104,7 @@ pub struct ExtractResult {
 ///
 /// // Owner: build the sharing request envelope.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
+///     request::produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
 ///         .expect("produce request failed");
 ///
 /// // Helper: extract the request, then build the response.
@@ -223,7 +223,7 @@ pub fn produce(
 ///
 /// // Owner → Helper → Owner roundtrip.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
+///     request::produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
 ///         .expect("produce request failed");
 /// let request::ExtractResult { request: share_request } =
 ///     request::extract(&req_envelope, &shared_key).expect("extract request failed");
@@ -315,7 +315,7 @@ pub fn extract(
 ///
 /// // Owner → Helper → Owner roundtrip.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, version, 1, committed_share, &[], "", &shared_key, &[])
+///     request::produce(channel_id, version, 1, committed_share, 0, "", &shared_key, &[])
 ///         .expect("produce request failed");
 /// let request::ExtractResult { request: share_request } =
 ///     request::extract(&req_envelope, &shared_key).expect("extract request failed");
@@ -397,12 +397,21 @@ impl ShareFault {
 /// - `VERIFICATION_FAILED`: the share does not verify against `commitment`
 ///   — it carries no subshares, repeats an `x`, or its Merkle path does not
 ///   lead to the commitment.
+/// - `FORMAT_ERROR`: `keep_version` is not below `version` and is not `0`.
 ///
 /// On success returns the decoded committed share and the `secret_id` of
 /// its inner [`DeRecShare`].
 pub(crate) fn validate_share(
     request: &StoreShareRequestMessage,
 ) -> Result<(CommittedDeRecShare, u64), ShareFault> {
+    const BAD_KEEP_VERSION: &str = "keepVersion must be below version";
+
+    if let Err(error) = crate::primitives::sharing::request::validate_keep_version(
+        request.keep_version,
+        request.version,
+    ) {
+        return Err(ShareFault::format(BAD_KEEP_VERSION, error.into()));
+    }
     validate_committed_share(&request.share)
 }
 

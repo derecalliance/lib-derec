@@ -241,6 +241,11 @@ pub struct ContactMessage {
     /// reached on, in its own preference order.
     #[serde(default)]
     pub supported_transports: Vec<TransportProtocol>,
+    /// The creator's 32-byte commitment to the fingerprint nonce its pairing
+    /// response reveals. Inline-keys contacts carry it; for the other modes it
+    /// arrives with the keys in the PrePair response.
+    #[serde(with = "serde_bytes", default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_commitment: Option<Vec<u8>>,
 }
 
 impl From<derec_proto::ContactMessage> for ContactMessage {
@@ -258,6 +263,7 @@ impl From<derec_proto::ContactMessage> for ContactMessage {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            fingerprint_commitment: value.fingerprint_commitment,
         }
     }
 }
@@ -277,6 +283,7 @@ impl From<ContactMessage> for derec_proto::ContactMessage {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            fingerprint_commitment: value.fingerprint_commitment,
         }
     }
 }
@@ -346,6 +353,10 @@ pub struct PairResponseMessage {
     /// Post-handshake rekey channel id; both sides switch their local
     /// channel record to this value once the response is accepted.
     pub channel_id: u64,
+    /// The 32-byte fingerprint nonce the creator committed to, revealed on
+    /// an accepted response.
+    #[serde(with = "serde_bytes", default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_nonce: Option<Vec<u8>>,
 }
 
 impl From<derec_proto::PairResponseMessage> for PairResponseMessage {
@@ -357,6 +368,7 @@ impl From<derec_proto::PairResponseMessage> for PairResponseMessage {
             parameter_range: value.parameter_range.map(Into::into),
             timestamp: value.timestamp.map(Into::into),
             channel_id: value.channel_id,
+            fingerprint_nonce: value.fingerprint_nonce,
         }
     }
 }
@@ -370,6 +382,7 @@ impl From<PairResponseMessage> for derec_proto::PairResponseMessage {
             parameter_range: value.parameter_range.map(Into::into),
             timestamp: value.timestamp.map(Into::into),
             channel_id: value.channel_id,
+            fingerprint_nonce: value.fingerprint_nonce,
         }
     }
 }
@@ -421,6 +434,10 @@ pub struct PrePairResponseMessage {
     pub ecies_public_key: Option<Vec<u8>>,
     pub nonce: u64,
     pub timestamp: Option<Timestamp>,
+    /// The creator's 32-byte commitment to the fingerprint nonce its pairing
+    /// response reveals, covering the two keys above.
+    #[serde(with = "serde_bytes", default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_commitment: Option<Vec<u8>>,
 }
 
 impl From<derec_proto::PrePairResponseMessage> for PrePairResponseMessage {
@@ -431,6 +448,7 @@ impl From<derec_proto::PrePairResponseMessage> for PrePairResponseMessage {
             ecies_public_key: value.ecies_public_key,
             nonce: value.nonce,
             timestamp: value.timestamp.map(Into::into),
+            fingerprint_commitment: value.fingerprint_commitment,
         }
     }
 }
@@ -443,6 +461,7 @@ impl From<PrePairResponseMessage> for derec_proto::PrePairResponseMessage {
             ecies_public_key: value.ecies_public_key,
             nonce: value.nonce,
             timestamp: value.timestamp.map(Into::into),
+            fingerprint_commitment: value.fingerprint_commitment,
         }
     }
 }
@@ -693,7 +712,7 @@ pub struct StoreShareRequestMessage {
     pub share: Vec<u8>,
     pub share_algorithm: i32,
     pub version: u32,
-    pub keep_list: Vec<u32>,
+    pub keep_version: u32,
     pub version_description: String,
     pub timestamp: Option<Timestamp>,
     pub secret_id: u64,
@@ -714,7 +733,7 @@ impl From<derec_proto::StoreShareRequestMessage> for StoreShareRequestMessage {
             share: value.share,
             share_algorithm: value.share_algorithm,
             version: value.version,
-            keep_list: value.keep_list,
+            keep_version: value.keep_version,
             version_description: value.version_description,
             timestamp: value.timestamp.map(Into::into),
             secret_id: value.secret_id,
@@ -735,7 +754,7 @@ impl From<StoreShareRequestMessage> for derec_proto::StoreShareRequestMessage {
             share: value.share,
             share_algorithm: value.share_algorithm,
             version: value.version,
-            keep_list: value.keep_list,
+            keep_version: value.keep_version,
             version_description: value.version_description,
             timestamp: value.timestamp.map(Into::into),
             secret_id: value.secret_id,

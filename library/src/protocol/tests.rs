@@ -226,14 +226,15 @@ impl DeRecSecretStore for InMemSecretStore {
 pub(crate) struct InMemShareStore {
     #[allow(clippy::type_complexity)]
     pub(crate) data: Arc<Mutex<HashMap<(u64, u64, u32), Share>>>,
-    /// What [`DeRecShareStore::keep_list`] answers on every call.
-    pub(crate) keep: Arc<Mutex<Option<Vec<u32>>>>,
-    /// Every `(secret_id, version)` [`DeRecShareStore::keep_list`] was asked
-    /// about, in call order.
-    pub(crate) keep_list_calls: Arc<Mutex<Vec<(u64, u32)>>>,
-    /// When set, every [`DeRecShareStore::keep_list`] fails with a backend
+    /// What [`DeRecShareStore::keep_version`] answers on every call; when
+    /// unset it answers `version - 1`, the version distributed before.
+    pub(crate) keep: Arc<Mutex<Option<u32>>>,
+    /// Every `(secret_id, version)` [`DeRecShareStore::keep_version`] was
+    /// asked about, in call order.
+    pub(crate) keep_version_calls: Arc<Mutex<Vec<(u64, u32)>>>,
+    /// When set, every [`DeRecShareStore::keep_version`] fails with a backend
     /// error.
-    pub(crate) keep_list_error: Arc<Mutex<bool>>,
+    pub(crate) keep_version_error: Arc<Mutex<bool>>,
 }
 
 impl DeRecShareStore for InMemShareStore {
@@ -300,16 +301,20 @@ impl DeRecShareStore for InMemShareStore {
             .retain(|(s, c, v), _| !(*s == sid && *c == cid.0 && versions.contains(v)));
         Box::pin(std::future::ready(Ok(())))
     }
-    fn keep_list(&self, sid: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
-        self.keep_list_calls.lock().unwrap().push((sid, version));
-        if *self.keep_list_error.lock().unwrap() {
+    fn keep_version(&self, sid: u64, version: u32) -> ShareStoreFuture<'_, u32> {
+        self.keep_version_calls.lock().unwrap().push((sid, version));
+        if *self.keep_version_error.lock().unwrap() {
             return Box::pin(std::future::ready(Err(
                 crate::protocol::ShareStoreError::Backend(
                     "share store backend unavailable".to_owned().into(),
                 ),
             )));
         }
-        let keep = self.keep.lock().unwrap().clone();
+        let keep = self
+            .keep
+            .lock()
+            .unwrap()
+            .unwrap_or(version.saturating_sub(1));
         Box::pin(std::future::ready(Ok(keep)))
     }
 }
@@ -416,8 +421,8 @@ impl DeRecShareStore for RefusingShareStore {
     ) -> ShareStoreFuture<'_, ()> {
         self.inner.remove_versions(secret_id, channel_id, versions)
     }
-    fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
-        self.inner.keep_list(secret_id, version)
+    fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32> {
+        self.inner.keep_version(secret_id, version)
     }
     fn record_verification(
         &mut self,

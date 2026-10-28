@@ -434,9 +434,8 @@ type stateItemWire struct {
 	BehindReplicas  *[]string               `json:"behind_replicas,omitempty"`
 	LocalVersion    *uint32                 `json:"local_version,omitempty"`
 	Reported        *[]replicaDiscoveryWire `json:"reported,omitempty"`
-	// KeepList is SharingRound only. Absent on rows written before 0.0.9,
-	// which the library reads as an empty list.
-	KeepList *[]uint32 `json:"keep_list,omitempty"`
+	// KeepVersion is SharingRound only. Absent when the round sent no share.
+	KeepVersion *uint32 `json:"keep_version,omitempty"`
 	// Threshold is SharingRound only. Absent on rows written before 0.0.9,
 	// which the library judges against the builder's threshold.
 	Threshold *uint32 `json:"threshold,omitempty"`
@@ -514,10 +513,7 @@ func EncodeStateItem(item StateItem) ([]byte, error) {
 		w.PendingReplicas = &pendingReplicas
 		w.SyncedReplicas = &syncedReplicas
 		w.BehindReplicas = &behindReplicas
-		if item.KeepList != nil {
-			keepList := item.KeepList
-			w.KeepList = &keepList
-		}
+		w.KeepVersion = item.KeepVersion
 		w.Threshold = item.Threshold
 	case StateKindPendingReplicaDiscovery:
 		pendingReplicas := stringifyUint64s(item.PendingReplicas)
@@ -581,9 +577,7 @@ func DecodeStateItem(data []byte) (StateItem, error) {
 			return StateItem{}, err
 		}
 	}
-	if w.KeepList != nil {
-		item.KeepList = append([]uint32{}, (*w.KeepList)...)
-	}
+	item.KeepVersion = w.KeepVersion
 	item.Threshold = w.Threshold
 	if w.Reported != nil {
 		item.Reported = make(map[uint64]uint32, len(*w.Reported))

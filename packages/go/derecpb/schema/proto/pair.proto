@@ -237,8 +237,8 @@ message PairResponseMessage {
   // ```
   //
   // where `originalChannelId` is the channelId from the contact / pairing
-  // envelopes and `sharedKeyBytes` is the freshly-derived pairing shared
-  // key.
+  // envelopes and `sharedKeyBytes` is the channel key derived as described
+  // on `fingerprintNonce`.
   //
   // # Validation
   //
@@ -257,4 +257,28 @@ message PairResponseMessage {
   // UpdateChannelInfo handover for the long-term transport — route on the
   // new id.
   uint64 channelId = 8;
+
+  // The 32-byte fingerprint nonce the creator committed to in
+  // `fingerprintCommitment` (on the `ContactMessage` in `INLINE_KEYS` mode,
+  // on the `PrePairResponseMessage` otherwise). Present only when
+  // `result.status == OK`.
+  //
+  // The requester MUST recompute the commitment from the creator's keys and
+  // this nonce, and reject the response (closing the would-be channel) if
+  // it does not match.
+  //
+  // # Channel key
+  //
+  // Both parties derive the channel key from the handshake key and this
+  // nonce:
+  //
+  // ```text
+  // SHA-256("DeRec channel key v1" || handshakeKey || fingerprintNonce)
+  // ```
+  //
+  // where `handshakeKey` is the ML-KEM shared secret XOR the ECDH shared
+  // secret. The channel key encrypts every later message, feeds the
+  // `channelId` derivation above, and is what the fingerprint is computed
+  // from.
+  optional bytes fingerprintNonce = 9;
 }

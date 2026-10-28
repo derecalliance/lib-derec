@@ -284,32 +284,35 @@ func (p *DeRecProtocol) GetFingerprint(channelID uint64) (string, error) {
 
 // VerifyFingerprint compares fingerprint against channelID's
 // locally-derived one. On match, the channel transitions from Pending to
-// Paired and this returns true. Every non-nil error, and every legitimate
-// mismatch, returns false — callers must check err to distinguish "did
-// not match" from "could not be verified".
+// Paired and this returns nil.
+//
+// A mismatch returns an error with code derec.CodeFingerprintMismatch — a
+// possible man-in-the-middle. A Pending pairing is revoked: its records,
+// channel key and pairing material are deleted, so pair again. A channel
+// already Paired is left as it is.
 //
 // On a replica destination, confirming is also the decision to adopt the
 // group's vault: the source's publish is then installed as it arrives, with
 // no further prompt. Ask the user before calling this; to decline, never
-// confirm.
+// confirm: expired-channel cleanup removes the channel and its key.
 //
 // On a promotion the current snapshot is published to the promoted peer,
 // reusing the stored helper weights. If one is no longer valid under the
 // current threshold, that publish fails with derec.CodeInvalidWeight before
 // anything is sent and this returns that error. The promotion stands:
-// calling VerifyFingerprint again returns true and publishes nothing, so
+// calling VerifyFingerprint again returns nil and publishes nothing, so
 // call Start(FlowKindProtectSecret, ...) with valid weights to reach the
 // promoted peer.
-func (p *DeRecProtocol) VerifyFingerprint(channelID uint64, fingerprint string) (bool, error) {
+func (p *DeRecProtocol) VerifyFingerprint(channelID uint64, fingerprint string) error {
 	if p.closed {
-		return false, errors.New("protocol: VerifyFingerprint: protocol is closed")
+		return errors.New("protocol: VerifyFingerprint: protocol is closed")
 	}
 	return p.instance.VerifyFingerprint(channelID, fingerprint)
 }
 
 // RemoveExpiredChannels removes Pending channels older than
-// olderThanSecs, along with their pairing keys, returning the ids
-// removed.
+// olderThanSecs, along with their channel keys and pairing keys,
+// returning the ids removed.
 //
 // Independent of Config.Timeouts.ExpiredChannels — this sweeps at the
 // age given even when that policy is disabled. The age comparison
