@@ -8,6 +8,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using DeRec.Library;
 using DeRec.Library.Primitives;
 using Proto = Org.Derecalliance.Derec.Protobuf;
@@ -24,7 +25,12 @@ internal static class Primitives
         RunContactOfferListRoundTripTest();
         RunPairingFlowHashedKeysTest();
         RunPairingFlowNoKeysTest();
+        RunFingerprintCommitmentHonestHandshakeTest();
+        RunFingerprintNonceTamperedTest();
+        RunPrePairWithoutFingerprintCommitmentTest();
+        RunRelayCopiedFingerprintCommitmentTest();
         RunSharingFlowTest();
+        RunWeightedSharingSplitTest();
         RunVerificationFlowTest();
         RunRecoveryFlowTest();
         RunDiscoveryFlowTest();
@@ -117,6 +123,8 @@ internal static class Primitives
 
         if (contact.SecretKeyMaterial.Length == 0)
             throw new InvalidOperationException("Pairing test failed: empty contact secret key material.");
+        if (contact.ContactMessage.FingerprintCommitment is not { Length: 32 })
+            throw new InvalidOperationException("Pairing test failed: INLINE_KEYS contact must carry a 32-byte fingerprint commitment.");
 
         var pairRequest = Pairing.Request.Produce(
             Pairing.SenderKind.Helper,
@@ -270,6 +278,8 @@ internal static class Primitives
             throw new InvalidOperationException("HASHED_KEYS contact must NOT carry the ECIES key inline.");
         if (aliceContact.ContactMessage.ContactBindingHash is not { Length: 48 })
             throw new InvalidOperationException("HASHED_KEYS contact must carry a 48-byte SHA-384 binding hash.");
+        if (aliceContact.ContactMessage.FingerprintCommitment is not null)
+            throw new InvalidOperationException("HASHED_KEYS contact must NOT carry the fingerprint commitment; it arrives with the keys.");
         Console.WriteLine("  contact carries 48-byte binding hash, no inline keys");
 
 
@@ -309,6 +319,8 @@ internal static class Primitives
             throw new InvalidOperationException("PrePair validation must return Alice's ECIES public key.");
         if (validated.Nonce != aliceContact.ContactMessage.Nonce)
             throw new InvalidOperationException("PrePair validation must echo the contact's nonce.");
+        if (validated.FingerprintCommitment is not { Length: 32 })
+            throw new InvalidOperationException("PrePair validation must return Alice's 32-byte fingerprint commitment.");
         Console.WriteLine($"  PrePair validated (mlkem={validated.MlkemEncapsulationKey.Length}B, ecies={validated.EciesPublicKey.Length}B, nonce echoed)");
 
 
@@ -323,6 +335,7 @@ internal static class Primitives
             MlkemEncapsulationKey = validated.MlkemEncapsulationKey,
             EciesPublicKey = validated.EciesPublicKey,
             ContactBindingHash = null,
+            FingerprintCommitment = validated.FingerprintCommitment,
         };
 
         var pairRequest = Pairing.Request.Produce(
@@ -446,8 +459,9 @@ internal static class Primitives
             throw new InvalidOperationException("NO_KEYS contact must carry the explicit nonce.");
         if (aliceContact.ContactMessage.MlkemEncapsulationKey is not null
             || aliceContact.ContactMessage.EciesPublicKey is not null
-            || aliceContact.ContactMessage.ContactBindingHash is not null)
-            throw new InvalidOperationException("NO_KEYS contact must carry neither keys nor a binding hash.");
+            || aliceContact.ContactMessage.ContactBindingHash is not null
+            || aliceContact.ContactMessage.FingerprintCommitment is not null)
+            throw new InvalidOperationException("NO_KEYS contact must carry neither keys, a binding hash, nor a fingerprint commitment.");
         if (aliceContact.SecretKeyMaterial.Length != 0)
             throw new InvalidOperationException("NO_KEYS contact must not produce secret key material.");
 
@@ -488,6 +502,8 @@ internal static class Primitives
             throw new InvalidOperationException("ProcessPrePairNoKeys must return Alice's public keys.");
         if (accepted.Nonce != nonce)
             throw new InvalidOperationException("ProcessPrePairNoKeys must echo the contact's nonce.");
+        if (accepted.FingerprintCommitment is not { Length: 32 })
+            throw new InvalidOperationException("ProcessPrePairNoKeys must return Alice's 32-byte fingerprint commitment.");
         Console.WriteLine($"  PrePair accepted (mlkem={accepted.MlkemEncapsulationKey.Length}B, ecies={accepted.EciesPublicKey.Length}B, nonce echoed)");
 
         // From here the flow continues exactly as HASHED_KEYS does after
@@ -498,6 +514,7 @@ internal static class Primitives
             MlkemEncapsulationKey = accepted.MlkemEncapsulationKey,
             EciesPublicKey = accepted.EciesPublicKey,
             ContactBindingHash = null,
+            FingerprintCommitment = accepted.FingerprintCommitment,
         };
 
         var pairRequest = Pairing.Request.Produce(
@@ -555,6 +572,209 @@ internal static class Primitives
         Console.WriteLine("Pairing flow test (NO_KEYS + PrePair + fingerprint) passed.");
     }
 
+    private static TransportProtocol[] EndpointAt(string uri) => new[] { new TransportProtocol(uri) };
+
+    private static DeRecException ExpectPairingError(Action action, int code, string what)
+    {
+        try
+        {
+            action();
+        }
+        catch (DeRecException e)
+        {
+            if (e.Category != DeRecCategory.Pairing || e.Code != code)
+                throw new InvalidOperationException(
+                    $"{what}: expected Pairing/{DeRecCode.Name(code)}, got category={e.CategoryName} code={e.CodeName} message={e.Message}");
+            Console.WriteLine($"  {what} refused ({e.CategoryName}/{e.CodeName})  ✓");
+            return e;
+        }
+        throw new InvalidOperationException($"{what} must be refused with {DeRecCode.Name(code)}.");
+    }
+
+    /// <summary>
+    /// One <c>InlineKeys</c> handshake up to the scanner holding the decrypted
+    /// pair response, plus the key the creator derived.
+    /// </summary>
+    private static (ContactMessage Contact, byte[] ResponseProtoBytes, byte[] ScannerSecret, byte[] CreatorKey)
+        InlineKeysHandshake()
+    {
+        const ulong channelId = 42;
+        var contact = Pairing.Request.CreateContact(
+            channelId, ContactMode.InlineKeys, EndpointAt("https://relay.example/alice"));
+        var request = Pairing.Request.Produce(
+            Pairing.SenderKind.Helper, EndpointAt("https://relay.example/bob"), contact.ContactMessage);
+        var extractedRequest = Pairing.Request.Extract(request.Envelope, contact.SecretKeyMaterial);
+        var produced = Pairing.Response.Produce(
+            channelId, extractedRequest.RequestProtoBytes, contact.SecretKeyMaterial);
+        var extractedResponse = Pairing.Response.Extract(produced.Envelope, request.SecretKeyMaterial);
+        return (request.InitiatorContactMessage, extractedResponse.ResponseProtoBytes,
+            request.SecretKeyMaterial, produced.SharedKey);
+    }
+
+    /// <summary>
+    /// The creator reveals, in its <c>PairResponse</c>, the fingerprint nonce
+    /// its contact committed to, and both sides derive the same channel key
+    /// and fingerprint from it.
+    /// </summary>
+    private static void RunFingerprintCommitmentHonestHandshakeTest()
+    {
+        Console.WriteLine("=== Fingerprint commitment: honest INLINE_KEYS handshake ===");
+
+        var (contact, responseBytes, scannerSecret, creatorKey) = InlineKeysHandshake();
+
+        if (contact.FingerprintCommitment is not { Length: 32 })
+            throw new InvalidOperationException("INLINE_KEYS contact must carry a 32-byte fingerprint commitment.");
+        var response = Proto.PairResponseMessage.Parser.ParseFrom(responseBytes);
+        if (!response.HasFingerprintNonce || response.FingerprintNonce.Length != 32)
+            throw new InvalidOperationException("an accepted PairResponse must reveal a 32-byte fingerprint nonce.");
+        Console.WriteLine("  PairResponse reveals a 32-byte fingerprint nonce  ✓");
+
+        var processed = Pairing.Response.Process(contact, responseBytes, scannerSecret);
+        if (!processed.SharedKey.SequenceEqual(creatorKey))
+            throw new InvalidOperationException("both sides must derive the same channel key.");
+        if (Pairing.Fingerprint(processed.SharedKey) != Pairing.Fingerprint(creatorKey))
+            throw new InvalidOperationException("both sides must derive the same fingerprint.");
+        Console.WriteLine("  both sides derive the same channel key and fingerprint  ✓");
+
+        Console.WriteLine("Fingerprint commitment honest handshake test passed.");
+    }
+
+    /// <summary>
+    /// A <c>PairResponse</c> whose fingerprint nonce does not open the
+    /// contact's commitment, or that carries none, is refused.
+    /// </summary>
+    private static void RunFingerprintNonceTamperedTest()
+    {
+        Console.WriteLine("=== Fingerprint commitment: tampered or missing PairResponse nonce ===");
+
+        var (contact, responseBytes, scannerSecret, _) = InlineKeysHandshake();
+
+        var tampered = Proto.PairResponseMessage.Parser.ParseFrom(responseBytes);
+        byte[] nonce = tampered.FingerprintNonce.ToByteArray();
+        nonce[0] ^= 1;
+        tampered.FingerprintNonce = Google.Protobuf.ByteString.CopyFrom(nonce);
+        byte[] tamperedBytes = Google.Protobuf.MessageExtensions.ToByteArray(tampered);
+        ExpectPairingError(
+            () => Pairing.Response.Process(contact, tamperedBytes, scannerSecret),
+            DeRecCode.FingerprintCommitmentMismatch,
+            "Process(tampered fingerprint nonce)");
+
+        var stripped = Proto.PairResponseMessage.Parser.ParseFrom(responseBytes);
+        stripped.ClearFingerprintNonce();
+        byte[] strippedBytes = Google.Protobuf.MessageExtensions.ToByteArray(stripped);
+        ExpectPairingError(
+            () => Pairing.Response.Process(contact, strippedBytes, scannerSecret),
+            DeRecCode.InvalidPairResponseMessage,
+            "Process(no fingerprint nonce)");
+
+        Console.WriteLine("Fingerprint nonce tampering test passed.");
+    }
+
+    /// <summary>
+    /// A HASHED_KEYS or NO_KEYS <c>PrePair</c> response without the creator's
+    /// fingerprint commitment is refused.
+    /// </summary>
+    private static void RunPrePairWithoutFingerprintCommitmentTest()
+    {
+        Console.WriteLine("=== Fingerprint commitment: PrePair response without a commitment ===");
+
+        static byte[] StripCommitment(byte[] responseBytes)
+        {
+            var response = Proto.PrePairResponseMessage.Parser.ParseFrom(responseBytes);
+            if (!response.HasFingerprintCommitment || response.FingerprintCommitment.Length != 32)
+                throw new InvalidOperationException("an OK PrePair response must carry a 32-byte fingerprint commitment.");
+            response.ClearFingerprintCommitment();
+            return Google.Protobuf.MessageExtensions.ToByteArray(response);
+        }
+
+        const ulong hashedChannelId = 42;
+        var hashed = Pairing.Request.CreateContact(
+            hashedChannelId, ContactMode.HashedKeys, EndpointAt("https://relay.example/alice"));
+        var hashedRequest = Pairing.Request.ExtractPrePair(
+            Pairing.Request.ProducePrePair(EndpointAt("https://relay.example/bob"), hashed.ContactMessage).Envelope);
+        var hashedAnswer = Pairing.Response.ExtractPrePair(
+            Pairing.Response.ProducePrePair(hashedChannelId, hashedRequest.RequestProtoBytes, hashed.SecretKeyMaterial).Envelope);
+        byte[] hashedStripped = StripCommitment(hashedAnswer.ResponseProtoBytes);
+        ExpectPairingError(
+            () => Pairing.Response.ProcessPrePair(hashed.ContactMessage, hashedStripped),
+            DeRecCode.InvalidPairResponseMessage,
+            "ProcessPrePair(HASHED_KEYS, no commitment)");
+
+        var (noKeysContact, noKeysAnswer) = NoKeysPrePairLeg();
+        byte[] noKeysStripped = StripCommitment(noKeysAnswer);
+        ExpectPairingError(
+            () => Pairing.Response.ProcessPrePairNoKeys(noKeysContact, noKeysStripped),
+            DeRecCode.InvalidPairResponseMessage,
+            "ProcessPrePairNoKeys(no commitment)");
+
+        Console.WriteLine("PrePair without fingerprint commitment test passed.");
+    }
+
+    /// <summary>
+    /// The NO_KEYS contact and the creator's decoded <c>PrePair</c> answer.
+    /// </summary>
+    private static (ContactMessage Contact, byte[] ResponseProtoBytes) NoKeysPrePairLeg()
+    {
+        const ulong channelId = 7;
+        var contact = Pairing.Request.CreateContact(
+            channelId, ContactMode.NoKeys, EndpointAt("https://relay.example/alice"), 4321);
+        var request = Pairing.Request.ExtractPrePair(
+            Pairing.Request.ProducePrePair(EndpointAt("https://relay.example/bob"), contact.ContactMessage).Envelope);
+        var answer = Pairing.Response.ProducePrePairNoKeys(channelId, request.RequestProtoBytes);
+        var extracted = Pairing.Response.ExtractPrePair(answer.Envelope);
+        return (contact.ContactMessage, extracted.ResponseProtoBytes);
+    }
+
+    /// <summary>
+    /// A relay on the NO_KEYS <c>PrePair</c> leg answers the scanner with its
+    /// own keys and copies the creator's commitment. That commitment covers the
+    /// creator's keys and opens only with the creator's nonce, so the relay's
+    /// own <c>PairResponse</c> is refused.
+    /// </summary>
+    private static void RunRelayCopiedFingerprintCommitmentTest()
+    {
+        Console.WriteLine("=== Fingerprint commitment: relay copies the creator's commitment ===");
+
+        const ulong channelId = 7;
+        var (contact, creatorAnswer) = NoKeysPrePairLeg();
+        var creatorCommitment = Proto.PrePairResponseMessage.Parser.ParseFrom(creatorAnswer).FingerprintCommitment;
+
+        var request = Pairing.Request.ExtractPrePair(
+            Pairing.Request.ProducePrePair(EndpointAt("https://relay.example/bob"), contact).Envelope);
+        var relay = Pairing.Response.ProducePrePairNoKeys(channelId, request.RequestProtoBytes);
+        var relayed = Proto.PrePairResponseMessage.Parser.ParseFrom(
+            Pairing.Response.ExtractPrePair(relay.Envelope).ResponseProtoBytes);
+        relayed.FingerprintCommitment = creatorCommitment;
+        byte[] relayedBytes = Google.Protobuf.MessageExtensions.ToByteArray(relayed);
+
+        // Nothing binds NO_KEYS keys to the contact, so the scanner accepts them.
+        var validated = Pairing.Response.ProcessPrePairNoKeys(contact, relayedBytes);
+        var filledIn = contact with
+        {
+            ContactMode = ContactMode.InlineKeys,
+            MlkemEncapsulationKey = validated.MlkemEncapsulationKey,
+            EciesPublicKey = validated.EciesPublicKey,
+            ContactBindingHash = null,
+            FingerprintCommitment = validated.FingerprintCommitment,
+        };
+        Console.WriteLine("  scanner accepts the relay's keys with the copied commitment");
+
+        var pairRequest = Pairing.Request.Produce(
+            Pairing.SenderKind.Helper, EndpointAt("https://relay.example/bob"), filledIn);
+        var extractedRequest = Pairing.Request.Extract(pairRequest.Envelope, relay.SecretKeyMaterial);
+        var produced = Pairing.Response.Produce(
+            channelId, extractedRequest.RequestProtoBytes, relay.SecretKeyMaterial);
+        var extractedResponse = Pairing.Response.Extract(produced.Envelope, pairRequest.SecretKeyMaterial);
+
+        ExpectPairingError(
+            () => Pairing.Response.Process(
+                pairRequest.InitiatorContactMessage, extractedResponse.ResponseProtoBytes, pairRequest.SecretKeyMaterial),
+            DeRecCode.FingerprintCommitmentMismatch,
+            "Process(relay PairResponse)");
+
+        Console.WriteLine("Relay copied fingerprint commitment test passed.");
+    }
+
     private static void RunSharingFlowTest()
     {
         Console.WriteLine("=== Sharing flow test ===");
@@ -564,8 +784,9 @@ internal static class Primitives
         ulong[] channelIds = new ulong[] { 1, 2, 3 };
         ulong threshold = 2;
         uint version = 1;
+        var channels = Array.ConvertAll(channelIds, id => new Sharing.WeightedChannel(id, 1));
 
-        var splitResult = Sharing.Request.Split(secretId, secretData, channelIds, threshold, version);
+        var splitResult = Sharing.Request.Split(secretId, secretData, channels, threshold, version);
         var shares = splitResult.DeserializeShares();
 
         if (shares.Count != channelIds.Length)
@@ -583,7 +804,7 @@ internal static class Primitives
 
             DeRecMessage requestEnvelope = Sharing.Request.Produce(
                 channel, version, secretId, shareBytes,
-                Array.Empty<uint>(), string.Empty, sharedKeys[channel]
+                0u, string.Empty, sharedKeys[channel]
             );
 
             // Helper side: extract then produce response
@@ -621,7 +842,7 @@ internal static class Primitives
         {
             Sharing.Request.Produce(
                 firstChannel, version, secretId, shares[firstChannel],
-                Array.Empty<uint>(), string.Empty, shortKey);
+                0u, string.Empty, shortKey);
         }
         catch (DeRecException e)
         {
@@ -647,6 +868,50 @@ internal static class Primitives
         Console.WriteLine("Sharing flow test passed.");
     }
 
+    /// <summary>
+    /// A channel listed in <c>Split</c>'s <c>channels</c> with weight 2 gets
+    /// that many subshares in its committed share; a channel with weight 1
+    /// gets exactly one. Channel 3 sorts last among the inputs, which
+    /// exercises weight assignment by channel ID rather than slice position.
+    /// </summary>
+    private static void RunWeightedSharingSplitTest()
+    {
+        Console.WriteLine("=== Weighted sharing split test ===");
+
+        ulong secretId = 1;
+        byte[] secretData = Encoding.UTF8.GetBytes("super_secret_value");
+        ulong threshold = 3;
+        uint version = 1;
+        var channels = new[]
+        {
+            new Sharing.WeightedChannel(3UL, 2),
+            new Sharing.WeightedChannel(1UL, 1),
+            new Sharing.WeightedChannel(2UL, 1),
+        };
+
+        var shares = Sharing.Request.Split(secretId, secretData, channels, threshold, version)
+            .DeserializeShares();
+
+        static int SubshareCount(byte[] committedShareBytes)
+        {
+            var committed = Proto.CommittedDeRecShare.Parser.ParseFrom(committedShareBytes);
+            var inner = Proto.DeRecShare.Parser.ParseFrom(committed.DeRecShare.ToByteArray());
+            return inner.Subshares.Count;
+        }
+
+        var expectedSubshares = new Dictionary<ulong, int> { [3UL] = 2, [1UL] = 1, [2UL] = 1 };
+        foreach (var (channelId, expected) in expectedSubshares)
+        {
+            int actual = SubshareCount(shares[channelId]);
+            if (actual != expected)
+                throw new InvalidOperationException(
+                    $"channel {channelId} must hold {expected} subshare(s), got {actual}");
+        }
+        Console.WriteLine("  weighted channel holds 2 subshares, unweighted channels hold 1 each  ✓");
+
+        Console.WriteLine("Weighted sharing split test passed.");
+    }
+
     private static void RunVerificationFlowTest()
     {
         Console.WriteLine("=== Verification flow test ===");
@@ -659,7 +924,8 @@ internal static class Primitives
 
         var sharedKeys = CreateChannelSharedKeys(channels);
 
-        var shares = Sharing.Request.Split(secretId, secretData, channels, threshold, version)
+        var weightedChannels = Array.ConvertAll(channels, id => new Sharing.WeightedChannel(id, 1));
+        var shares = Sharing.Request.Split(secretId, secretData, weightedChannels, threshold, version)
             .DeserializeShares();
 
         ulong channel1 = 1;
@@ -668,10 +934,10 @@ internal static class Primitives
 
         // Helper's stored share is the *extracted* inner StoreShareRequestMessage
         DeRecMessage storeEnv1 = Sharing.Request.Produce(
-            channel1, version, secretId, shares[channel1], Array.Empty<uint>(), string.Empty, sharedKey1
+            channel1, version, secretId, shares[channel1], 0u, string.Empty, sharedKey1
         );
         DeRecMessage storeEnv2 = Sharing.Request.Produce(
-            channel2, version, secretId, shares[channel2], Array.Empty<uint>(), string.Empty, sharedKey1
+            channel2, version, secretId, shares[channel2], 0u, string.Empty, sharedKey1
         );
         byte[] storedShare1 = Sharing.Request.Extract(storeEnv1, sharedKey1).RequestProtoBytes;
         byte[] storedShare2 = Sharing.Request.Extract(storeEnv2, sharedKey1).RequestProtoBytes;
@@ -722,7 +988,8 @@ internal static class Primitives
 
         var sharedKeys = CreateChannelSharedKeys(channels);
 
-        var shares = Sharing.Request.Split(secretId, secretData, channels, threshold, version)
+        var weightedChannels = Array.ConvertAll(channels, id => new Sharing.WeightedChannel(id, 1));
+        var shares = Sharing.Request.Split(secretId, secretData, weightedChannels, threshold, version)
             .DeserializeShares();
 
         ulong channel1 = 1;
@@ -732,11 +999,11 @@ internal static class Primitives
 
         // Helper-side persisted store-share inner request bytes
         byte[] storedShare1 = Sharing.Request.Extract(
-            Sharing.Request.Produce(channel1, version, secretId, shares[channel1], Array.Empty<uint>(), string.Empty, sharedKey1),
+            Sharing.Request.Produce(channel1, version, secretId, shares[channel1], 0u, string.Empty, sharedKey1),
             sharedKey1
         ).RequestProtoBytes;
         byte[] storedShare2 = Sharing.Request.Extract(
-            Sharing.Request.Produce(channel2, version, secretId, shares[channel2], Array.Empty<uint>(), string.Empty, sharedKey2),
+            Sharing.Request.Produce(channel2, version, secretId, shares[channel2], 0u, string.Empty, sharedKey2),
             sharedKey2
         ).RequestProtoBytes;
 

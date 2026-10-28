@@ -12,6 +12,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"google.golang.org/protobuf/proto"
@@ -31,7 +32,12 @@ func runPrimitives() {
 	runProtocolVersion()
 	runPairingFlow()
 	runNoKeysPairingFlow()
+	runFingerprintCommitmentHandshake()
+	runFingerprintNonceTampered()
+	runPrePairWithoutCommitment()
+	runNoKeysRelayCopiesCommitment()
 	runSharingFlow()
+	runWeightedSplit()
 	runVerificationFlow()
 	runRecoveryFlow()
 	runDiscoveryFlow()
@@ -195,15 +201,9 @@ func runNoKeysPairingFlow() {
 	must(err, "pairing.Response.ProcessPrePairNoKeys")
 	assertTrue(len(processed.MlkemEncapsulationKey) != 0 && len(processed.EciesPublicKey) != 0, "NO_KEYS PrePair must return both public keys")
 	assertTrue(processed.Nonce == nonce, "NO_KEYS PrePair must echo the contact nonce")
+	assertTrue(len(processed.FingerprintCommitment) == 32, "NO_KEYS PrePair must return a 32-byte fingerprint commitment")
 
-	var contact derecpb.ContactMessage
-	must(proto.Unmarshal(aliceContact.ContactWireBytes, &contact), "decode ContactMessage")
-	contact.ContactMode = derecpb.ContactMode_INLINE_KEYS
-	contact.MlkemEncapsulationKey = processed.MlkemEncapsulationKey
-	contact.EciesPublicKey = processed.EciesPublicKey
-	contact.ContactBindingHash = nil
-	filledIn, err := proto.Marshal(&contact)
-	must(err, "encode filled-in ContactMessage")
+	filledIn := inlineKeysContact(aliceContact.ContactWireBytes, processed)
 
 	pairReq, err := pairing.Request.Produce(pairing.SenderKindHelper, transportListBytes("https://example.com/helper"), filledIn, nil, nil)
 	must(err, "pairing.Request.Produce")
@@ -244,7 +244,8 @@ func runSharingFlow() {
 	const threshold = 2
 	const version = uint32(1)
 
-	shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold, version)
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 1}, {ChannelID: 3, Weight: 1}}
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
 	must(err, "sharing.Request.Split")
 	assertTrue(len(shares) == len(channelIDs), "expected one share per channel, got %d", len(shares))
 
@@ -255,7 +256,7 @@ func runSharingFlow() {
 		assertTrue(ok, "missing share for channel %d", channelID)
 		assertTrue(len(committedShare) != 0, "empty committed share for channel %d", channelID)
 
-		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", sharedKey, nil)
+		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, 0, "", sharedKey, nil)
 		must(err, fmt.Sprintf("sharing.Request.Produce channel %d", channelID))
 		assertTrue(len(requestWire) != 0, "empty store share request envelope for channel %d", channelID)
 
@@ -278,6 +279,35 @@ func runSharingFlow() {
 	fmt.Println("Sharing flow test passed.")
 }
 
+// runWeightedSplit mirrors a weighted Split call: channel 1 gets two
+// subshares, channel 2 gets three, and channel 3 (weight 1) gets the
+// unweighted default of one, decoded from the committed share's
+// DeRecShare.subshares count.
+func runWeightedSplit() {
+	fmt.Println("=== Weighted split test ===")
+
+	const secretID = uint64(0x0102_0304_05ff)
+	secretData := []byte{5, 6, 7, 8, 255}
+	channelIDs := []uint64{1, 2, 3}
+	const threshold = 4
+	const version = uint32(1)
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 2}, {ChannelID: 2, Weight: 3}, {ChannelID: 3, Weight: 1}}
+
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
+	must(err, "sharing.Request.Split (weighted)")
+
+	wantSubshares := map[uint64]int{1: 2, 2: 3, 3: 1}
+	for _, id := range channelIDs {
+		var committed derecpb.CommittedDeRecShare
+		must(proto.Unmarshal(shares[id], &committed), fmt.Sprintf("decode CommittedDeRecShare channel %d", id))
+		var share derecpb.DeRecShare
+		must(proto.Unmarshal(committed.GetDeRecShare(), &share), fmt.Sprintf("decode DeRecShare channel %d", id))
+		assertTrue(len(share.GetSubshares()) == wantSubshares[id], "channel %d: expected %d subshares, got %d", id, wantSubshares[id], len(share.GetSubshares()))
+	}
+
+	fmt.Println("Weighted split test passed.")
+}
+
 // runVerificationFlow mirrors run_verification_flow_test in
 // smoke-tests/rust/src/primitives.rs: challenge channel 1 for its share of a
 // split secret, confirm a response proving possession of the exact share
@@ -288,14 +318,14 @@ func runVerificationFlow() {
 
 	const secretID = uint64(0x0102_0304_05ff)
 	secretData := []byte{5, 6, 7, 8, 255}
-	channelIDs := []uint64{1, 2, 3}
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 1}, {ChannelID: 3, Weight: 1}}
 	const threshold = 2
 	const version = uint32(1)
 	const channel1, channel2 = uint64(1), uint64(2)
 
 	sharedKey := sharedKeyFill(1)
 
-	shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold, version)
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
 	must(err, "sharing.Request.Split")
 	shareContent1 := shares[channel1]
 	shareContent2 := shares[channel2]
@@ -339,11 +369,11 @@ func runRecoveryFlow() {
 
 	const secretID = uint64(0x0102_0304_05ff)
 	secretData := []byte{5, 6, 7, 8, 255}
-	channelIDs := []uint64{1, 2, 3}
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 1}, {ChannelID: 3, Weight: 1}}
 	const threshold = 2
 	const version = uint32(1)
 
-	shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold, version)
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
 	must(err, "sharing.Request.Split")
 
 	keys := map[uint64][]byte{1: sharedKeyFill(1), 2: sharedKeyFill(2), 3: sharedKeyFill(3)}
@@ -352,7 +382,7 @@ func runRecoveryFlow() {
 	for _, channelID := range []uint64{1, 2} {
 		key := keys[channelID]
 
-		requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], nil, "", key, nil)
+		requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], 0, "", key, nil)
 		must(err, fmt.Sprintf("sharing.Request.Produce channel %d", channelID))
 
 		extracted, err := sharing.Request.Extract(requestWire, key)
@@ -464,4 +494,192 @@ func runEnvelopeTraceID() {
 	must(err, "discovery.Request.Extract on re-stamped envelope")
 
 	fmt.Println("Envelope trace_id helpers test passed.")
+}
+
+// inlineKeysContact rewrites a HASHED_KEYS or NO_KEYS contact into the
+// INLINE_KEYS shape Request.Produce requires, carrying the keys and the
+// fingerprint commitment the PrePair leg returned.
+func inlineKeysContact(contactWireBytes []byte, keys pairing.ProcessedPrePair) []byte {
+	var contact derecpb.ContactMessage
+	must(proto.Unmarshal(contactWireBytes, &contact), "decode ContactMessage")
+	contact.ContactMode = derecpb.ContactMode_INLINE_KEYS
+	contact.MlkemEncapsulationKey = keys.MlkemEncapsulationKey
+	contact.EciesPublicKey = keys.EciesPublicKey
+	contact.FingerprintCommitment = keys.FingerprintCommitment
+	contact.ContactBindingHash = nil
+	filledIn, err := proto.Marshal(&contact)
+	must(err, "encode filled-in ContactMessage")
+	return filledIn
+}
+
+// assertPairingCode fails unless err is a *derec.Error in the pairing
+// category carrying code.
+func assertPairingCode(err error, code int32, context string) {
+	var derr *derec.Error
+	assertTrue(errors.As(err, &derr) && derr.Code == code && derr.Category == derec.CategoryPairing,
+		"%s: want pairing error code %d, got %#v", context, code, err)
+}
+
+// inlineKeysHandshakeResult is one INLINE_KEYS handshake up to the scanner
+// holding the decrypted pair response, plus the key the creator derived.
+type inlineKeysHandshakeResult struct {
+	initiatorContact []byte
+	responseProto    []byte
+	scannerSecret    []byte
+	creatorKey       []byte
+}
+
+func inlineKeysHandshake() inlineKeysHandshakeResult {
+	const channelID = uint64(42)
+	created, err := pairing.Request.CreateContact(channelID, pairing.ContactModeInlineKeys, transportListBytes("https://relay.example/alice"), nil)
+	must(err, "pairing.Request.CreateContact")
+	contact, err := pairing.Request.DecodeContact(created.ContactWireBytes)
+	must(err, "pairing.Request.DecodeContact")
+	assertTrue(len(contact.FingerprintCommitment) == 32, "an INLINE_KEYS contact must carry a 32-byte fingerprint commitment")
+
+	req, err := pairing.Request.Produce(pairing.SenderKindHelper, transportListBytes("https://relay.example/bob"), created.ContactWireBytes, nil, nil)
+	must(err, "pairing.Request.Produce")
+	extractedReq, err := pairing.Request.Extract(req.Envelope, created.SecretKeyMaterial, nil)
+	must(err, "pairing.Request.Extract")
+	produced, err := pairing.Response.Produce(channelID, extractedReq.RequestProto, created.SecretKeyMaterial, nil, nil, false)
+	must(err, "pairing.Response.Produce")
+	extractedResp, err := pairing.Response.Extract(produced.Envelope, req.SecretKeyMaterial)
+	must(err, "pairing.Response.Extract")
+	return inlineKeysHandshakeResult{
+		initiatorContact: req.InitiatorContactMessage,
+		responseProto:    extractedResp.ResponseProto,
+		scannerSecret:    req.SecretKeyMaterial,
+		creatorKey:       produced.SharedKey,
+	}
+}
+
+// runFingerprintCommitmentHandshake: an honest INLINE_KEYS handshake reveals
+// a 32-byte fingerprint nonce, and both sides derive the same channel key and
+// fingerprint from it.
+func runFingerprintCommitmentHandshake() {
+	fmt.Println("=== Fingerprint commitment test (honest InlineKeys) ===")
+	h := inlineKeysHandshake()
+
+	var resp derecpb.PairResponseMessage
+	must(proto.Unmarshal(h.responseProto, &resp), "decode PairResponseMessage")
+	assertTrue(len(resp.GetFingerprintNonce()) == 32, "the pair response must reveal a 32-byte fingerprint nonce, got %d bytes", len(resp.GetFingerprintNonce()))
+
+	processed, err := pairing.Response.Process(h.initiatorContact, h.responseProto, h.scannerSecret, nil)
+	must(err, "pairing.Response.Process")
+	assertTrue(bytes.Equal(processed.SharedKey, h.creatorKey), "both sides must derive the same channel key")
+	creatorFP, err := pairing.Fingerprint(h.creatorKey)
+	must(err, "pairing.Fingerprint (creator)")
+	scannerFP, err := pairing.Fingerprint(processed.SharedKey)
+	must(err, "pairing.Fingerprint (scanner)")
+	assertTrue(creatorFP == scannerFP, "fingerprints must match: creator=%q scanner=%q", creatorFP, scannerFP)
+
+	fmt.Println("Fingerprint commitment test (honest InlineKeys) passed.")
+}
+
+// runFingerprintNonceTampered: a pair response whose fingerprint nonce does
+// not open the contact's commitment is refused.
+func runFingerprintNonceTampered() {
+	fmt.Println("=== Fingerprint commitment test (tampered nonce) ===")
+	h := inlineKeysHandshake()
+
+	var resp derecpb.PairResponseMessage
+	must(proto.Unmarshal(h.responseProto, &resp), "decode PairResponseMessage")
+	resp.FingerprintNonce[0] ^= 1
+	tampered, err := proto.Marshal(&resp)
+	must(err, "encode tampered PairResponseMessage")
+
+	_, err = pairing.Response.Process(h.initiatorContact, tampered, h.scannerSecret, nil)
+	assertPairingCode(err, derec.CodeFingerprintCommitmentMismatch, "pairing.Response.Process (tampered nonce)")
+
+	fmt.Println("Fingerprint commitment test (tampered nonce) passed.")
+}
+
+// prePairLeg runs the PrePair exchange for a fresh contact of mode, returning
+// the contact, the PrePair request proto, and the creator's response proto.
+func prePairLeg(mode pairing.ContactMode) (contact, requestProto, responseProto []byte) {
+	const channelID = uint64(7)
+	nonce := uint64(4321)
+	created, err := pairing.Request.CreateContact(channelID, mode, transportListBytes("https://relay.example/alice"), &nonce)
+	must(err, "pairing.Request.CreateContact")
+	req, err := pairing.Request.ProducePrePair(transportListBytes("https://relay.example/bob"), created.ContactWireBytes)
+	must(err, "pairing.Request.ProducePrePair")
+	extractedReq, err := pairing.Request.ExtractPrePair(req.Envelope)
+	must(err, "pairing.Request.ExtractPrePair")
+	var envelope []byte
+	if mode == pairing.ContactModeNoKeys {
+		answer, err := pairing.Response.ProducePrePairNoKeys(channelID, extractedReq.RequestProto)
+		must(err, "pairing.Response.ProducePrePairNoKeys")
+		envelope = answer.Envelope
+	} else {
+		answer, err := pairing.Response.ProducePrePair(channelID, extractedReq.RequestProto, created.SecretKeyMaterial)
+		must(err, "pairing.Response.ProducePrePair")
+		envelope = answer.Envelope
+	}
+	extractedResp, err := pairing.Response.ExtractPrePair(envelope)
+	must(err, "pairing.Response.ExtractPrePair")
+	return created.ContactWireBytes, extractedReq.RequestProto, extractedResp.ResponseProto
+}
+
+// runPrePairWithoutCommitment: a HASHED_KEYS or NO_KEYS PrePair response
+// with its fingerprint commitment removed is refused.
+func runPrePairWithoutCommitment() {
+	fmt.Println("=== Fingerprint commitment test (PrePair without commitment) ===")
+	for _, mode := range []pairing.ContactMode{pairing.ContactModeHashedKeys, pairing.ContactModeNoKeys} {
+		contact, _, responseProto := prePairLeg(mode)
+		var resp derecpb.PrePairResponseMessage
+		must(proto.Unmarshal(responseProto, &resp), "decode PrePairResponseMessage")
+		assertTrue(len(resp.GetFingerprintCommitment()) == 32, "mode %d: the PrePair response must carry a 32-byte fingerprint commitment", mode)
+		resp.FingerprintCommitment = nil
+		stripped, err := proto.Marshal(&resp)
+		must(err, "encode stripped PrePairResponseMessage")
+
+		if mode == pairing.ContactModeNoKeys {
+			_, err = pairing.Response.ProcessPrePairNoKeys(contact, stripped)
+			assertPairingCode(err, derec.CodeInvalidPairResponseMessage, "pairing.Response.ProcessPrePairNoKeys (no commitment)")
+		} else {
+			_, err = pairing.Response.ProcessPrePair(contact, stripped)
+			assertPairingCode(err, derec.CodeInvalidPairResponseMessage, "pairing.Response.ProcessPrePair (no commitment)")
+		}
+	}
+	fmt.Println("Fingerprint commitment test (PrePair without commitment) passed.")
+}
+
+// runNoKeysRelayCopiesCommitment: a relay answers a NO_KEYS PrePair with its
+// own keys but copies the creator's commitment. That commitment covers the
+// creator's keys and opens only with the creator's nonce, so the scanner
+// refuses the relay's pairing response.
+func runNoKeysRelayCopiesCommitment() {
+	fmt.Println("=== Fingerprint commitment test (NO_KEYS relay) ===")
+	const channelID = uint64(7)
+	contact, requestProto, creatorAnswer := prePairLeg(pairing.ContactModeNoKeys)
+	var creatorResp derecpb.PrePairResponseMessage
+	must(proto.Unmarshal(creatorAnswer, &creatorResp), "decode creator PrePairResponseMessage")
+
+	relay, err := pairing.Response.ProducePrePairNoKeys(channelID, requestProto)
+	must(err, "relay pairing.Response.ProducePrePairNoKeys")
+	relayedResp, err := pairing.Response.ExtractPrePair(relay.Envelope)
+	must(err, "pairing.Response.ExtractPrePair (relayed)")
+	var relayed derecpb.PrePairResponseMessage
+	must(proto.Unmarshal(relayedResp.ResponseProto, &relayed), "decode relayed PrePairResponseMessage")
+	relayed.FingerprintCommitment = creatorResp.GetFingerprintCommitment()
+	relayedProto, err := proto.Marshal(&relayed)
+	must(err, "encode relayed PrePairResponseMessage")
+
+	validated, err := pairing.Response.ProcessPrePairNoKeys(contact, relayedProto)
+	must(err, "pairing.Response.ProcessPrePairNoKeys accepts unbound NO_KEYS keys")
+	filledIn := inlineKeysContact(contact, validated)
+
+	req, err := pairing.Request.Produce(pairing.SenderKindHelper, transportListBytes("https://relay.example/bob"), filledIn, nil, nil)
+	must(err, "pairing.Request.Produce")
+	extractedReq, err := pairing.Request.Extract(req.Envelope, relay.SecretKeyMaterial, nil)
+	must(err, "relay pairing.Request.Extract")
+	produced, err := pairing.Response.Produce(channelID, extractedReq.RequestProto, relay.SecretKeyMaterial, nil, nil, false)
+	must(err, "relay pairing.Response.Produce")
+	extractedResp, err := pairing.Response.Extract(produced.Envelope, req.SecretKeyMaterial)
+	must(err, "pairing.Response.Extract")
+
+	_, err = pairing.Response.Process(req.InitiatorContactMessage, extractedResp.ResponseProto, req.SecretKeyMaterial, nil)
+	assertPairingCode(err, derec.CodeFingerprintCommitmentMismatch, "pairing.Response.Process (relayed keys)")
+
+	fmt.Println("Fingerprint commitment test (NO_KEYS relay) passed.")
 }

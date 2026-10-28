@@ -117,6 +117,7 @@ fn typescript_surfaces_declare_every_dto_field() {
         ContactMessage {
             channel_id, nonce, contact_mode, mlkem_encapsulation_key,
             ecies_public_key, contact_binding_hash, timestamp, supported_transports,
+            fingerprint_commitment,
         }
         PairRequestMessage {
             sender_kind, mlkem_ciphertext, ecies_public_key, nonce, communication_info,
@@ -124,10 +125,12 @@ fn typescript_surfaces_declare_every_dto_field() {
         }
         PairResponseMessage {
             result, nonce, communication_info, parameter_range, timestamp, channel_id,
+            fingerprint_nonce,
         }
         PrePairRequestMessage { nonce, timestamp, supported_transports }
         PrePairResponseMessage {
             result, mlkem_encapsulation_key, ecies_public_key, nonce, timestamp,
+            fingerprint_commitment,
         }
         VersionListEntry { version, version_description }
         VersionList { secret_id, versions }
@@ -140,7 +143,7 @@ fn typescript_surfaces_declare_every_dto_field() {
         SiblingHash { is_left, hash }
         CommittedDeRecShare { de_rec_share, commitment, merkle_path }
         StoreShareRequestMessage {
-            share, share_algorithm, version, keep_list, version_description, timestamp,
+            share, share_algorithm, version, keep_version, version_description, timestamp,
             secret_id, reply_to, replica_id,
         }
         StoreShareResponseMessage { result, version, timestamp, secret_id, replica_id }
@@ -202,8 +205,8 @@ fn typescript_surfaces_declare_every_dto_field() {
 
 /// `withUnsafeConnection` and the `grpc` transport protocol have no
 /// `dto::` struct behind them to destructure exhaustively: `unsafe_connection`
-/// lives on the private FFI `ProtocolConfig`
-/// (`library/src/interop/ffi/protocol/handle/mod.rs`), and the transport
+/// lives on `DeRecProtocolConfig`
+/// (`library/src/protocol/protocol_config.rs`), and the transport
 /// `Protocol` enum is declared in `protobufs/transportprotocol.proto` — both
 /// unreachable from this external test crate the way `dto::` is. The check
 /// is therefore textual, the same trick `enum_fixture.rs` uses for the

@@ -30,7 +30,7 @@ use crate::{
 };
 use derec_proto::{
     CommittedDeRecShare, DeRecResult, DeRecShare, GetShareResponseMessage, MessageBody, StatusEnum,
-    StoreShareRequestMessage,
+    StoreShareRequestMessage, de_rec_share::Subshare,
 };
 use prost::Message;
 
@@ -42,8 +42,10 @@ fn create_committed_share_bytes(secret_id: u64, version: u32) -> Vec<u8> {
     let derec_share = DeRecShare {
         secret_id,
         version,
-        x: vec![1, 2, 3],
-        y: vec![4, 5, 6],
+        subshares: vec![Subshare {
+            x: vec![1, 2, 3],
+            y: vec![4, 5, 6],
+        }],
         encrypted_secret: vec![7, 8, 9],
     };
 
@@ -129,7 +131,7 @@ fn create_store_share_request_envelope(
         share: share_bytes,
         share_algorithm: 0,
         version: 0,
-        keep_list: vec![],
+        keep_version: 0,
         version_description: String::new(),
         timestamp: Some(timestamp),
         secret_id: 1,
@@ -332,6 +334,79 @@ fn test_recover_from_share_responses_decode_derec_share_error() {
     ));
 }
 
+fn committed_pre_0_0_9_share(secret_id: u64, version: u32) -> Vec<u8> {
+    CommittedDeRecShare {
+        de_rec_share: crate::protocol::tests::pre_0_0_9_derec_share(secret_id, version),
+        commitment: vec![0xCD; 32],
+        merkle_path: vec![],
+    }
+    .encode_to_vec()
+}
+
+#[test]
+fn test_pre_0_0_9_layout_fails_only_at_the_old_y_field() {
+    assert!(
+        DeRecShare::decode(crate::protocol::tests::pre_0_0_9_fields_before_y().as_slice()).is_ok(),
+        "the old x field must not be what fails"
+    );
+    assert!(
+        DeRecShare::decode(crate::protocol::tests::pre_0_0_9_derec_share(1, 0).as_slice()).is_err()
+    );
+}
+
+#[test]
+fn test_recover_from_share_responses_rejects_the_pre_0_0_9_layout() {
+    let secret_id = 123;
+    let version = 0;
+    let shared_key = make_shared_key(1);
+
+    let response_envelope = create_response_envelope(
+        ChannelId(1),
+        &shared_key,
+        Some(StatusEnum::Ok as i32),
+        committed_pre_0_0_9_share(secret_id, version),
+    );
+    let ExtractGetShareResponseResult { response } =
+        extract_get_share_response(&response_envelope, &shared_key)
+            .expect("extract should succeed");
+
+    let result = recover_from_share_responses(secret_id, version, &[&response]);
+
+    assert!(matches!(
+        result,
+        Err(Error::Recovery(RecoveryError::DecodeDeRecShare { .. }))
+    ));
+}
+
+#[test]
+fn test_produce_rejects_a_stored_share_in_the_pre_0_0_9_layout() {
+    let channel_id = ChannelId(1);
+    let secret_id = 123;
+    let version = 0;
+    let shared_key = make_shared_key(1);
+
+    let ProduceGetShareRequestMessageResult {
+        envelope: request_envelope,
+    } = produce_get_share_request_message(channel_id, secret_id, version, &shared_key, &[])
+        .expect("request generation should succeed");
+    let ExtractGetShareRequestResult { request } =
+        extract_get_share_request(&request_envelope, &shared_key)
+            .expect("extract_get_share_request should succeed");
+    let stored = StoreShareRequestMessage {
+        share: committed_pre_0_0_9_share(secret_id, version),
+        secret_id,
+        version,
+        ..Default::default()
+    };
+
+    let result = produce_get_share_response_message(channel_id, &request, &stored, &shared_key);
+
+    assert!(matches!(
+        result,
+        Err(Error::Recovery(RecoveryError::DecodeDeRecShare { .. }))
+    ));
+}
+
 #[test]
 fn test_recover_from_share_responses_secret_id_mismatch() {
     let requested_secret_id = 123;
@@ -495,7 +570,7 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
         share: create_committed_share_bytes(secret_id, version),
         share_algorithm: 0,
         version,
-        keep_list: vec![],
+        keep_version: 0,
         version_description: String::new(),
         timestamp: Some(message_timestamp),
         secret_id,
@@ -643,7 +718,8 @@ fn test_recovery_end_to_end() {
     let threshold = 2;
     let version = 2;
 
-    let SplitResult { shares } = sharing_split(&channel_ids, secret_id, version, secret, threshold)
+    let weighted: Vec<_> = channel_ids.iter().map(|&c| (c, 1)).collect();
+    let SplitResult { shares } = sharing_split(&weighted, secret_id, version, secret, threshold)
         .expect("split should succeed");
 
     let mut response_messages: Vec<GetShareResponseMessage> = Vec::new();
@@ -667,7 +743,7 @@ fn test_recovery_end_to_end() {
             share: committed_share.encode_to_vec(),
             share_algorithm: 0,
             version,
-            keep_list: vec![],
+            keep_version: 0,
             version_description: String::new(),
             timestamp: Some(timestamp),
             secret_id,

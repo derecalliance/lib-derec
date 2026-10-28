@@ -53,6 +53,7 @@ use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
 use crate::protocol::context::{Exchange, Local, Round};
 use crate::protocol::stores::{StoreSet, Stores};
+use crate::protocol::types::{ChannelQuery, ChannelRecord, ChannelStatus};
 use crate::{
     Error, Result,
     primitives::unpairing::{
@@ -116,7 +117,10 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 ) -> Result<Vec<DeRecEvent>> {
     let secret_id = local.secret_id;
     let memo_str = memo.unwrap_or_default();
-    let mut events = Vec::new();
+    let mut events = vec![DeRecEvent::UnpairStarted {
+        channel_id,
+        trace_id: round.trace_id,
+    }];
 
     let shared_key = match stores
         .secrets
@@ -157,6 +161,16 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
                     },
                 )
                 .await?;
+            // Written after the pending row, so an `Unpairing` channel always
+            // has one and the acknowledgement timeout always reaches it.
+            set_status(
+                stores,
+                local,
+                channel_id,
+                ChannelStatus::Paired,
+                ChannelStatus::Unpairing,
+            )
+            .await?;
         }
     }
 
@@ -188,17 +202,36 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .resolve_response_endpoints(
             local.secret_id,
             channel_id,
+            local.policy,
             &crate::extensions::advertised_endpoints::reply_to_owned(request),
         )
         .await?;
-    stores.transport.send(&endpoint, envelope).await?;
+    let sent = crate::protocol::obligation::deliver(
+        exchange.obligation,
+        stores.transport,
+        &endpoint,
+        envelope,
+        StatusEnum::Ok,
+        "",
+    )
+    .await;
+    if sent.is_err() && !crate::protocol::obligation::attempted(exchange.obligation) {
+        return sent.map(|()| Vec::new());
+    }
 
-    drop_channel_state(stores, local, channel_id).await?;
+    // The acknowledgement is out, so the peer may already have dropped its
+    // side: the local state goes too, and a failure from here on is
+    // reported after `Unpaired`, never answered a second time.
+    let dropped = drop_channel_state(stores, local, channel_id).await;
 
     #[cfg(feature = "logging")]
     tracing::info!("unpair accepted; local state dropped");
 
-    Ok(vec![DeRecEvent::Unpaired { channel_id }])
+    crate::protocol::obligation::reported(
+        exchange.obligation,
+        vec![DeRecEvent::Unpaired { channel_id }],
+        sent.and(dropped),
+    )
 }
 
 #[cfg_attr(
@@ -213,25 +246,33 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
-    let response = UnpairResponseMessage {
-        result: Some(DeRecResult {
-            status: status as i32,
-            memo: memo.to_owned(),
-        }),
-        timestamp: Some(current_timestamp()),
-    };
-
     crate::extensions::channel_store::send_channel_message(
         stores.channels,
         stores.transport,
         local.secret_id,
         exchange.channel_id,
-        MessageBody::UnpairResponse(response),
+        failure_response(status, memo),
         exchange.shared_key,
         exchange.trace_id,
+        local.policy,
         &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        exchange.obligation,
+        status,
+        memo,
     )
     .await
+}
+
+/// The `UnpairResponse` that answers an unpair request with a non-`Ok`
+/// `status`; the channel is kept.
+pub(in crate::protocol) fn failure_response(status: StatusEnum, memo: &str) -> MessageBody {
+    MessageBody::UnpairResponse(UnpairResponseMessage {
+        result: Some(DeRecResult {
+            status: status as i32,
+            memo: memo.to_owned(),
+        }),
+        timestamp: Some(current_timestamp()),
+    })
 }
 
 pub(in crate::protocol) async fn drop_channel_state<S: StoreSet>(
@@ -314,11 +355,49 @@ async fn on_response<S: StoreSet>(
         Err(Error::Unpairing(crate::primitives::unpairing::UnpairingError::NonOkStatus {
             status,
             memo,
-        })) => Ok(vec![DeRecEvent::UnpairRejected {
-            channel_id: exchange.channel_id,
-            status,
-            memo,
-        }]),
+        })) => {
+            set_status(
+                stores,
+                local,
+                exchange.channel_id,
+                ChannelStatus::Unpairing,
+                ChannelStatus::Paired,
+            )
+            .await?;
+            Ok(vec![DeRecEvent::UnpairRejected {
+                channel_id: exchange.channel_id,
+                status,
+                memo,
+            }])
+        }
         Err(e) => Err(e),
     }
+}
+
+/// Move a helper channel from `from` to `to`, leaving any other status alone.
+///
+/// Only a `Paired` channel becomes `Unpairing`: one still `Pending` is
+/// already excluded from every flow, and a rejection must not promote it.
+async fn set_status<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    channel_id: ChannelId,
+    from: ChannelStatus,
+    to: ChannelStatus,
+) -> Result<()> {
+    let Some(mut helper) = stores
+        .channels
+        .load(local.secret_id, ChannelQuery::Helper { channel_id })
+        .await?
+        .and_then(|record| record.as_helper().cloned())
+        .filter(|helper| helper.status == from)
+    else {
+        return Ok(());
+    };
+    helper.status = to;
+    stores
+        .channels
+        .save(local.secret_id, ChannelRecord::Helper(helper))
+        .await?;
+    Ok(())
 }

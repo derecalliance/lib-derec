@@ -10,6 +10,7 @@ use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::communication_info::CommunicationInfoExt as _;
 use crate::extensions::derec_result::DeRecResultExt as _;
+use crate::extensions::message_body::MessageBodyExt as _;
 use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::protocol::context::{Exchange, Local};
 use crate::protocol::stores::{StoreSet, Stores};
@@ -25,9 +26,12 @@ use derec_proto::{
 use prost::Message;
 use std::collections::HashMap;
 
-const EMPTY_UPDATE_ERROR: Error = Error::InvalidInput(
-    "UpdateChannelInfo requires at least one of communication_info or supported_transports",
-);
+/// Why an update carrying neither field is refused. Sent to the peer as is:
+/// it names the rule the request broke, not a local fault.
+const EMPTY_UPDATE: &str =
+    "UpdateChannelInfo requires at least one of communication_info or supported_transports";
+
+const EMPTY_UPDATE_ERROR: Error = Error::InvalidInput(EMPTY_UPDATE);
 
 #[cfg_attr(
     feature = "logging",
@@ -182,7 +186,15 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .channels
         .peer_endpoints(secret_id, channel_id)
         .await?;
-    stores.transport.send(&endpoint, envelope).await?;
+    let sent = crate::protocol::obligation::deliver(
+        exchange.obligation,
+        stores.transport,
+        &endpoint,
+        envelope,
+        StatusEnum::Ok,
+        "",
+    )
+    .await;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -192,7 +204,11 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         "update_channel_info applied; Ok response sent"
     );
 
-    Ok(vec![DeRecEvent::ChannelInfoUpdated { channel_id }])
+    crate::protocol::obligation::reported(
+        exchange.obligation,
+        vec![DeRecEvent::ChannelInfoUpdated { channel_id }],
+        sent,
+    )
 }
 
 #[cfg_attr(
@@ -207,18 +223,12 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     memo: &str,
 ) -> Result<()> {
     let timestamp = current_timestamp();
-    let response = UpdateChannelInfoResponseMessage {
-        result: Some(DeRecResult {
-            status: status as i32,
-            memo: memo.to_owned(),
-        }),
-        timestamp: Some(timestamp),
-    };
-
+    let mut body = failure_response(status, memo);
+    body.set_timestamp(timestamp);
     let envelope = DeRecMessageBuilder::channel()
         .channel_id(exchange.channel_id)
         .timestamp(timestamp)
-        .message_body(MessageBody::UpdateChannelInfoResponse(response))
+        .message_body(body)
         .trace_id(exchange.trace_id)
         .encrypt(exchange.shared_key)?
         .build()?
@@ -228,12 +238,32 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         .channels
         .peer_endpoints(local.secret_id, exchange.channel_id)
         .await?;
-    stores.transport.send(&endpoint, envelope).await?;
+    crate::protocol::obligation::deliver(
+        exchange.obligation,
+        stores.transport,
+        &endpoint,
+        envelope,
+        status,
+        memo,
+    )
+    .await?;
 
     #[cfg(feature = "logging")]
     tracing::info!("update_channel_info rejected");
 
     Ok(())
+}
+
+/// The `UpdateChannelInfoResponse` that answers an update with a non-`Ok`
+/// `status`; the stored channel is left unchanged.
+pub(in crate::protocol) fn failure_response(status: StatusEnum, memo: &str) -> MessageBody {
+    MessageBody::UpdateChannelInfoResponse(UpdateChannelInfoResponseMessage {
+        result: Some(DeRecResult {
+            status: status as i32,
+            memo: memo.to_owned(),
+        }),
+        timestamp: Some(current_timestamp()),
+    })
 }
 
 /// Receives a peer's update and asks the application to accept it.
@@ -251,6 +281,9 @@ fn on_request(
     request: UpdateChannelInfoRequestMessage,
 ) -> Result<Vec<DeRecEvent>> {
     if request.communication_info.is_none() && request.supported_transports.is_empty() {
+        if let Some(obligation) = exchange.obligation {
+            obligation.fail_with(StatusEnum::Fail, EMPTY_UPDATE);
+        }
         return Err(EMPTY_UPDATE_ERROR);
     }
 
@@ -437,6 +470,7 @@ mod tests {
                 channel_id,
                 shared_key: &shared_key,
                 trace_id: 0,
+                obligation: None,
             },
             request,
         );
@@ -455,7 +489,7 @@ mod tests {
     /// application accepts.
     #[test]
     fn a_peer_may_move_to_a_transport_this_node_does_not_serve() {
-        use crate::protocol::test::{LocalFixture, StoreRig, run_async};
+        use crate::protocol::tests::{LocalFixture, StoreRig, run_async};
         use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel};
 
         run_async(async {
@@ -482,6 +516,7 @@ mod tests {
                         peer_role: derec_proto::SenderKind::Owner,
                         status: ChannelStatus::Paired,
                         created_at: 0,
+                        weight: 1,
                     }),
                 )
                 .await
@@ -499,6 +534,7 @@ mod tests {
                 channel_id,
                 shared_key: &shared_key,
                 trace_id: 0,
+                obligation: None,
             };
 
             let events = handle(

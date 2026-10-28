@@ -5,7 +5,9 @@ use derec_library::primitives::discovery::{
     request as disc_request,
     response::{self as disc_response, SecretVersionEntry, VersionEntry},
 };
-use derec_library::primitives::pairing::{request as pair_request, response as pair_response};
+use derec_library::primitives::pairing::{
+    PairingError, request as pair_request, response as pair_response,
+};
 use derec_library::primitives::recovery::{request as rec_request, response as rec_response};
 use derec_library::primitives::sharing::{request as share_request, response as share_response};
 use derec_library::primitives::verification::{
@@ -20,6 +22,10 @@ pub fn run_all() {
     run_protocol_version_test();
     run_pairing_flow_test();
     run_pairing_flow_hashed_keys_test();
+    run_fingerprint_nonce_opens_the_commitment_test();
+    run_tampered_fingerprint_nonce_test();
+    run_pre_pair_response_without_commitment_test();
+    run_relay_reusing_creator_commitment_test();
     run_sharing_flow_test();
     run_verification_flow_test();
     run_recovery_flow_test();
@@ -245,6 +251,8 @@ fn run_pairing_flow_hashed_keys_test() {
     filled_in_contact.ecies_public_key = Some(processed_prepair.ecies_public_key.clone());
     filled_in_contact.contact_mode = derec_proto::ContactMode::InlineKeys as i32;
     filled_in_contact.contact_binding_hash = None;
+    filled_in_contact.fingerprint_commitment =
+        Some(processed_prepair.fingerprint_commitment.clone());
 
     let pair_req = pair_request::produce(
         SenderKind::Helper,
@@ -303,6 +311,225 @@ fn run_pairing_flow_hashed_keys_test() {
     println!("Pairing flow test (HASHED_KEYS + PrePair) passed.");
 }
 
+fn endpoint(uri: &str) -> Vec<TransportProtocol> {
+    vec![TransportProtocol {
+        uri: uri.to_owned(),
+        protocol: Protocol::Https.into(),
+    }]
+}
+
+/// An InlineKeys handshake up to the scanner holding the decrypted pair
+/// response: `(contact, response, scanner secret, creator's channel key)`.
+fn inline_keys_handshake() -> (
+    derec_proto::ContactMessage,
+    derec_proto::PairResponseMessage,
+    derec_library::primitives::pairing::request::ProduceResult,
+    [u8; 32],
+) {
+    let channel_id = ChannelId(31);
+    let contact = pair_request::create_contact(
+        channel_id,
+        derec_proto::ContactMode::InlineKeys,
+        endpoint("https://example.com/alice"),
+        None,
+    )
+    .expect("pair_request::create_contact failed");
+    let creator_secret = contact
+        .secret_key
+        .expect("InlineKeys contact has key material");
+
+    let pair_req = pair_request::produce(
+        SenderKind::Helper,
+        endpoint("https://example.com/helper"),
+        &contact.contact_message,
+        None,
+        None,
+    )
+    .expect("pair_request::produce failed");
+    let request =
+        pair_request::extract(&pair_req.envelope, creator_secret.ecies_secret_key(), None)
+            .expect("pair_request::extract failed")
+            .request;
+    let pair_resp = pair_response::produce(
+        channel_id,
+        &request,
+        &creator_secret,
+        None,
+        None,
+        derec_library::transport::TransportPolicy::new(false),
+    )
+    .expect("pair_response::produce failed");
+    let response =
+        pair_response::extract(&pair_resp.envelope, pair_req.secret_key.ecies_secret_key())
+            .expect("pair_response::extract failed")
+            .response;
+
+    (
+        contact.contact_message,
+        response,
+        pair_req,
+        pair_resp.shared_key,
+    )
+}
+
+fn run_fingerprint_nonce_opens_the_commitment_test() {
+    println!("=== Fingerprint nonce opens the creator's commitment ===");
+
+    let (contact, response, pair_req, creator_key) = inline_keys_handshake();
+    assert_eq!(
+        contact.fingerprint_commitment.as_ref().map(Vec::len),
+        Some(32),
+        "an InlineKeys contact carries a 32-byte fingerprint commitment"
+    );
+    assert_eq!(
+        response.fingerprint_nonce.as_ref().map(Vec::len),
+        Some(32),
+        "an accepted pair response reveals a 32-byte fingerprint nonce"
+    );
+
+    let processed = pair_response::process(&contact, &response, &pair_req.secret_key, None)
+        .expect("the honest response completes pairing");
+    assert_eq!(processed.shared_key, creator_key);
+    assert_eq!(
+        derec_library::primitives::pairing::fingerprint(&processed.shared_key),
+        derec_library::primitives::pairing::fingerprint(&creator_key),
+        "both sides display the same fingerprint"
+    );
+
+    println!("Fingerprint nonce opens the creator's commitment passed.");
+}
+
+fn run_tampered_fingerprint_nonce_test() {
+    println!("=== Tampered fingerprint nonce is refused ===");
+
+    let (contact, mut response, pair_req, _) = inline_keys_handshake();
+    response.fingerprint_nonce.as_mut().unwrap()[0] ^= 1;
+
+    let result = pair_response::process(&contact, &response, &pair_req.secret_key, None);
+    assert!(
+        matches!(
+            result,
+            Err(derec_library::Error::Pairing(
+                PairingError::FingerprintCommitmentMismatch
+            ))
+        ),
+        "a nonce that does not open the commitment must be refused"
+    );
+
+    println!("Tampered fingerprint nonce is refused passed.");
+}
+
+fn no_keys_pre_pair_answer() -> (
+    derec_proto::ContactMessage,
+    derec_proto::PrePairRequestMessage,
+    derec_proto::PrePairResponseMessage,
+) {
+    let contact = pair_request::create_contact(
+        ChannelId(32),
+        derec_proto::ContactMode::NoKeys,
+        endpoint("https://example.com/alice"),
+        Some(4321),
+    )
+    .expect("pair_request::create_contact (NoKeys) failed")
+    .contact_message;
+    let pre_pair = pair_request::produce_pre_pair_request(
+        endpoint("https://example.com/helper/ephemeral"),
+        &contact,
+    )
+    .expect("pair_request::produce_pre_pair_request failed");
+    let request = pair_request::extract_pre_pair(&pre_pair.envelope)
+        .expect("pair_request::extract_pre_pair failed")
+        .request;
+    let answer = pair_response::produce_pre_pair_no_keys(ChannelId(32), &request)
+        .expect("pair_response::produce_pre_pair_no_keys failed");
+    let response = pair_response::extract_pre_pair(&answer.envelope)
+        .expect("pair_response::extract_pre_pair failed")
+        .response;
+    (contact, request, response)
+}
+
+fn run_pre_pair_response_without_commitment_test() {
+    println!("=== PrePair response without a fingerprint commitment is refused ===");
+
+    let (contact, _, mut response) = no_keys_pre_pair_answer();
+    response.fingerprint_commitment = None;
+
+    let result = pair_response::process_pre_pair_no_keys(&contact, &response);
+    assert!(
+        matches!(
+            result,
+            Err(derec_library::Error::Pairing(
+                PairingError::InvalidPairResponseMessage(_)
+            ))
+        ),
+        "a PrePair response without a commitment must be refused"
+    );
+
+    println!("PrePair response without a fingerprint commitment is refused passed.");
+}
+
+fn run_relay_reusing_creator_commitment_test() {
+    println!("=== Relay reusing the creator's commitment is refused ===");
+
+    let (contact, request, creator_answer) = no_keys_pre_pair_answer();
+
+    // A relay answers the same PrePair request with its own keys and copies
+    // the creator's commitment, the only one it has seen.
+    let relay = pair_response::produce_pre_pair_no_keys(ChannelId(32), &request)
+        .expect("relay keygen failed");
+    let mut relayed = pair_response::extract_pre_pair(&relay.envelope)
+        .expect("pair_response::extract_pre_pair failed")
+        .response;
+    relayed.fingerprint_commitment = creator_answer.fingerprint_commitment;
+
+    let validated = pair_response::process_pre_pair_no_keys(&contact, &relayed)
+        .expect("nothing binds NoKeys keys to the contact, so the scanner accepts them");
+    let mut filled_in = contact.clone();
+    filled_in.mlkem_encapsulation_key = Some(validated.mlkem_encapsulation_key);
+    filled_in.ecies_public_key = Some(validated.ecies_public_key);
+    filled_in.fingerprint_commitment = Some(validated.fingerprint_commitment);
+    filled_in.contact_mode = derec_proto::ContactMode::InlineKeys as i32;
+
+    let pair_req = pair_request::produce(
+        SenderKind::Helper,
+        endpoint("https://example.com/helper"),
+        &filled_in,
+        None,
+        None,
+    )
+    .expect("pair_request::produce failed");
+    let relay_secret = &relay.pairing_secret_key_material;
+    let request = pair_request::extract(&pair_req.envelope, relay_secret.ecies_secret_key(), None)
+        .expect("the relay reads a request encrypted to its keys")
+        .request;
+    let pair_resp = pair_response::produce(
+        ChannelId(32),
+        &request,
+        relay_secret,
+        None,
+        None,
+        derec_library::transport::TransportPolicy::new(false),
+    )
+    .expect("relay pair_response::produce failed");
+    let response =
+        pair_response::extract(&pair_resp.envelope, pair_req.secret_key.ecies_secret_key())
+            .expect("pair_response::extract failed")
+            .response;
+
+    let result = pair_response::process(&filled_in, &response, &pair_req.secret_key, None);
+    assert!(
+        matches!(
+            result,
+            Err(derec_library::Error::Pairing(
+                PairingError::FingerprintCommitmentMismatch
+            ))
+        ),
+        "the relay's nonce cannot open the creator's commitment"
+    );
+
+    println!("Relay reusing the creator's commitment is refused passed.");
+}
+
 fn run_sharing_flow_test() {
     println!("=== Sharing flow test ===");
 
@@ -312,7 +539,8 @@ fn run_sharing_flow_test() {
     let threshold = 2_usize;
     let version: u32 = 1;
 
-    let split_result = share_request::split(&channels, secret_id, version, secret_data, threshold)
+    let weighted: Vec<_> = channels.iter().map(|&c| (c, 1)).collect();
+    let split_result = share_request::split(&weighted, secret_id, version, secret_data, threshold)
         .expect("share_request::split failed");
 
     assert_eq!(
@@ -335,17 +563,9 @@ fn run_sharing_flow_test() {
             "empty commitment for channel {channel:?}"
         );
 
-        let store_result = share_request::produce(
-            *channel,
-            version,
-            secret_id,
-            share,
-            &[],
-            "",
-            &shared_key,
-            &[],
-        )
-        .unwrap_or_else(|e| panic!("share_request::produce failed for {channel:?}: {e}"));
+        let store_result =
+            share_request::produce(*channel, version, secret_id, share, 0, "", &shared_key, &[])
+                .unwrap_or_else(|e| panic!("share_request::produce failed for {channel:?}: {e}"));
 
         assert!(
             !store_result.envelope.is_empty(),
@@ -396,7 +616,8 @@ fn run_verification_flow_test() {
 
     let shared_keys = make_shared_keys(&channels);
 
-    let sharing = share_request::split(&channels, secret_id, version, secret_data, threshold)
+    let weighted: Vec<_> = channels.iter().map(|&c| (c, 1)).collect();
+    let sharing = share_request::split(&weighted, secret_id, version, secret_data, threshold)
         .expect("share_request::split failed");
 
     let channel_1 = ChannelId(1);
@@ -411,7 +632,7 @@ fn run_verification_flow_test() {
         version,
         secret_id,
         &sharing.shares[&channel_1],
-        &[],
+        0,
         "",
         shared_key_1,
         &[],
@@ -424,7 +645,7 @@ fn run_verification_flow_test() {
         version,
         secret_id,
         &sharing.shares[&channel_2],
-        &[],
+        0,
         "",
         shared_key_1,
         &[],
@@ -503,7 +724,8 @@ fn run_recovery_flow_test() {
 
     let shared_keys = make_shared_keys(&channels);
 
-    let sharing = share_request::split(&channels, secret_id, version, secret_data, threshold)
+    let weighted: Vec<_> = channels.iter().map(|&c| (c, 1)).collect();
+    let sharing = share_request::split(&weighted, secret_id, version, secret_data, threshold)
         .expect("share_request::split failed");
 
     let channel_1 = ChannelId(1);
@@ -522,7 +744,7 @@ fn run_recovery_flow_test() {
             version,
             secret_id,
             &sharing.shares[&channel_1],
-            &[],
+            0,
             "",
             shared_key_1,
             &[],
@@ -540,7 +762,7 @@ fn run_recovery_flow_test() {
             version,
             secret_id,
             &sharing.shares[&channel_2],
-            &[],
+            0,
             "",
             shared_key_2,
             &[],

@@ -54,20 +54,19 @@ pub(crate) use crate::protocol::utils::pending_action_wire;
 mod stores;
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use crate::interop::protocol_names::unpair_ack_from_name;
 use crate::interop::wasm::primitives::pairing::ContactMessage as PairingContactMessage;
 use crate::{
     interop::wasm::ts_bindings_utils::{js_error, js_error_from_lib},
     protocol::{
-        DeRecFlow, DeRecProtocol, DeRecProtocolBuilder, UnpairAck,
+        DeRecFlow, DeRecProtocol, DeRecProtocolBuilder, DeRecProtocolConfig, TimeoutsConfig,
         types::{Target, UserSecret},
     },
-    types::ChannelId,
+    types::{ChannelId, WeightedChannel},
 };
 use derec_proto::{SenderKind, TransportProtocol};
-use js_sys::{Array, Uint8Array};
+use js_sys::Array;
 use stores::{
     JsChannelStore, JsSecretStore, JsShareStore, JsStateStore, JsTransport, JsUserSecretStore,
 };
@@ -131,48 +130,14 @@ pub struct DeRecProtocolWasm {
     secret_id: u64,
 }
 
-/// JS-side shape of [`crate::protocol::types::Timeouts`]. Every field is
-/// optional; absent means the library's default stands. Mirrors the FFI
-/// `"timeouts"` config object so the two bindings cannot drift.
-#[derive(serde::Deserialize)]
-struct TimeoutsJs {
-    #[serde(default)]
-    inbound_message_secs: Option<u64>,
-    #[serde(default)]
-    sharing_round_secs: Option<u64>,
-    #[serde(default)]
-    unpair_ack_secs: Option<u64>,
-    #[serde(default)]
-    expired_channels: Option<ExpiredChannelsJs>,
-}
-
-#[derive(serde::Deserialize)]
-struct ExpiredChannelsJs {
-    enabled: bool,
-    timeout_in_secs: u64,
-}
-
-impl TimeoutsJs {
-    fn to_timeouts(&self) -> crate::protocol::types::Timeouts {
-        let d = crate::protocol::types::Timeouts::default();
-        crate::protocol::types::Timeouts {
-            inbound_message: self
-                .inbound_message_secs
-                .map_or(d.inbound_message, Duration::from_secs),
-            sharing_round: self
-                .sharing_round_secs
-                .map_or(d.sharing_round, Duration::from_secs),
-            unpair_ack: self
-                .unpair_ack_secs
-                .map_or(d.unpair_ack, Duration::from_secs),
-            expired_channels: self
-                .expired_channels
-                .as_ref()
-                .map_or(d.expired_channels, |e| {
-                    crate::protocol::ExpiredChannelCleanup::new(e.enabled, e.timeout_in_secs)
-                }),
-        }
-    }
+/// `value` read strictly as `T`: it must be a plain object, and a key `T`
+/// does not define, at any level, is an error. The object goes through a
+/// [`serde_json::Value`] first because that keeps every key it carries;
+/// reading the `JsValue` as `T` directly sees only the keys `T` names.
+fn js_object_into<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<T, String> {
+    let json: serde_json::Value =
+        serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())?;
+    crate::interop::strict_json::object_into(json)
 }
 
 /// Fluent builder for [`DeRecProtocolWasm`]. Mirrors the Rust
@@ -182,9 +147,10 @@ impl TimeoutsJs {
 /// docs.
 ///
 /// Required setters: `withChannelStore`, `withShareStore`,
-/// `withSecretStore`, `withUserSecretStore`, `withStateStore`,
-/// `withTransport`, and `withOwnTransports`. Calling `build()` without all
-/// seven throws.
+/// `withSecretStore`, `withUserSecretStore`, `withStateStore`, and
+/// `withTransport`. Calling `build()` without all six throws. Own transports
+/// come from `withOwnTransports` or a config applied with `withConfig`;
+/// `build()` fails with `InvalidInput` if none are set.
 ///
 /// An optional setter that is never called leaves the Rust builder's default
 /// in force: the value is forwarded only when the application supplied one.
@@ -197,18 +163,10 @@ pub struct DeRecProtocolBuilderWasm {
     user_secret_store: Option<JsValue>,
     state_store: Option<JsValue>,
     transport: Option<JsValue>,
-    /// Set by `withOwnTransports`, in preference order.
-    own_transports: Vec<crate::transport::TransportProtocol>,
-    threshold: Option<u32>,
-    communication_info: Option<HashMap<String, String>>,
-    timeouts: Option<TimeoutsJs>,
-    unsafe_connection: Option<bool>,
-    auto_respond_on_failure: Option<bool>,
-    unpair_ack: Option<UnpairAck>,
-    auto_reply_to: Option<bool>,
-    auto_accept: Option<crate::protocol::AutoAcceptPolicy>,
-    replica_id: Option<u64>,
-    parameter_range: Option<derec_proto::ParameterRange>,
+    /// Every data setting made so far, by the per-option setters and by
+    /// `withConfig`, applied with [`DeRecProtocolBuilder::with_config`] at
+    /// `build()`.
+    config: DeRecProtocolConfig,
 }
 
 #[wasm_bindgen(js_class = DeRecProtocolBuilder)]
@@ -228,17 +186,7 @@ impl DeRecProtocolBuilderWasm {
             user_secret_store: None,
             state_store: None,
             transport: None,
-            own_transports: Vec::new(),
-            threshold: None,
-            communication_info: None,
-            timeouts: None,
-            unsafe_connection: None,
-            auto_respond_on_failure: None,
-            unpair_ack: None,
-            auto_reply_to: None,
-            auto_accept: None,
-            replica_id: None,
-            parameter_range: None,
+            config: DeRecProtocolConfig::default(),
         })
     }
 
@@ -270,6 +218,36 @@ impl DeRecProtocolBuilderWasm {
     pub fn with_state_store(mut self, store: JsValue) -> DeRecProtocolBuilderWasm {
         self.state_store = Some(store);
         self
+    }
+
+    /// Set every store in one call. `stores` is `{ channelStore, shareStore,
+    /// secretStore, userSecretStore, stateStore }`. Forwards to the five
+    /// per-store setters above, so calling one of them again afterwards
+    /// replaces just that store.
+    #[wasm_bindgen(js_name = withStores)]
+    pub fn with_stores(mut self, stores: JsValue) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        // `Reflect::get` returns `undefined` for an absent key rather than
+        // erroring, so a missing or explicit `null`/`undefined` store must
+        // be rejected here with the same message `build()` gives an unset
+        // store — otherwise it is stored as `Some(undefined)` and survives
+        // to construct a store wrapper over a value that isn't one.
+        let get = |key: &str, setter_name: &str| -> Result<JsValue, JsValue> {
+            let value = js_sys::Reflect::get(&stores, &JsValue::from_str(key))
+                .map_err(|e| js_error("decode_error", format!("missing {key}: {e:?}")))?;
+            if value.is_undefined() || value.is_null() {
+                return Err(js_error(
+                    "builder_missing",
+                    format!("{setter_name} is required"),
+                ));
+            }
+            Ok(value)
+        };
+        self.channel_store = Some(get("channelStore", "withChannelStore")?);
+        self.share_store = Some(get("shareStore", "withShareStore")?);
+        self.secret_store = Some(get("secretStore", "withSecretStore")?);
+        self.user_secret_store = Some(get("userSecretStore", "withUserSecretStore")?);
+        self.state_store = Some(get("stateStore", "withStateStore")?);
+        Ok(self)
     }
 
     #[wasm_bindgen(js_name = withTransport)]
@@ -319,16 +297,20 @@ impl DeRecProtocolBuilderWasm {
                 .map_err(|e| js_error("invalid_own_transport", e.to_string()))?;
             parsed_transports.push(tp);
         }
-        self.own_transports = parsed_transports;
+        self.config.own_transports = Some(parsed_transports);
         Ok(self)
     }
 
     /// Minimum number of shares required to reconstruct the secret.
-    /// Default: [`crate::protocol::DEFAULT_THRESHOLD`].
+    /// Default: [`crate::protocol::DEFAULT_THRESHOLD`]. `threshold` must be an
+    /// integer in `0..=u32::MAX`.
     #[wasm_bindgen(js_name = withThreshold)]
-    pub fn with_threshold(mut self, threshold: u32) -> DeRecProtocolBuilderWasm {
-        self.threshold = Some(threshold);
-        self
+    pub fn with_threshold(
+        mut self,
+        threshold: JsValue,
+    ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        self.config.threshold = Some(js_number_to_u32(&threshold, "threshold")? as usize);
+        Ok(self)
     }
 
     /// Accept plaintext transport endpoints — `http://` and `grpc://`.
@@ -342,7 +324,7 @@ impl DeRecProtocolBuilderWasm {
     /// work (a phone against a laptop), and why the name is blunt.
     #[wasm_bindgen(js_name = withUnsafeConnection)]
     pub fn with_unsafe_connection(mut self, allow: bool) -> DeRecProtocolBuilderWasm {
-        self.unsafe_connection = Some(allow);
+        self.config.unsafe_connection = Some(allow);
         self
     }
 
@@ -362,12 +344,13 @@ impl DeRecProtocolBuilderWasm {
     ///
     /// Values are forwarded verbatim; clamping and the meaning of a disabled
     /// `expired_channels` are library decisions, not this shim's. Not calling
-    /// this leaves every default in force.
+    /// this leaves every default in force. A key outside this shape throws
+    /// `invalid_timeouts` instead of being ignored.
     #[wasm_bindgen(js_name = withTimeouts)]
     pub fn with_timeouts(mut self, timeouts: JsValue) -> Result<DeRecProtocolBuilderWasm, JsValue> {
-        let parsed: TimeoutsJs = serde_wasm_bindgen::from_value(timeouts)
-            .map_err(|e| js_error("invalid_timeouts", e.to_string()))?;
-        self.timeouts = Some(parsed);
+        let parsed: TimeoutsConfig =
+            js_object_into(timeouts).map_err(|e| js_error("invalid_timeouts", e))?;
+        self.config.timeouts = Some(parsed);
         Ok(self)
     }
 
@@ -379,7 +362,7 @@ impl DeRecProtocolBuilderWasm {
     ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
         let parsed: HashMap<String, String> = serde_wasm_bindgen::from_value(info)
             .map_err(|e| js_error("invalid_communication_info", e.to_string()))?;
-        self.communication_info = Some(parsed);
+        self.config.communication_info = Some(parsed);
         Ok(self)
     }
 
@@ -387,15 +370,16 @@ impl DeRecProtocolBuilderWasm {
     /// Default: false.
     #[wasm_bindgen(js_name = withAutoRespondOnFailure)]
     pub fn with_auto_respond_on_failure(mut self, enabled: bool) -> DeRecProtocolBuilderWasm {
-        self.auto_respond_on_failure = Some(enabled);
+        self.config.auto_respond_on_failure = Some(enabled);
         self
     }
 
     /// `ack` is exactly `"required"` (default) or `"not_required"`, naming
-    /// [`UnpairAck::Required`] and [`UnpairAck::NotRequired`].
+    /// [`crate::protocol::UnpairAck::Required`] and
+    /// [`crate::protocol::UnpairAck::NotRequired`].
     #[wasm_bindgen(js_name = withUnpairAck)]
     pub fn with_unpair_ack(mut self, ack: String) -> Result<DeRecProtocolBuilderWasm, JsValue> {
-        self.unpair_ack = Some(unpair_ack_from_name(&ack).ok_or_else(|| {
+        self.config.unpair_ack = Some(unpair_ack_from_name(&ack).ok_or_else(|| {
             js_error(
                 "invalid_unpair_ack",
                 format!(
@@ -410,7 +394,7 @@ impl DeRecProtocolBuilderWasm {
     /// Default: false.
     #[wasm_bindgen(js_name = withAutoReplyTo)]
     pub fn with_auto_reply_to(mut self, enabled: bool) -> DeRecProtocolBuilderWasm {
-        self.auto_reply_to = Some(enabled);
+        self.config.auto_reply_to = Some(enabled);
         self
     }
 
@@ -443,7 +427,7 @@ impl DeRecProtocolBuilderWasm {
         }
         let parsed: AutoAcceptPolicyShape = serde_wasm_bindgen::from_value(policy)
             .map_err(|e| js_error("invalid_auto_accept_policy", e.to_string()))?;
-        self.auto_accept = Some(crate::protocol::AutoAcceptPolicy {
+        self.config.auto_accept = Some(crate::protocol::AutoAcceptPolicy {
             pairing: parsed.pairing,
             pre_pair: parsed.pre_pair,
             store_share: parsed.store_share,
@@ -461,7 +445,7 @@ impl DeRecProtocolBuilderWasm {
     pub fn with_replica_id(mut self, id: JsValue) -> Result<DeRecProtocolBuilderWasm, JsValue> {
         let v =
             js_value_to_u64(id).map_err(|e| js_error("invalid_replica_id", format!("{e:?}")))?;
-        self.replica_id = Some(v);
+        self.config.replica_id = Some(v);
         Ok(self)
     }
 
@@ -504,7 +488,7 @@ impl DeRecProtocolBuilderWasm {
         }
         let parsed: In = serde_wasm_bindgen::from_value(range)
             .map_err(|e| js_error("invalid_parameter_range", e.to_string()))?;
-        self.parameter_range = Some(derec_proto::ParameterRange {
+        self.config.parameter_range = Some(derec_proto::ParameterRange {
             min_share_size: parsed.min_share_size,
             max_share_size: parsed.max_share_size,
             min_time_between_verifications: parsed.min_time_between_verifications,
@@ -516,6 +500,41 @@ impl DeRecProtocolBuilderWasm {
             min_unresponsive_deactivation_timeout: parsed.min_unresponsive_deactivation_timeout,
             max_unresponsive_deactivation_timeout: parsed.max_unresponsive_deactivation_timeout,
         });
+        Ok(self)
+    }
+
+    /// Cap the total number of subshares one sharing round may split the
+    /// secret into (the sum of every helper's weight). `max` is a JS
+    /// `bigint`, `number` or decimal string. Default: unset, no cap.
+    ///
+    /// Checked only when a round is started; a round over the cap fails
+    /// with `too_many_subshares` before anything is sent. Recovery applies
+    /// no cap. Recovering costs time that grows quadratically with the
+    /// total number of subshares, so the cap bounds what a later recovery
+    /// must do. A cap below the threshold makes `build()` throw.
+    #[wasm_bindgen(js_name = withMaxSubshares)]
+    pub fn with_max_subshares(mut self, max: JsValue) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        let v = js_value_to_u64(max)
+            .map_err(|e| js_error("invalid_max_subshares", format!("{e:?}")))?;
+        self.config.max_subshares = Some(v);
+        Ok(self)
+    }
+
+    /// Apply a `DeRecProtocolConfig`: a plain object in the canonical
+    /// `snake_case` JSON shape every SDK shares, for example one loaded from a
+    /// config file or a user record.
+    ///
+    /// Only the keys present are applied, each as its own setter would: a
+    /// later `withConfig` or setter call overwrites a value per field, and
+    /// `timeouts` merges per field. A key the config does not define throws
+    /// `decode_error` instead of being ignored. `replica_id` and
+    /// `max_subshares` are decimal strings. Values are validated by `build()`,
+    /// exactly as when set through their own setter.
+    #[wasm_bindgen(js_name = withConfig)]
+    pub fn with_config(mut self, config: JsValue) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        let parsed: DeRecProtocolConfig = js_object_into(config)
+            .map_err(|e| js_error("decode_error", format!("invalid config: {e}")))?;
+        self.config.layer(parsed);
         Ok(self)
     }
 
@@ -540,44 +559,14 @@ impl DeRecProtocolBuilderWasm {
         let transport = self
             .transport
             .ok_or_else(|| js_error("builder_missing", "withTransport is required"))?;
-        let mut builder = DeRecProtocolBuilder::new(self.secret_id)
+        let builder = DeRecProtocolBuilder::new(self.secret_id)
             .with_channel_store(JsChannelStore(channel_store))
             .with_share_store(JsShareStore(share_store))
             .with_secret_store(JsSecretStore(secret_store))
             .with_user_secret_store(JsUserSecretStore(user_secret_store))
             .with_state_store(JsStateStore(state_store))
             .with_transport(JsTransport(transport))
-            .with_own_transports(self.own_transports);
-        if let Some(threshold) = self.threshold {
-            builder = builder.with_threshold(threshold as usize);
-        }
-        if let Some(info) = self.communication_info {
-            builder = builder.with_communication_info(info);
-        }
-        if let Some(enabled) = self.auto_respond_on_failure {
-            builder = builder.with_auto_respond_on_failure(enabled);
-        }
-        if let Some(ack) = self.unpair_ack {
-            builder = builder.with_unpair_ack(ack);
-        }
-        if let Some(enabled) = self.auto_reply_to {
-            builder = builder.with_auto_reply_to(enabled);
-        }
-        if let Some(policy) = self.auto_accept {
-            builder = builder.with_auto_accept(policy);
-        }
-        if let Some(allow) = self.unsafe_connection {
-            builder = builder.with_unsafe_connection(allow);
-        }
-        if let Some(t) = self.timeouts {
-            builder = builder.with_timeouts(t.to_timeouts());
-        }
-        if let Some(id) = self.replica_id {
-            builder = builder.with_replica_id(id);
-        }
-        if let Some(range) = self.parameter_range {
-            builder = builder.with_parameter_range(range);
-        }
+            .with_config(self.config);
         let inner = builder.build().map_err(js_error_from_lib)?;
         Ok(DeRecProtocolWasm {
             secret_id: inner.secret_id(),
@@ -608,11 +597,11 @@ impl DeRecProtocolWasm {
     pub async fn create_contact(
         &self,
         channel_id: JsValue,
-        contact_mode: u32,
+        contact_mode: JsValue,
         nonce: JsValue,
     ) -> Result<JsValue, JsValue> {
         let id = parse_optional_channel_id(channel_id)?;
-        let mode = match contact_mode {
+        let mode = match js_number_to_u32(&contact_mode, "contact_mode")? {
             0 => derec_proto::ContactMode::InlineKeys,
             1 => derec_proto::ContactMode::HashedKeys,
             2 => derec_proto::ContactMode::NoKeys,
@@ -716,14 +705,20 @@ impl DeRecProtocolWasm {
     ///   `6` UpdateChannelInfo, `7` ReplicaDiscovery, `8` UnpairReplica.
     /// * `params` — the flow's parameters, declared per kind in `index.d.ts`
     ///   as `PairingParams`, `DiscoveryParams`, … `UnpairReplicaParams`.
+    ///   ProtectSecret's optional `weights` is a `Map<bigint, number>` of
+    ///   channel ID to how many subshares that channel holds. It is the full
+    ///   assignment: an unnamed Helper gets one, and absent or `null` is an
+    ///   empty map, which resets every Helper to one. Its optional
+    ///   `threshold` is the round's threshold; absent or `null` keeps the
+    ///   stored one, or the builder's when none is stored.
     ///
     /// # Returns
     ///
     /// An `Array` of `*Started` / `*Failed` events describing the
     /// dispatched requests. Same shape as `process()`.
     #[wasm_bindgen(js_name = "start")]
-    pub async fn start(&self, flow_kind: u32, params: JsValue) -> Result<JsValue, JsValue> {
-        let flow = parse_flow(flow_kind, params)?;
+    pub async fn start(&self, flow_kind: JsValue, params: JsValue) -> Result<JsValue, JsValue> {
+        let flow = parse_flow(js_number_to_u32(&flow_kind, "flow_kind")?, params)?;
         let rust_events = self
             .inner
             .lock()
@@ -754,15 +749,15 @@ impl DeRecProtocolWasm {
     }
 
     /// Verify a fingerprint against the channel's locally-derived one. On
-    /// match, the channel transitions from `Pending` to `Paired`. Returns
-    /// `true` when the fingerprint matches and the channel is confirmed,
-    /// `false` otherwise.
+    /// match, the channel transitions from `Pending` to `Paired`. A mismatch
+    /// rejects with code `fingerprint_mismatch` — a possible man-in-the-middle
+    /// — after which a `Pending` pairing has been revoked.
     #[wasm_bindgen(js_name = "verifyFingerprint")]
     pub async fn verify_fingerprint(
         &self,
         channel_id: JsValue,
         fingerprint: String,
-    ) -> Result<bool, JsValue> {
+    ) -> Result<(), JsValue> {
         let id = js_value_to_u64(channel_id)?;
         self.inner
             .lock()
@@ -840,17 +835,21 @@ impl DeRecProtocolWasm {
     pub async fn reject(
         &self,
         action_bytes: &[u8],
-        status: i32,
+        status: JsValue,
         memo: &str,
     ) -> Result<(), JsValue> {
         let action = pending_action_wire::deserialize(action_bytes)
             .map_err(|e| js_error("decode_error", e))?;
-        let status_enum = derec_proto::StatusEnum::try_from(status).map_err(|_| {
-            js_error(
-                "invalid_status",
-                format!("invalid StatusEnum value: {status}"),
-            )
-        })?;
+        let status_enum = status
+            .as_f64()
+            .filter(|f| f.fract() == 0.0 && (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(f))
+            .and_then(|f| derec_proto::StatusEnum::try_from(f as i32).ok())
+            .ok_or_else(|| {
+                js_error(
+                    "invalid_status",
+                    format!("invalid StatusEnum value: {status:?}"),
+                )
+            })?;
         self.inner
             .lock()
             .await
@@ -930,7 +929,9 @@ impl DeRecProtocolWasm {
     /// `SecretRecovered` event; pass it verbatim. A helper or member whose
     /// `transports` is empty, `null` or absent gets no channel; it is
     /// reported as a `PeerNotRestored` event in the returned array and the
-    /// rest of the roster is restored.
+    /// rest of the roster is restored. An absent or `null`
+    /// `communication_info` reads as an empty map, and an absent or `null`
+    /// helper `weight` as `1`.
     ///
     /// Errors surface as a `DeRecError` (`category`, `code`, `message`):
     ///
@@ -947,8 +948,9 @@ impl DeRecProtocolWasm {
     pub async fn restore(
         &self,
         recovered_secret: JsValue,
-        version: u32,
+        version: JsValue,
     ) -> Result<JsValue, JsValue> {
+        let version = js_number_to_u32(&version, "version")?;
         let secret = parse_recovered_secret(recovered_secret)?;
         let rust_events = self
             .inner
@@ -1083,28 +1085,102 @@ fn parse_target(val: JsValue) -> Result<Target, JsValue> {
     ))
 }
 
-/// Parse a JS `Array<{ id: Uint8Array, name: string, data: Uint8Array }>` into
-/// a `Vec<UserSecret>`.
-fn parse_user_secrets(val: JsValue) -> Result<Vec<UserSecret>, JsValue> {
+/// Parse a JS `Map<u64, number>` of channel ID to subshare weight.
+///
+/// `null` / `undefined` is an empty map: every channel holds one subshare. A key
+/// is any `u64` form [`js_value_to_u64`] accepts; a value must be an integer
+/// in `0..=u32::MAX`. Whether a weight is valid for the split is decided by
+/// the sharing primitive, not here.
+fn parse_weights(val: JsValue) -> Result<HashMap<ChannelId, u32>, JsValue> {
+    if val.is_null() || val.is_undefined() {
+        return Ok(HashMap::new());
+    }
+    if !val.is_instance_of::<js_sys::Map>() {
+        return Err(js_error(
+            "decode_error",
+            "weights must be a Map of channel ID to weight",
+        ));
+    }
+    let map = js_sys::Map::from(val);
+    let mut weights = HashMap::with_capacity(map.size() as usize);
+    for entry in map.entries() {
+        let entry = Array::from(&entry.map_err(|e| js_error("decode_error", format!("{e:?}")))?);
+        let channel_id = ChannelId(js_value_to_u64(entry.get(0))?);
+        let weight = js_number_to_u32(&entry.get(1), "weight")?;
+        weights.insert(channel_id, weight);
+    }
+    Ok(weights)
+}
+
+/// Parse a JS array of `[channelId, weight]` tuples into [`WeightedChannel`]s.
+///
+/// `channelId` is any `u64` form [`js_value_to_u64`] accepts; `weight` must be
+/// an integer in `0..=u32::MAX`. A non-array value, or an entry that is not a
+/// two-element array, is a decode error. Whether a weight is valid for the
+/// split is decided by the sharing primitive, not here.
+pub(crate) fn parse_weighted_channels(val: JsValue) -> Result<Vec<WeightedChannel>, JsValue> {
+    if !Array::is_array(&val) {
+        return Err(js_error(
+            "decode_error",
+            "channels must be an array of [channelId, weight] tuples",
+        ));
+    }
     let arr = Array::from(&val);
-    let mut result = Vec::with_capacity(arr.length() as usize);
+    let mut channels = Vec::with_capacity(arr.length() as usize);
     for i in 0..arr.length() {
         let entry = arr.get(i);
-        let id = js_sys::Reflect::get(&entry, &JsValue::from_str("id"))
-            .map_err(|e| js_error("decode_error", format!("missing id: {e:?}")))?;
-        let name = js_sys::Reflect::get(&entry, &JsValue::from_str("name"))
-            .map_err(|e| js_error("decode_error", format!("missing name: {e:?}")))?
-            .as_string()
-            .ok_or_else(|| js_error("decode_error", "name must be a string"))?;
-        let data = js_sys::Reflect::get(&entry, &JsValue::from_str("data"))
-            .map_err(|e| js_error("decode_error", format!("missing data: {e:?}")))?;
-        result.push(UserSecret {
-            id: Uint8Array::new(&id).to_vec(),
-            name,
-            data: Uint8Array::new(&data).to_vec(),
-        });
+        if !Array::is_array(&entry) || Array::from(&entry).length() != 2 {
+            return Err(js_error(
+                "decode_error",
+                format!("channels[{i}] must be a [channelId, weight] tuple"),
+            ));
+        }
+        let entry = Array::from(&entry);
+        let channel_id = ChannelId(js_value_to_u64(entry.get(0))?);
+        let weight = js_number_to_u32(&entry.get(1), "weight")?;
+        channels.push((channel_id, weight));
     }
-    Ok(result)
+    Ok(channels)
+}
+
+/// Parse a JS `Array<{ id: Uint8Array, name: string, data: Uint8Array }>` into
+/// a `Vec<UserSecret>`. A value that is not an array, or an entry missing a
+/// field or carrying one of the wrong type, is a decode error.
+fn parse_user_secrets(val: JsValue) -> Result<Vec<UserSecret>, JsValue> {
+    #[derive(serde::Deserialize)]
+    struct UserSecretShape {
+        #[serde(with = "serde_bytes")]
+        id: Vec<u8>,
+        name: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    }
+    if !Array::is_array(&val) {
+        return Err(js_error("decode_error", "secrets must be an array"));
+    }
+    let parsed: Vec<UserSecretShape> = serde_wasm_bindgen::from_value(val)
+        .map_err(|e| js_error("decode_error", format!("invalid secrets: {e}")))?;
+    Ok(parsed
+        .into_iter()
+        .map(|s| UserSecret {
+            id: s.id,
+            name: s.name,
+            data: s.data,
+        })
+        .collect())
+}
+
+/// `params[key]` as an optional string: `undefined` or `null` is `None`, any
+/// other non-string is a decode error.
+fn optional_string(params: &JsValue, key: &str) -> Result<Option<String>, JsValue> {
+    let value = js_sys::Reflect::get(params, &JsValue::from_str(key)).unwrap_or(JsValue::UNDEFINED);
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_string()
+        .map(Some)
+        .ok_or_else(|| js_error("decode_error", format!("{key} must be a string")))
 }
 
 /// Parse a JS flow kind + params into a [`DeRecFlow`].
@@ -1112,7 +1188,7 @@ fn parse_user_secrets(val: JsValue) -> Result<Vec<UserSecret>, JsValue> {
 /// Flow kinds:
 /// - `0` = Pairing: `{ kind: number, contact: ContactMessage, peerCommunicationInfo?: Record<string, string> }`
 /// - `1` = Discovery: `{ target?: Target }`
-/// - `2` = ProtectSecret: `{ secrets: UserSecret[], description?: string }`
+/// - `2` = ProtectSecret: `{ secrets: UserSecret[], description?: string, weights?: Map<u64, number>, threshold?: number }`
 /// - `3` = VerifyShares: `{ secretId: u64, version: number, target?: Target }`
 /// - `4` = RecoverSecret: `{ secretId: u64, version: number }`
 /// - `5` = Unpair: `{ channel_id: u64, memo?: string }`
@@ -1122,7 +1198,11 @@ fn parse_user_secrets(val: JsValue) -> Result<Vec<UserSecret>, JsValue> {
 ///
 /// `u64` is a `bigint`, a non-negative safe-integer `number`, or a decimal
 /// string; `Target` is `null`/absent (every channel), a `bigint`/`number`, or an array
-/// of them.
+/// of them. `weights` maps a channel ID to how many subshares that channel
+/// holds. It is the full assignment, so `null`/absent is an empty map: every
+/// channel holds one subshare and that is what is stored (see [`parse_weights`]).
+/// `threshold` is the round's threshold; `null`/absent keeps the stored one,
+/// or the builder's when none is stored.
 fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
     match flow_kind {
         0 => {
@@ -1163,12 +1243,22 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
             let secrets_val = js_sys::Reflect::get(&params, &JsValue::from_str("secrets"))
                 .map_err(|e| js_error("decode_error", format!("missing secrets: {e:?}")))?;
             let secrets = parse_user_secrets(secrets_val)?;
-            let description = js_sys::Reflect::get(&params, &JsValue::from_str("description"))
-                .unwrap_or(JsValue::UNDEFINED)
-                .as_string();
+            let description = optional_string(&params, "description")?;
+            let weights_val = js_sys::Reflect::get(&params, &JsValue::from_str("weights"))
+                .unwrap_or(JsValue::UNDEFINED);
+            let weights = parse_weights(weights_val)?;
+            let threshold_val = js_sys::Reflect::get(&params, &JsValue::from_str("threshold"))
+                .unwrap_or(JsValue::UNDEFINED);
+            let threshold = if threshold_val.is_undefined() || threshold_val.is_null() {
+                None
+            } else {
+                Some(js_number_to_u32(&threshold_val, "threshold")?)
+            };
             Ok(DeRecFlow::ProtectSecret {
                 secrets,
                 description,
+                weights,
+                threshold,
             })
         }
         3 => {
@@ -1203,9 +1293,7 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
             let channel_id_val = js_sys::Reflect::get(&params, &JsValue::from_str("channel_id"))
                 .map_err(|e| js_error("decode_error", format!("missing channel_id: {e:?}")))?;
             let channel_id = ChannelId(js_value_to_u64(channel_id_val)?);
-            let memo = js_sys::Reflect::get(&params, &JsValue::from_str("memo"))
-                .unwrap_or(JsValue::UNDEFINED)
-                .as_string();
+            let memo = optional_string(&params, "memo")?;
             Ok(DeRecFlow::Unpair { channel_id, memo })
         }
         6 => {
@@ -1285,13 +1373,7 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
                         format!("replica_id must be a decimal u64: {e}"),
                     )
                 })?;
-            let memo_val = js_sys::Reflect::get(&params, &JsValue::from_str("memo"))
-                .unwrap_or(JsValue::UNDEFINED);
-            let memo = if memo_val.is_null() || memo_val.is_undefined() {
-                None
-            } else {
-                memo_val.as_string()
-            };
+            let memo = optional_string(&params, "memo")?;
             Ok(DeRecFlow::UnpairReplica { replica_id, memo })
         }
         7 => {

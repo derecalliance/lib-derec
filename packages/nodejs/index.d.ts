@@ -169,9 +169,18 @@ export declare function advertisedEndpoints(
  * return new TextEncoder().encode(`[${inner.join(",")}]`);
  * ```
  *
- * Do not `JSON.parse` and re-serialise. Every id in these records is a `u64`,
+ * Do not re-serialise a parsed record. Every id in these records is a `u64`,
  * and `JSON.parse` silently rounds anything above 2^53 — the corruption only
  * appears once a real id happens to be large.
+ *
+ * A helper record's `weight` is the number of Shamir subshares that helper
+ * receives: the weight the last `start(ProtectSecret)` resolved for it, which
+ * every publish the library starts on its own reuses (1 for a new pairing and
+ * for a record written before the field existed). Parsing a stored helper
+ * record to read `Helper.weight` is safe and is the normal way to pre-fill
+ * the weights the user is shown: it is a small integer, and the channel id
+ * comes from the store call's `channelId` argument, never from the parsed
+ * object. Keep persisting the original bytes.
  */
 export interface ChannelStore {
   load(
@@ -229,6 +238,24 @@ export interface Share {
   secretId: string;
   version: number;
   bytes: Uint8Array;
+  /**
+   * How many subshares the share carries, recorded on the owner side only:
+   * the library sets it on every share the owner saves (including a replica
+   * Destination's mirrored copies) and leaves it absent on a helper's share.
+   * Owner shares stored before the field existed read back absent; the
+   * library never backfills them. Persist it as given and return it
+   * unchanged. `null` and `undefined` both mean no count.
+   */
+  subshares?: number | null;
+  /**
+   * The threshold this version was split with, recorded on the owner side
+   * only, on the same shares as `subshares`: a later round may change the
+   * threshold, so this is the only record of the one an older version needs
+   * to be recoverable. Absent on a helper's share and on owner shares stored
+   * before the field existed. Persist it as given and return it unchanged.
+   * `null` and `undefined` both mean none.
+   */
+  threshold?: number | null;
 }
 
 /**
@@ -250,6 +277,11 @@ export interface ShareStore {
     versions: number[],
   ): Promise<Share[]>;
   loadAll(secretId: string, channelIds: string[]): Promise<Share[]>;
+  /**
+   * Reject, or throw, a {@link shareStoreRefusal} `Error` to refuse a share
+   * update on a helper channel; any other rejection is an ordinary backend
+   * failure.
+   */
   save(secretId: string, channelId: string, share: Share): Promise<void>;
   latestVersion(secretId: string): Promise<number | null>;
   removeChannel(secretId: string, channelId: string): Promise<void>;
@@ -258,30 +290,44 @@ export interface ShareStore {
    * `versions`. Idempotent: a version that is not stored is skipped, and
    * an empty array is a no-op.
    *
-   * A helper calls this to apply `StoreShareRequestMessage.keepList`, the
-   * complete set of versions the owner wants retained: every stored
-   * version outside it is removed once the incoming share is persisted.
+   * A helper calls this to apply `StoreShareRequestMessage.keepVersion`:
+   * once the incoming share is persisted, every version stored on the
+   * channel other than the incoming one and `keepVersion` is removed.
    * Shares under other channels or partitions must be left untouched.
    */
   removeVersions(secretId: string, channelId: string, versions: number[]): Promise<void>;
   /**
-   * Owner only: the versions every helper keeps after the owner distributes
-   * `version`. Asked once per sharing round, before anything is sent,
-   * including the rounds the library starts itself; the answer becomes
-   * `keepList` for every helper.
+   * Owner only: the one older version every helper keeps after the owner
+   * distributes `version`. Asked once per sharing round, before anything is
+   * sent, including the rounds the library starts itself; the answer
+   * becomes `keepVersion` for every helper.
    *
-   * Return `null` or `undefined` to send no `keepList` (it goes out empty):
-   * helpers then keep every version they hold. An app that wants to cap how
-   * many versions helpers retain returns that cap here. A returned list is
-   * used as is, plus `version`, which the library always adds. Helpers
-   * delete every version that is not listed, so list every version that
-   * could still become the latest: those that committed (for example, whose
-   * `SharingComplete` reported `threshold_met`) and those whose round is
-   * still open. Leave out only versions whose round failed or that the user
-   * rolled back; a list that leaves out too much can make the secret
-   * unrecoverable.
+   * Resolve to an integer in `0..=4294967295`. A helper that stores
+   * `version` keeps it and the returned version, and deletes every other
+   * version it holds; `0` keeps no other version. An answer equal to or
+   * greater than `version` fails the round with `invalid_keep_version`
+   * before anything is sent.
+   *
+   * Return the last valid version: the newest one whose `SharingComplete`
+   * reported `threshold_met`. A version whose round is still open is
+   * deleted from every helper that stores `version` unless it is the one
+   * returned here. Only the application knows which versions committed.
+   * When a helper confirms `version`, the library also removes this
+   * device's rows for that channel other than `version` and the returned
+   * version.
    */
-  keepList(secretId: string, version: number): Promise<number[] | null | undefined>;
+  keepVersion(secretId: string, version: number): Promise<number>;
+  /**
+   * Record a verification challenge the helper is about to answer for
+   * `(secretId, channelId, version)`. Called once per accepted challenge,
+   * after the challenged share is found and before the helper answers.
+   *
+   * Reject, or throw, a {@link shareStoreRefusal} `Error` to refuse the
+   * verification on a helper channel; the library answers the owner with
+   * the mapped status instead of the verification result. Any other
+   * rejection is an ordinary backend failure.
+   */
+  recordVerification(secretId: string, channelId: string, version: number): Promise<void>;
 }
 
 export interface UserSecretEntry {
@@ -298,6 +344,14 @@ export interface UserSecrets {
    *  when none is recorded. Store and return it unchanged: replica members
    *  compare it to detect a conflicting copy of the same version. */
   author_replica_id?: string;
+  /** The threshold the next publish splits at unless
+   *  `ProtectSecretParams.threshold` passes its own. Every publish writes the
+   *  threshold it used, and `restore` and replica hydration write the
+   *  recovered roster's. Absent on a snapshot written before the threshold
+   *  was recorded, or restored from a roster that carries none; the
+   *  builder's `withThreshold` then applies. Store and return it unchanged.
+   *  `null` and `undefined` both mean none. */
+  threshold?: number | null;
 }
 
 /**
@@ -437,6 +491,19 @@ export declare function protocol_version(): { major: number; minor: number };
  */
 export declare function generate_replica_id(): bigint;
 
+/** Reason a `ShareStore` gives for refusing a `save` or `recordVerification`
+ *  call, carried on the `refusal` property of the `Error` {@link
+ *  shareStoreRefusal} builds. The app picks the reason; the library alone
+ *  decides the status and memo that reach the peer. */
+export type ShareStoreRefusalReason = "too_frequent" | "size_limit_exceeded" | "rejected";
+
+/**
+ * Builds the `Error` a `ShareStore`'s `save`/`recordVerification` throws, or
+ * rejects its promise with, to refuse the call: `reason` tagged onto the
+ * error's `refusal` property.
+ */
+export declare function shareStoreRefusal(reason: ShareStoreRefusalReason): Error;
+
 /**
  * Builds a {@link Transport} that tries each endpoint in the order the peer
  * offered it and stops at the first success.
@@ -465,11 +532,18 @@ export declare function sequentialFailover(dialer: SendOne): Transport;
  */
 export declare function singleEndpointTransport(dialer: SendOne): Transport;
 
-export enum SenderKind {
-  Owner = 0,
-  Helper = 1,
-  ReplicaSource = 3,
-  ReplicaDestination = 4,
+export declare const SenderKind: {
+  readonly Owner: 0;
+  readonly Helper: 1;
+  readonly ReplicaSource: 3;
+  readonly ReplicaDestination: 4;
+};
+export type SenderKind = (typeof SenderKind)[keyof typeof SenderKind];
+export declare namespace SenderKind {
+  type Owner = typeof SenderKind.Owner;
+  type Helper = typeof SenderKind.Helper;
+  type ReplicaSource = typeof SenderKind.ReplicaSource;
+  type ReplicaDestination = typeof SenderKind.ReplicaDestination;
 }
 
 /**
@@ -496,52 +570,92 @@ export enum SenderKind {
  *   are ignored. A man-in-the-middle on the plaintext `PrePair` leg leaves
  *   the two sides with different shared keys and so different fingerprints,
  *   which is what the comparison catches — the role `contact_binding_hash`
- *   plays for `HashedKeys`.
+ *   plays for `HashedKeys`. The creator's `PrePair` response also carries a
+ *   commitment to a nonce it reveals only in its `PairResponse`, and the
+ *   channel key depends on that nonce, so whoever answers the scanner cannot
+ *   search offline for keys that make the two fingerprints agree.
  */
-export enum ContactMode {
-  InlineKeys = 0,
-  HashedKeys = 1,
-  NoKeys = 2,
+export declare const ContactMode: {
+  readonly InlineKeys: 0;
+  readonly HashedKeys: 1;
+  readonly NoKeys: 2;
+};
+export type ContactMode = (typeof ContactMode)[keyof typeof ContactMode];
+export declare namespace ContactMode {
+  type InlineKeys = typeof ContactMode.InlineKeys;
+  type HashedKeys = typeof ContactMode.HashedKeys;
+  type NoKeys = typeof ContactMode.NoKeys;
 }
 
-export enum FlowKind {
-  Pairing = 0,
-  Discovery = 1,
-  ProtectSecret = 2,
-  VerifyShares = 3,
-  RecoverSecret = 4,
-  Unpair = 5,
-  UpdateChannelInfo = 6,
+export declare const FlowKind: {
+  readonly Pairing: 0;
+  readonly Discovery: 1;
+  readonly ProtectSecret: 2;
+  readonly VerifyShares: 3;
+  readonly RecoverSecret: 4;
+  readonly Unpair: 5;
+  readonly UpdateChannelInfo: 6;
   /** Ask the replica group whether this device is behind, and catch up if it
    *  is. Replica-only, and takes no parameters — the group and this device's
    *  own version both come from the stores. */
-  ReplicaDiscovery = 7,
+  readonly ReplicaDiscovery: 7;
   /** Remove a member from the replica group. Replica-only. Naming this device
    *  is a voluntary departure; naming another is an eviction. Params:
    *  `{ replica_id: string; memo?: string }` — `replica_id` is a decimal
    *  string so ids above 2^53 survive JS number handling. */
-  UnpairReplica = 8,
+  readonly UnpairReplica: 8;
+};
+export type FlowKind = (typeof FlowKind)[keyof typeof FlowKind];
+export declare namespace FlowKind {
+  type Pairing = typeof FlowKind.Pairing;
+  type Discovery = typeof FlowKind.Discovery;
+  type ProtectSecret = typeof FlowKind.ProtectSecret;
+  type VerifyShares = typeof FlowKind.VerifyShares;
+  type RecoverSecret = typeof FlowKind.RecoverSecret;
+  type Unpair = typeof FlowKind.Unpair;
+  type UpdateChannelInfo = typeof FlowKind.UpdateChannelInfo;
+  type ReplicaDiscovery = typeof FlowKind.ReplicaDiscovery;
+  type UnpairReplica = typeof FlowKind.UnpairReplica;
 }
 
 /** Result status carried in every protocol response (`result.proto`). Passed
  *  to `reject()` to say why an inbound request was refused. */
-export enum StatusEnum {
-  Ok = 0,
-  Partial = 1,
-  Fail = 2,
-  SizeLimitExceeded = 3,
-  TooFrequent = 4,
-  UnknownSecretId = 5,
-  UnknownShareVersion = 6,
-  DecryptionFailed = 7,
-  VerificationFailed = 8,
-  FormatError = 9,
-  Rejected = 10,
-  IncompatibleParameterRange = 11,
-  UnsupportedTransportProtocol = 12,
-  VersionConflict = 13,
-  ReplicaIdConflict = 14,
-  RequestToClose = 99,
+export declare const StatusEnum: {
+  readonly Ok: 0;
+  readonly Partial: 1;
+  readonly Fail: 2;
+  readonly SizeLimitExceeded: 3;
+  readonly TooFrequent: 4;
+  readonly UnknownSecretId: 5;
+  readonly UnknownShareVersion: 6;
+  readonly DecryptionFailed: 7;
+  readonly VerificationFailed: 8;
+  readonly FormatError: 9;
+  readonly Rejected: 10;
+  readonly IncompatibleParameterRange: 11;
+  readonly UnsupportedTransportProtocol: 12;
+  readonly VersionConflict: 13;
+  readonly ReplicaIdConflict: 14;
+  readonly RequestToClose: 99;
+};
+export type StatusEnum = (typeof StatusEnum)[keyof typeof StatusEnum];
+export declare namespace StatusEnum {
+  type Ok = typeof StatusEnum.Ok;
+  type Partial = typeof StatusEnum.Partial;
+  type Fail = typeof StatusEnum.Fail;
+  type SizeLimitExceeded = typeof StatusEnum.SizeLimitExceeded;
+  type TooFrequent = typeof StatusEnum.TooFrequent;
+  type UnknownSecretId = typeof StatusEnum.UnknownSecretId;
+  type UnknownShareVersion = typeof StatusEnum.UnknownShareVersion;
+  type DecryptionFailed = typeof StatusEnum.DecryptionFailed;
+  type VerificationFailed = typeof StatusEnum.VerificationFailed;
+  type FormatError = typeof StatusEnum.FormatError;
+  type Rejected = typeof StatusEnum.Rejected;
+  type IncompatibleParameterRange = typeof StatusEnum.IncompatibleParameterRange;
+  type UnsupportedTransportProtocol = typeof StatusEnum.UnsupportedTransportProtocol;
+  type VersionConflict = typeof StatusEnum.VersionConflict;
+  type ReplicaIdConflict = typeof StatusEnum.ReplicaIdConflict;
+  type RequestToClose = typeof StatusEnum.RequestToClose;
 }
 
 export type UnpairAck = "required" | "not_required";
@@ -558,6 +672,14 @@ export interface ContactMessage {
   /** Present only when `contact_mode === ContactMode.HashedKeys`. SHA-384 digest (48 bytes). */
   contact_binding_hash?: Uint8Array;
   timestamp?: Timestamp;
+  /**
+   * Present only when `contact_mode === ContactMode.InlineKeys`. The
+   * creator's 32-byte commitment to the fingerprint nonce its
+   * `PairResponseMessage` reveals. For the other modes it arrives with the
+   * keys in the `PrePairResponseMessage`; a contact filled in from a
+   * `ProcessPrePairResult` must carry it alongside the two keys.
+   */
+  fingerprint_commitment?: Uint8Array;
   /** Every transport endpoint the creator of this contact can be reached
    *  on, in its own preference order. */
   supported_transports: TransportProtocol[];
@@ -584,6 +706,60 @@ export interface DiscoveryParams {
 export interface ProtectSecretParams {
   secrets: UserSecret[];
   description?: string;
+  /**
+   * Channel ID to how many subshares that channel should hold. The map is the
+   * full assignment, not a patch: a paired helper absent from it holds one
+   * subshare. The resolved weights are stored on each helper's channel
+   * record. A key is a channel id as bigint or decimal string, e.g. the
+   * `channel_id` string from an event.
+   *
+   * Weights are the user's choice. Before `start`, show the user each paired
+   * helper's current weight, pre-filled from your `ChannelStore` (the stored
+   * `Helper.weight`, which is safe to read; see `ChannelStore`), and pass the
+   * user's final choice as the whole map. Reading the stored weights first is
+   * the normal flow. Every other `start(ProtectSecret)` the app makes, such
+   * as a republish after editing the secrets or the follow-up after
+   * `restore`, must pass the stored weights unchanged: a helper left out
+   * returns to 1, which silently undoes the user's choice. Only the
+   * publishes the library starts on its own (after pairing, after a
+   * fingerprint is confirmed) reuse the stored weights by themselves.
+   *
+   * A stored weight the round's threshold does not allow fails the
+   * publishes the library starts on its own with `invalid_weight`, before
+   * anything is sent: `process()` throws with the message's `events`
+   * (`PairingCompleted` included); `accept()` throws after the pairing has
+   * completed and its response was sent, without returning
+   * `PairingCompleted`; `verifyFingerprint()` throws after the promotion,
+   * which stands, and a retry resolves `true` and publishes nothing. Call
+   * `start` with `ProtectSecret` and valid weights to publish.
+   *
+   * When the paired helpers' resolved total is below the round's threshold
+   * (see `threshold`), `start` skips the split: no helper is sent anything, so no
+   * `ProtectSecretStarted` / `ProtectSecretFailed` comes back for one. A
+   * paired replica still gets its usual secret-only copy and events; with
+   * none paired, `start` resolves with no events at all — this is not an
+   * error. The version still advances and the secrets/description are
+   * saved as the latest snapshot, so the next publish that reaches
+   * threshold shares it. Sum the weights about to be assigned against the
+   * threshold beforehand, or count the returned helper events afterward,
+   * to detect the case.
+   */
+  weights?: Map<bigint | string, number>;
+  /**
+   * The threshold this round splits at: the number of distinct subshares
+   * that reconstruct this version. Absent keeps the stored threshold
+   * (`UserSecrets.threshold`), or the builder's `withThreshold` when none is
+   * stored; a value changes it, and the new threshold is stored with this
+   * round. Leave it absent on the follow-up after `restore`, which has
+   * already put the recovered threshold back. Publishes the library starts
+   * on its own always use the stored threshold.
+   *
+   * The resolved threshold must be at least 2 (`invalid_threshold`), above
+   * every resolved weight (`invalid_weight`), and no greater than a
+   * `withMaxSubshares` cap (`invalid_input`). Each check runs before
+   * anything is written or sent.
+   */
+  threshold?: number;
 }
 export interface VerifySharesParams {
   secretId: bigint | string;
@@ -705,6 +881,15 @@ export type DeRecEvent =
       updated_transports?: Endpoint[];
     }
   | { type: "ShareStored"; channel_id: string; version: number }
+  /** The library refused an inbound share (helper side) instead of raising
+   *  `ActionRequired`: nothing was stored, no stored version was removed, and
+   *  the owner was answered with `status` and `memo`, which it observes as
+   *  `ShareRejected`. `status` is FORMAT_ERROR (the share does not decode),
+   *  VERIFICATION_FAILED (it does not verify against its commitment),
+   *  SIZE_LIMIT_EXCEEDED (outside the helper's size range) or
+   *  VERSION_CONFLICT (a different share is stored at `version`). A refusal
+   *  from the application's own share store does not raise it. */
+  | { type: "ShareRefused"; channel_id: string; version: number; status: StatusEnum; memo: string }
   | { type: "ShareConfirmed"; channel_id: string; version: number }
   | { type: "ShareRejected"; channel_id: string; version: number; status: StatusEnum; memo: string }
   /** A publishing round finished — every targeted helper confirmed,
@@ -767,7 +952,21 @@ export type DeRecEvent =
    *  not fail the round. `behind` is the application's retry list — the
    *  library keeps no durable per-member sync state. */
   | { type: "ReplicaSyncComplete"; version: number; synced: string[]; behind: string[] }
-  | { type: "ShareVerified"; channel_id: string; version: number }
+  /** A helper's verification proof checked out (owner side). `subshares` is
+   *  how many subshares this helper holds for `version`: the count on the
+   *  owner's stored share for this channel and version, not the helper's
+   *  current weight; absent when that share was stored before the count was
+   *  recorded. `threshold` is the threshold `version` was split with, from
+   *  the same owner share, not the current one; absent when that share was
+   *  stored before the threshold was recorded. To judge whether a version is
+   *  recoverable, sum `subshares` over its `ShareVerified` events and compare
+   *  with their `threshold`. If either is absent on any of those events, the
+   *  result is unknown: an absent count is not `0` or `1`. */
+  | { type: "ShareVerified"; channel_id: string; version: number; subshares?: number; threshold?: number }
+  /** A helper answered a verification challenge, but its proof does not
+   *  match the share this device stored. The challenge is spent; a new
+   *  `VerifyShares` round challenges the helper again. */
+  | { type: "ShareVerifyInvalid"; channel_id: string; version: number }
   /** A helper refused a verification challenge: its response carried a
    *  non-OK `status` instead of a proof. The challenge is spent; a new
    *  `VerifyShares` round challenges the helper again. */
@@ -810,7 +1009,12 @@ export type DeRecEvent =
           /** Every endpoint this peer advertised, in the order it offered them. */
           transports: Endpoint[];
           shared_key: Uint8Array;
-          communication_info?: Record<string, string>;
+          communication_info?: Record<string, string> | null;
+          /** Shamir subshares this helper received in the round that wrote the
+           *  roster. `restore` writes it into the helper's channel record, so the
+           *  next publish gives it the same count. Every event carries it;
+           *  `restore` reads an absent value as 1. */
+          weight?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -832,10 +1036,15 @@ export type DeRecEvent =
             /** Every endpoint this peer advertised, in the order it offered them. */
             transports: Endpoint[];
             role: "Source" | "Destination";
-            communication_info?: Record<string, string>;
+            communication_info?: Record<string, string> | null;
           }>;
           shared_key: Uint8Array;
         };
+        /** The threshold the secret was split with. Absent when the roster
+         *  records none. `restore` writes it into the snapshot, so the next
+         *  publish splits at the same threshold; to change it, pass
+         *  `threshold` on `start(ProtectSecret)`. */
+        threshold?: number;
       };
     }
 
@@ -847,6 +1056,26 @@ export type DeRecEvent =
    *  non-Ok status (HashedKeys flow). Distinct from a cryptographic
    *  hash mismatch, which surfaces as a thrown error from `process()`. */
   | { type: "PrePairRejected"; channel_id: string; status: StatusEnum; memo: string }
+  /** The peer answered a message from this device with an
+   *  `ErrorResponseMessage`: it could not process it, typically because the
+   *  body could not be decoded (`FORMAT_ERROR`). Never answered. */
+  | { type: "ErrorResponseReceived"; channel_id: string; status: StatusEnum; memo: string }
+  /** This device refused an inbound `PairRequest` under a protocol rule
+   *  (`INCOMPATIBLE_PARAMETER_RANGE` or `REPLICA_ID_CONFLICT`), whatever the
+   *  auto-accept or `auto_respond_on_failure` setting, and sent the requester a
+   *  `PairResponse` carrying `status` and `memo`. No channel was created.
+   *  Returned by `process()`; it does not throw. `memo` is what the requester
+   *  reads, written from its side. `error_code` (`"incompatible_parameter_range"`
+   *  or `"replica_id_conflict"`) and `message` carry the local reason, as on
+   *  `RequestFailed`; `message` is never sent to the peer. */
+  | {
+      type: "PairingRefused";
+      channel_id: string;
+      status: StatusEnum;
+      memo: string;
+      error_code: DeRecErrorCode;
+      message: string;
+    }
 
   /** Fires alongside `PairingCompleted` on replica-mode pair handshakes.
    *  `peer_replica_id` is the peer's `u64` as a **decimal** string,
@@ -886,6 +1115,11 @@ export type DeRecEvent =
           transports: Endpoint[];
           shared_key: Uint8Array;
           communication_info?: Record<string, string>;
+          /** Shamir subshares this helper received in the round that wrote the
+           *  roster. `restore` writes it into the helper's channel record, so the
+           *  next publish gives it the same count. Every event carries it;
+           *  `restore` reads an absent value as 1. */
+          weight?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -909,6 +1143,11 @@ export type DeRecEvent =
           }>;
           shared_key: Uint8Array;
         };
+        /** The threshold the secret was split with. Absent when the roster
+         *  records none. `restore` writes it into the snapshot, so the next
+         *  publish splits at the same threshold; to change it, pass
+         *  `threshold` on `start(ProtectSecret)`. */
+        threshold?: number;
       };
       shares: Array<{
         channel_id: string;
@@ -938,6 +1177,11 @@ export type DeRecEvent =
           transports: Endpoint[];
           shared_key: Uint8Array;
           communication_info?: Record<string, string>;
+          /** Shamir subshares this helper received in the round that wrote the
+           *  roster. `restore` writes it into the helper's channel record, so the
+           *  next publish gives it the same count. Every event carries it;
+           *  `restore` reads an absent value as 1. */
+          weight?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -961,6 +1205,11 @@ export type DeRecEvent =
           }>;
           shared_key: Uint8Array;
         };
+        /** The threshold the secret was split with. Absent when the roster
+         *  records none. `restore` writes it into the snapshot, so the next
+         *  publish splits at the same threshold; to change it, pass
+         *  `threshold` on `start(ProtectSecret)`. */
+        threshold?: number;
       };
       shares: Array<{
         channel_id: string;
@@ -996,6 +1245,11 @@ export type DeRecEvent =
           transports: Endpoint[];
           shared_key: Uint8Array;
           communication_info?: Record<string, string>;
+          /** Shamir subshares this helper received in the round that wrote the
+           *  roster. `restore` writes it into the helper's channel record, so the
+           *  next publish gives it the same count. Every event carries it;
+           *  `restore` reads an absent value as 1. */
+          weight?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -1018,7 +1272,27 @@ export type DeRecEvent =
           }>;
           shared_key: Uint8Array;
         };
+        /** The threshold the secret was split with. Absent when the roster
+         *  records none. `restore` writes it into the snapshot, so the next
+         *  publish splits at the same threshold; to change it, pass
+         *  `threshold` on `start(ProtectSecret)`. */
+        threshold?: number;
       };
+    }
+  /** This device's library refused a group member's copy of the secret:
+   *  `FORMAT_ERROR` (the payload does not decode or is not self-consistent)
+   *  or `VERIFICATION_FAILED` (a share map entry does not verify against its
+   *  commitment). Nothing was written. On a push the publisher was answered
+   *  with this `status` and `memo`, which it observes as
+   *  `ReplicaSyncRejected`; a copy served by a catch-up is not answered. */
+  | {
+      type: "ReplicaSecretRefused";
+      channel_id: string;
+      from_replica_id: string;
+      secret_id: string;
+      version: number;
+      status: StatusEnum;
+      memo: string;
     }
   /** Peer's ack of a secret sync we sent. `status` is the `StatusEnum`
    *  integer (0 = Ok), `memo` is the peer's explanation. */
@@ -1056,6 +1330,37 @@ export type DeRecEvent =
    *  is the same label vocabulary as `ActionRequired.action_kind`
    *  (`"Pairing"`, `"StoreShare"`, …). */
   | { type: "AutoAccepted"; channel_id: string; action_kind: PendingActionKind }
+  /** A request that arrived on an authenticated channel failed while it
+   *  was being handled. Every such request is owed exactly one response.
+   *  When the library sent it, `responded` is `true` and `action` is absent.
+   *  Otherwise `responded` is `false` and `action` is the same opaque token
+   *  `ActionRequired` carries: pass it to `reject` to send the response
+   *  (`accept` refuses it). `action` is also absent when `reject` could
+   *  never answer it: a request on a replica group channel that names no
+   *  member, which has no reply target, or, with `autoRespondOnFailure`
+   *  off, a replica copy that hands this device the group key and fails
+   *  before that key is stored. Resolve each token once: the library is
+   *  stateless, so rejecting the same token twice sends two responses.
+   *  `action_kind` is the type of the failed request, `"Failed"` when its
+   *  body could not be decoded or is a request the channel cannot carry.
+   *  `status` is the `StatusEnum` value that was sent, or would have been,
+   *  and `memo` the wire-safe memo sent with it, or that would have been:
+   *  `reject(action, status, memo)` sends exactly the response
+   *  `autoRespondOnFailure` would have sent. `message` is a local
+   *  description, never sent to the peer. Reported
+   *  instead of a thrown error from `process()` or `accept()`, so the call's
+   *  other events are kept. */
+  | {
+      type: "RequestFailed";
+      channel_id: string;
+      action_kind: PendingActionKind;
+      responded: boolean;
+      status: StatusEnum;
+      memo: string;
+      error_code: DeRecErrorCode;
+      message: string;
+      action?: Uint8Array;
+    }
   | { type: "NoOp" }
   /** An inbound message was dropped untouched: no store was written and
    *  nothing was sent back. `reason` says why.
@@ -1066,8 +1371,14 @@ export type DeRecEvent =
    *  Confirming does not replay it: after `verifyFingerprint` succeeds, a
    *  replica destination calls `start(FlowKind.ReplicaDiscovery)` to pull
    *  the copy itself. `"Expired"` means the message was older than the
-   *  inbound timeout. `trace_id` matches the peer's `*Started` event for
-   *  the same round (`"0"` when the sender set none). */
+   *  inbound timeout. `"TimestampMismatch"` means the envelope's timestamp
+   *  and the encrypted message's differ, or one is absent: a sender stamps
+   *  both with the same time, so the envelope was altered or built by a
+   *  non-conforming peer. `"StaleResponse"` means a verification answer to
+   *  a challenge that a newer one on the channel replaced; the newer
+   *  challenge stays outstanding and its own answer still completes it.
+   *  `trace_id` matches the peer's `*Started` event for the same round
+   *  (`"0"` when the sender set none). */
   | {
       type: "MessageIgnored";
       channel_id: string;
@@ -1100,22 +1411,29 @@ export type DeRecEvent =
    *  targeted channels are unaffected. */
   | { type: "DiscoveryFailed"; channel_id: string; error: string }
   /** A share-storage request was dispatched to `channel_id`. Emitted per
-   *  targeted peer by `start(ProtectSecret)`. */
-  | { type: "ProtectSecretStarted"; channel_id: string; version: number; trace_id: string }
+   *  targeted peer by `start(ProtectSecret)`. `weight` is the number of
+   *  subshares sent, which is also the weight now stored for this channel:
+   *  its `ProtectSecretParams.weights` entry, 1 when the map does not name
+   *  it, or the stored weight on a publish the library starts on its own. */
+  | { type: "ProtectSecretStarted"; channel_id: string; version: number; trace_id: string; weight: number }
   /** A share-storage request could not be dispatched to `channel_id`. */
   | {
       type: "ProtectSecretFailed";
       channel_id: string;
       version: number;
       error: string;
+      /** Number of subshares that were to be sent to this channel; see
+       *  `ProtectSecretStarted.weight`. */
+      weight: number;
     }
   /** A verify-share challenge was dispatched to `channel_id`. */
   | { type: "VerifySharesStarted"; channel_id: string; version: number; trace_id: string }
-  /** A verify-share challenge could not be dispatched to `channel_id`. */
+  /** Verification reached no verdict for `channel_id`. `reason` says why. */
   | {
       type: "VerifySharesFailed";
       channel_id: string;
       version: number;
+      reason: VerifyFailureReason;
       error: string;
     }
   /** A recovery share request was dispatched to `channel_id`. */
@@ -1127,9 +1445,13 @@ export type DeRecEvent =
       version: number;
       error: string;
     }
-  /** An unpair request was dispatched to `channel_id`. Followed by an
-   *  `Unpaired` event once the peer acknowledges (or in the same event
-   *  vec, under `UnpairAck.NotRequired`). */
+  /** An unpair request was dispatched to `channel_id`, by
+   *  `start(Unpair)` or by `restore` for each recovery channel. Under
+   *  `UnpairAck.Required` the channel is now `"Unpairing"`, and an
+   *  `Unpaired` event follows once the peer acknowledges or the
+   *  acknowledgement window elapses, or `UnpairRejected` if the peer
+   *  refuses (the channel is `"Paired"` again). Under
+   *  `UnpairAck.NotRequired`, `Unpaired` follows in the same event vec. */
   | { type: "UnpairFailed"; channel_id: string; error: string }
   | { type: "UnpairStarted"; channel_id: string; trace_id: string }
   /** An update-channel-info request was dispatched to `channel_id`. */
@@ -1153,16 +1475,20 @@ export type DeRecEvent =
  *   oracle. Anyone who knows a HashedKeys contact's nonce can elicit a
  *   key-publish response. Keep off unless you control both ends of
  *   the transport.
- * - `storeShare` — the helper's only admission-control point for
- *   inbound shares. The protocol enforces no size, quota or rate limit
- *   of its own, and `maxShareSize` is checked for range overlap at
- *   pairing time only, never against an actual share. While this is
- *   `false`, `ActionRequired` carries `share_size`, so the application
- *   can compare it to its quota and call `reject()` with
- *   `StatusEnum.SizeLimitExceeded`. Setting it `true` removes that
- *   opportunity entirely: every share from every paired Owner is stored
- *   unconditionally, at whatever size it arrives. Keep off in any
- *   deployment with per-user storage limits.
+ * - `storeShare` — the helper's admission-control point for inbound
+ *   shares beyond what the library already checks: this device's own
+ *   configured `minShareSize`/`maxShareSize` is enforced against every
+ *   inbound share's actual length regardless of this flag, before
+ *   `ActionRequired` is ever considered — an out-of-range share is
+ *   refused with `StatusEnum.SizeLimitExceeded` either way, and this
+ *   flag has no say in it. While this is `false`, `ActionRequired`
+ *   carries the decoded request, which is where a tighter or per-user
+ *   size limit, storage quota, or any other app-specific decline
+ *   belongs — call `reject()` for that. Setting it `true` removes that
+ *   opportunity: every in-range share from every paired Owner is stored
+ *   unconditionally, unless the share store refuses it. Keep off in any
+ *   deployment with per-user storage limits tighter than this device's
+ *   own configured range.
  * - `unpair` — destructive. Accepting deletes the local channel
  *   record before any UI confirmation.
  * - `updateChannelInfo` — silently overwrites the channel record with
@@ -1180,15 +1506,123 @@ export interface AutoAcceptPolicy {
 }
 
 /**
+ * The five stores {@link DeRecProtocolBuilder.build} requires, bundled for
+ * {@link DeRecProtocolBuilder.withStores}.
+ */
+export interface StoresInit {
+  channelStore: ChannelStore;
+  shareStore: ShareStore;
+  secretStore: SecretStore;
+  userSecretStore: UserSecretStore;
+  stateStore: StateStore;
+}
+
+/**
+ * `parameter_range` bounds inside {@link DeRecProtocolConfig}. Each bound is
+ * a JSON number or a decimal string — the string form carries a bound past
+ * `Number.MAX_SAFE_INTEGER` through a config file or a JSON encoder whose
+ * numbers are `f64`. An absent bound is `0` ("no bound"), the same as
+ * {@link DeRecProtocolBuilder.withParameterRange}.
+ */
+export interface DeRecParameterRangeConfig {
+  min_share_size?: number | string;
+  max_share_size?: number | string;
+  min_time_between_verifications?: number | string;
+  max_time_between_verifications?: number | string;
+  min_time_between_share_updates?: number | string;
+  max_time_between_share_updates?: number | string;
+  min_unresponsive_deletion_timeout?: number | string;
+  max_unresponsive_deletion_timeout?: number | string;
+  min_unresponsive_deactivation_timeout?: number | string;
+  max_unresponsive_deactivation_timeout?: number | string;
+}
+
+/**
+ * `auto_accept` inside {@link DeRecProtocolConfig}: the same eight flows as
+ * {@link AutoAcceptPolicy}, named as the canonical JSON spells them rather
+ * than in `camelCase`. An absent flow is `false`. See {@link AutoAcceptPolicy}
+ * for per-field caveats.
+ */
+export interface DeRecAutoAcceptConfig {
+  pairing?: boolean;
+  pre_pair?: boolean;
+  store_share?: boolean;
+  verify_share?: boolean;
+  discovery?: boolean;
+  get_share?: boolean;
+  unpair?: boolean;
+  update_channel_info?: boolean;
+}
+
+/**
+ * Every data setting of {@link DeRecProtocolBuilder} in one serializable
+ * value, in the canonical `snake_case` JSON shape every SDK accepts — the
+ * format for a config file or a user record. Passed to
+ * {@link DeRecProtocolBuilder.withConfig}.
+ *
+ * Every field is optional: an absent or `null` field leaves that setting
+ * unset. Stores, the delivery transport and the constructor's `secretId` are
+ * not settings and are not carried here.
+ *
+ * Configs layer: apply a general config, then a per-user one, then any
+ * individual `with*` call, and the last write wins per field —
+ * `timeouts` merges per field too, so a config that sets only
+ * `inbound_message_secs` keeps whatever `sharing_round_secs` an earlier
+ * config or call set. Every other nested object (`parameter_range`,
+ * `auto_accept`, `own_transports`) replaces as a whole.
+ *
+ * Values set through a field here are validated by `build()` exactly as the
+ * matching `with*` setter's value would be: there is one rule set.
+ *
+ * ```json
+ * {
+ *   "threshold": 3,
+ *   "max_subshares": "12",
+ *   "timeouts": { "inbound_message_secs": 120, "sharing_round_secs": 30 },
+ *   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
+ *   "auto_accept": { "pairing": true, "store_share": true },
+ *   "auto_respond_on_failure": false,
+ *   "auto_reply_to": false,
+ *   "unpair_ack": "required",
+ *   "unsafe_connection": false,
+ *   "communication_info": { "name": "alice" },
+ *   "own_transports": [{ "uri": "https://me.example.com/derec", "protocol": "https" }],
+ *   "replica_id": "9007199254740993"
+ * }
+ * ```
+ */
+export interface DeRecProtocolConfig {
+  threshold?: number;
+  /** Decimal string. A `bigint` throws `decode_error`; call
+   *  {@link DeRecProtocolBuilder.withMaxSubshares} directly for a `bigint`. */
+  max_subshares?: string;
+  timeouts?: Timeouts;
+  parameter_range?: DeRecParameterRangeConfig;
+  auto_accept?: DeRecAutoAcceptConfig;
+  auto_respond_on_failure?: boolean;
+  auto_reply_to?: boolean;
+  /** Its name, or the discriminant `0` (`"required"`) / `1`
+   *  (`"not_required"`). */
+  unpair_ack?: UnpairAck | 0 | 1;
+  unsafe_connection?: boolean;
+  communication_info?: Record<string, string>;
+  own_transports?: Endpoint[];
+  /** Decimal string. A `bigint` throws `decode_error`; call
+   *  {@link DeRecProtocolBuilder.withReplicaId} directly for a `bigint`. */
+  replica_id?: string;
+}
+
+/**
  * Fluent builder for {@link DeRecProtocol}. Mirrors the Rust
  * `DeRecProtocolBuilder` and the dotnet `DeRecProtocolBuilder`
  * method-for-method so a developer who already knows one SDK can move
  * between them without reaching for reference docs.
  *
  * Required setters: `withChannelStore`, `withShareStore`,
- * `withSecretStore`, `withUserSecretStore`, `withStateStore`,
- * `withTransport`, and `withOwnTransports`. Calling `build()` without all
- * seven throws.
+ * `withSecretStore`, `withUserSecretStore`, `withStateStore`, and
+ * `withTransport`. Calling `build()` without all six throws. Own transports
+ * come from `withOwnTransports` or a config applied with `withConfig`;
+ * `build()` fails with `InvalidInput` if none are set.
  *
  * An optional setter that is never called leaves the library's default in
  * force.
@@ -1216,6 +1650,13 @@ export declare class DeRecProtocolBuilder {
   withSecretStore(store: SecretStore): DeRecProtocolBuilder;
   withUserSecretStore(store: UserSecretStore): DeRecProtocolBuilder;
   withStateStore(store: StateStore): DeRecProtocolBuilder;
+  /**
+   * Set every store in one call. Forwards to {@link DeRecProtocolBuilder.withChannelStore},
+   * {@link DeRecProtocolBuilder.withShareStore}, {@link DeRecProtocolBuilder.withSecretStore},
+   * {@link DeRecProtocolBuilder.withUserSecretStore} and {@link DeRecProtocolBuilder.withStateStore}
+   * in turn, so calling one of them again afterwards replaces just that store.
+   */
+  withStores(stores: StoresInit): DeRecProtocolBuilder;
   withTransport(transport: Transport): DeRecProtocolBuilder;
   /**
    * Set every transport endpoint this application serves, in preference
@@ -1230,7 +1671,22 @@ export declare class DeRecProtocolBuilder {
    */
   withOwnTransports(transports: Endpoint[]): DeRecProtocolBuilder;
 
-  /** Minimum number of shares required to reconstruct the secret. Default: 3. */
+  /**
+   * The starting threshold: the minimum number of subshares required to
+   * reconstruct the secret, for a secret with no threshold stored. Every
+   * publish stores the threshold it used (`UserSecrets.threshold`), the
+   * roster carries it, and `restore` and replica hydration put it back. A
+   * round splits at `ProtectSecretParams.threshold`, otherwise at the stored
+   * threshold, and only otherwise at this value, so changing it later does
+   * not change a stored threshold.
+   *
+   * A Helper holds one subshare unless `ProtectSecretParams.weights` has
+   * given it a weight, so with no weights the threshold is a number of
+   * Helpers, as before. Every weight must be below the round's threshold, so
+   * no single Helper can recover alone. When this value applies and is
+   * lowered to or below a stored weight, every publish fails with
+   * `invalid_weight` until `ProtectSecret` assigns valid weights. Default: 3.
+   */
   withThreshold(threshold: number): DeRecProtocolBuilder;
   /**
    * Configure how long the protocol waits on each thing that can keep it
@@ -1270,7 +1726,12 @@ export declare class DeRecProtocolBuilder {
   withUnsafeConnection(allow: boolean): DeRecProtocolBuilder;
   /** Default: empty. */
   withCommunicationInfo(info: Record<string, string>): DeRecProtocolBuilder;
-  /** Default: false. */
+  /**
+   * Who answers an inbound request whose handling failed. `true`: the
+   * library sends the response itself. `false`: nothing is sent, and the
+   * `RequestFailed` event carries a token to pass to `reject`. Default:
+   * false.
+   */
   withAutoRespondOnFailure(enabled: boolean): DeRecProtocolBuilder;
   /** Exactly `"required"` or `"not_required"`; any other string throws
    *  `invalid_unpair_ack`. Default: `"required"`. */
@@ -1308,8 +1769,42 @@ export declare class DeRecProtocolBuilder {
    * protocol reads as no constraint on that dimension.
    *
    * Default: unset — no constraints advertised, every peer range accepted.
+   *
+   * Share size is enforced by the helper; frequency limits are enforced by
+   * the app's share store (refuse from `save`/`recordVerification`); the
+   * deletion and deactivation timeouts are checked at pairing only.
    */
   withParameterRange(range: Partial<ParameterRange>): DeRecProtocolBuilder;
+  /**
+   * Cap the total number of subshares one sharing round may split the
+   * secret into — the sum of every helper's weight. Default: unset, no
+   * cap.
+   *
+   * Checked only by `start(ProtectSecret)`, including the publishes the
+   * library starts itself: a round over the cap fails with
+   * `too_many_subshares` before anything is sent. Recovery applies no cap.
+   * Recovering costs time that grows quadratically with the total number of
+   * subshares, so the cap bounds what a later recovery must do. A cap below
+   * the threshold makes `build()` throw.
+   */
+  withMaxSubshares(max: bigint | number): DeRecProtocolBuilder;
+
+  /**
+   * Layer a {@link DeRecProtocolConfig} onto the builder: a field the config
+   * sets replaces what the builder currently holds, a field it leaves unset
+   * is untouched, and `timeouts` merges per field against the builder's
+   * current timeouts rather than resetting the other three. Every other
+   * nested object replaces as a whole. Apply a general config, then a
+   * per-user one, then any individual `with*` call — the last write wins
+   * per field, same as two `withConfig` calls in a row.
+   *
+   * Applies the fields; does not validate them. `build()` runs exactly the
+   * rules the matching `with*` setter documents.
+   *
+   * Throws `decode_error` if `config` is not a plain object in the
+   * canonical shape, or if it (or a nested object) has an unknown key.
+   */
+  withConfig(config: DeRecProtocolConfig): DeRecProtocolBuilder;
 
   /**
    * Finalize the configuration. Throws if any of the required setters
@@ -1434,6 +1929,17 @@ export declare class DeRecProtocol {
    */
   tick(): Promise<DeRecEvent[]>;
 
+  /**
+   * Accept a pending action from an `ActionRequired` event, returning the
+   * events it produces.
+   *
+   * When the action completes a pairing, the publish that follows reuses the
+   * stored helper weights. If one is no longer valid under the round's
+   * threshold, that publish fails with `invalid_weight` before anything is
+   * sent and this throws: the pairing has completed and its response was
+   * sent, but the `PairingCompleted` event is not returned. Call `start`
+   * with `ProtectSecret` and valid weights to publish.
+   */
   accept(actionBytes: Uint8Array): Promise<DeRecEvent[]>;
 
   reject(actionBytes: Uint8Array, status: StatusEnum, memo: string): Promise<void>;
@@ -1449,18 +1955,30 @@ export declare class DeRecProtocol {
 
   /**
    * Verify `fingerprint` against the channel's locally-derived one. On
-   * match, the channel transitions from `Pending` to `Paired`. Returns
-   * `true` on confirmation, `false` on mismatch.
+   * match, the channel transitions from `Pending` to `Paired`.
+   *
+   * A mismatch rejects with code `fingerprint_mismatch` — a possible
+   * man-in-the-middle. A `Pending` pairing is revoked: its records, channel
+   * key and pairing material are deleted, so pair again. A channel already
+   * `Paired` is left as it is.
    *
    * On a replica destination, confirming is also the decision to adopt the
    * group's vault: the source's publish is then installed as it arrives,
    * with no further prompt. Ask the user before calling this; to decline,
-   * never confirm.
+   * never confirm: expired-channel cleanup removes the channel and its key.
+   *
+   * On a promotion the current snapshot is published to the promoted peer,
+   * reusing the stored helper weights. If one is no longer valid under the
+   * current threshold, that publish fails with `invalid_weight` before
+   * anything is sent and this throws. The promotion stands: calling this
+   * again resolves and publishes nothing, so call `start` with
+   * `ProtectSecret` and valid weights to reach the promoted peer.
    */
-  verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<boolean>;
+  verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<void>;
   /**
    * Remove `Pending` channels older than `olderThanSecs`, along with their
-   * pairing keys. Resolves to the removed channel ids as decimal strings.
+   * channel keys and pairing keys. Resolves to the removed channel ids as
+   * decimal strings.
    *
    * Independent of the configured cleanup policy — this sweeps at the
    * threshold given even when that policy is disabled. The age comparison
@@ -1484,6 +2002,9 @@ export declare class DeRecProtocol {
    * A helper or member whose `transports` is empty gets no channel: it is
    * reported as a `PeerNotRestored` event in the returned array and the rest
    * of the roster is restored.
+   *
+   * A helper's or member's `communication_info` may be absent or `null`;
+   * both mean the same thing — no entries.
    *
    * Errors surface as a `DeRecError` (`category`, `code`, `message`):
    *
@@ -1592,23 +2113,21 @@ export interface CommunicationInfo {
   communication_info_entries: CommunicationInfoKeyValue[];
 }
 
-// `ContactMessage` is defined once above (line ~87) and covers both
+// `ContactMessage` is defined once above and covers both
 // `INLINE_KEYS` and `HASHED_KEYS` modes.
 
-
-/**
- * The label vocabulary for `ActionRequired.action_kind` and
- * `AutoAccepted.action_kind` — one value per pending-action kind the
- * protocol can raise. Matches the Rust `PendingActionKind` discriminants
- * one-for-one.
- */
 /** Why a `MessageIgnored` event dropped a message. Matches the Rust
  *  `IgnoreReason` discriminants one-for-one. */
-export type IgnoreReason = "PendingVerification" | "Expired";
+export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse";
 
 /** Why a `PeerNotRestored` event left a roster entry without a channel.
  *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */
 export type NotRestoredReason = "NoTransports";
+
+/** Why a `VerifySharesFailed` event reached no verdict for a channel.
+ *  Matches the Rust `VerifyFailureReason` discriminants
+ *  one-for-one. */
+export type VerifyFailureReason = "NoSharedKey" | "NoProof" | "DispatchFailed";
 
 /** Why a `RecoveryShareCorrupted` event set a helper's share aside.
  *  Matches the Rust `CorruptionReason` discriminants one-for-one:
@@ -1618,6 +2137,13 @@ export type NotRestoredReason = "NoTransports";
  *  disagrees with the shares the secret was rebuilt from. */
 export type CorruptionReason = "Malformed" | "InvalidProof" | "Inconsistent";
 
+/**
+ * The label vocabulary for `ActionRequired.action_kind`,
+ * `AutoAccepted.action_kind` and `RequestFailed.action_kind` — one value per
+ * pending-action kind the protocol can raise, plus `"Failed"` for a request
+ * whose body could not be decoded or that the channel cannot carry. Matches the Rust `PendingActionKind`
+ * discriminants one-for-one.
+ */
 export type PendingActionKind =
   | "Pairing"
   | "PrePair"
@@ -1626,7 +2152,8 @@ export type PendingActionKind =
   | "Discovery"
   | "GetShare"
   | "Unpair"
-  | "UpdateChannelInfo";
+  | "UpdateChannelInfo"
+  | "Failed";
 
 export interface ParameterRange {
   min_share_size: bigint;
@@ -1668,6 +2195,11 @@ export interface PairResponseMessage {
    * its own derivation. Zero on rejection (non-Ok `result.status`).
    */
   channel_id: bigint;
+  /**
+   * Present only when `result.status === Ok`. The 32-byte fingerprint nonce
+   * the contact creator committed to in `fingerprint_commitment`.
+   */
+  fingerprint_nonce?: Uint8Array;
 }
 
 export interface PrePairRequestMessage {
@@ -1688,6 +2220,12 @@ export interface PrePairResponseMessage {
   ecies_public_key?: Uint8Array;
   nonce: bigint;
   timestamp?: Timestamp;
+  /**
+   * Present only when `result.status === Ok`. The creator's 32-byte
+   * commitment to the fingerprint nonce its `PairResponseMessage` reveals,
+   * covering the two keys above.
+   */
+  fingerprint_commitment?: Uint8Array;
 }
 
 export interface GetShareRequestMessage {
@@ -1737,7 +2275,7 @@ export interface StoreShareRequestMessage {
   share: Uint8Array;
   share_algorithm: number;
   version: number;
-  keep_list: number[];
+  keep_version: number;
   version_description: string;
   timestamp?: Timestamp;
   secret_id: bigint;
@@ -1894,7 +2432,19 @@ export interface ProcessPrePairResult {
 
   /** Nonce echoed from the original `ContactMessage`. */
   nonce: bigint;
+
+  /** The creator's 32-byte commitment to its fingerprint nonce. Copy it into
+   * the contact the pair request is built from, alongside the two keys. */
+  fingerprint_commitment: Uint8Array;
 }
+
+/**
+ * A channel paired with how many subshares it holds. A weight of `1` is an
+ * ordinary helper; every weight must satisfy `1 <= weight < threshold`.
+ * `channelId` is a channel id as bigint or decimal string, e.g. the
+ * `channel_id` string from an event.
+ */
+export type WeightedChannel = [channelId: bigint | string, weight: number];
 
 export interface SplitResult {
   /** Map keyed by channel id (`bigint`). */
@@ -1930,9 +2480,103 @@ export type DeRecErrorCategory =
   | "invariant"
   | "wasm";
 
+/**
+ * Every code `derec_error_code_name` can return, plus the WASM-marshalling
+ * codes this binding raises itself before a value reaches the library (see
+ * `library/src/interop/wasm/**\/*.rs`'s `js_error` call sites) — rejecting a
+ * malformed argument shape, a bad flow kind, or a value that will not fit a
+ * `u64`.
+ */
+export type DeRecErrorCode =
+  | "ok"
+  | "non_ok_status"
+  | "version_mismatch"
+  | "invariant"
+  | "invalid_input"
+  | "protobuf_decode"
+  | "protobuf_encode"
+  | "protocol_violation"
+  | "store_error"
+  | "builder_error"
+  | "missing_shared_key"
+  | "role_mismatch"
+  | "replica_id_not_configured"
+  | "channel_already_paired"
+  | "already_restored"
+  | "restore_conflict"
+  | "replica_id_conflict"
+  | "fingerprint_mismatch"
+  | "encryption"
+  | "keygen"
+  | "finish_pairing_initiator"
+  | "finish_pairing_responder"
+  | "empty_transport_uri"
+  | "invalid_contact_message"
+  | "invalid_pair_request_message"
+  | "invalid_pair_response_message"
+  | "prepair_hash_mismatch"
+  | "missing_replica_id"
+  | "unexpected_replica_id"
+  | "incompatible_parameter_range"
+  | "fingerprint_commitment_mismatch"
+  | "empty_channels"
+  | "duplicate_channel_id"
+  | "invalid_threshold"
+  | "empty_secret_data"
+  | "vss_share_failed"
+  | "invalid_weight"
+  | "too_many_subshares"
+  | "invalid_keep_version"
+  | "empty_responses"
+  | "empty_committed_derec_share"
+  | "decode_committed_derec_share"
+  | "decode_derec_share"
+  | "secret_id_mismatch"
+  | "reconstruction_failed"
+  | "malformed_recovered_secret"
+  | "ffi_null_ptr"
+  | "ffi_bad_length"
+  | "ffi_bad_utf8"
+  | "ffi_bad_proto"
+  | "ffi_invalid_enum"
+  | "ffi_bad_shared_key"
+  | "ffi_nul_in_string"
+  | "transport_invalid"
+  | "no_usable_endpoint"
+  | "builder_missing"
+  | "decode_error"
+  | "envelope_decode_error"
+  | "internal"
+  | "invalid_auto_accept_policy"
+  | "invalid_communication_info"
+  | "invalid_contact_mode"
+  | "invalid_discovery_target"
+  | "invalid_flow_kind"
+  | "invalid_flow_params"
+  | "invalid_max_subshares"
+  | "invalid_nonce"
+  | "invalid_own_transport"
+  | "invalid_parameter_range"
+  | "invalid_peer_communication_info"
+  | "invalid_protocol"
+  | "invalid_recovered_secret"
+  | "invalid_refusal_reason"
+  | "invalid_replica_id"
+  | "invalid_secret_id"
+  | "invalid_sender_kind"
+  | "invalid_shared_key_length"
+  | "invalid_status"
+  | "invalid_timeouts"
+  | "invalid_transport_protocol"
+  | "invalid_unpair_ack"
+  | "serialization_error"
+  | "serialize"
+  | "wasm_deserialize_error"
+  | "wasm_serialize_error";
+
 export interface DeRecError {
   category: DeRecErrorCategory;
-  code: string;
+  code: DeRecErrorCode;
   message: string;
   status?: number;
   memo?: string;
@@ -2171,7 +2815,9 @@ export declare const primitives: {
   sharing: {
     request: {
       split(
-        channels: bigint[],
+        /** Every channel the secret is split to, each with its own weight
+         *  (`1` for an ordinary helper). See {@link WeightedChannel}. */
+        channels: WeightedChannel[],
         secret_id: bigint,
         version: number,
         secret_data: Uint8Array,
@@ -2182,7 +2828,7 @@ export declare const primitives: {
         version: number,
         secret_id: bigint,
         committed_share: CommittedDeRecShare,
-        keep_list: number[],
+        keep_version: number,
         description: string,
         shared_key: Uint8Array,
         /** See `discovery.request.produce.reply_to`. */

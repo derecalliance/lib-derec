@@ -77,12 +77,17 @@ describe('byte fields', () => {
     expect(Array.from(revived.hash)).toEqual([9]);
   });
 
-  // `keep_list` is a genuine number[]. A structural "array of numbers is
-  // bytes" rule would corrupt it, which is why the conversion is name-keyed.
-  it('leaves keep_list as an array of numbers', () => {
-    const revived = reviveMessage({ keep_list: [1, 2, 3] }) as { keep_list: unknown };
-    expect(Array.isArray(revived.keep_list)).toBe(true);
-    expect(revived.keep_list).toEqual([1, 2, 3]);
+  // The conversion is name-keyed, so an array of numbers outside the byte
+  // field list is not mistaken for bytes.
+  it('leaves an unlisted array of numbers as an array of numbers', () => {
+    const revived = reviveMessage({ versions: [1, 2, 3] }) as { versions: unknown };
+    expect(Array.isArray(revived.versions)).toBe(true);
+    expect(revived.versions).toEqual([1, 2, 3]);
+  });
+
+  it('leaves keep_version as a plain number', () => {
+    const revived = reviveMessage({ keep_version: 3 }) as { keep_version: unknown };
+    expect(revived.keep_version).toBe(3);
   });
 
   it('narrows Uint8Array back to a byte array', () => {

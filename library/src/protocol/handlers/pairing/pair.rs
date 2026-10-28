@@ -129,11 +129,51 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     }
 
     let envelope = crate::derec_message::apply_trace_id(&resp.envelope, trace_id)?;
-    stores
-        .transport
-        .send(&resp.peer_transports, envelope)
-        .await?;
+    let sent = stores.transport.send(&resp.peer_transports, envelope).await;
 
+    // The response was handed to the transport, so the peer may already hold
+    // the pairing. The responder's side is already persisted; what follows
+    // only drops the transient material, and a failure in it, or in the send
+    // itself, is reported after the completion events rather than surfacing
+    // as an error the application could answer with a second response.
+    let cleaned = drop_transient_material(stores, local, channel_id).await;
+
+    #[cfg(feature = "logging")]
+    tracing::info!(
+        old_channel_id = channel_id.0,
+        new_channel_id = new_channel_id.0,
+        "pairing complete (responder side); rotated to long-term channel_id"
+    );
+
+    let mut events = pair_completion_events(
+        new_channel_id,
+        channel_id,
+        kind,
+        peer_communication_info,
+        peer_replica_id,
+    );
+    if let Err(error) = sent.and(cleaned) {
+        events.push(crate::protocol::obligation::request_failed(
+            new_channel_id,
+            crate::protocol::PendingActionKind::Pairing,
+            true,
+            StatusEnum::Ok as i32,
+            "",
+            &error,
+            None,
+        ));
+    }
+    Ok(events)
+}
+
+/// Drop what only the handshake on `channel_id` needed: the pairing secret,
+/// the contact, and the transient channel row.
+async fn drop_transient_material<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    channel_id: ChannelId,
+) -> Result<()> {
+    let secret_id = local.secret_id;
     stores
         .secrets
         .remove(secret_id, channel_id, SecretKind::PairingSecret)
@@ -149,21 +189,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
             crate::protocol::types::ChannelQuery::Helper { channel_id },
         )
         .await?;
-
-    #[cfg(feature = "logging")]
-    tracing::info!(
-        old_channel_id = channel_id.0,
-        new_channel_id = new_channel_id.0,
-        "pairing complete (responder side); rotated to long-term channel_id"
-    );
-
-    Ok(pair_completion_events(
-        new_channel_id,
-        channel_id,
-        kind,
-        peer_communication_info,
-        peer_replica_id,
-    ))
+    Ok(())
 }
 
 #[cfg_attr(
@@ -184,6 +210,29 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     memo: &str,
     trace_id: u64,
 ) -> Result<()> {
+    match send_refusal(stores, local, channel_id, request, status, memo, trace_id).await? {
+        None => Ok(()),
+        Some(error) => Err(error),
+    }
+}
+
+/// Send the refusal of an inbound `PairRequest`, then drop the pairing
+/// secret.
+///
+/// `Err` when the refusal was never handed to the transport. Once it was, the
+/// requester may already hold the answer, so a failure of the send itself or
+/// of the cleanup after it is returned as `Ok(Some(error))`, for the caller to
+/// report after the refusal rather than as an error the application could
+/// answer with a second response.
+pub(super) async fn send_refusal<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    channel_id: ChannelId,
+    request: &PairRequestMessage,
+    status: StatusEnum,
+    memo: &str,
+    trace_id: u64,
+) -> Result<Option<Error>> {
     let peer_transports = local
         .policy
         .admit_peer_endpoints(request.advertised_endpoints())?;
@@ -200,6 +249,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         parameter_range: None,
         timestamp: Some(timestamp),
         channel_id: 0,
+        fingerprint_nonce: None,
     };
 
     let envelope = DeRecMessageBuilder::pairing()
@@ -211,17 +261,18 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         .build()?
         .encode_to_vec();
 
-    stores.transport.send(&peer_transports, envelope).await?;
+    let sent = stores.transport.send(&peer_transports, envelope).await;
 
-    stores
+    let cleaned = stores
         .secrets
         .remove(local.secret_id, channel_id, SecretKind::PairingSecret)
-        .await?;
+        .await
+        .map_err(Error::from);
 
     #[cfg(feature = "logging")]
     tracing::info!("pairing request rejected");
 
-    Ok(())
+    Ok(sent.and(cleaned).err())
 }
 
 #[cfg_attr(
@@ -675,6 +726,7 @@ pub(super) async fn persist_peer_record<S: StoreSet>(
             peer_role: peer_kind,
             status,
             created_at: now_secs(),
+            weight: 1,
         }),
     };
     stores.channels.save(local.secret_id, record).await?;

@@ -1,9 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { DeRecProtocolBuilder } from '../src/protocol';
 import { FlowKind, StatusEnum } from '../src/types';
-import type { CorruptionReason, DeRecEvent } from '../src/types';
+import type { CorruptionReason, DeRecEvent, DeRecProtocolConfig } from '../src/types';
+
+const protocolConfigFixtures = JSON.parse(
+  fs.readFileSync(
+    path.join(__dirname, '../../../library/tests/fixtures/protocol_config.json'),
+    'utf8',
+  ),
+) as Record<string, DeRecProtocolConfig>;
 
 let lastConfig: Record<string, unknown> | undefined;
 
@@ -65,6 +74,16 @@ describe('DeRecProtocolBuilder', () => {
   it('sends replica_id as null when unset', () => {
     baseBuilder().build();
     expect(lastConfig!.replica_id).toBeNull();
+  });
+
+  it('sends max_subshares as an exact decimal string', () => {
+    baseBuilder().withMaxSubshares(18446744073709551615n).build();
+    expect(lastConfig!.max_subshares).toBe('18446744073709551615');
+  });
+
+  it('omits max_subshares when never configured', () => {
+    baseBuilder().build();
+    expect(lastConfig).not.toHaveProperty('max_subshares');
   });
 
   it('does not clamp threshold', () => {
@@ -153,6 +172,99 @@ describe('DeRecProtocolBuilder', () => {
   it('withUnpairAck forwards an unrecognized value verbatim', () => {
     baseBuilder().withUnpairAck('bogus' as never).build();
     expect(lastConfig!.unpair_ack).toBe('bogus');
+  });
+});
+
+describe('withConfig', () => {
+  it('sends the fixture full config verbatim, alongside own_transports', () => {
+    const { own_transports: _own_transports, ...rest } = protocolConfigFixtures.full;
+    baseBuilder().withConfig(rest).build();
+    for (const [key, value] of Object.entries(rest)) {
+      expect(lastConfig![key]).toEqual(value);
+    }
+    // withConfig does not replace own_transports the base builder already set.
+    expect(lastConfig!.own_transports).toEqual([
+      { uri: 'https://example.com/derec', protocol: 'https' },
+    ]);
+  });
+
+  it('sends the fixture minimal config verbatim', () => {
+    const minimal = protocolConfigFixtures.minimal;
+    baseBuilder().withConfig(minimal).build();
+    expect(lastConfig!.own_transports).toEqual(minimal.own_transports);
+  });
+
+  // Layering: a general config, then a per-user one, then an individual
+  // `with*` call. Every field keeps the last write that set it; `timeouts`
+  // merges per field rather than resetting the fields neither config named.
+  it('layers two configs and a setter, last write wins per field', () => {
+    const general: DeRecProtocolConfig = {
+      threshold: 3,
+      replica_id: '7',
+      auto_reply_to: true,
+      timeouts: { sharing_round_secs: 30 },
+    };
+    const perUser: DeRecProtocolConfig = {
+      threshold: 5,
+      communication_info: { name: 'alice' },
+      timeouts: { inbound_message_secs: 90 },
+    };
+    baseBuilder()
+      .withConfig(general)
+      .withConfig(perUser)
+      .withThreshold(6)
+      .build();
+    expect(lastConfig!.threshold).toBe(6);
+    expect(lastConfig!.replica_id).toBe('7');
+    expect(lastConfig!.auto_reply_to).toBe(true);
+    expect(lastConfig!.communication_info).toEqual({ name: 'alice' });
+    expect(lastConfig!.timeouts).toEqual({
+      sharing_round_secs: 30,
+      inbound_message_secs: 90,
+    });
+  });
+
+  // No validation or defaulting happens here: whatever key the caller
+  // spells is forwarded verbatim in the config JSON for Rust to accept or
+  // reject (`deny_unknown_fields` rejects it there).
+  it('forwards a misspelled key to Rust unchanged', () => {
+    baseBuilder()
+      .withConfig({ treshold: 3 } as unknown as DeRecProtocolConfig)
+      .build();
+    expect(lastConfig).toHaveProperty('treshold', 3);
+    expect(lastConfig).not.toHaveProperty('threshold');
+  });
+
+  // `secret_id` is the constructor argument, not a config field: a config
+  // loaded from a per-user record must never be able to redirect which
+  // secret this instance manages.
+  it('does not let a config override the constructor secret_id', () => {
+    baseBuilder()
+      .withConfig({ secret_id: '999' } as unknown as DeRecProtocolConfig)
+      .build();
+    expect(lastConfig!.secret_id).toBe('7');
+  });
+
+  // `JSON.parse` can produce an own `__proto__` key (it does not itself
+  // pollute anything). Assigning it through plain bracket notation
+  // (`this.config[key] = value`) is what is dangerous: `__proto__` is an
+  // accessor inherited from `Object.prototype`, so that assignment changes
+  // the builder's config object's prototype instead of setting a key on
+  // it, and the value silently disappears from the JSON payload Rust is
+  // meant to validate. The key must reach the wire — as an own property
+  // Rust can reject — not vanish, and it must never change what
+  // `this.config` inherits.
+  it('does not let a __proto__ key in a config pollute the prototype', () => {
+    const malicious = JSON.parse(
+      '{"__proto__": {"threshold": 9}}',
+    ) as unknown as DeRecProtocolConfig;
+    baseBuilder().withConfig(malicious).build();
+    // Inherited lookups are unaffected: this is not the library default of
+    // 3, nor the polluted 9 that a prototype change would produce.
+    expect(lastConfig!.threshold).toBeUndefined();
+    expect(({} as Record<string, unknown>).threshold).toBeUndefined();
+    // The key reaches the payload rather than being silently dropped.
+    expect(lastConfig).toHaveProperty('__proto__', { threshold: 9 });
   });
 });
 
@@ -478,6 +590,57 @@ describe('event byte fields', () => {
     expect(decoded[0].status).toBe(StatusEnum.UnknownShareVersion);
   });
 
+  it('passes ShareRefused through with its status and memo', async () => {
+    const events = [
+      {
+        type: 'ShareRefused',
+        channel_id: '18446744073709551615',
+        version: 2,
+        status: StatusEnum.VerificationFailed,
+        memo: 'CommittedDeRecShare Merkle proof verification failed',
+      },
+    ];
+    host.tick = () => Promise.resolve(utf8(JSON.stringify(events)).buffer);
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    const decoded = (await protocol.tick()) as Array<
+      Extract<DeRecEvent, {type: 'ShareRefused'}>
+    >;
+
+    expect(decoded[0]).toEqual(events[0]);
+    expect(decoded[0].channel_id).toBe('18446744073709551615');
+    expect(decoded[0].version).toBe(2);
+    expect(decoded[0].status).toBe(StatusEnum.VerificationFailed);
+  });
+
+  it('passes ReplicaSecretRefused through with its status and memo', async () => {
+    const events = [
+      {
+        type: 'ReplicaSecretRefused',
+        channel_id: '18446744073709551615',
+        from_replica_id: '7',
+        secret_id: '42',
+        version: 3,
+        status: StatusEnum.VerificationFailed,
+        memo: 'CommittedDeRecShare Merkle proof verification failed',
+      },
+    ];
+    host.tick = () => Promise.resolve(utf8(JSON.stringify(events)).buffer);
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    const decoded = (await protocol.tick()) as Array<
+      Extract<DeRecEvent, {type: 'ReplicaSecretRefused'}>
+    >;
+
+    expect(decoded[0]).toEqual(events[0]);
+    expect(decoded[0].channel_id).toBe('18446744073709551615');
+    expect(decoded[0].from_replica_id).toBe('7');
+    expect(decoded[0].version).toBe(3);
+    expect(decoded[0].status).toBe(StatusEnum.VerificationFailed);
+  });
+
   it('passes RecoveryShareRefused through with its status and memo', async () => {
     const events = [
       {
@@ -500,6 +663,47 @@ describe('event byte fields', () => {
     expect(decoded[0].channel_id).toBe('18446744073709551615');
     expect(decoded[0].version).toBe(2);
     expect(decoded[0].status).toBe(StatusEnum.UnknownShareVersion);
+  });
+
+  it('passes RequestFailed through with its status and memo, answered or not', async () => {
+    const events = [
+      {
+        type: 'RequestFailed',
+        channel_id: '18446744073709551615',
+        action_kind: 'StoreShare',
+        responded: false,
+        status: StatusEnum.Fail,
+        memo: 'request could not be processed',
+        error_code: 'store_error',
+        message: 'backend unavailable',
+        action: [1, 2, 255],
+      },
+      {
+        type: 'RequestFailed',
+        channel_id: '4',
+        action_kind: 'Failed',
+        responded: true,
+        status: StatusEnum.FormatError,
+        memo: 'message body could not be decoded',
+        error_code: 'internal',
+        message: 'cause',
+      },
+    ];
+    host.tick = () => Promise.resolve(utf8(JSON.stringify(events)).buffer);
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    const decoded = (await protocol.tick()) as Array<
+      Extract<DeRecEvent, {type: 'RequestFailed'}>
+    >;
+
+    expect(decoded[0].status).toBe(StatusEnum.Fail);
+    expect(decoded[0].memo).toBe('request could not be processed');
+    expect(decoded[0].action).toBeInstanceOf(Uint8Array);
+    expect(Array.from(decoded[0].action!)).toEqual([1, 2, 255]);
+    expect(decoded[1]).toEqual(events[1]);
+    expect(decoded[1].status).toBe(StatusEnum.FormatError);
+    expect(decoded[1].action).toBeUndefined();
   });
 
   it('passes RecoveryShareCorrupted through with every reason', async () => {

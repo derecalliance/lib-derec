@@ -27,7 +27,8 @@ func TestSplitProducesOneCommittedShareperChannel(t *testing.T) {
 	const threshold = 2
 	const version = uint32(1)
 
-	shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold, version)
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 1}, {ChannelID: 3, Weight: 1}}
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
 	if err != nil {
 		t.Fatalf("split: %v", err)
 	}
@@ -45,6 +46,38 @@ func TestSplitProducesOneCommittedShareperChannel(t *testing.T) {
 	}
 }
 
+// TestSplitWeighted asserts a weighted channel's committed share carries as
+// many subshares as its weight, while an unweighted channel in the same
+// split still carries exactly one.
+func TestSplitWeighted(t *testing.T) {
+	const secretID = uint64(0x0102_0304_05ff)
+	secretData := []byte{5, 6, 7, 8, 255}
+	channelIDs := []uint64{1, 2, 3}
+	const threshold = 4
+	const version = uint32(1)
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 2}, {ChannelID: 2, Weight: 3}, {ChannelID: 3, Weight: 1}}
+
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+
+	wantSubshares := map[uint64]int{1: 2, 2: 3, 3: 1}
+	for _, id := range channelIDs {
+		var committed derecpb.CommittedDeRecShare
+		if err := proto.Unmarshal(shares[id], &committed); err != nil {
+			t.Fatalf("channel %d: decode CommittedDeRecShare: %v", id, err)
+		}
+		var share derecpb.DeRecShare
+		if err := proto.Unmarshal(committed.GetDeRecShare(), &share); err != nil {
+			t.Fatalf("channel %d: decode DeRecShare: %v", id, err)
+		}
+		if got := len(share.GetSubshares()); got != wantSubshares[id] {
+			t.Fatalf("channel %d: expected %d subshares, got %d", id, wantSubshares[id], got)
+		}
+	}
+}
+
 func TestStoreShareRequestResponseRoundTrip(t *testing.T) {
 	const secretID = uint64(0x0102_0304_05ff)
 	secretData := []byte{5, 6, 7, 8, 255}
@@ -53,7 +86,8 @@ func TestStoreShareRequestResponseRoundTrip(t *testing.T) {
 	const version = uint32(1)
 	key := sharedKey()
 
-	shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold, version)
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 1}, {ChannelID: 3, Weight: 1}}
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
 	if err != nil {
 		t.Fatalf("split: %v", err)
 	}
@@ -61,7 +95,7 @@ func TestStoreShareRequestResponseRoundTrip(t *testing.T) {
 	for _, channelID := range channelIDs {
 		committedShare := shares[channelID]
 
-		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", key, nil)
+		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, 0, "", key, nil)
 		if err != nil {
 			t.Fatalf("channel %d: request produce: %v", channelID, err)
 		}
@@ -138,11 +172,12 @@ func produceAndExtractStoreShare(t *testing.T, rt []sharing.Endpoint) []byte {
 	t.Helper()
 	const secretID, version = uint64(9), uint32(1)
 	key := sharedKey()
-	shares, err := sharing.Request.Split(secretID, []byte{1, 2, 3}, []uint64{1, 2}, 2, version)
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 1}}
+	shares, err := sharing.Request.Split(secretID, []byte{1, 2, 3}, channels, 2, version)
 	if err != nil {
 		t.Fatalf("split: %v", err)
 	}
-	wire, err := sharing.Request.Produce(1, version, secretID, shares[1], nil, "", key, rt)
+	wire, err := sharing.Request.Produce(1, version, secretID, shares[1], 0, "", key, rt)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}

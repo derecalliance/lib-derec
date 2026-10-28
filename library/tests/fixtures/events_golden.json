@@ -1,0 +1,628 @@
+{
+  "$schema_note": "One sample of every event the core emits, as the FFI delivers it (JSON) and the WASM bridge mirrors it (byte fields become Uint8Array, a null id stays null). Every optional field is present and every value differs from its type's default, except where a sample shows the null form of an optional id. Rust generates this file (library/src/protocol/events/tests.rs); every SDK decodes each entry into its own event type and checks every field survives. Do not edit by hand.",
+  "events": [
+    {
+      "channel_id": "1001",
+      "kind": 2,
+      "pairing_channel_id": "1002",
+      "peer_communication_info": {
+        "name": "Peer"
+      },
+      "type": "PairingCompleted"
+    },
+    {
+      "channel_id": "1003",
+      "peer_replica_id": "1004",
+      "type": "ReplicaPaired"
+    },
+    {
+      "author_replica_id": "1007",
+      "channel_id": "1005",
+      "from_replica_id": "1006",
+      "secret": {
+        "helpers": [
+          {
+            "channel_id": "7001",
+            "communication_info": {
+              "name": "Helper"
+            },
+            "shared_key": [
+              17,
+              18,
+              19
+            ],
+            "transports": [
+              {
+                "protocol": "https",
+                "uri": "https://helper.example/derec"
+              }
+            ],
+            "weight": 2
+          }
+        ],
+        "replicas": {
+          "channel_id": "7002",
+          "members": [
+            {
+              "communication_info": {
+                "device": "Laptop"
+              },
+              "replica_id": "7003",
+              "role": "Source",
+              "transports": [
+                {
+                  "protocol": "grpc",
+                  "uri": "grpc://replica.example:443"
+                }
+              ]
+            }
+          ],
+          "shared_key": [
+            65,
+            66
+          ]
+        },
+        "secrets": [
+          {
+            "data": [
+              49,
+              50,
+              51
+            ],
+            "id": [
+              33,
+              34
+            ],
+            "name": "wallet"
+          }
+        ],
+        "threshold": 3
+      },
+      "secret_id": "1008",
+      "shares": [
+        {
+          "channel_id": "7004",
+          "committed_share": [
+            81,
+            82
+          ]
+        }
+      ],
+      "type": "ReplicaSecretReceived",
+      "version": 4
+    },
+    {
+      "author_replica_id": null,
+      "channel_id": "1009",
+      "from_replica_id": "1010",
+      "secret": {
+        "helpers": [
+          {
+            "channel_id": "7001",
+            "communication_info": {
+              "name": "Helper"
+            },
+            "shared_key": [
+              17,
+              18,
+              19
+            ],
+            "transports": [
+              {
+                "protocol": "https",
+                "uri": "https://helper.example/derec"
+              }
+            ],
+            "weight": 2
+          }
+        ],
+        "replicas": {
+          "channel_id": "7002",
+          "members": [
+            {
+              "communication_info": {
+                "device": "Laptop"
+              },
+              "replica_id": "7003",
+              "role": "Source",
+              "transports": [
+                {
+                  "protocol": "grpc",
+                  "uri": "grpc://replica.example:443"
+                }
+              ]
+            }
+          ],
+          "shared_key": [
+            65,
+            66
+          ]
+        },
+        "secrets": [
+          {
+            "data": [
+              49,
+              50,
+              51
+            ],
+            "id": [
+              33,
+              34
+            ],
+            "name": "wallet"
+          }
+        ],
+        "threshold": 3
+      },
+      "secret_id": "1011",
+      "shares": [
+        {
+          "channel_id": "7004",
+          "committed_share": [
+            81,
+            82
+          ]
+        }
+      ],
+      "type": "ReplicaSecretInstalled",
+      "version": 5
+    },
+    {
+      "channel_id": "1012",
+      "from_replica_id": "1013",
+      "held_author_replica_id": "1015",
+      "incoming_author_replica_id": null,
+      "secret": {
+        "helpers": [
+          {
+            "channel_id": "7001",
+            "communication_info": {
+              "name": "Helper"
+            },
+            "shared_key": [
+              17,
+              18,
+              19
+            ],
+            "transports": [
+              {
+                "protocol": "https",
+                "uri": "https://helper.example/derec"
+              }
+            ],
+            "weight": 2
+          }
+        ],
+        "replicas": {
+          "channel_id": "7002",
+          "members": [
+            {
+              "communication_info": {
+                "device": "Laptop"
+              },
+              "replica_id": "7003",
+              "role": "Source",
+              "transports": [
+                {
+                  "protocol": "grpc",
+                  "uri": "grpc://replica.example:443"
+                }
+              ]
+            }
+          ],
+          "shared_key": [
+            65,
+            66
+          ]
+        },
+        "secrets": [
+          {
+            "data": [
+              49,
+              50,
+              51
+            ],
+            "id": [
+              33,
+              34
+            ],
+            "name": "wallet"
+          }
+        ],
+        "threshold": 3
+      },
+      "secret_id": "1014",
+      "type": "ReplicaVersionConflict",
+      "version": 6
+    },
+    {
+      "channel_id": "1016",
+      "from_replica_id": "1017",
+      "memo": "replica refused",
+      "secret_id": "1018",
+      "status": 3,
+      "type": "ReplicaSecretRefused",
+      "version": 7
+    },
+    {
+      "channel_id": "1019",
+      "from_replica_id": "1020",
+      "memo": "replica acked",
+      "secret_id": "1021",
+      "status": 1,
+      "type": "ReplicaSecretAcked",
+      "version": 8
+    },
+    {
+      "memo": "sync rejected",
+      "replica_id": "1022",
+      "secret_id": "1023",
+      "status": 4,
+      "type": "ReplicaSyncRejected",
+      "version": 9
+    },
+    {
+      "reason": "sync failed",
+      "replica_id": "1024",
+      "type": "ReplicaSyncFailed",
+      "version": 10
+    },
+    {
+      "replica_id": "1025",
+      "type": "ReplicaRemoved"
+    },
+    {
+      "replica_id": "1026",
+      "type": "ReplicaSourceChanged"
+    },
+    {
+      "type": "SelfRemovedFromGroup",
+      "version": 11
+    },
+    {
+      "fetched_from": "1027",
+      "group_version": 13,
+      "local_version": 12,
+      "type": "ReplicaDiscoveryComplete"
+    },
+    {
+      "behind": [
+        "1029"
+      ],
+      "synced": [
+        "1028"
+      ],
+      "type": "ReplicaSyncComplete",
+      "version": 14
+    },
+    {
+      "channel_id": "1030",
+      "type": "ShareStored",
+      "version": 15
+    },
+    {
+      "channel_id": "1031",
+      "memo": "share refused",
+      "status": 5,
+      "type": "ShareRefused",
+      "version": 16
+    },
+    {
+      "channel_id": "1032",
+      "type": "ShareConfirmed",
+      "version": 17
+    },
+    {
+      "channel_id": "1033",
+      "memo": "share rejected",
+      "status": 6,
+      "type": "ShareRejected",
+      "version": 18
+    },
+    {
+      "confirmed_count": 3,
+      "failed_count": 1,
+      "threshold_met": true,
+      "type": "SharingComplete",
+      "version": 19
+    },
+    {
+      "channel_id": "1034",
+      "subshares": 2,
+      "threshold": 3,
+      "type": "ShareVerified",
+      "version": 20
+    },
+    {
+      "channel_id": "1035",
+      "type": "ShareVerifyInvalid",
+      "version": 21
+    },
+    {
+      "channel_id": "1036",
+      "memo": "verify rejected",
+      "status": 7,
+      "type": "ShareVerifyRejected",
+      "version": 22
+    },
+    {
+      "channel_id": "1037",
+      "secrets": [
+        {
+          "secret_id": "1038",
+          "versions": [
+            {
+              "description": "first",
+              "version": 23
+            }
+          ]
+        }
+      ],
+      "type": "SecretsDiscovered"
+    },
+    {
+      "channel_id": "1039",
+      "shares_received": 2,
+      "type": "RecoveryShareReceived"
+    },
+    {
+      "channel_id": "1040",
+      "error": "share error",
+      "shares_received": 1,
+      "type": "RecoveryShareError"
+    },
+    {
+      "channel_id": "1041",
+      "memo": "recovery refused",
+      "status": 8,
+      "type": "RecoveryShareRefused",
+      "version": 24
+    },
+    {
+      "channel_id": "1042",
+      "reason": "InvalidProof",
+      "type": "RecoveryShareCorrupted",
+      "version": 25
+    },
+    {
+      "secret": {
+        "helpers": [
+          {
+            "channel_id": "7001",
+            "communication_info": {
+              "name": "Helper"
+            },
+            "shared_key": [
+              17,
+              18,
+              19
+            ],
+            "transports": [
+              {
+                "protocol": "https",
+                "uri": "https://helper.example/derec"
+              }
+            ],
+            "weight": 2
+          }
+        ],
+        "replicas": {
+          "channel_id": "7002",
+          "members": [
+            {
+              "communication_info": {
+                "device": "Laptop"
+              },
+              "replica_id": "7003",
+              "role": "Source",
+              "transports": [
+                {
+                  "protocol": "grpc",
+                  "uri": "grpc://replica.example:443"
+                }
+              ]
+            }
+          ],
+          "shared_key": [
+            65,
+            66
+          ]
+        },
+        "secrets": [
+          {
+            "data": [
+              49,
+              50,
+              51
+            ],
+            "id": [
+              33,
+              34
+            ],
+            "name": "wallet"
+          }
+        ],
+        "threshold": 3
+      },
+      "type": "SecretRecovered"
+    },
+    {
+      "channel_id": "1043",
+      "type": "Unpaired"
+    },
+    {
+      "channel_id": "1044",
+      "memo": "unpair rejected",
+      "status": 9,
+      "type": "UnpairRejected"
+    },
+    {
+      "channel_id": "1045",
+      "memo": "prepair rejected",
+      "status": 10,
+      "type": "PrePairRejected"
+    },
+    {
+      "channel_id": "1046",
+      "type": "ChannelInfoUpdated"
+    },
+    {
+      "channel_id": "1047",
+      "memo": "update rejected",
+      "status": 11,
+      "type": "ChannelInfoUpdateRejected"
+    },
+    {
+      "action": [
+        97,
+        98,
+        99
+      ],
+      "action_kind": "StoreShare",
+      "channel_id": "1048",
+      "peer_communication_info": {
+        "name": "Owner"
+      },
+      "sender_kind": 1,
+      "share_description": "backup",
+      "share_secret_id": "1049",
+      "share_size": 4096,
+      "trace_id": "1050",
+      "type": "ActionRequired",
+      "unpair_memo": "goodbye",
+      "updated_communication_info": {
+        "name": "Renamed"
+      },
+      "updated_transports": [
+        {
+          "protocol": "https",
+          "uri": "https://moved.example/derec"
+        }
+      ],
+      "version": 26
+    },
+    {
+      "action_kind": "Pairing",
+      "channel_id": "1051",
+      "type": "AutoAccepted"
+    },
+    {
+      "action": [
+        113,
+        114
+      ],
+      "action_kind": "VerifyShare",
+      "channel_id": "1052",
+      "error_code": "store_error",
+      "memo": "request could not be processed",
+      "message": "share store unavailable",
+      "responded": true,
+      "status": 12,
+      "type": "RequestFailed"
+    },
+    {
+      "channel_id": "1053",
+      "memo": "peer error",
+      "status": 13,
+      "type": "ErrorResponseReceived"
+    },
+    {
+      "channel_id": "1054",
+      "error_code": "incompatible_parameter_range",
+      "memo": "pairing refused",
+      "message": "ranges do not overlap",
+      "status": 14,
+      "type": "PairingRefused"
+    },
+    {
+      "type": "NoOp"
+    },
+    {
+      "channel_id": "1055",
+      "reason": "StaleResponse",
+      "trace_id": "1056",
+      "type": "MessageIgnored"
+    },
+    {
+      "channel_id": "1057",
+      "reason": "NoTransports",
+      "replica_id": "1058",
+      "type": "PeerNotRestored"
+    },
+    {
+      "channel_id": "1059",
+      "kind": 1,
+      "trace_id": "1060",
+      "type": "PairingStarted"
+    },
+    {
+      "channel_id": "1061",
+      "trace_id": "1062",
+      "type": "DiscoveryStarted"
+    },
+    {
+      "channel_id": "1063",
+      "error": "discovery failed",
+      "type": "DiscoveryFailed"
+    },
+    {
+      "channel_id": "1064",
+      "trace_id": "1065",
+      "type": "ProtectSecretStarted",
+      "version": 27,
+      "weight": 2
+    },
+    {
+      "channel_id": "1066",
+      "error": "protect failed",
+      "type": "ProtectSecretFailed",
+      "version": 28,
+      "weight": 3
+    },
+    {
+      "channel_id": "1067",
+      "trace_id": "1068",
+      "type": "VerifySharesStarted",
+      "version": 29
+    },
+    {
+      "channel_id": "1069",
+      "error": "no proof",
+      "reason": "NoProof",
+      "type": "VerifySharesFailed",
+      "version": 30
+    },
+    {
+      "channel_id": "1070",
+      "trace_id": "1071",
+      "type": "RecoverSecretStarted",
+      "version": 31
+    },
+    {
+      "channel_id": "1072",
+      "error": "recover failed",
+      "type": "RecoverSecretFailed",
+      "version": 32
+    },
+    {
+      "channel_id": "1073",
+      "error": "unpair failed",
+      "type": "UnpairFailed"
+    },
+    {
+      "channel_id": "1074",
+      "trace_id": "1075",
+      "type": "UnpairStarted"
+    },
+    {
+      "channel_id": "1076",
+      "trace_id": "1077",
+      "type": "UpdateChannelInfoStarted"
+    },
+    {
+      "channel_id": "1078",
+      "error": "update failed",
+      "type": "UpdateChannelInfoFailed"
+    }
+  ]
+}

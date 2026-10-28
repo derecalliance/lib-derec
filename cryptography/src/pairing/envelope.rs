@@ -5,7 +5,7 @@
 //!
 //! This module provides ECIES-style hybrid encryption using:
 //!
-//! - secp256k1 ECDH (via `pairing_ecies`)
+//! - secp256k1 ECDH (via `ecies`)
 //! - AES-256-GCM (via `channel`)
 //!
 //! # Purpose
@@ -67,12 +67,12 @@
 //! # Usage
 //!
 //! ```rust
-//! use derec_cryptography::pairing::{envelope, pairing_ecies};
+//! use derec_cryptography::pairing::{envelope, ecies};
 //! use rand::rand_core::UnwrapErr;
 //! use rand::rngs::SysRng;
 //!
 //! // `generate_key` returns the secret key first, then the public key.
-//! let (secret_key, public_key) = pairing_ecies::generate_key(&mut UnwrapErr(SysRng)).unwrap();
+//! let (secret_key, public_key) = ecies::generate_key(&mut UnwrapErr(SysRng)).unwrap();
 //!
 //! let ciphertext = envelope::encrypt(b"hello derec", &public_key).unwrap();
 //! let plaintext = envelope::decrypt(&ciphertext, &secret_key).unwrap();
@@ -80,33 +80,12 @@
 //! assert_eq!(plaintext, b"hello derec");
 //! ```
 
-use rand::Rng as _;
-use thiserror::Error;
-
 use crate::channel;
-use crate::pairing::pairing_ecies;
+use crate::pairing::{DerecEncryptionError, ecies};
+use rand::Rng as _;
 
 /// Length of nonce used for AES-GCM (we reuse 32 bytes but only first 12 are used)
 const NONCE_SIZE: usize = 32;
-
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum DerecEncryptionError {
-    #[error("invalid public key")]
-    InvalidPublicKey,
-
-    #[error("invalid secret key")]
-    InvalidSecretKey,
-
-    #[error("invalid ciphertext format")]
-    InvalidFormat,
-
-    #[error("encryption failed")]
-    EncryptionFailed,
-
-    #[error("decryption failed")]
-    DecryptionFailed,
-}
 
 /// Encrypts a payload to a recipient public key using ECIES.
 ///
@@ -135,11 +114,11 @@ pub enum DerecEncryptionError {
 /// # Example
 ///
 /// ```rust
-/// use derec_cryptography::pairing::{envelope, pairing_ecies};
+/// use derec_cryptography::pairing::{envelope, ecies};
 /// use rand::rand_core::UnwrapErr;
 /// use rand::rngs::SysRng;
 ///
-/// let (_secret_key, public_key) = pairing_ecies::generate_key(&mut UnwrapErr(SysRng)).unwrap();
+/// let (_secret_key, public_key) = ecies::generate_key(&mut UnwrapErr(SysRng)).unwrap();
 ///
 /// let ciphertext = envelope::encrypt(b"hello", &public_key).unwrap();
 /// assert!(!ciphertext.is_empty());
@@ -155,13 +134,13 @@ pub fn encrypt(bytes: &[u8], public_key: &[u8]) -> Result<Vec<u8>, DerecEncrypti
         return Err(DerecEncryptionError::InvalidPublicKey);
     }
 
-    let (esk, epk) = pairing_ecies::generate_key(&mut crate::random::os_rng()).map_err(|_e| {
+    let (esk, epk) = ecies::generate_key(&mut crate::random::os_rng()).map_err(|_e| {
         #[cfg(feature = "logging")]
         tracing::warn!(error = %_e, "ephemeral keypair generation failed");
         DerecEncryptionError::EncryptionFailed
     })?;
 
-    let shared = pairing_ecies::derive_shared_key(&esk, public_key).map_err(|_e| {
+    let shared = ecies::derive_shared_key(&esk, public_key).map_err(|_e| {
         #[cfg(feature = "logging")]
         tracing::warn!(error = %_e, "ECDH shared key derivation failed");
         DerecEncryptionError::EncryptionFailed
@@ -217,11 +196,11 @@ pub fn encrypt(bytes: &[u8], public_key: &[u8]) -> Result<Vec<u8>, DerecEncrypti
 /// # Example
 ///
 /// ```rust
-/// use derec_cryptography::pairing::{envelope, pairing_ecies};
+/// use derec_cryptography::pairing::{envelope, ecies};
 /// use rand::rand_core::UnwrapErr;
 /// use rand::rngs::SysRng;
 ///
-/// let (secret_key, public_key) = pairing_ecies::generate_key(&mut UnwrapErr(SysRng)).unwrap();
+/// let (secret_key, public_key) = ecies::generate_key(&mut UnwrapErr(SysRng)).unwrap();
 /// let ciphertext = envelope::encrypt(b"hello", &public_key).unwrap();
 ///
 /// let plaintext = envelope::decrypt(&ciphertext, &secret_key).unwrap();
@@ -260,7 +239,7 @@ pub fn decrypt(ciphertext: &[u8], secret_key: &[u8]) -> Result<Vec<u8>, DerecEnc
     let epk = &ciphertext[4..4 + epk_len];
     let encrypted = &ciphertext[4 + epk_len..];
 
-    let shared = pairing_ecies::derive_shared_key(secret_key, epk).map_err(|_e| {
+    let shared = ecies::derive_shared_key(secret_key, epk).map_err(|_e| {
         #[cfg(feature = "logging")]
         tracing::warn!(error = %_e, "ECDH shared key derivation failed");
         DerecEncryptionError::DecryptionFailed
@@ -281,10 +260,10 @@ pub fn decrypt(ciphertext: &[u8], secret_key: &[u8]) -> Result<Vec<u8>, DerecEnc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pairing::pairing_ecies;
+    use crate::pairing::ecies;
 
     fn generate_recipient_keypair() -> (Vec<u8>, Vec<u8>) {
-        pairing_ecies::generate_key(&mut crate::random::os_rng())
+        ecies::generate_key(&mut crate::random::os_rng())
             .expect("failed to generate recipient keypair")
     }
 

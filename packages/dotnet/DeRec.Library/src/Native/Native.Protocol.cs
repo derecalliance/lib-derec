@@ -141,9 +141,13 @@ internal static class Protocol
         IntPtr versionsJsonPtr, UIntPtr versionsJsonLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    internal delegate int ShareStoreKeepListDelegate(
+    internal delegate int ShareStoreKeepVersionDelegate(
         IntPtr userData, ulong secretId, uint version,
-        out IntPtr outPtr, out UIntPtr outLen);
+        out uint outVersion);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int ShareStoreRecordVerificationDelegate(
+        IntPtr userData, ulong secretId, ulong channelId, uint version);
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct ShareStoreCallbacks
@@ -156,7 +160,8 @@ internal static class Protocol
         public IntPtr Save;
         public IntPtr RemoveChannel;
         public IntPtr RemoveVersions;
-        public IntPtr KeepList;
+        public IntPtr KeepVersion;
+        public IntPtr RecordVerification;
         public IntPtr FreeBuffer;
     }
 
@@ -245,8 +250,9 @@ internal static class Protocol
 
     /// <summary>
     /// Constructs a protocol handle. Scalar configuration is bundled into a
-    /// single JSON buffer (see <c>ProtocolConfig</c> in the Rust FFI crate
-    /// for the exact shape), including <c>communication_info</c>, so the
+    /// single JSON buffer: <c>secret_id</c> plus the canonical
+    /// <c>DeRecProtocolConfig</c> JSON (library/src/protocol/protocol_config.rs),
+    /// including <c>communication_info</c>, so the
     /// <c>communicationInfo</c> proto buffer is passed empty. Bundling the scalar config into JSON keeps the native
     /// signature small enough for every FFI consumer (Go via purego, .NET)
     /// to call — some callers cannot marshal many native arguments in a
@@ -272,7 +278,7 @@ internal static class Protocol
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecError derec_protocol_verify_fingerprint(
-        IntPtr handle, ulong channelId, byte[] fingerprintUtf8, out uint outMatched);
+        IntPtr handle, ulong channelId, byte[] fingerprintUtf8);
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct DeRecRemovedChannelsResult

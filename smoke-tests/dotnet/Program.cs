@@ -16,6 +16,7 @@ internal static class Program
         Primitives.RunAll();
         TransportAdapters.RunAll();
         ChannelFilterConformance.RunAll();
+        EventGolden.RunAll();
         Protocol.RunAll();
 
         Console.WriteLine("All smoke tests passed.");

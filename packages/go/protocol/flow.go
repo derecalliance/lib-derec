@@ -126,11 +126,64 @@ type ProtectSecretParams struct {
 	// Option<String> None), a non-nil pointer — including one to an
 	// empty string — sets it explicitly.
 	Description *string
+	// Weights maps a paired channel id to how many subshares that
+	// channel should hold. The map is the full assignment, not a patch: a
+	// paired helper absent from it holds one subshare. The resolved weights
+	// are stored on each HelperChannel.Weight. nil omits the field entirely.
+	//
+	// Weights are the user's choice. Before Start, show the user each paired
+	// helper's current weight, pre-filled from your ChannelStore (the stored
+	// HelperChannel.Weight), and pass the user's final choice as the whole
+	// map. Reading the stored weights first is the normal flow. Every other
+	// Start the app makes, such as a republish after editing the secrets or
+	// the follow-up after Restore, must pass the stored weights unchanged: a
+	// helper left out returns to 1, which silently undoes the user's choice.
+	// Only the publishes the library starts on its own (after pairing, after
+	// a fingerprint is confirmed) reuse the stored weights by themselves.
+	//
+	// A stored weight the round's threshold does not allow fails the
+	// publishes the library starts on its own with derec.CodeInvalidWeight,
+	// before anything is sent: Process returns a *ProcessError whose Events
+	// keep the message's events, PairingCompleted included; Accept returns
+	// an error after the pairing has completed and its response was sent,
+	// without returning PairingCompleted; VerifyFingerprint returns an error
+	// after the promotion, which stands, and a retry returns true and
+	// publishes nothing. Call Start with valid weights to publish.
+	//
+	// When the paired helpers' resolved total is below the round's threshold
+	// (see Threshold), Start skips the split: no helper is sent anything, so no
+	// EventTypeProtectSecretStarted / EventTypeProtectSecretFailed comes back
+	// for one. A paired replica still gets its usual secret-only copy and
+	// events; with none paired, Start returns no events at all — this is not
+	// an error. The version still advances and the secrets/description are
+	// saved as the latest snapshot, so the next publish that reaches
+	// threshold shares it. Sum the weights about to be assigned against the
+	// threshold beforehand, or count the returned helper events afterward,
+	// to detect the case.
+	Weights map[uint64]uint32
+	// Threshold is the threshold this round splits at: the number of
+	// distinct subshares that reconstruct this version. nil keeps the stored
+	// threshold (UserSecrets.Threshold), or DeRecProtocolConfig.Threshold
+	// when none is stored; a value changes it, and the new threshold is stored
+	// with this round. Leave it nil on the follow-up after Restore, which has
+	// already put the recovered threshold back. Publishes the library starts
+	// on its own always use the stored threshold.
+	//
+	// The resolved threshold must be at least 2 (derec.CodeInvalidThreshold),
+	// above every resolved weight (derec.CodeInvalidWeight), and no greater
+	// than a MaxSubshares cap (derec.CodeInvalidInput). Each check runs
+	// before anything is written or sent.
+	Threshold *uint32
 }
 
 type protectSecretParamsWire struct {
 	Secrets     []UserSecret `json:"secrets"`
 	Description *string      `json:"description,omitempty"`
+	// Weights marshals a map[uint64]uint32 directly: encoding/json renders
+	// integer map keys as decimal-string JSON object keys, matching the
+	// wire's `HashMap<String, u32>` shape without a separate wire type.
+	Weights   map[uint64]uint32 `json:"weights,omitempty"`
+	Threshold *uint32           `json:"threshold,omitempty"`
 }
 
 // VerifySharesParams are the parameters for FlowKindVerifyShares.
@@ -169,8 +222,10 @@ type unpairParamsWire struct {
 	Memo      *string `json:"memo,omitempty"`
 }
 
-// TransportProtocolParam is the transport endpoint carried by
-// UpdateChannelInfoParams.
+// TransportProtocolParam is a transport endpoint: an entry of
+// DeRecProtocolConfig.OwnTransports, of SetOwnTransports, and of
+// UpdateChannelInfoParams. In the canonical config JSON it is
+// {"uri": ..., "protocol": ...}, protocol written as its lowercase name.
 type TransportProtocolParam struct {
 	URI      string
 	Protocol int32
@@ -267,6 +322,8 @@ func marshalFlowParams(flowKind FlowKind, params any) ([]byte, error) {
 		return json.Marshal(protectSecretParamsWire{
 			Secrets:     secrets,
 			Description: psp.Description,
+			Weights:     psp.Weights,
+			Threshold:   psp.Threshold,
 		})
 	case FlowKindVerifyShares:
 		vsp, ok := params.(VerifySharesParams)
@@ -361,6 +418,13 @@ func (p *DeRecProtocol) Start(flowKind FlowKind, params any) ([]Event, error) {
 // Accept accepts a pending action carried by an ActionRequired event's
 // Action field, passed verbatim. Returns the events produced by resuming
 // the suspended flow (e.g. PairingCompleted).
+//
+// When the action completes a pairing, the publish that follows reuses the
+// stored helper weights. If one is no longer valid under the round's
+// threshold, that publish fails with derec.CodeInvalidWeight before anything
+// is sent and Accept returns that error: the pairing has completed and its
+// response was sent, but PairingCompleted is not returned. Call
+// Start(FlowKindProtectSecret, ...) with valid weights to publish.
 func (p *DeRecProtocol) Accept(action []byte) ([]Event, error) {
 	if p.closed {
 		return nil, errors.New("protocol: Accept: protocol is closed")
@@ -374,7 +438,10 @@ func (p *DeRecProtocol) Accept(action []byte) ([]Event, error) {
 
 // Reject rejects a pending action carried by an ActionRequired event's
 // Action field, with a status + memo. status is the StatusEnum the peer
-// receives in the response.
+// receives in the response. A RequestFailed event's Action is passed the same
+// way and sends the one response that request is owed. Resolve each token
+// once: the library is stateless, so rejecting the same token twice sends two
+// responses.
 func (p *DeRecProtocol) Reject(action []byte, status derecpb.StatusEnum, memo string) error {
 	if p.closed {
 		return errors.New("protocol: Reject: protocol is closed")

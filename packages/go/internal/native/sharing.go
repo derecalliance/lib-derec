@@ -47,13 +47,13 @@ var (
 	protectSecretOnce sync.Once
 	protectSecretFn   func(secretID uint64,
 		secretData *byte, secretDataLen uintptr,
-		channels *uint64, channelsLen uintptr,
+		channels *uint64, weights *uint32, channelsLen uintptr,
 		threshold uintptr, version uint32) protectSecretResult
 
 	produceStoreShareReqOnce sync.Once
 	produceStoreShareReqFn   func(channelID uint64, version uint32, secretID uint64,
 		committedShare *byte, committedShareLen uintptr,
-		keepList *uint32, keepListLen uintptr,
+		keepVersion uint32,
 		description *byte, descriptionLen uintptr,
 		sharedKey *byte, sharedKeyLen uintptr,
 		replyTo *byte, replyToLen uintptr) produceStoreShareRequestMessageResult
@@ -98,13 +98,17 @@ func u32Ptr(s []uint32) *uint32 {
 // returning the committed shares in the wire format documented at
 // library/src/interop/ffi/sharing.rs: a length-prefixed sequence of (channel_id,
 // serialized CommittedDeRecShare) entries sorted by channel id.
-func ProtectSecret(secretID uint64, secretData []byte, channelIDs []uint64, threshold uintptr, version uint32) ([]byte, error) {
+//
+// channelIDs and weights are two aligned slices: weights[i] is the number of
+// subshares channelIDs[i]'s committed share carries (1 for an ordinary
+// helper). Every channel the secret is shared with must appear.
+func ProtectSecret(secretID uint64, secretData []byte, channelIDs []uint64, weights []uint32, threshold uintptr, version uint32) ([]byte, error) {
 	protectSecretOnce.Do(func() {
 		purego.RegisterFunc(&protectSecretFn, symbol("protect_secret"))
 	})
 	res := protectSecretFn(secretID,
 		bytePtr(secretData), uintptr(len(secretData)),
-		u64Ptr(channelIDs), uintptr(len(channelIDs)),
+		u64Ptr(channelIDs), u32Ptr(weights), uintptr(len(channelIDs)),
 		threshold, version)
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err
@@ -114,7 +118,7 @@ func ProtectSecret(secretID uint64, secretData []byte, channelIDs []uint64, thre
 
 // ProduceStoreShareRequest builds the wire-encoded DeRecMessage carrying
 // committedShare for storage at channelID, encrypted under sharedKey.
-func ProduceStoreShareRequest(channelID uint64, version uint32, secretID uint64, committedShare []byte, keepList []uint32, description string, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
+func ProduceStoreShareRequest(channelID uint64, version uint32, secretID uint64, committedShare []byte, keepVersion uint32, description string, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
 	produceStoreShareReqOnce.Do(func() {
 		purego.RegisterFunc(&produceStoreShareReqFn, symbol("produce_store_share_request_message"))
 	})
@@ -125,7 +129,7 @@ func ProduceStoreShareRequest(channelID uint64, version uint32, secretID uint64,
 	descriptionBytes := []byte(description)
 	res := produceStoreShareReqFn(channelID, version, secretID,
 		bytePtr(committedShare), uintptr(len(committedShare)),
-		u32Ptr(keepList), uintptr(len(keepList)),
+		keepVersion,
 		bytePtr(descriptionBytes), uintptr(len(descriptionBytes)),
 		bytePtr(sharedKey), uintptr(len(sharedKey)),
 		bytePtr(replyToBytes), uintptr(len(replyToBytes)))

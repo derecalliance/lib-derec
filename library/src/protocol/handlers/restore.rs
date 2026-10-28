@@ -7,7 +7,8 @@
 //! [`DeRecEvent::SecretRecovered`](super::super::DeRecEvent::SecretRecovered)
 //! event and reseats the protocol's `secret_id` namespace from it:
 //! writes canonical helper / replica channel records, commits the
-//! user-secret snapshot, then unpairs every other channel under the
+//! user-secret snapshot with the roster's threshold, then unpairs every
+//! other channel under the
 //! `secret_id` (the recovery-mode channels minted to drive
 //! `start(RecoverSecret)` — scrap after restore commits).
 //!
@@ -94,8 +95,9 @@ pub enum RestoreError {
 /// persisted with their `SharedKey`; canonical replica channels are
 /// persisted with the group key from `secret.replicas.shared_key`; the
 /// user-secret snapshot is committed at `recovered_version`; every
-/// recovery-mode channel under `secret_id` is unpaired
-/// (`UnpairAck::NotRequired`). The returned events are one
+/// recovery-mode channel under `secret_id` is unpaired under the
+/// configured `unpair_ack`, exactly as `start(Unpair)` would. The returned
+/// events are one
 /// [`DeRecEvent::PeerNotRestored`] per roster entry that got no channel,
 /// followed by those of the recovery-channel wipe, and should be drained
 /// into the protocol's `pending_start_events`.
@@ -103,8 +105,10 @@ pub enum RestoreError {
 /// # Verification after a restore
 ///
 /// No owner-side tracking [`crate::protocol::types::Share`] is written,
-/// so `start(VerifyShares)` at `recovered_version` reports
-/// [`crate::Error::InvalidInput`] — this device holds no reference bytes
+/// so `start(VerifyShares)` at `recovered_version` sends no challenge and
+/// reports each channel as `VerifySharesFailed` with
+/// [`crate::protocol::VerifyFailureReason::NoProof`] — this device holds no
+/// reference bytes
 /// for that version and cannot check a proof against it. That is a
 /// property of recovery, not a defect: a `VerifyShare` proof is
 /// `SHA-384(share ‖ nonce)` over the *exact* bytes a Helper holds, and
@@ -148,8 +152,8 @@ pub enum RestoreError {
 /// 1. **Preconditions.** Validate the protocol can restore and plan
 ///    every write the rest of the flow makes.
 ///    [`RestoreError::AlreadyRestored`] when a snapshot is already
-///    committed, [`RestoreError::Invariant`] when a key is mis-sized or a
-///    member's role is unknown, [`crate::Error::InvalidInput`] when a
+///    committed, [`RestoreError::Invariant`] when a key is mis-sized, a
+///    member's role is unknown or the threshold is below `2`, [`crate::Error::InvalidInput`] when a
 ///    member's `replica_id` is the reserved `0`, and
 ///    [`RestoreError::Conflict`] when an existing channel sits at an id
 ///    restore is about to write. All are reported before any store
@@ -170,22 +174,21 @@ pub enum RestoreError {
 ///    `replica_id` still has none after restore and cannot publish as a
 ///    replica until the application configures one.
 /// 4. **Commit.** Write the user-secret snapshot at
-///    `recovered_version`. This write is the commit point — nothing is
-///    removed before it succeeds, so any earlier failure is fully
-///    retryable.
-/// 5. **Wipe.** Send unpair requests to every channel at no roster id —
-///    the recovery-mode channels minted to drive `start(RecoverSecret)` —
-///    and drop their local state.
-///
-///    `UnpairAck::NotRequired` is forced here, deliberately, and does
-///    not follow the protocol's configured ack mode. Waiting on an
-///    acknowledgement would keep the ephemeral channels alive for up to
-///    the unpair timeout, and those channels are indistinguishable from
-///    the canonical ones to
-///    [`sharing`](super::sharing) — which selects purely on
-///    `peer_role == Helper && status == Paired` — so a subsequent
-///    `ProtectSecret` would double-send to every helper. The ephemeral
-///    channels must be gone by the time this call returns.
+///    `recovered_version`, carrying the roster's threshold, so the next
+///    publish splits at the `t` the secret was shared under. To change it,
+///    pass `threshold` on `start(ProtectSecret)`. This write is the commit
+///    point — nothing is removed before it succeeds, so any earlier failure
+///    is fully retryable.
+/// 5. **Wipe.** Unpair every channel at no roster id — the recovery-mode
+///    channels minted to drive `start(RecoverSecret)` — under the
+///    configured `unpair_ack`, as `start(Unpair)` does. Under
+///    `UnpairAck::Required` each one is
+///    [`ChannelStatus::Unpairing`](crate::protocol::types::ChannelStatus::Unpairing)
+///    until its helper answers or the acknowledgement window elapses, so
+///    no flow selects it in the meantime: the follow-up `ProtectSecret`
+///    reaches only the restored helpers, and the helper's answer lands on
+///    a channel that still exists. Under `UnpairAck::NotRequired` its
+///    local state is dropped as the request goes out.
 ///
 ///    For the same reason the wipe cannot fail the restore. An old
 ///    helper that has gone away is the expected condition during
@@ -195,14 +198,17 @@ pub enum RestoreError {
 ///    [`RestoreError::AlreadyRestored`] blocking any retry. Instead each
 ///    undeliverable teardown surfaces as
 ///    [`DeRecEvent::UnpairFailed`] and local state is dropped anyway, so
-///    every wiped channel still yields exactly one
-///    [`DeRecEvent::Unpaired`].
+///    every wiped channel yields exactly one [`DeRecEvent::Unpaired`]:
+///    in the returned events when the request could not be sent or no
+///    acknowledgement is required, later from `process` or the timeout
+///    sweep otherwise.
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
 pub(in crate::protocol) async fn restore<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     secret: &Secret,
     recovered_version: u32,
+    unpair_ack: UnpairAck,
 ) -> Result<Vec<DeRecEvent>> {
     let plan = plan_restore(secret)?;
     let existing_channels = check_preconditions(stores, local, &plan).await?;
@@ -217,7 +223,14 @@ pub(in crate::protocol) async fn restore<S: StoreSet>(
 
     let mut events = plan.not_restored;
     events.extend(
-        unpair_recovery_channels(stores, local, &existing_channels, &plan.roster_ids).await,
+        unpair_recovery_channels(
+            stores,
+            local,
+            &existing_channels,
+            &plan.roster_ids,
+            unpair_ack,
+        )
+        .await,
     );
 
     #[cfg(feature = "logging")]
@@ -255,6 +268,9 @@ struct GroupPlan {
 }
 
 fn plan_restore(secret: &Secret) -> Result<RestorePlan> {
+    if secret.threshold.is_some_and(|t| t < 2) {
+        return Err(RestoreError::Invariant("threshold must be at least 2").into());
+    }
     let mut not_restored = Vec::new();
     let mut helpers = Vec::new();
     let mut written_ids = HashSet::new();
@@ -285,6 +301,7 @@ fn plan_restore(secret: &Secret) -> Result<RestorePlan> {
                 status: ChannelStatus::Paired,
                 created_at: now_secs(),
                 peer_role: derec_proto::SenderKind::Helper,
+                weight: h.effective_weight(),
             },
             shared_key,
         ));
@@ -444,6 +461,7 @@ async fn commit_snapshot<S: StoreSet>(
                 secrets: secret.secrets.clone(),
                 description: None,
                 author_replica_id: None,
+                threshold: secret.threshold,
             },
         )
         .await?;
@@ -455,6 +473,7 @@ async fn unpair_recovery_channels<S: StoreSet>(
     local: &Local<'_>,
     existing_channels: &[HelperChannel],
     roster_ids: &HashSet<u64>,
+    unpair_ack: UnpairAck,
 ) -> Vec<DeRecEvent> {
     let recovery_ids: Vec<ChannelId> = existing_channels
         .iter()
@@ -471,16 +490,7 @@ async fn unpair_recovery_channels<S: StoreSet>(
     };
     let mut events = Vec::new();
     for channel_id in recovery_ids {
-        match super::unpairing::start(
-            stores,
-            local,
-            channel_id,
-            None,
-            UnpairAck::NotRequired,
-            now,
-            round,
-        )
-        .await
+        match super::unpairing::start(stores, local, channel_id, None, unpair_ack, now, round).await
         {
             Ok(mut per_channel) => events.append(&mut per_channel),
             Err(e) => {
@@ -514,7 +524,7 @@ mod tests {
     use derec_proto::{SenderKind, TransportProtocol};
     use std::collections::HashMap;
 
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
         InMemUserSecretStore, NoopTransport, StoreRig, run_async,
     };
@@ -540,8 +550,13 @@ mod tests {
     }
 
     fn build_rig(secret_id: u64) -> TestRig {
+        build_rig_with_ack(secret_id, UnpairAck::Required)
+    }
+
+    fn build_rig_with_ack(secret_id: u64, unpair_ack: UnpairAck) -> TestRig {
         let rig = StoreRig::new();
         let protocol = DeRecProtocolBuilder::new(secret_id)
+            .with_unpair_ack(unpair_ack)
             .with_channel_store(rig.channels.clone())
             .with_share_store(rig.shares.clone())
             .with_secret_store(rig.secrets.clone())
@@ -572,6 +587,7 @@ mod tests {
                     }],
                     shared_key: vec![0xAA; 32],
                     communication_info: HashMap::from([("name".to_owned(), "HelperA".to_owned())]),
+                    weight: 1,
                 },
                 HelperInfo {
                     channel_id: 12,
@@ -581,6 +597,7 @@ mod tests {
                     }],
                     shared_key: vec![0xBB; 32],
                     communication_info: HashMap::new(),
+                    weight: 1,
                 },
             ],
             secrets: vec![
@@ -619,10 +636,46 @@ mod tests {
                 ],
                 shared_key: vec![0xCC; 32],
             }),
+            threshold: None,
         }
     }
 
     // ---------------- Happy path ----------------
+
+    /// Each Helper's channel is written with the roster's weight, so the next
+    /// publish gives it the same number of subshares. A protobuf-default `0`
+    /// is a roster written before weights existed and reads as `1`.
+    #[test]
+    fn restore_writes_each_roster_weight_into_the_helper_channel() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2ED;
+            let mut rig = build_rig(secret_id);
+            let mut secret = fixture_secret();
+            secret.helpers[0].weight = 2;
+            secret.helpers[1].weight = 0;
+
+            rig.protocol
+                .restore(&secret, 7)
+                .await
+                .expect("restore succeeds");
+
+            for (hid, expected) in [(11_u64, 2_u32), (12, 1)] {
+                let ch = rig
+                    .channel_store
+                    .load(
+                        secret_id,
+                        ChannelQuery::Helper {
+                            channel_id: ChannelId(hid),
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .and_then(|r| r.as_helper().cloned())
+                    .expect("helper channel persisted");
+                assert_eq!(ch.weight, expected, "helper {hid}");
+            }
+        });
+    }
 
     #[test]
     fn restore_happy_path_persists_canonical_state() {
@@ -1027,6 +1080,7 @@ mod tests {
                     status: ChannelStatus::Paired,
                     created_at: 1,
                     peer_role: SenderKind::Helper,
+                    weight: 1,
                 },
             );
             rig.secret_store.data.lock().unwrap().insert(
@@ -1192,36 +1246,94 @@ mod tests {
 
     // ---------------- Recovery-channel wipe ----------------
 
+    /// Seeds two recovery channels at ids that don't collide with any
+    /// canonical helper or replica id from `fixture_secret`. Each needs a
+    /// SharedKey in `secret_store` so the unpair handler can build the
+    /// encrypted request envelope.
+    fn seed_recovery_channels(rig: &TestRig, secret_id: u64) {
+        for rcid in RECOVERY_IDS {
+            rig.channel_store.helper_rows.lock().unwrap().insert(
+                (secret_id, rcid),
+                HelperChannel {
+                    channel_id: ChannelId(rcid),
+                    transports: vec![TransportProtocol {
+                        uri: format!("https://recovery-{rcid}.example"),
+                        protocol: 0,
+                    }],
+                    communication_info: HashMap::new(),
+                    status: ChannelStatus::Paired,
+                    created_at: 1,
+                    peer_role: SenderKind::Helper,
+                    weight: 1,
+                },
+            );
+            rig.secret_store.data.lock().unwrap().insert(
+                (secret_id, rcid, SecretKind::SharedKey as u8),
+                SecretValue::SharedKey([0x77; 32]),
+            );
+        }
+    }
+
+    const RECOVERY_IDS: [u64; 2] = [99, 100];
+
+    /// Under `UnpairAck::Required` a recovery channel waits for its helper's
+    /// answer like any other unpair: it is `Unpairing`, keeps its key so the
+    /// answer can be read, and no `Unpaired` is reported yet.
+    #[test]
+    fn restore_leaves_recovery_channels_unpairing_until_answered() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EC;
+            let mut rig = build_rig(secret_id);
+            seed_recovery_channels(&rig, secret_id);
+
+            let events = rig
+                .protocol
+                .restore(&fixture_secret(), 7)
+                .await
+                .expect("restore must succeed despite recovery channels");
+
+            for rcid in RECOVERY_IDS {
+                let channel = rig
+                    .channel_store
+                    .load(
+                        secret_id,
+                        ChannelQuery::Helper {
+                            channel_id: ChannelId(rcid),
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .and_then(|record| record.as_helper().cloned())
+                    .expect("the recovery channel stays until its helper answers");
+                assert_eq!(channel.status, ChannelStatus::Unpairing);
+                assert!(
+                    rig.secret_store
+                        .load(secret_id, ChannelId(rcid), SecretKind::SharedKey)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "the key stays, so the helper's answer can be decrypted"
+                );
+                assert!(events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::UnpairStarted { channel_id, .. } if *channel_id == ChannelId(rcid)
+                )));
+            }
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::Unpaired { .. })),
+                "no recovery channel is unpaired before its helper answers, got {events:?}"
+            );
+        });
+    }
+
     #[test]
     fn restore_unpairs_pre_existing_recovery_channels() {
         run_async(async {
             let secret_id: u64 = 0xDE_2EC;
-            let mut rig = build_rig(secret_id);
-
-            // Two recovery channels at ids that don't collide with any
-            // canonical helper or replica id from `fixture_secret`.
-            // Each needs a SharedKey in `secret_store` so the unpair
-            // handler can build the encrypted request envelope.
-            for rcid in [99_u64, 100] {
-                rig.channel_store.helper_rows.lock().unwrap().insert(
-                    (secret_id, rcid),
-                    HelperChannel {
-                        channel_id: ChannelId(rcid),
-                        transports: vec![TransportProtocol {
-                            uri: format!("https://recovery-{rcid}.example"),
-                            protocol: 0,
-                        }],
-                        communication_info: HashMap::new(),
-                        status: ChannelStatus::Paired,
-                        created_at: 1,
-                        peer_role: SenderKind::Helper,
-                    },
-                );
-                rig.secret_store.data.lock().unwrap().insert(
-                    (secret_id, rcid, SecretKind::SharedKey as u8),
-                    SecretValue::SharedKey([0x77; 32]),
-                );
-            }
+            let mut rig = build_rig_with_ack(secret_id, UnpairAck::NotRequired);
+            seed_recovery_channels(&rig, secret_id);
 
             rig.protocol
                 .restore(&fixture_secret(), 7)
@@ -1229,7 +1341,7 @@ mod tests {
                 .expect("restore must succeed despite recovery channels");
 
             // Recovery channels and their SharedKeys are gone.
-            for rcid in [99_u64, 100] {
+            for rcid in RECOVERY_IDS {
                 assert!(
                     rig.channel_store
                         .load(
@@ -1281,7 +1393,7 @@ mod tests {
                 .with_share_store(rig.shares.clone())
                 .with_secret_store(rig.secrets.clone())
                 .with_user_secret_store(rig.user_secrets.clone())
-                .with_transport(crate::protocol::test::FailingTransport)
+                .with_transport(crate::protocol::tests::FailingTransport)
                 .with_state_store(InMemStateStore)
                 .with_own_transports(["https://owner.example.com"])
                 .with_threshold(2)
@@ -1300,6 +1412,7 @@ mod tests {
                     status: ChannelStatus::Paired,
                     created_at: 1,
                     peer_role: SenderKind::Helper,
+                    weight: 1,
                 },
             );
             rig.secrets.data.lock().unwrap().insert(
@@ -1397,6 +1510,8 @@ mod tests {
                 .start(crate::protocol::DeRecFlow::ProtectSecret {
                     secrets: secret.secrets.clone(),
                     description: None,
+                    weights: std::collections::HashMap::new(),
+                    threshold: None,
                 })
                 .await
                 .expect("a restored owner must be able to publish again");
@@ -1429,6 +1544,175 @@ mod tests {
         });
     }
 
+    /// Seed a paired Helper channel the way a completed pairing leaves it.
+    async fn seed_paired_helper(rig: &mut TestRig, secret_id: u64, channel: u64) {
+        rig.channel_store
+            .save(
+                secret_id,
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id: ChannelId(channel),
+                    transports: vec![TransportProtocol {
+                        uri: format!("https://helper-{channel}.example"),
+                        protocol: derec_proto::Protocol::Https as i32,
+                    }],
+                    communication_info: HashMap::new(),
+                    status: ChannelStatus::Paired,
+                    created_at: 0,
+                    peer_role: SenderKind::Helper,
+                    weight: 1,
+                }),
+            )
+            .await
+            .expect("seed helper");
+        rig.secret_store
+            .save(
+                secret_id,
+                ChannelId(channel),
+                SecretValue::SharedKey([channel as u8; 32]),
+            )
+            .await
+            .expect("seed key");
+    }
+
+    async fn publish_after_pairing(rig: &mut TestRig, channel: u64) {
+        rig.protocol
+            .maybe_auto_publish_after_pair(&[DeRecEvent::PairingCompleted {
+                channel_id: ChannelId(channel),
+                pairing_channel_id: ChannelId(channel),
+                kind: SenderKind::Owner,
+                peer_communication_info: HashMap::new(),
+            }])
+            .await
+            .expect("the pairing publish runs");
+    }
+
+    async fn recorded_threshold(
+        rig: &TestRig,
+        secret_id: u64,
+        channel: u64,
+        version: u32,
+    ) -> Option<u32> {
+        rig.share_store
+            .load(secret_id, ChannelId(channel), &[version])
+            .await
+            .unwrap()
+            .first()
+            .unwrap_or_else(|| panic!("no owner row for {channel} at v{version}"))
+            .threshold
+    }
+
+    async fn stored_threshold(rig: &TestRig, secret_id: u64) -> Option<u32> {
+        rig.user_secret_store
+            .load_latest(secret_id)
+            .await
+            .unwrap()
+            .expect("snapshot committed")
+            .threshold
+    }
+
+    /// The roster's threshold is put back, so a device whose builder says 2
+    /// keeps splitting at the 3 the secret was shared under, including in
+    /// the publishes the library starts itself. An explicit threshold then
+    /// replaces it.
+    #[test]
+    fn restore_puts_the_rosters_threshold_back() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EE;
+            let mut rig = build_rig(secret_id);
+            let secret = Secret {
+                replicas: None,
+                threshold: Some(3),
+                ..fixture_secret()
+            };
+
+            rig.protocol
+                .restore(&secret, 4)
+                .await
+                .expect("restore succeeds");
+            assert_eq!(stored_threshold(&rig, secret_id).await, Some(3));
+
+            seed_paired_helper(&mut rig, secret_id, 13).await;
+            publish_after_pairing(&mut rig, 13).await;
+            for hid in [11, 12, 13] {
+                assert_eq!(recorded_threshold(&rig, secret_id, hid, 5).await, Some(3));
+            }
+
+            seed_paired_helper(&mut rig, secret_id, 14).await;
+            publish_after_pairing(&mut rig, 14).await;
+            assert_eq!(recorded_threshold(&rig, secret_id, 14, 6).await, Some(3));
+
+            rig.protocol
+                .start(crate::protocol::DeRecFlow::ProtectSecret {
+                    secrets: secret.secrets.clone(),
+                    description: None,
+                    weights: HashMap::new(),
+                    threshold: Some(4),
+                })
+                .await
+                .expect("an explicit threshold publishes");
+            for hid in [11, 12, 13, 14] {
+                assert_eq!(recorded_threshold(&rig, secret_id, hid, 7).await, Some(4));
+            }
+            assert_eq!(stored_threshold(&rig, secret_id).await, Some(4));
+        });
+    }
+
+    /// A roster that records no threshold restores none, and the builder's
+    /// threshold applies to the next publish.
+    #[test]
+    fn a_roster_without_a_threshold_restores_none() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EF;
+            let mut rig = build_rig(secret_id);
+            let secret = Secret {
+                replicas: None,
+                ..fixture_secret()
+            };
+
+            rig.protocol
+                .restore(&secret, 4)
+                .await
+                .expect("restore succeeds");
+            assert_eq!(stored_threshold(&rig, secret_id).await, None);
+
+            seed_paired_helper(&mut rig, secret_id, 13).await;
+            publish_after_pairing(&mut rig, 13).await;
+            assert_eq!(recorded_threshold(&rig, secret_id, 11, 5).await, Some(2));
+        });
+    }
+
+    /// A threshold below 2 is an inconsistent `Secret`, refused before any
+    /// write.
+    #[test]
+    fn a_roster_threshold_below_two_is_refused_before_any_write() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2F0;
+            let mut rig = build_rig(secret_id);
+            let secret = Secret {
+                replicas: None,
+                threshold: Some(1),
+                ..fixture_secret()
+            };
+
+            let err = rig
+                .protocol
+                .restore(&secret, 4)
+                .await
+                .expect_err("a threshold of 1 is malformed");
+            assert!(
+                matches!(err, crate::Error::Restore(RestoreError::Invariant(_))),
+                "got {err:?}"
+            );
+            assert!(
+                rig.user_secret_store
+                    .load_latest(secret_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
     #[test]
     fn restore_returns_already_restored_when_snapshot_exists() {
         run_async(async {
@@ -1441,6 +1725,7 @@ mod tests {
                     secrets: Vec::new(),
                     description: None,
                     author_replica_id: None,
+                    threshold: None,
                 },
             );
 
@@ -1488,6 +1773,7 @@ mod tests {
                     status: ChannelStatus::Paired,
                     created_at: 1,
                     peer_role: SenderKind::Helper,
+                    weight: 1,
                 },
             );
 

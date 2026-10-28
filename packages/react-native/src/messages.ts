@@ -26,9 +26,9 @@
  *     surface.
  *
  * Both conversions are keyed by field name, matching the lists in
- * `message_json.rs`. A name-keyed walk is deliberate: `keep_list` is a
- * genuine `number[]` and must stay one, so a structural "array of numbers is
- * bytes" rule would corrupt it.
+ * `message_json.rs`. A name-keyed walk is deliberate: only the fields that
+ * file names change representation, so a structural "array of numbers is
+ * bytes" rule cannot corrupt a field that is not bytes.
  */
 
 import { jsonFromBytes, jsonToBytes } from './codec';
@@ -93,6 +93,8 @@ const BYTE_FIELDS = new Set([
   'mlkem_encapsulation_key',
   'ecies_public_key',
   'contact_binding_hash',
+  'fingerprint_commitment',
+  'fingerprint_nonce',
   'bytes_value',
   'share',
   'committed_de_rec_share',

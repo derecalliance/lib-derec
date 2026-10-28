@@ -4,6 +4,7 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 
@@ -309,6 +310,20 @@ func TestDecodeEvents_ShareRejected(t *testing.T) {
 	}
 }
 
+func TestDecodeEvents_ShareRefused(t *testing.T) {
+	ev := decodeOne(t, `{
+		"type": "ShareRefused",
+		"channel_id": "18446744073709551615",
+		"version": 2,
+		"status": 8,
+		"memo": "CommittedDeRecShare Merkle proof verification failed"
+	}`)
+	if ev.Type != EventTypeShareRefused || ev.ChannelID != ^uint64(0) || ev.Version == nil || *ev.Version != 2 ||
+		ev.Status != derecpb.StatusEnum_VERIFICATION_FAILED || ev.Memo != "CommittedDeRecShare Merkle proof verification failed" {
+		t.Fatalf("got %+v", ev)
+	}
+}
+
 func TestDecodeEvents_SharingComplete(t *testing.T) {
 	ev := decodeOne(t, `{
 		"type": "SharingComplete",
@@ -332,6 +347,34 @@ func TestDecodeEvents_SharingComplete(t *testing.T) {
 func TestDecodeEvents_ShareVerified(t *testing.T) {
 	ev := decodeOne(t, `{"type": "ShareVerified", "channel_id": "11", "version": 2}`)
 	if ev.Type != EventTypeShareVerified || ev.ChannelID != 11 || ev.Version == nil || *ev.Version != 2 {
+		t.Fatalf("got %+v", ev)
+	}
+	if ev.Subshares != nil {
+		t.Fatalf("an absent count must decode as nil, got %d", *ev.Subshares)
+	}
+}
+
+func TestDecodeEvents_ShareVerifiedCarriesSubshares(t *testing.T) {
+	ev := decodeOne(t, `{"type": "ShareVerified", "channel_id": "11", "version": 2, "subshares": 3}`)
+	if ev.Subshares == nil || *ev.Subshares != 3 {
+		t.Fatalf("got %+v", ev)
+	}
+}
+
+func TestDecodeEvents_ShareVerifiedCarriesThreshold(t *testing.T) {
+	ev := decodeOne(t, `{"type": "ShareVerified", "channel_id": "11", "version": 2, "subshares": 1, "threshold": 3}`)
+	if ev.Threshold == nil || *ev.Threshold != 3 {
+		t.Fatalf("got %+v", ev)
+	}
+	ev = decodeOne(t, `{"type": "ShareVerified", "channel_id": "11", "version": 2}`)
+	if ev.Threshold != nil {
+		t.Fatalf("an absent threshold must decode as nil, got %d", *ev.Threshold)
+	}
+}
+
+func TestDecodeEvents_ShareVerifyInvalid(t *testing.T) {
+	ev := decodeOne(t, `{"type": "ShareVerifyInvalid", "channel_id": "11", "version": 2}`)
+	if ev.Type != EventTypeShareVerifyInvalid || ev.ChannelID != 11 || ev.Version == nil || *ev.Version != 2 {
 		t.Fatalf("got %+v", ev)
 	}
 }
@@ -456,6 +499,23 @@ func TestDecodeEvents_ReplicaSyncRejected(t *testing.T) {
 	}
 }
 
+func TestDecodeEvents_ReplicaSecretRefused(t *testing.T) {
+	ev := decodeOne(t, `{
+		"type": "ReplicaSecretRefused",
+		"channel_id": "18446744073709551615",
+		"from_replica_id": "7",
+		"secret_id": "42",
+		"version": 3,
+		"status": 8,
+		"memo": "CommittedDeRecShare Merkle proof verification failed"
+	}`)
+	if ev.Type != EventTypeReplicaSecretRefused || ev.ChannelID != ^uint64(0) || ev.FromReplicaID != 7 ||
+		ev.SecretID != 42 || ev.Version == nil || *ev.Version != 3 ||
+		ev.Status != derecpb.StatusEnum_VERIFICATION_FAILED || ev.Memo != "CommittedDeRecShare Merkle proof verification failed" {
+		t.Fatalf("got %+v", ev)
+	}
+}
+
 func TestDecodeEvents_Unpaired(t *testing.T) {
 	ev := decodeOne(t, `{"type": "Unpaired", "channel_id": "11"}`)
 	if ev.Type != EventTypeUnpaired || ev.ChannelID != 11 {
@@ -473,6 +533,51 @@ func TestDecodeEvents_UnpairRejected(t *testing.T) {
 func TestDecodeEvents_PrePairRejected(t *testing.T) {
 	ev := decodeOne(t, `{"type": "PrePairRejected", "channel_id": "11", "status": 3, "memo": "no"}`)
 	if ev.Type != EventTypePrePairRejected || ev.Status != derecpb.StatusEnum_SIZE_LIMIT_EXCEEDED || ev.Memo != "no" {
+		t.Fatalf("got %+v", ev)
+	}
+}
+
+func TestDecodeEvents_ErrorResponseReceived(t *testing.T) {
+	ev := decodeOne(t, `{"type": "ErrorResponseReceived", "channel_id": "18446744073709551615", "status": 9, "memo": "message body could not be decoded"}`)
+	if ev.Type != EventTypeErrorResponseReceived || ev.ChannelID != ^uint64(0) ||
+		ev.Status != derecpb.StatusEnum_FORMAT_ERROR || ev.Memo != "message body could not be decoded" {
+		t.Fatalf("got %+v", ev)
+	}
+}
+
+func TestDecodeEvents_PairingRefused(t *testing.T) {
+	ev := decodeOne(t, `{"type": "PairingRefused", "channel_id": "18446744073709551615", "status": 14, "memo": "replica id in use",
+		"error_code": "replica_id_conflict", "message": "replica id 7 is already in use by another member of the group"}`)
+	if ev.Type != EventTypePairingRefused || ev.ChannelID != ^uint64(0) ||
+		ev.Status != derecpb.StatusEnum_REPLICA_ID_CONFLICT || ev.Memo != "replica id in use" ||
+		ev.ErrorCode != "replica_id_conflict" ||
+		ev.Message != "replica id 7 is already in use by another member of the group" {
+		t.Fatalf("got %+v", ev)
+	}
+}
+
+// An unanswered RequestFailed carries the token in `action` as the same
+// opaque bytes ActionRequired uses, and its request kind in `action_kind`.
+func TestDecodeEvents_RequestFailed_Unanswered(t *testing.T) {
+	ev := decodeOne(t, `{"type": "RequestFailed", "channel_id": "18446744073709551615", "action_kind": "StoreShare",
+		"responded": false, "status": 2, "memo": "request could not be processed", "error_code": "store_error", "message": "backend unavailable",
+		"action": [1, 2, 255]}`)
+	if ev.Type != EventTypeRequestFailed || ev.ChannelID != ^uint64(0) ||
+		ev.ActionKind != ActionKindStoreShare || ev.Responded ||
+		ev.Status != derecpb.StatusEnum_FAIL || ev.Memo != "request could not be processed" ||
+		ev.ErrorCode != "store_error" || ev.Message != "backend unavailable" ||
+		string(ev.Action) != string([]byte{1, 2, 255}) {
+		t.Fatalf("got %+v", ev)
+	}
+}
+
+// An answered RequestFailed omits the token and carries the status it was
+// answered with.
+func TestDecodeEvents_RequestFailed_Answered(t *testing.T) {
+	ev := decodeOne(t, `{"type": "RequestFailed", "channel_id": "4", "action_kind": "Failed", "responded": true,
+		"status": 9, "memo": "message body could not be decoded", "error_code": "internal", "message": "cause"}`)
+	if ev.Type != EventTypeRequestFailed || ev.ActionKind != ActionKindFailed || !ev.Responded ||
+		ev.Status != derecpb.StatusEnum_FORMAT_ERROR || ev.Memo != "message body could not be decoded" || ev.Action != nil {
 		t.Fatalf("got %+v", ev)
 	}
 }
@@ -723,7 +828,7 @@ func TestDecodeEvents_NoOp(t *testing.T) {
 
 func TestDecodeEvents_PairingStarted(t *testing.T) {
 	ev := decodeOne(t, `{"type": "PairingStarted", "channel_id": "11", "kind": 0}`)
-	if ev.Type != EventTypePairingStarted || ev.ChannelID != 11 || ev.Kind != 0 {
+	if ev.Type != EventTypePairingStarted || ev.ChannelID != 11 {
 		t.Fatalf("got %+v", ev)
 	}
 }
@@ -743,16 +848,32 @@ func TestDecodeEvents_DiscoveryFailed(t *testing.T) {
 }
 
 func TestDecodeEvents_ProtectSecretStarted(t *testing.T) {
-	ev := decodeOne(t, `{"type": "ProtectSecretStarted", "channel_id": "11", "version": 1}`)
+	ev := decodeOne(t, `{"type": "ProtectSecretStarted", "channel_id": "11", "version": 1, "weight": 2}`)
 	if ev.Type != EventTypeProtectSecretStarted || ev.Version == nil || *ev.Version != 1 {
 		t.Fatalf("got %+v", ev)
+	}
+	if ev.Weight == nil || *ev.Weight != 2 {
+		t.Fatalf("Weight: got %v", ev.Weight)
 	}
 }
 
 func TestDecodeEvents_ProtectSecretFailed(t *testing.T) {
-	ev := decodeOne(t, `{"type": "ProtectSecretFailed", "channel_id": "11", "version": 1, "error": "send failed"}`)
+	ev := decodeOne(t, `{"type": "ProtectSecretFailed", "channel_id": "11", "version": 1, "error": "send failed", "weight": 3}`)
 	if ev.Type != EventTypeProtectSecretFailed || ev.Error != "send failed" {
 		t.Fatalf("got %+v", ev)
+	}
+	if ev.Weight == nil || *ev.Weight != 3 {
+		t.Fatalf("Weight: got %v", ev.Weight)
+	}
+}
+
+// TestDecodeEvents_ProtectSecretStarted_WeightAbsentOnOtherVariants proves
+// Weight stays nil on a variant that does not carry it, rather than
+// decoding to the ambiguous zero value.
+func TestDecodeEvents_ProtectSecretStarted_WeightAbsentOnOtherVariants(t *testing.T) {
+	ev := decodeOne(t, `{"type": "ShareStored", "channel_id": "11", "version": 1}`)
+	if ev.Weight != nil {
+		t.Fatalf("expected nil Weight, got %v", *ev.Weight)
 	}
 }
 
@@ -764,8 +885,8 @@ func TestDecodeEvents_VerifySharesStarted(t *testing.T) {
 }
 
 func TestDecodeEvents_VerifySharesFailed(t *testing.T) {
-	ev := decodeOne(t, `{"type": "VerifySharesFailed", "channel_id": "11", "version": 1, "error": "timeout"}`)
-	if ev.Type != EventTypeVerifySharesFailed || ev.Error != "timeout" {
+	ev := decodeOne(t, `{"type": "VerifySharesFailed", "channel_id": "11", "version": 1, "reason": "NoProof", "error": "timeout"}`)
+	if ev.Type != EventTypeVerifySharesFailed || ev.Reason != VerifyFailureReasonNoProof || ev.Error != "timeout" {
 		t.Fatalf("got %+v", ev)
 	}
 }
@@ -921,6 +1042,67 @@ func TestDecodeEvents_IDsAboveFloat64Precision_RoundTripToRestore(t *testing.T) 
 	if rs.Helpers[0].ChannelID != max || rs.Replicas.ChannelID != above53 ||
 		rs.Replicas.Members[0].ReplicaID != max || rs.Replicas.Members[0].Role != "Source" {
 		t.Fatalf("restore params do not carry the decimal ids verbatim: %s", got)
+	}
+}
+
+// The recovered roster names each helper's weight, and Restore's params hand
+// it back so the restored channels keep it.
+func TestDecodeEvents_SecretRecoveredHelperWeight_RoundTripsToRestore(t *testing.T) {
+	ev := decodeOne(t, `{
+		"type": "SecretRecovered",
+		"secret": {
+			"helpers": [{"channel_id": "1", "transports": [], "shared_key": [1], "weight": 3}],
+			"secrets": []
+		}
+	}`)
+	if ev.Secret.Helpers[0].Weight != 3 {
+		t.Fatalf("Weight = %d, want 3", ev.Secret.Helpers[0].Weight)
+	}
+	got, err := json.Marshal(restoreParamsWire{Version: 1, RecoveredSecret: *ev.Secret})
+	if err != nil {
+		t.Fatalf("marshal restore params: %v", err)
+	}
+	if !bytes.Contains(got, []byte(`"weight":3`)) {
+		t.Fatalf("restore params must carry the weight: %s", got)
+	}
+}
+
+// A roster entry built without a Weight leaves the key out, so restore reads
+// it as 1 rather than refusing a weight of 0.
+func TestHelper_UnsetWeightIsOmittedFromRestoreParams(t *testing.T) {
+	got, err := json.Marshal(Helper{ChannelID: 1, SharedKey: []byte{1}})
+	if err != nil {
+		t.Fatalf("marshal helper: %v", err)
+	}
+	if bytes.Contains(got, []byte(`"weight"`)) {
+		t.Fatalf("an unset weight must be omitted: %s", got)
+	}
+}
+
+// The recovered roster names its threshold, and Restore's params hand it back
+// so the restored snapshot keeps it. A roster without one omits it.
+func TestDecodeEvents_SecretRecoveredThreshold_RoundTripsToRestore(t *testing.T) {
+	ev := decodeOne(t, `{
+		"type": "SecretRecovered",
+		"secret": {"helpers": [], "secrets": [], "threshold": 3}
+	}`)
+	if ev.Secret.Threshold == nil || *ev.Secret.Threshold != 3 {
+		t.Fatalf("Threshold = %v, want 3", ev.Secret.Threshold)
+	}
+	got, err := json.Marshal(restoreParamsWire{Version: 1, RecoveredSecret: *ev.Secret})
+	if err != nil {
+		t.Fatalf("marshal restore params: %v", err)
+	}
+	if !bytes.Contains(got, []byte(`"threshold":3`)) {
+		t.Fatalf("restore params must carry the threshold: %s", got)
+	}
+	ev = decodeOne(t, `{"type": "SecretRecovered", "secret": {"helpers": [], "secrets": []}}`)
+	got, err = json.Marshal(restoreParamsWire{Version: 1, RecoveredSecret: *ev.Secret})
+	if err != nil {
+		t.Fatalf("marshal restore params: %v", err)
+	}
+	if bytes.Contains(got, []byte("threshold")) {
+		t.Fatalf("a roster without a threshold must not send one: %s", got)
 	}
 }
 

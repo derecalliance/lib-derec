@@ -25,26 +25,25 @@ package org.derecalliance.derec.protobuf;
 // The Owner sends this message to each Helper to:
 //
 // - store (or replace) a specific share version
-// - update the set of versions that must be retained (keepList)
+// - name the one older version that must be retained (keepVersion)
 //
 // # Semantics
 //
-// This message may carry two independent instructions:
+// This message carries two instructions:
 //
 // 1. Share storage/update:
 //    - If `share` is present, the Helper MUST store this share under the
 //      specified `version`
 //    - If the version already exists, the Helper MUST replace it
 //
-// 2. Retention policy update:
-//    - If `keepList` is present, it defines the complete set of versions
-//      that MUST be retained
-//    - Any stored version not in `keepList` SHOULD be deleted
+// 2. Retention:
+//    - Once the share is stored, the Helper MUST delete every version it
+//      holds for this secret on this channel other than `version` and
+//      `keepVersion`
+//    - `keepVersion = 0` retains no version other than `version`
 //
-// If `keepList` is absent:
-//
-// - The Helper MUST preserve the existing keepList
-// - The Helper MUST add the new `version` to the retained set
+// A Helper therefore holds at most two versions of a secret: the one being
+// shared and the last version the Owner considers valid.
 //
 // # Consistency Requirements
 //
@@ -60,7 +59,7 @@ package org.derecalliance.derec.protobuf;
 // To prevent replay attacks:
 //
 // - If `version` is less than the latest stored version,
-//  the Helper MUST ignore the `keepList` field
+//  the Helper MUST ignore the `keepVersion` field
 //
 // This ensures that stale messages cannot cause deletion of newer shares.
 //
@@ -74,7 +73,7 @@ package org.derecalliance.derec.protobuf;
 // This message is idempotent:
 //
 // - Re-sending the same (version, share) pair SHOULD result in the same state
-// - Re-applying the same keepList SHOULD not change state after the first time
+// - Re-applying the same keepVersion SHOULD not change state after the first time
 message StoreShareRequestMessage {
 
   // Share bytes to be stored by the Helper.
@@ -106,18 +105,18 @@ message StoreShareRequestMessage {
   // Each resharing event increments this value.
   uint32 version = 4;
 
-  // List of share versions that MUST be retained by the Helper.
+  // The one version, other than `version`, that the Helper MUST retain.
   //
-  // Any stored version not included in this list SHOULD be deleted.
+  // The Owner sets it to the last version it considers valid, which is never
+  // the version being shared. Every other stored version MUST be deleted
+  // once the share is stored. `0` retains no other version.
   //
-  // If absent, the Helper MUST:
-  //
-  // - retain the existing keepList
-  // - add the current `version` to the retained set
+  // A value equal to or greater than `version` is invalid: the Helper MUST
+  // reject the request and store nothing.
   //
   // This field MUST be ignored if `version` is older than the latest
   // version already stored, to prevent replay attacks.
-  repeated uint32 keepList = 5;
+  uint32 keepVersion = 5;
 
   // Optional human-readable description of this share version.
   //
@@ -196,7 +195,7 @@ message StoreShareRequestMessage {
 // This message indicates whether the Helper successfully:
 //
 // - stored or updated the requested share version
-// - applied the retention policy (keepList)
+// - applied the retention policy (keepVersion)
 //
 // # Idempotency
 //

@@ -65,9 +65,18 @@ static void absentAuthorStaysAbsent() {
   expect(back.find("description") == std::string::npos, "no description is invented: " + back);
 }
 
+static void thresholdRoundTrips() {
+  std::string back = roundTrip("{\"version\":1,\"secrets\":[],\"threshold\":3}");
+  expect(back.find("\"threshold\":3") != std::string::npos,
+         "threshold survives save -> load verbatim: " + back);
+  back = roundTrip("{\"version\":1,\"secrets\":[]}");
+  expect(back.find("threshold") == std::string::npos, "no threshold is invented: " + back);
+}
+
 int main() {
   derec::testing::run("authorReplicaIdRoundTrips", authorReplicaIdRoundTrips);
   derec::testing::run("storeSeesAuthorReplicaIdAsString", storeSeesAuthorReplicaIdAsString);
   derec::testing::run("absentAuthorStaysAbsent", absentAuthorStaysAbsent);
+  derec::testing::run("thresholdRoundTrips", thresholdRoundTrips);
   return derec::testing::summary();
 }

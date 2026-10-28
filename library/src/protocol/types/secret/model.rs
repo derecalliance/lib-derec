@@ -66,6 +66,26 @@ pub struct HelperInfo {
     #[prost(map = "string, string", tag = "5")]
     pub communication_info:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// The number of Shamir subshares this Helper received in the round that
+    /// wrote this roster, copied from
+    /// [`crate::protocol::types::HelperChannel::weight`]. Restore and replica
+    /// hydration write it back into the channel record, so the next publish
+    /// on the recovering or receiving device gives the Helper the same count.
+    ///
+    /// In the recoverable JSON encoding it is `weight`, omitted when `1`; an
+    /// absent key decodes as `1` and a `0` is malformed. In the protobuf form
+    /// carried by the replica-sync message, `0` means the writer predates this
+    /// field and is read as `1`.
+    #[prost(uint32, tag = "7")]
+    pub weight: u32,
+}
+
+impl HelperInfo {
+    /// The weight this entry stands for: [`HelperInfo::weight`], with the
+    /// protobuf default `0` of a writer that predates the field read as `1`.
+    pub(crate) fn effective_weight(&self) -> u32 {
+        self.weight.max(1)
+    }
 }
 
 /// A single user-facing secret within the [`Secret`].
@@ -150,6 +170,19 @@ pub struct Secret {
     /// replica setup. See [`Replicas`] for field semantics.
     #[prost(message, optional, tag = "3")]
     pub replicas: ::core::option::Option<Replicas>,
+    /// The threshold `t` this version was split with: the number of distinct
+    /// subshares that reconstruct it.
+    ///
+    /// Restore and replica hydration write it into the
+    /// [`UserSecrets`](crate::protocol::types::UserSecrets) snapshot, so the
+    /// next publish on the recovering or receiving device splits at the same
+    /// `t`. `None` on a roster written before the threshold was recorded; the
+    /// device's builder threshold then applies.
+    ///
+    /// In the recoverable JSON encoding it is `threshold`, omitted when
+    /// `None`; a value below `2` is malformed.
+    #[prost(uint32, optional, tag = "4")]
+    pub threshold: ::core::option::Option<u32>,
 }
 
 /// The replica group carried inside [`Secret`] — the full member roster plus
@@ -215,6 +248,7 @@ impl fmt::Debug for HelperInfo {
             .field("transports", &self.transports)
             .field("shared_key", &Redacted(&self.shared_key))
             .field("communication_info", &self.communication_info)
+            .field("weight", &self.weight)
             .finish()
     }
 }
@@ -280,6 +314,7 @@ mod redaction_tests {
             }],
             shared_key: KEY.to_vec(),
             communication_info: Default::default(),
+            weight: 1,
         };
         let out = rendered(&helper);
         assert!(!out.contains(&decimal_rendering(&KEY)), "{out}");
@@ -310,6 +345,7 @@ mod redaction_tests {
                 }],
                 shared_key: KEY.to_vec(),
                 communication_info: Default::default(),
+                weight: 1,
             }],
             secrets: vec![user_secret()],
             replicas: Some(Replicas {
@@ -317,6 +353,7 @@ mod redaction_tests {
                 shared_key: KEY.to_vec(),
                 channel_id: 9,
             }),
+            threshold: None,
         };
 
         let out = rendered(&secret);

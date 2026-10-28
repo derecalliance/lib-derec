@@ -97,7 +97,7 @@ pub struct RecoverResult {
 /// use derec_library::primitives::{recovery, sharing};
 /// use derec_library::types::ChannelId;
 ///
-/// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
+/// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
 /// let shared_key = [42u8; 32];
 /// let channel_id = ChannelId(1);
 ///
@@ -107,7 +107,7 @@ pub struct RecoverResult {
 ///         .expect("split failed");
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 /// let sharing::request::ProduceResult { envelope: share_envelope } =
-///     sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
+///     sharing::request::produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
 ///         .expect("share produce failed");
 /// let sharing::request::ExtractResult { request: stored_share_request } =
 ///     sharing::request::extract(&share_envelope, &shared_key).expect("share extract failed");
@@ -219,7 +219,7 @@ pub fn produce(
 /// use derec_library::primitives::{recovery, sharing};
 /// use derec_library::types::ChannelId;
 ///
-/// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
+/// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
 /// let shared_key = [42u8; 32];
 /// let channel_id = ChannelId(1);
 ///
@@ -229,7 +229,7 @@ pub fn produce(
 ///         .expect("split failed");
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 /// let sharing::request::ProduceResult { envelope: share_envelope } =
-///     sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
+///     sharing::request::produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
 ///         .expect("share produce failed");
 /// let sharing::request::ExtractResult { request: stored_share_request } =
 ///     sharing::request::extract(&share_envelope, &shared_key).expect("share extract failed");
@@ -334,19 +334,20 @@ pub fn extract(
 /// use derec_library::primitives::recovery::response::RecoverResult;
 /// use derec_library::types::ChannelId;
 ///
-/// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
+/// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
 /// let shared_key = [42u8; 32];
 /// let secret_data = b"super_secret_value";
 ///
 /// // Sharing flow: store one share per Helper for later recovery.
 /// let sharing::request::SplitResult { shares } =
-///     sharing::request::split(&channels, 1, 1, secret_data, 2).expect("split failed");
+///     sharing::request::split(&channels, 1, 1, secret_data, 2)
+///         .expect("split failed");
 ///
 /// let mut stored_shares = Vec::new();
-/// for &channel_id in &channels[..2] {
+/// for &(channel_id, _) in &channels[..2] {
 ///     let committed_share = shares.get(&channel_id).expect("missing share");
 ///     let sharing::request::ProduceResult { envelope } =
-///         sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
+///         sharing::request::produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
 ///             .expect("share produce failed");
 ///     let sharing::request::ExtractResult { request } =
 ///         sharing::request::extract(&envelope, &shared_key).expect("share extract failed");
@@ -443,8 +444,7 @@ pub(crate) fn extract_share_from_response(
     derec_share.validate(secret_id, version)?;
 
     Ok(vss::VSSShare {
-        x: derec_share.x,
-        y: derec_share.y,
+        subshares: crate::extensions::derec_share::into_vss_subshares(derec_share.subshares),
         encrypted_secret: derec_share.encrypted_secret,
         commitment: committed_derec_share.commitment,
         merkle_path: committed_derec_share

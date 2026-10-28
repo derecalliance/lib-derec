@@ -71,6 +71,7 @@ import type {
   UnpairingProcessResult,
   VerifyShareRequestMessage,
   VerifyShareResponseMessage,
+  WeightedChannel,
 } from './types';
 
 /** Shape of the `__DeRec` host object: every member is a plain callable, since
@@ -459,11 +460,13 @@ const pairing = {
         mlkem_encapsulation_key: ArrayBuffer;
         ecies_public_key: ArrayBuffer;
         nonce: bigint;
+        fingerprint_commitment: ArrayBuffer;
       };
       return {
         mlkem_encapsulation_key: bytes(result.mlkem_encapsulation_key),
         ecies_public_key: bytes(result.ecies_public_key),
         nonce: result.nonce,
+        fingerprint_commitment: bytes(result.fingerprint_commitment),
       };
     },
 
@@ -494,11 +497,13 @@ const pairing = {
         mlkem_encapsulation_key: ArrayBuffer;
         ecies_public_key: ArrayBuffer;
         nonce: bigint;
+        fingerprint_commitment: ArrayBuffer;
       };
       return {
         mlkem_encapsulation_key: bytes(result.mlkem_encapsulation_key),
         ecies_public_key: bytes(result.ecies_public_key),
         nonce: result.nonce,
+        fingerprint_commitment: bytes(result.fingerprint_commitment),
       };
     },
   },
@@ -593,13 +598,23 @@ const recovery = {
 const sharing = {
   request: {
     split(
-      channels: bigint[],
+      channels: WeightedChannel[],
       secret_id: bigint,
       version: number,
       secret_data: Uint8Array,
       threshold: number,
     ): SplitResult {
-      const packed = call('protect_secret', secret_id, secret_data, channels, threshold, version);
+      const ids = channels.map(([channelId]) => BigInt(channelId));
+      const weights = channels.map(([, weight]) => weight);
+      const packed = call(
+        'protect_secret',
+        secret_id,
+        secret_data,
+        ids,
+        weights,
+        threshold,
+        version,
+      );
       const shares = new Map<bigint, CommittedDeRecShare>();
       for (const entry of decodeCommittedShareEntries(packed as ArrayBuffer)) {
         shares.set(
@@ -615,7 +630,7 @@ const sharing = {
       version: number,
       secret_id: bigint,
       committed_share: CommittedDeRecShare,
-      keep_list: number[],
+      keep_version: number,
       description: string,
       shared_key: Uint8Array,
       reply_to?: TransportProtocol[],
@@ -626,7 +641,7 @@ const sharing = {
         version,
         secret_id,
         encodeMessage(MessageKind.CommittedDeRecShare, committed_share),
-        keep_list,
+        keep_version,
         utf8Encode(description),
         shared_key,
         replyTo(reply_to),

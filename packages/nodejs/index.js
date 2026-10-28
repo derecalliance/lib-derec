@@ -153,6 +153,10 @@ function generate_replica_id() {
   return wasm.generate_replica_id();
 }
 
+function shareStoreRefusal(reason) {
+  return wasm.shareStoreRefusal(reason);
+}
+
 function sequentialFailover(dialer) {
   return {
     async send(endpoints, message) {
@@ -190,6 +194,7 @@ module.exports = {
   advertisedEndpoints,
   protocol_version,
   generate_replica_id,
+  shareStoreRefusal,
   sequentialFailover,
   singleEndpointTransport,
   envelope,

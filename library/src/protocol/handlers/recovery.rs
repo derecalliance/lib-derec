@@ -52,7 +52,13 @@ use prost::Message;
 /// An OK response is checked on its own before it is collected (see
 /// [`response::inspect`]); one that fails surfaces as
 /// [`DeRecEvent::RecoveryShareCorrupted`] and, like a refusal, leaves the
-/// state untouched. The collected set holds one share per channel and is
+/// state untouched. Before that check ever parses the share, its committed
+/// bytes are measured against this device's own configured
+/// `parameter_range.max_share_size` (`0` or no range means unbounded); an
+/// oversized response is set aside the same way, without being decoded —
+/// the owner holds no proofs to validate against here, so size is the only
+/// admission check available, mirroring the helper-side check in
+/// `handlers::sharing::on_request`. The collected set holds one share per channel and is
 /// reconstructed from its consistent part (see
 /// [`recover_consistent`]); shares outside that part are reported
 /// as [`CorruptionReason::Inconsistent`] with the recovered secret.
@@ -199,6 +205,15 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 
 /// Answer a `GetShareRequest` with the share stored for it.
 ///
+/// The share is looked up across every channel linked to the one the
+/// request arrived on (see
+/// [`DeRecChannelStore::link_channel`](crate::protocol::DeRecChannelStore::link_channel)),
+/// at the requested version, and the answer carries **one** share: the
+/// first whose `secret_id` matches the request, in the order the share
+/// store returns. With one-to-one links a helper holds at most one share
+/// per owner for a given `secret_id` and version, so there is only one
+/// candidate; otherwise the share store's order decides which is served.
+///
 /// A helper holding no share for the requested `(secret_id, version)` still
 /// answers: the response carries `UNKNOWN_SHARE_VERSION` and no share, the
 /// failure the protocol defines for a missing version, so the owner learns
@@ -251,7 +266,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
             version = request.version,
             "no stored share for the requested version; answering UNKNOWN_SHARE_VERSION"
         );
-        reject(
+        let sent = reject(
             stores,
             local,
             exchange,
@@ -259,8 +274,14 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
             StatusEnum::UnknownShareVersion,
             NO_SHARE_FOR_VERSION,
         )
-        .await?;
-        return Ok(vec![DeRecEvent::NoOp]);
+        .await;
+        return crate::protocol::obligation::refused(
+            exchange.obligation,
+            DeRecEvent::NoOp,
+            StatusEnum::UnknownShareVersion,
+            NO_SHARE_FOR_VERSION,
+            sent,
+        );
     };
 
     let stored =
@@ -274,10 +295,19 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .resolve_response_endpoints(
             local.secret_id,
             exchange.channel_id,
+            local.policy,
             &crate::extensions::advertised_endpoints::reply_to_owned(request),
         )
         .await?;
-    stores.transport.send(&endpoints, envelope).await?;
+    crate::protocol::obligation::deliver(
+        exchange.obligation,
+        stores.transport,
+        &endpoints,
+        envelope,
+        StatusEnum::Ok,
+        "",
+    )
+    .await?;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -309,7 +339,32 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
-    let response = GetShareResponseMessage {
+    crate::extensions::channel_store::send_channel_message(
+        stores.channels,
+        stores.transport,
+        local.secret_id,
+        exchange.channel_id,
+        failure_response(local, request, status, memo),
+        exchange.shared_key,
+        exchange.trace_id,
+        local.policy,
+        &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        exchange.obligation,
+        status,
+        memo,
+    )
+    .await
+}
+
+/// The `GetShareResponse` that answers `request` with a non-`Ok` `status`
+/// and no share.
+pub(in crate::protocol) fn failure_response(
+    local: &Local<'_>,
+    request: &GetShareRequestMessage,
+    status: StatusEnum,
+    memo: &str,
+) -> MessageBody {
+    MessageBody::GetShareResponse(GetShareResponseMessage {
         result: Some(DeRecResult {
             status: status as i32,
             memo: memo.to_owned(),
@@ -322,19 +377,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         // Answer on the path the request arrived on: a member asking gets a
         // member's answer, a helper exchange stays helper-bound.
         replica_id: local.replica_id.filter(|_| request.replica_id.is_some()),
-    };
-
-    crate::extensions::channel_store::send_channel_message(
-        stores.channels,
-        stores.transport,
-        local.secret_id,
-        exchange.channel_id,
-        MessageBody::GetShareResponse(response),
-        exchange.shared_key,
-        exchange.trace_id,
-        &crate::extensions::advertised_endpoints::reply_to_owned(request),
-    )
-    .await
+    })
 }
 
 #[cfg_attr(
@@ -427,11 +470,23 @@ async fn on_response<S: StoreSet>(
         }]);
     }
 
-    if let Err(fault) = inspect(response.secret_id, response.version, response) {
-        let reason = match fault {
-            ShareFault::Malformed(_) => CorruptionReason::Malformed,
-            ShareFault::InvalidProof => CorruptionReason::InvalidProof,
-        };
+    let oversized = local.parameter_range.is_some_and(|range| {
+        range.max_share_size != 0
+            && response.committed_de_rec_share.len() as i64 > range.max_share_size
+    });
+
+    let fault = if oversized {
+        Some(CorruptionReason::Malformed)
+    } else {
+        inspect(response.secret_id, response.version, response)
+            .err()
+            .map(|fault| match fault {
+                ShareFault::Malformed(_) => CorruptionReason::Malformed,
+                ShareFault::InvalidProof => CorruptionReason::InvalidProof,
+            })
+    };
+
+    if let Some(reason) = fault {
         #[cfg(feature = "logging")]
         tracing::warn!(
             channel_id = channel_id.0,
@@ -695,9 +750,10 @@ fn inspect(
     Ok(share)
 }
 
-/// The smallest set VSS reconstructs from: [`vss::share`] refuses a
-/// threshold below two, so a single share is never a complete set.
-const MIN_RECONSTRUCTION_SHARES: usize = 2;
+/// The fewest subshares VSS reconstructs from: [`vss::share`] refuses a
+/// threshold below two, and a share always carries fewer subshares than the
+/// threshold, so a single share is never a complete set.
+const MIN_RECONSTRUCTION_SUBSHARES: usize = 2;
 
 /// A secret reconstructed from the consistent part of a collected set.
 struct ConsistentRecovery {
@@ -720,11 +776,11 @@ struct ConsistentRecovery {
 /// outside it is an outlier.
 ///
 /// Reconstruction is the arbiter because it is what proves a group whole: a
-/// key interpolated from fewer than the threshold of genuine shares fails the
+/// key interpolated from fewer than the threshold of genuine subshares fails the
 /// ciphertext's authentication, so a group can only succeed by holding a
-/// complete set of one split. A group needs at least two distinct
-/// x-coordinates to be tried, and a share repeated across channels counts
-/// once.
+/// complete set of one split. A group needs at least two subshares to be
+/// tried, and a share repeated across channels counts once: a share whose
+/// subshares equal those of a share already taken is skipped.
 ///
 /// No threshold is known before reconstruction, so a set that reconstructs
 /// from no group is not an error of any share: it fails with
@@ -764,16 +820,17 @@ fn recover_consistent(
     groups.sort_by_key(|group| std::cmp::Reverse(group.len()));
 
     for group in &groups {
-        let mut points: Vec<vss::VSSShare> = Vec::with_capacity(group.len());
+        let mut distinct: Vec<vss::VSSShare> = Vec::with_capacity(group.len());
         for &i in group {
-            if !points.iter().any(|p| p.x == shares[i].x) {
-                points.push(shares[i].clone());
+            if !distinct.iter().any(|s| s.subshares == shares[i].subshares) {
+                distinct.push(shares[i].clone());
             }
         }
-        if points.len() < MIN_RECONSTRUCTION_SHARES {
+        let subshares: usize = distinct.iter().map(|s| s.subshares.len()).sum();
+        if subshares < MIN_RECONSTRUCTION_SUBSHARES {
             continue;
         }
-        if let Ok(secret_data) = vss::recover(&points) {
+        if let Ok(secret_data) = vss::recover(&distinct) {
             let outliers = (0..shares.len()).filter(|i| !group.contains(i)).collect();
             #[cfg(feature = "logging")]
             tracing::info!(
@@ -807,8 +864,8 @@ mod recovery_ids_tests {
 
     use super::*;
     use crate::protocol::context::Exchange;
-    use crate::protocol::test::LocalFixture;
-    use crate::protocol::test::{
+    use crate::protocol::tests::LocalFixture;
+    use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, RecordingTransport,
         StoreRig, run_async,
     };
@@ -888,6 +945,7 @@ mod recovery_ids_tests {
                 status,
                 created_at: 1,
                 peer_role,
+                weight: 1,
             }),
         };
         channels.save(sid, record).await.expect("channel saved");
@@ -919,8 +977,9 @@ mod recovery_ids_tests {
         payload: &[u8],
     ) -> Vec<GetShareResponseMessage> {
         let cids: Vec<ChannelId> = channel_ids.iter().copied().map(ChannelId).collect();
+        let weighted: Vec<_> = cids.iter().map(|&cid| (cid, 1)).collect();
         let split = crate::primitives::sharing::request::split(
-            &cids, secret_id, version, payload, threshold,
+            &weighted, secret_id, version, payload, threshold,
         )
         .expect("split succeeds");
         cids.iter()
@@ -1525,7 +1584,10 @@ mod recovery_ids_tests {
         use derec_proto::{CommittedDeRecShare, DeRecShare};
 
         async fn seeded() -> (LocalFixture, StoreRig) {
-            let lf = LocalFixture::new(LOCAL);
+            seeded_with(LocalFixture::new(LOCAL)).await
+        }
+
+        async fn seeded_with(lf: LocalFixture) -> (LocalFixture, StoreRig) {
             let mut rig = StoreRig::new();
             rig.state
                 .save(
@@ -1539,6 +1601,19 @@ mod recovery_ids_tests {
                 .await
                 .expect("seed pending");
             (lf, rig)
+        }
+
+        /// Appends a harmless, unrecognized field to a committed share's
+        /// encoding, growing it by roughly `extra_len` bytes without
+        /// changing what it decodes to: an unknown field is skipped during
+        /// `CommittedDeRecShare::decode`.
+        fn padded(response: &GetShareResponseMessage, extra_len: usize) -> GetShareResponseMessage {
+            let mut bytes = response.committed_de_rec_share.clone();
+            prost::encoding::bytes::encode(9_999, &vec![0xAA_u8; extra_len], &mut bytes);
+            GetShareResponseMessage {
+                committed_de_rec_share: bytes,
+                ..response.clone()
+            }
         }
 
         fn secret_payload() -> Vec<u8> {
@@ -1563,7 +1638,7 @@ mod recovery_ids_tests {
         }
 
         fn with_flipped_y(response: &GetShareResponseMessage) -> GetShareResponseMessage {
-            rewrite_share(response, |share| share.y[0] ^= 0x01)
+            rewrite_share(response, |share| share.subshares[0].y[0] ^= 0x01)
         }
 
         fn with_flipped_ciphertext(response: &GetShareResponseMessage) -> GetShareResponseMessage {
@@ -1826,6 +1901,91 @@ mod recovery_ids_tests {
             });
         }
 
+        /// A share bigger than this device's own `max_share_size` is set
+        /// aside before it is even parsed, exactly like an undecodable
+        /// share. The threshold is still met from the shares that fit.
+        #[test]
+        fn recovery_sets_aside_a_share_above_max_share_size() {
+            run_async(async {
+                let good = helper_responses(TARGET, VERSION, &[11, 12, 13], 2, &secret_payload());
+                let max = good[0]
+                    .committed_de_rec_share
+                    .len()
+                    .max(good[1].committed_de_rec_share.len()) as i64;
+                let range = derec_proto::ParameterRange {
+                    max_share_size: max,
+                    ..Default::default()
+                };
+                let (lf, mut rig) =
+                    seeded_with(LocalFixture::with_parameter_range(LOCAL, range)).await;
+                let oversized = padded(&good[2], 256);
+
+                let first = deliver(&mut rig, &lf, 13, &oversized).await;
+                assert_eq!(
+                    corrupted(&first),
+                    vec![(ChannelId(13), CorruptionReason::Malformed)]
+                );
+                assert!(
+                    collected(&rig).await.is_empty(),
+                    "an oversized share must not enter the collected set"
+                );
+
+                let second = deliver(&mut rig, &lf, 11, &good[0]).await;
+                assert!(
+                    matches!(
+                        second.as_slice(),
+                        [DeRecEvent::RecoveryShareReceived {
+                            shares_received: 1,
+                            ..
+                        }]
+                    ),
+                    "got {second:?}"
+                );
+
+                let third = deliver(&mut rig, &lf, 12, &good[1]).await;
+                assert!(corrupted(&third).is_empty(), "got {third:?}");
+                assert!(recovered(&third), "got {third:?}");
+            });
+        }
+
+        /// With no `max_share_size` configured (no parameter range at all),
+        /// a large share is accepted and recovery proceeds normally.
+        #[test]
+        fn recovery_accepts_large_shares_without_a_limit() {
+            run_async(async {
+                let (lf, mut rig) = seeded().await;
+                let good = helper_responses(TARGET, VERSION, &[11, 12], 2, &secret_payload());
+                let large = padded(&good[0], 64 * 1024);
+
+                deliver(&mut rig, &lf, 11, &large).await;
+                let last = deliver(&mut rig, &lf, 12, &good[1]).await;
+                assert!(corrupted(&last).is_empty(), "got {last:?}");
+                assert!(recovered(&last), "got {last:?}");
+            });
+        }
+
+        /// A parameter range whose `max_share_size` is `0` means unbounded:
+        /// a large share is accepted and recovery proceeds normally.
+        #[test]
+        fn recovery_accepts_large_shares_when_max_share_size_is_zero() {
+            run_async(async {
+                let range = derec_proto::ParameterRange {
+                    max_share_size: 0,
+                    ..Default::default()
+                };
+                let (lf, mut rig) =
+                    seeded_with(LocalFixture::with_parameter_range(LOCAL, range)).await;
+                let good = helper_responses(TARGET, VERSION, &[11, 12], 2, &secret_payload());
+                let large = padded(&good[0], 64 * 1024);
+
+                let first = deliver(&mut rig, &lf, 11, &large).await;
+                assert!(corrupted(&first).is_empty(), "got {first:?}");
+                let last = deliver(&mut rig, &lf, 12, &good[1]).await;
+                assert!(corrupted(&last).is_empty(), "got {last:?}");
+                assert!(recovered(&last), "got {last:?}");
+            });
+        }
+
         /// A response from a channel that already answered replaces its
         /// earlier share instead of counting twice.
         #[test]
@@ -1851,10 +2011,10 @@ mod recovery_ids_tests {
         }
 
         /// The same share reaching the owner on two channels — an original
-        /// and its linked recovery channel — is one point, not two. It must
+        /// and its linked recovery channel — counts once, not twice. It must
         /// neither complete the recovery alone nor fail the interpolation.
         #[test]
-        fn one_share_arriving_on_two_channels_counts_as_one_point() {
+        fn one_share_arriving_on_two_channels_counts_once() {
             run_async(async {
                 let (lf, mut rig) = seeded().await;
                 let good = helper_responses(TARGET, VERSION, &[11, 12], 2, &secret_payload());
@@ -1884,7 +2044,7 @@ mod recovery_ids_tests {
     /// waiting, and the exchange is not a failure of the helper's `process`.
     mod helper_without_the_share {
         use super::*;
-        use crate::protocol::test::{InMemShareStore, InMemUserSecretStore};
+        use crate::protocol::tests::{InMemShareStore, InMemUserSecretStore};
         use crate::protocol::{AutoAcceptPolicy, DeRecProtocolBuilder};
 
         type TestProto = crate::protocol::DeRecProtocol<
@@ -2026,7 +2186,7 @@ mod recovery_ids_tests {
 
     mod wiring {
         use super::*;
-        use crate::protocol::test::{InMemShareStore, InMemUserSecretStore};
+        use crate::protocol::tests::{InMemShareStore, InMemUserSecretStore};
         use crate::protocol::{DeRecFlow, DeRecProtocolBuilder};
 
         type TestProto = crate::protocol::DeRecProtocol<
@@ -2309,8 +2469,10 @@ mod recovery_ids_tests {
         fn stored_share(secret_id: u64, version: u32) -> Vec<u8> {
             let share = derec_proto::DeRecShare {
                 encrypted_secret: vec![0xAB; 4],
-                x: vec![0x01],
-                y: vec![0x02],
+                subshares: vec![derec_proto::de_rec_share::Subshare {
+                    x: vec![0x01],
+                    y: vec![0x02],
+                }],
                 secret_id,
                 version,
             };
@@ -2378,6 +2540,8 @@ mod recovery_ids_tests {
                             secret_id: secret,
                             version: VERSION,
                             bytes: stored_share(secret, VERSION),
+                            subshares: None,
+                            threshold: None,
                         },
                     )
                     .await
@@ -2397,6 +2561,7 @@ mod recovery_ids_tests {
                         channel_id: ChannelId(WANTED_CHANNEL),
                         shared_key: &[0xB2; 32],
                         trace_id: 0,
+                        obligation: None,
                     },
                     &request,
                 )
@@ -2439,6 +2604,7 @@ mod tests {
                 }],
                 shared_key: vec![0xAA; 32],
                 communication_info: HashMap::from([("name".to_owned(), "Helper".to_owned())]),
+                weight: 1,
             }],
             secrets: vec![
                 UserSecret {
@@ -2476,6 +2642,7 @@ mod tests {
                 ],
                 shared_key: vec![0x55; 32],
             }),
+            threshold: None,
         }
     }
 
@@ -2587,8 +2754,9 @@ mod share_judging_tests {
 
     fn responses(payload: &[u8], threshold: usize, count: u64) -> Vec<GetShareResponseMessage> {
         let channels: Vec<ChannelId> = (1..=count).map(ChannelId).collect();
+        let weighted: Vec<_> = channels.iter().map(|&c| (c, 1)).collect();
         let SplitResult { shares } =
-            sharing_split(&channels, SECRET_ID, VERSION, payload, threshold).expect("split");
+            sharing_split(&weighted, SECRET_ID, VERSION, payload, threshold).expect("split");
         channels
             .iter()
             .map(|c| GetShareResponseMessage {
@@ -2605,7 +2773,7 @@ mod share_judging_tests {
         let mut committed =
             CommittedDeRecShare::decode(response.committed_de_rec_share.as_slice()).unwrap();
         let mut share = DeRecShare::decode(committed.de_rec_share.as_slice()).unwrap();
-        share.y[0] ^= 0x01;
+        share.subshares[0].y[0] ^= 0x01;
         committed.de_rec_share = share.encode_to_vec();
         GetShareResponseMessage {
             committed_de_rec_share: committed.encode_to_vec(),
@@ -2649,6 +2817,22 @@ mod share_judging_tests {
         };
         assert!(matches!(
             inspect(SECRET_ID, VERSION, &no_result),
+            Err(ShareFault::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn inspect_rejects_a_pre_0_0_9_layout_share_as_malformed() {
+        let good = responses(b"payload", 2, 3);
+        let mut committed =
+            CommittedDeRecShare::decode(good[0].committed_de_rec_share.as_slice()).unwrap();
+        committed.de_rec_share = crate::protocol::tests::pre_0_0_9_derec_share(SECRET_ID, VERSION);
+        let old = GetShareResponseMessage {
+            committed_de_rec_share: committed.encode_to_vec(),
+            ..good[0].clone()
+        };
+        assert!(matches!(
+            inspect(SECRET_ID, VERSION, &old),
             Err(ShareFault::Malformed(_))
         ));
     }
@@ -2700,7 +2884,7 @@ mod share_judging_tests {
         let good = responses(b"the real secret", 2, 3);
         let err = recover_consistent(SECRET_ID, VERSION, &[&good[0], &good[0]])
             .err()
-            .expect("one point twice is still one point");
+            .expect("one subshare twice is still one subshare");
         assert!(matches!(
             err,
             Error::Recovery(RecoveryError::ReconstructionFailed {
@@ -2709,7 +2893,7 @@ mod share_judging_tests {
         ));
 
         let result = recover_consistent(SECRET_ID, VERSION, &[&good[0], &good[0], &good[1]])
-            .expect("two distinct points complete a threshold-2 split");
+            .expect("two distinct subshares complete a threshold-2 split");
         assert_eq!(result.secret_data, b"the real secret");
         assert!(result.outliers.is_empty());
     }

@@ -6,7 +6,9 @@
 //! A library [`crate::Error`] is classified once, here, into a [`Category`]
 //! (the layer or flow that failed) and a [`Code`] (the specific reason). The
 //! C ABI carries the numeric discriminants; WASM carries the names. Both come
-//! from this table, so the same failure reads the same in every SDK.
+//! from this table, so the same failure reads the same in every SDK, and so
+//! does the code a [`DeRecEvent::RequestFailed`](crate::protocol::DeRecEvent::RequestFailed)
+//! carries.
 //!
 //! Errors a binding raises itself, before a value reaches the library, are
 //! outside this table's library categories: the C ABI reports them under
@@ -41,7 +43,7 @@ macro_rules! vocabulary {
             }
 
             /// [`Self::name`], NUL-terminated for the C ABI.
-            #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+            #[cfg_attr(any(target_arch = "wasm32", not(feature = "ffi")), allow(dead_code))]
             pub(crate) fn c_name(self) -> &'static str {
                 match self {
                     $($enum::$variant => concat!($name, "\0"),)*
@@ -49,7 +51,10 @@ macro_rules! vocabulary {
             }
 
             /// The member with this discriminant, if any.
-            #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+            #[cfg_attr(
+                any(target_arch = "wasm32", not(any(feature = "ffi", test))),
+                allow(dead_code)
+            )]
             pub(crate) fn from_i32(value: i32) -> Option<Self> {
                 match value {
                     $($value => Some($enum::$variant),)*
@@ -103,6 +108,7 @@ vocabulary! {
         AlreadyRestored = 14 => "already_restored",
         RestoreConflict = 15 => "restore_conflict",
         ReplicaIdConflict = 16 => "replica_id_conflict",
+        FingerprintMismatch = 17 => "fingerprint_mismatch",
         Encryption = 20 => "encryption",
         Keygen = 21 => "keygen",
         FinishPairingInitiator = 22 => "finish_pairing_initiator",
@@ -115,11 +121,15 @@ vocabulary! {
         MissingReplicaId = 45 => "missing_replica_id",
         UnexpectedReplicaId = 46 => "unexpected_replica_id",
         IncompatibleParameterRange = 47 => "incompatible_parameter_range",
+        FingerprintCommitmentMismatch = 48 => "fingerprint_commitment_mismatch",
         EmptyChannels = 60 => "empty_channels",
         DuplicateChannelId = 61 => "duplicate_channel_id",
         InvalidThreshold = 62 => "invalid_threshold",
         EmptySecretData = 63 => "empty_secret_data",
         VssShareFailed = 64 => "vss_share_failed",
+        InvalidWeight = 65 => "invalid_weight",
+        TooManySubshares = 66 => "too_many_subshares",
+        InvalidKeepVersion = 67 => "invalid_keep_version",
         EmptyResponses = 80 => "empty_responses",
         EmptyCommittedDeRecShare = 81 => "empty_committed_derec_share",
         DecodeCommittedDeRecShare = 82 => "decode_committed_derec_share",
@@ -174,6 +184,7 @@ pub(crate) fn classify(err: &crate::Error) -> (Category, Code) {
         E::ReplicaIdNotConfigured => (Category::InvalidInput, Code::ReplicaIdNotConfigured),
         E::ReplicaIdConflict { .. } => (Category::InvalidInput, Code::ReplicaIdConflict),
         E::ChannelAlreadyPaired { .. } => (Category::InvalidInput, Code::ChannelAlreadyPaired),
+        E::FingerprintMismatch { .. } => (Category::Pairing, Code::FingerprintMismatch),
         E::Restore(e) => {
             use crate::protocol::RestoreError;
             match e {
@@ -194,6 +205,7 @@ fn pairing_code(e: &PairingError) -> Code {
         PairingError::NonOkStatus { .. } => Code::NonOkStatus,
         PairingError::ProtocolViolation(_) => Code::ProtocolViolation,
         PairingError::PrePairHashMismatch => Code::PrePairHashMismatch,
+        PairingError::FingerprintCommitmentMismatch => Code::FingerprintCommitmentMismatch,
         PairingError::MissingReplicaId { .. } => Code::MissingReplicaId,
         PairingError::UnexpectedReplicaId { .. } => Code::UnexpectedReplicaId,
         PairingError::IncompatibleParameterRange { .. } => Code::IncompatibleParameterRange,
@@ -233,6 +245,9 @@ fn sharing_code(e: &SharingError) -> Code {
         SharingError::InvalidThreshold { .. } => Code::InvalidThreshold,
         SharingError::EmptySecretData => Code::EmptySecretData,
         SharingError::VssShareFailed { .. } => Code::VssShareFailed,
+        SharingError::InvalidWeight { .. } => Code::InvalidWeight,
+        SharingError::TooManySubshares { .. } => Code::TooManySubshares,
+        SharingError::InvalidKeepVersion { .. } => Code::InvalidKeepVersion,
         SharingError::NonOkStatus { .. } => Code::NonOkStatus,
         SharingError::VersionMismatch { .. } => Code::VersionMismatch,
     }

@@ -16,10 +16,18 @@ const repoRoot = path.resolve(projectRoot, '../..');
  * succeeded. A consumer installing the published package from npm needs none of
  * this; it is purely an artefact of testing against the local checkout.
  *
+ * `src/protocol.ts` also imports the shared `protocol_config.json` fixture
+ * straight out of `library/tests/fixtures`, so that it stays the single
+ * source of truth instead of a copy this app could drift from. That path is
+ * outside `projectRoot` too, so it needs the same `watchFolders` treatment.
+ *
  * @type {import('@react-native/metro-config').MetroConfig}
  */
 const config = {
-  watchFolders: [path.resolve(repoRoot, 'packages/react-native')],
+  watchFolders: [
+    path.resolve(repoRoot, 'packages/react-native'),
+    path.resolve(repoRoot, 'library/tests/fixtures'),
+  ],
   resolver: {
     nodeModulesPaths: [path.resolve(projectRoot, 'node_modules')],
   },

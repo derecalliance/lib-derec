@@ -41,3 +41,30 @@ impl DeRecShareExt for derec_proto::DeRecShare {
         Ok(())
     }
 }
+
+/// A wire `DeRecShare`'s subshares as the [`vss`] subshares they encode.
+///
+/// [`vss`]: derec_cryptography::vss
+pub(crate) fn into_vss_subshares(
+    subshares: Vec<derec_proto::de_rec_share::Subshare>,
+) -> Vec<derec_cryptography::vss::Subshare> {
+    subshares
+        .into_iter()
+        .map(|p| derec_cryptography::vss::Subshare { x: p.x, y: p.y })
+        .collect()
+}
+
+/// [`vss`] subshares as the subshares of a wire `DeRecShare`.
+///
+/// [`vss`]: derec_cryptography::vss
+pub(crate) fn to_wire_subshares(
+    subshares: &[derec_cryptography::vss::Subshare],
+) -> Vec<derec_proto::de_rec_share::Subshare> {
+    subshares
+        .iter()
+        .map(|p| derec_proto::de_rec_share::Subshare {
+            x: p.x.clone(),
+            y: p.y.clone(),
+        })
+        .collect()
+}

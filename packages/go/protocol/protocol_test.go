@@ -212,9 +212,17 @@ type inMemoryShareStore struct {
 	mu   sync.Mutex
 	data map[shareStoreKey]Share
 
-	keep          []uint32
-	keepOK        bool
-	keepListCalls []uint32
+	// keep, when keepSet, is every KeepVersion answer; otherwise the store
+	// answers version-1, keeping the previous version.
+	keep             uint32
+	keepSet          bool
+	keepVersionCalls []uint32
+
+	// recordVerificationErr, when non-nil, is returned by every
+	// RecordVerification call instead of nil — lets a test inject a
+	// *ShareStoreRefusedError or a plain backend error.
+	recordVerificationErr   error
+	recordVerificationCalls []shareStoreKey
 }
 
 func newInMemoryShareStore() *inMemoryShareStore {
@@ -315,11 +323,21 @@ func (s *inMemoryShareStore) RemoveVersions(secretID, channelID uint64, versions
 	return nil
 }
 
-func (s *inMemoryShareStore) KeepList(secretID uint64, version uint32) ([]uint32, bool, error) {
+func (s *inMemoryShareStore) KeepVersion(secretID uint64, version uint32) (uint32, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.keepListCalls = append(s.keepListCalls, version)
-	return s.keep, s.keepOK, nil
+	s.keepVersionCalls = append(s.keepVersionCalls, version)
+	if s.keepSet {
+		return s.keep, nil
+	}
+	return version - 1, nil
+}
+
+func (s *inMemoryShareStore) RecordVerification(secretID, channelID uint64, version uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordVerificationCalls = append(s.recordVerificationCalls, shareStoreKey{channelID, secretID, version})
+	return s.recordVerificationErr
 }
 
 var _ ShareStore = (*inMemoryShareStore)(nil)
@@ -543,12 +561,14 @@ func TestNew_ConstructsRealProtocolHandleAndCloses(t *testing.T) {
 	channel, share, secret, userSecret, state, transport := newTestStores()
 
 	cfg := Config{
-		SecretID:      1,
-		OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(2),
+		SecretID: 1,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(2),
+		},
 	}
 
-	p, err := New(channel, share, secret, userSecret, state, transport, cfg)
+	p, err := New(Stores{Channel: channel, Share: share, Secret: secret, UserSecret: userSecret, State: state}, transport, cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -575,23 +595,27 @@ func TestNew_TwoInstancesBothConstructAndClose(t *testing.T) {
 	channel2, share2, secret2, userSecret2, state2, transport2 := newTestStores()
 
 	cfg1 := Config{
-		SecretID:      1,
-		OwnTransports: []TransportProtocolParam{{URI: "https://owner-a.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(2),
+		SecretID: 1,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner-a.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(2),
+		},
 	}
 	cfg2 := Config{
-		SecretID:      2,
-		OwnTransports: []TransportProtocolParam{{URI: "https://owner-b.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(2),
+		SecretID: 2,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner-b.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(2),
+		},
 	}
 
-	p1, err := New(channel1, share1, secret1, userSecret1, state1, transport1, cfg1)
+	p1, err := New(Stores{Channel: channel1, Share: share1, Secret: secret1, UserSecret: userSecret1, State: state1}, transport1, cfg1)
 	if err != nil {
 		t.Fatalf("New (instance 1): %v", err)
 	}
 	defer p1.Close()
 
-	p2, err := New(channel2, share2, secret2, userSecret2, state2, transport2, cfg2)
+	p2, err := New(Stores{Channel: channel2, Share: share2, Secret: secret2, UserSecret: userSecret2, State: state2}, transport2, cfg2)
 	if err != nil {
 		t.Fatalf("New (instance 2): %v", err)
 	}
@@ -607,29 +631,34 @@ func TestNew_TwoInstancesBothConstructAndClose(t *testing.T) {
 
 func TestNew_RequiresEveryStoreAndTransport(t *testing.T) {
 	channel, share, secret, userSecret, state, transport := newTestStores()
-	cfg := Config{SecretID: 1, OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com"}}}
+	cfg := Config{
+		SecretID: 1,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com"}},
+		},
+	}
 
 	cases := []struct {
 		name string
 		call func() (*DeRecProtocol, error)
 	}{
 		{"nil channelStore", func() (*DeRecProtocol, error) {
-			return New(nil, share, secret, userSecret, state, transport, cfg)
+			return New(Stores{Channel: nil, Share: share, Secret: secret, UserSecret: userSecret, State: state}, transport, cfg)
 		}},
 		{"nil shareStore", func() (*DeRecProtocol, error) {
-			return New(channel, nil, secret, userSecret, state, transport, cfg)
+			return New(Stores{Channel: channel, Share: nil, Secret: secret, UserSecret: userSecret, State: state}, transport, cfg)
 		}},
 		{"nil secretStore", func() (*DeRecProtocol, error) {
-			return New(channel, share, nil, userSecret, state, transport, cfg)
+			return New(Stores{Channel: channel, Share: share, Secret: nil, UserSecret: userSecret, State: state}, transport, cfg)
 		}},
 		{"nil userSecretStore", func() (*DeRecProtocol, error) {
-			return New(channel, share, secret, nil, state, transport, cfg)
+			return New(Stores{Channel: channel, Share: share, Secret: secret, UserSecret: nil, State: state}, transport, cfg)
 		}},
 		{"nil stateStore", func() (*DeRecProtocol, error) {
-			return New(channel, share, secret, userSecret, nil, transport, cfg)
+			return New(Stores{Channel: channel, Share: share, Secret: secret, UserSecret: userSecret, State: nil}, transport, cfg)
 		}},
 		{"nil transport", func() (*DeRecProtocol, error) {
-			return New(channel, share, secret, userSecret, state, nil, cfg)
+			return New(Stores{Channel: channel, Share: share, Secret: secret, UserSecret: userSecret, State: state}, nil, cfg)
 		}},
 	}
 	for _, tc := range cases {
@@ -646,10 +675,12 @@ func TestNew_RequiresEveryStoreAndTransport(t *testing.T) {
 func TestNew_ThresholdIsDecidedByTheLibrary(t *testing.T) {
 	build := func(threshold *uint32) error {
 		channel, share, secret, userSecret, state, transport := newTestStores()
-		p, err := New(channel, share, secret, userSecret, state, transport, Config{
-			SecretID:      1,
-			OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-			Threshold:     threshold,
+		p, err := New(Stores{Channel: channel, Share: share, Secret: secret, UserSecret: userSecret, State: state}, transport, Config{
+			SecretID: 1,
+			DeRecProtocolConfig: DeRecProtocolConfig{
+				OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+				Threshold:     threshold,
+			},
 		})
 		if err == nil {
 			p.Close()
@@ -681,9 +712,11 @@ func TestNew_ThresholdIsDecidedByTheLibrary(t *testing.T) {
 func TestNew_EmptyOwnTransportsAreRefusedByTheLibrary(t *testing.T) {
 	for _, own := range [][]TransportProtocolParam{nil, {}} {
 		channel, share, secret, userSecret, state, transport := newTestStores()
-		p, err := New(channel, share, secret, userSecret, state, transport, Config{
-			SecretID:      1,
-			OwnTransports: own,
+		p, err := New(Stores{Channel: channel, Share: share, Secret: secret, UserSecret: userSecret, State: state}, transport, Config{
+			SecretID: 1,
+			DeRecProtocolConfig: DeRecProtocolConfig{
+				OwnTransports: own,
+			},
 		})
 		if err == nil {
 			p.Close()
@@ -704,9 +737,11 @@ func TestNew_EmptyOwnTransportsAreRefusedByTheLibrary(t *testing.T) {
 func TestSecretStore_SharedKeyLengthIsCheckedByTheLibrary(t *testing.T) {
 	channel, share, _, userSecret, state, transport := newTestStores()
 	secrets := newInMemorySecretStore()
-	p, err := New(channel, share, secrets, userSecret, state, transport, Config{
-		SecretID:      1,
-		OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+	p, err := New(Stores{Channel: channel, Share: share, Secret: secrets, UserSecret: userSecret, State: state}, transport, Config{
+		SecretID: 1,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -739,11 +774,13 @@ func newTestProtocol(t *testing.T) *DeRecProtocol {
 	t.Helper()
 	channel, share, secret, userSecret, state, transport := newTestStores()
 	cfg := Config{
-		SecretID:      1,
-		OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(2),
+		SecretID: 1,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(2),
+		},
 	}
-	p, err := New(channel, share, secret, userSecret, state, transport, cfg)
+	p, err := New(Stores{Channel: channel, Share: share, Secret: secret, UserSecret: userSecret, State: state}, transport, cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -817,16 +854,11 @@ func TestGetFingerprint_UnpairedChannel(t *testing.T) {
 
 // TestVerifyFingerprint_UnpairedChannel mirrors
 // TestGetFingerprint_UnpairedChannel: verifying against a channel with no
-// shared key must fail closed (matched == false, non-nil error) instead
-// of crashing.
+// shared key must fail with an error instead of crashing.
 func TestVerifyFingerprint_UnpairedChannel(t *testing.T) {
 	p := newTestProtocol(t)
-	matched, err := p.VerifyFingerprint(42, "not-a-real-fingerprint")
-	if err == nil {
+	if err := p.VerifyFingerprint(42, "not-a-real-fingerprint"); err == nil {
 		t.Fatal("expected an error for an unpaired channel")
-	}
-	if matched {
-		t.Fatal("expected matched == false on error (fail-closed)")
 	}
 }
 
@@ -848,7 +880,7 @@ func TestVerifyFingerprint_ClosedProtocol(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if _, err := p.VerifyFingerprint(42, "fp"); err == nil {
+	if err := p.VerifyFingerprint(42, "fp"); err == nil {
 		t.Fatal("expected an error on a closed protocol")
 	}
 }
@@ -870,11 +902,13 @@ func TestSetCommunicationInfo_ClosedProtocol(t *testing.T) {
 func TestNew_WithGeneratedReplicaID(t *testing.T) {
 	channel, share, secret, userSecret, state, transport := newTestStores()
 	replicaID := derec.GenerateReplicaID()
-	p, err := New(channel, share, secret, userSecret, state, transport, Config{
-		SecretID:      1,
-		OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(2),
-		ReplicaID:     &replicaID,
+	p, err := New(Stores{Channel: channel, Share: share, Secret: secret, UserSecret: userSecret, State: state}, transport, Config{
+		SecretID: 1,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(2),
+			ReplicaID:     &replicaID,
+		},
 	})
 	if err != nil {
 		t.Fatalf("New with generated ReplicaID %d: %v", replicaID, err)

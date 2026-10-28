@@ -51,6 +51,9 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
                 .channels
                 .load_replica_member(local.secret_id, exchange.channel_id, author)
                 .await?;
+            if let Some(obligation) = exchange.obligation {
+                obligation.answer_at(&member.transports);
+            }
             on_request(
                 stores,
                 local,
@@ -58,6 +61,7 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
                 &request,
                 *exchange.shared_key,
                 exchange.trace_id,
+                exchange.obligation,
             )
             .await
         }
@@ -176,6 +180,7 @@ async fn on_request<S: StoreSet>(
     request: &GetSecretIdsVersionsRequestMessage,
     shared_key: SharedKey,
     inbound_trace_id: u64,
+    obligation: Option<&crate::protocol::obligation::Obligation>,
 ) -> Result<Vec<DeRecEvent>> {
     let version = stores
         .user_secrets
@@ -210,14 +215,28 @@ async fn on_request<S: StoreSet>(
         .build()?
         .encode_to_vec();
     let envelope = crate::derec_message::apply_trace_id(&envelope, inbound_trace_id)?;
-    // A reply-to overrides the recorded endpoints for this exchange only.
-    let reply_to = crate::extensions::advertised_endpoints::reply_to_owned(request);
+    // A reply-to overrides the recorded endpoints for this exchange only,
+    // and only once it has passed the same transport policy every other
+    // peer-supplied endpoint is held to; an offer refused in full is no
+    // reply-to at all.
+    let reply_to = crate::extensions::channel_store::filter_reply_to(
+        local.policy,
+        &crate::extensions::advertised_endpoints::reply_to_owned(request),
+    );
     let endpoint = if reply_to.is_empty() {
         member.transports.clone()
     } else {
         reply_to
     };
-    stores.transport.send(&endpoint, envelope).await?;
+    crate::protocol::obligation::deliver(
+        obligation,
+        stores.transport,
+        &endpoint,
+        envelope,
+        derec_proto::StatusEnum::Ok,
+        "",
+    )
+    .await?;
 
     Ok(vec![DeRecEvent::NoOp])
 }
@@ -381,8 +400,8 @@ async fn finish<S: StoreSet>(
 mod tests {
     use super::*;
     use crate::protocol::DeRecSecretStore;
-    use crate::protocol::test::LocalFixture;
-    use crate::protocol::test::{
+    use crate::protocol::tests::LocalFixture;
+    use crate::protocol::tests::{
         InMemChannelStore, InMemSecretStore, InMemUserSecretStore, StoreRig, run_async,
     };
     use crate::protocol::types::{
@@ -437,6 +456,7 @@ mod tests {
                     secrets: Vec::new(),
                     description: None,
                     author_replica_id: None,
+                    threshold: None,
                 },
             )
             .await

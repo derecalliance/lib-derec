@@ -39,6 +39,7 @@ package protocol
 import (
 	"errors"
 
+	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/internal/native"
 )
 
@@ -232,7 +233,10 @@ type ShareStore interface {
 	LatestVersion(secretID uint64) (version uint32, ok bool, err error)
 	// Save inserts or replaces the share at (secretID, channelID,
 	// share.Version) — the secretID argument, not share.SecretID. See
-	// the interface docs.
+	// the interface docs. On a helper channel, saving a version not yet
+	// stored may return a *ShareStoreRefusedError to refuse the share with
+	// the matching protocol status; any other error is an ordinary backend
+	// failure.
 	Save(secretID, channelID uint64, share Share) error
 	// RemoveChannel deletes every share stored for channelID within
 	// secretID.
@@ -241,27 +245,60 @@ type ShareStore interface {
 	// secretID at each of versions. Idempotent: a version that is not
 	// stored is skipped, and an empty slice is a no-op.
 	//
-	// A helper calls it to apply StoreShareRequestMessage.keepList, the
-	// complete set of versions the owner wants retained: every stored
-	// version outside it is removed once the incoming share is persisted.
-	// Shares under other channels or partitions must be left untouched.
+	// A helper calls it to apply StoreShareRequestMessage.keepVersion: once
+	// the incoming share is persisted, every version stored on the channel
+	// other than the incoming one and keepVersion is removed. Shares under
+	// other channels or partitions must be left untouched.
 	RemoveVersions(secretID, channelID uint64, versions []uint32) error
-	// KeepList is asked by an owner, once per sharing round and before
-	// anything is sent, which versions every helper keeps after version
-	// is distributed. It is asked on library-started publishes too.
+	// KeepVersion is asked by an owner, once per sharing round and before
+	// anything is sent, which one older version every helper keeps after
+	// version is distributed. It is asked on library-started publishes too.
+	// The answer becomes StoreShareRequestMessage.keepVersion, the same
+	// value for every helper in the round.
 	//
-	// Return ok=false to send no keepList (it goes out empty): helpers then
-	// keep every version they hold. An application that wants to cap how
-	// many versions helpers retain returns that cap here. With ok=true,
-	// helpers keep exactly versions plus version, which the library always
-	// adds. Helpers delete every version that is not listed, so list every
-	// version that could still become the latest: those that committed (for
-	// example, whose SharingComplete event reported ThresholdMet) and those
-	// whose round is still open. Leave out only versions whose round failed
-	// or that the user rolled back; a list that leaves out too much can make
-	// the secret unrecoverable.
-	KeepList(secretID uint64, version uint32) (versions []uint32, ok bool, err error)
+	// A helper that stores version keeps it and the returned version, and
+	// deletes every other version it holds; 0 keeps no other version. An
+	// answer equal to or greater than version fails the round with
+	// derec.CodeInvalidKeepVersion before anything is sent.
+	//
+	// Return the last version that is valid: the newest one whose
+	// SharingComplete event reported ThresholdMet. If version never
+	// reaches threshold, that version is what the secret recovers from, so
+	// helpers must still hold it. Only the application knows which
+	// versions committed; nothing in the stores records it.
+	//
+	// The answer also governs this store's owner-side rows: when a helper
+	// confirms version, the library removes, through RemoveVersions, this
+	// device's rows for that channel other than version and the returned
+	// version. Replica pushes never consult it.
+	KeepVersion(secretID uint64, version uint32) (uint32, error)
+	// RecordVerification records that the helper has seen a verification
+	// challenge for the share at (secretID, channelID, version), called
+	// once per accepted challenge, after the challenged share is found and
+	// before the helper answers. Return a *ShareStoreRefusedError to refuse
+	// the verification with the matching protocol status; any other error
+	// is an ordinary backend failure. An application that does not care
+	// about this hook returns nil.
+	RecordVerification(secretID, channelID uint64, version uint32) error
 }
+
+// ShareStoreRefusal is the reason a *ShareStoreRefusedError refuses a
+// ShareStore.Save or ShareStore.RecordVerification call. The library maps
+// each variant to the matching protocol status answered to the owner — the
+// application chooses the reason, never the wire status.
+type ShareStoreRefusal = derec.ShareStoreRefusal
+
+const (
+	RefusalTooFrequent       = derec.RefusalTooFrequent
+	RefusalSizeLimitExceeded = derec.RefusalSizeLimitExceeded
+	RefusalRejected          = derec.RefusalRejected
+)
+
+// ShareStoreRefusedError is returned from ShareStore.Save or
+// ShareStore.RecordVerification to refuse the write or verification with
+// Refusal. The library turns this into the matching protocol status
+// answered to the owner, rather than treating it as a backend failure.
+type ShareStoreRefusedError = derec.ShareStoreRefusedError
 
 // UserSecretStore persists the user-facing secret contents, keyed by
 // secretID; one secretID maps to at most one stored UserSecrets entry —

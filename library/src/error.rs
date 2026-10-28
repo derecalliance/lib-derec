@@ -99,9 +99,9 @@ pub enum Error {
     },
 
     /// `start(Pairing)` was called for a `channel_id` that already has
-    /// a `Paired` channel record. Re-pairing would silently overwrite
-    /// the stored `SharedKey`; the caller must skip the call or unpair
-    /// first.
+    /// a `Paired` or `Unpairing` channel record. Re-pairing would silently
+    /// overwrite the stored `SharedKey`; the caller must skip the call, or
+    /// unpair first and wait for [`DeRecEvent::Unpaired`](crate::protocol::DeRecEvent::Unpaired).
     #[error("channel {channel_id:?} is already paired")]
     ChannelAlreadyPaired { channel_id: crate::types::ChannelId },
 
@@ -125,6 +125,12 @@ pub enum Error {
     /// fingerprint verification: there is no point asking a user to confirm a
     /// pairing that cannot complete.
     ///
+    /// Raised by the initiator, which learns the responder's id from its
+    /// `PairResponse`. A responder that receives a colliding `PairRequest`
+    /// instead refuses it with a `PairResponse` carrying `REPLICA_ID_CONFLICT`
+    /// and reports
+    /// [`DeRecEvent::PairingRefused`](crate::protocol::DeRecEvent::PairingRefused).
+    ///
     /// `replica_id` is assigned by the application, so this is a
     /// configuration fault — most often the same identity reused on two
     /// devices. Resolution is the application's: assign a distinct id and
@@ -132,6 +138,17 @@ pub enum Error {
     /// device is meant to keep the original.
     #[error("replica id {replica_id} is already in use by another member of the group")]
     ReplicaIdConflict { replica_id: u64 },
+
+    /// The fingerprint compared out of band does not match the one derived
+    /// from the channel key.
+    ///
+    /// The two sides hold different keys, which is what a man-in-the-middle
+    /// on the pairing produces. A `Pending` pairing is revoked: its records,
+    /// its channel key and its pairing material are deleted, so the channel
+    /// can never be used. Pairing again is the only way forward. A channel
+    /// already `Paired` is left as it is; removing it is an unpair.
+    #[error("fingerprint does not match channel {channel_id:?}: possible man-in-the-middle")]
+    FingerprintMismatch { channel_id: crate::types::ChannelId },
 
     /// A peer advertised no endpoint this library will record.
     ///

@@ -72,6 +72,8 @@ pub async fn protect_secret(
         .start(DeRecFlow::ProtectSecret {
             secrets: vec![user_secret],
             description: Some(description.to_owned()),
+            weights: HashMap::new(),
+            threshold: None,
         })
         .await
         .expect("owner.start(ProtectSecret) failed");

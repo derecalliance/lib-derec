@@ -27,11 +27,11 @@ func sharedKey(fill byte) []byte {
 func TestRecoverReconstructsOriginalSecret(t *testing.T) {
 	const secretID = uint64(0x0102_0304_05ff)
 	secretData := []byte{5, 6, 7, 8, 255}
-	channelIDs := []uint64{1, 2, 3}
 	const threshold = 2
 	const version = uint32(1)
 
-	shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold, version)
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 1}, {ChannelID: 3, Weight: 1}}
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
 	if err != nil {
 		t.Fatalf("split: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestRecoverReconstructsOriginalSecret(t *testing.T) {
 	for _, channelID := range []uint64{1, 2} {
 		key := keys[channelID]
 
-		requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], nil, "", key, nil)
+		requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], 0, "", key, nil)
 		if err != nil {
 			t.Fatalf("channel %d: store request produce: %v", channelID, err)
 		}
@@ -109,11 +109,11 @@ func TestRecoverReconstructsOriginalSecret(t *testing.T) {
 func TestRecoverBelowThresholdFails(t *testing.T) {
 	const secretID = uint64(0x0102_0304_05ff)
 	secretData := []byte{5, 6, 7, 8, 255}
-	channelIDs := []uint64{1, 2, 3}
 	const threshold = 2
 	const version = uint32(1)
 
-	shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold, version)
+	channels := []sharing.WeightedChannel{{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 1}, {ChannelID: 3, Weight: 1}}
+	shares, err := sharing.Request.Split(secretID, secretData, channels, threshold, version)
 	if err != nil {
 		t.Fatalf("split: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestRecoverBelowThresholdFails(t *testing.T) {
 	channelID := uint64(1)
 	key := sharedKey(1)
 
-	requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], nil, "", key, nil)
+	requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], 0, "", key, nil)
 	if err != nil {
 		t.Fatalf("store request produce: %v", err)
 	}

@@ -56,6 +56,9 @@ impl PartialEq<u64> for ChannelId {
     }
 }
 
+/// A channel paired with the number of subshares it receives (its weight).
+pub type WeightedChannel = (ChannelId, u32);
+
 /// Stable per-device identity of a replica within a group.
 ///
 /// Distinct from [`ChannelId`], which identifies a *channel*: every member of a

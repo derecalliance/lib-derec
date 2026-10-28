@@ -171,12 +171,7 @@ pub async fn deliver(peer: &StatelessPeer, bytes: &[u8]) -> Vec<DeRecEvent> {
 }
 
 /// As [`deliver`], but surfacing the error instead of panicking.
-///
-/// A deployed endpoint receives whatever is sent to it, including replies to
-/// channels it has already torn down, so `process()` returning an error is
-/// ordinary operation rather than a fault. See
-/// [`pump_tolerating_stale`] for where that arises by design.
-pub async fn try_deliver(peer: &StatelessPeer, bytes: &[u8]) -> Result<Vec<DeRecEvent>, String> {
+async fn try_deliver(peer: &StatelessPeer, bytes: &[u8]) -> Result<Vec<DeRecEvent>, String> {
     let mut protocol = peer.session();
 
     let mut collected = protocol.process(bytes).await.map_err(|e| e.to_string())?;
@@ -239,50 +234,4 @@ pub async fn pump(peers: &[&StatelessPeer]) -> Vec<DeRecEvent> {
         }
     }
     all_events
-}
-
-/// Error text produced when a message arrives for a channel whose keys are
-/// gone. Matched rather than swallowed wholesale so the harness still fails on
-/// every other kind of processing error.
-const STALE_CHANNEL: &str = "unknown channel_id";
-
-/// As [`pump`], but counting — rather than failing on — replies that arrive
-/// for a channel the recipient has already torn down.
-///
-/// `restore()` forces `UnpairAck::NotRequired` when it scraps the
-/// recovery-mode channels, deliberately: waiting for acknowledgements would
-/// leave those channels alive and indistinguishable from canonical ones, and
-/// the next publish would double-send to every helper. The consequence is that
-/// each helper still answers, and those answers reach an owner that no longer
-/// holds the key.
-///
-/// A deployed service must absorb exactly this, so the harness does too —
-/// while returning the count, so the test can assert it saw the number of
-/// stale replies it expected and no more.
-pub async fn pump_tolerating_stale(peers: &[&StatelessPeer]) -> (Vec<DeRecEvent>, usize) {
-    let mut all_events = Vec::new();
-    let mut stale = 0usize;
-    loop {
-        let mut in_flight: Vec<(usize, Vec<u8>)> = Vec::new();
-        for peer in peers.iter() {
-            for (endpoint, bytes) in peer.drain() {
-                let dest = peers
-                    .iter()
-                    .position(|p| p.uri == endpoint.uri)
-                    .unwrap_or_else(|| panic!("no peer for destination uri {}", endpoint.uri));
-                in_flight.push((dest, bytes));
-            }
-        }
-        if in_flight.is_empty() {
-            break;
-        }
-        for (dest, bytes) in in_flight {
-            match try_deliver(peers[dest], &bytes).await {
-                Ok(events) => all_events.extend(events),
-                Err(e) if e.contains(STALE_CHANNEL) => stale += 1,
-                Err(e) => panic!("[{}] process() failed: {e}", peers[dest].label),
-            }
-        }
-    }
-    (all_events, stale)
 }

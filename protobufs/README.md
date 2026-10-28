@@ -234,7 +234,7 @@ significant, and all three kinds of change below affect the encoding.
 | --- | --- | --- |
 | `secretId` | *(absent — read from the enclosing `DeRecMessage`)* | `uint64` = 3 |
 | `version` | `int32` = 3 | `uint32` = 4 |
-| `keepList` | `repeated int32` = 4 | `repeated uint32` = 5 |
+| `keepList` → `keepVersion` | `repeated int32` = 4 | `uint32` = 5 |
 | `versionDescription` | = 5 | = 6 |
 | `timestamp` | = 6 | = 7 |
 
@@ -256,6 +256,25 @@ neither a version nor a retained-version list is ever negative.
 `replyTo` (8) and `replicaId` (9) on the request, and `replicaId` (5) on the
 response, were added afterwards in free slots and are backward compatible:
 both are `optional`, and a reader that does not know them ignores them.
+
+### `DeRecShare` schema revision
+
+In 0.0.9 a share became a list of subshares instead of a single
+`(x, y)` pair: a helper holds one or more subshares, and the number of subshares
+is its weight. The fields were renumbered with no gaps, so a `DeRecShare`
+written by an earlier release does not decode.
+
+| field | before | now |
+| --- | --- | --- |
+| `encryptedSecret` | `bytes` = 1 | `bytes` = 1 |
+| `x` | `bytes` = 2 | *(removed)* |
+| `y` | `bytes` = 3 | *(removed)* |
+| `subshares` | *(absent)* | `repeated Subshare` = 2 |
+| `secretId` | `uint64` = 4 | `uint64` = 3 |
+| `version` | `uint32` = 5 | `uint32` = 4 |
+
+`Subshare` carries `x` = 1 and `y` = 2, each a BW6-761 scalar-field
+element in arkworks compressed serialization (48 bytes, little-endian).
 
 ---
 

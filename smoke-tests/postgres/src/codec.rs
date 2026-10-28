@@ -104,13 +104,34 @@ pub fn assemble_user_secrets(
     description: Option<String>,
     payload: Vec<u8>,
     author_replica_id: Option<u64>,
+    threshold: Option<u32>,
 ) -> UserSecrets {
     UserSecrets {
         version,
         description,
         secrets: decode_user_secrets_payload(&payload),
         author_replica_id,
+        threshold,
     }
+}
+
+/// `Share::subshares` ↔ the nullable `subshares` column. `None` is NULL.
+pub fn subshares_to_sql(value: Option<u32>) -> Option<i64> {
+    value.map(i64::from)
+}
+
+pub fn sql_to_subshares(value: Option<i64>) -> Option<u32> {
+    value.map(|count| u32::try_from(count).expect("subshares column holds a u32"))
+}
+
+/// `Share::threshold` / `UserSecrets::threshold` ↔ the nullable `threshold`
+/// column. `None` is NULL.
+pub fn threshold_to_sql(value: Option<u32>) -> Option<i64> {
+    value.map(i64::from)
+}
+
+pub fn sql_to_threshold(value: Option<i64>) -> Option<u32> {
+    value.map(|t| u32::try_from(t).expect("threshold column holds a u32"))
 }
 
 /// Integer tags for the two enums projected into indexed columns.

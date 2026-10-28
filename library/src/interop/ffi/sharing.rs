@@ -18,6 +18,14 @@
 //!   [share_len: u32 LE]
 //!   [serialized CommittedDeRecShare protobuf]
 //! ```
+//!
+//! # Weighted channels
+//!
+//! [`protect_secret`] takes the channels to share with as two aligned arrays
+//! of `channels_len` entries: `channels_ptr[i]` is a channel ID and
+//! `weights_ptr[i]` its weight, the number of subshares that channel's share
+//! carries. Every channel is listed with its weight; an ordinary Helper has
+//! weight `1`. When `channels_len > 0` both pointers must be non-null.
 
 use crate::{
     interop::ffi::common::{
@@ -28,7 +36,7 @@ use crate::{
         DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_BAD_UTF8,
         DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error, success,
     },
-    types::ChannelId,
+    types::{ChannelId, WeightedChannel},
 };
 use derec_proto::{
     CommittedDeRecShare, DeRecMessage, StoreShareRequestMessage, StoreShareResponseMessage,
@@ -84,15 +92,25 @@ pub struct ProcessStoreShareResponseMessageResult {
     pub error: DeRecError,
 }
 
+/// Splits `secret_data` into one committed share per weighted channel; see
+/// [`crate::primitives::sharing::request::split`] for the weight and threshold
+/// rules. Channels are given as the aligned `channels_ptr` / `weights_ptr`
+/// arrays described in the module-level "Weighted channels" section; the
+/// result does not depend on the order they are listed in.
+///
 /// # Safety
 ///
-/// Non-null input pointers must point to the corresponding readable byte ranges.
+/// Non-null input pointers must point to the corresponding readable ranges:
+/// `secret_data_len` bytes, and `channels_len` entries for each of
+/// `channels_ptr` and `weights_ptr`.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn protect_secret(
     secret_id: u64,
     secret_data_ptr: *const u8,
     secret_data_len: usize,
     channels_ptr: *const u64,
+    weights_ptr: *const u32,
     channels_len: usize,
     threshold: usize,
     version: u32,
@@ -106,18 +124,13 @@ pub extern "C" fn protect_secret(
         Ok(b) => b,
         Err(e) => return with_err(e),
     };
-    if channels_ptr.is_null() && channels_len > 0 {
-        return with_err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "channels_ptr is null"));
-    }
-    let channel_ids: Vec<ChannelId> = if channels_len == 0 {
-        vec![]
-    } else {
-        let raw = unsafe { std::slice::from_raw_parts(channels_ptr, channels_len) };
-        raw.iter().map(|&id| ChannelId(id)).collect()
+    let channels = match parse_weighted_channels(channels_ptr, weights_ptr, channels_len) {
+        Ok(c) => c,
+        Err(e) => return with_err(e),
     };
 
     match crate::primitives::sharing::request::split(
-        &channel_ids,
+        &channels,
         secret_id,
         version,
         secret_data,
@@ -142,8 +155,7 @@ pub extern "C" fn produce_store_share_request_message(
     secret_id: u64,
     committed_share_ptr: *const u8,
     committed_share_len: usize,
-    keep_list_ptr: *const u32,
-    keep_list_len: usize,
+    keep_version: u32,
     description_ptr: *const u8,
     description_len: usize,
     shared_key_ptr: *const u8,
@@ -169,14 +181,6 @@ pub extern "C" fn produce_store_share_request_message(
     ) {
         Ok(b) => b,
         Err(e) => return with_err(e),
-    };
-    if keep_list_ptr.is_null() && keep_list_len > 0 {
-        return with_err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "keep_list_ptr is null"));
-    }
-    let keep_list: &[u32] = if keep_list_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(keep_list_ptr, keep_list_len) }
     };
     let description_bytes = match parse_buffer(description_ptr, description_len, "description_ptr")
     {
@@ -217,7 +221,7 @@ pub extern "C" fn produce_store_share_request_message(
         version,
         secret_id,
         &committed_share,
-        keep_list,
+        keep_version,
         description,
         &shared_key,
         &reply_to,
@@ -431,6 +435,31 @@ fn serialize_committed_shares(shares: &HashMap<ChannelId, CommittedDeRecShare>) 
     out
 }
 
+/// Pairs each channel ID with its weight from the two aligned arrays
+/// described in the module-level "Weighted channels" section.
+fn parse_weighted_channels(
+    channels_ptr: *const u64,
+    weights_ptr: *const u32,
+    len: usize,
+) -> Result<Vec<WeightedChannel>, DeRecError> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if channels_ptr.is_null() {
+        return Err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "channels_ptr is null"));
+    }
+    if weights_ptr.is_null() {
+        return Err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "weights_ptr is null"));
+    }
+    let channels = unsafe { std::slice::from_raw_parts(channels_ptr, len) };
+    let weights = unsafe { std::slice::from_raw_parts(weights_ptr, len) };
+    Ok(channels
+        .iter()
+        .zip(weights)
+        .map(|(&channel_id, &weight)| (ChannelId(channel_id), weight))
+        .collect())
+}
+
 fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], DeRecError> {
     if ptr.is_null() && len > 0 {
         return Err(ffi_error(
@@ -453,4 +482,97 @@ fn parse_shared_key(ptr: *const u8, len: usize) -> Result<[u8; 32], DeRecError> 
             "shared_key must be exactly 32 bytes",
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interop::ffi::common::derec_free_buffer;
+    use derec_proto::DeRecShare;
+
+    /// Decodes the committed-shares container into each channel's subshare count.
+    fn subshare_counts(result: ProtectSecretResult) -> HashMap<u64, usize> {
+        assert_eq!(result.error.code, 0, "protect_secret should succeed");
+        let buffer = result.shares_wire_bytes;
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) }.to_vec();
+        derec_free_buffer(buffer.ptr, buffer.len);
+
+        let read_u32 = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let read_u64 = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let count = read_u32(0) as usize;
+        let mut offset = 4;
+        let mut counts = HashMap::new();
+        for _ in 0..count {
+            let channel_id = read_u64(offset);
+            let share_len = read_u32(offset + 8) as usize;
+            offset += 12;
+            let committed = CommittedDeRecShare::decode(&bytes[offset..offset + share_len])
+                .expect("committed share should decode");
+            offset += share_len;
+            let share =
+                DeRecShare::decode(&committed.de_rec_share[..]).expect("inner share should decode");
+            counts.insert(channel_id, share.subshares.len());
+        }
+        counts
+    }
+
+    fn protect(channels: &[u64], weights: &[u32], threshold: usize) -> ProtectSecretResult {
+        let secret = b"super_secret_value";
+        protect_secret(
+            42,
+            secret.as_ptr(),
+            secret.len(),
+            channels.as_ptr(),
+            weights.as_ptr(),
+            channels.len(),
+            threshold,
+            1,
+        )
+    }
+
+    #[test]
+    fn protect_secret_with_unit_weights_gives_each_channel_one_subshare() {
+        let counts = subshare_counts(protect(&[1, 2, 3], &[1, 1, 1], 2));
+        assert_eq!(counts, HashMap::from([(1, 1), (2, 1), (3, 1)]));
+    }
+
+    #[test]
+    fn protect_secret_gives_a_weighted_channel_its_subshares() {
+        let counts = subshare_counts(protect(&[3, 1, 2], &[2, 1, 1], 3));
+        assert_eq!(counts, HashMap::from([(1, 1), (2, 1), (3, 2)]));
+    }
+
+    #[test]
+    fn protect_secret_rejects_a_null_weights_pointer_with_a_length() {
+        let secret = b"super_secret_value";
+        let channels = [1u64, 2, 3];
+        let result = protect_secret(
+            42,
+            secret.as_ptr(),
+            secret.len(),
+            channels.as_ptr(),
+            std::ptr::null(),
+            channels.len(),
+            2,
+            1,
+        );
+        assert_eq!(result.error.code, DEREC_CODE_FFI_NULL_PTR);
+    }
+
+    #[test]
+    fn protect_secret_rejects_a_null_channels_pointer_with_a_length() {
+        let secret = b"super_secret_value";
+        let weights = [1u32, 1, 1];
+        let result = protect_secret(
+            42,
+            secret.as_ptr(),
+            secret.len(),
+            std::ptr::null(),
+            weights.as_ptr(),
+            weights.len(),
+            2,
+            1,
+        );
+        assert_eq!(result.error.code, DEREC_CODE_FFI_NULL_PTR);
+    }
 }

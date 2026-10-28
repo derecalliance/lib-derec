@@ -31,6 +31,25 @@ import "github.com/derecalliance/lib-derec/packages/go/internal/native"
 // import the binding without an import cycle.
 type Error = native.Error
 
+// ShareStoreRefusal is the reason a ShareStoreRefusedError refuses a
+// protocol.ShareStore Save or RecordVerification call. Declared in the
+// internal binding (alongside Error, for the same reason) so this package
+// can alias it without an import cycle; package protocol re-aliases it in
+// turn.
+type ShareStoreRefusal = native.ShareStoreRefusal
+
+const (
+	RefusalTooFrequent       = native.RefusalTooFrequent
+	RefusalSizeLimitExceeded = native.RefusalSizeLimitExceeded
+	RefusalRejected          = native.RefusalRejected
+)
+
+// ShareStoreRefusedError is returned from a protocol.ShareStore's Save or
+// RecordVerification method to refuse the write or verification with
+// Refusal, rather than reporting an ordinary backend failure. The library
+// maps each Refusal to the matching protocol status answered to the owner.
+type ShareStoreRefusedError = native.ShareStoreRefusedError
+
 // Categories identify the protocol phase or layer that produced an [Error].
 // They mirror the DEREC_CATEGORY_* constants in library/src/interop/ffi/error.rs.
 const (
@@ -77,6 +96,10 @@ const (
 	// is the application's, so this is a configuration fault: assign a
 	// distinct id and pair again.
 	CodeReplicaIDConflict int32 = 16
+	// CodeFingerprintMismatch: VerifyFingerprint was given a fingerprint that
+	// does not match the channel key — a possible man-in-the-middle. A
+	// Pending pairing has been revoked; pair again.
+	CodeFingerprintMismatch int32 = 17
 
 	CodeEncryption             int32 = 20
 	CodeKeygen                 int32 = 21
@@ -91,12 +114,32 @@ const (
 	CodeMissingReplicaID           int32 = 45
 	CodeUnexpectedReplicaID        int32 = 46
 	CodeIncompatibleParameterRange int32 = 47
+	// CodeFingerprintCommitmentMismatch: the fingerprint nonce in a pairing
+	// response does not open the commitment the contact creator published
+	// with its keys, so the response or the keys did not come from the
+	// party that made the commitment — a possible man-in-the-middle. The
+	// pairing does not complete.
+	CodeFingerprintCommitmentMismatch int32 = 48
 
 	CodeEmptyChannels      int32 = 60
 	CodeDuplicateChannelID int32 = 61
 	CodeInvalidThreshold   int32 = 62
 	CodeEmptySecretData    int32 = 63
 	CodeVSSShareFailed     int32 = 64
+	// CodeInvalidWeight: a weight given to start(ProtectSecret) or
+	// Sharing.Request.Split is invalid. Every weight must satisfy
+	// 1 <= weight < threshold and name a channel the secret is being
+	// shared with.
+	CodeInvalidWeight int32 = 65
+	// CodeTooManySubshares: a sharing round's weights total more subshares
+	// than the cap set with protocol.Config.MaxSubshares. Raised by
+	// Start(ProtectSecret) before anything is sent.
+	CodeTooManySubshares int32 = 66
+	// CodeInvalidKeepVersion: the keepVersion of a sharing round is equal
+	// to or greater than the version being shared (0 keeps no other
+	// version and is always valid). Raised by Start(ProtectSecret), and by
+	// Sharing.Request.Produce, before anything is sent.
+	CodeInvalidKeepVersion int32 = 67
 
 	CodeEmptyResponses            int32 = 80
 	CodeEmptyCommittedDeRecShare  int32 = 81

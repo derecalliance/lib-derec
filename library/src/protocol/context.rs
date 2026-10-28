@@ -35,8 +35,8 @@ pub(crate) struct Local<'a> {
     /// `DeRecProtocol::replica_id`.
     pub(crate) replica_id: Option<u64>,
     /// Every endpoint this device advertises, in preference order. Never
-    /// empty — the typestate builder cannot reach `build()` with the slot
-    /// unfilled.
+    /// empty — `build()` refuses a builder with none, and
+    /// `set_own_transports` refuses an empty list.
     pub(crate) own_transports: &'a [TransportProtocol],
     /// Which peer-supplied endpoint schemes this device will accept.
     pub(crate) policy: TransportPolicy,
@@ -44,6 +44,15 @@ pub(crate) struct Local<'a> {
     /// at pairing, and published as this device's own row in the replica
     /// roster.
     pub(crate) communication_info: &'a HashMap<String, String>,
+    /// The limits this device enforces as a helper.
+    ///
+    /// `None` means no check: every share size is accepted. `Some(range)`
+    /// is this device's own configured [`derec_proto::ParameterRange`];
+    /// only its `min_share_size`/`max_share_size` fields are enforced here,
+    /// against the bytes of an incoming `StoreShareRequest`. The frequency
+    /// fields are checked for overlap at pairing but enforced by the
+    /// application's share store, not read from this field.
+    pub(crate) parameter_range: Option<&'a derec_proto::ParameterRange>,
 }
 
 impl Local<'_> {
@@ -83,6 +92,11 @@ pub(crate) struct Exchange<'a> {
     /// outbound envelope. It is the same token either way, and carrying it
     /// here is what stops a new call site from forgetting it.
     pub(crate) trace_id: u64,
+    /// The response the exchange's request is owed, when it is a request.
+    /// Every response to it is sent through
+    /// [`deliver`](crate::protocol::obligation::deliver) with this, so it is
+    /// answered once.
+    pub(crate) obligation: Option<&'a crate::protocol::obligation::Obligation>,
 }
 
 /// What one [`DeRecProtocol::start`](crate::protocol::DeRecProtocol::start)
@@ -132,6 +146,7 @@ macro_rules! local {
             own_transports: &$protocol.own_transports,
             policy: $crate::transport::TransportPolicy::new($protocol.unsafe_connection),
             communication_info: &$protocol.communication_info,
+            parameter_range: $protocol.parameter_range.as_ref(),
         }
     };
 }

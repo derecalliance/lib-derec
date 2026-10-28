@@ -56,8 +56,15 @@ impl<
     /// Verify that a fingerprint matches the one derived from a channel's shared key.
     ///
     /// If the fingerprint matches, the channel status is updated from `Pending`
-    /// to `Paired`, enabling it to process protocol messages. Returns `true` on
-    /// match, `false` otherwise. Returns an error if the channel has no shared key.
+    /// to `Paired`, enabling it to process protocol messages. Returns an error
+    /// if the channel has no shared key.
+    ///
+    /// A mismatch fails with [`Error::FingerprintMismatch`]: the two sides
+    /// hold different keys, which is what a man-in-the-middle on the pairing
+    /// produces. The comparison is authoritative, so a `Pending` pairing is
+    /// revoked — its records, its channel key and its pairing material are
+    /// deleted, and pairing again is the only way forward. A channel already
+    /// `Paired` is left as it is; removing it is an unpair.
     ///
     /// This is the confirmation step for both gated cases: every replica
     /// pairing, and every [`derec_proto::ContactMode::NoKeys`] pairing —
@@ -70,7 +77,8 @@ impl<
     /// the group's vault: once the channel is `Paired`, the source's publish
     /// is installed into this device's stores as it arrives, with no further
     /// prompt. Ask the user whether to adopt before calling this; to decline,
-    /// never confirm, and the channel stays `Pending` and is never used.
+    /// never confirm: the channel stays `Pending`, is never used, and is
+    /// removed with its key by expired-channel cleanup.
     ///
     /// A match promotes every row on the channel, not just the peer that was
     /// confirmed: on a group channel that is every member and this device's
@@ -84,16 +92,26 @@ impl<
     /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret). A device holding no snapshot still
     /// publishes an empty one to a promoted Destination, since the payload
     /// carries the roster; a promoted helper, for which an empty payload is
-    /// inert, is sent nothing.
+    /// inert, is sent nothing. That publish reuses every Helper's stored
+    /// weight, and a newly promoted Helper is at `1`. A stored weight that is
+    /// invalid under the round's threshold fails it with
+    /// [`SharingError::InvalidWeight`](crate::primitives::sharing::SharingError::InvalidWeight)
+    /// before anything is sent, and this returns that error. The promotion
+    /// has already been saved and stands, so calling `verify_fingerprint`
+    /// again returns `Ok(())` and publishes nothing: the promoted peer
+    /// receives nothing until
+    /// `start(`[`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret)`)`
+    /// runs with valid weights.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(channel_id = channel_id.0)))]
     pub async fn verify_fingerprint(
         &mut self,
         channel_id: ChannelId,
         fingerprint: &str,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let local = self.get_fingerprint(channel_id).await?;
         if local != fingerprint {
-            return Ok(false);
+            self.revoke_pending_pairing(channel_id).await?;
+            return Err(Error::FingerprintMismatch { channel_id });
         }
 
         let mut transitioned_helper = false;
@@ -165,6 +183,8 @@ impl<
                 self.start_protect_secret(
                     secrets,
                     description,
+                    None,
+                    None,
                     &Round {
                         reply_to: &reply_to,
                         trace_id: crate::derec_message::fresh_trace_id(),
@@ -174,7 +194,53 @@ impl<
             }
         }
 
-        Ok(true)
+        Ok(())
+    }
+
+    /// Delete the unconfirmed pairing on `channel_id`: its `Pending` helper
+    /// record or peer rows, then, once nothing else is recorded there, this
+    /// device's own `Pending` row, the channel key and the pairing material.
+    /// `Paired` records are left in place.
+    async fn revoke_pending_pairing(&mut self, channel_id: ChannelId) -> Result<()> {
+        use crate::protocol::types::{ChannelQuery, ChannelStatus, ReplicaFilter};
+
+        if self
+            .channel_store
+            .load(self.secret_id, ChannelQuery::Helper { channel_id })
+            .await?
+            .and_then(|r| r.as_helper().cloned())
+            .is_some_and(|helper| helper.status == ChannelStatus::Pending)
+        {
+            self.channel_store
+                .remove(self.secret_id, ChannelQuery::Helper { channel_id })
+                .await?;
+        }
+
+        let peers = self
+            .channel_store
+            .replicas_matching(
+                self.secret_id,
+                ReplicaFilter {
+                    status: vec![ChannelStatus::Pending],
+                    exclude: self.exclude_self(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        for peer in peers.into_iter().filter(|m| m.channel_id == channel_id) {
+            self.channel_store
+                .remove(
+                    self.secret_id,
+                    ChannelQuery::Replica {
+                        channel_id,
+                        replica_id: peer.replica_id,
+                    },
+                )
+                .await?;
+        }
+
+        self.release_if_unused(channel_id).await?;
+        Ok(())
     }
 
     /// The scheme policy this protocol applies to every transport endpoint
@@ -190,7 +256,7 @@ impl<
 mod tests {
     use super::*;
     use crate::protocol::builder::DeRecProtocolBuilder;
-    use crate::protocol::test::{
+    use crate::protocol::tests::{
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
@@ -224,6 +290,7 @@ mod tests {
                     status,
                     created_at: now_secs(),
                     peer_role: derec_proto::SenderKind::Helper,
+                    weight: 1,
                 }),
             )
             .await
@@ -289,13 +356,10 @@ mod tests {
                 .await
                 .expect("fingerprint derives from the shared key");
 
-            assert!(
-                protocol
-                    .verify_fingerprint(CHANNEL, &fingerprint)
-                    .await
-                    .expect("verify_fingerprint"),
-                "a matching fingerprint must verify"
-            );
+            protocol
+                .verify_fingerprint(CHANNEL, &fingerprint)
+                .await
+                .expect("a matching fingerprint must verify");
 
             let mut check = channels.clone();
             assert_eq!(
@@ -306,10 +370,18 @@ mod tests {
         });
     }
 
-    /// A mismatch is the MITM case the gate exists for: the channel stays
-    /// inert so nothing can be shared over it.
+    fn has_key(secrets: &InMemSecretStore, channel_id: ChannelId) -> bool {
+        secrets.data.lock().unwrap().contains_key(&(
+            SECRET_ID,
+            channel_id.0,
+            SecretKind::SharedKey as u8,
+        ))
+    }
+
+    /// A mismatch is the man-in-the-middle case the gate exists for: the
+    /// pairing is revoked, so no record and no key of it remain.
     #[test]
-    fn a_wrong_fingerprint_leaves_the_helper_pending() {
+    fn a_wrong_fingerprint_revokes_the_pending_helper() {
         run_async(async {
             let channels = InMemChannelStore::default();
             let secrets = InMemSecretStore::default();
@@ -317,20 +389,86 @@ mod tests {
             seed_pending_helper(&mut seeded_ch, &mut seeded_se, ChannelStatus::Pending).await;
 
             let mut protocol = build(channels.clone(), secrets.clone());
-            assert!(
-                !protocol
-                    .verify_fingerprint(CHANNEL, "not-the-fingerprint")
-                    .await
-                    .expect("verify_fingerprint"),
-                "a mismatched fingerprint must not verify"
-            );
+            let err = protocol
+                .verify_fingerprint(CHANNEL, "not-the-fingerprint")
+                .await
+                .expect_err("a mismatched fingerprint must not verify");
 
-            let mut check = channels.clone();
-            assert_eq!(
-                status_of(&mut check).await,
-                ChannelStatus::Pending,
-                "a failed comparison must leave the channel inert"
+            assert!(
+                matches!(err, Error::FingerprintMismatch { channel_id } if channel_id == CHANNEL),
+                "{err:?}"
             );
+            assert!(channels.helper_rows.lock().unwrap().is_empty());
+            assert!(!has_key(&secrets, CHANNEL));
+        });
+    }
+
+    /// A replica pairing is revoked the same way: the peer's row, this
+    /// device's own `Pending` row, and the key they shared.
+    #[test]
+    fn a_wrong_fingerprint_revokes_a_pending_replica_pairing() {
+        run_async(async {
+            use crate::protocol::types::{ReplicaMember, ReplicaRole};
+            const OWN: u64 = 9;
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let mut seeded = channels.clone();
+            for (id, role) in [(7, ReplicaRole::Source), (OWN, ReplicaRole::Destination)] {
+                seeded
+                    .save(
+                        SECRET_ID,
+                        ChannelRecord::Replica(ReplicaMember {
+                            channel_id: CHANNEL,
+                            replica_id: crate::types::ReplicaId(id),
+                            transports: vec![endpoint()],
+                            communication_info: std::collections::HashMap::new(),
+                            role,
+                            status: ChannelStatus::Pending,
+                            created_at: now_secs(),
+                        }),
+                    )
+                    .await
+                    .expect("seed member");
+            }
+            secrets
+                .clone()
+                .save(SECRET_ID, CHANNEL, SecretValue::SharedKey([7u8; 32]))
+                .await
+                .expect("seed shared key");
+
+            let mut protocol = build(channels.clone(), secrets.clone());
+            protocol.replica_id = Some(OWN);
+            let err = protocol
+                .verify_fingerprint(CHANNEL, "not-the-fingerprint")
+                .await
+                .expect_err("a mismatched fingerprint must not verify");
+
+            assert!(matches!(err, Error::FingerprintMismatch { .. }), "{err:?}");
+            assert!(channels.member_rows.lock().unwrap().is_empty());
+            assert!(!has_key(&secrets, CHANNEL));
+        });
+    }
+
+    /// A working channel is not torn down by a comparison: removing a paired
+    /// peer is an unpair, which tells the peer.
+    #[test]
+    fn a_wrong_fingerprint_leaves_a_paired_channel_in_place() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let (mut seeded_ch, mut seeded_se) = (channels.clone(), secrets.clone());
+            seed_pending_helper(&mut seeded_ch, &mut seeded_se, ChannelStatus::Paired).await;
+
+            let mut protocol = build(channels.clone(), secrets.clone());
+            let err = protocol
+                .verify_fingerprint(CHANNEL, "not-the-fingerprint")
+                .await
+                .expect_err("a mismatched fingerprint must not verify");
+
+            assert!(matches!(err, Error::FingerprintMismatch { .. }), "{err:?}");
+            let mut check = channels.clone();
+            assert_eq!(status_of(&mut check).await, ChannelStatus::Paired);
+            assert!(has_key(&secrets, CHANNEL));
         });
     }
 
@@ -350,12 +488,10 @@ mod tests {
                 .get_fingerprint(CHANNEL)
                 .await
                 .expect("fingerprint");
-            assert!(
-                protocol
-                    .verify_fingerprint(CHANNEL, &fingerprint)
-                    .await
-                    .expect("verify_fingerprint")
-            );
+            protocol
+                .verify_fingerprint(CHANNEL, &fingerprint)
+                .await
+                .expect("verify_fingerprint");
 
             let mut check = channels.clone();
             assert_eq!(status_of(&mut check).await, ChannelStatus::Paired);
@@ -363,11 +499,11 @@ mod tests {
     }
 
     /// The publish a confirmation triggers is an ordinary sharing round, so
-    /// the application's keep list governs it like any other.
+    /// the application's `keepVersion` governs it like any other.
     #[test]
-    fn the_confirmation_publish_sends_the_app_keep_list() {
+    fn the_confirmation_publish_sends_the_app_keep_version() {
         run_async(async {
-            use crate::protocol::test::RecordingTransport;
+            use crate::protocol::tests::RecordingTransport;
             const OTHER: ChannelId = ChannelId(78);
             let mut channels = InMemChannelStore::default();
             let mut secrets = InMemSecretStore::default();
@@ -382,6 +518,7 @@ mod tests {
                         status: ChannelStatus::Paired,
                         created_at: now_secs(),
                         peer_role: derec_proto::SenderKind::Helper,
+                        weight: 1,
                     }),
                 )
                 .await
@@ -399,12 +536,13 @@ mod tests {
                         secrets: Vec::new(),
                         description: None,
                         author_replica_id: None,
+                        threshold: None,
                     },
                 )
                 .await
                 .expect("seed snapshot");
             let shares = InMemShareStore::default();
-            *shares.keep.lock().unwrap() = Some(vec![2]);
+            *shares.keep.lock().unwrap() = Some(2);
             let transport = RecordingTransport::default();
 
             let mut protocol = DeRecProtocolBuilder::new(SECRET_ID)
@@ -422,28 +560,26 @@ mod tests {
                 .get_fingerprint(CHANNEL)
                 .await
                 .expect("fingerprint");
-            assert!(
-                protocol
-                    .verify_fingerprint(CHANNEL, &fingerprint)
-                    .await
-                    .expect("verify_fingerprint")
-            );
+            protocol
+                .verify_fingerprint(CHANNEL, &fingerprint)
+                .await
+                .expect("verify_fingerprint");
 
             assert_eq!(
-                *shares.keep_list_calls.lock().unwrap(),
+                *shares.keep_version_calls.lock().unwrap(),
                 vec![(SECRET_ID, 5)]
             );
-            let keep_lists: Vec<Vec<u32>> = transport
+            let keep_versions: Vec<u32> = transport
                 .sent_envelopes()
                 .iter()
                 .map(|envelope| {
                     crate::primitives::sharing::request::extract(envelope, &[7u8; 32])
                         .expect("extract store-share request")
                         .request
-                        .keep_list
+                        .keep_version
                 })
                 .collect();
-            assert_eq!(keep_lists, vec![vec![2, 5], vec![2, 5]]);
+            assert_eq!(keep_versions, vec![2, 2]);
         });
     }
 }

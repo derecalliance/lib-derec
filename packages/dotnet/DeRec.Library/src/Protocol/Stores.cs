@@ -32,9 +32,13 @@ public enum ChannelStatus
     Paired,
 
     /// <summary>
-    /// A replica-group member that has been told to leave and is awaiting
-    /// the roster version that completes its removal. Never set on a helper
-    /// channel.
+    /// Being torn down. A helper channel is <c>Unpairing</c> from the moment
+    /// an unpair that awaits acknowledgement is sent until the helper answers
+    /// or the acknowledgement window elapses; a rejection returns it to
+    /// <c>Paired</c>. A replica-group member is <c>Unpairing</c> once told to
+    /// leave, until the roster version that completes its removal. Not a
+    /// publish target, not a recovery source, and not a target of any new
+    /// request, but inbound messages on it are still processed.
     /// </summary>
     Unpairing,
 }
@@ -100,13 +104,22 @@ internal sealed class ReplicaRoleJsonConverter : JsonConverter<ReplicaRole>
 /// helper-pairing held by an Owner carries <c>Helper</c> here, and the
 /// Helper's own row for the same channel carries <c>Owner</c>.
 /// </param>
+/// <param name="Weight">
+/// The number of Shamir subshares this helper receives: the weight the last
+/// <c>ProtectSecret</c> resolved for it, reused by every publish the library
+/// starts on its own. Written by the library; read it here to pre-fill an
+/// edit of the weights, since a <c>ProtectSecret</c> weights map replaces
+/// every helper's weight. <c>1</c> for a new pairing. The core reads a record
+/// stored without it, or with <c>0</c>, as <c>1</c>.
+/// </param>
 public sealed record HelperChannel(
     ulong ChannelId,
     IReadOnlyList<TransportProtocol> Transports,
     Dictionary<string, string> CommunicationInfo,
     ChannelStatus Status,
     ulong CreatedAt,
-    Pairing.SenderKind PeerRole);
+    Pairing.SenderKind PeerRole,
+    uint Weight = 1);
 
 /// <summary>
 /// One member of a replica group, including this device itself.
@@ -362,8 +375,24 @@ public interface ISecretStore
 /// a helper is the owner's id — it is <b>not</b> the partition the row is
 /// keyed under. See <see cref="IShareStore.Save"/>.
 /// </para>
+/// <para>
+/// <see cref="Subshares"/> is the number of subshares the share carries,
+/// recorded on the owner side only: the library sets it on every share the
+/// owner saves (including a replica Destination's mirrored copies) and
+/// leaves it <c>null</c> on a helper's share. Owner shares stored before the
+/// field existed read back as <c>null</c>; the library never backfills them.
+/// Persist it as given and return it unchanged.
+/// </para>
+/// <para>
+/// <see cref="Threshold"/> is the threshold this version was split with,
+/// recorded on the owner side only, on the same shares as
+/// <see cref="Subshares"/>: a later round may change the threshold, so this is
+/// the only record of the one an older version needs to be recoverable. It is
+/// <c>null</c> on a helper's share and on owner shares stored before the field
+/// existed. Persist it as given and return it unchanged.
+/// </para>
 /// </summary>
-public sealed record Share(ulong SecretId, uint Version, byte[] Bytes);
+public sealed record Share(ulong SecretId, uint Version, byte[] Bytes, uint? Subshares = null, uint? Threshold = null);
 
 /// <summary>
 /// Share-record persistence. Same per-call-isolation contract as
@@ -413,33 +442,77 @@ public interface IShareStore
     /// <paramref name="versions"/>. Idempotent: a version that is not stored
     /// is skipped, and an empty array is a no-op.
     /// <para>
-    /// A helper calls this to apply <c>StoreShareRequestMessage.keepList</c>,
-    /// the complete set of versions the owner wants retained: every stored
-    /// version outside it is removed once the incoming share is persisted.
+    /// A helper calls this to apply <c>StoreShareRequestMessage.keepVersion</c>:
+    /// once the incoming share is persisted, every version stored on the
+    /// channel other than the incoming one and <c>keepVersion</c> is removed.
     /// Shares under other channels or partitions must be left untouched.
     /// </para>
     /// </summary>
     void RemoveVersions(ulong secretId, ulong channelId, uint[] versions);
     /// <summary>
-    /// Owner only: the versions every helper keeps after the owner
+    /// Owner only: the one older version every helper keeps after the owner
     /// distributes <paramref name="version"/>. Called once per sharing
     /// round, before anything is sent, including the rounds the library
-    /// starts itself; the answer becomes <c>keepList</c> for every helper.
+    /// starts itself; the answer becomes <c>keepVersion</c> for every helper.
     /// <para>
-    /// Return <c>null</c> to send no <c>keepList</c> (it goes out empty):
-    /// helpers then keep every version they hold. An application that
-    /// wants to cap how many versions helpers retain returns that cap
-    /// here. A returned list is used as is, plus
-    /// <paramref name="version"/>, which the library always adds.
-    /// Helpers delete every version that is not listed, so list every
-    /// version that could still become the latest: those that committed
-    /// (for example, whose <see cref="SharingCompleteEvent"/> reported
-    /// <c>ThresholdMet</c>) and those whose round is still open. Leave out
-    /// only versions whose round failed or that the user rolled back; a
-    /// list that leaves out too much can make the secret unrecoverable.
+    /// A helper that stores <paramref name="version"/> keeps it and the
+    /// returned version, and removes every other version it holds. Return
+    /// <c>0</c> to keep no other version. An answer equal to or greater than
+    /// <paramref name="version"/> fails the round with
+    /// <see cref="DeRecCode.InvalidKeepVersion"/> before anything is
+    /// sent.
+    /// </para>
+    /// <para>
+    /// Return the last version that is valid: the newest one whose
+    /// <see cref="SharingCompleteEvent"/> reported <c>ThresholdMet</c>. If
+    /// <paramref name="version"/> never reaches threshold, that version is
+    /// what the secret recovers from, so helpers must still hold it. A
+    /// version whose round is still open is removed from every helper that
+    /// stores <paramref name="version"/>, unless it is the one returned here.
+    /// </para>
+    /// <para>
+    /// The answer also governs this store's owner-side rows: when a helper
+    /// confirms <paramref name="version"/>, the library removes this
+    /// device's rows for that channel other than <paramref name="version"/>
+    /// and the returned version through <see cref="RemoveVersions"/>.
     /// </para>
     /// </summary>
-    uint[]? KeepList(ulong secretId, uint version);
+    uint KeepVersion(ulong secretId, uint version);
+    /// <summary>
+    /// Records that the helper has seen a verification challenge for the
+    /// share at <c>(secretId, channelId, version)</c>, called once per
+    /// accepted challenge, after the challenged share is found and before
+    /// the helper answers. Throw <see cref="ShareStoreRefusedException"/>
+    /// to refuse the verification; any other exception is an ordinary
+    /// backend failure.
+    /// </summary>
+    void RecordVerification(ulong secretId, ulong channelId, uint version);
+}
+
+/// <summary>
+/// The reason a <see cref="ShareStoreRefusedException"/> refuses a
+/// <see cref="IShareStore.Save"/> or <see cref="IShareStore.RecordVerification"/>
+/// call. The library maps each variant to the matching protocol status
+/// answered to the owner.
+/// </summary>
+public enum ShareStoreRefusal
+{
+    TooFrequent,
+    SizeLimitExceeded,
+    Rejected,
+}
+
+/// <summary>
+/// Thrown from <see cref="IShareStore.Save"/> or
+/// <see cref="IShareStore.RecordVerification"/> to refuse the write or
+/// verification with <see cref="Refusal"/>. The library turns this into the
+/// matching protocol status answered to the owner, rather than treating it
+/// as a backend failure.
+/// </summary>
+public sealed class ShareStoreRefusedException(ShareStoreRefusal refusal, string? message = null)
+    : Exception(message)
+{
+    public ShareStoreRefusal Refusal { get; } = refusal;
 }
 
 /// <summary>
@@ -461,8 +534,17 @@ public sealed record UserSecretEntry(byte[] Id, string Name, byte[] Data);
 /// Persist it with the snapshot and return it unchanged: a replica compares
 /// it against incoming copies of the same version to detect conflicts.
 /// </para>
+/// <para>
+/// <see cref="Threshold"/> is the threshold the next publish splits at unless
+/// <see cref="ProtectSecretParams.Threshold"/> passes its own. Every publish
+/// writes the threshold it used, and restore and replica hydration write the
+/// recovered roster's. <c>null</c> on a snapshot written before the threshold
+/// was recorded, or restored from a roster that carries none; the builder's
+/// <c>WithThreshold</c> then applies. Persist it as given and return it
+/// unchanged.
+/// </para>
 /// </summary>
-public sealed record UserSecrets(uint Version, UserSecretEntry[] Secrets, string? Description, ulong? AuthorReplicaId = null);
+public sealed record UserSecrets(uint Version, UserSecretEntry[] Secrets, string? Description, ulong? AuthorReplicaId = null, uint? Threshold = null);
 
 /// <summary>
 /// Persistence for the user-facing secret contents, keyed by
@@ -758,6 +840,16 @@ public sealed record StateKey(StateKind Kind, ulong? ChannelId, ulong? SecretId,
 /// index-aligned with it (only for <see cref="StateKind.PendingRecovery"/>).
 /// A row without it is read by the library as no shares collected.
 /// </param>
+/// <param name="KeepVersion">
+/// The <c>keepVersion</c> every Helper of the round received (only for
+/// <see cref="StateKind.SharingRound"/>). Null when the round sent no
+/// share.
+/// </param>
+/// <param name="Threshold">
+/// The threshold the round split at (only for
+/// <see cref="StateKind.SharingRound"/>). A row without it is judged against
+/// the builder's threshold.
+/// </param>
 /// <remarks>
 /// Fields are carried exactly as the library wrote them. A replica-id set
 /// left null is read by the library as empty.
@@ -778,7 +870,9 @@ public sealed record StateItem(
     ulong[]? BehindReplicas = null,
     uint? LocalVersion = null,
     IReadOnlyDictionary<ulong, uint>? Reported = null,
-    ulong[]? ShareChannels = null)
+    ulong[]? ShareChannels = null,
+    uint? KeepVersion = null,
+    uint? Threshold = null)
 {
     public StateKey Key() => Kind switch
     {
@@ -809,9 +903,11 @@ public sealed record StateItem(
         ulong startedAt,
         ulong[]? pendingReplicas = null,
         ulong[]? syncedReplicas = null,
-        ulong[]? behindReplicas = null) =>
+        ulong[]? behindReplicas = null,
+        uint? keepVersion = null,
+        uint? threshold = null) =>
         new(StateKind.SharingRound, null, null, version, startedAt, null, null, pending, confirmed, failed,
-            pendingReplicas, syncedReplicas, behindReplicas);
+            pendingReplicas, syncedReplicas, behindReplicas, KeepVersion: keepVersion, Threshold: threshold);
     public static StateItem PendingReplicaDiscovery(
         uint localVersion,
         ulong[] pendingReplicas,

@@ -120,6 +120,7 @@ fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
         mlkem_encapsulation_key: Some(Vec::new()),
         ecies_public_key: Some(vec![1; 33]),
         contact_binding_hash: None,
+        fingerprint_commitment: Some(vec![3; 32]),
         nonce: 1234,
         timestamp: Some(current_timestamp()),
         supported_transports: vec![TransportProtocol {
@@ -154,6 +155,7 @@ fn test_produce_pairing_request_message_empty_ecies_public_key() {
         mlkem_encapsulation_key: Some(vec![1; 32]),
         ecies_public_key: Some(Vec::new()),
         contact_binding_hash: None,
+        fingerprint_commitment: Some(vec![3; 32]),
         nonce: 1234,
         timestamp: Some(current_timestamp()),
         supported_transports: vec![TransportProtocol {
@@ -186,6 +188,7 @@ fn test_produce_pairing_request_message_empty_transport_uri() {
         channel_id: ChannelId(42).into(),
         contact_mode: derec_proto::ContactMode::InlineKeys as i32,
         contact_binding_hash: None,
+        fingerprint_commitment: Some(vec![3; 32]),
         mlkem_encapsulation_key: Some(vec![1; 32]),
         ecies_public_key: Some(vec![1; 33]),
         nonce: 1234,
@@ -585,6 +588,7 @@ fn test_process_pairing_response_message_missing_result() {
         parameter_range: None,
         timestamp: Some(current_timestamp()),
         channel_id: 0,
+        fingerprint_nonce: None,
     };
 
     let result = process_pairing_response_message(
@@ -654,6 +658,7 @@ fn test_process_pairing_response_message_result_non_ok() {
         parameter_range: None,
         timestamp: Some(current_timestamp()),
         channel_id: 0,
+        fingerprint_nonce: None,
     };
 
     let result = process_pairing_response_message(
@@ -723,6 +728,7 @@ fn test_process_pairing_response_message_invalid_status() {
         parameter_range: None,
         timestamp: Some(current_timestamp()),
         channel_id: 0,
+        fingerprint_nonce: None,
     };
 
     let result = process_pairing_response_message(
@@ -789,6 +795,7 @@ fn test_process_pairing_response_message_nonce_mismatch() {
         parameter_range: None,
         timestamp: Some(current_timestamp()),
         channel_id: 0,
+        fingerprint_nonce: None,
     };
 
     let result = process_pairing_response_message(
@@ -855,6 +862,7 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
         parameter_range: None,
         timestamp: Some(current_timestamp()),
         channel_id: 0,
+        fingerprint_nonce: None,
     };
 
     let mut invalid_contact = initiator_contact_message;
@@ -920,6 +928,7 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
         parameter_range: None,
         timestamp: Some(current_timestamp()),
         channel_id: 0,
+        fingerprint_nonce: None,
     };
 
     let mut invalid_contact = initiator_contact_message;
@@ -1705,6 +1714,7 @@ fn test_process_pre_pair_returns_keys_and_nonce_on_valid_response() {
         mlkem_encapsulation_key,
         ecies_public_key,
         nonce,
+        fingerprint_commitment,
     } = process_pre_pair(&contact, &response).expect("process_pre_pair should succeed");
 
     assert_eq!(
@@ -1713,6 +1723,10 @@ fn test_process_pre_pair_returns_keys_and_nonce_on_valid_response() {
     );
     assert_eq!(Some(&ecies_public_key), response.ecies_public_key.as_ref());
     assert_eq!(nonce, contact.nonce);
+    assert_eq!(
+        Some(&fingerprint_commitment),
+        response.fingerprint_commitment.as_ref()
+    );
 }
 
 #[test]
@@ -1941,6 +1955,7 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
     let filled_in_contact = ContactMessage {
         mlkem_encapsulation_key: Some(validated.mlkem_encapsulation_key),
         ecies_public_key: Some(validated.ecies_public_key),
+        fingerprint_commitment: Some(validated.fingerprint_commitment),
         contact_mode: ContactMode::InlineKeys as i32,
         contact_binding_hash: None,
         ..alice_contact.clone()
@@ -2017,6 +2032,7 @@ fn well_formed_inline_keys_contact() -> ContactMessage {
         mlkem_encapsulation_key: Some(vec![1; 1184]),
         ecies_public_key: Some(vec![2; 33]),
         contact_binding_hash: None,
+        fingerprint_commitment: Some(vec![3; 32]),
         nonce: 0xCAFE_BABE,
         timestamp: Some(current_timestamp()),
         supported_transports: vec![TransportProtocol {
@@ -2033,6 +2049,7 @@ fn well_formed_hashed_keys_contact() -> ContactMessage {
         mlkem_encapsulation_key: None,
         ecies_public_key: None,
         contact_binding_hash: Some(vec![0xAB; 48]),
+        fingerprint_commitment: None,
         nonce: 0xDEAD_BEEF,
         timestamp: Some(current_timestamp()),
         supported_transports: vec![TransportProtocol {
@@ -2585,6 +2602,7 @@ fn test_contact_codec_refuses_an_invalid_contact_both_ways() {
         mlkem_encapsulation_key: Some(vec![1, 2, 3]),
         ecies_public_key: Some(vec![4, 5, 6]),
         contact_binding_hash: Some(vec![7; 48]),
+        fingerprint_commitment: Some(vec![3; 32]),
         timestamp: None,
         supported_transports: vec![endpoint("https://relay.example/alice")],
     };
@@ -2686,6 +2704,57 @@ fn test_contact_creator_refuses_an_incompatible_parameter_range() {
     .expect("an overlapping range is accepted");
 }
 
+/// A requester advertising `maxShareSize = 0` (no maximum) overlaps any
+/// creator minimum, and a requester range whose `min` exceeds its non-zero
+/// `max` is refused as incompatible on that field.
+#[test]
+fn test_contact_creator_reads_zero_max_as_unbounded_and_refuses_a_malformed_range() {
+    let creator_range = share_size_range(1_000_000_000, 5_000_000_000);
+
+    let CreateContactMessageResult {
+        contact_message,
+        secret_key,
+    } = create_contact_message(
+        ChannelId(42),
+        ContactMode::InlineKeys,
+        vec![endpoint("https://relay.example/alice")],
+        None,
+    )
+    .expect("failed to create contact message");
+    let secret_key = secret_key.expect("InlineKeys contact carries key material");
+
+    let request_with = |range| {
+        produce_pairing_request_message(
+            SenderKind::Helper,
+            vec![endpoint("https://relay.example/bob")],
+            &contact_message,
+            None,
+            Some(range),
+        )
+        .expect("producing a request is not where ranges are compared")
+        .envelope
+    };
+
+    let unbounded = request_with(share_size_range(10_000_000, 0));
+    extract_pairing_request(
+        &unbounded,
+        secret_key.ecies_secret_key(),
+        Some(&creator_range),
+    )
+    .expect("a peer max of 0 is no upper bound");
+
+    let malformed = request_with(share_size_range(500_000_000, 10_000_000));
+    let refused = extract_pairing_request(
+        &malformed,
+        secret_key.ecies_secret_key(),
+        Some(&creator_range),
+    );
+    assert!(
+        is_incompatible_share_size(&refused),
+        "extract must refuse a malformed peer range"
+    );
+}
+
 /// The scanner refuses a response whose advertised range cannot overlap its
 /// own before deriving any key.
 #[test]
@@ -2756,4 +2825,243 @@ fn test_scanner_refuses_an_incompatible_parameter_range() {
         Some(&share_size_range(1_000_000_000, 2_000_000_000)),
     )
     .expect("an overlapping range is accepted");
+}
+
+fn endpoint_at(uri: &str) -> Vec<TransportProtocol> {
+    vec![TransportProtocol {
+        uri: uri.to_owned(),
+        protocol: Protocol::Https.into(),
+    }]
+}
+
+/// One `InlineKeys` handshake up to the scanner holding the decrypted pair
+/// response, plus the key the creator derived.
+fn inline_keys_handshake() -> (
+    ContactMessage,
+    PairResponseMessage,
+    derec_cryptography::pairing::PairingSecretKeyMaterial,
+    derec_cryptography::pairing::PairingSharedKey,
+) {
+    let CreateContactMessageResult {
+        contact_message: contact,
+        secret_key: creator_secret,
+    } = create_contact_message(
+        ChannelId(42),
+        ContactMode::InlineKeys,
+        endpoint_at("https://relay.example/alice"),
+        None,
+    )
+    .expect("create_contact failed");
+    let creator_secret = creator_secret.expect("inline keys contact carries key material");
+
+    let ProducePairingRequestMessageResult {
+        envelope,
+        secret_key: scanner_secret,
+        ..
+    } = produce_pairing_request_message(
+        SenderKind::Helper,
+        endpoint_at("https://relay.example/bob"),
+        &contact,
+        None,
+        None,
+    )
+    .expect("produce pair request failed");
+    let ExtractPairingRequestResult { request } =
+        extract_pairing_request(&envelope, creator_secret.ecies_secret_key(), None)
+            .expect("extract pair request failed");
+    let ProducePairingResponseMessageResult {
+        envelope,
+        shared_key,
+        ..
+    } = produce_pairing_response_message(
+        ChannelId(42),
+        &request,
+        &creator_secret,
+        None,
+        None,
+        test_policy(),
+    )
+    .expect("produce pair response failed");
+    let ExtractPairingResponseResult { response } =
+        extract_pairing_response(&envelope, scanner_secret.ecies_secret_key())
+            .expect("extract pair response failed");
+
+    (contact, response, scanner_secret, shared_key)
+}
+
+#[test]
+fn the_pair_response_reveals_the_nonce_the_contact_committed_to() {
+    let (contact, response, _, _) = inline_keys_handshake();
+
+    let nonce: [u8; 32] = response
+        .fingerprint_nonce
+        .clone()
+        .expect("an accepted response reveals the nonce")
+        .try_into()
+        .expect("the nonce is 32 bytes");
+    let opened = derec_cryptography::pairing::fingerprint_commitment(
+        contact.mlkem_encapsulation_key.as_deref().unwrap(),
+        contact.ecies_public_key.as_deref().unwrap(),
+        &nonce,
+    );
+    assert_eq!(contact.fingerprint_commitment, Some(opened.to_vec()));
+}
+
+#[test]
+fn both_sides_derive_the_channel_key_from_the_revealed_nonce() {
+    let (contact, response, scanner_secret, creator_key) = inline_keys_handshake();
+
+    let ProcessPairingResponseMessageResult { shared_key, .. } =
+        process_pairing_response_message(&contact, &response, &scanner_secret, None)
+            .expect("the honest response completes pairing");
+    assert_eq!(shared_key, creator_key);
+    assert_eq!(
+        crate::primitives::pairing::fingerprint(&shared_key),
+        crate::primitives::pairing::fingerprint(&creator_key)
+    );
+}
+
+#[test]
+fn a_pair_response_whose_nonce_does_not_open_the_commitment_is_refused() {
+    let (contact, mut response, scanner_secret, _) = inline_keys_handshake();
+    response.fingerprint_nonce.as_mut().unwrap()[0] ^= 1;
+
+    assert!(matches!(
+        process_pairing_response_message(&contact, &response, &scanner_secret, None),
+        Err(Error::Pairing(PairingError::FingerprintCommitmentMismatch))
+    ));
+}
+
+#[test]
+fn a_pair_response_without_a_fingerprint_nonce_is_refused() {
+    let (contact, mut response, scanner_secret, _) = inline_keys_handshake();
+    response.fingerprint_nonce = None;
+
+    assert!(matches!(
+        process_pairing_response_message(&contact, &response, &scanner_secret, None),
+        Err(Error::Pairing(PairingError::InvalidPairResponseMessage(
+            "pair response carries no 32-byte fingerprint_nonce"
+        )))
+    ));
+}
+
+#[test]
+fn a_hashed_keys_pre_pair_response_without_a_commitment_is_refused() {
+    let (contact, mut response) = run_pre_pair_leg(ChannelId(42));
+    response.fingerprint_commitment = None;
+
+    assert!(matches!(
+        process_pre_pair(&contact, &response),
+        Err(Error::Pairing(PairingError::InvalidPairResponseMessage(
+            "fingerprint_commitment is not a SHA-256 digest"
+        )))
+    ));
+}
+
+/// The NoKeys contact, a `PrePairRequest` for it, and the creator's answer.
+fn no_keys_pre_pair_leg() -> (ContactMessage, PrePairResponseMessage) {
+    let CreateContactMessageResult {
+        contact_message: contact,
+        ..
+    } = create_contact_message(
+        ChannelId(7),
+        ContactMode::NoKeys,
+        endpoint_at("https://relay.example/alice"),
+        Some(4321),
+    )
+    .expect("create_contact (NO_KEYS) failed");
+    let ProducePrePairResult { envelope } =
+        produce_pre_pair_request(endpoint_at("https://relay.example/bob"), &contact)
+            .expect("produce_pre_pair_request failed");
+    let PrePairExtractResult { request } =
+        extract_pre_pair(&envelope).expect("extract_pre_pair failed");
+    let answer =
+        crate::primitives::pairing::response::produce_pre_pair_no_keys(ChannelId(7), &request)
+            .expect("produce_pre_pair_no_keys failed");
+    let PrePairResponseExtractResult { response } =
+        extract_pre_pair_response(&answer.envelope).expect("extract_pre_pair_response failed");
+    (contact, response)
+}
+
+#[test]
+fn a_no_keys_pre_pair_response_without_a_commitment_is_refused() {
+    let (contact, mut response) = no_keys_pre_pair_leg();
+    response.fingerprint_commitment = None;
+
+    assert!(matches!(
+        crate::primitives::pairing::response::process_pre_pair_no_keys(&contact, &response),
+        Err(Error::Pairing(PairingError::InvalidPairResponseMessage(
+            "fingerprint_commitment is not a SHA-256 digest"
+        )))
+    ));
+}
+
+/// A relay on the PrePair leg answers the scanner with its own keys. It can
+/// copy the creator's commitment, but that commitment covers the creator's
+/// keys and opens only with the creator's nonce, which the relay never
+/// learns before it must answer. Its own nonce does not open it either.
+#[test]
+fn a_relay_cannot_pass_off_the_creators_commitment_as_its_own() {
+    let (contact, creator_answer) = no_keys_pre_pair_leg();
+
+    let PrePairExtractResult { request } = extract_pre_pair(
+        &produce_pre_pair_request(endpoint_at("https://relay.example/bob"), &contact)
+            .expect("produce_pre_pair_request failed")
+            .envelope,
+    )
+    .expect("extract_pre_pair failed");
+    let relay =
+        crate::primitives::pairing::response::produce_pre_pair_no_keys(ChannelId(7), &request)
+            .expect("relay keygen failed");
+    let PrePairResponseExtractResult {
+        response: mut relayed,
+    } = extract_pre_pair_response(&relay.envelope).expect("extract relayed response failed");
+    relayed.fingerprint_commitment = creator_answer.fingerprint_commitment;
+
+    let validated =
+        crate::primitives::pairing::response::process_pre_pair_no_keys(&contact, &relayed)
+            .expect("nothing binds NoKeys keys to the contact, so the scanner accepts them");
+    let filled_in = ContactMessage {
+        mlkem_encapsulation_key: Some(validated.mlkem_encapsulation_key),
+        ecies_public_key: Some(validated.ecies_public_key),
+        fingerprint_commitment: Some(validated.fingerprint_commitment),
+        contact_mode: ContactMode::InlineKeys as i32,
+        ..contact.clone()
+    };
+
+    let ProducePairingRequestMessageResult {
+        envelope,
+        secret_key: scanner_secret,
+        ..
+    } = produce_pairing_request_message(
+        SenderKind::Helper,
+        endpoint_at("https://relay.example/bob"),
+        &filled_in,
+        None,
+        None,
+    )
+    .expect("produce pair request failed");
+    let ExtractPairingRequestResult { request } = extract_pairing_request(
+        &envelope,
+        relay.pairing_secret_key_material.ecies_secret_key(),
+        None,
+    )
+    .expect("the relay reads a request encrypted to its keys");
+    let ProducePairingResponseMessageResult { envelope, .. } = produce_pairing_response_message(
+        ChannelId(7),
+        &request,
+        &relay.pairing_secret_key_material,
+        None,
+        None,
+        test_policy(),
+    )
+    .expect("relay pair response failed");
+    let ExtractPairingResponseResult { response } =
+        extract_pairing_response(&envelope, scanner_secret.ecies_secret_key())
+            .expect("extract pair response failed");
+
+    assert!(matches!(
+        process_pairing_response_message(&filled_in, &response, &scanner_secret, None),
+        Err(Error::Pairing(PairingError::FingerprintCommitmentMismatch))
+    ));
 }

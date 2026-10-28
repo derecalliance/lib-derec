@@ -96,6 +96,7 @@ type processPrePairResponseMessageResult struct {
 	MlkemEncapsulationKey DeRecBuffer
 	EciesPublicKey        DeRecBuffer
 	Nonce                 uint64
+	FingerprintCommitment DeRecBuffer
 }
 
 var (
@@ -412,9 +413,10 @@ func ExtractPrePairResponse(envelope []byte) (uint64, []byte, error) {
 // ProcessPrePairResponse validates a PrePair response (the
 // ResponseProtoBytes returned by ExtractPrePairResponse) against
 // contactMessage's SHA-384 binding hash, returning the validated ML-KEM
-// encapsulation key, ECIES public key, and echoed nonce. On a binding-hash
+// encapsulation key, ECIES public key, echoed nonce, and the creator's
+// fingerprint commitment. On a binding-hash
 // mismatch the returned error's Code is derec.CodePrepairHashMismatch.
-func ProcessPrePairResponse(contactMessage, responseProto []byte) (mlkemEncapsulationKey, eciesPublicKey []byte, nonce uint64, err error) {
+func ProcessPrePairResponse(contactMessage, responseProto []byte) (mlkemEncapsulationKey, eciesPublicKey []byte, nonce uint64, fingerprintCommitment []byte, err error) {
 	processPrePairRespOnce.Do(func() {
 		purego.RegisterFunc(&processPrePairRespFn, symbol("process_pre_pair_response_message"))
 	})
@@ -422,9 +424,10 @@ func ProcessPrePairResponse(contactMessage, responseProto []byte) (mlkemEncapsul
 		bytePtr(contactMessage), uintptr(len(contactMessage)),
 		bytePtr(responseProto), uintptr(len(responseProto)))
 	if e := errorFrom(res.Error); e != nil {
-		return nil, nil, 0, e
+		return nil, nil, 0, nil, e
 	}
-	return bytesFromBuffer(res.MlkemEncapsulationKey), bytesFromBuffer(res.EciesPublicKey), res.Nonce, nil
+	return bytesFromBuffer(res.MlkemEncapsulationKey), bytesFromBuffer(res.EciesPublicKey), res.Nonce,
+		bytesFromBuffer(res.FingerprintCommitment), nil
 }
 
 // ProducePrePairNoKeysResponse is the contact-creator side of a NO_KEYS
@@ -449,9 +452,9 @@ func ProducePrePairNoKeysResponse(channelID uint64, requestProto []byte) (envelo
 // ProcessPrePairNoKeysResponse is the scanner side of a NO_KEYS pairing: it
 // accepts the public keys in responseProto (the ResponseProtoBytes returned
 // by ExtractPrePairResponse) for contactMessage, returning them with the
-// echoed nonce. Nothing binds these keys to the contact, so the resulting
+// echoed nonce and the creator's fingerprint commitment. Nothing binds these keys to the contact, so the resulting
 // pairing MUST be confirmed by comparing PairingFingerprint out of band.
-func ProcessPrePairNoKeysResponse(contactMessage, responseProto []byte) (mlkemEncapsulationKey, eciesPublicKey []byte, nonce uint64, err error) {
+func ProcessPrePairNoKeysResponse(contactMessage, responseProto []byte) (mlkemEncapsulationKey, eciesPublicKey []byte, nonce uint64, fingerprintCommitment []byte, err error) {
 	processPrePairNoKeysRespOnce.Do(func() {
 		purego.RegisterFunc(&processPrePairNoKeysRespFn, symbol("process_pre_pair_no_keys_response_message"))
 	})
@@ -459,9 +462,10 @@ func ProcessPrePairNoKeysResponse(contactMessage, responseProto []byte) (mlkemEn
 		bytePtr(contactMessage), uintptr(len(contactMessage)),
 		bytePtr(responseProto), uintptr(len(responseProto)))
 	if e := errorFrom(res.Error); e != nil {
-		return nil, nil, 0, e
+		return nil, nil, 0, nil, e
 	}
-	return bytesFromBuffer(res.MlkemEncapsulationKey), bytesFromBuffer(res.EciesPublicKey), res.Nonce, nil
+	return bytesFromBuffer(res.MlkemEncapsulationKey), bytesFromBuffer(res.EciesPublicKey), res.Nonce,
+		bytesFromBuffer(res.FingerprintCommitment), nil
 }
 
 // PairingFingerprint returns the human-readable fingerprint of a pairing's

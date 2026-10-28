@@ -44,17 +44,36 @@ type ExtractedResponse struct {
 // same type as pairing.Endpoint.
 type Endpoint = native.Endpoint
 
+// WeightedChannel is a Helper channel and the number of subshares (Shamir
+// points) its committed share carries. An ordinary Helper carries weight 1.
+type WeightedChannel struct {
+	ChannelID uint64
+	Weight    uint32
+}
+
 type requestAPI struct{}
 
 // Request groups the owner-side sharing operations, mirroring the Rust
 // primitives::sharing::request module.
 var Request requestAPI
 
-// Split shares secretData across channelIDs using a Shamir secret-sharing
+// Split shares secretData across channels using a Shamir secret-sharing
 // scheme at the given threshold, returning one committed share per channel
 // keyed by channel id.
-func (requestAPI) Split(secretID uint64, secretData []byte, channelIDs []uint64, threshold int, version uint32) (map[uint64][]byte, error) {
-	wire, err := native.ProtectSecret(secretID, secretData, channelIDs, uintptr(threshold), version)
+//
+// Every channel the secret is shared with is listed in channels with its
+// weight — the number of subshares its committed share carries (1 for an
+// ordinary helper); there is no implicit default. threshold counts
+// subshares, not channels, so a channel's weight must fall within
+// 1..threshold.
+func (requestAPI) Split(secretID uint64, secretData []byte, channels []WeightedChannel, threshold int, version uint32) (map[uint64][]byte, error) {
+	channelIDs := make([]uint64, len(channels))
+	weights := make([]uint32, len(channels))
+	for i, c := range channels {
+		channelIDs[i] = c.ChannelID
+		weights[i] = c.Weight
+	}
+	wire, err := native.ProtectSecret(secretID, secretData, channelIDs, weights, uintptr(threshold), version)
 	if err != nil {
 		return nil, err
 	}
@@ -64,10 +83,14 @@ func (requestAPI) Split(secretID uint64, secretData []byte, channelIDs []uint64,
 // Produce builds the wire-encoded DeRecMessage carrying committedShare for
 // storage at channelID under secretID/version, encrypted under sharedKey.
 //
+// keepVersion is the one older version the helper keeps besides version;
+// 0 keeps no other version. A keepVersion equal to or greater than version
+// fails with derec.CodeInvalidKeepVersion.
+//
 // replyTo lists the endpoints, in preference order, the peer should answer
 // on; nil or empty means answer on the endpoints recorded for the channel.
-func (requestAPI) Produce(channelID uint64, version uint32, secretID uint64, committedShare []byte, keepList []uint32, description string, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
-	return native.ProduceStoreShareRequest(channelID, version, secretID, committedShare, keepList, description, sharedKey, replyTo)
+func (requestAPI) Produce(channelID uint64, version uint32, secretID uint64, committedShare []byte, keepVersion uint32, description string, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
+	return native.ProduceStoreShareRequest(channelID, version, secretID, committedShare, keepVersion, description, sharedKey, replyTo)
 }
 
 // Extract decrypts a store-share request envelope and returns its channel id

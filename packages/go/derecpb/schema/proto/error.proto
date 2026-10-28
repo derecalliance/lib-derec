@@ -5,6 +5,7 @@
 
 syntax = "proto3";
 
+import "google/protobuf/timestamp.proto";
 import "result.proto";
 
 package org.derecalliance.derec.protobuf;
@@ -57,4 +58,11 @@ message ErrorResponseMessage {
   //
   // This field encodes the error type and any associated status information.
   DeRecResult result = 1;
+
+  // Timestamp indicating when this message was created.
+  //
+  // This value is expressed in UTC and can be used for observability,
+  // replay detection, and timeout handling. The envelope carries the same
+  // value, and a receiver rejects a message whose two copies differ.
+  google.protobuf.Timestamp timestamp = 2;
 }

@@ -11,9 +11,29 @@ pub enum SharingError {
     DuplicateChannelId(u64),
 
     #[error(
-        "invalid threshold (threshold={threshold}, channels={channels}); must satisfy 2 <= threshold <= channels"
+        "invalid threshold (threshold={threshold}, subshares={subshares} across {channels} channels); must satisfy 2 <= threshold <= subshares"
     )]
-    InvalidThreshold { threshold: usize, channels: usize },
+    InvalidThreshold {
+        threshold: usize,
+        channels: usize,
+        subshares: u64,
+    },
+
+    #[error(
+        "weight {weight} for channel {channel_id} is invalid: it must be at least 1, below the threshold, and name a channel being shared with"
+    )]
+    InvalidWeight { channel_id: u64, weight: u32 },
+
+    /// The round's total subshares (the sum of every paired Helper's weight)
+    /// exceeds the cap set with
+    /// [`DeRecProtocolBuilder::with_max_subshares`](crate::protocol::DeRecProtocolBuilder::with_max_subshares).
+    #[error("too many subshares ({subshares}) for the configured cap ({max})")]
+    TooManySubshares { subshares: u64, max: u64 },
+
+    /// `keep_version` names the version being shared or a later one. It must
+    /// be below `version`, or `0` to keep no other version.
+    #[error("keep_version {keep_version} must be below the shared version {version}")]
+    InvalidKeepVersion { keep_version: u32, version: u32 },
 
     #[error("secret_data is empty")]
     EmptySecretData,

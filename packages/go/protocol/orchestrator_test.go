@@ -110,14 +110,16 @@ func newOrchestratorPeerWith(t *testing.T, label, uri string, threshold uint32, 
 	transport := newInProcessTransport()
 
 	cfg := Config{
-		SecretID:      orchestratorSecretID,
-		OwnTransports: []TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
-		Threshold:     proto.Uint32(threshold),
+		SecretID: orchestratorSecretID,
+		DeRecProtocolConfig: DeRecProtocolConfig{
+			OwnTransports: []TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:     proto.Uint32(threshold),
+		},
 	}
 	if configure != nil {
 		configure(&cfg)
 	}
-	p, err := New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
+	p, err := New(Stores{Channel: channelStore, Share: shareStore, Secret: secretStore, UserSecret: userSecretStore, State: stateStore}, transport, cfg)
 	if err != nil {
 		t.Fatalf("New(%s): %v", label, err)
 	}
@@ -615,15 +617,46 @@ func TestOrchestrator_UpdateChannelInfoAnnouncesEndpointsByName(t *testing.T) {
 	}
 }
 
+// TestOrchestrator_InvalidKeepVersionFailsTheRound has the owner answer
+// KeepVersion with the version being shared: Start(ProtectSecret) fails
+// with CodeInvalidKeepVersion and nothing is sent.
+func TestOrchestrator_InvalidKeepVersionFailsTheRound(t *testing.T) {
+	const threshold = 2
+
+	owner := newOrchestratorPeer(t, "owner", "https://owner.example.com", threshold)
+	helperA := newOrchestratorPeer(t, "helper-a", "https://helper-a.example.com", threshold)
+	helperB := newOrchestratorPeer(t, "helper-b", "https://helper-b.example.com", threshold)
+	pairOrchestratorPeers(t, owner, helperA, 1)
+	pairOrchestratorPeers(t, owner, helperB, 2)
+
+	secrets := []UserSecret{{ID: []byte{5}, Name: "kept", Data: []byte("round-1")}}
+	if _, err := owner.protocol.Start(FlowKindProtectSecret, ProtectSecretParams{Secrets: secrets}); err != nil {
+		t.Fatalf("round 1 Start(ProtectSecret): %v", err)
+	}
+	pumpOrchestratorPeersMany(t, []*orchestratorPeer{owner, helperA, helperB})
+
+	owner.shareStore.mu.Lock()
+	owner.shareStore.keep, owner.shareStore.keepSet = 2, true
+	owner.shareStore.mu.Unlock()
+	_, err := owner.protocol.Start(FlowKindProtectSecret, ProtectSecretParams{Secrets: secrets})
+	var derecErr *derec.Error
+	if !errors.As(err, &derecErr) || derecErr.Code != derec.CodeInvalidKeepVersion {
+		t.Fatalf("keepVersion equal to the version must fail with CodeInvalidKeepVersion, got %v", err)
+	}
+	if sent := owner.transport.drain(); len(sent) != 0 {
+		t.Fatalf("an invalid keepVersion must send nothing, got %d envelopes", len(sent))
+	}
+}
+
 // TestOrchestrator_SecretStoreLoadManyServesTheWholeBroadcast checks that a
 // broadcast to several helpers reads every SharedKey through one
 // SecretStore.LoadMany call, and that a nil entry is judged by the
 // library's missing-entry policy: discovery needs a key for every target,
 // so it fails with CodeMissingSharedKey naming the channel without one.
-// TestOrchestrator_OwnerKeepListReachesHelpers has the owner roll back v2
-// by listing only v1 for the v3 round: KeepList is asked once per round,
+// TestOrchestrator_OwnerKeepVersionReachesHelpers has the owner roll back
+// v2 by keeping v1 for the v3 round: KeepVersion is asked once per round,
 // and both helpers end up holding exactly v1 and v3.
-func TestOrchestrator_OwnerKeepListReachesHelpers(t *testing.T) {
+func TestOrchestrator_OwnerKeepVersionReachesHelpers(t *testing.T) {
 	const threshold = 2
 
 	owner := newOrchestratorPeer(t, "owner", "https://owner.example.com", threshold)
@@ -635,7 +668,7 @@ func TestOrchestrator_OwnerKeepListReachesHelpers(t *testing.T) {
 	for round := 1; round <= 3; round++ {
 		if round == 3 {
 			owner.shareStore.mu.Lock()
-			owner.shareStore.keep, owner.shareStore.keepOK = []uint32{1}, true
+			owner.shareStore.keep, owner.shareStore.keepSet = 1, true
 			owner.shareStore.mu.Unlock()
 		}
 		if _, err := owner.protocol.Start(FlowKindProtectSecret, ProtectSecretParams{
@@ -646,8 +679,8 @@ func TestOrchestrator_OwnerKeepListReachesHelpers(t *testing.T) {
 		pumpOrchestratorPeersMany(t, []*orchestratorPeer{owner, helperA, helperB})
 	}
 
-	if got := owner.shareStore.keepListCalls; !slices.Equal(got, []uint32{1, 2, 3}) {
-		t.Fatalf("KeepList must be asked once per round with the version being sent, got %v", got)
+	if got := owner.shareStore.keepVersionCalls; !slices.Equal(got, []uint32{1, 2, 3}) {
+		t.Fatalf("KeepVersion must be asked once per round with the version being sent, got %v", got)
 	}
 	for _, check := range []struct {
 		label     string
@@ -713,5 +746,75 @@ func TestOrchestrator_SecretStoreLoadManyServesTheWholeBroadcast(t *testing.T) {
 	}
 	if len(owner.secretStore.loadManyCalls) != 1 {
 		t.Fatalf("the failing broadcast must still be one LoadMany call, got %v", owner.secretStore.loadManyCalls)
+	}
+}
+
+// TestOrchestrator_HelperChannelWithoutWeightPublishesAtOne rebuilds the
+// owner's stored HelperChannel rows without Weight, the shape an application
+// that maps its own schema onto the struct produces, and asserts the next
+// library-initiated publish gives those helpers weight 1 instead of failing.
+func TestOrchestrator_HelperChannelWithoutWeightPublishesAtOne(t *testing.T) {
+	const threshold = 2
+
+	owner := newOrchestratorPeer(t, "owner", "https://owner.example.com", threshold)
+	helperA := newOrchestratorPeer(t, "helper-a", "https://helper-a.example.com", threshold)
+	helperB := newOrchestratorPeer(t, "helper-b", "https://helper-b.example.com", threshold)
+	helperC := newOrchestratorPeer(t, "helper-c", "https://helper-c.example.com", threshold)
+
+	channelA := pairOrchestratorPeers(t, owner, helperA, 1)
+	channelB := pairOrchestratorPeers(t, owner, helperB, 2)
+
+	if _, err := owner.protocol.Start(FlowKindProtectSecret, ProtectSecretParams{
+		Secrets: []UserSecret{{ID: []byte{1}, Name: "s", Data: []byte("v")}},
+	}); err != nil {
+		t.Fatalf("owner.Start(ProtectSecret): %v", err)
+	}
+	pumpOrchestratorPeersMany(t, []*orchestratorPeer{owner, helperA, helperB})
+
+	for _, cid := range []uint64{channelA, channelB} {
+		record, ok, err := owner.channelStore.Load(orchestratorSecretID, cid, 0)
+		if err != nil || !ok || record.Helper == nil {
+			t.Fatalf("owner channel %d: ok=%v err=%v", cid, ok, err)
+		}
+		h := record.Helper
+		rebuilt := HelperChannel{
+			ChannelID:         h.ChannelID,
+			Transports:        h.Transports,
+			CommunicationInfo: h.CommunicationInfo,
+			PeerRole:          h.PeerRole,
+			Status:            h.Status,
+			CreatedAt:         h.CreatedAt,
+		}
+		if err := owner.channelStore.Save(orchestratorSecretID, ChannelRecord{Helper: &rebuilt}); err != nil {
+			t.Fatalf("save rebuilt channel %d: %v", cid, err)
+		}
+	}
+
+	pairingChannelID := uint64(3)
+	contact, err := owner.protocol.CreateContact(&pairingChannelID, ContactModeInlineKeys, nil)
+	if err != nil {
+		t.Fatalf("owner.CreateContact: %v", err)
+	}
+	if _, err := helperC.protocol.Start(FlowKindPairing, PairingParams{
+		Kind:    SenderKindHelper,
+		Contact: contact.ContactBytes,
+	}); err != nil {
+		t.Fatalf("helperC.Start(Pairing): %v", err)
+	}
+	events := pumpOrchestratorPeersMany(t, []*orchestratorPeer{owner, helperA, helperB, helperC})
+
+	weights := map[uint64]uint32{}
+	for _, ev := range events {
+		if ev.Type == EventTypeProtectSecretFailed {
+			t.Fatalf("auto-publish failed: %+v", ev)
+		}
+		if ev.Type == EventTypeProtectSecretStarted && ev.Weight != nil {
+			weights[ev.ChannelID] = *ev.Weight
+		}
+	}
+	for _, cid := range []uint64{channelA, channelB} {
+		if weights[cid] != 1 {
+			t.Fatalf("channel %d published at weight %d, want 1 (all: %+v)", cid, weights[cid], weights)
+		}
 	}
 }

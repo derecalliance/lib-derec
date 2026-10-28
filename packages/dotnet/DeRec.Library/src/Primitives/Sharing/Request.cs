@@ -49,12 +49,20 @@ public static partial class Sharing
         public static SplitResult Split(
             ulong secretId,
             byte[] secretData,
-            ulong[] channelIds,
+            IReadOnlyList<WeightedChannel> channels,
             ulong threshold,
             uint version
         )
         {
-            ArgumentNullException.ThrowIfNull(channelIds);
+            ArgumentNullException.ThrowIfNull(channels);
+
+            ulong[] channelIds = new ulong[channels.Count];
+            uint[] weights = new uint[channels.Count];
+            for (int i = 0; i < channels.Count; i++)
+            {
+                channelIds[i] = channels[i].ChannelId;
+                weights[i] = channels[i].Weight;
+            }
 
             Native.Sharing.ProtectSecretResult nativeResult =
                 Native.Sharing.protect_secret(
@@ -62,6 +70,7 @@ public static partial class Sharing
                     secretData,
                     (UIntPtr)secretData.Length,
                     channelIds,
+                    weights,
                     (UIntPtr)channelIds.Length,
                     (UIntPtr)threshold,
                     version
@@ -86,14 +95,13 @@ public static partial class Sharing
             uint version,
             ulong secretId,
             byte[] committedShare,
-            uint[] keepList,
+            uint keepVersion,
             string description,
             byte[] sharedKey,
             IReadOnlyList<TransportProtocol>? replyTo = null
         )
         {
             ArgumentNullException.ThrowIfNull(committedShare);
-            ArgumentNullException.ThrowIfNull(keepList);
             ArgumentNullException.ThrowIfNull(sharedKey);
 
             byte[] descriptionBytes = System.Text.Encoding.UTF8.GetBytes(description ?? string.Empty);
@@ -109,8 +117,7 @@ public static partial class Sharing
                     secretId,
                     committedShare,
                     (UIntPtr)committedShare.Length,
-                    keepList,
-                    (UIntPtr)keepList.Length,
+                    keepVersion,
                     descriptionBytes,
                     (UIntPtr)descriptionBytes.Length,
                     sharedKey,

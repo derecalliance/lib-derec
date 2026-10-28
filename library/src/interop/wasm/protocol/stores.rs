@@ -35,7 +35,11 @@
 //!
 //! ### `ShareStore`
 //! ```ts
-//! interface Share { secretId: string; version: number; bytes: Uint8Array }
+//! // `subshares` is the owner-side subshare count and `threshold` the
+//! // owner-side threshold the version was split with; store and return them
+//! // as given. Each is absent on a helper's share and on owner rows written
+//! // before it existed.
+//! interface Share { secretId: string; version: number; bytes: Uint8Array; subshares?: number | null; threshold?: number | null }
 //! interface ShareStore {
 //!   // `secretId` is the u64 secret identifier as a decimal string.
 //!   // For `load`/`loadMany`, an empty `versions` array means "all versions of secretId".
@@ -51,14 +55,21 @@
 //!   // Drop the shares stored under (secretId, channelId) at each listed
 //!   // version. A version that is not stored is a no-op.
 //!   removeVersions(secretId: string, channelId: string, versions: number[]): Promise<void>;
-//!   // Owner only: the versions every Helper keeps after `version` is
-//!   // distributed. `null`/`undefined` sends an empty keepList, so Helpers
-//!   // keep every version. List committed versions and those whose round
-//!   // is still open; the library always adds `version`.
-//!   keepList(secretId: string, version: number): Promise<number[] | null | undefined>;
+//!   // Owner only: the one version, other than `version`, every Helper keeps
+//!   // after `version` is distributed: the last version that met threshold.
+//!   // `0` keeps no other version. Must be below `version`.
+//!   keepVersion(secretId: string, version: number): Promise<number>;
 //!   latestVersion(): Promise<number | null>;
+//!   // Called once per accepted verification challenge on a helper channel.
+//!   // Reject or throw a `shareStoreRefusal(reason)` `Error` to refuse the
+//!   // verification; any other rejection/throw is an ordinary backend
+//!   // failure.
+//!   recordVerification(secretId: string, channelId: string, version: number): Promise<void>;
 //! }
 //! ```
+//!
+//! `save` may likewise reject or throw a `shareStoreRefusal(reason)` `Error`
+//! to refuse a share update on a helper channel.
 //!
 //! ### `Transport`
 //! ```ts
@@ -76,7 +87,7 @@ use wasm_bindgen_futures::JsFuture;
 use crate::{
     Error,
     protocol::{
-        error::{ChannelStoreError, SecretStoreError, ShareStoreError, StateStoreError},
+        error::{ChannelStoreError, Refusal, SecretStoreError, ShareStoreError, StateStoreError},
         traits::{
             ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore,
             DeRecStateStore, DeRecTransport, DeRecUserSecretStore, SecretStoreFuture,
@@ -119,6 +130,55 @@ async fn resolve_promise(val: JsValue) -> Result<JsValue, String> {
     JsFuture::from(Promise::from(val))
         .await
         .map_err(|e| format!("promise rejected: {e:?}"))
+}
+
+/// Same as [`call_method`], but keeps the thrown value instead of
+/// stringifying it, so a caller can read a `refusal` property off it.
+fn call_method_value(obj: &JsValue, method: &str, args: &Array) -> Result<JsValue, JsValue> {
+    let func_val = js_sys::Reflect::get(obj, &JsValue::from_str(method))?;
+    Function::from(func_val).apply(obj, args)
+}
+
+/// Same as [`resolve_promise`], but keeps the rejection value instead of
+/// stringifying it, so a caller can read a `refusal` property off it.
+async fn resolve_promise_value(val: JsValue) -> Result<JsValue, JsValue> {
+    JsFuture::from(Promise::from(val)).await
+}
+
+/// Reads the `refusal` property a JS `ShareStore` tags its thrown/rejected
+/// value with — see [`crate::interop::wasm::ts_bindings_utils::share_store_refusal`]
+/// — and maps its wire string to a [`Refusal`]. `None` for any other shape,
+/// which callers treat as an ordinary backend failure.
+fn refusal_from_js(value: &JsValue) -> Option<Refusal> {
+    js_sys::Reflect::get(value, &JsValue::from_str("refusal"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .and_then(|reason| refusal_from_reason(&reason))
+}
+
+/// The wire-string-to-[`Refusal`] mapping [`refusal_from_js`] applies, pulled
+/// out as a pure function so it can be unit tested independently of
+/// `JsValue`.
+fn refusal_from_reason(reason: &str) -> Option<Refusal> {
+    match reason {
+        "too_frequent" => Some(Refusal::TooFrequent),
+        "size_limit_exceeded" => Some(Refusal::SizeLimitExceeded),
+        "rejected" => Some(Refusal::Rejected),
+        _ => None,
+    }
+}
+
+/// Maps a failed `save`/`recordVerification` call's thrown or rejected
+/// `JsValue` to a [`ShareStoreError`]: a recognised `refusal` tag becomes
+/// [`ShareStoreError::Refused`], anything else an ordinary
+/// [`ShareStoreError::Backend`].
+fn share_store_call_error(method: &str, value: &JsValue) -> ShareStoreError {
+    match refusal_from_js(value) {
+        Some(refusal) => ShareStoreError::Refused(refusal),
+        None => {
+            ShareStoreError::Backend(box_err(format!("share store {method} failed: {value:?}")))
+        }
+    }
 }
 
 fn decode_secret_value(kind: SecretKind, bytes: &[u8]) -> Result<SecretValue, SecretStoreError> {
@@ -474,7 +534,9 @@ impl DeRecChannelStore for JsChannelStore {
             let value = resolve_promise(promise_val)
                 .await
                 .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
-            Ok(value.as_bool().unwrap_or(false))
+            value.as_bool().ok_or_else(|| {
+                ChannelStoreError::Backend(box_err("remove must return a boolean".to_string()))
+            })
         })
     }
 
@@ -586,7 +648,60 @@ fn share_to_js(share: &Share) -> JsValue {
     .unwrap_or_default();
     let js_bytes = Uint8Array::from(share.bytes.as_slice());
     js_sys::Reflect::set(&obj, &"bytes".into(), &js_bytes).unwrap_or_default();
+    for (key, value) in [
+        ("subshares", share.subshares),
+        ("threshold", share.threshold),
+    ] {
+        if let Some(value) = value {
+            js_sys::Reflect::set(&obj, &key.into(), &JsValue::from_f64(f64::from(value)))
+                .unwrap_or_default();
+        }
+    }
     obj.into()
+}
+
+/// `value` as a `u32`: a `number` that is an integer in `0..=u32::MAX`.
+fn u32_from_js(value: &JsValue) -> Option<u32> {
+    value
+        .as_f64()
+        .filter(|n| n.fract() == 0.0 && *n >= 0.0 && *n <= f64::from(u32::MAX))
+        .map(|n| n as u32)
+}
+
+/// `record[key]`: `undefined` or `null` is none, otherwise a string. `what`
+/// names the record in the error.
+fn optional_string_from_js(
+    item: &JsValue,
+    what: &str,
+    key: &str,
+) -> Result<Option<String>, ShareStoreError> {
+    let value = js_sys::Reflect::get(item, &key.into()).unwrap_or(JsValue::UNDEFINED);
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    value.as_string().map(Some).ok_or_else(|| {
+        ShareStoreError::Backend(box_err(format!(
+            "{what}.{key} must be a string, null or undefined"
+        )))
+    })
+}
+
+/// `record[key]`: `undefined` or `null` is none, otherwise a `u32`. `what`
+/// names the record in the error.
+fn optional_u32_from_js(
+    item: &JsValue,
+    what: &str,
+    key: &str,
+) -> Result<Option<u32>, ShareStoreError> {
+    let value = js_sys::Reflect::get(item, &key.into()).unwrap_or(JsValue::UNDEFINED);
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    u32_from_js(&value).map(Some).ok_or_else(|| {
+        ShareStoreError::Backend(box_err(format!(
+            "{what}.{key} must be a u32, null or undefined"
+        )))
+    })
 }
 
 fn share_from_js(item: &JsValue) -> Result<Share, ShareStoreError> {
@@ -601,19 +716,18 @@ fn share_from_js(item: &JsValue) -> Result<Share, ShareStoreError> {
     })?;
     let version = js_sys::Reflect::get(item, &"version".into())
         .ok()
-        .and_then(|v| v.as_f64())
+        .and_then(|v| u32_from_js(&v))
         .ok_or_else(|| {
-            ShareStoreError::Backend(box_err("share.version must be a number".to_string()))
-        })? as u32;
+            ShareStoreError::Backend(box_err("share.version must be a u32".to_string()))
+        })?;
     let bytes_val = js_sys::Reflect::get(item, &"bytes".into()).unwrap_or(JsValue::null());
     let bytes = Uint8Array::new(&bytes_val).to_vec();
-    // `replicaId` is an optional decimal-string on the JS side
-    // (matching `derec.replica_id` and `Channel.replicaId`). Missing /
-    // null / empty string all map to `None`.
     Ok(Share {
         secret_id,
         version,
         bytes,
+        subshares: optional_u32_from_js(item, "share", "subshares")?,
+        threshold: optional_u32_from_js(item, "share", "threshold")?,
     })
 }
 
@@ -665,11 +779,11 @@ impl DeRecShareStore for JsShareStore {
             if value.is_null() || value.is_undefined() {
                 Ok(None)
             } else {
-                let v = value.as_f64().ok_or_else(|| {
+                let v = u32_from_js(&value).ok_or_else(|| {
                     ShareStoreError::Backend(box_err(
-                        "latestVersion must return a number or null".to_string(),
+                        "latestVersion must return a u32 or null".to_string(),
                     ))
-                })? as u32;
+                })?;
                 Ok(Some(v))
             }
         })
@@ -689,11 +803,11 @@ impl DeRecShareStore for JsShareStore {
             args.push(&JsValue::from_str(&secret_str));
             args.push(&JsValue::from_str(&channel_str));
             args.push(&share_to_js(&share));
-            let promise_val = call_method(&obj, "save", &args)
-                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
-            resolve_promise(promise_val)
+            let promise_val = call_method_value(&obj, "save", &args)
+                .map_err(|e| share_store_call_error("save", &e))?;
+            resolve_promise_value(promise_val)
                 .await
-                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+                .map_err(|e| share_store_call_error("save", &e))?;
             Ok(())
         })
     }
@@ -814,40 +928,50 @@ impl DeRecShareStore for JsShareStore {
         })
     }
 
-    fn keep_list(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, Option<Vec<u32>>> {
+    fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32> {
         let obj = self.0.clone();
         let secret_str = secret_id.to_string();
         Box::pin(async move {
             let args = Array::new();
             args.push(&JsValue::from_str(&secret_str));
             args.push(&JsValue::from_f64(f64::from(version)));
-            let promise_val = call_method(&obj, "keepList", &args)
+            let promise_val = call_method(&obj, "keepVersion", &args)
                 .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
             let value = resolve_promise(promise_val)
                 .await
                 .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
-            if value.is_null() || value.is_undefined() {
-                return Ok(None);
-            }
-            if !Array::is_array(&value) {
-                return Err(ShareStoreError::Backend(box_err(
-                    "keepList must return an array of numbers, null or undefined".to_string(),
-                )));
-            }
-            Array::from(&value)
-                .iter()
-                .map(|v| {
-                    v.as_f64()
-                        .filter(|f| f.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(f))
-                        .map(|f| f as u32)
-                        .ok_or_else(|| {
-                            ShareStoreError::Backend(box_err(
-                                "keepList entries must be integers in 0..=4294967295".to_string(),
-                            ))
-                        })
+            value
+                .as_f64()
+                .filter(|f| f.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(f))
+                .map(|f| f as u32)
+                .ok_or_else(|| {
+                    ShareStoreError::Backend(box_err(
+                        "keepVersion must return an integer in 0..=4294967295".to_string(),
+                    ))
                 })
-                .collect::<Result<Vec<u32>, _>>()
-                .map(Some)
+        })
+    }
+
+    fn record_verification(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        version: u32,
+    ) -> ShareStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        let channel_str = channel_id.0.to_string();
+        Box::pin(async move {
+            let args = Array::new();
+            args.push(&JsValue::from_str(&secret_str));
+            args.push(&JsValue::from_str(&channel_str));
+            args.push(&JsValue::from_f64(f64::from(version)));
+            let promise_val = call_method_value(&obj, "recordVerification", &args)
+                .map_err(|e| share_store_call_error("recordVerification", &e))?;
+            resolve_promise_value(promise_val)
+                .await
+                .map_err(|e| share_store_call_error("recordVerification", &e))?;
+            Ok(())
         })
     }
 }
@@ -865,6 +989,9 @@ impl DeRecShareStore for JsShareStore {
 ///   version: number;
 ///   secrets: { id: Uint8Array; name: string; data: Uint8Array }[];
 ///   description?: string;
+///   author_replica_id?: string;
+///   // The recorded threshold; store and return it as given.
+///   threshold?: number | null;
 /// };
 /// ```
 pub struct JsUserSecretStore(pub JsValue);
@@ -901,39 +1028,51 @@ fn user_secrets_to_js(value: &UserSecrets) -> JsValue {
         )
         .unwrap_or_default();
     }
+    if let Some(threshold) = value.threshold {
+        js_sys::Reflect::set(
+            &obj,
+            &"threshold".into(),
+            &JsValue::from_f64(f64::from(threshold)),
+        )
+        .unwrap_or_default();
+    }
     obj.into()
 }
 
 fn user_secrets_from_js(value: &JsValue) -> Result<UserSecrets, ShareStoreError> {
     let version = js_sys::Reflect::get(value, &"version".into())
         .ok()
-        .and_then(|v| v.as_f64())
+        .and_then(|v| u32_from_js(&v))
         .ok_or_else(|| {
-            ShareStoreError::Backend(box_err("userSecrets.version must be a number".to_string()))
-        })? as u32;
-    let entries_val = js_sys::Reflect::get(value, &"secrets".into()).unwrap_or(JsValue::null());
-    let entries_arr = Array::from(&entries_val);
-    let mut secrets = Vec::with_capacity(entries_arr.length() as usize);
-    for i in 0..entries_arr.length() {
-        let item = entries_arr.get(i);
-        let id_val = js_sys::Reflect::get(&item, &"id".into()).unwrap_or(JsValue::null());
-        let data_val = js_sys::Reflect::get(&item, &"data".into()).unwrap_or(JsValue::null());
-        let name = js_sys::Reflect::get(&item, &"name".into())
-            .ok()
-            .and_then(|v| v.as_string())
-            .unwrap_or_default();
-        secrets.push(UserSecret {
-            id: Uint8Array::new(&id_val).to_vec(),
-            name,
-            data: Uint8Array::new(&data_val).to_vec(),
-        });
+            ShareStoreError::Backend(box_err("userSecrets.version must be a u32".to_string()))
+        })?;
+    #[derive(serde::Deserialize)]
+    struct UserSecretShape {
+        #[serde(with = "serde_bytes")]
+        id: Vec<u8>,
+        name: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
     }
-    let description = js_sys::Reflect::get(value, &"description".into())
-        .ok()
-        .and_then(|v| v.as_string());
-    let author_replica_id = js_sys::Reflect::get(value, &"author_replica_id".into())
-        .ok()
-        .and_then(|v| v.as_string())
+    let entries_val = js_sys::Reflect::get(value, &"secrets".into()).unwrap_or(JsValue::UNDEFINED);
+    if !Array::is_array(&entries_val) {
+        return Err(ShareStoreError::Backend(box_err(
+            "userSecrets.secrets must be an array".to_string(),
+        )));
+    }
+    let secrets = serde_wasm_bindgen::from_value::<Vec<UserSecretShape>>(entries_val)
+        .map_err(|e| {
+            ShareStoreError::Backend(box_err(format!("invalid userSecrets.secrets: {e}")))
+        })?
+        .into_iter()
+        .map(|s| UserSecret {
+            id: s.id,
+            name: s.name,
+            data: s.data,
+        })
+        .collect();
+    let description = optional_string_from_js(value, "userSecrets", "description")?;
+    let author_replica_id = optional_string_from_js(value, "userSecrets", "author_replica_id")?
         .map(|id| {
             id.parse::<u64>().map_err(|_| {
                 ShareStoreError::Backend(box_err(format!(
@@ -947,6 +1086,7 @@ fn user_secrets_from_js(value: &JsValue) -> Result<UserSecrets, ShareStoreError>
         secrets,
         description,
         author_replica_id,
+        threshold: optional_u32_from_js(value, "userSecrets", "threshold")?,
     })
 }
 
@@ -1154,7 +1294,9 @@ impl DeRecStateStore for JsStateStore {
             let value = resolve_promise(promise_val)
                 .await
                 .map_err(|e| StateStoreError::Backend(box_err(e)))?;
-            Ok(value.as_bool().unwrap_or(false))
+            value.as_bool().ok_or_else(|| {
+                StateStoreError::Backend(box_err("remove must return a boolean".to_string()))
+            })
         })
     }
 
