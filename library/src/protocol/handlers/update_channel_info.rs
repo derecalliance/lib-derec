@@ -2,8 +2,8 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecTransport, MissingPolicy, PendingAction,
-    SecretKind, SecretValue,
+    ChannelRequest, DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecTransport, MissingPolicy,
+    PendingAction, SecretKind, SecretValue,
 };
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
@@ -293,12 +293,12 @@ fn on_request(
 
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id: exchange.channel_id,
-        action: PendingAction::UpdateChannelInfo {
-            channel_id: exchange.channel_id,
-            request,
-            shared_key: *exchange.shared_key,
-            trace_id: exchange.trace_id,
-        },
+        action: PendingAction::request(
+            exchange.channel_id,
+            exchange.trace_id,
+            ChannelRequest::UpdateChannelInfo(request),
+        )
+        .sealed_with(exchange.shared_key),
     }])
 }
 
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn on_request_rejects_scheme_mismatched_transport_protocol() {
         let channel_id = ChannelId(31);
-        let shared_key = [11u8; 32];
+        let shared_key = SharedKey::new([11u8; 32]);
 
         let malicious_transport = derec_proto::TransportProtocol {
             uri: "ws://attacker.example/inbox".to_owned(),
@@ -494,7 +494,7 @@ mod tests {
 
         run_async(async {
             let channel_id = ChannelId(41);
-            let shared_key = [7u8; 32];
+            let shared_key = SharedKey::new([7u8; 32]);
             let lf = LocalFixture {
                 own_transports: vec![derec_proto::TransportProtocol {
                     uri: "grpcs://me.example.com:443".to_owned(),
@@ -548,10 +548,8 @@ mod tests {
             assert!(
                 matches!(
                     events.as_slice(),
-                    [DeRecEvent::ActionRequired {
-                        action: PendingAction::UpdateChannelInfo { .. },
-                        ..
-                    }]
+                    [DeRecEvent::ActionRequired { action, .. }]
+                        if action.kind() == crate::protocol::PendingActionKind::UpdateChannelInfo
                 ),
                 "the move must be surfaced for acceptance, not refused: {events:?}"
             );

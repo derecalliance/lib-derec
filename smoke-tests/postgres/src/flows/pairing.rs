@@ -439,7 +439,9 @@ async fn seed_channel(peer: &mut Peer, record: ChannelRecord) {
         .save(
             DEFAULT_TEST_SECRET_ID,
             channel_id,
-            SecretValue::SharedKey(std::array::from_fn(|i| (i * 11 + 5) as u8)),
+            SecretValue::SharedKey(derec_library::types::SharedKey::new(std::array::from_fn(
+                |i| (i * 11 + 5) as u8,
+            ))),
         )
         .await
         .expect("seed channel key");

@@ -99,7 +99,7 @@ pub struct ExtractResult {
 ///         .expect("split failed");
 ///
 /// let channel_id = ChannelId(1);
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// // Owner: build the sharing request envelope.
@@ -218,7 +218,7 @@ pub fn produce(
 ///         .expect("split failed");
 ///
 /// let channel_id = ChannelId(1);
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// // Owner → Helper → Owner roundtrip.
@@ -309,7 +309,7 @@ pub fn extract(
 ///         .expect("split failed");
 ///
 /// let channel_id = ChannelId(1);
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
 /// let version = 1;
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///

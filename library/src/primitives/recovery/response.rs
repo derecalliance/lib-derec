@@ -98,7 +98,7 @@ pub struct RecoverResult {
 /// use derec_library::types::ChannelId;
 ///
 /// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
 /// let channel_id = ChannelId(1);
 ///
 /// // Sharing flow: produce a stored share that the Helper retains for recovery.
@@ -220,7 +220,7 @@ pub fn produce(
 /// use derec_library::types::ChannelId;
 ///
 /// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
 /// let channel_id = ChannelId(1);
 ///
 /// // Sharing flow: produce a stored share that the Helper retains for recovery.
@@ -335,7 +335,7 @@ pub fn extract(
 /// use derec_library::types::ChannelId;
 ///
 /// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
 /// let secret_data = b"super_secret_value";
 ///
 /// // Sharing flow: store one share per Helper for later recovery.

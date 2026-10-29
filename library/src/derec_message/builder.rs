@@ -157,7 +157,7 @@ pub struct ChannelMode;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # let channel_id = ChannelId(1);
 /// # let verify_request = VerifyShareRequestMessage::default();
-/// # let shared_key = [0u8; 32];
+/// # let shared_key = derec_library::types::SharedKey::new([0u8; 32]);
 /// let envelope = DeRecMessageBuilder::channel()
 ///     .channel_id(channel_id)
 ///     .timestamp(current_timestamp())
@@ -419,7 +419,7 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
     /// - the underlying channel encryption routine fails
     pub fn encrypt(
         self,
-        shared_key: &[u8; 32],
+        shared_key: &crate::types::SharedKey,
     ) -> Result<DeRecMessageBuilder<Encrypted, ChannelMode>, DeRecMessageBuilderError> {
         let message = self
             .message
@@ -433,7 +433,8 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
         rand::Rng::fill_bytes(&mut crate::utils::os_rng(), &mut nonce[..12]);
 
         let encoded = message.encode_to_vec();
-        let encrypted = derec_cryptography::channel::encrypt_message(&encoded, shared_key, &nonce)?;
+        let encrypted =
+            derec_cryptography::channel::encrypt_message(&encoded, shared_key.as_bytes(), &nonce)?;
 
         Ok(DeRecMessageBuilder {
             message: None,

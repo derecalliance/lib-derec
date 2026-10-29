@@ -5,8 +5,8 @@ use crate::interop::wasm::ts_bindings_utils::js_error;
 use serde::Serialize;
 use wasm_bindgen::JsValue;
 
-pub(crate) fn parse_shared_key(shared_key: &[u8]) -> Result<[u8; 32], JsValue> {
-    shared_key.try_into().map_err(|_| {
+pub(crate) fn parse_shared_key(shared_key: &[u8]) -> Result<crate::types::SharedKey, JsValue> {
+    crate::types::SharedKey::try_from(shared_key).map_err(|_| {
         js_error(
             "invalid_shared_key_length",
             "shared_key must be exactly 32 bytes".to_string(),

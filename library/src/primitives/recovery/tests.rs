@@ -2,6 +2,7 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use crate::extensions::derec_result::DeRecResultExt as _;
+use crate::types::SharedKey;
 use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp},
@@ -60,7 +61,7 @@ fn create_committed_share_bytes(secret_id: u64, version: u32) -> Vec<u8> {
 
 fn create_response_envelope(
     channel_id: ChannelId,
-    shared_key: &[u8; 32],
+    shared_key: &SharedKey,
     status: Option<i32>,
     committed_bytes: Vec<u8>,
 ) -> Vec<u8> {
@@ -92,7 +93,7 @@ fn create_response_envelope(
 
 fn create_response_envelope_with_mismatched_timestamp(
     channel_id: ChannelId,
-    shared_key: &[u8; 32],
+    shared_key: &SharedKey,
     committed_bytes: Vec<u8>,
 ) -> Vec<u8> {
     let message_timestamp = current_timestamp();
@@ -122,7 +123,7 @@ fn create_response_envelope_with_mismatched_timestamp(
 
 fn create_store_share_request_envelope(
     channel_id: ChannelId,
-    shared_key: &[u8; 32],
+    shared_key: &SharedKey,
     share_bytes: Vec<u8>,
 ) -> Vec<u8> {
     let timestamp = current_timestamp();
@@ -800,7 +801,7 @@ fn test_recovery_end_to_end() {
 #[test]
 fn test_extract_get_share_request_rejects_scheme_mismatched_reply_to() {
     let channel_id = ChannelId(13);
-    let shared_key = [97u8; 32];
+    let shared_key = SharedKey::new([97u8; 32]);
 
     let malicious_reply_to = derec_proto::TransportProtocol {
         uri: "ws://attacker.example/inbox".to_owned(),

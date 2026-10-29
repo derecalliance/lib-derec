@@ -96,6 +96,16 @@ impl<
         self.secret_id
     }
 
+    /// This device's own row, as a
+    /// [`ReplicaFilter::exclude`](crate::protocol::types::ChannelFilter::exclude)
+    /// list. See [`Local::exclude_self`](crate::protocol::context::Local::exclude_self).
+    pub(super) fn exclude_self(&self) -> Vec<crate::types::ReplicaId> {
+        self.replica_id
+            .map(crate::types::ReplicaId)
+            .into_iter()
+            .collect()
+    }
+
     /// Generate an out-of-band contact message (QR code payload, deep link, …).
     ///
     /// Either party (Owner or Helper) may call this to begin a pairing session.

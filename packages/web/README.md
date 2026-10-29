@@ -1020,6 +1020,12 @@ Resolve each token once. The library is stateless, so rejecting the same
 token twice, or rejecting an action already accepted, sends a second
 response.
 
+Hand the token back exactly as you received it. It is sealed to its channel,
+so `accept` and `reject` refuse one that was edited, rebuilt or moved to
+another channel with a `DeRecError` whose `code` is `"invalid_input"`, and
+nothing is stored or sent. A token issued by v0.0.10 does not decode
+(`"decode_error"`).
+
 `withAutoRespondOnFailure` decides who answers. With it on, the library sends
 the response itself (a known failure keeps its specific status; anything else
 is `FAIL` with a generic memo). With it off (the default), nothing is sent and

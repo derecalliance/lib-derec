@@ -155,7 +155,7 @@ pub struct ProcessResult {
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
 ///
 /// let secret_list = vec![
 ///     SecretVersionEntry {
@@ -258,7 +258,7 @@ pub fn produce(
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
 ///
 /// let secret_list = vec![SecretVersionEntry {
 ///     secret_id: 1,
@@ -346,7 +346,7 @@ pub fn extract(
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
 ///
 /// let secret_list = vec![SecretVersionEntry {
 ///     secret_id: 1,

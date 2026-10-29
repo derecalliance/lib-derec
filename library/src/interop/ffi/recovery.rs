@@ -367,9 +367,9 @@ fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], 
     }
 }
 
-fn parse_shared_key(ptr: *const u8, len: usize) -> Result<[u8; 32], DeRecError> {
+fn parse_shared_key(ptr: *const u8, len: usize) -> Result<crate::types::SharedKey, DeRecError> {
     let bytes = parse_buffer(ptr, len, "shared_key_ptr")?;
-    bytes.try_into().map_err(|_| {
+    crate::types::SharedKey::try_from(bytes).map_err(|_| {
         ffi_error(
             DEREC_CODE_FFI_BAD_SHARED_KEY,
             "shared_key must be exactly 32 bytes",

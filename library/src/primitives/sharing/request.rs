@@ -225,7 +225,7 @@ pub fn split(
 /// let SplitResult { shares } = split(&channels, 1, 1, b"super_secret_value", 2)
 ///     .expect("split failed");
 ///
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
 /// let channel_id = ChannelId(1);
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
@@ -370,7 +370,7 @@ pub(crate) fn validate_keep_version(keep_version: u32, version: u32) -> Result<(
 ///     .expect("split failed");
 ///
 /// let channel_id = ChannelId(1);
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =

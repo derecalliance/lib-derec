@@ -297,13 +297,13 @@ pub(super) fn on_request(
     // nothing is sent here. Bound to `_` because `Option` is `must_use`.
     let _ = super::require_replica_id_for_kind(kind, local.replica_id)?;
 
-    let action = PendingAction::Pairing {
+    let action = PendingAction::pairing(
         channel_id,
-        request: request.clone(),
+        trace_id,
+        request.clone(),
         kind,
         peer_communication_info,
-        trace_id,
-    };
+    );
 
     Ok(vec![DeRecEvent::ActionRequired { channel_id, action }])
 }

@@ -108,7 +108,7 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
                 local,
                 &member,
                 request,
-                *exchange.shared_key,
+                exchange.shared_key,
                 exchange.trace_id,
                 exchange.obligation,
             )
@@ -341,7 +341,7 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
             .await?;
         stores
             .secrets
-            .save(secret_id, channel_id, SecretValue::SharedKey(*key))
+            .save(secret_id, channel_id, SecretValue::SharedKey(key.clone()))
             .await?;
     }
 
@@ -401,7 +401,7 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
         .save(
             secret_id,
             group.channel_id,
-            SecretValue::SharedKey(group.key),
+            SecretValue::SharedKey(group.key.clone()),
         )
         .await?;
 
@@ -422,7 +422,7 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
         )
         .await?;
 
-    Ok(Some((group.channel_id, group.key)))
+    Ok(Some((group.channel_id, group.key.clone())))
 }
 
 /// Inbound `StoreShareRequest` on a **replica** channel. The payload
@@ -464,7 +464,7 @@ async fn on_request<S: StoreSet>(
     local: &Local<'_>,
     channel: &crate::protocol::types::ReplicaMember,
     request: StoreShareRequestMessage,
-    shared_key: SharedKey,
+    shared_key: &SharedKey,
     inbound_trace_id: u64,
     obligation: Option<&Obligation>,
 ) -> Result<Vec<DeRecEvent>> {
@@ -491,6 +491,7 @@ async fn on_request<S: StoreSet>(
     // only learn of it by timing out. It goes to `reply`, which starts as the
     // channel the request arrived on and moves to the group channel once the
     // payload shows an admission handover.
+    let handover_key;
     let mut reply = (channel.channel_id, shared_key);
     macro_rules! refuse {
         ($fault:expr) => {{
@@ -550,9 +551,10 @@ async fn on_request<S: StoreSet>(
         <SharedKey>::try_from(composite.shared_key.as_slice()),
         secret.replicas.as_ref(),
     ) {
-        reply = (ChannelId(group.channel_id), group_key);
+        handover_key = group_key;
+        reply = (ChannelId(group.channel_id), &handover_key);
         if let Some(obligation) = obligation {
-            obligation.encrypt_for(reply.0, reply.1);
+            obligation.encrypt_for(reply.0, reply.1.clone());
         }
     }
 
@@ -696,9 +698,13 @@ async fn on_request<S: StoreSet>(
     // Every member answers on the group channel under the group key. Before
     // the first sync a joiner has neither, so it answers where the request
     // arrived.
-    let (ack_channel, ack_key) = hydrated.unwrap_or((channel.channel_id, shared_key));
+    let (ack_channel, ack_key) = hydrated
+        .as_ref()
+        .map_or((channel.channel_id, shared_key), |(channel_id, key)| {
+            (*channel_id, key)
+        });
     if let Some(obligation) = obligation {
-        obligation.encrypt_for(ack_channel, ack_key);
+        obligation.encrypt_for(ack_channel, ack_key.clone());
     }
 
     // Second half of the removal safety rule: a member flagged as leaving and
@@ -835,7 +841,7 @@ async fn answer<S: StoreSet>(
     local: &Local<'_>,
     channel: &crate::protocol::types::ReplicaMember,
     request: &StoreShareRequestMessage,
-    (ack_channel, ack_key): (ChannelId, SharedKey),
+    (ack_channel, ack_key): (ChannelId, &SharedKey),
     status: StatusEnum,
     memo: &str,
     inbound_trace_id: u64,
@@ -856,7 +862,7 @@ async fn answer<S: StoreSet>(
         .channel_id(ack_channel)
         .timestamp(timestamp)
         .message_body(MessageBody::StoreShareResponse(response))
-        .encrypt(&ack_key)?
+        .encrypt(ack_key)?
         .build()?
         .encode_to_vec();
     let envelope = crate::derec_message::apply_trace_id(&envelope_bytes, inbound_trace_id)?;
@@ -1387,7 +1393,7 @@ mod tests {
                 &lf.local(),
                 &channel,
                 request(1),
-                [0x11; 32],
+                &crate::types::SharedKey::new([0x11; 32]),
                 7,
                 None,
             )
@@ -1406,7 +1412,7 @@ mod tests {
                 &lf.local(),
                 &channel,
                 request(2),
-                [0x11; 32],
+                &crate::types::SharedKey::new([0x11; 32]),
                 8,
                 None,
             )
@@ -1450,7 +1456,7 @@ mod tests {
         const B: u64 = 1001;
         const A: u64 = 1002;
         const C: u64 = 1003;
-        const GROUP_KEY: [u8; 32] = [0x42; 32];
+        const GROUP_KEY: crate::types::SharedKey = crate::types::SharedKey::new([0x42; 32]);
 
         fn state(label: &str) -> Secret {
             let member = |replica_id, role: ReplicaRole| ReplicaInfo {
@@ -1473,7 +1479,7 @@ mod tests {
                         member(A, ReplicaRole::Destination),
                         member(C, ReplicaRole::Destination),
                     ],
-                    shared_key: GROUP_KEY.to_vec(),
+                    shared_key: GROUP_KEY.as_bytes().to_vec(),
                 }),
                 threshold: None,
             }
@@ -1540,7 +1546,7 @@ mod tests {
                 &lf.local(),
                 &channel,
                 request,
-                GROUP_KEY,
+                &GROUP_KEY,
                 0,
                 None,
             )
@@ -2001,7 +2007,7 @@ mod tests {
                 &lf.local(),
                 &channel,
                 request,
-                [0x11; 32],
+                &crate::types::SharedKey::new([0x11; 32]),
                 7,
                 None,
             )
@@ -2114,7 +2120,7 @@ mod tests {
                     reply_to_transports: Vec::new(),
                     timestamp: None,
                 },
-                [0x11; 32],
+                &crate::types::SharedKey::new([0x11; 32]),
                 7,
                 None,
             )
@@ -2210,7 +2216,7 @@ mod tests {
                     reply_to_transports: Vec::new(),
                     timestamp: None,
                 },
-                [0x11; 32],
+                &crate::types::SharedKey::new([0x11; 32]),
                 7,
                 None,
             )
@@ -2251,7 +2257,7 @@ mod tests {
 
         const SOURCE: u64 = 1001;
         const SELF_ID: u64 = 1002;
-        const GROUP_KEY: [u8; 32] = [0x42; 32];
+        const GROUP_KEY: crate::types::SharedKey = crate::types::SharedKey::new([0x42; 32]);
         const HELPER_CHANNEL: u64 = 77;
         const VERSION: u32 = 1;
 
@@ -2339,7 +2345,7 @@ mod tests {
                         member(SOURCE, ReplicaRole::Source, "https://source"),
                         member(SELF_ID, ReplicaRole::Destination, "https://self"),
                     ],
-                    shared_key: GROUP_KEY.to_vec(),
+                    shared_key: GROUP_KEY.as_bytes().to_vec(),
                 }),
                 threshold: None,
             }
@@ -2633,7 +2639,7 @@ mod tests {
 
         const ADMITTER: u64 = SOURCE;
         const EPHEMERAL: ChannelId = ChannelId(4242);
-        const EPHEMERAL_KEY: [u8; 32] = [0x11; 32];
+        const EPHEMERAL_KEY: crate::types::SharedKey = crate::types::SharedKey::new([0x11; 32]);
 
         /// A joiner still on the ephemeral channel of its pairing with the
         /// admitter, holding only that channel's key.
@@ -2739,7 +2745,7 @@ mod tests {
                         channel_id: HELPER_CHANNEL,
                         committed_share: share.encode_to_vec(),
                     }],
-                    shared_key: GROUP_KEY.to_vec(),
+                    shared_key: GROUP_KEY.as_bytes().to_vec(),
                     version: VERSION,
                     author_replica_id: Some(ADMITTER),
                 };
@@ -2932,7 +2938,7 @@ mod tests {
             &roster,
             Vec::new(),
             Some(GROUP_CHANNEL),
-            Some([0x42; 32]),
+            Some(&crate::types::SharedKey::new([0x42; 32])),
             None,
         )
         .expect("build secret")

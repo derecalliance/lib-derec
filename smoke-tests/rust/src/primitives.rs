@@ -127,8 +127,8 @@ fn run_pairing_flow_test() {
         "pair response envelope must not be empty"
     );
     assert!(
-        !pair_resp.shared_key.is_empty(),
-        "initiator shared key must not be empty"
+        pair_resp.shared_key.as_bytes().iter().any(|&b| b != 0),
+        "initiator shared key must not be all zeros"
     );
 
     let extracted_response =
@@ -144,8 +144,8 @@ fn run_pairing_flow_test() {
     .expect("pair_response::process failed");
 
     assert!(
-        !processed.shared_key.is_empty(),
-        "responder shared key must not be empty"
+        processed.shared_key.as_bytes().iter().any(|&b| b != 0),
+        "responder shared key must not be all zeros"
     );
     assert_eq!(
         pair_resp.shared_key, processed.shared_key,
@@ -324,7 +324,7 @@ fn inline_keys_handshake() -> (
     derec_proto::ContactMessage,
     derec_proto::PairResponseMessage,
     derec_library::primitives::pairing::request::ProduceResult,
-    [u8; 32],
+    derec_library::types::SharedKey,
 ) {
     let channel_id = ChannelId(31);
     let contact = pair_request::create_contact(
@@ -555,7 +555,7 @@ fn run_sharing_flow_test() {
         );
     }
 
-    let shared_key = [42u8; 32];
+    let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
 
     for (channel, share) in &split_result.shares {
         assert!(
@@ -816,7 +816,7 @@ fn run_discovery_flow_test() {
     println!("=== Discovery flow test ===");
 
     let channel_id = ChannelId(7);
-    let shared_key = [11u8; 32];
+    let shared_key = derec_library::types::SharedKey::new([11u8; 32]);
 
     let request =
         disc_request::produce(channel_id, &shared_key, &[]).expect("disc_request::produce failed");
@@ -864,7 +864,7 @@ fn run_envelope_trace_id_test() {
     println!("=== Envelope trace_id helpers test ===");
 
     let channel_id = ChannelId(42);
-    let shared_key = [9u8; 32];
+    let shared_key = derec_library::types::SharedKey::new([9u8; 32]);
 
     let result =
         disc_request::produce(channel_id, &shared_key, &[]).expect("disc_request::produce failed");
@@ -893,7 +893,7 @@ fn run_request_reply_to_test() {
     println!("=== Request reply_to round-trip test ===");
 
     let channel_id = ChannelId(7);
-    let shared_key = [11u8; 32];
+    let shared_key = derec_library::types::SharedKey::new([11u8; 32]);
 
     let reply_to = TransportProtocol {
         uri: "https://replica-a.example.com/derec".to_owned(),
@@ -927,12 +927,13 @@ fn run_request_reply_to_test() {
     println!("Request reply_to round-trip test passed.");
 }
 
-fn make_shared_keys(channels: &[ChannelId]) -> HashMap<ChannelId, [u8; 32]> {
+fn make_shared_keys(channels: &[ChannelId]) -> HashMap<ChannelId, derec_library::types::SharedKey> {
     let mut out = HashMap::with_capacity(channels.len());
     for (i, channel) in channels.iter().enumerate() {
-        let mut key = [0u8; 32];
-        key.fill((i + 1) as u8);
-        out.insert(*channel, key);
+        out.insert(
+            *channel,
+            derec_library::types::SharedKey::new([(i + 1) as u8; 32]),
+        );
     }
     out
 }

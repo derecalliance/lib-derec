@@ -76,10 +76,8 @@ pub async fn run() {
     let still_required = events.iter().any(|e| {
         matches!(
             e,
-            DeRecEvent::ActionRequired {
-                action: derec_library::protocol::PendingAction::StoreShare { .. },
-                ..
-            }
+            DeRecEvent::ActionRequired { action, .. }
+                if action.kind() == PendingActionKind::StoreShare
         )
     });
     assert!(

@@ -2,9 +2,9 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
-    DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport, IgnoreReason,
-    MissingPolicy, PendingAction, SecretKind, SecretValue, ShareStoreError, StateItem, StateKey,
-    VerifyFailureReason,
+    ChannelRequest, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport,
+    IgnoreReason, MissingPolicy, PendingAction, SecretKind, SecretValue, ShareStoreError,
+    StateItem, StateKey, VerifyFailureReason,
 };
 use super::NO_SHARE_FOR_VERSION;
 use crate::extensions::channel_store::ChannelStoreExt as _;
@@ -372,12 +372,12 @@ fn on_request(
 ) -> Result<Vec<DeRecEvent>> {
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id: exchange.channel_id,
-        action: PendingAction::VerifyShare {
-            channel_id: exchange.channel_id,
-            request,
-            shared_key: *exchange.shared_key,
-            trace_id: exchange.trace_id,
-        },
+        action: PendingAction::request(
+            exchange.channel_id,
+            exchange.trace_id,
+            ChannelRequest::VerifyShare(request),
+        )
+        .sealed_with(exchange.shared_key),
     }])
 }
 
@@ -703,7 +703,7 @@ mod tests {
                 &local.local(),
                 &Exchange {
                     channel_id: CHANNEL,
-                    shared_key: &[0u8; 32],
+                    shared_key: &crate::types::SharedKey::new([0u8; 32]),
                     trace_id: 0,
                     obligation: None,
                 },
@@ -762,7 +762,7 @@ mod tests {
         >;
 
         const HELPER_PARTITION: u64 = 0x4E1;
-        const KEY: SharedKey = [0xC3; 32];
+        const KEY: SharedKey = SharedKey::new([0xC3; 32]);
 
         async fn helper(auto_accept: AutoAcceptPolicy) -> (TestProto, RecordingTransport) {
             let mut rig = StoreRig::new();
@@ -969,7 +969,7 @@ mod tests {
 
         const REC_SECRET_ID: u64 = 0xBEE5;
         const REC_CHANNEL: ChannelId = ChannelId(41);
-        const REC_KEY: SharedKey = [7u8; 32];
+        const REC_KEY: SharedKey = SharedKey::new([7u8; 32]);
 
         type RecRig = StoreRig<
             InMemChannelStore,
@@ -1240,12 +1240,12 @@ mod tests {
                     rig.shares.set_verification_backend_error(true);
                     let local = LocalFixture::new(REC_SECRET_ID);
                     let request = rec_request(1, 0x0BAD_5EED);
-                    let action = PendingAction::VerifyShare {
-                        channel_id: REC_CHANNEL,
-                        request: request.clone(),
-                        shared_key: REC_KEY,
-                        trace_id: 1,
-                    };
+                    let action = PendingAction::request(
+                        REC_CHANNEL,
+                        1,
+                        ChannelRequest::VerifyShare(request.clone()),
+                    )
+                    .sealed_with(&REC_KEY);
                     let obligation =
                         Obligation::for_action(&action, local.local().policy).expect("a request");
 
@@ -1301,12 +1301,11 @@ mod tests {
                         }
                         other => panic!("expected one RequestFailed, got {other:?}"),
                     };
-                    if let Some(PendingAction::RespondToFailure {
+                    if let Some((
                         channel_id,
                         trace_id,
-                        reply,
-                        request,
-                    }) = token
+                        crate::protocol::Action::RespondToFailure { reply, request },
+                    )) = token.map(PendingAction::into_parts)
                     {
                         assert!(rig.transport.sent_envelopes().is_empty());
                         let answer = Obligation::for_failure(
@@ -1348,7 +1347,7 @@ mod tests {
         use derec_proto::{ContactMessage, SenderKind, TransportProtocol};
 
         const OTHER: ChannelId = ChannelId(22);
-        const KEY: SharedKey = [0x3C; 32];
+        const KEY: SharedKey = SharedKey::new([0x3C; 32]);
         const PROOF: &[u8] = b"the share bytes the owner committed to";
 
         fn endpoint(uri: &str) -> TransportProtocol {

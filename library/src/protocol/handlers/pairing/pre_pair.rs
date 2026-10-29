@@ -84,7 +84,7 @@ pub(super) async fn start<S: StoreSet>(
     Ok(channel_id.0)
 }
 
-/// `accept` arm for [`PendingAction::PrePair`]. Branches on the stored
+/// `accept` arm for [`Action::PrePair`](crate::protocol::Action::PrePair). Branches on the stored
 /// contact's mode:
 ///
 /// - `HashedKeys`: loads the previously-generated `PairingSecret` and
@@ -193,7 +193,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     Ok(vec![])
 }
 
-/// `reject` arm for [`PendingAction::PrePair`]. Builds a non-Ok
+/// `reject` arm for [`Action::PrePair`](crate::protocol::Action::PrePair). Builds a non-Ok
 /// `PrePairResponse` (no keys) and sends it to the scanner's `replyTo`.
 /// Does NOT load `PairingSecret` — rejection carries no crypto material.
 pub(in crate::protocol) async fn reject<S: StoreSet>(
@@ -417,7 +417,7 @@ pub(in crate::protocol) async fn on_response<S: StoreSet>(
 /// keys are generated on the fly at accept time) or reject (refuse to
 /// participate) by calling [`DeRecProtocol::accept`](crate::protocol::DeRecProtocol::accept)
 /// or [`DeRecProtocol::reject`](crate::protocol::DeRecProtocol::reject) with
-/// the carried [`PendingAction::PrePair`].
+/// the carried [`Action::PrePair`](crate::protocol::Action::PrePair).
 pub(in crate::protocol) fn on_request(
     channel_id: ChannelId,
     request: &PrePairRequestMessage,
@@ -425,10 +425,6 @@ pub(in crate::protocol) fn on_request(
 ) -> Result<Vec<DeRecEvent>> {
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id,
-        action: PendingAction::PrePair {
-            channel_id,
-            request: request.clone(),
-            trace_id,
-        },
+        action: PendingAction::pre_pair(channel_id, trace_id, request.clone()),
     }])
 }

@@ -258,14 +258,12 @@ fn share_store_call_error(method: &str, value: &JsValue) -> ShareStoreError {
 fn decode_secret_value(kind: SecretKind, bytes: &[u8]) -> Result<SecretValue, SecretStoreError> {
     match kind {
         SecretKind::SharedKey => {
-            if bytes.len() != 32 {
-                return Err(SecretStoreError::Backend(box_err(format!(
+            let key = crate::types::SharedKey::try_from(bytes).map_err(|_| {
+                SecretStoreError::Backend(box_err(format!(
                     "shared key must be 32 bytes, got {}",
                     bytes.len()
-                ))));
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(bytes);
+                )))
+            })?;
             Ok(SecretValue::SharedKey(key))
         }
         SecretKind::PairingSecret => Ok(SecretValue::PairingSecret(
@@ -364,7 +362,7 @@ impl DeRecSecretStore for JsSecretStore {
         let channel_str = channel_id.0.to_string();
         Box::pin(async move {
             let (kind_num, bytes) = match &value {
-                SecretValue::SharedKey(key) => (0u32, key.to_vec()),
+                SecretValue::SharedKey(key) => (0u32, key.as_bytes().to_vec()),
                 SecretValue::PairingSecret(material) => (1u32, material.as_bytes().to_vec()),
                 SecretValue::PairingContact(contact) => (2u32, contact.encode_to_vec()),
             };

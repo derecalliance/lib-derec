@@ -256,7 +256,7 @@ impl TryFrom<&SecretValue> for SecretValueRecord {
         match v {
             SecretValue::SharedKey(k) => Ok(Self {
                 kind: 0,
-                bytes: k.to_vec(),
+                bytes: k.as_bytes().to_vec(),
             }),
             SecretValue::PairingSecret(sk) => Ok(Self {
                 kind: 1,
@@ -274,11 +274,9 @@ impl SecretValueRecord {
     pub(crate) fn into_value(self) -> Result<SecretValue, String> {
         match self.kind {
             0 => {
-                let arr: [u8; 32] = self
-                    .bytes
-                    .try_into()
+                let key = crate::types::SharedKey::try_from(self.bytes.as_slice())
                     .map_err(|_| "SharedKey payload must be 32 bytes".to_string())?;
-                Ok(SecretValue::SharedKey(arr))
+                Ok(SecretValue::SharedKey(key))
             }
             1 => Ok(SecretValue::PairingSecret(
                 crate::protocol::PairingKeyMaterial::from_bytes(self.bytes),
@@ -1937,7 +1935,9 @@ mod record_validation_tests {
             kind: 0,
             bytes: vec![7; 32],
         };
-        assert!(matches!(key.into_value(), Ok(SecretValue::SharedKey(k)) if k == [7; 32]));
+        assert!(
+            matches!(key.into_value(), Ok(SecretValue::SharedKey(k)) if k == crate::types::SharedKey::new([7; 32]))
+        );
     }
 
     /// A channel record must carry exactly one variant; bindings marshal

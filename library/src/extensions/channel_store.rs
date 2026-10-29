@@ -608,7 +608,7 @@ mod send_channel_message_tests {
 
     const SECRET_ID: u64 = 0x5E4D;
     const CHANNEL: ChannelId = ChannelId(77);
-    const KEY: SharedKey = [3u8; 32];
+    const KEY: SharedKey = SharedKey::new([3u8; 32]);
 
     /// The body arrives here already carrying a timestamp of its own; the
     /// envelope and the body must leave with one value, the send time.

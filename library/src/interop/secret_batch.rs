@@ -58,7 +58,9 @@ mod tests {
     use super::*;
 
     fn key(byte: u8) -> Result<SecretValue, String> {
-        Ok(SecretValue::SharedKey([byte; 32]))
+        Ok(SecretValue::SharedKey(crate::types::SharedKey::new(
+            [byte; 32],
+        )))
     }
 
     #[test]
@@ -74,7 +76,9 @@ mod tests {
         .unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].0, ChannelId(7));
-        assert!(matches!(got[1].1, SecretValue::SharedKey(k) if k == [2; 32]));
+        assert!(
+            matches!(&got[1].1, SecretValue::SharedKey(k) if *k == crate::types::SharedKey::new([2; 32]))
+        );
     }
 
     #[test]

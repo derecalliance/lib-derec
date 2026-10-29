@@ -75,6 +75,7 @@ pub mod types;
 pub mod utils;
 
 pub(crate) mod actions;
+pub(crate) mod auto_publish;
 pub(crate) mod builder;
 pub(crate) mod config;
 pub(crate) mod context;
@@ -114,9 +115,9 @@ pub use types::{
 };
 
 pub use events::{
-    AutoAcceptPolicy, CorruptionReason, DeRecEvent, DeRecFlow, FailedRequest, IgnoreReason,
-    NotRestoredReason, PendingAction, PendingActionKind, ReplyTarget, UnpairAck,
-    VerifyFailureReason,
+    Action, AutoAcceptPolicy, ChannelRequest, CorruptionReason, DeRecEvent, DeRecFlow,
+    FailedRequest, IgnoreReason, NotRestoredReason, PendingAction, PendingActionKind, ReplyTarget,
+    UnpairAck, VerifyFailureReason,
 };
 pub use handlers::restore::RestoreError;
 

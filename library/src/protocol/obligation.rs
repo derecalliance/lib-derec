@@ -19,7 +19,7 @@
 //! - `auto_respond_on_failure` on: the failure response is sent, then
 //!   `responded: true`;
 //! - off, or on with no reply target resolvable before any send attempt:
-//!   `responded: false` with a [`PendingAction::RespondToFailure`] the
+//!   `responded: false` with a [`Action::RespondToFailure`] the
 //!   application passes to `reject`. No token is issued when `reject` could
 //!   never answer it: no reply target can exist, or the channel whose key
 //!   would encrypt the response has none stored.
@@ -32,12 +32,13 @@
 
 use crate::derec_message::DeRecMessageBuilder;
 use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
+use crate::protocol::DeRecTransport;
 use crate::protocol::context::Local;
 use crate::protocol::events::{
-    DeRecEvent, FailedRequest, PendingAction, PendingActionKind, ReplyTarget,
+    Action, DeRecEvent, FailedRequest, PendingAction, PendingActionKind, ReplyTarget,
 };
 use crate::protocol::stores::{StoreSet, Stores};
-use crate::protocol::{DeRecSecretStore as _, DeRecTransport, SecretKind, SecretValue};
 use crate::transport::TransportPolicy;
 use crate::types::{ChannelId, SharedKey};
 use crate::{Error, Result};
@@ -139,7 +140,13 @@ impl Obligation {
             }
             _ => return None,
         };
-        Some(Self::new(channel_id, Some(*key), trace_id, request, policy))
+        Some(Self::new(
+            channel_id,
+            Some(key.clone()),
+            trace_id,
+            request,
+            policy,
+        ))
     }
 
     /// The obligation of a message that decrypted under the channel key but
@@ -154,7 +161,7 @@ impl Obligation {
     ) -> Self {
         Self::new(
             channel_id,
-            Some(*key),
+            Some(key.clone()),
             trace_id,
             FailedRequest::Undecodable,
             policy,
@@ -163,89 +170,23 @@ impl Obligation {
 
     /// The obligation a persisted action still carries, or `None` for an
     /// action that answers no channel request: the pairing handshake, and a
-    /// [`PendingAction::RespondToFailure`], which only `reject` resolves.
+    /// [`Action::RespondToFailure`], which only `reject` resolves.
+    /// The action carries no key, so the response is encrypted under the
+    /// channel's key, loaded when it is sent.
     pub(crate) fn for_action(action: &PendingAction, policy: TransportPolicy) -> Option<Self> {
-        let (channel_id, key, trace_id, request) = match action {
-            PendingAction::StoreShare {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            } => (
-                channel_id,
-                shared_key,
-                trace_id,
-                FailedRequest::StoreShare(request.clone()),
-            ),
-            PendingAction::VerifyShare {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            } => (
-                channel_id,
-                shared_key,
-                trace_id,
-                FailedRequest::VerifyShare(request.clone()),
-            ),
-            PendingAction::Discovery {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            } => (
-                channel_id,
-                shared_key,
-                trace_id,
-                FailedRequest::GetSecretIdsVersions(request.clone()),
-            ),
-            PendingAction::GetShare {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            } => (
-                channel_id,
-                shared_key,
-                trace_id,
-                FailedRequest::GetShare(request.clone()),
-            ),
-            PendingAction::Unpair {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            } => (
-                channel_id,
-                shared_key,
-                trace_id,
-                FailedRequest::Unpair(request.clone()),
-            ),
-            PendingAction::UpdateChannelInfo {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            } => (
-                channel_id,
-                shared_key,
-                trace_id,
-                FailedRequest::UpdateChannelInfo(request.clone()),
-            ),
-            PendingAction::Pairing { .. }
-            | PendingAction::PrePair { .. }
-            | PendingAction::RespondToFailure { .. } => return None,
+        let Action::Request(request) = action.action() else {
+            return None;
         };
         Some(Self::new(
-            *channel_id,
-            Some(*key),
-            *trace_id,
-            request,
+            action.channel_id(),
+            None,
+            action.trace_id(),
+            request.clone().into(),
             policy,
         ))
     }
 
-    /// The obligation a [`PendingAction::RespondToFailure`] token stands for.
+    /// The obligation a [`Action::RespondToFailure`] token stands for.
     /// The key is loaded from `reply.channel_id` when the response is sent.
     pub(crate) fn for_failure(
         channel_id: ChannelId,
@@ -360,7 +301,7 @@ impl Obligation {
     ) -> Result<Option<Target>> {
         let (channel_id, key, endpoints) = {
             let state = self.lock();
-            (state.channel_id, state.key, state.endpoints.clone())
+            (state.channel_id, state.key.clone(), state.endpoints.clone())
         };
         let endpoints = match endpoints {
             Some(endpoints) if !endpoints.is_empty() => endpoints,
@@ -386,18 +327,12 @@ impl Obligation {
         };
         let key = match key {
             Some(key) => key,
-            None => match stores
-                .secrets
-                .load(local.secret_id, channel_id, SecretKind::SharedKey)
-                .await?
-            {
-                Some(SecretValue::SharedKey(key)) => key,
-                _ => {
-                    return Err(Error::InvalidInput(
-                        "channel has no shared key — not yet paired",
-                    ));
-                }
-            },
+            None => {
+                stores
+                    .secrets
+                    .paired_key(local.secret_id, channel_id)
+                    .await?
+            }
         };
         Ok(Some((channel_id, endpoints, key)))
     }
@@ -591,16 +526,25 @@ pub(crate) async fn settle<S: StoreSet>(
         },
         Err(_) => obligation.unresolved_target(),
     };
-    // `reject` loads the key from the reply channel, so a token naming a
-    // channel with no stored key could never be answered and is not issued.
-    let token = has_stored_key(stores, local, reply.channel_id)
+    // The token is sealed under the reply channel's key, which `reject` also
+    // answers under: a channel whose key cannot be read could neither seal
+    // the token nor answer it, so no token is issued.
+    let token = match stores
+        .secrets
+        .shared_key(local.secret_id, reply.channel_id)
         .await
-        .then(|| PendingAction::RespondToFailure {
-            channel_id: obligation.channel_id,
-            trace_id: obligation.trace_id,
-            reply,
-            request: obligation.request.clone(),
-        });
+    {
+        Ok(Some(key)) => Some(
+            PendingAction::failure(
+                obligation.channel_id,
+                obligation.trace_id,
+                reply,
+                obligation.request.clone(),
+            )
+            .sealed_with(&key),
+        ),
+        Ok(None) | Err(_) => None,
+    };
     events.push(request_failed(
         obligation.channel_id,
         obligation.kind(),
@@ -611,25 +555,6 @@ pub(crate) async fn settle<S: StoreSet>(
         token,
     ));
     events
-}
-
-/// Whether the secret store holds a shared key for `channel_id`.
-///
-/// A store read that fails is not proof of a missing key: the token is kept,
-/// and `reject` reports the read again if it still fails.
-async fn has_stored_key<S: StoreSet>(
-    stores: &mut Stores<'_, S>,
-    local: &Local<'_>,
-    channel_id: ChannelId,
-) -> bool {
-    match stores
-        .secrets
-        .load(local.secret_id, channel_id, SecretKind::SharedKey)
-        .await
-    {
-        Ok(Some(SecretValue::SharedKey(_))) | Err(_) => true,
-        Ok(_) => false,
-    }
 }
 
 /// Answer the request `obligation` stands for with `status` and `memo`, using

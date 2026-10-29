@@ -691,7 +691,7 @@ included) are kept.
 - `error_code` is the error's `DeRecErrorCode` name and `message` a local
   description; neither goes on the wire.
 - `action`, when `responded` is `false`, is a
-  `PendingAction::RespondToFailure` token. Pass it to `reject`, which sends
+  `Action::RespondToFailure` token. Pass it to `reject`, which sends
   the one response; `accept` returns `Error::InvalidInput` for it. It is
   `None` only when `reject` could never answer it: a request on a replica
   group channel that names no member and carries no `reply_to`, which has
@@ -727,11 +727,17 @@ it accepts. The library is stateless, so resolving each token once is the
 application's part: rejecting the same token twice, or rejecting a copy of
 an action already accepted, sends a second response.
 
+A `PendingAction` comes only from `process`, and every one answered under a
+channel key is sealed to that channel. `accept` and `reject` check the seal
+before anything else, so an action that was altered, built by hand or moved to
+another channel is refused with `Error::InvalidInput`, and nothing is stored
+or sent.
+
 Before acting on a persisted action, `accept` checks its channel again. A
-channel that is gone or no longer `Paired` has nothing to answer on, so
-`accept` returns `Error::InvalidInput` and nothing is stored or sent. A peer
-that no longer holds the role the flow requires is a failed request with
-status `REJECTED`.
+channel that is gone, no longer `Paired`, or without a stored shared key has
+nothing to answer on, so `accept` returns `Error::InvalidInput` and nothing is
+stored or sent. A peer that no longer holds the role the flow requires is a
+failed request with status `REJECTED`.
 
 A message that decrypts under the channel key but whose body cannot be
 decoded, or that carries a `PairRequest` or `PrePairRequest` on a paired
@@ -810,15 +816,15 @@ decrypting the inner message and parsing the protobuf — reimplementing
 the protocol's receive path outside the protocol.
 
 Instead, `process()` does that work and hands back the decoded request in
-an `ActionRequired` event. `PendingAction::StoreShare` carries the
+an `ActionRequired` event. `ChannelRequest::StoreShare` carries the
 already-decrypted `StoreShareRequestMessage`, so the application inspects
 the share without touching wire bytes or key material:
 
 ```rust,ignore
 for event in protocol.process(&wire_bytes).await? {
     let DeRecEvent::ActionRequired { action, channel_id } = event else { continue };
-    match &action {
-        PendingAction::StoreShare { request, .. } => {
+    match action.action() {
+        Action::Request(ChannelRequest::StoreShare(request)) => {
             // `channel_id` maps to a user in the application's own store,
             // so the limit can be per-user, per-plan, or whatever the
             // deployment needs.
@@ -2456,7 +2462,7 @@ the next `start(ProtectSecret)`.
 
 When the peer's `UnpairRequest` arrives on the responder side, the
 orchestrator emits `DeRecEvent::ActionRequired { channel_id, action }` with
-`action` set to `PendingAction::Unpair { .. }`. The application calls
+`action` holding `Action::Request(ChannelRequest::Unpair(..))`. The application calls
 `protocol.accept(action)` to drop local state and reply `Ok`, or
 `protocol.reject(action, status, memo)` to keep local state and reply with a
 non-`Ok` status.

@@ -587,7 +587,7 @@ pub extern "C" fn produce_pair_response_message(
             error: success(),
             response_wire_bytes: vec_into_buffer(r.envelope),
             peer_transports: vec_into_buffer(encode_transport_list(&r.peer_transports)),
-            shared_key: vec_into_buffer(r.shared_key.to_vec()),
+            shared_key: vec_into_buffer(r.shared_key.as_bytes().to_vec()),
             channel_id: r.channel_id.into(),
         },
         Err(e) => with_err(from_lib_error(e)),
@@ -722,7 +722,7 @@ pub extern "C" fn process_pair_response_message(
     ) {
         Ok(r) => ProcessPairResponseMessageResult {
             error: success(),
-            shared_key: vec_into_buffer(r.shared_key.to_vec()),
+            shared_key: vec_into_buffer(r.shared_key.as_bytes().to_vec()),
             channel_id: r.channel_id.into(),
         },
         Err(e) => with_err(from_lib_error(e)),
@@ -1299,9 +1299,9 @@ fn decode_optional_parameter_range(
         })
 }
 
-fn parse_shared_key(ptr: *const u8, len: usize) -> Result<[u8; 32], DeRecError> {
+fn parse_shared_key(ptr: *const u8, len: usize) -> Result<crate::types::SharedKey, DeRecError> {
     let bytes = parse_buffer(ptr, len, "shared_key_ptr")?;
-    bytes.try_into().map_err(|_| {
+    crate::types::SharedKey::try_from(bytes).map_err(|_| {
         ffi_error(
             DEREC_CODE_FFI_BAD_SHARED_KEY,
             "shared_key must be exactly 32 bytes",
@@ -1735,8 +1735,8 @@ mod pairing_entry_point_tests {
     /// layers show the user the same value.
     #[test]
     fn the_fingerprint_matches_the_protocol_derivation() {
-        let key = [0x5A; 32];
-        let result = pairing_fingerprint(key.as_ptr(), key.len());
+        let key = crate::types::SharedKey::new([0x5A; 32]);
+        let result = pairing_fingerprint(key.as_bytes().as_ptr(), key.as_bytes().len());
         assert_eq!(result.error.category, DEREC_CATEGORY_OK);
         let text = unsafe { std::ffi::CStr::from_ptr(result.fingerprint) }
             .to_string_lossy()

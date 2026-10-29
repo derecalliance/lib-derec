@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::types::SharedKey;
 use crate::{
     Error,
     derec_message::extract_inner_message,
@@ -23,7 +24,7 @@ use sha2::{Digest, Sha384};
 
 fn parse_request(
     envelope_bytes: &[u8],
-    shared_key: &[u8; 32],
+    shared_key: &SharedKey,
 ) -> crate::primitives::verification::request::ExtractResult {
     extract_verify_share_request(envelope_bytes, shared_key)
         .expect("extract_verify_share_request failed")
@@ -32,7 +33,7 @@ fn parse_request(
 #[test]
 fn test_produce_verify_share_request_message_produces_non_empty_envelope() {
     let channel_id = ChannelId(7);
-    let shared_key = [23u8; 32];
+    let shared_key = SharedKey::new([23u8; 32]);
 
     let result = produce_verify_share_request_message(channel_id, 1, 5, &shared_key, &[])
         .expect("failed to produce verification request");
@@ -45,7 +46,7 @@ fn test_produce_verify_share_request_message_produces_non_empty_envelope() {
 #[test]
 fn test_extract_verify_share_request_extracts_all_fields() {
     let channel_id = ChannelId(5);
-    let shared_key = [29u8; 32];
+    let shared_key = SharedKey::new([29u8; 32]);
     let secret_id = 1;
     let version = 9;
 
@@ -67,7 +68,7 @@ fn test_extract_verify_share_request_extracts_all_fields() {
 #[test]
 fn test_extract_verify_share_request_nonce_matches_inner_message() {
     let channel_id = ChannelId(2);
-    let shared_key = [31u8; 32];
+    let shared_key = SharedKey::new([31u8; 32]);
 
     let produced = produce_verify_share_request_message(channel_id, 2, 3, &shared_key, &[])
         .expect("failed to produce verification request");
@@ -92,7 +93,7 @@ fn test_extract_verify_share_request_nonce_matches_inner_message() {
 #[test]
 fn test_extract_verify_share_request_rejects_tampered_timestamp() {
     let channel_id = ChannelId(4);
-    let shared_key = [37u8; 32];
+    let shared_key = SharedKey::new([37u8; 32]);
 
     let produced = produce_verify_share_request_message(channel_id, 4, 1, &shared_key, &[])
         .expect("failed to produce verification request");
@@ -133,7 +134,7 @@ fn test_extract_verify_share_request_rejects_tampered_timestamp() {
 #[test]
 fn test_produce_verify_share_response_message_produces_non_empty_envelope() {
     let channel_id = ChannelId(1);
-    let shared_key = [7u8; 32];
+    let shared_key = SharedKey::new([7u8; 32]);
 
     let produced = produce_verify_share_request_message(channel_id, 10, 4, &shared_key, &[])
         .expect("failed to produce verification request");
@@ -154,7 +155,7 @@ fn test_produce_verify_share_response_message_produces_non_empty_envelope() {
 #[test]
 fn test_produce_verify_share_response_message_echo_fields() {
     let channel_id = ChannelId(2);
-    let shared_key = [9u8; 32];
+    let shared_key = SharedKey::new([9u8; 32]);
     let secret_id = 123;
     let version = 4;
 
@@ -198,7 +199,7 @@ fn test_produce_verify_share_response_message_echo_fields() {
 #[test]
 fn test_full_verification_flow_success() {
     let channel_id = ChannelId(2);
-    let shared_key = [7u8; 32];
+    let shared_key = SharedKey::new([7u8; 32]);
     let secret_id = 987;
     let version = 4;
     let share_content = b"test_share_content";
@@ -230,7 +231,7 @@ fn test_full_verification_flow_success() {
 #[test]
 fn test_full_verification_flow_wrong_share_returns_false() {
     let channel_id = ChannelId(2);
-    let shared_key = [9u8; 32];
+    let shared_key = SharedKey::new([9u8; 32]);
     let secret_id = 987654;
     let version = 4;
     let share_content = b"test_share_content";
@@ -262,7 +263,7 @@ fn test_full_verification_flow_wrong_share_returns_false() {
 #[test]
 fn test_verification_hash_is_correct_sha384() {
     let channel_id = ChannelId(1);
-    let shared_key = [3u8; 32];
+    let shared_key = SharedKey::new([3u8; 32]);
     let share_content = b"abc123";
 
     let produced = produce_verify_share_request_message(channel_id, 654321, 4, &shared_key, &[])
@@ -293,7 +294,7 @@ fn test_verification_hash_is_correct_sha384() {
 #[test]
 fn test_verification_fails_with_modified_response_nonce() {
     let channel_id = ChannelId(1);
-    let shared_key = [5u8; 32];
+    let shared_key = SharedKey::new([5u8; 32]);
     let share_content = b"nonce_test_content";
 
     let produced = produce_verify_share_request_message(channel_id, 654321, 4, &shared_key, &[])
@@ -348,7 +349,7 @@ fn test_verification_fails_with_modified_response_nonce() {
 #[test]
 fn test_process_verify_share_response_message_rejects_tampered_envelope_timestamp() {
     let channel_id = ChannelId(1);
-    let shared_key = [13u8; 32];
+    let shared_key = SharedKey::new([13u8; 32]);
     let share_content = b"response_timestamp_test_content";
 
     let produced = produce_verify_share_request_message(channel_id, 9873241, 4, &shared_key, &[])
@@ -396,7 +397,7 @@ fn test_process_verify_share_response_message_rejects_tampered_envelope_timestam
 #[test]
 fn test_extract_verify_share_response_returns_correct_channel_id() {
     let channel_id = ChannelId(7);
-    let shared_key = [23u8; 32];
+    let shared_key = SharedKey::new([23u8; 32]);
 
     let produced = produce_verify_share_request_message(channel_id, 987654, 1, &shared_key, &[])
         .expect("failed to produce verification request");
@@ -413,7 +414,7 @@ fn test_extract_verify_share_response_returns_correct_channel_id() {
 #[test]
 fn test_extract_verify_share_response_returns_encrypted_bytes() {
     let channel_id = ChannelId(3);
-    let shared_key = [11u8; 32];
+    let shared_key = SharedKey::new([11u8; 32]);
 
     let produced = produce_verify_share_request_message(channel_id, 987654, 2, &shared_key, &[])
         .expect("failed to produce verification request");
@@ -433,7 +434,7 @@ fn test_extract_verify_share_response_returns_encrypted_bytes() {
 #[test]
 fn test_extract_verify_share_response_timestamp_matches_inner() {
     let channel_id = ChannelId(2);
-    let shared_key = [31u8; 32];
+    let shared_key = SharedKey::new([31u8; 32]);
 
     let produced = produce_verify_share_request_message(channel_id, 951984, 4, &shared_key, &[])
         .expect("failed to produce verification request");
@@ -464,7 +465,7 @@ fn test_extract_verify_share_response_timestamp_matches_inner() {
 #[test]
 fn test_process_rejects_response_with_mismatched_request_nonce() {
     let channel_id = ChannelId(1);
-    let shared_key = [41u8; 32];
+    let shared_key = SharedKey::new([41u8; 32]);
     let share_content = b"binding_test_share";
 
     let req_a = parse_request(
@@ -509,7 +510,7 @@ fn test_process_rejects_response_with_mismatched_request_nonce() {
 #[test]
 fn test_process_rejects_response_with_mismatched_secret_id() {
     let channel_id = ChannelId(2);
-    let shared_key = [43u8; 32];
+    let shared_key = SharedKey::new([43u8; 32]);
     let share_content = b"binding_test_share_2";
 
     let req = parse_request(
@@ -557,7 +558,7 @@ fn test_process_rejects_response_with_mismatched_secret_id() {
 #[test]
 fn test_process_rejects_response_with_mismatched_version() {
     let channel_id = ChannelId(3);
-    let shared_key = [47u8; 32];
+    let shared_key = SharedKey::new([47u8; 32]);
     let share_content = b"binding_test_share_3";
 
     let req = parse_request(
@@ -609,7 +610,7 @@ fn test_process_rejects_response_with_mismatched_version() {
 #[test]
 fn test_extract_verify_share_request_rejects_scheme_mismatched_reply_to() {
     let channel_id = ChannelId(11);
-    let shared_key = [42u8; 32];
+    let shared_key = SharedKey::new([42u8; 32]);
 
     let malicious_reply_to = derec_proto::TransportProtocol {
         uri: "ws://attacker.example/inbox".to_owned(),

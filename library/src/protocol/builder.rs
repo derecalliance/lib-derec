@@ -349,7 +349,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     ///   usable); anything else is `FAIL` with a generic memo, so no local
     ///   error text reaches the peer.
     /// - `false`: nothing is sent. The event carries `responded: false` and a
-    ///   [`PendingAction::RespondToFailure`](crate::protocol::PendingAction::RespondToFailure)
+    ///   [`Action::RespondToFailure`](crate::protocol::Action::RespondToFailure)
     ///   token; pass it to [`DeRecProtocol::reject`] with the status and memo
     ///   to send. The library never expires the token, so a request the
     ///   application never answers leaves its sender to time out.

@@ -4,6 +4,7 @@
 #[cfg(any(feature = "ffi", target_arch = "wasm32"))]
 pub(crate) mod wire;
 
+pub(crate) mod seal;
 #[cfg(test)]
 mod tests;
 
@@ -133,7 +134,7 @@ pub enum PendingActionKind {
     GetShare,
     Unpair,
     UpdateChannelInfo,
-    /// A [`PendingAction::RespondToFailure`]: a request that failed and still
+    /// A [`Action::RespondToFailure`]: a request that failed and still
     /// owes its sender a response. [`AutoAcceptPolicy`] never allows it.
     Failed,
 }
@@ -174,7 +175,7 @@ pub enum PendingActionKind {
 ///   [`DeRecEvent::ActionRequired`] is ever considered — an out-of-range
 ///   share is refused with `SIZE_LIMIT_EXCEEDED` either way, and this flag
 ///   has no say in it. While this flag is `false`, the
-///   [`DeRecEvent::ActionRequired`] carrying [`PendingAction::StoreShare`]
+///   [`DeRecEvent::ActionRequired`] carrying [`ChannelRequest::StoreShare`]
 ///   hands the application the decoded
 ///   [`derec_proto::StoreShareRequestMessage`], which is where a *tighter
 ///   or per-user* size limit, storage quota, or any other app-specific
@@ -203,7 +204,7 @@ pub enum PendingActionKind {
 /// protocol enforces itself, only the application's opportunity to
 /// refuse.
 ///
-/// No field covers [`PendingAction::RespondToFailure`]. A failed request can
+/// No field covers [`Action::RespondToFailure`]. A failed request can
 /// only be rejected, so [`Self::allows`] is `false` for it under every
 /// policy, [`Self::all`] included.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -262,12 +263,31 @@ impl AutoAcceptPolicy {
 /// pass this token to [`super::DeRecProtocol::accept`] or
 /// [`super::DeRecProtocol::reject`] to complete the flow.
 ///
+/// It holds what every action shares — the channel the request arrived on and
+/// the trace id of the exchange — and the [`Action`] itself. Only the library
+/// creates one, and its parts are read through accessors: an action is
+/// resolved exactly as `process` raised it.
+///
+/// Every action answered under a channel key is sealed: an HMAC over the
+/// action under a key derived from that channel's shared key. `accept` and
+/// `reject` refuse an action whose seal does not verify, so one that was
+/// altered, built by hand or moved to another channel is never acted on.
+/// The pairing actions carry no seal: their request is one anyone holding the
+/// contact can send anyway.
+///
+/// The application owns the action from the moment `process` returns it until
+/// it passes it to `accept` or `reject`. The seal catches an action that was
+/// changed; it does not stop one being resolved twice, so resolving each
+/// action once, and holding it where it cannot be lost, stays the
+/// application's responsibility.
+///
 /// `Debug` shows only the [`PendingActionKind`] discriminant plus
 /// `channel_id`, keeping any peer-supplied request contents out of log
-/// lines. No variant carries private key material — the accept handlers
-/// reload the pairing secret from the secret store (single source of
-/// truth), so the token stays small and safe to persist or ship across a
-/// language boundary.
+/// lines. No action carries key material: `accept` and `reject` load the
+/// channel's shared key, and the pairing secret, from the secret store (the
+/// single source of truth) when they run. The token can therefore be
+/// persisted or shipped across a language boundary without exposing a key.
+/// It still carries the peer's request, so it is not public data.
 ///
 /// `Clone` lets an application keep a copy of an action it passes to
 /// [`super::DeRecProtocol::accept`], so it can still hand that copy to
@@ -277,16 +297,24 @@ impl AutoAcceptPolicy {
 /// The library never expires an unresolved action: a token stays valid until
 /// the application resolves it, however long that takes.
 #[derive(Clone)]
-pub enum PendingAction {
+pub struct PendingAction {
+    channel_id: ChannelId,
+    trace_id: u64,
+    /// Present on every action answered under a channel key: `None` only for
+    /// [`Action::Pairing`] and [`Action::PrePair`], whose request anyone
+    /// holding the contact can send anyway.
+    seal: Option<seal::Seal>,
+    action: Action,
+}
+
+/// What a [`PendingAction`] asks the application to decide.
+#[derive(Clone)]
+pub enum Action {
+    /// The peer sent a `PairRequest` for a contact this device created.
     Pairing {
-        channel_id: ChannelId,
         request: PairRequestMessage,
         kind: SenderKind,
         peer_communication_info: HashMap<String, String>,
-        /// Trace id read from the inbound `PairRequest` envelope. Echoed
-        /// verbatim on the `PairResponse` envelope when the application
-        /// calls `accept` or `reject`; see `DeRecMessage.traceId`.
-        trace_id: u64,
     },
     /// The peer scanned a `HashedKeys`-mode `ContactMessage` and is asking
     /// for the real pairing public keys via a plaintext `PrePairRequest`.
@@ -300,83 +328,10 @@ pub enum PendingAction {
     /// Carries no `pairing_secret` — the handler loads it from the secret
     /// store at `accept` time (single source of truth) and the action stays
     /// small enough to round-trip cheaply across the WASM boundary.
-    PrePair {
-        channel_id: ChannelId,
-        request: PrePairRequestMessage,
-        /// Trace id read from the inbound `PrePairRequest` envelope. Echoed
-        /// verbatim on the `PrePairResponse` when the application calls
-        /// `accept` or `reject`; see `DeRecMessage.traceId`.
-        trace_id: u64,
-    },
-    StoreShare {
-        channel_id: ChannelId,
-        request: StoreShareRequestMessage,
-        shared_key: SharedKey,
-        /// Trace id read from the inbound request envelope. Echoed verbatim
-        /// on the response envelope when the application calls `accept` or
-        /// `reject`; see `DeRecMessage.traceId`.
-        trace_id: u64,
-    },
-    VerifyShare {
-        channel_id: ChannelId,
-        request: VerifyShareRequestMessage,
-        shared_key: SharedKey,
-        trace_id: u64,
-    },
-    /// The peer is asking us to enumerate which `(secret_id, version)`
-    /// tuples we currently hold for them on this channel (see
-    /// [`crate::primitives::discovery`]). Accepting replies with the
-    /// catalog so the asker can correlate it with their own view —
-    /// commonly the precursor an owner uses to drive `Recovery`, but
-    /// useful any time the owner wants to know what a given helper
-    /// still has. Rejecting sends back a non-`Ok` response and
-    /// discloses no catalog content.
-    Discovery {
-        channel_id: ChannelId,
-        request: GetSecretIdsVersionsRequestMessage,
-        shared_key: SharedKey,
-        trace_id: u64,
-    },
-    GetShare {
-        channel_id: ChannelId,
-        request: GetShareRequestMessage,
-        shared_key: SharedKey,
-        trace_id: u64,
-    },
-    /// The peer has asked us to drop our state for this channel
-    /// (see [`crate::primitives::unpairing`]). Accepting deletes the local
-    /// channel/share/secret state and sends back an `Ok` response; rejecting
-    /// sends a non-`Ok` response and keeps the state.
-    Unpair {
-        channel_id: ChannelId,
-        request: UnpairRequestMessage,
-        shared_key: SharedKey,
-        trace_id: u64,
-    },
-    /// The peer has announced an update to their communication info and/or
-    /// transport endpoints.
-    ///
-    /// Calling [`super::DeRecProtocol::accept`] on this action does the
-    /// state mutation **for you**: the orchestrator writes the new fields
-    /// onto the stored [`crate::protocol::types::HelperChannel`] and sends back
-    /// an `Ok` response. When the update carries endpoints, the response is
-    /// routed to the **new** endpoints, so subsequent outbound traffic on this
-    /// channel already targets the new addresses.
-    /// Applications do not need to call any setter themselves on the
-    /// receiving side — receiving-side endpoint changeover is handled
-    /// inside `accept`. The local-node endpoint setters
-    /// [`crate::protocol::DeRecProtocol::set_communication_info`] and
-    /// [`crate::protocol::DeRecProtocol::set_own_transports`] exist for
-    /// the **initiating** side only, where the announcement comes from.
-    ///
-    /// Calling [`super::DeRecProtocol::reject`] sends a non-`Ok`
-    /// response and leaves the stored channel state unchanged.
-    UpdateChannelInfo {
-        channel_id: ChannelId,
-        request: UpdateChannelInfoRequestMessage,
-        shared_key: SharedKey,
-        trace_id: u64,
-    },
+    PrePair(PrePairRequestMessage),
+    /// A request that arrived on a paired channel. `accept` and `reject`
+    /// answer it under the channel's shared key.
+    Request(ChannelRequest),
     /// A request that arrived on an authenticated channel failed, and the
     /// response it is owed has not been sent. Carried by
     /// [`DeRecEvent::RequestFailed`].
@@ -401,17 +356,14 @@ pub enum PendingAction {
     ///   channel it arrived on, so the response is owed on the group channel,
     ///   whose key this device has not stored yet. The admitter learns of the
     ///   failure by timing out. With `auto_respond_on_failure` on, the
-    ///   library answers it with the group key it holds in memory.
+    ///   library answers it with the group key it holds in memory;
+    /// - that channel's key cannot be read. The token is sealed under it, so
+    ///   without it the token could be neither sealed nor answered.
     ///
     /// The library is stateless and cannot tell a token it already answered
     /// from a fresh one: rejecting the same token twice sends two responses.
     /// Resolving each token once is the application's part.
     RespondToFailure {
-        /// The channel the failed request arrived on.
-        channel_id: ChannelId,
-        /// Trace id read from the inbound request envelope. Echoed verbatim
-        /// on the response envelope; see `DeRecMessage.traceId`.
-        trace_id: u64,
         /// Where the response goes.
         reply: ReplyTarget,
         /// The request being answered, which decides the response type.
@@ -419,7 +371,49 @@ pub enum PendingAction {
     },
 }
 
-/// Where the response to a [`PendingAction::RespondToFailure`] is sent.
+/// A request that arrived on a paired channel and waits for the
+/// application's decision.
+#[derive(Clone)]
+pub enum ChannelRequest {
+    StoreShare(StoreShareRequestMessage),
+    VerifyShare(VerifyShareRequestMessage),
+    /// The peer is asking us to enumerate which `(secret_id, version)`
+    /// tuples we currently hold for them on this channel (see
+    /// [`crate::primitives::discovery`]). Accepting replies with the
+    /// catalog so the asker can correlate it with their own view —
+    /// commonly the precursor an owner uses to drive `Recovery`, but
+    /// useful any time the owner wants to know what a given helper
+    /// still has. Rejecting sends back a non-`Ok` response and
+    /// discloses no catalog content.
+    Discovery(GetSecretIdsVersionsRequestMessage),
+    GetShare(GetShareRequestMessage),
+    /// The peer has asked us to drop our state for this channel
+    /// (see [`crate::primitives::unpairing`]). Accepting deletes the local
+    /// channel/share/secret state and sends back an `Ok` response; rejecting
+    /// sends a non-`Ok` response and keeps the state.
+    Unpair(UnpairRequestMessage),
+    /// The peer has announced an update to their communication info and/or
+    /// transport endpoints.
+    ///
+    /// Calling [`super::DeRecProtocol::accept`] on this action does the
+    /// state mutation **for you**: the orchestrator writes the new fields
+    /// onto the stored [`crate::protocol::types::HelperChannel`] and sends back
+    /// an `Ok` response. When the update carries endpoints, the response is
+    /// routed to the **new** endpoints, so subsequent outbound traffic on this
+    /// channel already targets the new addresses.
+    /// Applications do not need to call any setter themselves on the
+    /// receiving side — receiving-side endpoint changeover is handled
+    /// inside `accept`. The local-node endpoint setters
+    /// [`crate::protocol::DeRecProtocol::set_communication_info`] and
+    /// [`crate::protocol::DeRecProtocol::set_own_transports`] exist for
+    /// the **initiating** side only, where the announcement comes from.
+    ///
+    /// Calling [`super::DeRecProtocol::reject`] sends a non-`Ok`
+    /// response and leaves the stored channel state unchanged.
+    UpdateChannelInfo(UpdateChannelInfoRequestMessage),
+}
+
+/// Where the response to an [`Action::RespondToFailure`] is sent.
 ///
 /// The key is not part of the target: it is loaded from `channel_id` when
 /// the response is sent.
@@ -431,7 +425,7 @@ pub struct ReplyTarget {
     pub endpoints: Vec<TransportProtocol>,
 }
 
-/// The request a [`PendingAction::RespondToFailure`] answers.
+/// The request an [`Action::RespondToFailure`] answers.
 ///
 /// One variant per request type that is owed a response, each holding the
 /// decoded request so the response can be built for it. Helper-bound and
@@ -460,6 +454,19 @@ pub enum FailedRequest {
     Undecodable,
 }
 
+impl From<ChannelRequest> for FailedRequest {
+    fn from(request: ChannelRequest) -> Self {
+        match request {
+            ChannelRequest::StoreShare(r) => FailedRequest::StoreShare(r),
+            ChannelRequest::VerifyShare(r) => FailedRequest::VerifyShare(r),
+            ChannelRequest::Discovery(r) => FailedRequest::GetSecretIdsVersions(r),
+            ChannelRequest::GetShare(r) => FailedRequest::GetShare(r),
+            ChannelRequest::Unpair(r) => FailedRequest::Unpair(r),
+            ChannelRequest::UpdateChannelInfo(r) => FailedRequest::UpdateChannelInfo(r),
+        }
+    }
+}
+
 impl std::fmt::Debug for FailedRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -476,62 +483,228 @@ impl std::fmt::Debug for FailedRequest {
 
 impl std::fmt::Debug for PendingAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let channel_id = match self {
-            PendingAction::Pairing { channel_id, .. }
-            | PendingAction::PrePair { channel_id, .. }
-            | PendingAction::StoreShare { channel_id, .. }
-            | PendingAction::VerifyShare { channel_id, .. }
-            | PendingAction::Discovery { channel_id, .. }
-            | PendingAction::GetShare { channel_id, .. }
-            | PendingAction::Unpair { channel_id, .. }
-            | PendingAction::UpdateChannelInfo { channel_id, .. }
-            | PendingAction::RespondToFailure { channel_id, .. } => channel_id,
-        };
         f.debug_struct("PendingAction")
             .field("kind", &self.kind())
-            .field("channel_id", &channel_id.0)
+            .field("channel_id", &self.channel_id.0)
             .finish()
     }
 }
 
 impl PendingAction {
+    /// A [`ChannelRequest`] that arrived on `channel_id`, to be sealed under
+    /// that channel's key with [`UnsealedAction::sealed_with`].
+    pub(crate) fn request(
+        channel_id: ChannelId,
+        trace_id: u64,
+        request: ChannelRequest,
+    ) -> UnsealedAction {
+        UnsealedAction {
+            channel_id,
+            trace_id,
+            action: Sealable::Request(request),
+        }
+    }
+
+    /// A failed request that arrived on `channel_id` and is answered on
+    /// `reply`, to be sealed under the reply channel's key with
+    /// [`UnsealedAction::sealed_with`].
+    pub(crate) fn failure(
+        channel_id: ChannelId,
+        trace_id: u64,
+        reply: ReplyTarget,
+        request: FailedRequest,
+    ) -> UnsealedAction {
+        UnsealedAction {
+            channel_id,
+            trace_id,
+            action: Sealable::Failure { reply, request },
+        }
+    }
+
+    /// A `PairRequest` for a contact this device created.
+    pub(crate) fn pairing(
+        channel_id: ChannelId,
+        trace_id: u64,
+        request: PairRequestMessage,
+        kind: SenderKind,
+        peer_communication_info: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            channel_id,
+            trace_id,
+            seal: None,
+            action: Action::Pairing {
+                request,
+                kind,
+                peer_communication_info,
+            },
+        }
+    }
+
+    /// A `PrePairRequest` for a contact this device created.
+    pub(crate) fn pre_pair(
+        channel_id: ChannelId,
+        trace_id: u64,
+        request: PrePairRequestMessage,
+    ) -> Self {
+        Self {
+            channel_id,
+            trace_id,
+            seal: None,
+            action: Action::PrePair(request),
+        }
+    }
+
+    /// An action read back from a token, with the seal the token carried.
+    #[cfg(any(feature = "ffi", target_arch = "wasm32"))]
+    pub(crate) fn from_parts(
+        channel_id: ChannelId,
+        trace_id: u64,
+        seal: Option<seal::Seal>,
+        action: Action,
+    ) -> Self {
+        Self {
+            channel_id,
+            trace_id,
+            seal,
+            action,
+        }
+    }
+
+    /// The seal this action carries, if it is one answered under a key.
+    #[cfg(any(feature = "ffi", target_arch = "wasm32"))]
+    pub(crate) fn seal(&self) -> Option<&seal::Seal> {
+        self.seal.as_ref()
+    }
+
+    /// The channel whose shared key verifies this action's seal: the channel
+    /// a request arrived on, or the reply channel of a failed request.
+    /// `None` for the pairing actions, which carry no seal.
+    pub(crate) fn sealing_channel(&self) -> Option<ChannelId> {
+        match &self.action {
+            Action::Request(_) => Some(self.channel_id),
+            Action::RespondToFailure { reply, .. } => Some(reply.channel_id),
+            Action::Pairing { .. } | Action::PrePair(_) => None,
+        }
+    }
+
+    /// Whether this action is the one `process` raised and sealed under
+    /// `key`, the key of its [`sealing_channel`](Self::sealing_channel).
+    /// `false` for an action with no seal where one is required.
+    pub(crate) fn seal_verifies(&self, key: &SharedKey) -> bool {
+        let sealed = match &self.action {
+            Action::Request(request) => seal::Sealed::Request(request),
+            Action::RespondToFailure { reply, request } => seal::Sealed::Failure { reply, request },
+            Action::Pairing { .. } | Action::PrePair(_) => return true,
+        };
+        self.seal
+            .as_ref()
+            .is_some_and(|seal| seal.verifies(key, self.channel_id, self.trace_id, sealed))
+    }
+
+    /// The channel the request arrived on.
+    pub fn channel_id(&self) -> ChannelId {
+        self.channel_id
+    }
+
+    /// The token of the exchange that raised this action.
+    ///
+    /// Every action carries one: an action only exists because a request
+    /// arrived, and the response the application's decision produces echoes
+    /// the same token; see `DeRecMessage.traceId`.
+    pub fn trace_id(&self) -> u64 {
+        self.trace_id
+    }
+
+    /// What the application is asked to decide.
+    pub fn action(&self) -> &Action {
+        &self.action
+    }
+
+    /// The channel, trace id and action, by value.
+    pub(crate) fn into_parts(self) -> (ChannelId, u64, Action) {
+        (self.channel_id, self.trace_id, self.action)
+    }
+
     /// Return this action's discriminant — used by
     /// [`AutoAcceptPolicy::allows`] and by the [`DeRecEvent::AutoAccepted`]
     /// event so callers can route on flow kind without inspecting the
     /// inner payload.
     pub fn kind(&self) -> PendingActionKind {
-        match self {
-            PendingAction::Pairing { .. } => PendingActionKind::Pairing,
-            PendingAction::PrePair { .. } => PendingActionKind::PrePair,
-            PendingAction::StoreShare { .. } => PendingActionKind::StoreShare,
-            PendingAction::VerifyShare { .. } => PendingActionKind::VerifyShare,
-            PendingAction::Discovery { .. } => PendingActionKind::Discovery,
-            PendingAction::GetShare { .. } => PendingActionKind::GetShare,
-            PendingAction::Unpair { .. } => PendingActionKind::Unpair,
-            PendingAction::UpdateChannelInfo { .. } => PendingActionKind::UpdateChannelInfo,
-            PendingAction::RespondToFailure { .. } => PendingActionKind::Failed,
+        match &self.action {
+            Action::Pairing { .. } => PendingActionKind::Pairing,
+            Action::PrePair(_) => PendingActionKind::PrePair,
+            Action::Request(request) => request.kind(),
+            Action::RespondToFailure { .. } => PendingActionKind::Failed,
         }
     }
+}
 
-    /// The token of the exchange that raised this action.
-    ///
-    /// Every variant carries one: an action only exists because a request
-    /// arrived, and the response the application's decision produces echoes
-    /// the same token. Reading it uniformly is what lets
-    /// [`accept`](super::DeRecProtocol::accept) and
-    /// [`reject`](super::DeRecProtocol::reject) attribute their work to that
-    /// exchange without matching on the variant.
-    pub fn trace_id(&self) -> u64 {
+/// A request or failed request that becomes a [`PendingAction`] only once
+/// sealed. It is not an action: it cannot be resolved or serialized, so an
+/// unsealed one never leaves the library.
+pub(crate) struct UnsealedAction {
+    channel_id: ChannelId,
+    trace_id: u64,
+    action: Sealable,
+}
+
+/// The actions answered under a channel key, the only ones built unsealed.
+enum Sealable {
+    Request(ChannelRequest),
+    Failure {
+        reply: ReplyTarget,
+        request: FailedRequest,
+    },
+}
+
+impl UnsealedAction {
+    /// Seal the action under `key`, the shared key of the channel that
+    /// answers it, and hand it out. The key is used to compute the seal and
+    /// is not kept.
+    pub(crate) fn sealed_with(self, key: &SharedKey) -> PendingAction {
+        let (sealed, action) = match self.action {
+            Sealable::Request(request) => (
+                seal::Seal::new(
+                    key,
+                    self.channel_id,
+                    self.trace_id,
+                    seal::Sealed::Request(&request),
+                ),
+                Action::Request(request),
+            ),
+            Sealable::Failure { reply, request } => (
+                seal::Seal::new(
+                    key,
+                    self.channel_id,
+                    self.trace_id,
+                    seal::Sealed::Failure {
+                        reply: &reply,
+                        request: &request,
+                    },
+                ),
+                Action::RespondToFailure { reply, request },
+            ),
+        };
+        PendingAction {
+            channel_id: self.channel_id,
+            trace_id: self.trace_id,
+            seal: Some(sealed),
+            action,
+        }
+    }
+}
+
+impl ChannelRequest {
+    /// This request's discriminant.
+    pub fn kind(&self) -> PendingActionKind {
         match self {
-            PendingAction::Pairing { trace_id, .. }
-            | PendingAction::PrePair { trace_id, .. }
-            | PendingAction::StoreShare { trace_id, .. }
-            | PendingAction::VerifyShare { trace_id, .. }
-            | PendingAction::Discovery { trace_id, .. }
-            | PendingAction::GetShare { trace_id, .. }
-            | PendingAction::Unpair { trace_id, .. }
-            | PendingAction::UpdateChannelInfo { trace_id, .. }
-            | PendingAction::RespondToFailure { trace_id, .. } => *trace_id,
+            ChannelRequest::StoreShare(_) => PendingActionKind::StoreShare,
+            ChannelRequest::VerifyShare(_) => PendingActionKind::VerifyShare,
+            ChannelRequest::Discovery(_) => PendingActionKind::Discovery,
+            ChannelRequest::GetShare(_) => PendingActionKind::GetShare,
+            ChannelRequest::Unpair(_) => PendingActionKind::Unpair,
+            ChannelRequest::UpdateChannelInfo(_) => PendingActionKind::UpdateChannelInfo,
         }
     }
 }
@@ -1601,7 +1774,7 @@ pub enum DeRecEvent {
     ///
     /// Every such request is owed exactly one response. When the library sent
     /// it, `responded` is `true` and `action` is `None`. Otherwise `responded`
-    /// is `false` and `action` holds a [`PendingAction::RespondToFailure`];
+    /// is `false` and `action` holds a [`Action::RespondToFailure`];
     /// pass it to [`super::DeRecProtocol::reject`] to send the response.
     ///
     /// `action` is also `None`, with `responded` `false`, when no token could

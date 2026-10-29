@@ -44,7 +44,7 @@ pub fn decode_member(bytes: &[u8]) -> ReplicaMember {
 /// decoding the payload).
 pub fn encode_secret_value(value: &SecretValue) -> Vec<u8> {
     let (tag, payload) = match value {
-        SecretValue::SharedKey(key) => (SecretKind::SharedKey as u8, key.to_vec()),
+        SecretValue::SharedKey(key) => (SecretKind::SharedKey as u8, key.as_bytes().to_vec()),
         SecretValue::PairingSecret(material) => (
             SecretKind::PairingSecret as u8,
             material.as_bytes().to_vec(),
@@ -67,8 +67,7 @@ pub fn decode_secret_value(bytes: &[u8]) -> SecretValue {
     let payload = &bytes[1..];
     match tag {
         t if t == SecretKind::SharedKey as u8 => {
-            let key: [u8; 32] = payload
-                .try_into()
+            let key = derec_library::types::SharedKey::try_from(payload)
                 .expect("SharedKey blob must be 32 bytes after the tag byte");
             SecretValue::SharedKey(key)
         }

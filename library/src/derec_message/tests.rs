@@ -11,7 +11,7 @@ use prost::Message;
 
 const CHANNEL_ID: ChannelId = ChannelId(42);
 const SEQUENCE: u32 = 7;
-const SHARED_KEY: [u8; 32] = [0xAB; 32];
+const SHARED_KEY: crate::types::SharedKey = crate::types::SharedKey::new([0xAB; 32]);
 
 fn pairing_keypair() -> (Vec<u8>, Vec<u8>) {
     ecies::generate_key(&mut crate::utils::os_rng()).unwrap()

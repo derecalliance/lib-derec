@@ -1735,7 +1735,7 @@ mod tests {
     #[test]
     fn secret_value_serde_round_trips_all_variants() {
         let cases = [
-            SecretValue::SharedKey([7u8; 32]),
+            SecretValue::SharedKey(crate::types::SharedKey::new([7u8; 32])),
             SecretValue::PairingSecret(PairingKeyMaterial::from_bytes(vec![1, 2, 3, 4, 5])),
             SecretValue::PairingContact(ContactMessage {
                 nonce: 42,

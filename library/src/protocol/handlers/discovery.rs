@@ -2,8 +2,8 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    MissingPolicy, PendingAction, SecretKind, SecretValue,
+    ChannelRequest, DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore,
+    DeRecTransport, MissingPolicy, PendingAction, SecretKind, SecretValue,
 };
 use super::replicas::discovery as replica;
 use crate::extensions::channel_store::ChannelStoreExt as _;
@@ -226,12 +226,12 @@ fn on_request(
 ) -> Result<Vec<DeRecEvent>> {
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id: exchange.channel_id,
-        action: PendingAction::Discovery {
-            channel_id: exchange.channel_id,
-            request,
-            shared_key: *exchange.shared_key,
-            trace_id: exchange.trace_id,
-        },
+        action: PendingAction::request(
+            exchange.channel_id,
+            exchange.trace_id,
+            ChannelRequest::Discovery(request),
+        )
+        .sealed_with(exchange.shared_key),
     }])
 }
 

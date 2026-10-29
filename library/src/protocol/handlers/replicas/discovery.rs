@@ -9,10 +9,10 @@
 //! of catch-up. The owner↔helper side lives in
 //! [`handlers::discovery`](super::super::discovery), which routes here when
 //! the payload names an author.
-use super::load_channel_key;
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::derec_result::DeRecResultExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
 use crate::protocol::context::{Exchange, Local};
@@ -59,7 +59,7 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
                 local,
                 &member,
                 &request,
-                *exchange.shared_key,
+                exchange.shared_key,
                 exchange.trace_id,
                 exchange.obligation,
             )
@@ -117,7 +117,10 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         .unwrap_or(0);
 
     let group_channel = peers[0].channel_id;
-    let key = load_channel_key(stores, local, group_channel).await?;
+    let key = stores
+        .secrets
+        .paired_key(local.secret_id, group_channel)
+        .await?;
 
     let mut asked: HashSet<ReplicaId> = HashSet::new();
     for peer in &peers {
@@ -184,7 +187,7 @@ async fn on_request<S: StoreSet>(
     local: &Local<'_>,
     member: &ReplicaMember,
     request: &GetSecretIdsVersionsRequestMessage,
-    shared_key: SharedKey,
+    shared_key: &SharedKey,
     inbound_trace_id: u64,
     obligation: Option<&crate::protocol::obligation::Obligation>,
 ) -> Result<Vec<DeRecEvent>> {
@@ -217,7 +220,7 @@ async fn on_request<S: StoreSet>(
         .channel_id(member.channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::GetSecretIdsVersionsResponse(response))
-        .encrypt(&shared_key)?
+        .encrypt(shared_key)?
         .build()?
         .encode_to_vec();
     let envelope = crate::derec_message::apply_trace_id(&envelope, inbound_trace_id)?;
@@ -367,7 +370,10 @@ async fn finish<S: StoreSet>(
             "the member holding the newest state is no longer in the roster",
         ))?;
 
-    let key = load_channel_key(stores, local, member.channel_id).await?;
+    let key = stores
+        .secrets
+        .paired_key(local.secret_id, member.channel_id)
+        .await?;
     let timestamp = current_timestamp();
     let reply_to_transports = std::slice::from_ref(local.primary()).to_vec();
     let request = GetShareRequestMessage {
@@ -458,7 +464,11 @@ mod tests {
 
     async fn seed_key(secrets: &mut InMemSecretStore) {
         secrets
-            .save(SECRET_ID, GROUP, SecretValue::SharedKey([0x11; 32]))
+            .save(
+                SECRET_ID,
+                GROUP,
+                SecretValue::SharedKey(SharedKey::new([0x11; 32])),
+            )
             .await
             .expect("seed key");
     }

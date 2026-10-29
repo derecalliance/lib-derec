@@ -2840,7 +2840,7 @@ fn inline_keys_handshake() -> (
     ContactMessage,
     PairResponseMessage,
     derec_cryptography::pairing::PairingSecretKeyMaterial,
-    derec_cryptography::pairing::PairingSharedKey,
+    crate::types::SharedKey,
 ) {
     let CreateContactMessageResult {
         contact_message: contact,

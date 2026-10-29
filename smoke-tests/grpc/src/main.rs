@@ -309,7 +309,7 @@ impl DeRecSecretStore for InMemorySecretStore {
 
 fn clone_secret_value(v: &SecretValue) -> SecretValue {
     match v {
-        SecretValue::SharedKey(k) => SecretValue::SharedKey(*k),
+        SecretValue::SharedKey(k) => SecretValue::SharedKey(k.clone()),
         SecretValue::PairingSecret(p) => SecretValue::PairingSecret(p.clone()),
         SecretValue::PairingContact(c) => SecretValue::PairingContact(c.clone()),
     }

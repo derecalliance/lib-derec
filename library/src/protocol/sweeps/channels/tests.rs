@@ -357,7 +357,7 @@ async fn seed_key(secrets: &mut InMemSecretStore, channel_id: u64) {
         .save(
             SECRET_ID,
             ChannelId(channel_id),
-            SecretValue::SharedKey([3u8; 32]),
+            SecretValue::SharedKey(crate::types::SharedKey::new([3u8; 32])),
         )
         .await
         .expect("seed shared key");
@@ -612,7 +612,11 @@ fn a_failed_key_removal_keeps_the_record_for_the_next_sweep() {
         seed(&mut channels, 1, ChannelStatus::Pending, 600).await;
         let mut secrets = RefusingRemoveSecretStore::default();
         secrets
-            .save(SECRET_ID, ChannelId(1), SecretValue::SharedKey([7; 32]))
+            .save(
+                SECRET_ID,
+                ChannelId(1),
+                SecretValue::SharedKey(crate::types::SharedKey::new([7; 32])),
+            )
             .await
             .expect("seed key");
 

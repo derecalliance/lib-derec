@@ -359,7 +359,7 @@ mod timestamp_binding_tests {
 
     const SECRET_ID: u64 = 0x7153;
     const CHANNEL: ChannelId = ChannelId(4242);
-    const SHARED_KEY: crate::types::SharedKey = [5u8; 32];
+    const SHARED_KEY: crate::types::SharedKey = crate::types::SharedKey::new([5u8; 32]);
     const TRACE: u64 = 99;
     const ORIGINAL_URI: &str = "https://peer.example.com/derec";
     const MOVED_URI: &str = "https://moved.example.com/derec";
@@ -555,9 +555,9 @@ mod replica_channel_binding_tests {
     const SECRET_ID: u64 = 0xB1D0;
     const OWN_ID: u64 = 1;
     const HELPER_CHANNEL: ChannelId = ChannelId(4242);
-    const HELPER_KEY: SharedKey = [5u8; 32];
+    const HELPER_KEY: SharedKey = SharedKey::new([5u8; 32]);
     const GROUP_CHANNEL: ChannelId = ChannelId(5001);
-    const GROUP_KEY: SharedKey = [9u8; 32];
+    const GROUP_KEY: SharedKey = SharedKey::new([9u8; 32]);
     const MEMBER: u64 = 7;
     const FORGED_HELPER: u64 = 777;
 

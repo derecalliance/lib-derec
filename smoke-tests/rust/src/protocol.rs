@@ -298,7 +298,7 @@ impl DeRecSecretStore for InMemorySecretStore {
 
 fn clone_secret_value(v: &SecretValue) -> SecretValue {
     match v {
-        SecretValue::SharedKey(k) => SecretValue::SharedKey(*k),
+        SecretValue::SharedKey(k) => SecretValue::SharedKey(k.clone()),
         SecretValue::PairingSecret(p) => SecretValue::PairingSecret(p.clone()),
         SecretValue::PairingContact(c) => SecretValue::PairingContact(c.clone()),
     }
@@ -2224,7 +2224,7 @@ async fn run_protect_secret_with_replica_targets_flow() {
 /// handles the decryption step, so we decode the outer envelope here.
 fn decode_store_share_request(
     envelope_bytes: &[u8],
-    shared_key: &[u8; 32],
+    shared_key: &derec_library::types::SharedKey,
 ) -> derec_proto::StoreShareRequestMessage {
     use derec_library::derec_message::extract_inner_message;
     use prost::Message as _;
@@ -5628,7 +5628,7 @@ async fn run_replica_group_key_handover_flow() {
         k_after_pair_1, k_on_dest1,
         "after pair 1: Source and Dest1 must hold the same channel key (the implicit K_group)"
     );
-    let k_group = k_after_pair_1;
+    let k_group = k_after_pair_1.clone();
     println!("  step 1: pair Source↔Dest1 — K_group emerged, both sides agree  ✓");
 
     let dest2_channel = pair_replica_handshake(&mut source, &mut dest2, dest2_channel).await;
@@ -5834,7 +5834,11 @@ async fn run_replica_publish_before_handover_ack_flow() {
 
 /// Helper: read a channel's stored 32-byte `SharedKey`, or `None` when the
 /// channel has no key — used to prove a torn-down channel really is gone.
-async fn channel_key(peer: &Peer, secret_id: u64, channel_id: ChannelId) -> Option<[u8; 32]> {
+async fn channel_key(
+    peer: &Peer,
+    secret_id: u64,
+    channel_id: ChannelId,
+) -> Option<derec_library::types::SharedKey> {
     use derec_library::protocol::DeRecSecretStore;
     match peer
         .protocol
@@ -5855,7 +5859,11 @@ async fn channel_key(peer: &Peer, secret_id: u64, channel_id: ChannelId) -> Opti
 /// Helper: load a channel's stored 32-byte `SharedKey` from a peer's
 /// secret_store. Panics if missing — we only call this inside the
 /// group-key flow after pairing/sync rounds have completed.
-async fn load_channel_key(peer: &Peer, secret_id: u64, channel_id: ChannelId) -> [u8; 32] {
+async fn load_channel_key(
+    peer: &Peer,
+    secret_id: u64,
+    channel_id: ChannelId,
+) -> derec_library::types::SharedKey {
     use derec_library::protocol::DeRecSecretStore;
     let v = peer
         .protocol
@@ -6136,10 +6144,8 @@ async fn run_auto_accept_flow() {
     let action_required_for_store_share = events.iter().any(|e| {
         matches!(
             e,
-            DeRecEvent::ActionRequired {
-                action: derec_library::protocol::PendingAction::StoreShare { .. },
-                ..
-            }
+            DeRecEvent::ActionRequired { action, .. }
+                if action.kind() == PendingActionKind::StoreShare
         )
     });
     assert!(
@@ -6465,7 +6471,9 @@ async fn seed_channel(peer: &mut Peer, record: ChannelRecord) {
         .save(
             sid,
             channel_id,
-            SecretValue::SharedKey(std::array::from_fn(|i| (i * 11 + 5) as u8)),
+            SecretValue::SharedKey(derec_library::types::SharedKey::new(std::array::from_fn(
+                |i| (i * 11 + 5) as u8,
+            ))),
         )
         .await
         .expect("seed channel key");

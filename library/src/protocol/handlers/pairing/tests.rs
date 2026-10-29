@@ -693,7 +693,11 @@ mod replica_id_conflict_tests {
             let mut rig = StoreRig::new();
             seed_member(&mut rig.channels, 1001, PAIRING).await;
             rig.secrets
-                .save(SECRET_ID, PAIRING, SecretValue::SharedKey([0x22; 32]))
+                .save(
+                    SECRET_ID,
+                    PAIRING,
+                    SecretValue::SharedKey(crate::types::SharedKey::new([0x22; 32])),
+                )
                 .await
                 .expect("seed key");
 

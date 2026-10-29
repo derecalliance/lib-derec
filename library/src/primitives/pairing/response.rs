@@ -8,11 +8,11 @@ use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::extensions::pair_request::PairRequestMessageExt as _;
 use crate::primitives::pairing::PairingError;
 use crate::protocol_version::ProtocolVersion;
-use crate::types::ChannelId;
+use crate::types::{ChannelId, SharedKey};
 use crate::utils::verify_timestamps;
 use derec_cryptography::pairing::{
     self as cryptography_pairing, DerecPairingError, FingerprintCommitment, FingerprintNonce,
-    PairingSecretKeyMaterial, PairingSharedKey,
+    PairingSecretKeyMaterial,
 };
 use derec_proto::{
     CommunicationInfo, ContactMessage, ContactMode, DeRecMessage, DeRecResult, MessageBody,
@@ -31,7 +31,7 @@ pub struct ProduceResult {
     /// policy, in the order it offered them. Record all of them: which to
     /// dial, and whether to fall back, is the application's choice.
     pub peer_transports: Vec<TransportProtocol>,
-    pub shared_key: PairingSharedKey,
+    pub shared_key: SharedKey,
     /// Channel identifier the responder is committing to for all future
     /// traffic on this channel — derived from the pre-rekey id and the
     /// freshly negotiated `shared_key` via a deterministic hash. Callers
@@ -45,7 +45,7 @@ pub struct ExtractResult {
 }
 
 pub struct ProcessResult {
-    pub shared_key: PairingSharedKey,
+    pub shared_key: SharedKey,
     /// Channel identifier both peers MUST switch to for all future traffic
     /// on this channel. Already validated against the local derivation; the
     /// caller's only remaining job is to atomically rename its channel
@@ -265,9 +265,10 @@ pub fn produce(
         }
     };
 
-    let shared_key =
+    let shared_key = SharedKey::from(
         cryptography_pairing::finish_pairing_initiator(initiator_material, &pairing_request)
-            .map_err(|e| PairingError::FinishPairingInitiator { source: e })?;
+            .map_err(|e| PairingError::FinishPairingInitiator { source: e })?,
+    );
 
     let rekeyed_channel_id = derive_rekeyed_channel_id(channel_id, &shared_key);
 
@@ -864,18 +865,20 @@ pub fn process(
     let (fingerprint_commitment, fingerprint_nonce) =
         fingerprint_opening(contact_message, response)?;
 
-    let shared_key = cryptography_pairing::finish_pairing_responder(
-        responder_material,
-        &pairing_contact_key_material,
-        &fingerprint_commitment,
-        &fingerprint_nonce,
-    )
-    .map_err(|e| match e {
-        DerecPairingError::FingerprintCommitmentMismatch => {
-            PairingError::FingerprintCommitmentMismatch
-        }
-        source => PairingError::FinishPairingResponder { source },
-    })?;
+    let shared_key = SharedKey::from(
+        cryptography_pairing::finish_pairing_responder(
+            responder_material,
+            &pairing_contact_key_material,
+            &fingerprint_commitment,
+            &fingerprint_nonce,
+        )
+        .map_err(|e| match e {
+            DerecPairingError::FingerprintCommitmentMismatch => {
+                PairingError::FingerprintCommitmentMismatch
+            }
+            source => PairingError::FinishPairingResponder { source },
+        })?,
+    );
 
     let expected_channel_id =
         validate_rekeyed_channel_id(response, ChannelId(contact_message.channel_id), &shared_key)?;
@@ -1131,7 +1134,7 @@ fn build_pairing_contact_material(
 fn validate_rekeyed_channel_id(
     response: &PairResponseMessage,
     original_channel_id: ChannelId,
-    shared_key: &PairingSharedKey,
+    shared_key: &SharedKey,
 ) -> Result<ChannelId, crate::Error> {
     let expected_channel_id = derive_rekeyed_channel_id(original_channel_id, shared_key);
     if response.channel_id != u64::from(expected_channel_id) {
@@ -1217,13 +1220,10 @@ fn validate_process_pre_pair_inputs(
     Ok(())
 }
 
-fn derive_rekeyed_channel_id(
-    original_channel_id: ChannelId,
-    shared_key: &PairingSharedKey,
-) -> ChannelId {
+fn derive_rekeyed_channel_id(original_channel_id: ChannelId, shared_key: &SharedKey) -> ChannelId {
     let mut hasher = Sha384::new();
     hasher.update(u64::from(original_channel_id).to_be_bytes());
-    hasher.update(shared_key.as_slice());
+    hasher.update(shared_key.as_bytes());
     let digest = hasher.finalize();
     let prefix: [u8; 8] = digest[..8]
         .try_into()

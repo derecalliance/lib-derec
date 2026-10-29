@@ -60,7 +60,7 @@ pub struct ExtractResult {
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
 ///
 /// let result = request::produce(channel_id, 1, 1, &shared_key, &[])
 ///     .expect("failed to build recovery request");
@@ -155,7 +155,7 @@ pub fn produce(
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
 ///
 /// let request::ProduceResult { envelope } = request::produce(channel_id, 1, 1, &shared_key, &[])
 ///     .expect("failed to build recovery request");

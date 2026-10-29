@@ -30,6 +30,17 @@ impl<
 {
     /// Drop local state for any pending unpair whose acknowledgement window has
     /// elapsed, returning an `Unpaired` event per dropped channel.
+    ///
+    /// The expired channels are dropped together, and their pending entries
+    /// removed only after that, in one write: an entry is the only record that
+    /// a channel still has to go, so it outlives the drop. The `Unpaired`
+    /// events are reported once both have succeeded. A failure of either is
+    /// logged and reports nothing; the next sweep finds the same entries and
+    /// repeats the drop, which is idempotent, so it completes there.
+    ///
+    /// A drop that succeeds followed by an entry removal that fails is
+    /// reported by the next sweep, which no longer finds the dropped shares,
+    /// so the republish that follows an unpair does not run for it.
     pub(super) async fn check_unpair_timeouts(&mut self) -> Vec<DeRecEvent> {
         let now = now_secs();
         let all = match self
@@ -38,8 +49,16 @@ impl<
             .await
         {
             Ok(items) => items,
-            Err(_) => return Vec::new(),
+            Err(_error) => {
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    error = %_error,
+                    "pending unpairs could not be loaded; none times out this time"
+                );
+                return Vec::new();
+            }
         };
+
         let expired: Vec<ChannelId> = all
             .into_iter()
             .filter_map(|item| match item {
@@ -52,24 +71,43 @@ impl<
                 _ => None,
             })
             .collect();
-
-        let mut events = Vec::with_capacity(expired.len());
-        for cid in expired {
-            let _ = self
-                .state_store
-                .remove(self.secret_id, StateKey::PendingUnpair { channel_id: cid })
-                .await;
-            if handlers::unpairing::drop_channel_state(
-                &mut borrow_stores!(self),
-                &local!(self),
-                cid,
-            )
-            .await
-            .is_ok()
-            {
-                events.push(DeRecEvent::Unpaired { channel_id: cid });
-            }
+        if expired.is_empty() {
+            return Vec::new();
         }
-        events
+
+        if let Err(_error) = handlers::unpairing::drop_channels_state(
+            &mut borrow_stores!(self),
+            &local!(self),
+            &expired,
+        )
+        .await
+        {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                channels = ?expired,
+                error = %_error,
+                "timed-out unpairs could not be dropped; they are dropped again next time"
+            );
+            return Vec::new();
+        }
+
+        let entries: Vec<StateKey> = expired
+            .iter()
+            .map(|&channel_id| StateKey::PendingUnpair { channel_id })
+            .collect();
+        if let Err(_error) = self.state_store.remove_many(self.secret_id, &entries).await {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                channels = ?expired,
+                error = %_error,
+                "timed-out unpairs were dropped but are still pending; they are reported next time"
+            );
+            return Vec::new();
+        }
+
+        expired
+            .into_iter()
+            .map(|channel_id| DeRecEvent::Unpaired { channel_id })
+            .collect()
     }
 }

@@ -17,18 +17,18 @@
 //! 1. **Per-channel pending-unpair guard.** [`on_response`] requires
 //!    a matching [`crate::protocol::StateItem::PendingUnpair`] row in
 //!    the state store (written by [`start`] under
-//!    [`crate::protocol::UnpairAck::Required`]) and consumes it via
-//!    [`crate::protocol::DeRecStateStore::remove`], which returns
-//!    `Ok(true)` iff a row was actually deleted. A replayed response
-//!    after the entry has already been consumed sees a `false` return
-//!    and yields [`DeRecEvent::NoOp`] — no state is touched.
+//!    [`crate::protocol::UnpairAck::Required`]), and removes it only once
+//!    the response has been applied. A replayed response after that finds
+//!    no entry and yields [`DeRecEvent::NoOp`] — no state is touched. A
+//!    response whose effect could not be stored keeps the entry, so
+//!    processing it again, or the acknowledgement timeout, finishes it.
 //! 2. **Destructive-idempotent teardown.** When a pending entry is
 //!    present, the response IS legitimate (or indistinguishable
-//!    from one) and [`drop_channel_state`] runs. That function only
+//!    from one) and [`drop_channels_state`] runs. That function only
 //!    deletes per-`(secret_id, channel_id)` rows whose store
-//!    [`crate::protocol::DeRecChannelStore::remove`] /
+//!    [`crate::protocol::DeRecChannelStore::remove_many`] /
 //!    [`crate::protocol::DeRecShareStore::remove_channel`] /
-//!    [`crate::protocol::DeRecSecretStore::remove`] contracts are
+//!    [`crate::protocol::DeRecSecretStore::remove_many`] contracts are
 //!    explicitly idempotent — running them twice on the same key
 //!    converges to the same end state as running them once.
 //! 3. **Channel-id freshness across re-pair.** After teardown the
@@ -44,13 +44,15 @@
 //! response envelope is routed by channel id at the stores.transport layer.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
-    DeRecTransport, PendingAction, SecretKind, SecretValue, StateItem, StateKey, events::UnpairAck,
+    ChannelRequest, DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore,
+    DeRecStateStore, DeRecTransport, PendingAction, SecretKind, StateItem, StateKey,
+    events::UnpairAck,
 };
 use super::replicas::unpairing as replica;
 use crate::derec_message::current_timestamp;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
+use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::protocol::context::{Exchange, Local, Round};
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{ChannelRecord, ChannelStatus};
@@ -122,18 +124,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         trace_id: round.trace_id,
     }];
 
-    let shared_key = match stores
-        .secrets
-        .load(secret_id, channel_id, SecretKind::SharedKey)
-        .await?
-    {
-        Some(SecretValue::SharedKey(k)) => k,
-        _ => {
-            return Err(crate::Error::InvalidInput(
-                "channel has no shared key — not yet paired",
-            ));
-        }
-    };
+    let shared_key = stores.secrets.paired_key(secret_id, channel_id).await?;
 
     // Helper unpair: no member is named, which is what marks this the
     // owner ↔ helper path rather than a replica-group removal.
@@ -147,7 +138,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 
     match unpair_ack {
         UnpairAck::NotRequired => {
-            drop_channel_state(stores, local, channel_id).await?;
+            drop_channels_state(stores, local, &[channel_id]).await?;
             events.push(DeRecEvent::Unpaired { channel_id });
         }
         UnpairAck::Required => {
@@ -222,7 +213,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     // The acknowledgement is out, so the peer may already have dropped its
     // side: the local state goes too, and a failure from here on is
     // reported after `Unpaired`, never answered a second time.
-    let dropped = drop_channel_state(stores, local, channel_id).await;
+    let dropped = drop_channels_state(stores, local, &[channel_id]).await;
 
     #[cfg(feature = "logging")]
     tracing::info!("unpair accepted; local state dropped");
@@ -275,34 +266,44 @@ pub(in crate::protocol) fn failure_response(status: StatusEnum, memo: &str) -> M
     })
 }
 
-pub(in crate::protocol) async fn drop_channel_state<S: StoreSet>(
+/// Drop everything this device holds for `channel_ids`: their shares, their
+/// keys and their channel records.
+///
+/// Every removal is idempotent, so a call that fails part way is completed
+/// by calling it again. The keys and the records each go in one call; the
+/// shares go one channel at a time, since a share store removes a whole
+/// channel only one at a time.
+pub(in crate::protocol) async fn drop_channels_state<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-    channel_id: ChannelId,
+    channel_ids: &[ChannelId],
 ) -> Result<()> {
+    if channel_ids.is_empty() {
+        return Ok(());
+    }
     let secret_id = local.secret_id;
-    stores.shares.remove_channel(secret_id, channel_id).await?;
+    for &channel_id in channel_ids {
+        stores.shares.remove_channel(secret_id, channel_id).await?;
+    }
 
-    let _ = stores
-        .secrets
-        .remove(secret_id, channel_id, SecretKind::SharedKey)
-        .await;
-    let _ = stores
-        .secrets
-        .remove(secret_id, channel_id, SecretKind::PairingSecret)
-        .await;
-    let _ = stores
-        .secrets
-        .remove(secret_id, channel_id, SecretKind::PairingContact)
-        .await;
+    let secrets: Vec<(ChannelId, SecretKind)> = channel_ids
+        .iter()
+        .flat_map(|&channel_id| {
+            [
+                SecretKind::SharedKey,
+                SecretKind::PairingSecret,
+                SecretKind::PairingContact,
+            ]
+            .map(|kind| (channel_id, kind))
+        })
+        .collect();
+    stores.secrets.remove_many(secret_id, &secrets).await?;
 
-    let _ = stores
-        .channels
-        .remove(
-            secret_id,
-            crate::protocol::types::ChannelQuery::Helper { channel_id },
-        )
-        .await?;
+    let records: Vec<crate::protocol::types::ChannelQuery> = channel_ids
+        .iter()
+        .map(|&channel_id| crate::protocol::types::ChannelQuery::Helper { channel_id })
+        .collect();
+    stores.channels.remove_many(secret_id, &records).await?;
     Ok(())
 }
 
@@ -313,12 +314,12 @@ pub(in crate::protocol) async fn drop_channel_state<S: StoreSet>(
 fn on_request(exchange: &Exchange<'_>, request: UnpairRequestMessage) -> Result<Vec<DeRecEvent>> {
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id: exchange.channel_id,
-        action: PendingAction::Unpair {
-            channel_id: exchange.channel_id,
-            request,
-            shared_key: *exchange.shared_key,
-            trace_id: exchange.trace_id,
-        },
+        action: PendingAction::request(
+            exchange.channel_id,
+            exchange.trace_id,
+            ChannelRequest::Unpair(request),
+        )
+        .sealed_with(exchange.shared_key),
     }])
 }
 
@@ -332,25 +333,24 @@ async fn on_response<S: StoreSet>(
     exchange: &Exchange<'_>,
     response: &UnpairResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
-    if !stores
+    let pending = StateKey::PendingUnpair {
+        channel_id: exchange.channel_id,
+    };
+    if stores
         .state
-        .remove(
-            local.secret_id,
-            StateKey::PendingUnpair {
-                channel_id: exchange.channel_id,
-            },
-        )
+        .load(local.secret_id, pending.clone())
         .await?
+        .is_none()
     {
         return Ok(vec![DeRecEvent::NoOp]);
     }
 
-    match process_unpair_response(response) {
+    let events = match process_unpair_response(response) {
         Ok(_) => {
-            drop_channel_state(stores, local, exchange.channel_id).await?;
-            Ok(vec![DeRecEvent::Unpaired {
+            drop_channels_state(stores, local, &[exchange.channel_id]).await?;
+            vec![DeRecEvent::Unpaired {
                 channel_id: exchange.channel_id,
-            }])
+            }]
         }
         Err(Error::Unpairing(crate::primitives::unpairing::UnpairingError::NonOkStatus {
             status,
@@ -364,14 +364,19 @@ async fn on_response<S: StoreSet>(
                 ChannelStatus::Paired,
             )
             .await?;
-            Ok(vec![DeRecEvent::UnpairRejected {
+            vec![DeRecEvent::UnpairRejected {
                 channel_id: exchange.channel_id,
                 status,
                 memo,
-            }])
+            }]
         }
-        Err(e) => Err(e),
-    }
+        Err(e) => return Err(e),
+    };
+
+    // The entry goes last: until it does, processing this response again,
+    // or the acknowledgement timeout, completes what this call started.
+    stores.state.remove(local.secret_id, pending).await?;
+    Ok(events)
 }
 
 /// Move a helper channel from `from` to `to`, leaving any other status alone.

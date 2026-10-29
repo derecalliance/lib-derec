@@ -9,6 +9,204 @@ all of them unless it names a specific binding.
 
 ### Unreleased
 
+- **Changed: `SharedKey` is a type that wipes the key on drop.** *(security
+  hardening; breaking for Rust only)*
+
+  `SharedKey` was an alias for `[u8; 32]`, so the channel key was `Copy`:
+  every move left another copy in memory, none of them was ever wiped, `Debug`
+  printed the key, and `==` was not constant-time. It is now a newtype that
+  is not `Copy` (an explicit `clone()` makes a copy), zeroes its bytes on
+  drop, prints `SharedKey(<redacted>)` and compares in constant time. The
+  pairing primitives return it, so the key is wrapped from the moment the
+  library derives it.
+
+  With the `serde` feature it serializes exactly as the `[u8; 32]` it wraps:
+  keys already persisted through serde read back unchanged. .NET, Go, Node,
+  web and React Native are unaffected; the key still crosses the binding
+  boundary as 32 bytes.
+
+  Migration (Rust):
+
+  | Before | After |
+  | --- | --- |
+  | `let key: SharedKey = [7; 32];` | `SharedKey::new([7; 32])` or `[7; 32].into()` |
+  | `let key: SharedKey = bytes.try_into()?;` | `SharedKey::try_from(bytes.as_slice())?` |
+  | `key.to_vec()`, `&key[..]` | `key.as_bytes().to_vec()`, `key.as_bytes()` |
+  | `SecretValue::SharedKey(*key)` | `SecretValue::SharedKey(key.clone())` |
+
+  `DeRecMessageBuilder::encrypt` and `derec_message::extract_inner_message`
+  take `&SharedKey`, as the primitives already did.
+
+- **Fixed: `scripts/lib/build-env.sh` can be sourced from zsh.** Sourced
+  from zsh it failed on `BASH_SOURCE` and silently dropped the repository's
+  path remap. Sourced from any interactive shell it also left `set -euo
+  pipefail` on in that shell. It now finds its own path under bash or zsh and
+  sets no shell options; the packaging scripts set their own.
+
+- **Changed: an `ActionRequired` token carries no shared key.** *(security
+  fix; breaking for Rust; every SDK)*
+
+  The token handed to the application to pass back to `accept` or `reject`
+  held the channel's shared key in clear for `StoreShare`, `VerifyShare`,
+  `Discovery`, `GetShare`, `Unpair` and `UpdateChannelInfo`. An application
+  that queued, persisted or logged a token held a copy of the key outside
+  its secret store. Now `accept` and `reject` load the key from the secret
+  store when they run, as they already did for the pairing secret and for
+  `RespondToFailure`.
+
+  - A channel with no stored key can no longer be answered with a key copied
+    into the token: `accept` and `reject` return `InvalidInput`, and nothing
+    is stored or sent.
+  - A token issued by v0.0.10 is refused: `accept` and `reject` fail to
+    decode it, with the same error as any malformed token (`decode_error` in
+    Node and web, FFI code 103 `ffi_bad_proto` in .NET, Go and React Native), and
+    nothing is sent, so its sender times out as for any unanswered request.
+  - .NET, Go, Node, web and React Native pass the token through unchanged:
+    no code change.
+
+  **Migration (every SDK):** before upgrading, resolve every pending token
+  with `accept` or `reject`, or drop it. A token still held after the upgrade
+  cannot be resolved: drop it when its decode fails, and its sender treats
+  the request as unanswered. An application that keeps tokens only in memory
+  has none left after the restart that upgrades it.
+
+  **Migration (Rust):** code that read `shared_key` from a `PendingAction`
+  loads it from the secret store instead:
+
+  ```rust
+  // Before
+  let PendingAction::GetShare { shared_key, .. } = &action else { return };
+
+  // After
+  let Some(SecretValue::SharedKey(shared_key)) = secret_store
+      .load(secret_id, action.channel_id(), SecretKind::SharedKey)
+      .await?
+  else { return };
+  ```
+
+- **Changed: `PendingAction` is a struct around an `Action`.** *(breaking for
+  Rust only)*
+
+  `PendingAction` was an enum whose every variant repeated `channel_id` and
+  `trace_id`. It is now a struct holding those once, read through
+  `channel_id()` and `trace_id()`, and the decision itself through
+  `action()`: an `Action` that is `Pairing`, `PrePair`, `Request(ChannelRequest)`
+  or `RespondToFailure`. `ChannelRequest` holds the six requests on a paired
+  channel. Only the library creates a `PendingAction`, so an action is
+  resolved exactly as `process` raised it, and keeping it intact until then
+  is the application's part. `kind()` is unchanged.
+
+  .NET, Go, Node, web and React Native are unaffected: they hold the action
+  as opaque bytes, and the `ActionRequired` fields they read are unchanged.
+
+  **Migration (Rust):** match on `action.action()` instead of on the action
+  itself. The arms keep their bodies:
+
+  ```rust
+  // Before
+  match &action {
+      PendingAction::StoreShare { request, .. } => {
+          if request.share.len() > limit {
+              protocol.reject(action, StatusEnum::SizeLimitExceeded, "too large").await?
+          } else {
+              protocol.accept(action).await?;
+          }
+      }
+      PendingAction::Unpair { request, .. } => confirm_with_user(&request.memo),
+      _ => { protocol.accept(action).await?; }
+  }
+
+  // After
+  match action.action() {
+      Action::Request(ChannelRequest::StoreShare(request)) => {
+          if request.share.len() > limit {
+              protocol.reject(action, StatusEnum::SizeLimitExceeded, "too large").await?
+          } else {
+              protocol.accept(action).await?;
+          }
+      }
+      Action::Request(ChannelRequest::Unpair(request)) => confirm_with_user(&request.memo),
+      _ => { protocol.accept(action).await?; }
+  }
+  ```
+
+  | Before | After |
+  | --- | --- |
+  | `PendingAction::StoreShare { request, .. }` (and `VerifyShare`, `Discovery`, `GetShare`, `Unpair`, `UpdateChannelInfo`) | `Action::Request(ChannelRequest::StoreShare(request))` |
+  | `PendingAction::Pairing { request, kind, .. }` | `Action::Pairing { request, kind, .. }` |
+  | `PendingAction::PrePair { request, .. }` | `Action::PrePair(request)` |
+  | `PendingAction::RespondToFailure { reply, request, .. }` | `Action::RespondToFailure { reply, request }` |
+  | the `channel_id` / `trace_id` fields | `action.channel_id()` / `action.trace_id()` |
+
+  Code that only needs the kind matches without destructuring:
+
+  ```rust
+  // Before
+  matches!(event, DeRecEvent::ActionRequired { action: PendingAction::StoreShare { .. }, .. })
+
+  // After
+  matches!(event, DeRecEvent::ActionRequired { action, .. }
+      if action.kind() == PendingActionKind::StoreShare)
+  ```
+
+  A `PendingAction` can no longer be built by hand: it has no public
+  constructor, so the only actions `accept` and `reject` receive are those
+  `process` raised.
+
+- **Changed: a pending action is sealed, and an altered one is refused.**
+  *(security fix; every SDK)*
+
+  Nothing tied the action `accept` or `reject` received to the one `process`
+  raised: a token edited, extended or built from scratch while the
+  application held it was acted on as if the peer had sent it — an `Unpair`
+  for any paired channel, a `StoreShare` whose `keepVersion` deletes held
+  versions, an `UpdateChannelInfo` re-routing a channel. Now every action
+  answered under a channel key carries a seal, an HMAC-SHA256 under a key
+  derived from that channel's shared key, and `accept` and `reject` check it
+  before anything is loaded, stored or sent. An action that was altered,
+  built by hand or moved to another channel is refused with `InvalidInput`.
+  Nothing is persisted for this: the key is the one the secret store already
+  holds.
+
+  - `Pairing` and `PrePair` carry no seal: their request is one anyone
+    holding the contact can send anyway, and it is checked against the
+    stored contact.
+  - `RespondToFailure` is sealed under its reply channel's key. When that
+    key cannot be read, `RequestFailed` carries no token, as it already did
+    when the reply channel has no key.
+  - The seal does not stop an action being resolved twice; resolving each
+    once stays the application's part.
+  - The token grows by 32 bytes. .NET, Go, Node, web and React Native pass
+    it through unchanged: no code change.
+  - New dependency: `hmac` 0.13 (RustCrypto), on the `sha2` the library
+    already uses.
+
+  **Migration:** none beyond the earlier entries. An application that
+  rebuilt, merged or rewrote tokens itself must hand back exactly the bytes
+  `process` produced.
+
+- **Fixed: an unpair whose teardown fails is finished later, and reported
+  once.** *(bug fix; every SDK)*
+
+  A pending unpair's entry was removed before its channel was dropped, and
+  the drop ignored a failure to remove the channel's keys. So a teardown
+  that failed left the channel record, keys and shares behind for good:
+  neither the acknowledgement nor the timeout sweep would see the unpair
+  again. A sweep whose entry removal failed reported `Unpaired` twice. Now
+  the channel is dropped first, every removal's failure is reported, and the
+  entry goes last; `Unpaired` is reported once both are done. A failure
+  keeps the entry, so processing the same acknowledgement again (see the
+  sharing-round entry below) or the next acknowledgement timeout finishes
+  the teardown. A rejected or malformed acknowledgement keeps the entry the
+  same way. Timed-out unpairs are dropped together, the keys and the
+  records each in one store call.
+
+- **Fixed: `accept` applies this helper's share-size range.** *(bug fix;
+  every SDK)* The configured `minShareSize`/`maxShareSize` was enforced by
+  `process` only. A `StoreShare` action whose share was altered before
+  `accept` was stored whatever its size; it is now answered
+  `SIZE_LIMIT_EXCEEDED` and nothing is stored.
+
 - **Changed: removing a helper or a replica member publishes the next
   version.** *(behavior change; every SDK)*
 

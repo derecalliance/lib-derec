@@ -476,6 +476,98 @@ mod sharing_round_outcome {
         });
     }
 
+    /// Seed an unpair on `channel` whose acknowledgement window has elapsed.
+    async fn seed_expired_unpair(protocol: &mut TestProtocol, channel: ChannelId) {
+        protocol.timeouts.unpair_ack = std::time::Duration::from_secs(60);
+        protocol
+            .state_store
+            .save(
+                SECRET_ID,
+                StateItem::PendingUnpair {
+                    channel_id: channel,
+                    started_at: now_secs().saturating_sub(600),
+                },
+            )
+            .await
+            .expect("seed pending unpair");
+    }
+
+    async fn still_pending(protocol: &TestProtocol, channel: ChannelId) -> bool {
+        protocol
+            .state_store
+            .load(
+                SECRET_ID,
+                StateKey::PendingUnpair {
+                    channel_id: channel,
+                },
+            )
+            .await
+            .expect("load")
+            .is_some()
+    }
+
+    fn unpaired(events: &[DeRecEvent], channel: ChannelId) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == channel))
+            .count()
+    }
+
+    /// A timed-out unpair whose channel cannot be dropped keeps its pending
+    /// entry and reports nothing; the next sweep drops it and reports it.
+    #[test]
+    fn a_timed_out_unpair_that_cannot_be_dropped_is_dropped_next_time() {
+        run_async(async {
+            let mut protocol = build(2);
+            let channel = ChannelId(4242);
+            seed_expired_unpair(&mut protocol, channel).await;
+
+            *protocol.channel_store.fail_remove_many.lock().unwrap() = true;
+            let events = protocol.tick().await;
+            assert_eq!(unpaired(&events, channel), 0, "got {events:?}");
+            assert!(
+                still_pending(&protocol, channel).await,
+                "the entry survives"
+            );
+
+            *protocol.channel_store.fail_remove_many.lock().unwrap() = false;
+            let events = protocol.tick().await;
+            assert_eq!(unpaired(&events, channel), 1, "got {events:?}");
+            assert!(!still_pending(&protocol, channel).await);
+        });
+    }
+
+    /// A timed-out unpair dropped but whose entry cannot be removed reports
+    /// nothing; the next sweep removes it and reports it, once.
+    #[test]
+    fn a_timed_out_unpair_whose_entry_stays_is_reported_once() {
+        run_async(async {
+            let mut protocol = build(2);
+            let channel = ChannelId(4242);
+            seed_expired_unpair(&mut protocol, channel).await;
+
+            *protocol.state_store.fail_writes.lock().unwrap() = true;
+            let events = protocol.tick().await;
+            assert_eq!(unpaired(&events, channel), 0, "got {events:?}");
+            assert!(
+                still_pending(&protocol, channel).await,
+                "the entry survives"
+            );
+
+            *protocol.state_store.fail_writes.lock().unwrap() = false;
+            let events = protocol.tick().await;
+            assert_eq!(unpaired(&events, channel), 1, "got {events:?}");
+            assert!(!still_pending(&protocol, channel).await);
+
+            let events = protocol.tick().await;
+            assert_eq!(
+                unpaired(&events, channel),
+                0,
+                "reported once; got {events:?}"
+            );
+        });
+    }
+
     /// A pending unpair still inside its window survives a `tick`.
     #[test]
     fn tick_leaves_a_recent_unpair_pending() {

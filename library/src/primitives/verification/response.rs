@@ -78,7 +78,7 @@ pub struct ExtractResult {
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
 ///
 /// // Owner: issue a verification challenge.
 /// let request::ProduceResult { envelope: req_envelope, .. } =
@@ -185,7 +185,7 @@ pub fn produce(
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
 /// let share_content = b"the share bytes the Helper stores";
 ///
 /// // Owner: issue a verification challenge.
@@ -306,7 +306,7 @@ pub fn extract(
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
 /// let share_content = b"example_share";
 ///
 /// // Owner: issue a verification challenge and remember the request body

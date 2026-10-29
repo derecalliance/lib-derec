@@ -28,6 +28,7 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 rand = { version = "0.10.2", default-features = false, features = ["sys_rng"] }
 sha2 = "0.11.0"
+hmac = { version = "0.13.0", features = ["zeroize"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_bytes = "0.11.19"
 serde_json = "1.0.151"
@@ -35,7 +36,7 @@ base64 = "0.22.1"
 flate2 = "1.0.35"
 ark-serialize = { version = "0.6.0", default-features = true }
 thiserror = "2.0.19"
-zeroize = "1.9.0"
+zeroize = { version = "1.9.0", features = ["derive"] }
 subtle = "2.6.1"
 tracing = { version = "0.1.44", default-features = false, features = ["attributes"], optional = true }
 

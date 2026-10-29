@@ -2,9 +2,9 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
-    CollectedShare, CorruptionReason, DeRecChannelStore, DeRecEvent, DeRecSecretStore,
-    DeRecShareStore, DeRecStateStore, DeRecTransport, MissingPolicy, PendingAction, SecretKind,
-    SecretValue,
+    ChannelRequest, CollectedShare, CorruptionReason, DeRecChannelStore, DeRecEvent,
+    DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport, MissingPolicy,
+    PendingAction, SecretKind, SecretValue,
 };
 use super::NO_SHARE_FOR_VERSION;
 use super::replicas::recovery as replica;
@@ -394,12 +394,12 @@ pub(in crate::protocol) fn failure_response(
 fn on_request(exchange: &Exchange<'_>, request: GetShareRequestMessage) -> Result<Vec<DeRecEvent>> {
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id: exchange.channel_id,
-        action: PendingAction::GetShare {
-            channel_id: exchange.channel_id,
-            request,
-            shared_key: *exchange.shared_key,
-            trace_id: exchange.trace_id,
-        },
+        action: PendingAction::request(
+            exchange.channel_id,
+            exchange.trace_id,
+            ChannelRequest::GetShare(request),
+        )
+        .sealed_with(exchange.shared_key),
     }])
 }
 
@@ -950,7 +950,11 @@ mod recovery_ids_tests {
         };
         channels.save(sid, record).await.expect("channel saved");
         secrets
-            .save(sid, ChannelId(cid), SecretValue::SharedKey([key_byte; 32]))
+            .save(
+                sid,
+                ChannelId(cid),
+                SecretValue::SharedKey(SharedKey::new([key_byte; 32])),
+            )
             .await
             .expect("shared key saved");
     }
@@ -959,8 +963,11 @@ mod recovery_ids_tests {
     /// a helper would actually see.
     fn decode_request(envelope: &[u8], key_byte: u8) -> GetShareRequestMessage {
         let msg = DeRecMessage::decode(envelope).expect("outbound envelope decodes");
-        let inner = crate::derec_message::extract_inner_message(&msg.message, &[key_byte; 32])
-            .expect("inner message decrypts");
+        let inner = crate::derec_message::extract_inner_message(
+            &msg.message,
+            &crate::types::SharedKey::new([key_byte; 32]),
+        )
+        .expect("inner message decrypts");
         match inner {
             MessageBody::GetShareRequest(r) => r,
             other => panic!("expected GetShareRequest, got {other:?}"),
@@ -2096,7 +2103,7 @@ mod recovery_ids_tests {
                     timestamp: Some(timestamp),
                     ..Default::default()
                 }))
-                .encrypt(&[KEY_BYTE; 32])
+                .encrypt(&crate::types::SharedKey::new([KEY_BYTE; 32]))
                 .expect("encrypts")
                 .build()
                 .expect("builds")
@@ -2107,8 +2114,11 @@ mod recovery_ids_tests {
             let envelopes = transport.sent_envelopes();
             assert_eq!(envelopes.len(), 1, "exactly one answer must be sent");
             let msg = DeRecMessage::decode(envelopes[0].as_slice()).expect("envelope decodes");
-            match crate::derec_message::extract_inner_message(&msg.message, &[KEY_BYTE; 32])
-                .expect("inner message decrypts")
+            match crate::derec_message::extract_inner_message(
+                &msg.message,
+                &crate::types::SharedKey::new([KEY_BYTE; 32]),
+            )
+            .expect("inner message decrypts")
             {
                 MessageBody::GetShareResponse(r) => r,
                 other => panic!("expected GetShareResponse, got {other:?}"),
@@ -2359,7 +2369,7 @@ mod recovery_ids_tests {
                 .channel_id(ChannelId(channel_id))
                 .timestamp(response.timestamp.expect("response timestamp"))
                 .message_body(MessageBody::GetShareResponse(response.clone()))
-                .encrypt(&[key_byte; 32])
+                .encrypt(&crate::types::SharedKey::new([key_byte; 32]))
                 .expect("encrypts")
                 .build()
                 .expect("builds")
@@ -2559,7 +2569,7 @@ mod recovery_ids_tests {
                     &lf.local(),
                     &Exchange {
                         channel_id: ChannelId(WANTED_CHANNEL),
-                        shared_key: &[0xB2; 32],
+                        shared_key: &crate::types::SharedKey::new([0xB2; 32]),
                         trace_id: 0,
                         obligation: None,
                     },

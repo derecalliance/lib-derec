@@ -48,7 +48,7 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
                 local,
                 &member,
                 &request,
-                *exchange.shared_key,
+                exchange.shared_key,
                 exchange.trace_id,
                 exchange.obligation,
             )
@@ -80,7 +80,7 @@ async fn on_request<S: StoreSet>(
     local: &Local<'_>,
     member: &ReplicaMember,
     request: &GetShareRequestMessage,
-    shared_key: SharedKey,
+    shared_key: &SharedKey,
     inbound_trace_id: u64,
     obligation: Option<&crate::protocol::obligation::Obligation>,
 ) -> Result<Vec<DeRecEvent>> {
@@ -114,7 +114,7 @@ async fn on_request<S: StoreSet>(
         .channel_id(member.channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::GetShareResponse(response))
-        .encrypt(&shared_key)?
+        .encrypt(shared_key)?
         .build()?
         .encode_to_vec();
     let envelope = crate::derec_message::apply_trace_id(&envelope, inbound_trace_id)?;

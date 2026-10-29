@@ -996,8 +996,8 @@ mod keep_version_proof {
         format!("https://helper-{channel}.example")
     }
 
-    fn key_of(channel: u64) -> [u8; 32] {
-        [channel as u8; 32]
+    fn key_of(channel: u64) -> crate::types::SharedKey {
+        crate::types::SharedKey::new([channel as u8; 32])
     }
 
     async fn owner(shares: InMemShareStore, transport: RecordingTransport) -> TestProtocol {

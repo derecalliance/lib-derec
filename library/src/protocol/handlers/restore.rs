@@ -417,7 +417,7 @@ async fn write_helper_channels<S: StoreSet>(
             .await?;
         stores
             .secrets
-            .save(secret_id, cid, SecretValue::SharedKey(*shared_key))
+            .save(secret_id, cid, SecretValue::SharedKey(shared_key.clone()))
             .await?;
     }
     Ok(())
@@ -440,7 +440,7 @@ async fn write_replica_channels<S: StoreSet>(
         .save(
             local.secret_id,
             group.channel_id,
-            SecretValue::SharedKey(group.group_key),
+            SecretValue::SharedKey(group.group_key.clone()),
         )
         .await?;
     Ok(())
@@ -498,7 +498,7 @@ async fn unpair_recovery_channels<S: StoreSet>(
                     channel_id,
                     error: e.to_string(),
                 });
-                if super::unpairing::drop_channel_state(stores, local, channel_id)
+                if super::unpairing::drop_channels_state(stores, local, &[channel_id])
                     .await
                     .is_ok()
                 {
@@ -755,7 +755,7 @@ mod tests {
                 .unwrap()
                 .expect("replica group key must be persisted");
             match rep_sk {
-                SecretValue::SharedKey(k) => assert_eq!(k.to_vec(), vec![0xCC; 32]),
+                SecretValue::SharedKey(k) => assert_eq!(k.as_bytes().to_vec(), vec![0xCC; 32]),
                 _ => panic!("expected SharedKey"),
             }
 
@@ -1018,7 +1018,7 @@ mod tests {
             assert!(
                 matches!(
                     shared_key_at(&rig, secret_id, 21).await,
-                    Some(SecretValue::SharedKey(k)) if k == [0xCC; 32]
+                    Some(SecretValue::SharedKey(k)) if k == crate::types::SharedKey::new([0xCC; 32])
                 ),
                 "the group key is written for the members that remain"
             );
@@ -1085,7 +1085,7 @@ mod tests {
             );
             rig.secret_store.data.lock().unwrap().insert(
                 (secret_id, 12, SecretKind::SharedKey as u8),
-                SecretValue::SharedKey([0x77; 32]),
+                SecretValue::SharedKey(SharedKey::new([0x77; 32])),
             );
 
             let mut secret = fixture_secret();
@@ -1118,7 +1118,7 @@ mod tests {
             assert!(
                 matches!(
                     shared_key_at(&rig, secret_id, 12).await,
-                    Some(SecretValue::SharedKey(k)) if k == [0x77; 32]
+                    Some(SecretValue::SharedKey(k)) if k == crate::types::SharedKey::new([0x77; 32])
                 ),
                 "its key is left as it was"
             );
@@ -1269,7 +1269,7 @@ mod tests {
             );
             rig.secret_store.data.lock().unwrap().insert(
                 (secret_id, rcid, SecretKind::SharedKey as u8),
-                SecretValue::SharedKey([0x77; 32]),
+                SecretValue::SharedKey(SharedKey::new([0x77; 32])),
             );
         }
     }
@@ -1417,7 +1417,7 @@ mod tests {
             );
             rig.secrets.data.lock().unwrap().insert(
                 (secret_id, 99, SecretKind::SharedKey as u8),
-                SecretValue::SharedKey([0x77; 32]),
+                SecretValue::SharedKey(SharedKey::new([0x77; 32])),
             );
 
             let events = protocol
@@ -1568,7 +1568,7 @@ mod tests {
             .save(
                 secret_id,
                 ChannelId(channel),
-                SecretValue::SharedKey([channel as u8; 32]),
+                SecretValue::SharedKey(SharedKey::new([channel as u8; 32])),
             )
             .await
             .expect("seed key");

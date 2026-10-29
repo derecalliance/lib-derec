@@ -51,7 +51,7 @@ pub struct ProcessResult {
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
 ///
 /// let response::ProduceResult { envelope } = response::produce(channel_id, &shared_key)
 ///     .expect("failed to build unpair response");
@@ -112,7 +112,7 @@ pub fn produce(
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
 ///
 /// // Initiator: send an unpair request.
 /// let request::ProduceResult { envelope: req_envelope } =
@@ -179,7 +179,7 @@ pub fn extract(
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
 ///
 /// // Initiator → Responder → Initiator roundtrip.
 /// let request::ProduceResult { envelope: req_envelope } =

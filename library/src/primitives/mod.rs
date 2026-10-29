@@ -9,6 +9,6 @@ pub mod unpairing;
 pub mod verification;
 
 #[cfg(test)]
-pub(crate) fn make_shared_key(byte: u8) -> [u8; 32] {
-    [byte; 32]
+pub(crate) fn make_shared_key(byte: u8) -> crate::types::SharedKey {
+    crate::types::SharedKey::new([byte; 32])
 }

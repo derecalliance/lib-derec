@@ -21,7 +21,7 @@
 
 use crate::protocol::utils::{pending_action_wire, reserved_keys::encode_replica_id};
 use crate::protocol::{
-    DeRecEvent, PendingAction,
+    Action, ChannelRequest, DeRecEvent, PendingAction,
     types::{ChannelShare, Secret},
 };
 use serde::Serialize;
@@ -249,7 +249,7 @@ pub(crate) enum Event {
         /// Human-readable tag (e.g. `"Pairing"`, `"StoreShare"`) so JS
         /// callers can route on action kind without decoding `action`.
         action_kind: String,
-        /// Populated for `PendingAction::Pairing`; empty otherwise.
+        /// Populated for `Action::Pairing`; empty otherwise.
         #[serde(skip_serializing_if = "HashMap::is_empty")]
         peer_communication_info: HashMap<String, String>,
         /// `sender_kind` from the inbound `PairRequestMessage` (Pairing
@@ -893,16 +893,18 @@ impl Event {
                 let sender_kind = extract_pairing_sender_kind(&action);
                 let (version, share_description, share_secret_id) = extract_share_metadata(&action);
                 let trace_id = action.trace_id().to_string();
-                let share_size = match &action {
-                    PendingAction::StoreShare { request, .. } => Some(request.share.len() as u64),
+                let share_size = match action.action() {
+                    Action::Request(ChannelRequest::StoreShare(request)) => {
+                        Some(request.share.len() as u64)
+                    }
                     _ => None,
                 };
-                let unpair_memo = match &action {
-                    PendingAction::Unpair { request, .. } => Some(request.memo.clone()),
+                let unpair_memo = match action.action() {
+                    Action::Request(ChannelRequest::Unpair(request)) => Some(request.memo.clone()),
                     _ => None,
                 };
-                let (updated_communication_info, updated_transports) = match &action {
-                    PendingAction::UpdateChannelInfo { request, .. } => (
+                let (updated_communication_info, updated_transports) = match action.action() {
+                    Action::Request(ChannelRequest::UpdateChannelInfo(request)) => (
                         request.communication_info.as_ref().map(|info| {
                             use crate::extensions::communication_info::CommunicationInfoExt as _;
                             info.to_map()
@@ -1174,8 +1176,8 @@ fn action_kind_label(action: &PendingAction) -> &'static str {
 }
 
 fn extract_peer_communication_info(action: &PendingAction) -> HashMap<String, String> {
-    match action {
-        PendingAction::Pairing {
+    match action.action() {
+        Action::Pairing {
             peer_communication_info,
             ..
         } => peer_communication_info.clone(),
@@ -1184,15 +1186,15 @@ fn extract_peer_communication_info(action: &PendingAction) -> HashMap<String, St
 }
 
 fn extract_pairing_sender_kind(action: &PendingAction) -> Option<i32> {
-    match action {
-        PendingAction::Pairing { request, .. } => Some(request.sender_kind),
+    match action.action() {
+        Action::Pairing { request, .. } => Some(request.sender_kind),
         _ => None,
     }
 }
 
 fn extract_share_metadata(action: &PendingAction) -> (Option<u32>, Option<String>, Option<String>) {
-    match action {
-        PendingAction::StoreShare { request, .. } => {
+    match action.action() {
+        Action::Request(ChannelRequest::StoreShare(request)) => {
             let desc = if request.version_description.is_empty() {
                 None
             } else {
@@ -1204,12 +1206,12 @@ fn extract_share_metadata(action: &PendingAction) -> (Option<u32>, Option<String
                 Some(request.secret_id.to_string()),
             )
         }
-        PendingAction::VerifyShare { request, .. } => (
+        Action::Request(ChannelRequest::VerifyShare(request)) => (
             Some(request.version),
             None,
             Some(request.secret_id.to_string()),
         ),
-        PendingAction::GetShare { request, .. } => (
+        Action::Request(ChannelRequest::GetShare(request)) => (
             Some(request.version),
             None,
             Some(request.secret_id.to_string()),
@@ -1236,17 +1238,19 @@ mod tests {
     /// carries it, and the request's trace id for logs.
     #[test]
     fn a_store_share_action_reports_its_size_and_trace_id() {
-        let json = action_required(PendingAction::StoreShare {
-            channel_id: ChannelId(7),
-            request: derec_proto::StoreShareRequestMessage {
-                share: vec![0xAB; 1234],
-                version: 3,
-                secret_id: 42,
-                ..Default::default()
-            },
-            shared_key: [0; 32],
-            trace_id: u64::MAX,
-        });
+        let json = action_required(
+            PendingAction::request(
+                ChannelId(7),
+                u64::MAX,
+                ChannelRequest::StoreShare(derec_proto::StoreShareRequestMessage {
+                    share: vec![0xAB; 1234],
+                    version: 3,
+                    secret_id: 42,
+                    ..Default::default()
+                }),
+            )
+            .sealed_with(&crate::types::SharedKey::new([0; 32])),
+        );
         assert_eq!(json["share_size"], 1234);
         assert_eq!(json["version"], 3);
         assert_eq!(json["share_secret_id"], "42");
@@ -1255,16 +1259,18 @@ mod tests {
 
     #[test]
     fn a_get_share_action_names_the_share_asked_for() {
-        let json = action_required(PendingAction::GetShare {
-            channel_id: ChannelId(7),
-            request: derec_proto::GetShareRequestMessage {
-                secret_id: 42,
-                version: 5,
-                ..Default::default()
-            },
-            shared_key: [0; 32],
-            trace_id: 9,
-        });
+        let json = action_required(
+            PendingAction::request(
+                ChannelId(7),
+                9,
+                ChannelRequest::GetShare(derec_proto::GetShareRequestMessage {
+                    secret_id: 42,
+                    version: 5,
+                    ..Default::default()
+                }),
+            )
+            .sealed_with(&crate::types::SharedKey::new([0; 32])),
+        );
         assert_eq!(json["share_secret_id"], "42");
         assert_eq!(json["version"], 5);
         assert!(json.get("share_size").is_none());
@@ -1365,15 +1371,17 @@ mod tests {
 
     #[test]
     fn an_unpair_action_carries_the_peer_memo() {
-        let json = action_required(PendingAction::Unpair {
-            channel_id: ChannelId(7),
-            request: derec_proto::UnpairRequestMessage {
-                memo: "moving devices".to_owned(),
-                ..Default::default()
-            },
-            shared_key: [0; 32],
-            trace_id: 9,
-        });
+        let json = action_required(
+            PendingAction::request(
+                ChannelId(7),
+                9,
+                ChannelRequest::Unpair(derec_proto::UnpairRequestMessage {
+                    memo: "moving devices".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .sealed_with(&crate::types::SharedKey::new([0; 32])),
+        );
         assert_eq!(json["unpair_memo"], "moving devices");
     }
 
@@ -1382,21 +1390,23 @@ mod tests {
     #[test]
     fn an_update_channel_info_action_shows_what_would_change() {
         use crate::extensions::communication_info::CommunicationInfoExt as _;
-        let json = action_required(PendingAction::UpdateChannelInfo {
-            channel_id: ChannelId(7),
-            request: derec_proto::UpdateChannelInfoRequestMessage {
-                communication_info: Some(derec_proto::CommunicationInfo::from_map(&HashMap::from(
-                    [("name".to_owned(), "Alice".to_owned())],
-                ))),
-                supported_transports: vec![derec_proto::TransportProtocol {
-                    uri: "grpcs://alice.example:443".to_owned(),
-                    protocol: derec_proto::Protocol::Grpc as i32,
-                }],
-                ..Default::default()
-            },
-            shared_key: [0; 32],
-            trace_id: 9,
-        });
+        let json = action_required(
+            PendingAction::request(
+                ChannelId(7),
+                9,
+                ChannelRequest::UpdateChannelInfo(derec_proto::UpdateChannelInfoRequestMessage {
+                    communication_info: Some(derec_proto::CommunicationInfo::from_map(
+                        &HashMap::from([("name".to_owned(), "Alice".to_owned())]),
+                    )),
+                    supported_transports: vec![derec_proto::TransportProtocol {
+                        uri: "grpcs://alice.example:443".to_owned(),
+                        protocol: derec_proto::Protocol::Grpc as i32,
+                    }],
+                    ..Default::default()
+                }),
+            )
+            .sealed_with(&crate::types::SharedKey::new([0; 32])),
+        );
         assert_eq!(json["updated_communication_info"]["name"], "Alice");
         assert_eq!(
             json["updated_transports"][0]["uri"],
@@ -1406,18 +1416,20 @@ mod tests {
 
         // An update carrying only endpoints leaves the stored map alone, which
         // is distinct from clearing it.
-        let json = action_required(PendingAction::UpdateChannelInfo {
-            channel_id: ChannelId(7),
-            request: derec_proto::UpdateChannelInfoRequestMessage {
-                supported_transports: vec![derec_proto::TransportProtocol {
-                    uri: "https://alice.example".to_owned(),
-                    protocol: derec_proto::Protocol::Https as i32,
-                }],
-                ..Default::default()
-            },
-            shared_key: [0; 32],
-            trace_id: 9,
-        });
+        let json = action_required(
+            PendingAction::request(
+                ChannelId(7),
+                9,
+                ChannelRequest::UpdateChannelInfo(derec_proto::UpdateChannelInfoRequestMessage {
+                    supported_transports: vec![derec_proto::TransportProtocol {
+                        uri: "https://alice.example".to_owned(),
+                        protocol: derec_proto::Protocol::Https as i32,
+                    }],
+                    ..Default::default()
+                }),
+            )
+            .sealed_with(&crate::types::SharedKey::new([0; 32])),
+        );
         assert!(json.get("updated_communication_info").is_none());
     }
 
@@ -1666,15 +1678,16 @@ mod tests {
     /// status that would have been sent.
     #[test]
     fn request_failed_carries_its_token_when_unanswered() {
-        let action = PendingAction::RespondToFailure {
-            channel_id: ChannelId(u64::MAX),
-            trace_id: 9,
-            reply: crate::protocol::ReplyTarget {
+        let action = PendingAction::failure(
+            ChannelId(u64::MAX),
+            9,
+            crate::protocol::ReplyTarget {
                 channel_id: ChannelId(u64::MAX),
                 endpoints: Vec::new(),
             },
-            request: crate::protocol::FailedRequest::Undecodable,
-        };
+            crate::protocol::FailedRequest::Undecodable,
+        )
+        .sealed_with(&crate::types::SharedKey::new([0; 32]));
         let expected_bytes = pending_action_wire::serialize(action.clone()).expect("serializes");
         let mapped = Event::from_event(DeRecEvent::RequestFailed {
             channel_id: ChannelId(u64::MAX),

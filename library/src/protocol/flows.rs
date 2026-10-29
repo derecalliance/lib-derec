@@ -618,7 +618,7 @@ mod tests {
             .save(
                 SECRET_ID,
                 channel_id,
-                SecretValue::SharedKey([key_byte; 32]),
+                SecretValue::SharedKey(crate::types::SharedKey::new([key_byte; 32])),
             )
             .await
             .expect("seed key");

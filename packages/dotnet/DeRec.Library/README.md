@@ -965,6 +965,12 @@ Resolve each token once. The library is stateless, so rejecting the same
 token twice, or rejecting an action already accepted, sends a second
 response.
 
+Hand the token back exactly as you received it. It is sealed to its channel,
+so `AcceptAsync` and `RejectAsync` refuse one that was edited, rebuilt or
+moved to another channel with a `DeRecException` whose `Code` is
+`DeRecCode.InvalidInput`, and nothing is stored or sent. A token issued by
+v0.0.10 does not decode (`DeRecCode.FfiBadProto`).
+
 `WithAutoRespondOnFailure` decides who answers. With it on, the library sends
 the response itself (a known failure keeps its specific status; anything else
 is `FAIL` with a generic memo). With it off (the default), nothing is sent and

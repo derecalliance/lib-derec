@@ -19,6 +19,7 @@
 //! roster lands.
 use super::flag_unpairing;
 use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::protocol::context::Local;
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{
@@ -94,18 +95,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     };
 
     let group_channel = member.channel_id;
-    let key = match stores
-        .secrets
-        .load(secret_id, group_channel, SecretKind::SharedKey)
-        .await?
-    {
-        Some(crate::protocol::types::SecretValue::SharedKey(k)) => k,
-        _ => {
-            return Err(Error::InvalidInput(
-                "channel has no shared key — not yet paired",
-            ));
-        }
-    };
+    let key = stores.secrets.paired_key(secret_id, group_channel).await?;
 
     // Every member is told, the departing one included. The remaining members
     // need the flag to satisfy the safety rule when the new roster arrives;
@@ -316,7 +306,7 @@ async fn on_request<S: StoreSet>(
     // it: this leg raises no `ActionRequired` (a roster removal is not the
     // application's to confirm), and `ReplicaRemoved`, emitted later by
     // `reconcile`, carries no memo field. The owner↔helper leg does surface
-    // it, by handing the whole request to `PendingAction::Unpair`.
+    // it, by handing the whole request to `ChannelRequest::Unpair`.
     let _ = request;
     let target = ReplicaId::try_from(target)?;
     let member = stores
@@ -613,7 +603,11 @@ mod tests {
                 .await
                 .expect("seed helper");
             rig.secrets
-                .save(SECRET_ID, GROUP, SecretValue::SharedKey([0x33; 32]))
+                .save(
+                    SECRET_ID,
+                    GROUP,
+                    SecretValue::SharedKey(crate::types::SharedKey::new([0x33; 32])),
+                )
                 .await
                 .expect("seed key");
             rig.user_secrets
@@ -669,7 +663,11 @@ mod tests {
 
     async fn seed_group_key(secrets: &mut InMemSecretStore) {
         secrets
-            .save(SECRET_ID, GROUP, SecretValue::SharedKey([7u8; 32]))
+            .save(
+                SECRET_ID,
+                GROUP,
+                SecretValue::SharedKey(crate::types::SharedKey::new([7u8; 32])),
+            )
             .await
             .expect("seed group key");
     }

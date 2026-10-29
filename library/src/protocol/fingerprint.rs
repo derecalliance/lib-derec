@@ -13,8 +13,8 @@ use super::traits::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport,
     DeRecUserSecretStore,
 };
-use super::types::{SecretKind, SecretValue};
 use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::{Error, Result, types::ChannelId};
 
 impl<
@@ -36,18 +36,10 @@ impl<
     /// Returns an error if the channel has no shared key (not yet paired).
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(channel_id = channel_id.0)))]
     pub async fn get_fingerprint(&self, channel_id: ChannelId) -> Result<String> {
-        let shared_key = match self
+        let shared_key = self
             .secret_store
-            .load(self.secret_id, channel_id, SecretKind::SharedKey)
-            .await?
-        {
-            Some(SecretValue::SharedKey(key)) => key,
-            _ => {
-                return Err(Error::InvalidInput(
-                    "channel has no shared key — not yet paired",
-                ));
-            }
-        };
+            .paired_key(self.secret_id, channel_id)
+            .await?;
 
         Ok(crate::primitives::pairing::fingerprint(&shared_key))
     }
@@ -247,7 +239,9 @@ mod tests {
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
-    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, SecretValue};
+    use crate::protocol::types::{
+        ChannelRecord, ChannelStatus, HelperChannel, SecretKind, SecretValue,
+    };
     use crate::utils::now_secs;
 
     const SECRET_ID: u64 = 0xF1;
@@ -283,7 +277,11 @@ mod tests {
             .await
             .expect("seed helper channel");
         secrets
-            .save(SECRET_ID, CHANNEL, SecretValue::SharedKey([7u8; 32]))
+            .save(
+                SECRET_ID,
+                CHANNEL,
+                SecretValue::SharedKey(crate::types::SharedKey::new([7u8; 32])),
+            )
             .await
             .expect("seed shared key");
     }
@@ -419,7 +417,11 @@ mod tests {
             }
             secrets
                 .clone()
-                .save(SECRET_ID, CHANNEL, SecretValue::SharedKey([7u8; 32]))
+                .save(
+                    SECRET_ID,
+                    CHANNEL,
+                    SecretValue::SharedKey(crate::types::SharedKey::new([7u8; 32])),
+                )
                 .await
                 .expect("seed shared key");
 
@@ -511,7 +513,11 @@ mod tests {
                 .await
                 .expect("seed paired helper");
             secrets
-                .save(SECRET_ID, OTHER, SecretValue::SharedKey([7u8; 32]))
+                .save(
+                    SECRET_ID,
+                    OTHER,
+                    SecretValue::SharedKey(crate::types::SharedKey::new([7u8; 32])),
+                )
                 .await
                 .expect("seed shared key");
             let mut user_secrets = InMemUserSecretStore::default();
@@ -560,10 +566,13 @@ mod tests {
                 .sent_envelopes()
                 .iter()
                 .map(|envelope| {
-                    crate::primitives::sharing::request::extract(envelope, &[7u8; 32])
-                        .expect("extract store-share request")
-                        .request
-                        .keep_version
+                    crate::primitives::sharing::request::extract(
+                        envelope,
+                        &crate::types::SharedKey::new([7u8; 32]),
+                    )
+                    .expect("extract store-share request")
+                    .request
+                    .keep_version
                 })
                 .collect();
             assert_eq!(keep_versions, vec![2, 2]);

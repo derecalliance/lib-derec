@@ -69,7 +69,7 @@ pub(crate) fn decrypt_inner_message(
     shared_key: &SharedKey,
 ) -> Result<Vec<u8>, crate::Error> {
     Ok(
-        derec_cryptography::channel::decrypt_message(message_bytes, shared_key)
+        derec_cryptography::channel::decrypt_message(message_bytes, shared_key.as_bytes())
             .map_err(DeRecMessageBuilderError::Encryption)?,
     )
 }

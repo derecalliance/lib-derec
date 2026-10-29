@@ -117,7 +117,66 @@ impl std::fmt::Display for ReplicaId {
 ///
 /// A `SharedKey` is established during the pairing flow and used to encrypt
 /// and authenticate all subsequent protocol messages on the associated channel.
-pub type SharedKey = [u8; 32];
+///
+/// The bytes are wiped from memory when the key is dropped. The type is not
+/// `Copy`, so a copy of the key exists only where [`Clone::clone`] makes one.
+/// `Debug` prints no key material, and `==` compares in constant time.
+///
+/// Build one from its bytes with [`SharedKey::new`], `From<[u8; 32]>` or
+/// `TryFrom<&[u8]>`, and read them with [`SharedKey::as_bytes`]: those are the only ways the bytes
+/// cross into or out of the type, which is where a store or a binding moves
+/// them.
+///
+/// With the `serde` feature, it serializes exactly as the `[u8; 32]` it wraps,
+/// so a key persisted through serde reads back unchanged.
+#[derive(Clone, zeroize::ZeroizeOnDrop)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(transparent)
+)]
+pub struct SharedKey([u8; 32]);
+
+impl SharedKey {
+    /// Wrap the key's 32 bytes.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// The key's 32 bytes.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for SharedKey {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl TryFrom<&[u8]> for SharedKey {
+    type Error = std::array::TryFromSliceError;
+
+    /// Read a key from bytes that must be exactly 32 long.
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        <[u8; 32]>::try_from(bytes).map(Self)
+    }
+}
+
+impl PartialEq for SharedKey {
+    fn eq(&self, other: &Self) -> bool {
+        subtle::ConstantTimeEq::ct_eq(&self.0[..], &other.0[..]).into()
+    }
+}
+
+impl Eq for SharedKey {}
+
+impl std::fmt::Debug for SharedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedKey(<redacted>)")
+    }
+}
 
 #[cfg(test)]
 mod replica_id_tests {
@@ -136,5 +195,57 @@ mod replica_id_tests {
         let id = ReplicaId::try_from(1002u64).expect("1002 is a valid replica id");
         assert_eq!(u64::from(id), 1002);
         assert_eq!(id, 1002u64);
+    }
+}
+
+#[cfg(test)]
+mod shared_key_tests {
+    use super::SharedKey;
+
+    /// The key is wiped when it is dropped.
+    #[test]
+    fn a_key_is_zeroized_on_drop() {
+        fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        wiped_on_drop::<SharedKey>();
+    }
+
+    /// `Debug` prints no key byte.
+    #[test]
+    fn debug_prints_no_key_material() {
+        let rendered = format!("{:?}", SharedKey::new([0xAB; 32]));
+        assert_eq!(rendered, "SharedKey(<redacted>)");
+    }
+
+    /// Keys compare by their bytes.
+    #[test]
+    fn keys_compare_by_their_bytes() {
+        assert_eq!(SharedKey::new([1; 32]), SharedKey::from([1; 32]));
+        let mut other = [1; 32];
+        other[31] = 2;
+        assert_ne!(SharedKey::new([1; 32]), SharedKey::new(other));
+    }
+
+    /// Only exactly 32 bytes read as a key.
+    #[test]
+    fn a_key_is_read_only_from_32_bytes() {
+        assert_eq!(
+            SharedKey::try_from([7u8; 32].as_slice()).expect("32 bytes"),
+            SharedKey::new([7; 32])
+        );
+        assert!(SharedKey::try_from([7u8; 31].as_slice()).is_err());
+        assert!(SharedKey::try_from([7u8; 33].as_slice()).is_err());
+    }
+
+    /// A key serializes exactly as the `[u8; 32]` it wraps, so a key stored
+    /// through serde before the type existed reads back unchanged.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_key_serializes_as_its_bytes() {
+        let bytes: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let as_array = serde_json::to_string(&bytes).expect("serialize array");
+        let as_key = serde_json::to_string(&SharedKey::new(bytes)).expect("serialize key");
+        assert_eq!(as_key, as_array);
+        let read: SharedKey = serde_json::from_str(&as_array).expect("deserialize");
+        assert_eq!(read, SharedKey::new(bytes));
     }
 }

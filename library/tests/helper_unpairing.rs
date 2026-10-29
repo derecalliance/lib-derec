@@ -23,7 +23,8 @@ use derec_library::protocol::types::{
 };
 use derec_library::protocol::{
     DeRecChannelStore as _, DeRecEvent, DeRecFlow, DeRecProtocol, DeRecProtocolBuilder,
-    DeRecSecretStore as _, DeRecStateStore as _, DeRecUserSecretStore as _, StateItem, UnpairAck,
+    DeRecSecretStore as _, DeRecStateStore as _, DeRecUserSecretStore as _, SecretKind, StateItem,
+    StateKey, UnpairAck,
 };
 use derec_library::types::{ChannelId, SharedKey};
 use derec_proto::{
@@ -51,7 +52,7 @@ type Proto = DeRecProtocol<
 >;
 
 fn key(channel_id: ChannelId) -> SharedKey {
-    [channel_id.0 as u8; 32]
+    derec_library::types::SharedKey::new([channel_id.0 as u8; 32])
 }
 
 fn endpoint(channel_id: ChannelId) -> TransportProtocol {
@@ -224,6 +225,61 @@ fn a_helper_is_unpairing_until_it_acknowledges() {
     });
 }
 
+/// An acknowledgement whose teardown fails keeps the unpair pending, so
+/// processing the same answer again finishes it, and reports it once.
+#[test]
+fn an_acknowledgement_whose_teardown_fails_is_finished_by_processing_it_again() {
+    run_async(async {
+        let rig = Rig::default();
+        rig.seed_helper(A, ChannelStatus::Paired).await;
+        let mut owner = rig.build();
+        owner.start(unpair(A)).await.expect("unpair starts");
+        let answer = unpair_answer(A, StatusEnum::Ok);
+        let pending = || async {
+            rig.state
+                .load(SECRET_ID, StateKey::PendingUnpair { channel_id: A })
+                .await
+                .expect("load")
+                .is_some()
+        };
+
+        rig.secrets.set_fail_remove(Some(SecretKind::SharedKey));
+        owner
+            .process(&answer)
+            .await
+            .expect_err("the channel's keys cannot be removed");
+        assert!(pending().await, "the unpair is still pending");
+        assert_eq!(rig.status(A).await, Some(ChannelStatus::Unpairing));
+
+        rig.secrets.set_fail_remove(None);
+        let events = owner
+            .process(&answer)
+            .await
+            .expect("the same answer finishes the teardown");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == A)),
+            "got {events:?}"
+        );
+        assert_eq!(rig.status(A).await, None, "the channel is gone");
+        assert!(!pending().await, "the unpair is no longer pending");
+
+        // The channel and its key are gone, so a replay no longer decrypts;
+        // either way it reports no second `Unpaired`.
+        let events = match owner.process(&answer).await {
+            Ok(events) => events,
+            Err(error) => error.events,
+        };
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DeRecEvent::Unpaired { .. })),
+            "reported once; got {events:?}"
+        );
+    });
+}
+
 #[test]
 fn a_rejected_unpair_returns_the_helper_to_paired() {
     run_async(async {
@@ -297,7 +353,7 @@ fn the_recovery_helpers_answers_end_their_channels_after_restore() {
         let helper = |channel_id: ChannelId| HelperInfo {
             channel_id: channel_id.0,
             transports: vec![endpoint(channel_id)],
-            shared_key: key(channel_id).to_vec(),
+            shared_key: key(channel_id).as_bytes().to_vec(),
             communication_info: HashMap::new(),
             weight: 1,
         };

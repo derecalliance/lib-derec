@@ -19,6 +19,7 @@ use super::traits::{
 use super::types::{SecretKind, SecretValue};
 use super::{DeRecProtocol, handlers};
 use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::{Error, Result, types::ChannelId};
 use derec_proto::DeRecMessage;
 use prost::Message;
@@ -309,9 +310,9 @@ impl<
         message: &DeRecMessage,
         channel_id: ChannelId,
     ) -> Result<Option<Vec<DeRecEvent>>> {
-        let Some(SecretValue::SharedKey(shared_key)) = self
+        let Some(shared_key) = self
             .secret_store
-            .load(self.secret_id, channel_id, SecretKind::SharedKey)
+            .shared_key(self.secret_id, channel_id)
             .await?
         else {
             return Ok(None);
@@ -450,7 +451,7 @@ mod tests {
 
     const SECRET_ID: u64 = 0xAF;
     const CHANNEL: ChannelId = ChannelId(808);
-    const SHARED_KEY: crate::types::SharedKey = [9u8; 32];
+    const SHARED_KEY: crate::types::SharedKey = crate::types::SharedKey::new([9u8; 32]);
 
     fn endpoint() -> derec_proto::TransportProtocol {
         derec_proto::TransportProtocol {
@@ -647,7 +648,7 @@ mod tests {
                         reply_to_transports: Vec::new(),
                     },
                 ))
-                .encrypt(&[1u8; 32])
+                .encrypt(&crate::types::SharedKey::new([1u8; 32]))
                 .expect("encrypt")
                 .build()
                 .expect("build")

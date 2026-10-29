@@ -24,30 +24,11 @@ pub(in crate::protocol) mod recovery;
 pub(in crate::protocol) mod sharing;
 pub(in crate::protocol) mod unpairing;
 
+use crate::Result;
+use crate::protocol::DeRecChannelStore;
 use crate::protocol::context::Local;
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{ChannelRecord, ChannelStatus, ReplicaMember};
-use crate::protocol::{DeRecChannelStore, DeRecSecretStore, SecretKind, SecretValue};
-use crate::types::{ChannelId, SharedKey};
-use crate::{Error, Result};
-
-/// The group key a member encrypts with on `channel_id`.
-async fn load_channel_key<S: StoreSet>(
-    stores: &mut Stores<'_, S>,
-    local: &Local<'_>,
-    channel_id: ChannelId,
-) -> Result<SharedKey> {
-    match stores
-        .secrets
-        .load(local.secret_id, channel_id, SecretKind::SharedKey)
-        .await?
-    {
-        Some(SecretValue::SharedKey(key)) => Ok(key),
-        _ => Err(Error::InvalidInput(
-            "channel has no shared key — not yet paired",
-        )),
-    }
-}
 
 /// Mark a member as told-to-leave, preserving everything else about the row.
 async fn flag_unpairing<S: StoreSet>(
