@@ -259,6 +259,9 @@ mod handshake_tests {
         fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
             Box::pin(std::future::ready(Ok(false)))
         }
+        fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+            Box::pin(std::future::ready(Ok(())))
+        }
         fn helpers(&self, _: u64, _: HelperFilter) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
             Box::pin(std::future::ready(Ok(Vec::new())))
         }

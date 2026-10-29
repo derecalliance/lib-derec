@@ -86,7 +86,8 @@ impl<
     /// does not decode, a channel with no key, a message that does not
     /// decrypt, any other failure of the pairing handshake or of a response
     /// this device received, and a store failure before the message could be
-    /// authenticated.
+    /// authenticated, or while the message's answers were recorded on the
+    /// open sharing rounds.
     ///
     /// # Event ordering
     ///
@@ -96,8 +97,15 @@ impl<
     ///
     /// A failed call still reports what it produced before failing, in
     /// [`ProcessError::events`]: the timeout events at least, and every
-    /// event of the message when only the follow-up auto-publish failed.
-    /// Those deadlines are already settled and are never reported again.
+    /// event of the message when only the follow-up auto-publish or the
+    /// recording of the message's answers failed. Those deadlines are
+    /// already settled and are never reported again.
+    ///
+    /// When the state store fails while the message's answers are recorded
+    /// on the open sharing rounds, the message itself was handled but no
+    /// round has taken its answers yet. Processing the same bytes again,
+    /// within the inbound message timeout, records them; that call repeats
+    /// the message's own events, never a round's.
     ///
     /// # Security: bounding inbound message size
     ///
@@ -142,6 +150,7 @@ impl<
         &mut self,
         message: &[u8],
     ) -> std::result::Result<Vec<DeRecEvent>, ProcessError> {
+        let share_holders = self.pending_unpair_share_holders().await;
         let mut events = self.run_timeout_sweeps().await;
 
         let handled = self.handle_message(message).await;
@@ -151,7 +160,13 @@ impl<
                 channel_id
             }
             Err((channel_id, source)) => {
-                self.update_sharing_round(&mut events).await;
+                if let Err(_error) = self.update_sharing_round(&mut events).await {
+                    #[cfg(feature = "logging")]
+                    tracing::warn!(
+                        error = %_error,
+                        "sharing rounds could not be settled after a failed message"
+                    );
+                }
                 return Err(ProcessError {
                     channel_id,
                     source,
@@ -160,19 +175,33 @@ impl<
             }
         };
 
-        self.update_sharing_round(&mut events).await;
+        let settled = self.update_sharing_round(&mut events).await;
 
-        match self.maybe_auto_publish_after_pair(&events).await {
+        let published = match self.maybe_auto_publish(&events, &share_holders).await {
             Ok(auto_publish_events) => {
                 events.extend(auto_publish_events);
-                Ok(events)
+                Ok(())
             }
-            Err(source) => Err(ProcessError {
-                channel_id: Some(channel_id),
-                source,
-                events,
-            }),
-        }
+            Err(source) => Err(source),
+        };
+
+        let failure = match (settled, published) {
+            (Ok(()), Ok(())) => return Ok(events),
+            (Err(source), Ok(())) | (Ok(()), Err(source)) => source,
+            (Err(source), Err(_publish_error)) => {
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    error = %_publish_error,
+                    "publish after an unpair failed; the remaining helpers keep the previous version"
+                );
+                source
+            }
+        };
+        Err(ProcessError {
+            channel_id: Some(channel_id),
+            source: failure,
+            events,
+        })
     }
 
     async fn handle_message(
@@ -208,18 +237,18 @@ impl<
             return Ok(true);
         }
 
-        Ok(self
+        Ok(!self
             .channel_store
-            .replicas_matching(
+            .replicas_on_channel(
                 self.secret_id,
+                channel_id,
                 ReplicaFilter {
                     status: vec![ChannelStatus::Pending],
                     ..Default::default()
                 },
             )
             .await?
-            .iter()
-            .any(|member| member.channel_id == channel_id))
+            .is_empty())
     }
 
     pub(super) fn is_message_expired(

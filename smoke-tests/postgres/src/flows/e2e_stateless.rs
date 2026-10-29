@@ -208,7 +208,7 @@ pub async fn run() {
     .await;
     step_7_admit_remaining_replicas(&owner, &helpers, &mut replicas).await;
     let secrets = step_8_protect_more_secrets(&owner, &helpers, &replicas, secrets).await;
-    step_9_remove_a_replica(&owner, &helpers, &mut replicas, &secrets).await;
+    step_9_remove_a_replica(&owner, &helpers, &mut replicas).await;
     step_10_a_silent_helper_is_resolved_by_a_scheduled_tick(
         &mut owner, &helpers, &replicas, &secrets,
     )
@@ -630,12 +630,12 @@ async fn step_8_protect_more_secrets(
 ///
 /// The evicted device is told to leave, then receives the roster that omits
 /// it; only once it has seen both does it drop its copy of the secret. The
-/// remaining members drop its row and carry on.
+/// remaining members drop its row and carry on. Starting the removal publishes
+/// that roster itself, so the application runs no `ProtectSecret` here.
 async fn step_9_remove_a_replica(
     owner: &StatelessPeer,
     helpers: &[HelperDevice],
     replicas: &mut Vec<ReplicaDevice>,
-    secrets: &[UserSecret],
 ) {
     let evicted = replicas.pop().expect("three replicas were admitted");
     assert_eq!(evicted.replica_id, REPLICA_FOUR);
@@ -651,15 +651,11 @@ async fn step_9_remove_a_replica(
 
     // The publish that completes the removal has to reach the evictee too —
     // its absence from that roster is what tells it it may leave.
-    let refs: Vec<&ReplicaDevice> = replicas.iter().chain(std::iter::once(&evicted)).collect();
-    protect(
-        owner,
-        helpers,
-        &refs,
-        secrets.to_vec(),
-        "roster without the retired tablet",
-    )
-    .await;
+    let mut cast: Vec<&StatelessPeer> = vec![owner];
+    cast.extend(helpers.iter().map(|h| &h.peer));
+    cast.extend(replicas.iter().map(|r| &r.peer));
+    cast.push(&evicted.peer);
+    pump(&cast).await;
 
     let expected = vec![REPLICA_OWNER, REPLICA_TWO, REPLICA_THREE];
     assert_eq!(

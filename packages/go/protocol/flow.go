@@ -243,6 +243,15 @@ type ReplicaDiscoveryParams struct{}
 // ReplicaID names the member being removed — this device for a voluntary
 // departure, another for an eviction.
 //
+// Start tells every member, flags the target locally, then publishes the
+// roster omitting it as the next version: an ordinary FlowKindProtectSecret of
+// the latest snapshot with the stored weights and threshold, or an empty
+// payload when nothing has been published yet. Its events are returned with
+// the announcement's. EventTypeReplicaRemoved fires once that round
+// completes, not from Start. A publish that fails is returned as the error
+// with the announcement already sent and the flag kept; the next
+// FlowKindProtectSecret completes the removal.
+//
 // Any member may remove any member, the source included: a lost or stolen
 // source must be removable by the devices that remain, and the library checks
 // no role. Ask the user before starting this flow, above all when it names the

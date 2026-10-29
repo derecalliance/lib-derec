@@ -830,4 +830,123 @@ mod tests {
             assert_eq!(role_of(&rig.channels, 1001).await, ReplicaRole::Source);
         });
     }
+
+    type GroupProtocol = crate::protocol::DeRecProtocol<
+        InMemChannelStore,
+        crate::protocol::tests::InMemShareStore,
+        InMemSecretStore,
+        crate::protocol::tests::InMemUserSecretStore,
+        crate::protocol::tests::InMemPersistedStateStore,
+        crate::protocol::tests::RecordingTransport,
+    >;
+
+    /// This device (1001, the source) in a group with two destinations.
+    async fn group_member(
+        snapshot: Option<UserSecrets>,
+    ) -> (GroupProtocol, crate::protocol::tests::InMemUserSecretStore) {
+        let mut channels = InMemChannelStore::default();
+        let mut secrets = InMemSecretStore::default();
+        seed_group_key(&mut secrets).await;
+        for (id, role) in [
+            (1001, ReplicaRole::Source),
+            (1002, ReplicaRole::Destination),
+            (1003, ReplicaRole::Destination),
+        ] {
+            seed_member(&mut channels, id, role, ChannelStatus::Paired).await;
+        }
+        let mut user_secrets = crate::protocol::tests::InMemUserSecretStore::default();
+        if let Some(snapshot) = snapshot {
+            user_secrets
+                .save_latest(SECRET_ID, snapshot)
+                .await
+                .expect("seed snapshot");
+        }
+        let protocol = crate::protocol::DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(channels)
+            .with_share_store(crate::protocol::tests::InMemShareStore::default())
+            .with_secret_store(secrets)
+            .with_user_secret_store(user_secrets.clone())
+            .with_transport(crate::protocol::tests::RecordingTransport::default())
+            .with_state_store(crate::protocol::tests::InMemPersistedStateStore::default())
+            .with_own_transports(["https://self.example"])
+            .with_replica_id(1001)
+            .build()
+            .expect("test protocol builds");
+        (protocol, user_secrets)
+    }
+
+    fn unpair_replica(replica_id: u64) -> crate::protocol::DeRecFlow {
+        crate::protocol::DeRecFlow::UnpairReplica {
+            replica_id,
+            memo: None,
+        }
+    }
+
+    /// The flow publishes the roster that omits the member itself, so the
+    /// removal completes without the application publishing.
+    #[test]
+    fn removing_a_member_publishes_the_next_version() {
+        run_async(async {
+            let (mut protocol, user_secrets) = group_member(Some(UserSecrets {
+                version: 1,
+                secrets: vec![crate::protocol::types::UserSecret {
+                    id: b"id".to_vec(),
+                    name: "name".to_owned(),
+                    data: b"data".to_vec(),
+                }],
+                description: None,
+                author_replica_id: Some(1001),
+                threshold: None,
+            }))
+            .await;
+
+            protocol
+                .start(unpair_replica(1003))
+                .await
+                .expect("the removal starts");
+
+            let snapshot = user_secrets
+                .load_latest(SECRET_ID)
+                .await
+                .expect("load")
+                .expect("snapshot");
+            assert_eq!(
+                snapshot.version, 2,
+                "the removal published the next version"
+            );
+            assert_eq!(
+                snapshot.secrets.len(),
+                1,
+                "the secrets are republished unchanged"
+            );
+            assert_eq!(
+                protocol.transport.sent_envelopes().len(),
+                4,
+                "both members are told of the removal, then both receive the new version"
+            );
+        });
+    }
+
+    /// With nothing published yet the roster still has to travel, so the
+    /// removal publishes an empty payload rather than leaving the member
+    /// flagged.
+    #[test]
+    fn removing_a_member_without_a_snapshot_publishes_the_roster() {
+        run_async(async {
+            let (mut protocol, user_secrets) = group_member(None).await;
+
+            protocol
+                .start(unpair_replica(1003))
+                .await
+                .expect("the removal starts");
+
+            let snapshot = user_secrets
+                .load_latest(SECRET_ID)
+                .await
+                .expect("load")
+                .expect("the roster round saves a snapshot");
+            assert_eq!(snapshot.version, 1);
+            assert!(snapshot.secrets.is_empty());
+        });
+    }
 }

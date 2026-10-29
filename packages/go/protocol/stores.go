@@ -37,8 +37,6 @@
 package protocol
 
 import (
-	"errors"
-
 	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/internal/native"
 )
@@ -63,6 +61,8 @@ type (
 	TransportEndpoint = native.TransportEndpoint
 	// ChannelStatus is a channel's lifecycle status.
 	ChannelStatus = native.ChannelStatus
+	// ChannelQuery addresses one record for ChannelStore.RemoveMany.
+	ChannelQuery = native.ChannelQuery
 	// ChannelFilter carries the id and status restrictions shared by the
 	// two listing filters.
 	ChannelFilter = native.ChannelFilter
@@ -75,11 +75,19 @@ type (
 	// SecretKind selects which kind of secret material a SecretValue
 	// carries.
 	SecretKind = native.SecretKind
+	// SecretEntry names one secret for SecretStore.RemoveMany.
+	SecretEntry = native.SecretEntry
 	// SecretValue is the opaque secret payload stored alongside a
 	// channel id and SecretKind.
 	SecretValue = native.SecretValue
 	// Share is a single stored share entry.
 	Share = native.Share
+	// ShareEntry is one ShareStore.LoadMany result: a share paired with
+	// the channel it is stored under.
+	ShareEntry = native.ShareEntry
+	// ShareVersionsEntry names the versions to drop under one channel for
+	// ShareStore.RemoveVersionsMany.
+	ShareVersionsEntry = native.ShareVersionsEntry
 	// StateKind tags which category of in-flight orchestrator state a
 	// StateItem/StateKey belongs to.
 	StateKind = native.StateKind
@@ -148,6 +156,13 @@ type ChannelStore interface {
 	// Returns whether an entry actually existed; removing a missing
 	// entry is not an error.
 	Remove(secretID, channelID, replicaID uint64) (existed bool, err error)
+	// RemoveMany deletes every record queries addresses, in one call, each
+	// entry addressed the way Remove's arguments are: a replica query
+	// removes that member only. Idempotent: an entry that names no record
+	// is skipped, not an error. The library calls it when it removes several
+	// records at once, so a backend that can delete them in one statement or
+	// transaction should.
+	RemoveMany(secretID uint64, queries []ChannelQuery) error
 	// ListHelpers returns the helper channels stored under secretID that
 	// filter selects.
 	//
@@ -204,6 +219,12 @@ type SecretStore interface {
 	// Remove deletes the value at (secretID, channelID, kind).
 	// Idempotent.
 	Remove(secretID, channelID uint64, kind SecretKind) error
+	// RemoveMany deletes every value entries names, in one call, each
+	// entry addressed the way Remove's arguments are. Idempotent: an entry
+	// with nothing stored is skipped, not an error. The library calls it
+	// when it removes several secrets at once, so a backend that can delete
+	// them in one statement or transaction should.
+	RemoveMany(secretID uint64, entries []SecretEntry) error
 }
 
 // ShareStore persists shares, keyed by (secretID, channelID, version)
@@ -222,9 +243,10 @@ type ShareStore interface {
 	// Load returns the shares for a single channel within secretID. An
 	// empty versions selects every version.
 	Load(secretID, channelID uint64, versions []uint32) ([]Share, error)
-	// LoadMany returns shares across several channels within secretID.
-	// An empty versions selects every version.
-	LoadMany(secretID uint64, channelIDs []uint64, versions []uint32) ([]Share, error)
+	// LoadMany returns shares across several channels within secretID,
+	// each paired with the channel it is stored under. An empty versions
+	// selects every version.
+	LoadMany(secretID uint64, channelIDs []uint64, versions []uint32) ([]ShareEntry, error)
 	// LoadAll returns every share stored under secretID across the
 	// given channels.
 	LoadAll(secretID uint64, channelIDs []uint64) ([]Share, error)
@@ -250,6 +272,13 @@ type ShareStore interface {
 	// other than the incoming one and keepVersion is removed. Shares under
 	// other channels or partitions must be left untouched.
 	RemoveVersions(secretID, channelID uint64, versions []uint32) error
+	// RemoveVersionsMany is RemoveVersions for several channels in one call,
+	// each entry dropping its versions under its channel the way
+	// RemoveVersions's arguments do. Idempotent: a version that is not
+	// stored is skipped, not an error. The library calls it when it removes
+	// versions across several channels at once, so a backend that can delete
+	// them in one statement or transaction should.
+	RemoveVersionsMany(secretID uint64, entries []ShareVersionsEntry) error
 	// KeepVersion is asked by an owner, once per sharing round and before
 	// anything is sent, which one older version every helper keeps after
 	// version is distributed. It is asked on library-started publishes too.
@@ -330,6 +359,11 @@ type StateStore interface {
 	// Remove deletes the row at (secretID, key). Returns whether a row
 	// actually existed; removing a missing entry is not an error.
 	Remove(secretID uint64, key StateKey) (existed bool, err error)
+	// RemoveMany deletes every row keys names under secretID, in one call.
+	// Idempotent: a key with no row is skipped, not an error. The library
+	// calls it when it removes several rows at once, so a backend that can
+	// delete them in one statement or transaction should.
+	RemoveMany(secretID uint64, keys []StateKey) error
 	// LoadAll returns every item of the given kind under secretID.
 	LoadAll(secretID uint64, kind StateKind) ([]StateItem, error)
 }
@@ -380,87 +414,5 @@ type Transport interface {
 	// does not corrupt state, but it is still a duplicate to anything
 	// counting messages, and a peer entitled to treat re-delivery as a
 	// replay will.
-	//
-	// Prefer an adapter to writing this by hand. Choosing which endpoint to
-	// dial is yours and stays here; the bookkeeping around it is the same
-	// everywhere and is already written and tested. Implement SendOne and
-	// wrap it in SequentialFailover. Taking endpoints[0] compiles, passes
-	// every test, and silently gives up the failover the list exists to
-	// provide — if that is genuinely wanted, say so with
-	// SingleEndpointTransport rather than by indexing.
 	Send(endpoints []Endpoint, message []byte) error
-}
-
-// SendOne delivers one message to one endpoint.
-//
-// The narrow half of a transport: everything genuinely about dialing, and
-// nothing about which endpoint to dial. Implement this, then wrap it in
-// SequentialFailover or SingleEndpointTransport to get a Transport.
-type SendOne interface {
-	// SendOne delivers message to endpoint, or reports that it did not
-	// arrive.
-	//
-	// The error need not distinguish "unreachable" from "rejected":
-	// SequentialFailover treats both as a reason to try the next endpoint,
-	// which is the safe reading. Trying an endpoint that would have refused
-	// costs a round trip; skipping one that would have worked costs the
-	// delivery.
-	SendOne(endpoint Endpoint, message []byte) error
-}
-
-// SequentialFailover tries each endpoint in the order the peer offered it and
-// stops at the first success.
-//
-// Implements the Transport contract over a SendOne: endpoints are attempted in
-// order, delivery stops at the first success, and an error is returned only
-// when every endpoint failed. The message is delivered at most once.
-//
-// This is the right default. A peer advertising several endpoints is saying it
-// can be reached at any of them, and the reason 0.0.3 records the whole list is
-// so one being down does not end the conversation.
-type SequentialFailover struct {
-	// Dialer delivers to a single endpoint. Required.
-	Dialer SendOne
-}
-
-// Send implements Transport.
-func (s SequentialFailover) Send(endpoints []Endpoint, message []byte) error {
-	var last error
-	for _, endpoint := range endpoints {
-		if err := s.Dialer.SendOne(endpoint, message); err != nil {
-			last = err
-			continue
-		}
-		return nil
-	}
-	if last == nil {
-		// endpoints is never empty through the protocol, which refuses to
-		// record a peer whose endpoints were all filtered away.
-		return errors.New("protocol: Send called with no endpoints")
-	}
-	return last
-}
-
-// SingleEndpointTransport uses the first endpoint only.
-//
-// Reproduces the pre-0.0.3 behaviour exactly, for an application that genuinely
-// serves one endpoint or has a reason not to fail over.
-//
-// It exists so that choosing it is visible. endpoints[0] written inline looks
-// like an implementation detail and reads as finished; naming this type records
-// that failover was considered and declined, which is a claim a reviewer can
-// disagree with. If the peers this application talks to advertise more than one
-// endpoint, prefer SequentialFailover — every endpoint after the first is
-// reachability being thrown away.
-type SingleEndpointTransport struct {
-	// Dialer delivers to a single endpoint. Required.
-	Dialer SendOne
-}
-
-// Send implements Transport.
-func (s SingleEndpointTransport) Send(endpoints []Endpoint, message []byte) error {
-	if len(endpoints) == 0 {
-		return errors.New("protocol: Send called with no endpoints")
-	}
-	return s.Dialer.SendOne(endpoints[0], message)
 }

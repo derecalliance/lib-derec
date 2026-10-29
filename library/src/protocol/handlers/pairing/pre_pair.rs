@@ -17,6 +17,7 @@
 //! decodes the body before any key is available and calls them directly.
 
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
+use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::sender_kind::SenderKindExt as _;
 use crate::protocol::context::{Local, PairingConfig};
 use crate::protocol::stores::{StoreSet, Stores};
@@ -335,15 +336,7 @@ pub(in crate::protocol) async fn on_response<S: StoreSet>(
         ..filled_in_contact.clone()
     };
 
-    let local_kind = match stores
-        .channels
-        .load(
-            secret_id,
-            crate::protocol::types::ChannelQuery::Helper { channel_id },
-        )
-        .await?
-        .and_then(|r| r.as_helper().cloned())
-    {
+    let local_kind = match stores.channels.load_helper(secret_id, channel_id).await? {
         Some(helper) => helper.peer_role.counterparty(),
         None => {
             let own_replica_id = replica_id.ok_or(Error::Invariant(

@@ -797,6 +797,12 @@ typedef struct DeRecProtocolNewResult {
  * returning fewer rows than it selects is wrong, and undetectable. The buffer is owned
  * by the caller and valid only for the duration of the call.
  *
+ * `remove_many` receives a JSON array of `[channel_id, replica_id]` pairs,
+ * the ids as decimal strings, each addressing one record the way `remove`'s
+ * arguments do (`replica_id` `"0"` for a helper channel). An entry
+ * that names no record is skipped. The buffer is owned by the caller and
+ * valid only for the duration of the call.
+ *
  * The order `list_replicas` returns is significant in exactly one situation —
  * it selects the successor when the group's source is removed. See
  * [`crate::protocol::DeRecChannelStore::replicas`] for the full contract.
@@ -820,6 +826,10 @@ typedef struct ChannelStoreCallbacks {
                     uint64_t channel_id,
                     uint64_t replica_id,
                     uint32_t *out_existed);
+  int32_t (*remove_many)(void *user_data,
+                         uint64_t secret_id,
+                         const uint8_t *queries,
+                         size_t queries_len);
   int32_t (*list_helpers)(void *user_data,
                           uint64_t secret_id,
                           const uint8_t *filter,
@@ -849,6 +859,12 @@ typedef struct ChannelStoreCallbacks {
  * in the same order: the same `{kind, bytes}` record `load` returns, or
  * `null` when nothing of `kind` is stored for that channel. Whether a
  * missing entry is an error is decided by the library, not the callback.
+ *
+ * `remove_many` receives a JSON array of `[channel_id, kind]` pairs, the
+ * channel id as a decimal string and the kind as the number `remove` takes,
+ * each naming one secret to remove. An entry with nothing stored is skipped.
+ * The buffer is owned by the caller and valid only for the duration of the
+ * call.
  */
 typedef struct SecretStoreCallbacks {
   void *user_data;
@@ -872,6 +888,10 @@ typedef struct SecretStoreCallbacks {
                   const uint8_t *bytes,
                   size_t len);
   int32_t (*remove)(void *user_data, uint64_t secret_id, uint64_t channel_id, uint32_t kind);
+  int32_t (*remove_many)(void *user_data,
+                         uint64_t secret_id,
+                         const uint8_t *entries,
+                         size_t entries_len);
   void (*free_buffer)(void *user_data, uint8_t *ptr, size_t len);
 } SecretStoreCallbacks;
 
@@ -889,6 +909,17 @@ typedef struct SecretStoreCallbacks {
  * ([`crate::protocol::types::Share::threshold`]). Each is omitted when there
  * is none, and absent or `null` reads as none. Store them as given and return
  * them unchanged.
+ *
+ * `load` and `load_all` return a JSON array of those objects. `load_many`
+ * returns a JSON array of `[channel_id, share]` pairs, `channel_id` the
+ * decimal string of the channel the share is stored under, so the caller can
+ * tell which channel each share came from.
+ *
+ * `remove_versions_many` receives a JSON array of `[channel_id, versions]`
+ * pairs, `channel_id` a decimal string and `versions` an array of numbers,
+ * each naming the versions to remove on that channel. A version that is not
+ * stored is skipped. The buffer is owned by the caller and valid only for the
+ * duration of the call.
  *
  * `keep_version` writes the application's answer to `out_version`: the one
  * version, other than `version`, every helper keeps, or `0` to keep no
@@ -944,6 +975,10 @@ typedef struct ShareStoreCallbacks {
                              uint64_t channel_id,
                              const uint8_t *versions_json_ptr,
                              size_t versions_json_len);
+  int32_t (*remove_versions_many)(void *user_data,
+                                  uint64_t secret_id,
+                                  const uint8_t *entries,
+                                  size_t entries_len);
   int32_t (*keep_version)(void *user_data,
                           uint64_t secret_id,
                           uint32_t version,
@@ -996,6 +1031,9 @@ typedef struct UserSecretStoreCallbacks {
  * - `remove`: `0` = ok (`*out_removed` set to `0` or `1`), other =
  *   backend failure.
  * - `save` / `load_all`: `0` = ok, other = backend failure.
+ * - `remove_many`: `0` = ok, other = backend failure. The keys arrive as a
+ *   JSON array of the [`StateKeyRecord`]s `remove` takes one at a time; a
+ *   key with no row is skipped.
  */
 typedef struct StateStoreCallbacks {
   void *user_data;
@@ -1014,6 +1052,10 @@ typedef struct StateStoreCallbacks {
                     const uint8_t *key_json_ptr,
                     size_t key_json_len,
                     uint32_t *out_removed);
+  int32_t (*remove_many)(void *user_data,
+                         uint64_t secret_id,
+                         const uint8_t *keys_json_ptr,
+                         size_t keys_json_len);
   int32_t (*load_all)(void *user_data,
                       uint64_t secret_id,
                       uint32_t kind,

@@ -147,4 +147,28 @@ impl DeRecSecretStore for SqliteSecretStore {
         .expect("secret remove failed");
         Box::pin(std::future::ready(Ok(())))
     }
+
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, SecretKind)],
+    ) -> SecretStoreFuture<'_, ()> {
+        let conn = lock(&self.connection);
+        let tx = conn
+            .unchecked_transaction()
+            .expect("remove_many transaction failed");
+        for &(channel_id, kind) in entries {
+            tx.execute(
+                "DELETE FROM secrets WHERE secret_id = ?1 AND channel_id = ?2 AND kind = ?3",
+                rusqlite::params![
+                    u64_to_sql(secret_id),
+                    u64_to_sql(channel_id.0),
+                    secret_kind_tag(kind),
+                ],
+            )
+            .expect("secret remove failed");
+        }
+        tx.commit().expect("remove_many commit failed");
+        Box::pin(std::future::ready(Ok(())))
+    }
 }

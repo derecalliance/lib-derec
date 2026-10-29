@@ -148,6 +148,40 @@ impl DeRecChannelStore for PostgresChannelStore {
         })
     }
 
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        queries: &[ChannelQuery],
+    ) -> ChannelStoreFuture<'_, ()> {
+        let client = self.client.clone();
+        let secret_id = u64_to_sql(secret_id);
+        let (helpers, members) = split_queries(queries);
+        Box::pin(async move {
+            client
+                .execute(
+                    "DELETE FROM channels WHERE secret_id = $1 AND channel_id = ANY($2)",
+                    &[&secret_id, &helpers],
+                )
+                .await
+                .expect("helper channel remove_many failed");
+            client
+                .execute(
+                    "DELETE FROM channel_links WHERE secret_id = $1 AND (a = ANY($2) OR b = ANY($2))",
+                    &[&secret_id, &helpers],
+                )
+                .await
+                .expect("channel_link cleanup failed");
+            client
+                .execute(
+                    "DELETE FROM replica_members WHERE secret_id = $1 AND replica_id = ANY($2)",
+                    &[&secret_id, &members],
+                )
+                .await
+                .expect("replica member remove_many failed");
+            Ok(())
+        })
+    }
+
     fn helpers(
         &self,
         secret_id: u64,
@@ -294,4 +328,18 @@ impl DeRecChannelStore for PostgresChannelStore {
             Ok(visited.into_iter().map(ChannelId).collect())
         })
     }
+}
+
+/// Split `queries` into the helper channel ids and the replica member ids
+/// they address, as SQL integers.
+fn split_queries(queries: &[ChannelQuery]) -> (Vec<i64>, Vec<i64>) {
+    let mut helpers = Vec::new();
+    let mut members = Vec::new();
+    for query in queries {
+        match *query {
+            ChannelQuery::Helper { channel_id } => helpers.push(u64_to_sql(channel_id.0)),
+            ChannelQuery::Replica { replica_id, .. } => members.push(u64_to_sql(replica_id.0)),
+        }
+    }
+    (helpers, members)
 }

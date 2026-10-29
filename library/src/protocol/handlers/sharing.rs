@@ -14,7 +14,6 @@ use crate::protocol::DeRecUserSecretStore;
 use crate::protocol::context::{Exchange, Local, Round};
 use crate::protocol::obligation::{deliver, refused, reported};
 use crate::protocol::stores::{StoreSet, Stores};
-use crate::protocol::types::ChannelQuery;
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -51,9 +50,8 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
         (Route::Helper, _) => {
             let channel = stores
                 .channels
-                .load(local.secret_id, ChannelQuery::Helper { channel_id })
+                .load_helper(local.secret_id, channel_id)
                 .await?
-                .and_then(|r| r.as_helper().cloned())
                 .ok_or(Error::InvalidInput(
                     "channel id not present in channel store",
                 ))?;
@@ -4743,7 +4741,7 @@ mod weighted_round_tests {
             seed_helper(&mut rig.channels, &mut rig.secrets, 53).await;
             let events = rig
                 .protocol
-                .maybe_auto_publish_after_pair(&[paired(53)])
+                .maybe_auto_publish(&[paired(53)], &std::collections::HashSet::new())
                 .await
                 .expect("auto-publish runs");
 
@@ -4752,6 +4750,98 @@ mod weighted_round_tests {
             assert_eq!(stored_subshares(&rig.shares, 52, 2), 1);
             assert_eq!(stored_subshares(&rig.shares, 53, 2), 1);
             assert_eq!(stored_weight(&rig.channels, 53).await, 1);
+        });
+    }
+
+    async fn snapshot_version(rig: &ProtocolRig) -> Option<u32> {
+        rig.user_secrets
+            .load_latest(SECRET_ID)
+            .await
+            .unwrap()
+            .map(|s| s.version)
+    }
+
+    async fn seed_pending_helper(rig: &mut ProtocolRig, channel: u64) {
+        rig.channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id: ChannelId(channel),
+                    transports: vec![endpoint(channel)],
+                    communication_info: HashMap::new(),
+                    status: ChannelStatus::Pending,
+                    created_at: 0,
+                    peer_role: SenderKind::Helper,
+                    weight: 1,
+                }),
+            )
+            .await
+            .expect("seed pending helper");
+        rig.secrets
+            .save(
+                SECRET_ID,
+                ChannelId(channel),
+                SecretValue::SharedKey([channel as u8; 32]),
+            )
+            .await
+            .expect("seed helper key");
+    }
+
+    /// Pairing a Helper that leaves the Helpers below the threshold publishes
+    /// nothing and consumes no version; the pairing that reaches it publishes
+    /// the stored snapshot to every Helper.
+    #[test]
+    fn a_pairing_below_the_threshold_publishes_nothing() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51], 3).await;
+            protect(&mut rig, &[]).await;
+            assert_eq!(snapshot_version(&rig).await, Some(1));
+
+            seed_helper(&mut rig.channels, &mut rig.secrets, 52).await;
+            let events = rig
+                .protocol
+                .maybe_auto_publish(&[paired(52)], &std::collections::HashSet::new())
+                .await
+                .expect("auto-publish runs");
+            assert!(events.is_empty(), "got {events:?}");
+            assert_eq!(snapshot_version(&rig).await, Some(1));
+
+            seed_helper(&mut rig.channels, &mut rig.secrets, 53).await;
+            let events = rig
+                .protocol
+                .maybe_auto_publish(&[paired(53)], &std::collections::HashSet::new())
+                .await
+                .expect("auto-publish runs");
+            assert_eq!(started_weights(&events), vec![(51, 1), (52, 1), (53, 1)]);
+            assert_eq!(snapshot_version(&rig).await, Some(2));
+        });
+    }
+
+    /// The fingerprint promotion follows the same rule as pairing.
+    #[test]
+    fn a_fingerprint_promotion_below_the_threshold_publishes_nothing() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51], 3).await;
+            protect(&mut rig, &[]).await;
+
+            seed_pending_helper(&mut rig, 52).await;
+            let fingerprint = rig.protocol.get_fingerprint(ChannelId(52)).await.unwrap();
+            rig.protocol
+                .verify_fingerprint(ChannelId(52), &fingerprint)
+                .await
+                .expect("verify_fingerprint");
+            assert_eq!(snapshot_version(&rig).await, Some(1));
+
+            seed_pending_helper(&mut rig, 53).await;
+            let fingerprint = rig.protocol.get_fingerprint(ChannelId(53)).await.unwrap();
+            rig.protocol
+                .verify_fingerprint(ChannelId(53), &fingerprint)
+                .await
+                .expect("verify_fingerprint");
+            assert_eq!(snapshot_version(&rig).await, Some(2));
+            for ch in [51, 52, 53] {
+                assert_eq!(stored_subshares(&rig.shares, ch, 2), 1);
+            }
         });
     }
 
@@ -4843,7 +4933,7 @@ mod weighted_round_tests {
 
             let result = rig
                 .protocol
-                .maybe_auto_publish_after_pair(&[paired(53)])
+                .maybe_auto_publish(&[paired(53)], &std::collections::HashSet::new())
                 .await;
 
             assert_invalid_weight(result, 51, 2);
@@ -5196,7 +5286,7 @@ mod weighted_round_tests {
             seed_helper(&mut destination.channels, &mut destination.secrets, 54).await;
             let events = destination
                 .protocol
-                .maybe_auto_publish_after_pair(&[paired(54)])
+                .maybe_auto_publish(&[paired(54)], &std::collections::HashSet::new())
                 .await
                 .expect("the destination publishes");
             assert_eq!(
@@ -5225,7 +5315,7 @@ mod weighted_round_tests {
             seed_helper(&mut restored.channels, &mut restored.secrets, 54).await;
             let events = restored
                 .protocol
-                .maybe_auto_publish_after_pair(&[paired(54)])
+                .maybe_auto_publish(&[paired(54)], &std::collections::HashSet::new())
                 .await
                 .expect("the restored device publishes");
             assert_eq!(
@@ -5415,12 +5505,15 @@ mod weighted_round_tests {
             seed_helper(&mut rig.channels, &mut rig.secrets, 53).await;
             let result = rig
                 .protocol
-                .maybe_auto_publish_after_pair(&[DeRecEvent::PairingCompleted {
-                    channel_id: ChannelId(53),
-                    pairing_channel_id: ChannelId(53),
-                    kind: SenderKind::Owner,
-                    peer_communication_info: HashMap::new(),
-                }])
+                .maybe_auto_publish(
+                    &[DeRecEvent::PairingCompleted {
+                        channel_id: ChannelId(53),
+                        pairing_channel_id: ChannelId(53),
+                        kind: SenderKind::Owner,
+                        peer_communication_info: HashMap::new(),
+                    }],
+                    &std::collections::HashSet::new(),
+                )
                 .await;
 
             assert!(
@@ -5543,7 +5636,7 @@ mod weighted_round_tests {
 
             seed_helper(&mut rig.channels, &mut rig.secrets, 54).await;
             rig.protocol
-                .maybe_auto_publish_after_pair(&[paired(54)])
+                .maybe_auto_publish(&[paired(54)], &std::collections::HashSet::new())
                 .await
                 .expect("the pairing publish runs");
             for ch in [51, 52, 53, 54] {
@@ -5576,7 +5669,7 @@ mod weighted_round_tests {
             seed_helper(&mut rig.channels, &mut rig.secrets, 54).await;
             let events = rig
                 .protocol
-                .maybe_auto_publish_after_pair(&[paired(54)])
+                .maybe_auto_publish(&[paired(54)], &std::collections::HashSet::new())
                 .await
                 .expect("the pairing publish runs");
             assert_eq!(helper_dispatches(&events), 4, "4 subshares reach t = 4");
@@ -5732,6 +5825,88 @@ mod weighted_round_tests {
                 )),
                 "got {events:?}"
             );
+        });
+    }
+
+    /// The sharing round at `version`, as stored.
+    async fn stored_round(
+        rig: &ProtocolRig,
+        version: u32,
+    ) -> Option<crate::protocol::types::SharingRoundState> {
+        use crate::protocol::DeRecStateStore as _;
+        use crate::protocol::types::{StateItem, StateKind};
+        rig.protocol
+            .state_store
+            .load_all(SECRET_ID, StateKind::SharingRound)
+            .await
+            .expect("load rounds")
+            .into_iter()
+            .find_map(|item| match item {
+                StateItem::SharingRound(round) if round.version == version => Some(*round),
+                _ => None,
+            })
+    }
+
+    /// A confirmation whose round cannot be saved fails `process`, and
+    /// processing the same bytes once the store recovers records it.
+    #[test]
+    fn a_confirmation_the_round_cannot_record_is_recorded_on_retry() {
+        use crate::primitives::sharing::{request, response};
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 2).await;
+            let started = protect(&mut rig, &[]).await;
+            let version = started
+                .iter()
+                .find_map(|e| match e {
+                    DeRecEvent::ProtectSecretStarted { version, .. } => Some(*version),
+                    _ => None,
+                })
+                .expect("a round starts");
+            let key = [51u8; 32];
+            let sent = rig
+                .protocol
+                .transport
+                .sent_envelopes()
+                .iter()
+                .find_map(|env| request::extract(env, &key).ok())
+                .expect("a request was sent to 51")
+                .request;
+            let answer = response::produce(ChannelId(51), &sent, &key)
+                .expect("the helper answers")
+                .envelope;
+
+            *rig.protocol.state_store.fail_writes.lock().unwrap() = true;
+            let error = rig
+                .protocol
+                .process(&answer)
+                .await
+                .expect_err("the round cannot record the confirmation");
+
+            assert_eq!(error.channel_id, Some(ChannelId(51)));
+            assert!(
+                error.events.iter().any(
+                    |e| matches!(e, DeRecEvent::ShareConfirmed { channel_id, .. }
+                        if *channel_id == ChannelId(51))
+                ),
+                "the message's events travel with the error; got {:?}",
+                error.events
+            );
+            let round = stored_round(&rig, version)
+                .await
+                .expect("the round is open");
+            assert!(round.pending.contains(&ChannelId(51)));
+
+            *rig.protocol.state_store.fail_writes.lock().unwrap() = false;
+            rig.protocol
+                .process(&answer)
+                .await
+                .expect("the retry records the confirmation");
+
+            let round = stored_round(&rig, version)
+                .await
+                .expect("52 is still pending");
+            assert!(round.confirmed.contains(&ChannelId(51)));
+            assert!(!round.pending.contains(&ChannelId(51)));
         });
     }
 }

@@ -529,9 +529,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     ///
     /// The order is meaningful: peers record these endpoints in this order,
     /// and their transport receives them in it, so it is the order in which
-    /// they try to reach this device (the default
-    /// [`SequentialFailover`](crate::protocol::SequentialFailover) tries them
-    /// in turn). The library itself does not rank endpoints. The first entry
+    /// they try to reach this device. The library itself does not rank
+    /// endpoints. The first entry
     /// is also this device's primary endpoint.
     ///
     /// Because delivery is push-only, an endpoint listed here is one this
@@ -1244,6 +1243,9 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
+            fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn helpers(
                 &self,
                 _: u64,
@@ -1285,7 +1287,7 @@ mod tests {
                 _: u64,
                 _: &[ChannelId],
                 _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
@@ -1305,6 +1307,13 @@ mod tests {
                 _: u64,
                 _: ChannelId,
                 _: &[u32],
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_versions_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, Vec<u32>)],
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
@@ -1336,6 +1345,13 @@ mod tests {
                 Box::pin(std::future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, SecretKind)],
+            ) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -1383,6 +1399,13 @@ mod tests {
                 _: crate::protocol::StateKey,
             ) -> crate::protocol::StateStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[crate::protocol::StateKey],
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn load_all(
                 &self,
@@ -1446,6 +1469,9 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
+            fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn helpers(
                 &self,
                 _: u64,
@@ -1486,7 +1512,7 @@ mod tests {
                 _: u64,
                 _: &[ChannelId],
                 _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
@@ -1506,6 +1532,13 @@ mod tests {
                 _: u64,
                 _: ChannelId,
                 _: &[u32],
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_versions_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, Vec<u32>)],
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
@@ -1536,6 +1569,13 @@ mod tests {
                 Box::pin(std::future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, SecretKind)],
+            ) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -1581,6 +1621,13 @@ mod tests {
                 _: crate::protocol::StateKey,
             ) -> crate::protocol::StateStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[crate::protocol::StateKey],
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn load_all(
                 &self,
@@ -1637,6 +1684,9 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
+            fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn helpers(
                 &self,
                 _: u64,
@@ -1677,7 +1727,7 @@ mod tests {
                 _: u64,
                 _: &[ChannelId],
                 _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
@@ -1697,6 +1747,13 @@ mod tests {
                 _: u64,
                 _: ChannelId,
                 _: &[u32],
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_versions_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, Vec<u32>)],
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
@@ -1727,6 +1784,13 @@ mod tests {
                 Box::pin(std::future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, SecretKind)],
+            ) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -1772,6 +1836,13 @@ mod tests {
                 _: crate::protocol::StateKey,
             ) -> crate::protocol::StateStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[crate::protocol::StateKey],
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn load_all(
                 &self,
@@ -1832,6 +1903,9 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
+            fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn helpers(
                 &self,
                 _: u64,
@@ -1872,7 +1946,7 @@ mod tests {
                 _: u64,
                 _: &[ChannelId],
                 _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
@@ -1892,6 +1966,13 @@ mod tests {
                 _: u64,
                 _: ChannelId,
                 _: &[u32],
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_versions_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, Vec<u32>)],
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
@@ -1922,6 +2003,13 @@ mod tests {
                 Box::pin(std::future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, SecretKind)],
+            ) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -1966,6 +2054,13 @@ mod tests {
                 _: crate::protocol::StateKey,
             ) -> crate::protocol::StateStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[crate::protocol::StateKey],
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn load_all(
                 &self,
@@ -2026,6 +2121,9 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
+            fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn helpers(
                 &self,
                 _: u64,
@@ -2066,7 +2164,7 @@ mod tests {
                 _: u64,
                 _: &[ChannelId],
                 _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
@@ -2086,6 +2184,13 @@ mod tests {
                 _: u64,
                 _: ChannelId,
                 _: &[u32],
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_versions_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, Vec<u32>)],
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
@@ -2116,6 +2221,13 @@ mod tests {
                 Box::pin(std::future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, SecretKind)],
+            ) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -2160,6 +2272,13 @@ mod tests {
                 _: crate::protocol::StateKey,
             ) -> crate::protocol::StateStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[crate::protocol::StateKey],
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn load_all(
                 &self,

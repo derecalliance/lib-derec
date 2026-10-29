@@ -304,6 +304,19 @@ public interface IChannelStore
     bool Remove(ulong secretId, ulong channelId, ulong replicaId);
 
     /// <summary>
+    /// Remove every record <paramref name="queries"/> addresses, in one call.
+    /// </summary>
+    /// <remarks>
+    /// Each entry addresses one record the way <see cref="Remove"/>'s
+    /// arguments do: a <c>ReplicaId</c> of <c>0</c> is the helper channel at
+    /// <c>ChannelId</c>, any other value removes that member only. Idempotent:
+    /// an entry that names no record is skipped, not an error. The library
+    /// calls it when it removes several records at once, so a backend that can
+    /// delete them in one statement or transaction should.
+    /// </remarks>
+    void RemoveMany(ulong secretId, IReadOnlyList<(ulong ChannelId, ulong ReplicaId)> queries);
+
+    /// <summary>
     /// The helper channels stored under <paramref name="secretId"/> that
     /// <paramref name="filter"/> selects.
     /// </summary>
@@ -364,6 +377,17 @@ public interface ISecretStore
     IReadOnlyList<SecretValue?> LoadMany(ulong secretId, ulong[] channelIds, SecretKind kind);
     void Save(ulong secretId, ulong channelId, SecretValue value);
     void Remove(ulong secretId, ulong channelId, SecretKind kind);
+
+    /// <summary>
+    /// Remove every secret <paramref name="entries"/> names, in one call.
+    /// </summary>
+    /// <remarks>
+    /// Each entry names one secret the way <see cref="Remove"/>'s arguments
+    /// do. Idempotent: an entry with nothing stored is skipped, not an error.
+    /// The library calls it when it removes several secrets at once, so a
+    /// backend that can delete them in one statement or transaction should.
+    /// </remarks>
+    void RemoveMany(ulong secretId, IReadOnlyList<(ulong ChannelId, SecretKind Kind)> entries);
 }
 
 /// <summary>
@@ -408,9 +432,11 @@ public interface IShareStore
     /// </summary>
     IEnumerable<Share> Load(ulong secretId, ulong channelId, uint[] versions);
     /// <summary>
-    /// Shares across several channels within <paramref name="secretId"/>.
+    /// Shares across several channels within <paramref name="secretId"/>,
+    /// each paired with the channel it is stored under. Pass an empty
+    /// <paramref name="versions"/> array for all versions.
     /// </summary>
-    IEnumerable<Share> LoadMany(ulong secretId, ulong[] channelIds, uint[] versions);
+    IEnumerable<(ulong ChannelId, Share Share)> LoadMany(ulong secretId, ulong[] channelIds, uint[] versions);
     /// <summary>
     /// Every share stored under <paramref name="secretId"/> across the
     /// given channels (used by Discovery for this secret).
@@ -449,6 +475,18 @@ public interface IShareStore
     /// </para>
     /// </summary>
     void RemoveVersions(ulong secretId, ulong channelId, uint[] versions);
+
+    /// <summary>
+    /// <see cref="RemoveVersions"/> for several channels in one call.
+    /// </summary>
+    /// <remarks>
+    /// Each entry drops the listed versions under its channel the way
+    /// <see cref="RemoveVersions"/>'s arguments do. Idempotent: a version that
+    /// is not stored is skipped, not an error. The library calls it when it
+    /// removes versions across several channels at once, so a backend that can
+    /// delete them in one statement or transaction should.
+    /// </remarks>
+    void RemoveVersionsMany(ulong secretId, IReadOnlyList<(ulong ChannelId, uint[] Versions)> entries);
     /// <summary>
     /// Owner only: the one older version every helper keeps after the owner
     /// distributes <paramref name="version"/>. Called once per sharing
@@ -619,122 +657,8 @@ public interface ITransport
     /// anything counting messages, and a peer entitled to treat re-delivery as
     /// a replay will.
     /// </para>
-    /// <para>
-    /// <b>Prefer an adapter to writing this by hand.</b> Choosing which
-    /// endpoint to dial is yours and stays here; the bookkeeping around it is
-    /// the same everywhere and is already written and tested. Implement
-    /// <see cref="ISendOne"/> and wrap it in <see cref="SequentialFailover"/>.
-    /// Taking <c>endpoints[0]</c> compiles, passes every test, and silently
-    /// gives up the failover the list exists to provide — if that is genuinely
-    /// wanted, say so with <see cref="SingleEndpointTransport"/> rather than by
-    /// indexing.
-    /// </para>
     /// </remarks>
     void Send(IReadOnlyList<TransportProtocol> endpoints, byte[] message);
-}
-
-/// <summary>
-/// Delivers one message to one endpoint.
-/// </summary>
-/// <remarks>
-/// The narrow half of a transport: everything genuinely about dialing, and
-/// nothing about which endpoint to dial. Implement this, then wrap it in
-/// <see cref="SequentialFailover"/> or <see cref="SingleEndpointTransport"/> to
-/// get an <see cref="ITransport"/>.
-/// </remarks>
-public interface ISendOne
-{
-    /// <summary>
-    /// Delivers <paramref name="message"/> to <paramref name="endpoint"/>, or
-    /// throws to report that it did not arrive.
-    /// </summary>
-    /// <remarks>
-    /// The exception type does not matter and need not distinguish
-    /// "unreachable" from "rejected": <see cref="SequentialFailover"/> treats
-    /// both as a reason to try the next endpoint, which is the safe reading.
-    /// Trying an endpoint that would have refused costs a round trip; skipping
-    /// one that would have worked costs the delivery.
-    /// </remarks>
-    void SendOne(TransportProtocol endpoint, byte[] message);
-}
-
-/// <summary>
-/// Tries each endpoint in the order the peer offered; the first success wins.
-/// </summary>
-/// <remarks>
-/// Implements the <see cref="ITransport"/> contract over an
-/// <see cref="ISendOne"/>: endpoints are attempted in order, delivery stops at
-/// the first success, and an exception is thrown only when every endpoint
-/// failed. The message is delivered at most once.
-///
-/// This is the right default. A peer advertising several endpoints is saying
-/// it can be reached at any of them, and the reason 0.0.3 records the whole
-/// list is so one being down does not end the conversation.
-/// </remarks>
-public sealed class SequentialFailover : ITransport
-{
-    private readonly ISendOne _dialer;
-
-    /// <summary>Wraps a one-endpoint dialer.</summary>
-    public SequentialFailover(ISendOne dialer) =>
-        _dialer = dialer ?? throw new ArgumentNullException(nameof(dialer));
-
-    /// <inheritdoc/>
-    public void Send(IReadOnlyList<TransportProtocol> endpoints, byte[] message)
-    {
-        Exception? last = null;
-        foreach (TransportProtocol endpoint in endpoints)
-        {
-            try
-            {
-                _dialer.SendOne(endpoint, message);
-                return;
-            }
-            catch (Exception e)
-            {
-                last = e;
-            }
-        }
-        // `endpoints` is never empty — the library refuses to record a peer
-        // whose endpoints were all filtered away — so reaching here means at
-        // least one attempt was made and `last` is populated.
-        throw last ?? new InvalidOperationException(
-            "Send was called with no endpoints, which the protocol never does");
-    }
-}
-
-/// <summary>
-/// Uses the first endpoint only.
-/// </summary>
-/// <remarks>
-/// Reproduces the pre-0.0.3 behaviour exactly, for an application that
-/// genuinely serves one endpoint or has a reason not to fail over.
-///
-/// It exists so that choosing it is visible. <c>endpoints[0]</c> written inline
-/// looks like an implementation detail and reads as finished; naming this type
-/// records that failover was considered and declined, which is a claim a
-/// reviewer can disagree with. If the peers this application talks to advertise
-/// more than one endpoint, prefer <see cref="SequentialFailover"/> — every
-/// endpoint after the first is reachability being thrown away.
-/// </remarks>
-public sealed class SingleEndpointTransport : ITransport
-{
-    private readonly ISendOne _dialer;
-
-    /// <summary>Wraps a one-endpoint dialer.</summary>
-    public SingleEndpointTransport(ISendOne dialer) =>
-        _dialer = dialer ?? throw new ArgumentNullException(nameof(dialer));
-
-    /// <inheritdoc/>
-    public void Send(IReadOnlyList<TransportProtocol> endpoints, byte[] message)
-    {
-        if (endpoints.Count == 0)
-        {
-            throw new InvalidOperationException(
-                "Send was called with no endpoints, which the protocol never does");
-        }
-        _dialer.SendOne(endpoints[0], message);
-    }
 }
 
 /// <summary>
@@ -945,6 +869,17 @@ public interface IStateStore
     /// entry returns <c>false</c>, not an error.
     /// </summary>
     bool Remove(ulong secretId, StateKey key);
+
+    /// <summary>
+    /// Remove every row <paramref name="keys"/> names under
+    /// <paramref name="secretId"/>, in one call.
+    /// </summary>
+    /// <remarks>
+    /// Idempotent: a key with no row is skipped, not an error. The library
+    /// calls it when it removes several rows at once, so a backend that can
+    /// delete them in one statement or transaction should.
+    /// </remarks>
+    void RemoveMany(ulong secretId, IReadOnlyList<StateKey> keys);
 
     /// <summary>
     /// Return every item of the given <paramref name="kind"/> under this

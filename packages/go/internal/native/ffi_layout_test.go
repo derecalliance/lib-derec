@@ -26,7 +26,7 @@ type layoutMirror struct {
 
 var layoutMirrors = []layoutMirror{
 	{"ApplyTraceIdResult", reflect.TypeOf(applyTraceIdResult{}), [][2]string{{"Error", "error"}, {"WireBytes", "wire_bytes"}}},
-	{"ChannelStoreCallbacks", reflect.TypeOf(ChannelStoreCallbacks{}), [][2]string{{"UserData", "user_data"}, {"Load", "load"}, {"Save", "save"}, {"Remove", "remove"}, {"ListHelpers", "list_helpers"}, {"ListReplicas", "list_replicas"}, {"LinkChannel", "link_channel"}, {"LinkedChannels", "linked_channels"}, {"FreeBuffer", "free_buffer"}}},
+	{"ChannelStoreCallbacks", reflect.TypeOf(ChannelStoreCallbacks{}), [][2]string{{"UserData", "user_data"}, {"Load", "load"}, {"Save", "save"}, {"Remove", "remove"}, {"RemoveMany", "remove_many"}, {"ListHelpers", "list_helpers"}, {"ListReplicas", "list_replicas"}, {"LinkChannel", "link_channel"}, {"LinkedChannels", "linked_channels"}, {"FreeBuffer", "free_buffer"}}},
 	{"CreateContactMessageResult", reflect.TypeOf(createContactMessageResult{}), [][2]string{{"Error", "error"}, {"ContactWireBytes", "contact_wire_bytes"}, {"SecretKeyMaterial", "secret_key_material"}}},
 	{"DeRecBuffer", reflect.TypeOf(DeRecBuffer{}), [][2]string{{"Ptr", "ptr"}, {"Len", "len"}}},
 	{"DeRecError", reflect.TypeOf(DeRecError{}), [][2]string{{"Category", "category"}, {"Code", "code"}, {"Message", "message"}, {"PeerStatus", "peer_status"}, {"PeerMemo", "peer_memo"}, {"Expected", "expected"}, {"Got", "got"}}},
@@ -78,9 +78,9 @@ var layoutMirrors = []layoutMirror{
 	{"ProtectSecretResult", reflect.TypeOf(protectSecretResult{}), [][2]string{{"Error", "error"}, {"SharesWireBytes", "shares_wire_bytes"}}},
 	{"ReadTraceIdResult", reflect.TypeOf(readTraceIdResult{}), [][2]string{{"Error", "error"}, {"TraceID", "trace_id"}}},
 	{"RecoverFromShareResponsesResult", reflect.TypeOf(recoverFromShareResponsesResult{}), [][2]string{{"Error", "error"}, {"SecretData", "secret_data"}}},
-	{"SecretStoreCallbacks", reflect.TypeOf(SecretStoreCallbacks{}), [][2]string{{"UserData", "user_data"}, {"Load", "load"}, {"LoadMany", "load_many"}, {"Save", "save"}, {"Remove", "remove"}, {"FreeBuffer", "free_buffer"}}},
-	{"ShareStoreCallbacks", reflect.TypeOf(ShareStoreCallbacks{}), [][2]string{{"UserData", "user_data"}, {"Load", "load"}, {"LoadMany", "load_many"}, {"LoadAll", "load_all"}, {"LatestVersion", "latest_version"}, {"Save", "save"}, {"RemoveChannel", "remove_channel"}, {"RemoveVersions", "remove_versions"}, {"KeepVersion", "keep_version"}, {"RecordVerification", "record_verification"}, {"FreeBuffer", "free_buffer"}}},
-	{"StateStoreCallbacks", reflect.TypeOf(StateStoreCallbacks{}), [][2]string{{"UserData", "user_data"}, {"Save", "save"}, {"Load", "load"}, {"Remove", "remove"}, {"LoadAll", "load_all"}, {"FreeBuffer", "free_buffer"}}},
+	{"SecretStoreCallbacks", reflect.TypeOf(SecretStoreCallbacks{}), [][2]string{{"UserData", "user_data"}, {"Load", "load"}, {"LoadMany", "load_many"}, {"Save", "save"}, {"Remove", "remove"}, {"RemoveMany", "remove_many"}, {"FreeBuffer", "free_buffer"}}},
+	{"ShareStoreCallbacks", reflect.TypeOf(ShareStoreCallbacks{}), [][2]string{{"UserData", "user_data"}, {"Load", "load"}, {"LoadMany", "load_many"}, {"LoadAll", "load_all"}, {"LatestVersion", "latest_version"}, {"Save", "save"}, {"RemoveChannel", "remove_channel"}, {"RemoveVersions", "remove_versions"}, {"RemoveVersionsMany", "remove_versions_many"}, {"KeepVersion", "keep_version"}, {"RecordVerification", "record_verification"}, {"FreeBuffer", "free_buffer"}}},
+	{"StateStoreCallbacks", reflect.TypeOf(StateStoreCallbacks{}), [][2]string{{"UserData", "user_data"}, {"Save", "save"}, {"Load", "load"}, {"Remove", "remove"}, {"RemoveMany", "remove_many"}, {"LoadAll", "load_all"}, {"FreeBuffer", "free_buffer"}}},
 	{"TransportCallbacks", reflect.TypeOf(TransportCallbacks{}), [][2]string{{"UserData", "user_data"}, {"Send", "send"}}},
 	{"UserSecretStoreCallbacks", reflect.TypeOf(UserSecretStoreCallbacks{}), [][2]string{{"UserData", "user_data"}, {"LoadLatest", "load_latest"}, {"SaveLatest", "save_latest"}, {"Remove", "remove"}, {"FreeBuffer", "free_buffer"}}},
 	{"VerifyShareResponseResult", reflect.TypeOf(verifyShareResponseResult{}), [][2]string{{"Error", "error"}, {"IsValid", "is_valid"}}},

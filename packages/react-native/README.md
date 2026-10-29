@@ -313,26 +313,32 @@ directly. `DeRecProtocolBuilder` takes one implementation of each interface
 declared in `src/types.ts`:
 
 - **`ChannelStore`** — pairing state: helper channels and replica-group
-  membership, keyed by `(channelId, replicaId)`.
+  membership, keyed by `(channelId, replicaId)`. `removeMany` removes every
+  record its `[channelId, replicaId]` pairs address in one call, each
+  addressed the way `remove`'s arguments are, and skips entries that name no
+  record; delete them in one statement or transaction when your backend can.
 - **`ShareStore`** — versioned VSS shares this device holds as a helper.
-  On an owner, `keepVersion` chooses the one older version helpers keep
+  `loadMany` resolves to `[channelId, share]` pairs, each share paired with
+  the channel it is stored under. On an owner, `keepVersion` chooses the one older version helpers keep
   besides the one being shared (`0` keeps none); an answer equal to or
   greater than that version fails the round with `invalid_keep_version`; see
   [`DeRecShareStore::keep_version`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html#tymethod.keep_version).
 - **`SecretStore`** — small per-channel key material (shared keys, etc.),
-  distinct from share bytes.
+  distinct from share bytes. `removeMany` removes every secret its
+  `[channelId, kind]` pairs name in one call, each addressed the way
+  `remove`'s arguments are, and skips entries with nothing stored.
 - **`UserSecretStore`** — the most recent user-facing secret snapshot per
   `secretId`, used to auto-publish to newly paired peers.
 - **`StateStore`** — in-flight orchestrator bookkeeping (pending
   verifications, recoveries, unpairs, sharing rounds, replica discoveries) so a
-  multi-round flow survives an app restart.
+  multi-round flow survives an app restart. `removeMany` receives a JSON
+  array of the keys `remove` takes one at a time and skips keys with no row.
 - **`Transport`** — outbound delivery.
   `send(endpoints: ReadonlyArray<{ protocol: string; uri: string }>, message: Uint8Array): Promise<void>`
   posts a wire-format envelope to a peer. `endpoints` is every address that
   peer advertised, in its own order (`protocol` is `"https"` or `"grpc"`);
   deliver once, to the first one that accepts it, and reject only when none
-  did. `sequentialFailover` and `singleEndpointTransport` implement that
-  choice for you. It is a mailbox, not a request/response call, since not
+  did. It is a mailbox, not a request/response call, since not
   every peer (e.g. a phone behind NAT) can be dialed back. Recommended HTTP
   conventions (`POST`, `application/octet-stream` body, `202 Accepted`) and
   the same-connection pattern for unreachable peers are in

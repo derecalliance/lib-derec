@@ -53,7 +53,7 @@ use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
 use crate::protocol::context::{Exchange, Local, Round};
 use crate::protocol::stores::{StoreSet, Stores};
-use crate::protocol::types::{ChannelQuery, ChannelRecord, ChannelStatus};
+use crate::protocol::types::{ChannelRecord, ChannelStatus};
 use crate::{
     Error, Result,
     primitives::unpairing::{
@@ -387,9 +387,8 @@ async fn set_status<S: StoreSet>(
 ) -> Result<()> {
     let Some(mut helper) = stores
         .channels
-        .load(local.secret_id, ChannelQuery::Helper { channel_id })
+        .load_helper(local.secret_id, channel_id)
         .await?
-        .and_then(|record| record.as_helper().cloned())
         .filter(|helper| helper.status == from)
     else {
         return Ok(());

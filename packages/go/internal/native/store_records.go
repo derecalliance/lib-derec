@@ -269,20 +269,35 @@ func DecodeShare(data []byte) (Share, error) {
 	return Share{SecretID: id, Version: w.Version, Bytes: []byte(w.Bytes), Subshares: w.Subshares, Threshold: w.Threshold}, nil
 }
 
+func toShareWire(s Share) shareWire {
+	return shareWire{
+		SecretID:  strconv.FormatUint(s.SecretID, 10),
+		Version:   s.Version,
+		Bytes:     JSONByteArray(s.Bytes),
+		Subshares: s.Subshares,
+		Threshold: s.Threshold,
+	}
+}
+
 // EncodeShareList produces the JSON array a ShareStoreCallbacks
-// load/load_many/load_all response carries.
+// load/load_all response carries.
 func EncodeShareList(shares []Share) ([]byte, error) {
 	wires := make([]shareWire, len(shares))
 	for i, s := range shares {
-		wires[i] = shareWire{
-			SecretID:  strconv.FormatUint(s.SecretID, 10),
-			Version:   s.Version,
-			Bytes:     JSONByteArray(s.Bytes),
-			Subshares: s.Subshares,
-			Threshold: s.Threshold,
-		}
+		wires[i] = toShareWire(s)
 	}
 	return json.Marshal(wires)
+}
+
+// EncodeShareEntryList produces the JSON array of
+// [channel_id, ShareRecord] pairs a ShareStoreCallbacks load_many response
+// carries, channel_id as a decimal string.
+func EncodeShareEntryList(entries []ShareEntry) ([]byte, error) {
+	pairs := make([][2]any, len(entries))
+	for i, e := range entries {
+		pairs[i] = [2]any{strconv.FormatUint(e.ChannelID, 10), toShareWire(e.Share)}
+	}
+	return json.Marshal(pairs)
 }
 
 // DecodeShareList parses a JSON array of ShareRecord.

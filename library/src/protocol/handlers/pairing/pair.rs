@@ -352,14 +352,7 @@ pub(super) async fn on_response<S: StoreSet>(
     // Try the helper key first — testing the local `ReplicaId` alone would
     // be wrong, since a device may have one configured while pairing with a
     // helper.
-    let helper_placeholder = stores
-        .channels
-        .load(
-            secret_id,
-            crate::protocol::types::ChannelQuery::Helper { channel_id },
-        )
-        .await?
-        .and_then(|r| r.as_helper().cloned());
+    let helper_placeholder = stores.channels.load_helper(secret_id, channel_id).await?;
 
     let own_member = match (helper_placeholder.as_ref(), replica_id) {
         (None, Some(own)) => stores

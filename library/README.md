@@ -977,7 +977,10 @@ composite and report their usual events; with none paired, the call returns
 advances and the secrets/description are saved as the latest snapshot, so
 the next publish that reaches `threshold` (including one the library starts
 on its own, after pairing or after a fingerprint is confirmed) shares that
-snapshot. An app can detect the case before calling, by summing the weights
+snapshot. The publishes the library starts on its own never run below the
+threshold unless a replica member needs the roster: pairing, confirming or
+removing a helper that leaves the total weight short publishes nothing and
+consumes no version. An app can detect the case before calling, by summing the weights
 it is about to assign (or the stored `HelperChannel.weight` of every paired
 Helper, for a library-initiated publish) against `threshold`; after calling,
 zero `ProtectSecretStarted` / `ProtectSecretFailed` events means nothing was
@@ -1571,27 +1574,13 @@ for that channel other than the confirmed version and the returned one,
 since the helper has deleted those shares. A helper that rejects the round
 keeps its older versions, and so does this device.
 
-### Transport: implement `SendOne`, not `send`
+### Transport: try the endpoints, deliver once
 
 `DeRecTransport::send` receives *every* endpoint a peer advertised and leaves
 the choice among them to you, because only your application knows which of its
-transports are healthy, cheap, or currently reachable. That decision stays
-yours. The bookkeeping around it does not: try in order, stop at the first
-success, fail only when none worked, never deliver twice.
-
-Implement [`SendOne`](https://docs.rs/derec-library/latest/derec_library/protocol/trait.SendOne.html)
-— deliver to one endpoint — and wrap it:
-
-```rust,ignore
-let transport = SequentialFailover::new(MyDialer);
-```
-
-`SequentialFailover` is the right default. `SingleEndpointTransport` uses only
-the first endpoint, which is what `endpoints[0]` written inline does — the
-difference is that choosing the type is visible to a reviewer, where the index
-reads as finished code. Every binding ships both: `SequentialFailover` /
-`SingleEndpointTransport` (.NET, Go), `sequentialFailover(dialer)` /
-`singleEndpointTransport(dialer)` (Node, web, React Native).
+transports are healthy, cheap, or currently reachable. Try them in the peer's
+order, stop at the first success, and fail only when none worked. Taking
+`endpoints[0]` alone gives up the failover the list exists to provide.
 
 Do not deliver to every endpoint. They all address the same peer, so a fan-out
 sends one authenticated message several times.
@@ -2449,6 +2438,21 @@ non-`Ok` reply emits `UnpairRejected` and returns the channel to `Paired`.
 `UnpairAck::NotRequired` drops local state immediately on `start(Unpair)`.
 The peer still answers, and since the channel is gone, `process` fails on
 that answer with an unknown-channel error the application can discard.
+
+**Removing a helper republishes.** When the channel is dropped and the helper
+held a share this device distributed, the library publishes the latest
+snapshot as the next version to the helpers that remain, with the stored
+weights and threshold, so the removed helper's share belongs to a split
+nothing else is built on. The round's events come back alongside `Unpaired`:
+from `start(Unpair)` under `NotRequired`, from `process` on the helper's
+answer, or from `process` / `tick` when the acknowledgement times out.
+Nothing is published when the remaining helpers' weights fall below the
+threshold and no replica member needs the roster, when no snapshot exists, or
+when the helper held no share, which covers the recovery channels `restore`
+unpairs. A publish that fails is returned as the error of `start` or
+`process`, with the channel already gone; `tick` cannot return one, so it
+logs the failure and the remaining helpers keep the previous version until
+the next `start(ProtectSecret)`.
 
 When the peer's `UnpairRequest` arrives on the responder side, the
 orchestrator emits `DeRecEvent::ActionRequired { channel_id, action }` with

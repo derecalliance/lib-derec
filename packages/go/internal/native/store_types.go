@@ -321,6 +321,20 @@ type Share struct {
 	Threshold *uint32
 }
 
+// ShareEntry is one ShareStore.LoadMany result: a share paired with the
+// channel it is stored under.
+type ShareEntry struct {
+	ChannelID uint64
+	Share     Share
+}
+
+// ShareVersionsEntry names the versions to drop under one channel, the way
+// ShareStore.RemoveVersions's channelID and versions arguments do.
+type ShareVersionsEntry struct {
+	ChannelID uint64
+	Versions  []uint32
+}
+
 // StateKind tags which category of in-flight orchestrator state a
 // StateItem/StateKey belongs to. Numeric values must match the Rust-side
 // StateKind enum.
@@ -473,6 +487,20 @@ type UserSecrets struct {
 	// recorded, or restored from a roster that carries none; the configured
 	// DeRecProtocolConfig.Threshold then applies. Store it as given.
 	Threshold *uint32
+}
+
+// SecretEntry names one secret the way SecretStore.Remove's arguments do.
+type SecretEntry struct {
+	ChannelID uint64
+	Kind      SecretKind
+}
+
+// ChannelQuery addresses one record the way ChannelStore.Remove's arguments
+// do: a ReplicaID of 0 is the helper channel at ChannelID, any other value is
+// that member of the replica group.
+type ChannelQuery struct {
+	ChannelID uint64
+	ReplicaID uint64
 }
 
 // ChannelFilter narrows a listing from ChannelStore.

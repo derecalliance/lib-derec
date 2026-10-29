@@ -16,6 +16,9 @@ use crate::types::ChannelId;
 /// `events` holds what the call produced before it failed, such as sharing
 /// round and unpair timeouts. Their state changes are already saved and are
 /// not reported again, so handle them exactly as a successful call's events.
+/// When `source` is a state store failure raised while the message's answers
+/// were recorded on the open sharing rounds, processing the same message
+/// again records them and repeats only the message's own events.
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
 pub struct ProcessError {

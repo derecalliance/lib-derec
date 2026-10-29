@@ -175,6 +175,18 @@ pub trait DeRecSecretStore {
         channel_id: ChannelId,
         kind: SecretKind,
     ) -> SecretStoreFuture<'_, ()>;
+
+    /// Remove every `(channel_id, kind)` secret in `entries`, in one call.
+    ///
+    /// The same as [`remove`](DeRecSecretStore::remove) applied to each
+    /// entry, and as idempotent: an entry with nothing stored is skipped.
+    /// The library calls it when it drops several secrets at once, so a
+    /// backend that can delete them in one statement or transaction should.
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, SecretKind)],
+    ) -> SecretStoreFuture<'_, ()>;
 }
 
 /// Storage backend for paired channels.
@@ -219,6 +231,19 @@ pub trait DeRecChannelStore {
     /// Removing one [`ChannelQuery::Replica`] removes **that member only** —
     /// the group channel and every other member survive.
     fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool>;
+
+    /// Remove every record `queries` addresses, in one call.
+    ///
+    /// The same addressing as [`remove`](DeRecChannelStore::remove), applied
+    /// to each entry: a [`ChannelQuery::Replica`] removes that member only.
+    /// Idempotent: an entry that names no record is skipped, not an error.
+    /// The library calls it when it removes several records at once, so a
+    /// backend that can delete them in one statement or transaction should.
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        queries: &[ChannelQuery],
+    ) -> ChannelStoreFuture<'_, ()>;
 
     /// The helper channels stored under `secret_id` that `filter` selects.
     ///
@@ -436,9 +461,11 @@ pub trait DeRecShareStore {
     ) -> ShareStoreFuture<'_, Vec<Share>>;
 
     /// Load shares for several channels in one call, scoped to
-    /// `secret_id`. Recovery uses this with the set returned by
+    /// `secret_id`, each paired with the channel it is stored under.
+    /// Recovery uses this with the set returned by
     /// [`DeRecChannelStore::linked_channels`], so it is a single
-    /// round-trip regardless of how many channels are linked.
+    /// round-trip regardless of how many channels are linked; the owner uses
+    /// it to read the share it kept for each Helper of a round.
     ///
     /// # Ordering
     ///
@@ -465,7 +492,7 @@ pub trait DeRecShareStore {
         secret_id: u64,
         channel_ids: &[ChannelId],
         versions: &[u32],
-    ) -> ShareStoreFuture<'_, Vec<Share>>;
+    ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>>;
 
     /// Load every share stored under `secret_id` across the given
     /// channels and every version. Used by Discovery to enumerate the
@@ -542,6 +569,21 @@ pub trait DeRecShareStore {
         secret_id: u64,
         channel_id: ChannelId,
         versions: &[u32],
+    ) -> ShareStoreFuture<'_, ()>;
+
+    /// Drop, for each `(channel_id, versions)` in `entries`, the shares
+    /// stored under `(secret_id, channel_id)` at those versions, in one
+    /// call.
+    ///
+    /// The same as [`remove_versions`](Self::remove_versions) applied to
+    /// each entry, and as idempotent: a version that is not stored is
+    /// skipped. The library calls it when it drops shares on several
+    /// channels at once, so a backend that can delete them in one statement
+    /// or transaction should.
+    fn remove_versions_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, Vec<u32>)],
     ) -> ShareStoreFuture<'_, ()>;
 
     /// Choose the one older version every Helper keeps after the Owner
@@ -804,22 +846,6 @@ pub trait DeRecTransport {
     /// success. The protocol's handlers are idempotent, so a duplicate does
     /// not corrupt state, but it is still a duplicate to anything counting
     /// messages, and a peer entitled to treat re-delivery as a replay will.
-    ///
-    /// # Prefer an adapter to writing this by hand
-    ///
-    /// Choosing *which* endpoint to dial is the application's, and stays
-    /// here. The bookkeeping around it — try in order, stop at the first
-    /// success, fail only when none worked — is the same everywhere and is
-    /// already written and tested:
-    /// [`SequentialFailover`](crate::protocol::SequentialFailover) implements
-    /// it over a [`SendOne`](crate::protocol::SendOne) that dials one
-    /// endpoint.
-    ///
-    /// Taking `endpoints[0]` and ignoring the rest compiles, passes every
-    /// test, and silently gives up failover — which is the feature the list
-    /// exists to provide. If that is genuinely wanted, say so with
-    /// [`SingleEndpointTransport`](crate::protocol::SingleEndpointTransport)
-    /// rather than by indexing, so the choice is visible to a reader.
     fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_>;
 }
 
@@ -901,6 +927,14 @@ pub trait DeRecStateStore {
     /// `Ok(false)`, not an error.
     fn remove(&mut self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, bool>;
 
+    /// Remove the item at every key in `keys`, in one call.
+    ///
+    /// The same as [`remove`](DeRecStateStore::remove) applied to each key,
+    /// and as idempotent: a key with no row is skipped. The library calls it
+    /// when it drops several rows at once, so a backend that can delete them
+    /// in one statement or transaction should.
+    fn remove_many(&mut self, secret_id: u64, keys: &[StateKey]) -> StateStoreFuture<'_, ()>;
+
     /// Return every item of the given `kind` under this `secret_id`, in
     /// no guaranteed order.
     ///
@@ -947,6 +981,13 @@ impl<T: DeRecSecretStore + ?Sized> DeRecSecretStore for Box<T> {
     ) -> SecretStoreFuture<'_, ()> {
         (**self).remove(secret_id, channel_id, kind)
     }
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, SecretKind)],
+    ) -> SecretStoreFuture<'_, ()> {
+        (**self).remove_many(secret_id, entries)
+    }
 }
 
 impl<T: DeRecChannelStore + ?Sized> DeRecChannelStore for Box<T> {
@@ -962,6 +1003,13 @@ impl<T: DeRecChannelStore + ?Sized> DeRecChannelStore for Box<T> {
     }
     fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
         (**self).remove(secret_id, query)
+    }
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        queries: &[ChannelQuery],
+    ) -> ChannelStoreFuture<'_, ()> {
+        (**self).remove_many(secret_id, queries)
     }
     fn helpers(
         &self,
@@ -1008,7 +1056,7 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for Box<T> {
         secret_id: u64,
         channel_ids: &[ChannelId],
         versions: &[u32],
-    ) -> ShareStoreFuture<'_, Vec<Share>> {
+    ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
         (**self).load_many(secret_id, channel_ids, versions)
     }
     fn load_all(
@@ -1044,6 +1092,13 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for Box<T> {
     ) -> ShareStoreFuture<'_, ()> {
         (**self).remove_versions(secret_id, channel_id, versions)
     }
+    fn remove_versions_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, Vec<u32>)],
+    ) -> ShareStoreFuture<'_, ()> {
+        (**self).remove_versions_many(secret_id, entries)
+    }
     fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32> {
         (**self).keep_version(secret_id, version)
     }
@@ -1078,6 +1133,9 @@ impl<T: DeRecStateStore + ?Sized> DeRecStateStore for Box<T> {
     }
     fn remove(&mut self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, bool> {
         (**self).remove(secret_id, key)
+    }
+    fn remove_many(&mut self, secret_id: u64, keys: &[StateKey]) -> StateStoreFuture<'_, ()> {
+        (**self).remove_many(secret_id, keys)
     }
     fn load_all(&self, secret_id: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
         (**self).load_all(secret_id, kind)
@@ -1124,6 +1182,13 @@ impl<T: DeRecSecretStore + ?Sized> DeRecSecretStore for &mut T {
     ) -> SecretStoreFuture<'_, ()> {
         (**self).remove(secret_id, channel_id, kind)
     }
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, SecretKind)],
+    ) -> SecretStoreFuture<'_, ()> {
+        (**self).remove_many(secret_id, entries)
+    }
 }
 
 impl<T: DeRecChannelStore + ?Sized> DeRecChannelStore for &mut T {
@@ -1139,6 +1204,13 @@ impl<T: DeRecChannelStore + ?Sized> DeRecChannelStore for &mut T {
     }
     fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
         (**self).remove(secret_id, query)
+    }
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        queries: &[ChannelQuery],
+    ) -> ChannelStoreFuture<'_, ()> {
+        (**self).remove_many(secret_id, queries)
     }
     fn helpers(
         &self,
@@ -1185,7 +1257,7 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for &mut T {
         secret_id: u64,
         channel_ids: &[ChannelId],
         versions: &[u32],
-    ) -> ShareStoreFuture<'_, Vec<Share>> {
+    ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
         (**self).load_many(secret_id, channel_ids, versions)
     }
     fn load_all(
@@ -1221,6 +1293,13 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for &mut T {
     ) -> ShareStoreFuture<'_, ()> {
         (**self).remove_versions(secret_id, channel_id, versions)
     }
+    fn remove_versions_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, Vec<u32>)],
+    ) -> ShareStoreFuture<'_, ()> {
+        (**self).remove_versions_many(secret_id, entries)
+    }
     fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32> {
         (**self).keep_version(secret_id, version)
     }
@@ -1255,6 +1334,9 @@ impl<T: DeRecStateStore + ?Sized> DeRecStateStore for &mut T {
     }
     fn remove(&mut self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, bool> {
         (**self).remove(secret_id, key)
+    }
+    fn remove_many(&mut self, secret_id: u64, keys: &[StateKey]) -> StateStoreFuture<'_, ()> {
+        (**self).remove_many(secret_id, keys)
     }
     fn load_all(&self, secret_id: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
         (**self).load_all(secret_id, kind)

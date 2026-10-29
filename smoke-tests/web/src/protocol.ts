@@ -93,6 +93,15 @@ class InMemorySecretStore implements SecretStore {
   async remove(secretId: string, channelId: string, kind: 0 | 1 | 2): Promise<void> {
     this.data.delete(this.key(secretId, channelId, kind));
   }
+
+  async removeMany(
+    secretId: string,
+    entries: [channelId: string, kind: 0 | 1 | 2][],
+  ): Promise<void> {
+    for (const [channelId, kind] of entries) {
+      await this.remove(secretId, channelId, kind);
+    }
+  }
 }
 
 // Stores opaque channel-record bytes plus the channel-link graph,
@@ -150,6 +159,15 @@ class InMemoryChannelStore implements ChannelStore {
     return this.mapFor(replicaId).delete(
       this.key(secretId, this.idFor(channelId, replicaId)),
     );
+  }
+
+  async removeMany(
+    secretId: string,
+    queries: [channelId: string, replicaId: string][],
+  ): Promise<void> {
+    for (const [channelId, replicaId] of queries) {
+      await this.remove(secretId, channelId, replicaId);
+    }
   }
 
   // The listing callbacks return a JSON array of the inner records.
@@ -269,15 +287,15 @@ class InMemoryShareStore implements ShareStore {
     secretId: string,
     channelIds: string[],
     versions: number[],
-  ): Promise<Share[]> {
+  ): Promise<[channelId: string, share: Share][]> {
     const filter = versions.length > 0 ? new Set(versions) : null;
-    const result: Share[] = [];
+    const result: [channelId: string, share: Share][] = [];
     for (const channelId of channelIds) {
       const byVersion = this.data.get(this.key(secretId, channelId));
       if (!byVersion) continue;
       for (const [v, share] of byVersion) {
         if (filter && !filter.has(v)) continue;
-        result.push(share);
+        result.push([channelId, share]);
       }
     }
     return result;
@@ -304,6 +322,15 @@ class InMemoryShareStore implements ShareStore {
     const byVersion = this.data.get(this.key(secretId, channelId));
     if (!byVersion) return;
     for (const v of versions) byVersion.delete(v);
+  }
+
+  async removeVersionsMany(secretId: string, entries: [string, number[]][]): Promise<void> {
+    for (const [channelId, versions] of entries) {
+      this.removeVersionsCalls.push({ secretId, channelId, versions: [...versions] });
+      const byVersion = this.data.get(this.key(secretId, channelId));
+      if (!byVersion) continue;
+      for (const v of versions) byVersion.delete(v);
+    }
   }
 
   keep: number | null = null;
@@ -402,6 +429,13 @@ class InMemoryStateStore implements StateStore {
   async remove(secretId: string, keyJson: Uint8Array): Promise<boolean> {
     const rec = this.parseBlob(keyJson);
     return this.data.delete(this.compositeKey(secretId, rec));
+  }
+
+  async removeMany(secretId: string, keysJson: Uint8Array): Promise<void> {
+    const keys: StateRecord[] = JSON.parse(new TextDecoder().decode(keysJson));
+    for (const rec of keys) {
+      this.data.delete(this.compositeKey(secretId, rec));
+    }
   }
 
   async loadAll(secretId: string, kind: 0 | 1 | 2 | 3): Promise<Uint8Array[]> {
@@ -2387,6 +2421,218 @@ async function runReplyToFlow(): Promise<void> {
 }
 
 
+/** The version of the node's latest user-secret snapshot, if any. */
+async function latestVersion(node: Node): Promise<number | undefined> {
+  const snapshot = await node.userSecretStore.loadLatest(String(node.protocol.secretId()));
+  return snapshot?.version;
+}
+
+/** Every `ShareStored` in `events` as `channel_id:version`, sorted. */
+function storedVersions(events: DeRecEvent[]): string[] {
+  return events
+    .flatMap((e) => (e.type === "ShareStored" ? [`${e.channel_id}:${e.version}`] : []))
+    .sort();
+}
+
+/** Pairs `helper` with `owner` and returns the long-term channel id. */
+async function pairHelperAt(
+  owner: AddressedNode,
+  helper: AddressedNode,
+  channelId: bigint,
+): Promise<string> {
+  await helperStartPairAt(owner, helper, channelId);
+  const events = await pumpAll([owner, helper]);
+  const completed = events.find(
+    (e) => e.type === "PairingCompleted" && BigInt(e.pairing_channel_id) === channelId,
+  );
+  if (!completed || completed.type !== "PairingCompleted") {
+    throw new Error(`pairHelperAt(cid=${channelId}): missing PairingCompleted`);
+  }
+  return completed.channel_id;
+}
+
+/**
+ * A publish the library starts on its own runs only once the helpers meet
+ * the threshold: with `threshold = 3`, pairing the second helper after a
+ * below-threshold `ProtectSecret` publishes nothing and consumes no version,
+ * and pairing the third publishes the stored snapshot to all three.
+ */
+async function runPairingBelowThresholdPublishesNothingFlow(): Promise<void> {
+  console.log("\n=== [Protocol] Pairing below threshold publishes nothing ===\n");
+
+  const owner = {
+    node: makeNode("Owner", "https://owner.example.com", { threshold: 3 }),
+    uri: "https://owner.example.com",
+  };
+  const helperA = { node: makeNode("HelperA", "https://helper-a.example.com"), uri: "https://helper-a.example.com" };
+  const helperB = { node: makeNode("HelperB", "https://helper-b.example.com"), uri: "https://helper-b.example.com" };
+  const helperC = { node: makeNode("HelperC", "https://helper-c.example.com"), uri: "https://helper-c.example.com" };
+
+  await pairHelperAt(owner, helperA, 71n);
+  await owner.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [
+      {
+        id: new Uint8Array([7]),
+        name: "staged",
+        data: new TextEncoder().encode("stored before the helpers meet the threshold"),
+      },
+    ],
+  });
+  await pumpAll([owner, helperA]);
+  if ((await latestVersion(owner.node)) !== 1) {
+    throw new Error(`expected v1 after ProtectSecret, got ${await latestVersion(owner.node)}`);
+  }
+
+  await helperStartPairAt(owner, helperB, 72n);
+  let events = await pumpAll([owner, helperA, helperB]);
+  if (storedVersions(events).length !== 0) {
+    throw new Error(
+      `two helpers cannot meet a threshold of 3, so nothing is shared: [${storedVersions(events).join(", ")}]`,
+    );
+  }
+  if ((await latestVersion(owner.node)) !== 1) {
+    throw new Error(`no version consumed: expected v1, got ${await latestVersion(owner.node)}`);
+  }
+  console.log("  second helper paired below the threshold: nothing published  ✓");
+
+  await helperStartPairAt(owner, helperC, 73n);
+  events = await pumpAll([owner, helperA, helperB, helperC]);
+  const stored = events.filter((e) => e.type === "ShareStored");
+  if (stored.length !== 3 || !stored.every((e) => e.version === 2)) {
+    throw new Error(`every helper stores v2: [${storedVersions(events).join(", ")}]`);
+  }
+  if ((await latestVersion(owner.node)) !== 2) {
+    throw new Error(`expected v2, got ${await latestVersion(owner.node)}`);
+  }
+  console.log("  third helper meets the threshold: v2 shared with all three  ✓");
+
+  console.log("\n✓ Pairing below threshold publishes nothing flow passed.\n");
+}
+
+/**
+ * Removing a helper that holds a share republishes the latest snapshot to
+ * the helpers that remain once the helper acknowledges, so the removed
+ * helper's share belongs to a split nothing else is built on. A removal
+ * that leaves the helpers below the threshold publishes nothing.
+ */
+async function runUnpairRepublishesFlow(): Promise<void> {
+  console.log("\n=== [Protocol] Unpair republishes ===\n");
+
+  const owner = { node: makeNode("Owner", "https://owner.example.com"), uri: "https://owner.example.com" };
+  const helperA = { node: makeNode("HelperA", "https://helper-a.example.com"), uri: "https://helper-a.example.com" };
+  const helperB = { node: makeNode("HelperB", "https://helper-b.example.com"), uri: "https://helper-b.example.com" };
+  const helperC = { node: makeNode("HelperC", "https://helper-c.example.com"), uri: "https://helper-c.example.com" };
+  const channelA = await pairHelperAt(owner, helperA, 81n);
+  const channelB = await pairHelperAt(owner, helperB, 82n);
+  const channelC = await pairHelperAt(owner, helperC, 83n);
+
+  await owner.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [
+      {
+        id: new Uint8Array([8]),
+        name: "republished",
+        data: new TextEncoder().encode("split again when a helper leaves"),
+      },
+    ],
+  });
+  await pumpAll([owner, helperA, helperB, helperC]);
+  if ((await latestVersion(owner.node)) !== 1) {
+    throw new Error(`expected v1 after ProtectSecret, got ${await latestVersion(owner.node)}`);
+  }
+
+  const started = await owner.node.protocol.start(FlowKind.Unpair, { channel_id: channelC });
+  if (started.some((e) => e.type === "ProtectSecretStarted")) {
+    throw new Error(
+      `nothing is published before the helper acknowledges: [${started.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  let events = await pumpAll([owner, helperA, helperB, helperC]);
+  if (!events.some((e) => e.type === "Unpaired" && e.channel_id === channelC)) {
+    throw new Error(`expected Unpaired for HelperC: [${events.map((e) => e.type).join(", ")}]`);
+  }
+  const expected = [`${channelA}:2`, `${channelB}:2`].sort();
+  if (storedVersions(events).join(",") !== expected.join(",")) {
+    throw new Error(
+      `the remaining helpers store v2 and the removed one nothing: [${storedVersions(events).join(", ")}]`,
+    );
+  }
+  if ((await latestVersion(owner.node)) !== 2) {
+    throw new Error(`expected v2, got ${await latestVersion(owner.node)}`);
+  }
+  console.log("  HelperC acknowledged its removal: v2 republished to HelperA and HelperB  ✓");
+
+  await owner.node.protocol.start(FlowKind.Unpair, { channel_id: channelB });
+  events = await pumpAll([owner, helperA, helperB]);
+  if (storedVersions(events).length !== 0) {
+    throw new Error(
+      `one helper cannot meet a threshold of 2, so nothing is shared: [${storedVersions(events).join(", ")}]`,
+    );
+  }
+  if ((await latestVersion(owner.node)) !== 2) {
+    throw new Error(`no version consumed: expected v2, got ${await latestVersion(owner.node)}`);
+  }
+  console.log("  removal below the threshold: nothing published  ✓");
+
+  console.log("\n✓ Unpair republishes flow passed.\n");
+}
+
+/**
+ * `start(UnpairReplica)` announces the removal and publishes the roster
+ * that omits the member, so the removal completes with no further call: the
+ * destination tears down and the source drops its row.
+ */
+async function runReplicaRemovalPublishesTheRosterFlow(): Promise<void> {
+  console.log("\n=== [Protocol] Replica removal publishes the roster ===\n");
+
+  const destinationId = 0xd0d0_d0d0_d0d0_d0d0n;
+  const source = {
+    node: makeNode("Source", "https://source.example.com", {
+      secretId: 0xfaden,
+      replicaId: 0x5050_5050_5050_5050n,
+    }),
+    uri: "https://source.example.com",
+  };
+  const destination = {
+    node: makeNode("Destination", "https://destination.example.com", { replicaId: destinationId }),
+    uri: "https://destination.example.com",
+  };
+  const { rekeyed } = await pairReplicaHandshake(source, destination, 91n);
+  await crossConfirmFingerprintAt(source, destination, rekeyed);
+  await pumpAll([source, destination]);
+
+  await source.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [
+      { id: new Uint8Array([9]), name: "mirrored", data: new TextEncoder().encode("held by both devices") },
+    ],
+  });
+  await pumpAll([source, destination]);
+  const before = await latestVersion(source.node);
+  if (before === undefined) throw new Error("the source has published");
+
+  await source.node.protocol.start(FlowKind.UnpairReplica, {
+    replica_id: destinationId.toString(),
+    memo: "retired device",
+  });
+  if ((await latestVersion(source.node)) !== before + 1) {
+    throw new Error(
+      `the removal publishes the next version itself: expected v${before + 1}, got ${await latestVersion(source.node)}`,
+    );
+  }
+
+  const events = await pumpAll([source, destination]);
+  if (!events.some((e) => e.type === "SelfRemovedFromGroup")) {
+    throw new Error(
+      `the destination must tear down on the roster that omits it: [${events.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  if (!events.some((e) => e.type === "ReplicaRemoved" && e.replica_id === destinationId.toString())) {
+    throw new Error(`the source must report the removal complete: [${events.map((e) => e.type).join(", ")}]`);
+  }
+  console.log("  removal completed with no ProtectSecret from the application  ✓");
+
+  console.log("\n✓ Replica removal publishes the roster flow passed.\n");
+}
+
 /**
  * Owner↔Destination replica pair, followed by a full ProtectSecret
  * fan-out that includes the Destination as one of the targets. Mirrors
@@ -3626,6 +3872,9 @@ export async function runProtocolSmoke(): Promise<void> {
   await runUnpairingFlow();
   await runUpdateChannelInfoFlow();
   await runReplyToFlow();
+  await runPairingBelowThresholdPublishesNothingFlow();
+  await runUnpairRepublishesFlow();
+  await runReplicaRemovalPublishesTheRosterFlow();
   await runReplicaIdWiringSadPathsFlow();
   await runReplicaPairingAndSecretSyncFlow();
   await runUnconfirmedDestinationIgnoresTheCopyFlow();

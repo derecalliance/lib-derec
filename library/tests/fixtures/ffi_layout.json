@@ -37,28 +37,32 @@
           "offset": 24
         },
         {
-          "name": "list_helpers",
+          "name": "remove_many",
           "offset": 32
         },
         {
-          "name": "list_replicas",
+          "name": "list_helpers",
           "offset": 40
         },
         {
-          "name": "link_channel",
+          "name": "list_replicas",
           "offset": 48
         },
         {
-          "name": "linked_channels",
+          "name": "link_channel",
           "offset": 56
         },
         {
-          "name": "free_buffer",
+          "name": "linked_channels",
           "offset": 64
+        },
+        {
+          "name": "free_buffer",
+          "offset": 72
         }
       ],
       "name": "ChannelStoreCallbacks",
-      "size": 72
+      "size": 80
     },
     {
       "align": 8,
@@ -1004,12 +1008,16 @@
           "offset": 32
         },
         {
-          "name": "free_buffer",
+          "name": "remove_many",
           "offset": 40
+        },
+        {
+          "name": "free_buffer",
+          "offset": 48
         }
       ],
       "name": "SecretStoreCallbacks",
-      "size": 48
+      "size": 56
     },
     {
       "align": 8,
@@ -1047,20 +1055,24 @@
           "offset": 56
         },
         {
-          "name": "keep_version",
+          "name": "remove_versions_many",
           "offset": 64
         },
         {
-          "name": "record_verification",
+          "name": "keep_version",
           "offset": 72
         },
         {
-          "name": "free_buffer",
+          "name": "record_verification",
           "offset": 80
+        },
+        {
+          "name": "free_buffer",
+          "offset": 88
         }
       ],
       "name": "ShareStoreCallbacks",
-      "size": 88
+      "size": 96
     },
     {
       "align": 8,
@@ -1082,16 +1094,20 @@
           "offset": 24
         },
         {
-          "name": "load_all",
+          "name": "remove_many",
           "offset": 32
         },
         {
-          "name": "free_buffer",
+          "name": "load_all",
           "offset": 40
+        },
+        {
+          "name": "free_buffer",
+          "offset": 48
         }
       ],
       "name": "StateStoreCallbacks",
-      "size": 48
+      "size": 56
     },
     {
       "align": 8,

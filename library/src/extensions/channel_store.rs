@@ -93,6 +93,44 @@ pub(crate) trait ChannelStoreExt: DeRecChannelStore {
         }))
     }
 
+    /// The helper channel record stored under `channel_id`, if any.
+    ///
+    /// A record of another kind under that key reads as none: the protocol
+    /// acts on helper fields, and a store that answered a helper query with
+    /// a replica row must not be mistaken for one that holds the helper.
+    async fn load_helper(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> Result<Option<HelperChannel>> {
+        Ok(self
+            .load(secret_id, ChannelQuery::Helper { channel_id })
+            .await?
+            .and_then(|record| record.as_helper().cloned()))
+    }
+
+    /// The replica-group members recorded on `channel_id` that match
+    /// `filter`.
+    ///
+    /// Members of one `secret_id` are not all on one channel: a pairing mints
+    /// a fresh channel for the joiner, and its row stays there, under its own
+    /// key, until it joins the group's. So asking who is on a given channel
+    /// narrows by it after [`Self::replicas_matching`], which the store-facing
+    /// [`ReplicaFilter`] cannot express.
+    async fn replicas_on_channel(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        filter: ReplicaFilter,
+    ) -> Result<Vec<ReplicaMember>> {
+        Ok(self
+            .replicas_matching(secret_id, filter)
+            .await?
+            .into_iter()
+            .filter(|member| member.channel_id == channel_id)
+            .collect())
+    }
+
     /// Refuse a message whose sender does not hold `expected` on every one
     /// of `channel_ids`.
     ///
@@ -105,18 +143,12 @@ pub(crate) trait ChannelStoreExt: DeRecChannelStore {
         expected: SenderKind,
     ) -> Result<()> {
         for channel_id in channel_ids {
-            let channel = self
-                .load(
-                    secret_id,
-                    ChannelQuery::Helper {
-                        channel_id: *channel_id,
-                    },
-                )
-                .await?
-                .and_then(|r| r.as_helper().cloned())
-                .ok_or(Error::InvalidInput(
-                    "channel id not present in channel store",
-                ))?;
+            let channel =
+                self.load_helper(secret_id, *channel_id)
+                    .await?
+                    .ok_or(Error::InvalidInput(
+                        "channel id not present in channel store",
+                    ))?;
             if channel.peer_role != expected {
                 return Err(Error::RoleMismatch {
                     channel_id: *channel_id,
@@ -376,6 +408,13 @@ mod defiant_store_tests {
         }
         fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
             self.0.remove(secret_id, query)
+        }
+        fn remove_many(
+            &mut self,
+            secret_id: u64,
+            queries: &[ChannelQuery],
+        ) -> ChannelStoreFuture<'_, ()> {
+            self.0.remove_many(secret_id, queries)
         }
         fn helpers(
             &self,

@@ -408,15 +408,15 @@ impl Obligation {
         stores: &mut Stores<'_, S>,
         local: &Local<'_>,
     ) -> Result<bool> {
-        Ok(stores
+        Ok(!stores
             .channels
-            .replicas_matching(
+            .replicas_on_channel(
                 local.secret_id,
+                self.channel_id,
                 crate::protocol::types::ReplicaFilter::default(),
             )
             .await?
-            .iter()
-            .any(|member| member.channel_id == self.channel_id))
+            .is_empty())
     }
 
     /// The target a token carries when none could be resolved: the channel

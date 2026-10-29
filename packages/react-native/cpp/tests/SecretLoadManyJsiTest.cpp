@@ -87,6 +87,7 @@ int32_t chRemove(void*, uint64_t, uint64_t, uint64_t, uint32_t* existed) {
   *existed = 0;
   return 0;
 }
+int32_t chRemoveMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t chListHelpers(void*, uint64_t, const uint8_t*, size_t, uint8_t** p, size_t* l) {
   return giveBytes(kHelpers, p, l);
 }
@@ -112,6 +113,7 @@ int32_t shLatest(void*, uint64_t, uint32_t* has, uint32_t* version) {
 int32_t shSave(void*, uint64_t, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t shRemove(void*, uint64_t, uint64_t) { return 0; }
 int32_t shRemoveVersions(void*, uint64_t, uint64_t, const uint8_t*, size_t) { return 0; }
+int32_t shRemoveVersionsMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t shKeepVersion(void*, uint64_t, uint32_t, uint32_t*) { return 1; }
 int32_t shRecordVerification(void*, uint64_t, uint64_t, uint32_t) { return 0; }
 
@@ -125,17 +127,18 @@ int32_t stRemove(void*, uint64_t, const uint8_t*, size_t, uint32_t* removed) {
   *removed = 0;
   return 0;
 }
+int32_t stRemoveMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t stLoadAll(void*, uint64_t, uint32_t, uint8_t** p, size_t* l) { return giveBytes("[]", p, l); }
 
 int32_t trSend(void*, const uint8_t*, size_t, const uint8_t*, size_t) { return 0; }
 
-ChannelStoreCallbacks channelStore{nullptr, chLoad, chSave, chRemove, chListHelpers,
+ChannelStoreCallbacks channelStore{nullptr, chLoad, chSave, chRemove, chRemoveMany, chListHelpers,
                                    chListReplicas, chLink, chLinked, freeBytes};
 ShareStoreCallbacks shareStore{nullptr, shLoad,   shLoadMany,       shLoadAll,  shLatest,
-                               shSave,  shRemove, shRemoveVersions, shKeepVersion,
+                               shSave,  shRemove, shRemoveVersions, shRemoveVersionsMany, shKeepVersion,
                                shRecordVerification, freeBytes};
 UserSecretStoreCallbacks userSecretStore{nullptr, usLoad, usSave, usRemove, freeBytes};
-StateStoreCallbacks stateStore{nullptr, stSave, stLoad, stRemove, stLoadAll, freeBytes};
+StateStoreCallbacks stateStore{nullptr, stSave, stLoad, stRemove, stRemoveMany, stLoadAll, freeBytes};
 TransportCallbacks transport{nullptr, trSend};
 
 /// A Hermes runtime holding `kStoresJs`, plus the `StoreBindings` built over

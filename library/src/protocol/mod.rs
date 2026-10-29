@@ -71,7 +71,6 @@
 pub mod error;
 pub mod events;
 pub mod traits;
-pub mod transport_adapters;
 pub mod types;
 pub mod utils;
 
@@ -107,7 +106,6 @@ pub use traits::{
     DeRecTransport, DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture, StateStoreFuture,
     TransportFuture,
 };
-pub use transport_adapters::{SendOne, SequentialFailover, SingleEndpointTransport};
 pub use types::{
     ChannelQuery, ChannelRecord, ChannelShare, ChannelStatus, CollectedShare,
     ExpiredChannelCleanup, HelperChannel, HelperInfo, MissingPolicy, PairingKeyMaterial,

@@ -157,37 +157,6 @@ function shareStoreRefusal(reason) {
   return wasm.shareStoreRefusal(reason);
 }
 
-function sequentialFailover(dialer) {
-  return {
-    async send(endpoints, message) {
-      let last;
-      for (const endpoint of endpoints) {
-        try {
-          await dialer(endpoint, message);
-          return;
-        } catch (e) {
-          last = e;
-        }
-      }
-      // `endpoints` is never empty — the library refuses to record a peer
-      // whose endpoints were all filtered away — so reaching here means at
-      // least one attempt was made and `last` is populated.
-      throw last ?? new Error("send was called with no endpoints");
-    },
-  };
-}
-
-function singleEndpointTransport(dialer) {
-  return {
-    async send(endpoints, message) {
-      if (endpoints.length === 0) {
-        throw new Error("send was called with no endpoints");
-      }
-      await dialer(endpoints[0], message);
-    },
-  };
-}
-
 module.exports = {
   primitives,
   channelFilterMatches,
@@ -195,8 +164,6 @@ module.exports = {
   protocol_version,
   generate_replica_id,
   shareStoreRefusal,
-  sequentialFailover,
-  singleEndpointTransport,
   envelope,
   DeRecProtocol,
   DeRecProtocolBuilder,

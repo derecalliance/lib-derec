@@ -129,6 +129,26 @@ impl DeRecStateStore for PostgresStateStore {
         })
     }
 
+    fn remove_many(&mut self, secret_id: u64, keys: &[StateKey]) -> StateStoreFuture<'_, ()> {
+        let client = self.client.clone();
+        let secret_id = u64_to_sql(secret_id);
+        let columns: Vec<(i64, i64, i64)> = keys.iter().map(key_columns).collect();
+        let kinds: Vec<i64> = columns.iter().map(|c| c.0).collect();
+        let sub_a: Vec<i64> = columns.iter().map(|c| c.1).collect();
+        let sub_b: Vec<i64> = columns.iter().map(|c| c.2).collect();
+        Box::pin(async move {
+            client
+                .execute(
+                    "DELETE FROM protocol_state WHERE secret_id = $1 AND (kind, sub_a, sub_b) IN \
+                     (SELECT * FROM unnest($2::BIGINT[], $3::BIGINT[], $4::BIGINT[]))",
+                    &[&secret_id, &kinds, &sub_a, &sub_b],
+                )
+                .await
+                .expect("protocol_state remove_many failed");
+            Ok(())
+        })
+    }
+
     fn load_all(&self, secret_id: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
         let client = self.client.clone();
         let secret_id = u64_to_sql(secret_id);

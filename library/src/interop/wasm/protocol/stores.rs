@@ -9,72 +9,146 @@
 //!
 //! ## JS interface contracts
 //!
+//! Every `u64` (`secretId`, `channelId`, `replicaId`) crosses as a decimal
+//! string, because a JS number cannot hold one exactly. Every method returns a
+//! `Promise`; a rejection or a throw is a backend failure unless stated
+//! otherwise. These are the interfaces the adapters below call, and the ones
+//! `packages/nodejs/index.d.ts`, `packages/web/index.d.ts` and
+//! `packages/react-native/src/types.ts` declare.
+//!
 //! ### `SecretStore`
 //! ```ts
+//! // kind 0 = SharedKey (32 raw bytes), 1 = PairingSecret (serialized key
+//! // material), 2 = PairingContact (protobuf ContactMessage).
+//! type SecretKind = 0 | 1 | 2;
 //! interface SecretStore {
-//!   load(channelId: string, kind: 0 | 1): Promise<Uint8Array | null | undefined>;
-//!   save(channelId: string, kind: 0 | 1, value: Uint8Array): Promise<void>;
-//!   remove(channelId: string, kind: 0 | 1): Promise<void>;
+//!   load(secretId: string, channelId: string, kind: SecretKind): Promise<Uint8Array | null | undefined>;
+//!   // Exactly one entry per id in `channelIds`, in order; `null` or
+//!   // `undefined` where nothing of `kind` is stored.
+//!   loadMany(secretId: string, channelIds: string[], kind: SecretKind): Promise<Array<Uint8Array | null | undefined>>;
+//!   save(secretId: string, channelId: string, kind: SecretKind, value: Uint8Array): Promise<void>;
+//!   remove(secretId: string, channelId: string, kind: SecretKind): Promise<void>;
+//!   // `remove` for each `[channelId, kind]` entry; an entry with nothing
+//!   // stored is skipped.
+//!   removeMany(secretId: string, entries: [channelId: string, kind: SecretKind][]): Promise<void>;
 //! }
-//! // kind 0 = SharedKey (32 raw bytes), kind 1 = PairingSecret (ark-serialized)
 //! ```
 //!
 //! ### `ChannelStore`
 //! ```ts
+//! type ChannelStatusName = "Pending" | "Paired" | "Unpairing";
+//! type SenderKindName = "Owner" | "Helper" | "ReplicaSource" | "ReplicaDestination";
+//! type ReplicaRoleName = "Source" | "Destination";
+//! // Every empty field selects everything; `exclude` applies after `ids`.
+//! interface ChannelFilter<Role> { ids: string[]; status: ChannelStatusName[]; role: Role | null; exclude: string[] }
 //! interface ChannelStore {
-//!   load(channelId: string): Promise<Uint8Array | null | undefined>;
-//!   save(channelId: string, contactBytes: Uint8Array): Promise<void>;
-//!   listChannels(): Promise<string[]>;
-//!   // Channel linking (same Owner identity); undirected, idempotent, transitive.
+//!   // A record is addressed by `(channelId, replicaId)`: `replicaId` "0" is
+//!   // the helper channel at `channelId`, any other value that replica-group
+//!   // member, keyed by `replicaId` alone. Bytes are a JSON `ChannelRecord`.
+//!   load(secretId: string, channelId: string, replicaId: string): Promise<Uint8Array | null | undefined>;
+//!   save(secretId: string, channelId: string, replicaId: string, bytes: Uint8Array): Promise<void>;
+//!   // Whether a record was removed.
+//!   remove(secretId: string, channelId: string, replicaId: string): Promise<boolean>;
+//!   // `remove` for each `[channelId, replicaId]` entry; an entry that names
+//!   // no record is skipped.
+//!   removeMany(secretId: string, queries: [channelId: string, replicaId: string][]): Promise<void>;
+//!   // JSON arrays of `HelperChannel` / `ReplicaMember` records the filter
+//!   // selects; `null`, `undefined` or an empty buffer is an empty list.
+//!   // The `listReplicas` order picks the successor when the source leaves.
+//!   listHelpers(secretId: string, filter: ChannelFilter<SenderKindName>): Promise<Uint8Array | null | undefined>;
+//!   listReplicas(secretId: string, filter: ChannelFilter<ReplicaRoleName>): Promise<Uint8Array | null | undefined>;
+//!   // Undirected and idempotent.
 //!   linkChannel(secretId: string, a: string, b: string): Promise<void>;
-//!   // Transitive closure INCLUDING channelId itself.
-//!   linkedChannels(channelId: string): Promise<string[]>;
+//!   // The transitive closure of `channelId`, including `channelId` itself.
+//!   linkedChannels(secretId: string, channelId: string): Promise<string[]>;
 //! }
-//! // Uint8Array is the raw protobuf encoding of a Channel record.
 //! ```
 //!
 //! ### `ShareStore`
 //! ```ts
-//! // `subshares` is the owner-side subshare count and `threshold` the
-//! // owner-side threshold the version was split with; store and return them
-//! // as given. Each is absent on a helper's share and on owner rows written
-//! // before it existed.
+//! // `secretId` on a share names the secret the bytes belong to; on a helper
+//! // it is the owner's id and differs from the `secretId` partition every
+//! // method takes. Key rows on the argument. `subshares` is the owner-side
+//! // subshare count and `threshold` the owner-side threshold the version was
+//! // split with; store and return them as given. Each is absent on a
+//! // helper's share and on owner rows written before it existed.
 //! interface Share { secretId: string; version: number; bytes: Uint8Array; subshares?: number | null; threshold?: number | null }
 //! interface ShareStore {
-//!   // `secretId` is the u64 secret identifier as a decimal string.
-//!   // For `load`/`loadMany`, an empty `versions` array means "all versions of secretId".
-//!   load(channelId: string, secretId: string, versions: number[]): Promise<Share[]>;
-//!   loadMany(channelIds: string[], secretId: string, versions: number[]): Promise<Share[]>;
-//!   // Discovery-only: all secrets and versions for these channels.
-//!   loadAll(channelIds: string[]): Promise<Share[]>;
-//!   save(channelId: string, share: Share): Promise<void>;
-//!   // Drop EVERY share stored under channelId (all secret_ids, all versions).
-//!   // Called when an unpair flow tears down a channel. Implementations must
-//!   // treat a non-existent channel as a no-op.
-//!   removeChannel(channelId: string): Promise<void>;
-//!   // Drop the shares stored under (secretId, channelId) at each listed
-//!   // version. A version that is not stored is a no-op.
+//!   // For `load` and `loadMany`, an empty `versions` selects every version.
+//!   load(secretId: string, channelId: string, versions: number[]): Promise<Share[]>;
+//!   // Each share paired with the channel it is stored under.
+//!   loadMany(secretId: string, channelIds: string[], versions: number[]): Promise<[channelId: string, share: Share][]>;
+//!   // Discovery: every version of every share on these channels.
+//!   loadAll(secretId: string, channelIds: string[]): Promise<Share[]>;
+//!   // The highest version stored under `secretId`, or `null` when none is.
+//!   latestVersion(secretId: string): Promise<number | null>;
+//!   // May reject or throw a `shareStoreRefusal(reason)` `Error` to refuse a
+//!   // share update on a helper channel.
+//!   save(secretId: string, channelId: string, share: Share): Promise<void>;
+//!   // Drop every share stored under `(secretId, channelId)`; a channel with
+//!   // nothing stored is a no-op.
+//!   removeChannel(secretId: string, channelId: string): Promise<void>;
+//!   // Drop the shares stored under `(secretId, channelId)` at each listed
+//!   // version. A version that is not stored is skipped.
 //!   removeVersions(secretId: string, channelId: string, versions: number[]): Promise<void>;
+//!   // `removeVersions` for each `[channelId, versions]` entry, in one call.
+//!   removeVersionsMany(secretId: string, entries: [channelId: string, versions: number[]][]): Promise<void>;
 //!   // Owner only: the one version, other than `version`, every Helper keeps
 //!   // after `version` is distributed: the last version that met threshold.
 //!   // `0` keeps no other version. Must be below `version`.
 //!   keepVersion(secretId: string, version: number): Promise<number>;
-//!   latestVersion(): Promise<number | null>;
 //!   // Called once per accepted verification challenge on a helper channel.
 //!   // Reject or throw a `shareStoreRefusal(reason)` `Error` to refuse the
-//!   // verification; any other rejection/throw is an ordinary backend
-//!   // failure.
+//!   // verification; any other rejection or throw is a backend failure.
 //!   recordVerification(secretId: string, channelId: string, version: number): Promise<void>;
 //! }
 //! ```
 //!
-//! `save` may likewise reject or throw a `shareStoreRefusal(reason)` `Error`
-//! to refuse a share update on a helper channel.
+//! ### `UserSecretStore`
+//! ```ts
+//! interface UserSecrets {
+//!   version: number;
+//!   secrets: { id: Uint8Array; name: string; data: Uint8Array }[];
+//!   description?: string;
+//!   // Decimal id of the member that published `version`; store and return
+//!   // it unchanged.
+//!   author_replica_id?: string;
+//!   // The recorded threshold; store and return it as given.
+//!   threshold?: number | null;
+//! }
+//! interface UserSecretStore {
+//!   loadLatest(secretId: string): Promise<UserSecrets | null | undefined>;
+//!   saveLatest(secretId: string, value: UserSecrets): Promise<void>;
+//!   remove(secretId: string): Promise<void>;
+//! }
+//! ```
+//!
+//! ### `StateStore`
+//! ```ts
+//! // kind 0 = PendingVerification, 1 = PendingRecovery, 2 = PendingUnpair,
+//! // 3 = SharingRound, 4 = PendingReplicaDiscovery.
+//! type StateKind = 0 | 1 | 2 | 3 | 4;
+//! interface StateStore {
+//!   // Buffers are JSON `StateItemRecord` / `StateKeyRecord`; store an item
+//!   // under its key and return the exact bytes received.
+//!   save(secretId: string, itemJson: Uint8Array): Promise<void>;
+//!   load(secretId: string, keyJson: Uint8Array): Promise<Uint8Array | null | undefined>;
+//!   // Whether a row was removed.
+//!   remove(secretId: string, keyJson: Uint8Array): Promise<boolean>;
+//!   // `keysJson` is a JSON array of the keys `remove` takes; a key with no
+//!   // row is skipped.
+//!   removeMany(secretId: string, keysJson: Uint8Array): Promise<void>;
+//!   loadAll(secretId: string, kind: StateKind): Promise<Uint8Array[]>;
+//! }
+//! ```
 //!
 //! ### `Transport`
 //! ```ts
+//! interface Endpoint { uri: string; protocol: "https" | "grpc" }
 //! interface Transport {
-//!   send(endpoints: { protocol: "https" | "grpc"; uri: string }[], message: Uint8Array): Promise<void>;
+//!   // The peer's whole endpoint set, in its order; which to dial is the
+//!   // implementation's choice.
+//!   send(endpoints: ReadonlyArray<Endpoint>, message: Uint8Array): Promise<void>;
 //! }
 //! ```
 
@@ -332,23 +406,37 @@ impl DeRecSecretStore for JsSecretStore {
             Ok(())
         })
     }
+
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, SecretKind)],
+    ) -> SecretStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        let pairs = Array::new();
+        for &(channel_id, kind) in entries {
+            let pair = Array::new();
+            pair.push(&JsValue::from_str(&channel_id.0.to_string()));
+            pair.push(&JsValue::from_f64(kind as u32 as f64));
+            pairs.push(&pair);
+        }
+        Box::pin(async move {
+            let args = Array::new();
+            args.push(&JsValue::from_str(&secret_str));
+            args.push(&pairs);
+            let promise_val = call_method(&obj, "removeMany", &args)
+                .map_err(|e| SecretStoreError::Backend(box_err(e)))?;
+            resolve_promise(promise_val)
+                .await
+                .map_err(|e| SecretStoreError::Backend(box_err(e)))?;
+            Ok(())
+        })
+    }
 }
 
-/// Adapter wrapping a JS `ChannelStore` object.
-///
-/// # JS interface contract
-///
-/// ```ts
-/// interface ChannelStore {
-///   load(secretId: string, channelId: string, replicaId: string): Promise<Uint8Array | null>;
-///   save(secretId: string, channelId: string, replicaId: string, bytes: Uint8Array): Promise<void>;
-///   remove(secretId: string, channelId: string, replicaId: string): Promise<boolean>;
-///   listHelpers(secretId: string): Promise<Uint8Array | null>;
-///   listReplicas(secretId: string): Promise<Uint8Array | null>;
-///   linkChannel(secretId: string, a: string, b: string): Promise<void>;
-///   linkedChannels(secretId: string, channelId: string): Promise<string[]>;
-/// }
-/// ```
+/// Adapter wrapping a JS `ChannelStore` object; the JS interface is
+/// `ChannelStore` in the module docs.
 ///
 /// A record is addressed by `(channelId, replicaId)`. A `replicaId` of `"0"` —
 /// the value [`crate::types::ReplicaId`] reserves as "absent" — addresses the
@@ -537,6 +625,34 @@ impl DeRecChannelStore for JsChannelStore {
             value.as_bool().ok_or_else(|| {
                 ChannelStoreError::Backend(box_err("remove must return a boolean".to_string()))
             })
+        })
+    }
+
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        queries: &[ChannelQuery],
+    ) -> ChannelStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        let pairs = Array::new();
+        for query in queries {
+            let (channel_str, replica_str) = query_key(*query);
+            let pair = Array::new();
+            pair.push(&JsValue::from_str(&channel_str));
+            pair.push(&JsValue::from_str(&replica_str));
+            pairs.push(&pair);
+        }
+        Box::pin(async move {
+            let args = Array::new();
+            args.push(&JsValue::from_str(&secret_str));
+            args.push(&pairs);
+            let promise_val = call_method(&obj, "removeMany", &args)
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+            resolve_promise(promise_val)
+                .await
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+            Ok(())
         })
     }
 
@@ -817,7 +933,7 @@ impl DeRecShareStore for JsShareStore {
         secret_id: u64,
         channel_ids: &[ChannelId],
         versions: &[u32],
-    ) -> ShareStoreFuture<'_, Vec<Share>> {
+    ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
         let obj = self.0.clone();
         let secret_str = secret_id.to_string();
         let ids_vec: Vec<String> = channel_ids.iter().map(|c| c.0.to_string()).collect();
@@ -843,7 +959,18 @@ impl DeRecShareStore for JsShareStore {
             let arr = Array::from(&value);
             let mut result = Vec::with_capacity(arr.length() as usize);
             for i in 0..arr.length() {
-                result.push(share_from_js(&arr.get(i))?);
+                let pair = Array::from(&arr.get(i));
+                let channel_id = pair
+                    .get(0)
+                    .as_string()
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        ShareStoreError::Backend(box_err(
+                            "loadMany entries must be [channelId: decimal string, share]"
+                                .to_string(),
+                        ))
+                    })?;
+                result.push((ChannelId(channel_id), share_from_js(&pair.get(1))?));
             }
             Ok(result)
         })
@@ -928,6 +1055,37 @@ impl DeRecShareStore for JsShareStore {
         })
     }
 
+    fn remove_versions_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, Vec<u32>)],
+    ) -> ShareStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        let pairs = Array::new();
+        for (channel_id, versions) in entries {
+            let js_versions = Array::new();
+            for v in versions {
+                js_versions.push(&JsValue::from_f64(f64::from(*v)));
+            }
+            let pair = Array::new();
+            pair.push(&JsValue::from_str(&channel_id.0.to_string()));
+            pair.push(&js_versions);
+            pairs.push(&pair);
+        }
+        Box::pin(async move {
+            let args = Array::new();
+            args.push(&JsValue::from_str(&secret_str));
+            args.push(&pairs);
+            let promise_val = call_method(&obj, "removeVersionsMany", &args)
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            resolve_promise(promise_val)
+                .await
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            Ok(())
+        })
+    }
+
     fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32> {
         let obj = self.0.clone();
         let secret_str = secret_id.to_string();
@@ -976,24 +1134,8 @@ impl DeRecShareStore for JsShareStore {
     }
 }
 
-/// Adapter wrapping a JS `UserSecretStore` object.
-///
-/// JS interface contract:
-/// ```ts
-/// interface UserSecretStore {
-///   loadLatest(secretId: string): Promise<UserSecrets | null | undefined>;
-///   saveLatest(secretId: string, value: UserSecrets): Promise<void>;
-///   remove(secretId: string): Promise<void>;
-/// }
-/// type UserSecrets = {
-///   version: number;
-///   secrets: { id: Uint8Array; name: string; data: Uint8Array }[];
-///   description?: string;
-///   author_replica_id?: string;
-///   // The recorded threshold; store and return it as given.
-///   threshold?: number | null;
-/// };
-/// ```
+/// Adapter wrapping a JS `UserSecretStore` object; the JS interface is
+/// `UserSecretStore` in the module docs.
 pub struct JsUserSecretStore(pub JsValue);
 
 fn user_secrets_to_js(value: &UserSecrets) -> JsValue {
@@ -1210,22 +1352,11 @@ fn state_kind_to_u32(kind: StateKind) -> u32 {
     }
 }
 
-/// Adapter wrapping a JS `StateStore` object.
-///
-/// # JS interface contract
-///
-/// ```ts
-/// interface StateStore {
-///   save(secretId: string, itemJson: Uint8Array): Promise<void>;
-///   load(secretId: string, keyJson: Uint8Array): Promise<Uint8Array | null>;
-///   remove(secretId: string, keyJson: Uint8Array): Promise<boolean>;
-///   loadAll(secretId: string, kind: number): Promise<Uint8Array[]>;
-/// }
-/// ```
+/// Adapter wrapping a JS `StateStore` object; the JS interface is
+/// `StateStore` in the module docs.
 ///
 /// The buffers are JSON-encoded records matching the Rust-side
-/// `StateItemRecord` / `StateKeyRecord`. `kind` values are `0` =
-/// PendingVerification, `1` = PendingRecovery, `2` = PendingUnpair.
+/// `StateItemRecord` / `StateKeyRecord`.
 pub struct JsStateStore(pub JsValue);
 
 impl DeRecStateStore for JsStateStore {
@@ -1297,6 +1428,25 @@ impl DeRecStateStore for JsStateStore {
             value.as_bool().ok_or_else(|| {
                 StateStoreError::Backend(box_err("remove must return a boolean".to_string()))
             })
+        })
+    }
+
+    fn remove_many(&mut self, secret_id: u64, keys: &[StateKey]) -> StateStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        let records: Vec<StateKeyRecord> = keys.iter().map(StateKeyRecord::from).collect();
+        Box::pin(async move {
+            let keys_bytes = serde_json::to_vec(&records)
+                .map_err(|e| StateStoreError::Backend(box_err(e.to_string())))?;
+            let args = Array::new();
+            args.push(&JsValue::from_str(&secret_str));
+            args.push(&Uint8Array::from(keys_bytes.as_slice()));
+            let promise_val = call_method(&obj, "removeMany", &args)
+                .map_err(|e| StateStoreError::Backend(box_err(e)))?;
+            resolve_promise(promise_val)
+                .await
+                .map_err(|e| StateStoreError::Backend(box_err(e)))?;
+            Ok(())
         })
     }
 

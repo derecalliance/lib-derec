@@ -362,6 +362,13 @@ const STORE_PARAMS: &[ParamOverride] = &[
         &["secret_id", "key_json"],
         "the key crosses as the opaque JSON the core wrote, and the name says so",
     ),
+    (
+        "ts",
+        "StateStore",
+        "removeMany",
+        &["secret_id", "keys_json"],
+        "the keys cross as the opaque JSON array the core wrote, and the name says so",
+    ),
 ];
 
 thread_local! {

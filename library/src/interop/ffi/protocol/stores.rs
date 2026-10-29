@@ -164,6 +164,14 @@ struct ChannelFilterWire<'a, Role: serde::Serialize> {
     exclude: Vec<String>,
 }
 
+/// The `[channel_id, replica_id]` pair one [`ChannelQuery`] travels as to
+/// `ChannelStoreCallbacks::remove_many`. Ids are decimal strings because a
+/// JavaScript host cannot hold a `u64` in a JSON number.
+fn query_pair(query: ChannelQuery) -> [String; 2] {
+    let (channel_id, replica_id) = query_key(query);
+    [channel_id.to_string(), replica_id.to_string()]
+}
+
 /// Encode a listing filter for the callback that will apply it.
 fn encode_filter<Role: serde::Serialize>(
     ids: &[u64],
@@ -348,6 +356,12 @@ fn state_kind_to_u32(kind: StateKind) -> u32 {
 /// returning fewer rows than it selects is wrong, and undetectable. The buffer is owned
 /// by the caller and valid only for the duration of the call.
 ///
+/// `remove_many` receives a JSON array of `[channel_id, replica_id]` pairs,
+/// the ids as decimal strings, each addressing one record the way `remove`'s
+/// arguments do (`replica_id` `"0"` for a helper channel). An entry
+/// that names no record is skipped. The buffer is owned by the caller and
+/// valid only for the duration of the call.
+///
 /// The order `list_replicas` returns is significant in exactly one situation —
 /// it selects the successor when the group's source is removed. See
 /// [`crate::protocol::DeRecChannelStore::replicas`] for the full contract.
@@ -376,6 +390,12 @@ pub struct ChannelStoreCallbacks {
         channel_id: u64,
         replica_id: u64,
         out_existed: *mut u32,
+    ) -> i32,
+    pub remove_many: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        queries: *const u8,
+        queries_len: usize,
     ) -> i32,
     pub list_helpers: extern "C" fn(
         user_data: *mut c_void,
@@ -411,6 +431,12 @@ pub struct ChannelStoreCallbacks {
 /// in the same order: the same `{kind, bytes}` record `load` returns, or
 /// `null` when nothing of `kind` is stored for that channel. Whether a
 /// missing entry is an error is decided by the library, not the callback.
+///
+/// `remove_many` receives a JSON array of `[channel_id, kind]` pairs, the
+/// channel id as a decimal string and the kind as the number `remove` takes,
+/// each naming one secret to remove. An entry with nothing stored is skipped.
+/// The buffer is owned by the caller and valid only for the duration of the
+/// call.
 #[repr(C)]
 pub struct SecretStoreCallbacks {
     pub user_data: *mut c_void,
@@ -441,6 +467,12 @@ pub struct SecretStoreCallbacks {
     ) -> i32,
     pub remove:
         extern "C" fn(user_data: *mut c_void, secret_id: u64, channel_id: u64, kind: u32) -> i32,
+    pub remove_many: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        entries: *const u8,
+        entries_len: usize,
+    ) -> i32,
     pub free_buffer: extern "C" fn(user_data: *mut c_void, ptr: *mut u8, len: usize),
 }
 
@@ -457,6 +489,17 @@ pub struct SecretStoreCallbacks {
 /// ([`crate::protocol::types::Share::threshold`]). Each is omitted when there
 /// is none, and absent or `null` reads as none. Store them as given and return
 /// them unchanged.
+///
+/// `load` and `load_all` return a JSON array of those objects. `load_many`
+/// returns a JSON array of `[channel_id, share]` pairs, `channel_id` the
+/// decimal string of the channel the share is stored under, so the caller can
+/// tell which channel each share came from.
+///
+/// `remove_versions_many` receives a JSON array of `[channel_id, versions]`
+/// pairs, `channel_id` a decimal string and `versions` an array of numbers,
+/// each naming the versions to remove on that channel. A version that is not
+/// stored is skipped. The buffer is owned by the caller and valid only for the
+/// duration of the call.
 ///
 /// `keep_version` writes the application's answer to `out_version`: the one
 /// version, other than `version`, every helper keeps, or `0` to keep no
@@ -524,6 +567,12 @@ pub struct ShareStoreCallbacks {
         channel_id: u64,
         versions_json_ptr: *const u8,
         versions_json_len: usize,
+    ) -> i32,
+    pub remove_versions_many: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        entries: *const u8,
+        entries_len: usize,
     ) -> i32,
     pub keep_version: extern "C" fn(
         user_data: *mut c_void,
@@ -650,6 +699,9 @@ impl TryFrom<UserSecretsRecord> for UserSecrets {
 /// - `remove`: `0` = ok (`*out_removed` set to `0` or `1`), other =
 ///   backend failure.
 /// - `save` / `load_all`: `0` = ok, other = backend failure.
+/// - `remove_many`: `0` = ok, other = backend failure. The keys arrive as a
+///   JSON array of the [`StateKeyRecord`]s `remove` takes one at a time; a
+///   key with no row is skipped.
 #[repr(C)]
 pub struct StateStoreCallbacks {
     pub user_data: *mut c_void,
@@ -673,6 +725,12 @@ pub struct StateStoreCallbacks {
         key_json_ptr: *const u8,
         key_json_len: usize,
         out_removed: *mut u32,
+    ) -> i32,
+    pub remove_many: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        keys_json_ptr: *const u8,
+        keys_json_len: usize,
     ) -> i32,
     pub load_all: extern "C" fn(
         user_data: *mut c_void,
@@ -880,6 +938,27 @@ impl DeRecChannelStore for DotnetChannelStore {
                 ));
             }
             Ok(existed != 0)
+        })();
+        Box::pin(async move { res })
+    }
+
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        queries: &[ChannelQuery],
+    ) -> ChannelStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let res = (|| -> Result<(), ChannelStoreError> {
+            let wire: Vec<[String; 2]> = queries.iter().copied().map(query_pair).collect();
+            let bytes = serde_json::to_vec(&wire)
+                .map_err(|e| ChannelStoreError::Backend(format!("remove_many JSON: {e}").into()))?;
+            let rc = (cb.remove_many)(cb.user_data, secret_id, bytes.as_ptr(), bytes.len());
+            if rc != 0 {
+                return Err(ChannelStoreError::Backend(
+                    format!("channel store remove_many failed (rc={rc})").into(),
+                ));
+            }
+            Ok(())
         })();
         Box::pin(async move { res })
     }
@@ -1127,6 +1206,30 @@ impl DeRecSecretStore for DotnetSecretStore {
             }
         })
     }
+
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, SecretKind)],
+    ) -> SecretStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let res = (|| -> Result<(), SecretStoreError> {
+            let wire: Vec<(String, u32)> = entries
+                .iter()
+                .map(|&(channel_id, kind)| (channel_id.0.to_string(), secret_kind_to_u32(kind)))
+                .collect();
+            let bytes = serde_json::to_vec(&wire)
+                .map_err(|e| SecretStoreError::Backend(format!("remove_many JSON: {e}").into()))?;
+            let rc = (cb.remove_many)(cb.user_data, secret_id, bytes.as_ptr(), bytes.len());
+            if rc != 0 {
+                return Err(SecretStoreError::Backend(
+                    format!("secret store remove_many failed (rc={rc})").into(),
+                ));
+            }
+            Ok(())
+        })();
+        Box::pin(async move { res })
+    }
 }
 
 /// Real DotnetShareStore — bridges to managed C# callbacks via the
@@ -1158,6 +1261,37 @@ impl DotnetShareStore {
             .map(|r| {
                 r.into_share()
                     .map_err(|e| ShareStoreError::Backend(boxed_err(e)))
+            })
+            .collect()
+    }
+
+    fn fetch_share_pairs(
+        &self,
+        bytes: Result<Option<Vec<u8>>, String>,
+    ) -> Result<Vec<(ChannelId, Share)>, ShareStoreError> {
+        let bytes = match bytes {
+            Err(e) => return Err(ShareStoreError::Backend(boxed_err(e))),
+            Ok(None) => return Ok(Vec::new()),
+            Ok(Some(b)) => b,
+        };
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pairs: Vec<(String, ShareRecord)> = serde_json::from_slice(&bytes).map_err(|e| {
+            ShareStoreError::Backend(boxed_err(format!("[channel_id, ShareRecord] JSON: {e}")))
+        })?;
+        pairs
+            .into_iter()
+            .map(|(channel_id, record)| {
+                let channel_id = channel_id.parse::<u64>().map_err(|e| {
+                    ShareStoreError::Backend(boxed_err(format!(
+                        "load_many channel_id must be a decimal u64: {e}"
+                    )))
+                })?;
+                let share = record
+                    .into_share()
+                    .map_err(|e| ShareStoreError::Backend(boxed_err(e)))?;
+                Ok((ChannelId(channel_id), share))
             })
             .collect()
     }
@@ -1198,7 +1332,7 @@ impl DeRecShareStore for DotnetShareStore {
         secret_id: u64,
         channel_ids: &[ChannelId],
         versions: &[u32],
-    ) -> ShareStoreFuture<'_, Vec<Share>> {
+    ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
         let channel_ids_json: Vec<u64> = channel_ids.iter().map(|c| c.0).collect();
         let channel_ids_bytes = serde_json::to_vec(&channel_ids_json).unwrap_or_default();
         let versions_json = serde_json::to_vec(versions).unwrap_or_else(|_| b"[]".to_vec());
@@ -1214,7 +1348,7 @@ impl DeRecShareStore for DotnetShareStore {
                 l,
             )
         });
-        let res = self.fetch_share_list(result);
+        let res = self.fetch_share_pairs(result);
         Box::pin(async move { res })
     }
 
@@ -1335,6 +1469,32 @@ impl DeRecShareStore for DotnetShareStore {
                 Ok(())
             }
         })
+    }
+
+    fn remove_versions_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, Vec<u32>)],
+    ) -> ShareStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let res = (|| -> Result<(), ShareStoreError> {
+            let wire: Vec<(String, &[u32])> = entries
+                .iter()
+                .map(|(channel_id, versions)| (channel_id.0.to_string(), versions.as_slice()))
+                .collect();
+            let bytes = serde_json::to_vec(&wire).map_err(|e| {
+                ShareStoreError::Backend(boxed_err(format!("remove_versions_many JSON: {e}")))
+            })?;
+            let rc =
+                (cb.remove_versions_many)(cb.user_data, secret_id, bytes.as_ptr(), bytes.len());
+            if rc != 0 {
+                return Err(ShareStoreError::Backend(boxed_err(format!(
+                    "share store remove_versions_many failed (rc={rc})"
+                ))));
+            }
+            Ok(())
+        })();
+        Box::pin(async move { res })
     }
 
     fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32> {
@@ -1576,6 +1736,23 @@ impl DeRecStateStore for DotnetStateStore {
                 ))));
             }
             Ok(removed != 0)
+        })();
+        Box::pin(async move { res })
+    }
+
+    fn remove_many(&mut self, secret_id: u64, keys: &[StateKey]) -> StateStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let res = (|| -> Result<(), StateStoreError> {
+            let records: Vec<StateKeyRecord> = keys.iter().map(StateKeyRecord::from).collect();
+            let bytes = serde_json::to_vec(&records)
+                .map_err(|e| StateStoreError::Backend(boxed_err(format!("StateKey JSON: {e}"))))?;
+            let rc = (cb.remove_many)(cb.user_data, secret_id, bytes.as_ptr(), bytes.len());
+            if rc != 0 {
+                return Err(StateStoreError::Backend(boxed_err(format!(
+                    "state store remove_many failed (rc={rc})"
+                ))));
+            }
+            Ok(())
         })();
         Box::pin(async move { res })
     }
@@ -2004,6 +2181,15 @@ mod share_store_refusal_tests {
         0
     }
 
+    extern "C" fn unused_remove_versions_many(
+        _user_data: *mut c_void,
+        _secret_id: u64,
+        _entries: *const u8,
+        _entries_len: usize,
+    ) -> i32 {
+        0
+    }
+
     extern "C" fn unused_keep_version(
         _user_data: *mut c_void,
         _secret_id: u64,
@@ -2046,6 +2232,7 @@ mod share_store_refusal_tests {
             save: stub_save,
             remove_channel: unused_remove_channel,
             remove_versions: unused_remove_versions,
+            remove_versions_many: unused_remove_versions_many,
             keep_version: unused_keep_version,
             record_verification: stub_record_verification,
             free_buffer: noop_free_buffer,

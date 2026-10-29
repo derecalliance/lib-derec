@@ -17,7 +17,7 @@ use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::interop::wasm::now_secs;
 use crate::protocol::context::{Exchange, Local};
 use crate::protocol::stores::{StoreSet, Stores};
-use crate::protocol::types::ReplicaMember;
+use crate::protocol::types::{ChannelStatus, ReplicaMember};
 use crate::protocol::{
     DeRecEvent, DeRecStateStore, DeRecTransport, DeRecUserSecretStore, StateItem, StateKey,
 };
@@ -74,7 +74,12 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
     }
 }
 
-/// Ask every other member which version it holds.
+/// Ask every other `Paired` member which version it holds.
+///
+/// Only `Paired` members are asked, because the check waits for every member
+/// it reached and has no timeout. A `Pending` member may never confirm and is
+/// removed when its pairing expires; an `Unpairing` one may be a lost device
+/// that never answers. Waiting on either would leave the check open forever.
 ///
 /// Returns `Ok(None)` when there is nobody to ask — a device with no peers is
 /// trivially current, and starting a round that can never complete would
@@ -93,6 +98,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         .replicas_matching(
             secret_id,
             crate::protocol::types::ReplicaFilter {
+                status: vec![ChannelStatus::Paired],
                 exclude: local.exclude_self(),
                 ..Default::default()
             },
@@ -423,6 +429,16 @@ mod tests {
     use crate::protocol::DeRecChannelStore as _;
 
     async fn seed(channels: &mut InMemChannelStore, id: u64, role: ReplicaRole, uri: &str) {
+        seed_with_status(channels, id, role, uri, ChannelStatus::Paired).await;
+    }
+
+    async fn seed_with_status(
+        channels: &mut InMemChannelStore,
+        id: u64,
+        role: ReplicaRole,
+        uri: &str,
+        status: ChannelStatus,
+    ) {
         channels
             .save(
                 SECRET_ID,
@@ -432,7 +448,7 @@ mod tests {
                     transports: vec![endpoint(uri)],
                     communication_info: std::collections::HashMap::new(),
                     role,
-                    status: ChannelStatus::Paired,
+                    status,
                     created_at: 0,
                 }),
             )
@@ -748,6 +764,56 @@ mod tests {
                 !sent.iter().any(|u| u == "https://alice-2"),
                 "the asker must not query itself, got {sent:?}"
             );
+        });
+    }
+
+    /// Only `Paired` members are asked. A `Pending` member may expire before
+    /// it ever answers, and an `Unpairing` one may be a lost device; the
+    /// check has no timeout, so waiting on either would never finish.
+    #[test]
+    fn start_asks_only_paired_members() {
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, 1002);
+            let mut rig = StoreRig::new();
+
+            seed(
+                &mut rig.channels,
+                1001,
+                ReplicaRole::Source,
+                "https://alice",
+            )
+            .await;
+            seed(
+                &mut rig.channels,
+                1002,
+                ReplicaRole::Destination,
+                "https://alice-2",
+            )
+            .await;
+            seed_with_status(
+                &mut rig.channels,
+                1003,
+                ReplicaRole::Destination,
+                "https://alice-3",
+                ChannelStatus::Pending,
+            )
+            .await;
+            seed_with_status(
+                &mut rig.channels,
+                1004,
+                ReplicaRole::Destination,
+                "https://alice-4",
+                ChannelStatus::Unpairing,
+            )
+            .await;
+            seed_key(&mut rig.secrets).await;
+            seed_version(&mut rig.user_secrets, 5).await;
+
+            super::start(&mut rig.stores(), &lf.local(), TRACE_ID)
+                .await
+                .expect("start succeeds");
+
+            assert_eq!(rig.transport.sent_uris(), vec!["https://alice".to_owned()]);
         });
     }
 }

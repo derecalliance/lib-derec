@@ -117,6 +117,24 @@ impl DeRecStateStore for SqliteStateStore {
         Box::pin(std::future::ready(Ok(affected > 0)))
     }
 
+    fn remove_many(&mut self, secret_id: u64, keys: &[StateKey]) -> StateStoreFuture<'_, ()> {
+        let conn = lock(&self.connection);
+        let tx = conn
+            .unchecked_transaction()
+            .expect("remove_many transaction failed");
+        for key in keys {
+            let (kind, sub_a, sub_b) = key_columns(key);
+            tx.execute(
+                "DELETE FROM protocol_state
+                 WHERE secret_id = ?1 AND kind = ?2 AND sub_a = ?3 AND sub_b = ?4",
+                rusqlite::params![u64_to_sql(secret_id), kind, sub_a, sub_b],
+            )
+            .expect("protocol_state remove failed");
+        }
+        tx.commit().expect("remove_many commit failed");
+        Box::pin(std::future::ready(Ok(())))
+    }
+
     fn load_all(&self, secret_id: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
         let conn = lock(&self.connection);
         let mut stmt = conn

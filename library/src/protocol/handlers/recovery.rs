@@ -256,8 +256,8 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .load_many(local.secret_id, &linked_ids, &[request.version])
         .await?
         .into_iter()
-        .find(|s| s.secret_id == request.secret_id)
-        .map(|s| s.bytes)
+        .find(|(_, s)| s.secret_id == request.secret_id)
+        .map(|(_, s)| s.bytes)
     else {
         #[cfg(feature = "logging")]
         tracing::info!(

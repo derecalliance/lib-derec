@@ -23,15 +23,15 @@ namespace {
 // binding targets; a mismatch means `derec_ffi.h` grew or shrank a field
 // this file has not been updated to match.
 
-static_assert(sizeof(ChannelStoreCallbacks) == 9 * sizeof(void*),
+static_assert(sizeof(ChannelStoreCallbacks) == 10 * sizeof(void*),
               "ChannelStoreCallbacks layout changed; update the bindings");
-static_assert(sizeof(SecretStoreCallbacks) == 6 * sizeof(void*),
+static_assert(sizeof(SecretStoreCallbacks) == 7 * sizeof(void*),
               "SecretStoreCallbacks layout changed; update the bindings");
-static_assert(sizeof(ShareStoreCallbacks) == 11 * sizeof(void*),
+static_assert(sizeof(ShareStoreCallbacks) == 12 * sizeof(void*),
               "ShareStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(UserSecretStoreCallbacks) == 5 * sizeof(void*),
               "UserSecretStoreCallbacks layout changed; update the bindings");
-static_assert(sizeof(StateStoreCallbacks) == 6 * sizeof(void*),
+static_assert(sizeof(StateStoreCallbacks) == 7 * sizeof(void*),
               "StateStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(TransportCallbacks) == 2 * sizeof(void*),
               "TransportCallbacks layout changed; update the bindings");
@@ -220,8 +220,39 @@ CallResult toLinkedChannelsResult(jsi::Runtime& rt, const jsi::Value& value) {
   return CallResult{0, std::vector<uint8_t>(text.begin(), text.end())};
 }
 
-/// `ShareStore.{load,loadMany,loadAll}(): Promise<Share[]>`. Encodes the
-/// resolved array as the wire's `Vec<ShareRecord>` JSON.
+/// Appends one JS `Share` as the wire's `ShareRecord` JSON object. Returns
+/// `false`, leaving `text` partially written, when the share cannot cross.
+bool appendShareRecordJson(jsi::Runtime& rt, std::string& text, const jsi::Object& entry) {
+  std::string secretIdStr = entry.getProperty(rt, "secretId").asString(rt).utf8(rt);
+  if (!isDecimalDigits(secretIdStr)) {
+    return false;
+  }
+  auto version = static_cast<uint32_t>(entry.getProperty(rt, "version").asNumber());
+  ByteView bytes = asBytes(rt, entry.getProperty(rt, "bytes"));
+  text += "{\"secret_id\":\"" + secretIdStr + "\",\"version\":" + std::to_string(version) +
+          ",\"bytes\":";
+  appendByteArrayJson(text, bytes.ptr, bytes.len);
+  // `subshares` and `threshold`: `null`/`undefined` is none and is omitted,
+  // as Rust omits it; anything else must be a `u32` to cross as one.
+  for (const char* field : {"subshares", "threshold"}) {
+    jsi::Value value = entry.getProperty(rt, field);
+    if (value.isNull() || value.isUndefined()) continue;
+    if (!value.isNumber()) {
+      return false;
+    }
+    double number = value.asNumber();
+    if (!(number >= 0 && number <= 4294967295.0) ||
+        number != static_cast<double>(static_cast<uint32_t>(number))) {
+      return false;
+    }
+    text += std::string(",\"") + field + "\":" + std::to_string(static_cast<uint32_t>(number));
+  }
+  text += '}';
+  return true;
+}
+
+/// `ShareStore.{load,loadAll}(): Promise<Share[]>`. Encodes the resolved
+/// array as the wire's `Vec<ShareRecord>` JSON.
 ///
 /// A non-array return is a backend failure, never an empty list: "zero
 /// shares, successfully" is exactly the report that turns an unreadable store
@@ -235,32 +266,52 @@ CallResult toShareListResult(jsi::Runtime& rt, const jsi::Value& value) {
   std::string text = "[";
   for (size_t i = 0; i < n; ++i) {
     if (i != 0) text += ',';
-    jsi::Object entry = arr.getValueAtIndex(rt, i).asObject(rt);
-    std::string secretIdStr = entry.getProperty(rt, "secretId").asString(rt).utf8(rt);
-    if (!isDecimalDigits(secretIdStr)) {
+    if (!appendShareRecordJson(rt, text, arr.getValueAtIndex(rt, i).asObject(rt))) {
       return CallResult{kBackendFailure, {}};
     }
-    auto version = static_cast<uint32_t>(entry.getProperty(rt, "version").asNumber());
-    ByteView bytes = asBytes(rt, entry.getProperty(rt, "bytes"));
-    text += "{\"secret_id\":\"" + secretIdStr + "\",\"version\":" + std::to_string(version) +
-            ",\"bytes\":";
-    appendByteArrayJson(text, bytes.ptr, bytes.len);
-    // `subshares` and `threshold`: `null`/`undefined` is none and is omitted,
-    // as Rust omits it; anything else must be a `u32` to cross as one.
-    for (const char* field : {"subshares", "threshold"}) {
-      jsi::Value value = entry.getProperty(rt, field);
-      if (value.isNull() || value.isUndefined()) continue;
-      if (!value.isNumber()) {
-        return CallResult{kBackendFailure, {}};
-      }
-      double number = value.asNumber();
-      if (!(number >= 0 && number <= 4294967295.0) ||
-          number != static_cast<double>(static_cast<uint32_t>(number))) {
-        return CallResult{kBackendFailure, {}};
-      }
-      text += std::string(",\"") + field + "\":" + std::to_string(static_cast<uint32_t>(number));
+  }
+  text += ']';
+  return CallResult{0, std::vector<uint8_t>(text.begin(), text.end())};
+}
+
+/// `ShareStore.loadMany(): Promise<[channelId: string, share: Share][]>`.
+/// Encodes the resolved array as the wire's `Vec<(String, ShareRecord)>`
+/// JSON: each entry a `[channel_id, share]` pair, `channel_id` the decimal
+/// string kept as a JSON string, `share` encoded exactly as `load` encodes it.
+///
+/// A non-array return, or an entry that is not a two-element
+/// `[decimal string, Share]` array, is a backend failure.
+CallResult toShareEntryListResult(jsi::Runtime& rt, const jsi::Value& value) {
+  if (!value.isObject()) {
+    return CallResult{kBackendFailure, {}};
+  }
+  jsi::Array arr = value.asObject(rt).asArray(rt);
+  size_t n = arr.size(rt);
+  std::string text = "[";
+  for (size_t i = 0; i < n; ++i) {
+    if (i != 0) text += ',';
+    jsi::Value entry = arr.getValueAtIndex(rt, i);
+    if (!entry.isObject() || !entry.asObject(rt).isArray(rt)) {
+      return CallResult{kBackendFailure, {}};
     }
-    text += '}';
+    jsi::Array pair = entry.asObject(rt).asArray(rt);
+    if (pair.size(rt) != 2) {
+      return CallResult{kBackendFailure, {}};
+    }
+    jsi::Value channel = pair.getValueAtIndex(rt, 0);
+    jsi::Value share = pair.getValueAtIndex(rt, 1);
+    if (!channel.isString() || !share.isObject()) {
+      return CallResult{kBackendFailure, {}};
+    }
+    std::string channelId = channel.asString(rt).utf8(rt);
+    if (!isDecimalDigits(channelId)) {
+      return CallResult{kBackendFailure, {}};
+    }
+    text += "[\"" + channelId + "\",";
+    if (!appendShareRecordJson(rt, text, share.asObject(rt))) {
+      return CallResult{kBackendFailure, {}};
+    }
+    text += ']';
   }
   text += ']';
   return CallResult{0, std::vector<uint8_t>(text.begin(), text.end())};
@@ -472,6 +523,36 @@ extern "C" int32_t channelStoreRemove(void* userData, uint64_t secretId, uint64_
         keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toBoolResult);
       });
   *outExisted = result.bytes.empty() ? 0 : 1;
+  return result.code;
+}
+
+/// `ChannelStore.removeMany(secretId, queries) -> void`
+///
+/// `queries` arrives as a JSON array of `[channelId, replicaId]` pairs and is
+/// handed to JavaScript as that array. The buffer is owned by the core and
+/// valid only for this call, so it is copied before the promise is awaited.
+extern "C" int32_t channelStoreRemoveMany(void* userData, uint64_t secretId, const uint8_t* queries,
+                                           size_t queriesLen) {
+  auto* self = static_cast<StoreBindings*>(userData);
+  // Kept alive past this call so the lambda handed to `callSync` — which the
+  // JavaScript CallInvoker's queue may still be holding after this object's
+  // owner has released its own reference — has somewhere safe to run.
+  auto keepAlive = self->shared_from_this();
+  std::vector<uint8_t> queriesJson(queries, queries + queriesLen);
+  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId, queriesJson](std::function<void(CallResult)> settle) {
+    jsi::Runtime& rt = keepAlive->runtime();
+    auto store = keepAlive->channelStore();
+    auto method = store->getPropertyAsFunction(rt, "removeMany");
+    // Ids arrive as decimal strings — the core encodes them that way because
+    // `JSON.parse` cannot hold a u64; see `query_pair` in
+    // `interop/ffi/protocol/stores.rs`.
+    jsi::Value queriesVal = queriesJson.empty()
+                                ? jsi::Value(jsi::Array(rt, 0))
+                                : jsonParseUtf8(rt, queriesJson.data(), queriesJson.size());
+    jsi::Value promise =
+        method.callWithThis(rt, *store, idVal(rt, secretId), std::move(queriesVal));
+    keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
+  });
   return result.code;
 }
 
@@ -700,6 +781,36 @@ extern "C" int32_t secretStoreRemove(void* userData, uint64_t secretId, uint64_t
   return result.code;
 }
 
+/// `SecretStore.removeMany(secretId, entries) -> void`
+///
+/// `entries` arrives as a JSON array of `[channelId, kind]` pairs and is
+/// handed to JavaScript as that array. The buffer is owned by the core and
+/// valid only for this call, so it is copied before the promise is awaited.
+extern "C" int32_t secretStoreRemoveMany(void* userData, uint64_t secretId, const uint8_t* entries,
+                                          size_t entriesLen) {
+  auto* self = static_cast<StoreBindings*>(userData);
+  // Kept alive past this call so the lambda handed to `callSync` — which the
+  // JavaScript CallInvoker's queue may still be holding after this object's
+  // owner has released its own reference — has somewhere safe to run.
+  auto keepAlive = self->shared_from_this();
+  std::vector<uint8_t> entriesJson(entries, entries + entriesLen);
+  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId, entriesJson](std::function<void(CallResult)> settle) {
+    jsi::Runtime& rt = keepAlive->runtime();
+    auto store = keepAlive->secretStore();
+    auto method = store->getPropertyAsFunction(rt, "removeMany");
+    // Channel ids arrive as decimal strings — the core encodes them that way
+    // because `JSON.parse` cannot hold a u64 — and kinds as the numbers
+    // `remove` takes.
+    jsi::Value entriesVal = entriesJson.empty()
+                                ? jsi::Value(jsi::Array(rt, 0))
+                                : jsonParseUtf8(rt, entriesJson.data(), entriesJson.size());
+    jsi::Value promise =
+        method.callWithThis(rt, *store, idVal(rt, secretId), std::move(entriesVal));
+    keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
+  });
+  return result.code;
+}
+
 /// `ShareStore.load(secretId, channelId, versions) -> Share[]`
 extern "C" int32_t shareStoreLoad(void* userData, uint64_t secretId, uint64_t channelId,
                                    const uint8_t* versionsJsonPtr, size_t versionsJsonLen,
@@ -731,7 +842,7 @@ extern "C" int32_t shareStoreLoad(void* userData, uint64_t secretId, uint64_t ch
   return result.code;
 }
 
-/// `ShareStore.loadMany(secretId, channelIds, versions) -> Share[]`
+/// `ShareStore.loadMany(secretId, channelIds, versions) -> [channelId, Share][]`
 extern "C" int32_t shareStoreLoadMany(void* userData, uint64_t secretId, const uint8_t* channelIdsJsonPtr,
                                        size_t channelIdsJsonLen, const uint8_t* versionsJsonPtr,
                                        size_t versionsJsonLen, uint8_t** outPtr, size_t* outLen) {
@@ -752,7 +863,7 @@ extern "C" int32_t shareStoreLoadMany(void* userData, uint64_t secretId, const u
             method.callWithThis(rt, *store, idVal(rt, secretId),
                                  jsi::Value(rt, u64VectorToJsStringArray(rt, channelIds)),
                                  jsi::Value(rt, u32VectorToJsArray(rt, versions)));
-        keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toShareListResult);
+        keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toShareEntryListResult);
       });
   if (result.code == 0) {
     if (!writeOut(result.bytes, outPtr, outLen)) {
@@ -940,6 +1051,36 @@ extern "C" int32_t shareStoreRemoveVersions(void* userData, uint64_t secretId, u
   return result.code;
 }
 
+/// `ShareStore.removeVersionsMany(secretId, entries) -> void`
+///
+/// `entries` arrives as a JSON array of `[channelId, versions]` pairs and is
+/// handed to JavaScript as that array. The buffer is owned by the core and
+/// valid only for this call, so it is copied before the promise is awaited.
+extern "C" int32_t shareStoreRemoveVersionsMany(void* userData, uint64_t secretId, const uint8_t* entries,
+                                                 size_t entriesLen) {
+  auto* self = static_cast<StoreBindings*>(userData);
+  // Kept alive past this call so the lambda handed to `callSync` — which the
+  // JavaScript CallInvoker's queue may still be holding after this object's
+  // owner has released its own reference — has somewhere safe to run.
+  auto keepAlive = self->shared_from_this();
+  std::vector<uint8_t> entriesJson(entries, entries + entriesLen);
+  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId, entriesJson](std::function<void(CallResult)> settle) {
+    jsi::Runtime& rt = keepAlive->runtime();
+    auto store = keepAlive->shareStore();
+    auto method = store->getPropertyAsFunction(rt, "removeVersionsMany");
+    // Channel ids arrive as decimal strings — the core encodes them that way
+    // because `JSON.parse` cannot hold a u64 — and versions as the number
+    // arrays `removeVersions` takes.
+    jsi::Value entriesVal = entriesJson.empty()
+                                ? jsi::Value(jsi::Array(rt, 0))
+                                : jsonParseUtf8(rt, entriesJson.data(), entriesJson.size());
+    jsi::Value promise =
+        method.callWithThis(rt, *store, idVal(rt, secretId), std::move(entriesVal));
+    keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
+  });
+  return result.code;
+}
+
 /// `ShareStore.keepVersion(secretId, version) -> number`
 extern "C" int32_t shareStoreKeepVersion(void* userData, uint64_t secretId, uint32_t version,
                                           uint32_t* outVersion) {
@@ -1091,6 +1232,25 @@ extern "C" int32_t stateStoreRemove(void* userData, uint64_t secretId, const uin
     keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toBoolResult);
   });
   *outRemoved = result.bytes.empty() ? 0 : 1;
+  return result.code;
+}
+
+/// `StateStore.removeMany(secretId, keysJson) -> void`
+extern "C" int32_t stateStoreRemoveMany(void* userData, uint64_t secretId, const uint8_t* keysJsonPtr,
+                                         size_t keysJsonLen) {
+  auto* self = static_cast<StoreBindings*>(userData);
+  // Kept alive past this call so the lambda handed to `callSync` — which the
+  // JavaScript CallInvoker's queue may still be holding after this object's
+  // owner has released its own reference — has somewhere safe to run.
+  auto keepAlive = self->shared_from_this();
+  std::vector<uint8_t> keys(keysJsonPtr, keysJsonPtr + keysJsonLen);
+  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId, keys](std::function<void(CallResult)> settle) {
+    jsi::Runtime& rt = keepAlive->runtime();
+    auto store = keepAlive->stateStore();
+    auto method = store->getPropertyAsFunction(rt, "removeMany");
+    jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId), toUint8ArrayVal(rt, keys));
+    keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
+  });
   return result.code;
 }
 
@@ -1267,6 +1427,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
       channelStoreLoad,            // load
       channelStoreSave,            // save
       channelStoreRemove,          // remove
+      channelStoreRemoveMany,      // remove_many
       channelStoreListHelpers,     // list_helpers
       channelStoreListReplicas,    // list_replicas
       channelStoreLinkChannel,     // link_channel
@@ -1279,6 +1440,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
       secretStoreLoadMany, // load_many
       secretStoreSave,     // save
       secretStoreRemove,   // remove
+      secretStoreRemoveMany, // remove_many
       storeFreeBuffer,     // free_buffer
   };
   bindings->shareCallbacks_ = ShareStoreCallbacks{
@@ -1290,6 +1452,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
       shareStoreSave,               // save
       shareStoreRemoveChannel,      // remove_channel
       shareStoreRemoveVersions,     // remove_versions
+      shareStoreRemoveVersionsMany, // remove_versions_many
       shareStoreKeepVersion,        // keep_version
       shareStoreRecordVerification, // record_verification
       storeFreeBuffer,              // free_buffer
@@ -1306,6 +1469,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
       stateStoreSave,     // save
       stateStoreLoad,     // load
       stateStoreRemove,   // remove
+      stateStoreRemoveMany, // remove_many
       stateStoreLoadAll,  // load_all
       storeFreeBuffer,    // free_buffer
   };
@@ -1318,6 +1482,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
   requireField(rt, bindings->channelCallbacks_.load, "ChannelStoreCallbacks.load");
   requireField(rt, bindings->channelCallbacks_.save, "ChannelStoreCallbacks.save");
   requireField(rt, bindings->channelCallbacks_.remove, "ChannelStoreCallbacks.remove");
+  requireField(rt, bindings->channelCallbacks_.remove_many, "ChannelStoreCallbacks.remove_many");
   requireField(rt, bindings->channelCallbacks_.list_helpers, "ChannelStoreCallbacks.list_helpers");
   requireField(rt, bindings->channelCallbacks_.list_replicas, "ChannelStoreCallbacks.list_replicas");
   requireField(rt, bindings->channelCallbacks_.link_channel, "ChannelStoreCallbacks.link_channel");
@@ -1329,6 +1494,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
   requireField(rt, bindings->secretCallbacks_.load_many, "SecretStoreCallbacks.load_many");
   requireField(rt, bindings->secretCallbacks_.save, "SecretStoreCallbacks.save");
   requireField(rt, bindings->secretCallbacks_.remove, "SecretStoreCallbacks.remove");
+  requireField(rt, bindings->secretCallbacks_.remove_many, "SecretStoreCallbacks.remove_many");
   requireField(rt, bindings->secretCallbacks_.free_buffer, "SecretStoreCallbacks.free_buffer");
 
   requireField(rt, bindings->shareCallbacks_.user_data, "ShareStoreCallbacks.user_data");
@@ -1339,6 +1505,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
   requireField(rt, bindings->shareCallbacks_.save, "ShareStoreCallbacks.save");
   requireField(rt, bindings->shareCallbacks_.remove_channel, "ShareStoreCallbacks.remove_channel");
   requireField(rt, bindings->shareCallbacks_.remove_versions, "ShareStoreCallbacks.remove_versions");
+  requireField(rt, bindings->shareCallbacks_.remove_versions_many, "ShareStoreCallbacks.remove_versions_many");
   requireField(rt, bindings->shareCallbacks_.keep_version, "ShareStoreCallbacks.keep_version");
   requireField(rt, bindings->shareCallbacks_.record_verification,
                "ShareStoreCallbacks.record_verification");
@@ -1354,6 +1521,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
   requireField(rt, bindings->stateCallbacks_.save, "StateStoreCallbacks.save");
   requireField(rt, bindings->stateCallbacks_.load, "StateStoreCallbacks.load");
   requireField(rt, bindings->stateCallbacks_.remove, "StateStoreCallbacks.remove");
+  requireField(rt, bindings->stateCallbacks_.remove_many, "StateStoreCallbacks.remove_many");
   requireField(rt, bindings->stateCallbacks_.load_all, "StateStoreCallbacks.load_all");
   requireField(rt, bindings->stateCallbacks_.free_buffer, "StateStoreCallbacks.free_buffer");
 

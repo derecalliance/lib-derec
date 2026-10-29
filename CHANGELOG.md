@@ -7,6 +7,161 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
+### Unreleased
+
+- **Changed: removing a helper or a replica member publishes the next
+  version.** *(behavior change; every SDK)*
+
+  `start(Unpair)` only tore the channel down, leaving the remaining helpers
+  on a split the removed helper still held a share of, and
+  `start(UnpairReplica)` only announced the removal, which completed when the
+  application next called `start(ProtectSecret)`. Now:
+
+  - When an unpaired helper's channel is dropped and that helper held a share
+    this device distributed, the latest snapshot is published to the helpers
+    that remain, with the stored weights and threshold. Under
+    `UnpairAck::Required` this happens on the helper's answer in `process`, or
+    on the acknowledgement timeout in `process` or `tick`; under `NotRequired`,
+    in `start(Unpair)` itself. The recovery channels `restore` unpairs never
+    held a share and publish nothing.
+  - `start(UnpairReplica)` publishes the roster that omits the member, as the
+    latest snapshot or an empty payload when there is none. A group with
+    nothing published can now complete a removal.
+
+  Migration: drop any `start(ProtectSecret)` the application ran after an
+  unpair or a replica removal, or it publishes one version more than needed.
+  A publish error (`InvalidWeight`, for one) is now returned by
+  `start(Unpair)`, `start(UnpairReplica)` and `process`, with the unpair
+  already done; `tick` logs it.
+
+- **Fixed: a publish the library starts on its own no longer runs below the
+  threshold.** *(bug fix; every SDK)*
+
+  Pairing or confirming a helper with a snapshot stored ran a round even when
+  the helpers' weights stayed below the threshold: it split nothing, sent
+  nothing and consumed a version. Those rounds, and the new unpair ones, now
+  run only when the helpers meet the threshold or a replica member needs the
+  roster. An explicit `start(ProtectSecret)` below the threshold is unchanged.
+
+- **Added: `remove_many` on the channel, secret and state stores.**
+  *(breaking; every SDK)*
+
+  `DeRecChannelStore::remove_many` removes every record a list of
+  `ChannelQuery` addresses in one call, with
+  `remove`'s semantics per entry (a replica query removes that member only)
+  and skipping entries that name no record. The library uses it when it
+  removes several records at once, so a backend can delete them in one
+  statement or transaction. The FFI `ChannelStoreCallbacks` gains a
+  `remove_many` slot right after `remove`, taking a JSON array of
+  `[channel_id, replica_id]` decimal-string pairs. Spelled `RemoveMany`
+  (.NET, Go) and `removeMany(secretId, queries)` (Node, web, React Native).
+
+  `DeRecSecretStore::remove_many(secret_id, &[(ChannelId, SecretKind)])` and
+  `DeRecStateStore::remove_many(secret_id, &[StateKey])` do the same for
+  secrets and state rows: `remove` per entry, skipping what is not stored.
+  Over FFI each gets a `remove_many` slot right after `remove`: the secret
+  slot takes a JSON array of `[channel_id, kind]` pairs (decimal-string id,
+  numeric kind), the state slot a JSON array of the key records `remove`
+  takes. In Node, web and React Native they are
+  `SecretStore.removeMany(secretId, entries)` and
+  `StateStore.removeMany(secretId, keysJson)`; in .NET
+  `ISecretStore.RemoveMany(secretId, IReadOnlyList<(ulong ChannelId, SecretKind Kind)>)`
+  and `IStateStore.RemoveMany(secretId, IReadOnlyList<StateKey>)`; in Go
+  `SecretStore.RemoveMany(secretID, []protocol.SecretEntry)` and
+  `StateStore.RemoveMany(secretID, []protocol.StateKey)`.
+
+  Migration: implement all three on every store.
+
+- **Fixed: the expired-channel sweep leaves nothing behind.** *(bug fix;
+  every SDK)*
+
+  Removing an expired `Pending` helper channel now also removes the unpair
+  or verification state started on it, which was left to time out on its
+  own. The sweep removes the channels' state, keys and pairing material
+  before the records, each with one `remove_many` call per store, so a store
+  failure partway leaves the record for the next sweep to retry rather than
+  a key with nothing pointing at it.
+
+- **Added: `DeRecShareStore::remove_versions_many`.** *(breaking; every SDK)*
+
+  `remove_versions_many(secret_id, &[(ChannelId, Vec<u32>)])` drops, for
+  each entry, the shares stored on that channel at those versions in one
+  call: `remove_versions` per entry, skipping versions that are not stored.
+  The owner uses it to drop the proofs its open sharing rounds gave up,
+  failed and pruned alike, in one call per settling pass, where it made one
+  call per helper channel per round. Over FFI the `ShareStoreCallbacks`
+  gains a `remove_versions_many` slot right after `remove_versions`, taking
+  a JSON array of `[channel_id, versions]` pairs (decimal-string id, array
+  of version numbers). In .NET it is
+  `IShareStore.RemoveVersionsMany(secretId, IReadOnlyList<(ulong ChannelId, uint[] Versions)>)`,
+  in Go `ShareStore.RemoveVersionsMany(secretID, []protocol.ShareVersionsEntry)`,
+  and in Node, web and React Native `ShareStore.removeVersionsMany(secretId, entries)`
+  with `[channelId, versions]` pairs.
+
+  Migration: implement it on every share store.
+
+- **Changed: `DeRecShareStore::load_many` returns each share with its
+  channel.** *(breaking; every SDK)*
+
+  It returns `Vec<(ChannelId, Share)>` instead of `Vec<Share>`, so a caller
+  loading several channels at once can tell which channel each share came
+  from. The owner uses it to read every confirmed helper's tracking share in
+  one call when a round completes, where it made one call per helper. Over
+  FFI, the `load_many` callback's buffer becomes a JSON array of
+  `[channel_id, share]` pairs (`channel_id` a decimal string, `share` the
+  object it already returned); in Node, web and React Native `loadMany`
+  resolves to `[channelId, share][]`; .NET `IShareStore.LoadMany` returns
+  `IEnumerable<(ulong ChannelId, Share Share)>`; Go `ShareStore.LoadMany`
+  returns `[]protocol.ShareEntry` (`ChannelID`, `Share`).
+
+  Migration: return the channel each share is stored under alongside it.
+  Every store already keys shares by channel.
+
+- **Fixed: `ReplicaDiscovery` asks only `Paired` members.** *(bug fix;
+  every SDK)*
+
+  It asked every other member, `Pending` and `Unpairing` ones included, and
+  waits for every member it reached with no timeout. A `Pending` member whose
+  pairing expired, or a lost device flagged `Unpairing`, never answered, so
+  the check never finished and no `ReplicaDiscoveryComplete` was emitted.
+
+- **Fixed: a sharing round acts only on what it has stored.** *(bug fix;
+  every SDK)*
+
+  A store failure while settling a round was swallowed, mostly without a
+  log, and the round went on as if the write had worked. A round whose save
+  failed still dropped its failed helpers' proofs and reported their
+  timeouts. A round whose removal failed was reported complete, and could
+  be completed or timed out again later. A failed weight read reported
+  `threshold_met: false` for a round that may have met it. A failed
+  departed-member removal left the member's row behind for good. Now a
+  round reports its events and gives up its proofs only once its new state
+  is stored. A round that cannot read its helpers' weights or remove its
+  departed members is kept as it is and completes on a later call. Each
+  failure is logged.
+
+  A state store failure while `process` records a message's answers on the
+  open rounds is now returned as a `ProcessError`, carrying the call's
+  events. It used to be logged only: the call succeeded, and the round
+  later timed out a helper that had confirmed. Processing the same message
+  again, within the inbound message timeout, records the answers; that call
+  repeats only the message's own events, never a round's. `tick` still logs
+  the failure and settles the round on its next call.
+
+- **Removed: the transport adapters.** *(breaking; every SDK)*
+
+  `SendOne`, `SequentialFailover` and `SingleEndpointTransport` (Rust, .NET's
+  `ISendOne`, Go) and `SendOne`, `sequentialFailover` and
+  `singleEndpointTransport` (Node, web, React Native) are gone. They assumed
+  the message is dialed inside `send`, which is not how transports that
+  collect messages during `process` and deliver them afterwards work. The
+  `send` contract is unchanged: try the endpoints in the peer's order, stop at
+  the first success, fail only when none worked.
+
+  Migration: implement `DeRecTransport` (`ITransport`, `Transport`) directly,
+  with the loop the adapter ran: dial each endpoint in order, return on the
+  first success, and return the last error when every endpoint failed.
+
 ### 0.0.10
 
 A body naming a group member is accepted only on that member's own channel,

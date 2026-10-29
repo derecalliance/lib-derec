@@ -9,7 +9,6 @@
 //! string and acting on the comparison are the two halves here.
 
 use super::DeRecProtocol;
-use super::context::Round;
 use super::traits::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport,
     DeRecUserSecretStore,
@@ -92,7 +91,10 @@ impl<
     /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret). A device holding no snapshot still
     /// publishes an empty one to a promoted Destination, since the payload
     /// carries the roster; a promoted helper, for which an empty payload is
-    /// inert, is sent nothing. That publish reuses every Helper's stored
+    /// inert, is sent nothing. The publish runs only when it reaches someone:
+    /// a promotion that leaves the Helpers below the threshold, with no
+    /// replica member to sync, publishes nothing and consumes no version.
+    /// That publish reuses every Helper's stored
     /// weight, and a newly promoted Helper is at `1`. A stored weight that is
     /// invalid under the round's threshold fails it with
     /// [`SharingError::InvalidWeight`](crate::primitives::sharing::SharingError::InvalidWeight)
@@ -139,8 +141,9 @@ impl<
         let mut transitioned_replica = false;
         let members = self
             .channel_store
-            .replicas_matching(
+            .replicas_on_channel(
                 self.secret_id,
+                channel_id,
                 crate::protocol::types::ReplicaFilter {
                     status: vec![crate::protocol::types::ChannelStatus::Pending],
                     ..Default::default()
@@ -148,9 +151,6 @@ impl<
             )
             .await?;
         for mut member in members {
-            if member.channel_id != channel_id {
-                continue;
-            }
             if member.role == crate::protocol::types::ReplicaRole::Destination
                 && Some(member.replica_id.0) != self.replica_id
             {
@@ -168,29 +168,16 @@ impl<
         if transitioned_replica || transitioned_helper {
             let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;
             let payload = match snapshot {
-                Some(s) => Some((s.secrets, s.description)),
+                Some(s) => Some((s.secrets, s.description, s.threshold)),
                 None if transitioned_replica || self.has_paired_replica_destination().await? => {
-                    Some((Vec::new(), None))
+                    Some((Vec::new(), None, None))
                 }
                 None => None,
             };
-            if let Some((secrets, description)) = payload {
-                let reply_to: Vec<derec_proto::TransportProtocol> = if self.auto_reply_to {
-                    self.own_transports.clone()
-                } else {
-                    Vec::new()
-                };
-                self.start_protect_secret(
-                    secrets,
-                    description,
-                    None,
-                    None,
-                    &Round {
-                        reply_to: &reply_to,
-                        trace_id: crate::derec_message::fresh_trace_id(),
-                    },
-                )
-                .await?;
+            if let Some((secrets, description, threshold)) = payload
+                && self.auto_round_reaches_anyone(threshold).await?
+            {
+                self.start_auto_protect_secret(secrets, description).await?;
             }
         }
 
@@ -206,9 +193,8 @@ impl<
 
         if self
             .channel_store
-            .load(self.secret_id, ChannelQuery::Helper { channel_id })
+            .load_helper(self.secret_id, channel_id)
             .await?
-            .and_then(|r| r.as_helper().cloned())
             .is_some_and(|helper| helper.status == ChannelStatus::Pending)
         {
             self.channel_store
@@ -218,8 +204,9 @@ impl<
 
         let peers = self
             .channel_store
-            .replicas_matching(
+            .replicas_on_channel(
                 self.secret_id,
+                channel_id,
                 ReplicaFilter {
                     status: vec![ChannelStatus::Pending],
                     exclude: self.exclude_self(),
@@ -227,7 +214,7 @@ impl<
                 },
             )
             .await?;
-        for peer in peers.into_iter().filter(|m| m.channel_id == channel_id) {
+        for peer in peers {
             self.channel_store
                 .remove(
                     self.secret_id,

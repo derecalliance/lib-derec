@@ -741,10 +741,12 @@ pub enum DeRecFlow {
     /// it is.
     ///
     /// **Replica-only.** Requires a configured `replica_id` and at least one
-    /// other group member. Every member is asked which version it holds; the
-    /// one holding the newest state is then asked for it, and the reply is
-    /// hydrated exactly as an inbound sync would be. Ties resolve to the
-    /// group's `Source`.
+    /// other group member. Every other `Paired` member is asked which version
+    /// it holds; the one holding the newest state is then asked for it, and
+    /// the reply is hydrated exactly as an inbound sync would be. Ties resolve
+    /// to the group's `Source`. `Pending` and `Unpairing` members are not
+    /// asked: the check waits for every member it reached and has no timeout,
+    /// so one that never answers would keep it open forever.
     ///
     /// A member reporting an *older* version than this device is ignored —
     /// the check never turns into a publish. Nothing here writes to a peer.
@@ -762,23 +764,26 @@ pub enum DeRecFlow {
     /// eviction. A `replica_id` that names no current member is rejected with
     /// [`crate::Error::InvalidInput`] rather than silently doing nothing.
     ///
-    /// # Announcing is all this flow does
+    /// # The flow announces, then publishes
     ///
     /// `start` tells every member, including the departing one, and flags that
-    /// member locally. **It removes nothing on its own, and emits no
-    /// [`DeRecEvent::ReplicaRemoved`].** The flag keeps the member out of the
-    /// next roster while leaving it on the distribution list, which is how it
-    /// learns it may tear down.
+    /// member locally. The flag keeps the member out of the next roster while
+    /// leaving it on the distribution list, which is how it learns it may tear
+    /// down.
     ///
-    /// The removal completes only when **the application publishes a roster
-    /// that omits the member** — an ordinary
-    /// [`DeRecFlow::ProtectSecret`]. `ReplicaRemoved` fires when that round
-    /// completes, not before. An application that calls this flow and then
-    /// waits for the event without publishing waits forever.
+    /// The same `start` then publishes that roster: the latest snapshot as the
+    /// next version, as an ordinary [`DeRecFlow::ProtectSecret`] reusing the
+    /// stored weights and threshold, or an empty payload when nothing has been
+    /// published yet, since the roster is what the removal needs. Its events
+    /// are returned with the announcement's. **`start` emits no
+    /// [`DeRecEvent::ReplicaRemoved`]**: that fires when the round completes,
+    /// once the departing member acknowledges the version that excludes it.
     ///
-    /// One consequence is worth stating plainly: **a group with no secret to
-    /// publish cannot complete a removal**, because there is no roster to
-    /// send. The member stays flagged until something is published.
+    /// The publish can fail like any other, for example with
+    /// [`SharingError::InvalidWeight`](crate::primitives::sharing::SharingError::InvalidWeight)
+    /// when a stored weight no longer fits the threshold. `start` then returns
+    /// that error; the announcement has already gone out and the flag stands,
+    /// so the removal completes on the next `ProtectSecret`.
     ///
     /// A member tears down only once it has been told to leave *and* has seen
     /// a newer roster excluding it. Absence alone never destroys a copy of the
@@ -821,6 +826,27 @@ pub enum DeRecFlow {
     /// Whether the local state for `channel_id` is dropped immediately on
     /// `start(Unpair)` or only after the peer acknowledges is governed by
     /// [`crate::protocol::DeRecProtocolBuilder::with_unpair_ack`].
+    ///
+    /// # The removal republishes
+    ///
+    /// When the channel is dropped — in this `start` without an
+    /// acknowledgement, otherwise when the helper's answer reaches
+    /// [`process`](super::DeRecProtocol::process) or the acknowledgement times
+    /// out in `process` or [`tick`](super::DeRecProtocol::tick) — and the helper
+    /// held a share this device distributed, the latest snapshot is published
+    /// as the next version to the Helpers that remain, reusing the stored
+    /// weights and threshold. The removed helper's share then belongs to a
+    /// split nothing else is built on. The round's events are returned
+    /// alongside [`DeRecEvent::Unpaired`].
+    ///
+    /// Nothing is published when the remaining Helpers fall below the
+    /// threshold and no replica member needs the roster, when there is no
+    /// snapshot, or when the helper held no share — the recovery-mode
+    /// channels `restore` unpairs among them. A publish that fails is
+    /// returned as the error of `start` or `process`, with the channel already
+    /// dropped; `tick` has no error to return, so there the failure is logged
+    /// and the remaining Helpers keep the previous version until the next
+    /// [`DeRecFlow::ProtectSecret`].
     Unpair {
         channel_id: ChannelId,
         /// Optional human-readable reason embedded into the wire request.

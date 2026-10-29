@@ -138,6 +138,23 @@ impl DeRecChannelStore for InMemoryChannelStore {
         };
         Box::pin(std::future::ready(Ok(removed)))
     }
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        queries: &[ChannelQuery],
+    ) -> ChannelStoreFuture<'_, ()> {
+        for query in queries {
+            match *query {
+                ChannelQuery::Helper { channel_id } => {
+                    self.helper_rows.remove(&(secret_id, channel_id.0));
+                }
+                ChannelQuery::Replica { replica_id, .. } => {
+                    self.member_rows.remove(&(secret_id, replica_id.0));
+                }
+            }
+        }
+        Box::pin(std::future::ready(Ok(())))
+    }
 
     fn helpers(
         &self,
@@ -278,6 +295,16 @@ impl DeRecSecretStore for InMemorySecretStore {
         self.data.remove(&(secret_id, channel_id.0, kind as u8));
         Box::pin(std::future::ready(Ok(())))
     }
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, SecretKind)],
+    ) -> SecretStoreFuture<'_, ()> {
+        for &(channel_id, kind) in entries {
+            self.data.remove(&(secret_id, channel_id.0, kind as u8));
+        }
+        Box::pin(std::future::ready(Ok(())))
+    }
 }
 
 fn clone_secret_value(v: &SecretValue) -> SecretValue {
@@ -318,10 +345,10 @@ impl DeRecShareStore for InMemoryShareStore {
         secret_id: u64,
         channel_ids: &[ChannelId],
         versions: &[u32],
-    ) -> ShareStoreFuture<'_, Vec<Share>> {
+    ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
         let cid_set: HashSet<u64> = channel_ids.iter().map(|c| c.0).collect();
         let version_set: HashSet<u32> = versions.iter().copied().collect();
-        let result: Vec<Share> = self
+        let result: Vec<(ChannelId, Share)> = self
             .data
             .iter()
             .filter(|((c, s, v), _)| {
@@ -329,7 +356,7 @@ impl DeRecShareStore for InMemoryShareStore {
                     && *s == secret_id
                     && (version_set.is_empty() || version_set.contains(v))
             })
-            .map(|(_, s)| s.clone())
+            .map(|((c, _, _), s)| (ChannelId(*c), s.clone()))
             .collect();
         Box::pin(std::future::ready(Ok(result)))
     }
@@ -394,6 +421,20 @@ impl DeRecShareStore for InMemoryShareStore {
         Box::pin(std::future::ready(Ok(())))
     }
 
+    fn remove_versions_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, Vec<u32>)],
+    ) -> ShareStoreFuture<'_, ()> {
+        self.data.retain(|(c, s, v), _| {
+            !(*s == secret_id
+                && entries
+                    .iter()
+                    .any(|(channel_id, versions)| *c == channel_id.0 && versions.contains(v)))
+        });
+        Box::pin(std::future::ready(Ok(())))
+    }
+
     fn keep_version(&self, _: u64, version: u32) -> ShareStoreFuture<'_, u32> {
         Box::pin(std::future::ready(Ok(version.saturating_sub(1))))
     }
@@ -440,6 +481,12 @@ impl DeRecStateStore for InMemoryStateStore {
     fn remove(&mut self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, bool> {
         let removed = self.data.remove(&(secret_id, key)).is_some();
         Box::pin(std::future::ready(Ok(removed)))
+    }
+    fn remove_many(&mut self, secret_id: u64, keys: &[StateKey]) -> StateStoreFuture<'_, ()> {
+        for key in keys {
+            self.data.remove(&(secret_id, key.clone()));
+        }
+        Box::pin(std::future::ready(Ok(())))
     }
 
     fn load_all(&self, secret_id: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {

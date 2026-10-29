@@ -583,6 +583,8 @@ using DeRec.Library;
 using DeRec.Library.Orchestrator;
 using DeRec.Library.Primitives;
 
+// Your store implementations; smoke-tests/dotnet/InMemoryStores.cs has
+// in-memory ones to copy.
 var channelStore = new InMemoryChannelStore();
 var shareStore   = new InMemoryShareStore();
 var secretStore  = new InMemorySecretStore();
@@ -813,8 +815,8 @@ filter faithfully is still your job.
 App-side responsibilities (mirrors the other SDKs):
 
 - Implement `IChannelStore`, `IShareStore`, `ISecretStore`, `ITransport`
-  with persistent backends. `InMemoryChannelStore` / `InMemoryShareStore`
-  / `InMemorySecretStore` / `RecordingTransport` ship for tests.
+  with persistent backends. The library ships none: the in-memory stores
+  in `smoke-tests/dotnet/InMemoryStores.cs` are a starting point to copy.
 - Run a reachable endpoint. Delivery is push-only: a reply produced by
   `ProcessAsync` goes out through `ITransport`, addressed to the peer, and
   is never returned to the caller. Recommended HTTP conventions (not

@@ -96,6 +96,9 @@ internal static class Protocol
         RunOrchestratorUnpairingFlowTest();
         RunOrchestratorUpdateChannelInfoFlowTest();
         RunOrchestratorReplyToFlowTest();
+        RunOrchestratorPairingBelowThresholdPublishesNothingFlowTest();
+        RunOrchestratorUnpairRepublishesFlowTest();
+        RunOrchestratorReplicaRemovalPublishesTheRosterFlowTest();
         RunOrchestratorReplicaIdWiringSadPathsTest();
         RunOrchestratorReplicaPairAndSecretSyncTest();
         RunReplicaVersionConflictEventParseTest();
@@ -3521,6 +3524,228 @@ internal static class Protocol
         Console.WriteLine("  default envelope.reply_to is unset  ✓");
 
         Console.WriteLine("Orchestrator replyTo flow test passed.");
+    }
+
+    /// <summary>
+    /// The <c>ShareStored</c> events in <paramref name="events"/> as
+    /// <c>(channelId, version)</c> pairs, ordered by channel id.
+    /// </summary>
+    private static List<(ulong ChannelId, uint Version)> StoredVersions(IEnumerable<DeRecEvent> events) =>
+        events.OfType<ShareStoredEvent>()
+            .Select(e => (e.ChannelId, e.Version))
+            .OrderBy(s => s.ChannelId)
+            .ToList();
+
+    /// <summary>
+    /// A publish the library starts on its own runs only once the helpers
+    /// meet the threshold: with <c>threshold = 3</c>, pairing the second
+    /// helper after a below-threshold <c>ProtectSecret</c> publishes nothing
+    /// and consumes no version, and pairing the third publishes the stored
+    /// snapshot to all three. Mirrors the Rust binding's
+    /// <c>run_pairing_below_threshold_publishes_nothing_flow</c>.
+    /// </summary>
+    private static void RunOrchestratorPairingBelowThresholdPublishesNothingFlowTest()
+    {
+        Console.WriteLine("=== Orchestrator pairing below threshold publishes nothing flow test ===");
+
+        const string ownerUri = "https://owner.example.com";
+        const string helperAUri = "https://helper-a.example.com";
+        const string helperBUri = "https://helper-b.example.com";
+        const string helperCUri = "https://helper-c.example.com";
+
+        using var owner = MakeNode("Owner", ownerUri, new NodeOptions { Threshold = 3 });
+        using var helperA = MakeNode("HelperA", helperAUri);
+        using var helperB = MakeNode("HelperB", helperBUri);
+        using var helperC = MakeNode("HelperC", helperCUri);
+        ulong secretId = owner.Protocol.SecretId;
+
+        DoOrchestratorPair(owner, owner.Transport, helperA, helperA.Transport, 71UL, Pairing.SenderKind.Helper);
+        owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret
+                {
+                    Id = new byte[] { 7 },
+                    Name = "staged",
+                    Data = Encoding.UTF8.GetBytes("stored before the helpers meet the threshold"),
+                },
+            },
+        }).GetAwaiter().GetResult();
+        PumpAll(new[] { (owner, ownerUri), (helperA, helperAUri) });
+        AssertLatestVersion(owner, secretId, 1);
+
+        HelperStartPair(owner, helperB, 72UL);
+        var events = PumpAll(new[] { (owner, ownerUri), (helperA, helperAUri), (helperB, helperBUri) });
+        if (StoredVersions(events).Count != 0)
+            throw new InvalidOperationException(
+                "two helpers cannot meet a threshold of 3, so nothing is shared, got ["
+                + string.Join(", ", events.Select(e => e.EventType)) + "]");
+        AssertLatestVersion(owner, secretId, 1);
+        Console.WriteLine("  second helper paired below the threshold: nothing published  ✓");
+
+        HelperStartPair(owner, helperC, 73UL);
+        events = PumpAll(new[]
+        {
+            (owner, ownerUri), (helperA, helperAUri), (helperB, helperBUri), (helperC, helperCUri),
+        });
+        var stored = StoredVersions(events);
+        if (stored.Count != 3 || stored.Any(s => s.Version != 2u))
+            throw new InvalidOperationException(
+                "every helper stores the snapshot at v=2, got ["
+                + string.Join(", ", stored.Select(s => $"{s.ChannelId}@v{s.Version}")) + "]");
+        AssertLatestVersion(owner, secretId, 2);
+        Console.WriteLine("  third helper meets the threshold: v2 shared with all three  ✓");
+
+        Console.WriteLine("Orchestrator pairing below threshold publishes nothing flow test passed.");
+    }
+
+    /// <summary>
+    /// Removing a helper that holds a share republishes the latest snapshot
+    /// to the helpers that remain once the helper acknowledges, so the
+    /// removed helper's share belongs to a split nothing else is built on. A
+    /// removal that leaves the helpers below the threshold publishes
+    /// nothing. Mirrors the Rust binding's <c>run_unpair_republishes_flow</c>.
+    /// </summary>
+    private static void RunOrchestratorUnpairRepublishesFlowTest()
+    {
+        Console.WriteLine("=== Orchestrator unpair republishes flow test ===");
+
+        const string ownerUri = "https://owner.example.com";
+        const string helperAUri = "https://helper-a.example.com";
+        const string helperBUri = "https://helper-b.example.com";
+        const string helperCUri = "https://helper-c.example.com";
+
+        using var owner = MakeNode("Owner", ownerUri);
+        using var helperA = MakeNode("HelperA", helperAUri);
+        using var helperB = MakeNode("HelperB", helperBUri);
+        using var helperC = MakeNode("HelperC", helperCUri);
+        ulong secretId = owner.Protocol.SecretId;
+
+        ulong channelA = DoOrchestratorPair(owner, owner.Transport, helperA, helperA.Transport, 81UL, Pairing.SenderKind.Helper);
+        ulong channelB = DoOrchestratorPair(owner, owner.Transport, helperB, helperB.Transport, 82UL, Pairing.SenderKind.Helper);
+        ulong channelC = DoOrchestratorPair(owner, owner.Transport, helperC, helperC.Transport, 83UL, Pairing.SenderKind.Helper);
+        var allScope = new[]
+        {
+            (owner, ownerUri), (helperA, helperAUri), (helperB, helperBUri), (helperC, helperCUri),
+        };
+
+        owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret
+                {
+                    Id = new byte[] { 8 },
+                    Name = "republished",
+                    Data = Encoding.UTF8.GetBytes("split again when a helper leaves"),
+                },
+            },
+        }).GetAwaiter().GetResult();
+        PumpAll(allScope);
+        AssertLatestVersion(owner, secretId, 1);
+
+        var started = owner.Protocol.StartAsync(FlowKind.Unpair, new UnpairParams
+        {
+            ChannelId = channelC,
+        }).GetAwaiter().GetResult();
+        if (started.OfType<ProtectSecretStartedEvent>().Any())
+            throw new InvalidOperationException(
+                "nothing is published before the helper acknowledges, got ["
+                + string.Join(", ", started.Select(e => e.EventType)) + "]");
+        var events = PumpAll(allScope);
+        if (!events.OfType<UnpairedEvent>().Any(e => e.ChannelId == channelC))
+            throw new InvalidOperationException(
+                "expected Unpaired for helper-c, got ["
+                + string.Join(", ", events.Select(e => e.EventType)) + "]");
+        var stored = StoredVersions(events);
+        var expected = new List<(ulong, uint)> { (channelA, 2u), (channelB, 2u) }
+            .OrderBy(s => s.Item1)
+            .ToList();
+        if (!stored.SequenceEqual(expected))
+            throw new InvalidOperationException(
+                "the remaining helpers store v2 and the removed one nothing, got ["
+                + string.Join(", ", stored.Select(s => $"{s.ChannelId}@v{s.Version}")) + "]");
+        AssertLatestVersion(owner, secretId, 2);
+        Console.WriteLine("  helper-c acknowledged its removal: v2 republished to helper-a and helper-b  ✓");
+
+        owner.Protocol.StartAsync(FlowKind.Unpair, new UnpairParams
+        {
+            ChannelId = channelB,
+        }).GetAwaiter().GetResult();
+        events = PumpAll(new[] { (owner, ownerUri), (helperA, helperAUri), (helperB, helperBUri) });
+        if (StoredVersions(events).Count != 0)
+            throw new InvalidOperationException(
+                "one helper cannot meet a threshold of 2, so nothing is shared, got ["
+                + string.Join(", ", events.Select(e => e.EventType)) + "]");
+        AssertLatestVersion(owner, secretId, 2);
+        Console.WriteLine("  removal below the threshold: nothing published  ✓");
+
+        Console.WriteLine("Orchestrator unpair republishes flow test passed.");
+    }
+
+    /// <summary>
+    /// <c>start(UnpairReplica)</c> announces the removal and publishes the
+    /// roster that omits the member, so the removal completes with no
+    /// further call: the destination tears down and the source drops its
+    /// row. Mirrors the Rust binding's
+    /// <c>run_replica_removal_publishes_the_roster_flow</c>.
+    /// </summary>
+    private static void RunOrchestratorReplicaRemovalPublishesTheRosterFlowTest()
+    {
+        Console.WriteLine("=== Orchestrator replica removal publishes the roster flow test ===");
+
+        const string sourceUri = "https://source.example.com";
+        const string destinationUri = "https://destination.example.com";
+        const ulong destinationId = 0xD0D0_D0D0_D0D0_D0D0UL;
+
+        using var source = MakeNode("Source", sourceUri,
+            new NodeOptions { SecretId = 0xFADEUL, ReplicaId = 0x5050_5050_5050_5050UL });
+        using var destination = MakeNode("Destination", destinationUri,
+            new NodeOptions { ReplicaId = destinationId });
+        var scope = new[] { (source, sourceUri), (destination, destinationUri) };
+        ulong secretId = source.Protocol.SecretId;
+
+        ulong replicaChannel = PairReplicaHandshake(source, destination, 91UL);
+        CrossConfirmFingerprint(source, destination, replicaChannel);
+        PumpAll(scope);
+
+        source.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret
+                {
+                    Id = new byte[] { 9 },
+                    Name = "mirrored",
+                    Data = Encoding.UTF8.GetBytes("held by both devices"),
+                },
+            },
+        }).GetAwaiter().GetResult();
+        PumpAll(scope);
+        uint before = source.UserSecretStore.LoadLatest(secretId)?.Version
+            ?? throw new InvalidOperationException("the source has published");
+
+        source.Protocol.StartAsync(FlowKind.UnpairReplica, new UnpairReplicaParams
+        {
+            ReplicaId = destinationId,
+            Memo = "retired device",
+        }).GetAwaiter().GetResult();
+        // The removal publishes the next version itself.
+        AssertLatestVersion(source, secretId, before + 1);
+
+        var events = PumpAll(scope);
+        if (!events.OfType<SelfRemovedFromGroupEvent>().Any())
+            throw new InvalidOperationException(
+                "the destination must tear down on the roster that omits it, got ["
+                + string.Join(", ", events.Select(e => e.EventType)) + "]");
+        if (!events.OfType<ReplicaRemovedEvent>().Any(e => e.ReplicaId == destinationId))
+            throw new InvalidOperationException(
+                "the source must report the removal complete, got ["
+                + string.Join(", ", events.Select(e => e.EventType)) + "]");
+        Console.WriteLine("  removal completed with no ProtectSecret from the application  ✓");
+
+        Console.WriteLine("Orchestrator replica removal publishes the roster flow test passed.");
     }
 
     /// <summary>

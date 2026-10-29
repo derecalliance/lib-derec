@@ -6,6 +6,7 @@ package native
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -21,6 +22,7 @@ type mockChannelStore struct {
 	loadFn         func(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error)
 	saveFn         func(secretID uint64, record ChannelRecord) error
 	removeFn       func(secretID, channelID, replicaID uint64) (bool, error)
+	removeManyFn   func(secretID uint64, queries []ChannelQuery) error
 	listHelpersFn  func(secretID uint64) ([]HelperChannel, error)
 	listReplicasFn func(secretID uint64) ([]ReplicaMember, error)
 	linkFn         func(secretID, a, b uint64) error
@@ -35,6 +37,9 @@ func (m *mockChannelStore) Save(secretID uint64, record ChannelRecord) error {
 }
 func (m *mockChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, error) {
 	return m.removeFn(secretID, channelID, replicaID)
+}
+func (m *mockChannelStore) RemoveMany(secretID uint64, queries []ChannelQuery) error {
+	return m.removeManyFn(secretID, queries)
 }
 func (m *mockChannelStore) ListHelpers(secretID uint64, _ HelperFilter) ([]HelperChannel, error) {
 	return m.listHelpersFn(secretID)
@@ -52,10 +57,11 @@ func (m *mockChannelStore) LinkedChannels(secretID, channelID uint64) ([]uint64,
 var _ channelStore = (*mockChannelStore)(nil)
 
 type mockSecretStore struct {
-	loadFn     func(secretID, channelID uint64, kind SecretKind) (SecretValue, bool, error)
-	loadManyFn func(secretID uint64, channelIDs []uint64, kind SecretKind) ([]*SecretValue, error)
-	saveFn     func(secretID, channelID uint64, value SecretValue) error
-	removeFn   func(secretID, channelID uint64, kind SecretKind) error
+	loadFn       func(secretID, channelID uint64, kind SecretKind) (SecretValue, bool, error)
+	loadManyFn   func(secretID uint64, channelIDs []uint64, kind SecretKind) ([]*SecretValue, error)
+	saveFn       func(secretID, channelID uint64, value SecretValue) error
+	removeFn     func(secretID, channelID uint64, kind SecretKind) error
+	removeManyFn func(secretID uint64, entries []SecretEntry) error
 }
 
 func (m *mockSecretStore) Load(secretID, channelID uint64, kind SecretKind) (SecretValue, bool, error) {
@@ -70,17 +76,21 @@ func (m *mockSecretStore) Save(secretID, channelID uint64, value SecretValue) er
 func (m *mockSecretStore) Remove(secretID, channelID uint64, kind SecretKind) error {
 	return m.removeFn(secretID, channelID, kind)
 }
+func (m *mockSecretStore) RemoveMany(secretID uint64, entries []SecretEntry) error {
+	return m.removeManyFn(secretID, entries)
+}
 
 var _ secretStore = (*mockSecretStore)(nil)
 
 type mockShareStore struct {
 	loadFn               func(secretID, channelID uint64, versions []uint32) ([]Share, error)
-	loadManyFn           func(secretID uint64, channelIDs []uint64, versions []uint32) ([]Share, error)
+	loadManyFn           func(secretID uint64, channelIDs []uint64, versions []uint32) ([]ShareEntry, error)
 	loadAllFn            func(secretID uint64, channelIDs []uint64) ([]Share, error)
 	latestVersionFn      func(secretID uint64) (uint32, bool, error)
 	saveFn               func(secretID, channelID uint64, share Share) error
 	removeChannelFn      func(secretID, channelID uint64) error
 	removeVersionsFn     func(secretID, channelID uint64, versions []uint32) error
+	removeVersionsManyFn func(secretID uint64, entries []ShareVersionsEntry) error
 	keepVersionFn        func(secretID uint64, version uint32) (uint32, error)
 	recordVerificationFn func(secretID, channelID uint64, version uint32) error
 }
@@ -88,7 +98,7 @@ type mockShareStore struct {
 func (m *mockShareStore) Load(secretID, channelID uint64, versions []uint32) ([]Share, error) {
 	return m.loadFn(secretID, channelID, versions)
 }
-func (m *mockShareStore) LoadMany(secretID uint64, channelIDs []uint64, versions []uint32) ([]Share, error) {
+func (m *mockShareStore) LoadMany(secretID uint64, channelIDs []uint64, versions []uint32) ([]ShareEntry, error) {
 	return m.loadManyFn(secretID, channelIDs, versions)
 }
 func (m *mockShareStore) LoadAll(secretID uint64, channelIDs []uint64) ([]Share, error) {
@@ -105,6 +115,9 @@ func (m *mockShareStore) RemoveChannel(secretID, channelID uint64) error {
 }
 func (m *mockShareStore) RemoveVersions(secretID, channelID uint64, versions []uint32) error {
 	return m.removeVersionsFn(secretID, channelID, versions)
+}
+func (m *mockShareStore) RemoveVersionsMany(secretID uint64, entries []ShareVersionsEntry) error {
+	return m.removeVersionsManyFn(secretID, entries)
 }
 func (m *mockShareStore) KeepVersion(secretID uint64, version uint32) (uint32, error) {
 	return m.keepVersionFn(secretID, version)
@@ -134,10 +147,11 @@ func (m *mockUserSecretStore) Remove(secretID uint64) error {
 var _ userSecretStore = (*mockUserSecretStore)(nil)
 
 type mockStateStore struct {
-	saveFn    func(secretID uint64, item StateItem) error
-	loadFn    func(secretID uint64, key StateKey) (StateItem, bool, error)
-	removeFn  func(secretID uint64, key StateKey) (bool, error)
-	loadAllFn func(secretID uint64, kind StateKind) ([]StateItem, error)
+	saveFn       func(secretID uint64, item StateItem) error
+	loadFn       func(secretID uint64, key StateKey) (StateItem, bool, error)
+	removeFn     func(secretID uint64, key StateKey) (bool, error)
+	removeManyFn func(secretID uint64, keys []StateKey) error
+	loadAllFn    func(secretID uint64, kind StateKind) ([]StateItem, error)
 }
 
 func (m *mockStateStore) Save(secretID uint64, item StateItem) error {
@@ -148,6 +162,9 @@ func (m *mockStateStore) Load(secretID uint64, key StateKey) (StateItem, bool, e
 }
 func (m *mockStateStore) Remove(secretID uint64, key StateKey) (bool, error) {
 	return m.removeFn(secretID, key)
+}
+func (m *mockStateStore) RemoveMany(secretID uint64, keys []StateKey) error {
+	return m.removeManyFn(secretID, keys)
 }
 func (m *mockStateStore) LoadAll(secretID uint64, kind StateKind) ([]StateItem, error) {
 	return m.loadAllFn(secretID, kind)
@@ -313,6 +330,93 @@ func TestDispatchChannelRemove_ExistedTransitions(t *testing.T) {
 	status, got = dispatchChannelRemove(s, 1, 2, 0)
 	if status != ffiStatusOK || got {
 		t.Fatalf("second remove: status=%d existed=%v, want ok/false", status, got)
+	}
+}
+
+func TestDispatchChannelRemoveMany_DecodesPairs(t *testing.T) {
+	var got []ChannelQuery
+	s := &storeSet{channel: &mockChannelStore{
+		removeManyFn: func(secretID uint64, queries []ChannelQuery) error {
+			got = queries
+			return nil
+		},
+	}}
+	status := dispatchChannelRemoveMany(s, 1, []byte(`[["12","0"],["7","18446744073709551615"]]`))
+	if status != ffiStatusOK {
+		t.Fatalf("status = %d, want ffiStatusOK", status)
+	}
+	want := []ChannelQuery{{ChannelID: 12, ReplicaID: 0}, {ChannelID: 7, ReplicaID: 18446744073709551615}}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("queries = %v, want %v", got, want)
+	}
+	if status := dispatchChannelRemoveMany(s, 1, []byte(`[["x","0"]]`)); status != ffiStatusFailure {
+		t.Fatalf("malformed id: status = %d, want ffiStatusFailure", status)
+	}
+}
+
+func TestDispatchSecretRemoveMany_DecodesPairs(t *testing.T) {
+	var got []SecretEntry
+	calls := 0
+	s := &storeSet{secret: &mockSecretStore{
+		removeManyFn: func(secretID uint64, entries []SecretEntry) error {
+			calls++
+			got = entries
+			return nil
+		},
+	}}
+	status := dispatchSecretRemoveMany(s, 1, []byte(`[["12",0],["18446744073709551615",2]]`))
+	if status != ffiStatusOK {
+		t.Fatalf("status = %d, want ffiStatusOK", status)
+	}
+	want := []SecretEntry{
+		{ChannelID: 12, Kind: SecretKindSharedKey},
+		{ChannelID: 18446744073709551615, Kind: SecretKindPairingContact},
+	}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("entries = %v, want %v", got, want)
+	}
+	if status := dispatchSecretRemoveMany(s, 1, nil); status != ffiStatusOK || len(got) != 0 {
+		t.Fatalf("empty buffer: status = %d entries = %v, want ok and none", status, got)
+	}
+	calls = 0
+	for _, bad := range []string{`[["x",0]]`, `[[12,0]]`, `[["12"]]`, `[["12","0"]]`} {
+		if status := dispatchSecretRemoveMany(s, 1, []byte(bad)); status != ffiStatusFailure {
+			t.Fatalf("%s: status = %d, want ffiStatusFailure", bad, status)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("malformed input reached the store %d times", calls)
+	}
+}
+
+func TestDispatchStateRemoveMany_DecodesKeys(t *testing.T) {
+	var got []StateKey
+	calls := 0
+	s := &storeSet{state: &mockStateStore{
+		removeManyFn: func(secretID uint64, keys []StateKey) error {
+			calls++
+			got = keys
+			return nil
+		},
+	}}
+	status := dispatchStateRemoveMany(s, 1, []byte(`[{"kind":0,"channel_id":"12"},{"kind":3,"version":4}]`))
+	if status != ffiStatusOK {
+		t.Fatalf("status = %d, want ffiStatusOK", status)
+	}
+	if len(got) != 2 ||
+		got[0].Kind != StateKindPendingVerification || got[0].ChannelID == nil || *got[0].ChannelID != 12 ||
+		got[1].Kind != StateKindSharingRound || got[1].Version == nil || *got[1].Version != 4 {
+		t.Fatalf("keys = %+v, want [PendingVerification ch 12, SharingRound v4]", got)
+	}
+	if status := dispatchStateRemoveMany(s, 1, nil); status != ffiStatusOK || len(got) != 0 {
+		t.Fatalf("empty buffer: status = %d keys = %v, want ok and none", status, got)
+	}
+	calls = 0
+	if status := dispatchStateRemoveMany(s, 1, []byte(`[{"kind":0,"channel_id":"x"}]`)); status != ffiStatusFailure {
+		t.Fatalf("malformed key: status = %d, want ffiStatusFailure", status)
+	}
+	if calls != 0 {
+		t.Fatalf("malformed input reached the store %d times", calls)
 	}
 }
 
@@ -522,8 +626,8 @@ func TestDispatchShareLoad_PanicRecovered(t *testing.T) {
 
 func TestDispatchShareLoadMany(t *testing.T) {
 	s := &storeSet{share: &mockShareStore{
-		loadManyFn: func(secretID uint64, channelIDs []uint64, versions []uint32) ([]Share, error) {
-			return []Share{{SecretID: secretID, Version: 1}}, nil
+		loadManyFn: func(secretID uint64, channelIDs []uint64, versions []uint32) ([]ShareEntry, error) {
+			return []ShareEntry{{ChannelID: channelIDs[1], Share: Share{SecretID: secretID, Version: 1}}}, nil
 		},
 	}}
 	idsJSON, _ := EncodeUint64Array([]uint64{1, 2})
@@ -532,9 +636,45 @@ func TestDispatchShareLoadMany(t *testing.T) {
 	if status != ffiStatusOK {
 		t.Fatalf("status = %d, want ffiStatusOK", status)
 	}
-	shares, err := DecodeShareList(out)
-	if err != nil || len(shares) != 1 {
-		t.Fatalf("DecodeShareList: shares=%v err=%v", shares, err)
+	var pairs []json.RawMessage
+	if err := json.Unmarshal(out, &pairs); err != nil || len(pairs) != 1 {
+		t.Fatalf("load_many response must be a JSON array of one pair: out=%s err=%v", out, err)
+	}
+	var pair []json.RawMessage
+	if err := json.Unmarshal(pairs[0], &pair); err != nil || len(pair) != 2 {
+		t.Fatalf("load_many entry must be a [channel_id, share] pair: %s err=%v", pairs[0], err)
+	}
+	var channelID string
+	if err := json.Unmarshal(pair[0], &channelID); err != nil || channelID != "2" {
+		t.Fatalf("channel_id must be the decimal string \"2\", got %s err=%v", pair[0], err)
+	}
+	share, err := DecodeShare(pair[1])
+	if err != nil || share.SecretID != 5 || share.Version != 1 {
+		t.Fatalf("DecodeShare: share=%v err=%v", share, err)
+	}
+}
+
+// TestEncodeShareEntryList_WireShape pins the load_many buffer: an array of
+// [channel_id, ShareRecord] pairs, channel_id a decimal string even above
+// 2^53, the share encoded exactly as load encodes it.
+func TestEncodeShareEntryList_WireShape(t *testing.T) {
+	threshold := uint32(2)
+	share := Share{SecretID: 7, Version: 3, Bytes: []byte{1, 2}, Threshold: &threshold}
+	got, err := EncodeShareEntryList([]ShareEntry{{ChannelID: 1 << 60, Share: share}})
+	if err != nil {
+		t.Fatalf("EncodeShareEntryList: %v", err)
+	}
+	single, err := EncodeShareList([]Share{share})
+	if err != nil {
+		t.Fatalf("EncodeShareList: %v", err)
+	}
+	want := `[["1152921504606846976",` + string(single[1:len(single)-1]) + `]]`
+	if string(got) != want {
+		t.Fatalf("got %s, want %s", got, want)
+	}
+	empty, err := EncodeShareEntryList(nil)
+	if err != nil || string(empty) != "[]" {
+		t.Fatalf("an empty result must encode as [], got %s err=%v", empty, err)
 	}
 }
 
@@ -709,6 +849,52 @@ func TestDispatchShareRemoveVersions(t *testing.T) {
 	}
 	if status := dispatchShareRemoveVersions(s, 5, 6, []byte("not json")); status != ffiStatusFailure {
 		t.Fatalf("malformed versions JSON must surface as ffiStatusFailure, got %d", status)
+	}
+}
+
+func TestDispatchShareRemoveVersionsMany_DecodesPairs(t *testing.T) {
+	var gotSecretID uint64
+	var got []ShareVersionsEntry
+	calls := 0
+	s := &storeSet{share: &mockShareStore{
+		removeVersionsManyFn: func(secretID uint64, entries []ShareVersionsEntry) error {
+			calls++
+			gotSecretID, got = secretID, entries
+			return nil
+		},
+	}}
+	status := dispatchShareRemoveVersionsMany(s, 5, []byte(`[["12",[3,4]],["18446744073709551615",[1]]]`))
+	if status != ffiStatusOK || gotSecretID != 5 {
+		t.Fatalf("status = %d secretID = %d, want ffiStatusOK and 5", status, gotSecretID)
+	}
+	want := []ShareVersionsEntry{
+		{ChannelID: 12, Versions: []uint32{3, 4}},
+		{ChannelID: 18446744073709551615, Versions: []uint32{1}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("entries = %v, want %v", got, want)
+	}
+	if status := dispatchShareRemoveVersionsMany(s, 5, nil); status != ffiStatusOK || len(got) != 0 {
+		t.Fatalf("empty buffer: status = %d entries = %v, want ok and none", status, got)
+	}
+
+	failing := &storeSet{share: &mockShareStore{
+		removeVersionsManyFn: func(secretID uint64, entries []ShareVersionsEntry) error {
+			return errors.New("backend down")
+		},
+	}}
+	if status := dispatchShareRemoveVersionsMany(failing, 5, []byte(`[["12",[1]]]`)); status != ffiStatusFailure {
+		t.Fatalf("store error must surface as ffiStatusFailure, got %d", status)
+	}
+
+	calls = 0
+	for _, bad := range []string{`not json`, `[["x",[1]]]`, `[[12,[1]]]`, `[["12"]]`, `[["12",1]]`, `[["12",[-1]]]`} {
+		if status := dispatchShareRemoveVersionsMany(s, 5, []byte(bad)); status != ffiStatusFailure {
+			t.Fatalf("%s: status = %d, want ffiStatusFailure", bad, status)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("malformed input reached the store %d times", calls)
 	}
 }
 

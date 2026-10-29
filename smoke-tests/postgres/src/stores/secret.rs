@@ -146,4 +146,26 @@ impl DeRecSecretStore for PostgresSecretStore {
             Ok(())
         })
     }
+
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, SecretKind)],
+    ) -> SecretStoreFuture<'_, ()> {
+        let client = self.client.clone();
+        let secret_id = u64_to_sql(secret_id);
+        let channel_ids: Vec<i64> = entries.iter().map(|(c, _)| u64_to_sql(c.0)).collect();
+        let kinds: Vec<i32> = entries.iter().map(|&(_, k)| secret_kind_tag(k)).collect();
+        Box::pin(async move {
+            client
+                .execute(
+                    "DELETE FROM secrets WHERE secret_id = $1 AND (channel_id, kind) IN \
+                     (SELECT * FROM unnest($2::BIGINT[], $3::INT[]))",
+                    &[&secret_id, &channel_ids, &kinds],
+                )
+                .await
+                .expect("secret remove_many failed");
+            Ok(())
+        })
+    }
 }

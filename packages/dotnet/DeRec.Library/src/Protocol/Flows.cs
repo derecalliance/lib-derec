@@ -280,13 +280,15 @@ public sealed record ReplicaDiscoveryParams;
 /// member is rejected, not silently ignored.
 /// </para>
 /// <para>
-/// <b>Starting this flow removes nothing on its own</b> and emits no
-/// <c>ReplicaRemovedEvent</c>. It tells every member and flags the target
-/// locally; the removal completes only once the application publishes a
-/// roster omitting that member — an ordinary
-/// <see cref="FlowKind.ProtectSecret"/> — at which point
-/// <c>ReplicaRemovedEvent</c> fires. A group with no secret to publish
-/// therefore cannot complete a removal.
+/// Starting this flow tells every member, flags the target locally, and then
+/// publishes the roster omitting that member as the next version — an
+/// ordinary <see cref="FlowKind.ProtectSecret"/> of the latest snapshot with
+/// the stored weights and threshold, or an empty payload when nothing has
+/// been published yet. Its events are returned with the announcement's.
+/// <c>ReplicaRemovedEvent</c> fires once that round completes, not from
+/// <c>StartAsync</c>. A publish that fails is thrown with the announcement
+/// already sent and the flag kept; the next
+/// <see cref="FlowKind.ProtectSecret"/> completes the removal.
 /// </para>
 /// <para>
 /// Any member may remove any member, the source included: a lost or stolen

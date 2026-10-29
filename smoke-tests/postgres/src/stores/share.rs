@@ -60,7 +60,7 @@ impl DeRecShareStore for PostgresShareStore {
         secret_id: u64,
         channel_ids: &[ChannelId],
         versions: &[u32],
-    ) -> ShareStoreFuture<'_, Vec<Share>> {
+    ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
         let channel_ids: Vec<i64> = channel_ids.iter().map(|c| u64_to_sql(c.0)).collect();
         let versions: Vec<i64> = versions.iter().map(|v| *v as i64).collect();
         let client = self.client.clone();
@@ -73,7 +73,7 @@ impl DeRecShareStore for PostgresShareStore {
                 let params: [&(dyn ToSql + Sync); 2] = [&secret_id_i64, &channel_ids];
                 client
                     .query(
-                        "SELECT share_secret_id, version, bytes, subshares, threshold FROM shares \
+                        "SELECT share_secret_id, version, bytes, subshares, threshold, channel_id FROM shares \
                          WHERE secret_id = $1 AND channel_id = ANY($2::bigint[])",
                         &params,
                     )
@@ -83,7 +83,7 @@ impl DeRecShareStore for PostgresShareStore {
                 let params: [&(dyn ToSql + Sync); 3] = [&secret_id_i64, &channel_ids, &versions];
                 client
                     .query(
-                        "SELECT share_secret_id, version, bytes, subshares, threshold FROM shares \
+                        "SELECT share_secret_id, version, bytes, subshares, threshold, channel_id FROM shares \
                          WHERE secret_id = $1 AND channel_id = ANY($2::bigint[]) \
                          AND version = ANY($3::bigint[])",
                         &params,
@@ -91,7 +91,15 @@ impl DeRecShareStore for PostgresShareStore {
                     .await
                     .expect("load_many failed")
             };
-            Ok(rows.into_iter().map(row_to_share).collect())
+            Ok(rows
+                .into_iter()
+                .map(|row| {
+                    (
+                        ChannelId(sql_to_u64(row.get::<_, i64>(5))),
+                        row_to_share(row),
+                    )
+                })
+                .collect())
         })
     }
 
@@ -222,6 +230,37 @@ impl DeRecShareStore for PostgresShareStore {
                 )
                 .await
                 .expect("share remove_versions failed");
+            Ok(())
+        })
+    }
+
+    fn remove_versions_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, Vec<u32>)],
+    ) -> ShareStoreFuture<'_, ()> {
+        let (channel_ids, versions): (Vec<i64>, Vec<i64>) = entries
+            .iter()
+            .flat_map(|(channel_id, versions)| {
+                versions
+                    .iter()
+                    .map(move |v| (u64_to_sql(channel_id.0), *v as i64))
+            })
+            .unzip();
+        let client = self.client.clone();
+        let secret_id = u64_to_sql(secret_id);
+        Box::pin(async move {
+            if versions.is_empty() {
+                return Ok(());
+            }
+            client
+                .execute(
+                    "DELETE FROM shares WHERE secret_id = $1 AND (channel_id, version) IN \
+                     (SELECT * FROM unnest($2::BIGINT[], $3::BIGINT[]))",
+                    &[&secret_id, &channel_ids, &versions],
+                )
+                .await
+                .expect("share remove_versions_many failed");
             Ok(())
         })
     }

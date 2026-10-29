@@ -175,6 +175,7 @@ fn generated() -> serde_json::Value {
             load,
             save,
             remove,
+            remove_many,
             list_helpers,
             list_replicas,
             link_channel,
@@ -187,6 +188,7 @@ fn generated() -> serde_json::Value {
             load_many,
             save,
             remove,
+            remove_many,
             free_buffer
         },
         super::protocol::stores::ShareStoreCallbacks {
@@ -198,6 +200,7 @@ fn generated() -> serde_json::Value {
             save,
             remove_channel,
             remove_versions,
+            remove_versions_many,
             keep_version,
             record_verification,
             free_buffer
@@ -214,6 +217,7 @@ fn generated() -> serde_json::Value {
             save,
             load,
             remove,
+            remove_many,
             load_all,
             free_buffer
         },

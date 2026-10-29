@@ -1576,12 +1576,15 @@ mod tests {
 
     async fn publish_after_pairing(rig: &mut TestRig, channel: u64) {
         rig.protocol
-            .maybe_auto_publish_after_pair(&[DeRecEvent::PairingCompleted {
-                channel_id: ChannelId(channel),
-                pairing_channel_id: ChannelId(channel),
-                kind: SenderKind::Owner,
-                peer_communication_info: HashMap::new(),
-            }])
+            .maybe_auto_publish(
+                &[DeRecEvent::PairingCompleted {
+                    channel_id: ChannelId(channel),
+                    pairing_channel_id: ChannelId(channel),
+                    kind: SenderKind::Owner,
+                    peer_communication_info: HashMap::new(),
+                }],
+                &std::collections::HashSet::new(),
+            )
             .await
             .expect("the pairing publish runs");
     }

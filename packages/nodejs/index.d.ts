@@ -26,6 +26,17 @@ export interface SecretStore {
     value: Uint8Array,
   ): Promise<void>;
   remove(secretId: string, channelId: string, kind: 0 | 1 | 2): Promise<void>;
+  /**
+   * Remove every secret `entries` names, in one call. Each entry is a
+   * `[channelId, kind]` pair addressed the way `remove`'s arguments are.
+   * Idempotent: an entry with nothing stored is skipped, not an error. The
+   * library calls it when it removes several secrets at once, so a backend
+   * that can delete them in one statement or transaction should.
+   */
+  removeMany(
+    secretId: string,
+    entries: [channelId: string, kind: 0 | 1 | 2][],
+  ): Promise<void>;
 }
 
 
@@ -196,6 +207,19 @@ export interface ChannelStore {
   ): Promise<void>;
   remove(secretId: string, channelId: string, replicaId: string): Promise<boolean>;
   /**
+   * Remove every record `queries` addresses, in one call. Each entry is a
+   * `[channelId, replicaId]` pair addressed the way `remove`'s arguments are:
+   * `replicaId` `"0"` is the helper channel at `channelId`, any other value
+   * removes that member only. Idempotent: an entry that names no record is
+   * skipped, not an error. The library calls it when it removes several
+   * records at once, so a backend that can delete them in one statement or
+   * transaction should.
+   */
+  removeMany(
+    secretId: string,
+    queries: [channelId: string, replicaId: string][],
+  ): Promise<void>;
+  /**
    * JSON array of the helper channels stored under `secretId` that `filter`
    * selects.
    *
@@ -271,11 +295,16 @@ export interface Share {
  */
 export interface ShareStore {
   load(secretId: string, channelId: string, versions: number[]): Promise<Share[]>;
+  /**
+   * Load shares across several channels in one call, scoped to `secretId`.
+   * Each share is paired with the channel it is stored under, as a
+   * `[channelId, share]` tuple. An empty `versions` selects every version.
+   */
   loadMany(
     secretId: string,
     channelIds: string[],
     versions: number[],
-  ): Promise<Share[]>;
+  ): Promise<[channelId: string, share: Share][]>;
   loadAll(secretId: string, channelIds: string[]): Promise<Share[]>;
   /**
    * Reject, or throw, a {@link shareStoreRefusal} `Error` to refuse a share
@@ -296,6 +325,18 @@ export interface ShareStore {
    * Shares under other channels or partitions must be left untouched.
    */
   removeVersions(secretId: string, channelId: string, versions: number[]): Promise<void>;
+  /**
+   * `removeVersions` for several channels in one call. Each entry is a
+   * `[channelId, versions]` pair addressed the way `removeVersions`'s
+   * arguments are. Idempotent: a version that is not stored is skipped, not
+   * an error. The library calls it when it removes versions across several
+   * channels at once, so a backend that can delete them in one statement or
+   * transaction should.
+   */
+  removeVersionsMany(
+    secretId: string,
+    entries: [channelId: string, versions: number[]][],
+  ): Promise<void>;
   /**
    * Owner only: the one older version every helper keeps after the owner
    * distributes `version`. Asked once per sharing round, before anything is
@@ -392,6 +433,14 @@ export interface StateStore {
     keyJson: Uint8Array,
   ): Promise<Uint8Array | null | undefined>;
   remove(secretId: string, keyJson: Uint8Array): Promise<boolean>;
+  /**
+   * Remove every row `keysJson` names, in one call. `keysJson` is a JSON
+   * array of the key objects `remove` receives one at a time as `keyJson`.
+   * Idempotent: a key with no row is skipped, not an error. The library calls
+   * it when it removes several rows at once, so a backend that can delete
+   * them in one statement or transaction should.
+   */
+  removeMany(secretId: string, keysJson: Uint8Array): Promise<void>;
   loadAll(secretId: string, kind: 0 | 1 | 2 | 3 | 4): Promise<Uint8Array[]>;
 }
 
@@ -442,39 +491,12 @@ export interface Transport {
    * first success. The protocol's handlers are idempotent, so a duplicate
    * does not corrupt state, but it is still a duplicate to anything counting
    * messages, and a peer entitled to treat re-delivery as a replay will.
-   *
-   * **Prefer an adapter to writing this by hand.** Choosing which endpoint to
-   * dial is yours and stays here; the bookkeeping around it is the same
-   * everywhere and is already written and tested. Write a
-   * {@link SendOne} and wrap it in {@link sequentialFailover}. Taking
-   * `endpoints[0]` type-checks, passes every test, and silently gives up the
-   * failover the list exists to provide — if that is genuinely wanted, say so
-   * with {@link singleEndpointTransport} rather than by indexing.
    */
   send(
     endpoints: ReadonlyArray<Endpoint>,
     message: Uint8Array,
   ): Promise<void>;
 }
-
-/**
- * Delivers one message to one endpoint.
- *
- * The narrow half of a transport: everything genuinely about dialing, and
- * nothing about which endpoint to dial. Pass one of these to
- * {@link sequentialFailover} or {@link singleEndpointTransport} to get a
- * {@link Transport}.
- *
- * Rejecting means the endpoint did not receive the message. The rejection
- * reason need not distinguish "unreachable" from "rejected":
- * {@link sequentialFailover} treats both as a reason to try the next endpoint,
- * which is the safe reading. Trying an endpoint that would have refused costs
- * a round trip; skipping one that would have worked costs the delivery.
- */
-export type SendOne = (
-  endpoint: Endpoint,
-  message: Uint8Array,
-) => Promise<void>;
 
 /**
  * The DeRec protocol version this build speaks — the `protocolVersionMajor` /
@@ -503,34 +525,6 @@ export type ShareStoreRefusalReason = "too_frequent" | "size_limit_exceeded" | "
  * error's `refusal` property.
  */
 export declare function shareStoreRefusal(reason: ShareStoreRefusalReason): Error;
-
-/**
- * Builds a {@link Transport} that tries each endpoint in the order the peer
- * offered it and stops at the first success.
- *
- * An error is thrown only when every endpoint failed. The message is delivered
- * at most once.
- *
- * This is the right default. A peer advertising several endpoints is saying it
- * can be reached at any of them, and the reason 0.0.3 records the whole list is
- * so one being down does not end the conversation.
- */
-export declare function sequentialFailover(dialer: SendOne): Transport;
-
-/**
- * Builds a {@link Transport} that uses the first endpoint only.
- *
- * Reproduces the pre-0.0.3 behaviour exactly, for an application that genuinely
- * serves one endpoint or has a reason not to fail over.
- *
- * It exists so that choosing it is visible. `endpoints[0]` written inline looks
- * like an implementation detail and reads as finished; naming this records that
- * failover was considered and declined, which is a claim a reviewer can
- * disagree with. If the peers this application talks to advertise more than one
- * endpoint, prefer {@link sequentialFailover} — every endpoint after the first
- * is reachability being thrown away.
- */
-export declare function singleEndpointTransport(dialer: SendOne): Transport;
 
 export declare const SenderKind: {
   readonly Owner: 0;
@@ -1883,12 +1877,14 @@ export declare class DeRecProtocol {
   start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.ReplicaDiscovery, params?: ReplicaDiscoveryParams): Promise<DeRecEvent[]>;
 
-  /** Announce a member's removal. This does **not** remove anything on its
-   *  own and emits no `ReplicaRemoved`: it tells every member and flags the
-   *  target locally. The removal completes only once the application
-   *  publishes a roster omitting that member — an ordinary
-   *  `start(FlowKind.ProtectSecret)` — at which point `ReplicaRemoved`
-   *  fires. A group with no secret to publish therefore cannot complete a
+  /** Remove a member: tell every member, flag the target locally, then
+   *  publish the roster omitting it as the next version — an ordinary
+   *  `start(FlowKind.ProtectSecret)` of the latest snapshot with the stored
+   *  weights and threshold, or an empty payload when nothing has been
+   *  published yet. Its events are returned with the announcement's.
+   *  `ReplicaRemoved` fires once that round completes, not from this call.
+   *  A publish that fails rejects with the announcement already sent and the
+   *  flag kept; the next `start(FlowKind.ProtectSecret)` completes the
    *  removal. */
   start(flowKind: FlowKind.UnpairReplica, params: UnpairReplicaParams): Promise<DeRecEvent[]>;
 

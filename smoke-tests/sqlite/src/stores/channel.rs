@@ -129,6 +129,42 @@ impl DeRecChannelStore for SqliteChannelStore {
         Box::pin(std::future::ready(Ok(affected > 0)))
     }
 
+    fn remove_many(
+        &mut self,
+        secret_id: u64,
+        queries: &[ChannelQuery],
+    ) -> ChannelStoreFuture<'_, ()> {
+        let conn = lock(&self.connection);
+        let tx = conn
+            .unchecked_transaction()
+            .expect("remove_many transaction failed");
+        for query in queries {
+            match *query {
+                ChannelQuery::Helper { channel_id } => {
+                    tx.execute(
+                        "DELETE FROM channels WHERE secret_id = ?1 AND channel_id = ?2",
+                        rusqlite::params![u64_to_sql(secret_id), u64_to_sql(channel_id.0)],
+                    )
+                    .expect("helper channel remove failed");
+                    tx.execute(
+                        "DELETE FROM channel_links WHERE secret_id = ?1 AND (a = ?2 OR b = ?2)",
+                        rusqlite::params![u64_to_sql(secret_id), u64_to_sql(channel_id.0)],
+                    )
+                    .expect("channel_link cleanup failed");
+                }
+                ChannelQuery::Replica { replica_id, .. } => {
+                    tx.execute(
+                        "DELETE FROM replica_members WHERE secret_id = ?1 AND replica_id = ?2",
+                        rusqlite::params![u64_to_sql(secret_id), u64_to_sql(replica_id.0)],
+                    )
+                    .expect("replica member remove failed");
+                }
+            }
+        }
+        tx.commit().expect("remove_many commit failed");
+        Box::pin(std::future::ready(Ok(())))
+    }
+
     fn helpers(
         &self,
         secret_id: u64,

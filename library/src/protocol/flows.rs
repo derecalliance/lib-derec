@@ -110,14 +110,16 @@ impl<
                 .await
             }
             DeRecFlow::UnpairReplica { replica_id, memo } => {
-                handlers::replicas::unpairing::start(
+                let mut events = handlers::replicas::unpairing::start(
                     &mut borrow_stores!(self),
                     &local!(self),
                     replica_id,
                     memo,
                     trace_id,
                 )
-                .await
+                .await?;
+                events.extend(self.auto_publish_after_replica_removal().await?);
+                Ok(events)
             }
             DeRecFlow::Unpair { channel_id, memo } => {
                 self.start_unpair(channel_id, memo, round).await
@@ -540,7 +542,8 @@ impl<
                 derec_proto::SenderKind::Helper,
             )
             .await?;
-        handlers::unpairing::start(
+        let share_holders = self.share_holders([channel_id]).await?;
+        let mut events = handlers::unpairing::start(
             &mut borrow_stores!(self),
             &local!(self),
             channel_id,
@@ -549,7 +552,9 @@ impl<
             now_secs(),
             round,
         )
-        .await
+        .await?;
+        events.extend(self.maybe_auto_publish(&events, &share_holders).await?);
+        Ok(events)
     }
 
     async fn start_update_channel_info(
