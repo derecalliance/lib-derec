@@ -9,8 +9,10 @@ use derec_proto::{
 };
 
 fn channel_request(request: ChannelRequest) -> PendingAction {
-    PendingAction::request(ChannelId(1), 0, request)
-        .sealed_with(&crate::types::SharedKey::new([0; 32]))
+    PendingAction::request(ChannelId(1), 0, request).sealed_with(&crate::protocol::ChannelKey {
+        epoch: 0,
+        key: crate::types::SharedKey::new([0; 32]),
+    })
 }
 
 fn store_share_action() -> PendingAction {
@@ -62,7 +64,10 @@ fn respond_to_failure_action() -> PendingAction {
             ..Default::default()
         }),
     )
-    .sealed_with(&crate::types::SharedKey::new([0; 32]))
+    .sealed_with(&crate::protocol::ChannelKey {
+        epoch: 0,
+        key: crate::types::SharedKey::new([0; 32]),
+    })
 }
 
 #[test]
@@ -281,6 +286,7 @@ mod golden {
                 shared_key: vec![0x11, 0x12, 0x13],
                 communication_info: info("name", "Helper"),
                 weight: 2,
+                key_epoch: 16,
             }],
             secrets: vec![UserSecret {
                 id: vec![0x21, 0x22],
@@ -296,6 +302,7 @@ mod golden {
                     communication_info: info("device", "Laptop"),
                 }],
                 shared_key: vec![0x41, 0x42],
+                key_epoch: 3,
             }),
             threshold: Some(3),
         }

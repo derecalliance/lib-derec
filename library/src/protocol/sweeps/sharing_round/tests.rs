@@ -1083,7 +1083,7 @@ mod keep_version_proof {
                 secret_id: SECRET_ID,
                 replica_id: None,
             }))
-            .encrypt(&key_of(channel))
+            .encrypt(&crate::types::ChannelKey::new(0, key_of(channel).clone()))
             .expect("encrypt")
             .build()
             .expect("build")

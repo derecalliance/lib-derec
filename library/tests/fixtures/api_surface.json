@@ -100,6 +100,12 @@
       "ts": "withAutoRespondOnFailure"
     },
     {
+      "rust": "key_rotation",
+      "dotnet": "WithKeyRotation",
+      "go": "KeyRotation",
+      "ts": "withKeyRotation"
+    },
+    {
       "rust": "unpair_ack",
       "dotnet": "WithUnpairAck",
       "go": "UnpairAck",
@@ -1163,6 +1169,22 @@
       "dotnet": "Envelope.ReadTraceId",
       "go": "envelope.ReadTraceID",
       "ts": "envelope.read_trace_id"
+    },
+    {
+      "rust": "derec_message::read_sequence",
+      "ffi": "read_sequence_from_envelope",
+      "wasm": "envelope_read_sequence",
+      "dotnet": "Envelope.ReadSequence",
+      "go": "envelope.ReadSequence",
+      "ts": "envelope.read_sequence"
+    },
+    {
+      "rust": "types::ChannelKey::derive",
+      "ffi": "derive_channel_key",
+      "wasm": "channel_key_derive",
+      "dotnet": "ChannelKey.Derive",
+      "go": "channelkey.Derive",
+      "ts": "channel_key.derive"
     }
   ],
   "records": [

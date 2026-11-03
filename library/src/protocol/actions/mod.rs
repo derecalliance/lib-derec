@@ -57,13 +57,16 @@ impl<
     /// stored or sent. A channel whose peer no longer holds the role the flow
     /// requires is answered `REJECTED`, like any other answerable failure.
     ///
-    /// The action carries no key: the response is encrypted under the shared
-    /// key stored for the action's channel, loaded when `accept` runs. Under
-    /// that key `accept` first checks the action's seal, so an action that
-    /// was altered, built by hand or moved to another channel is an `Err`
+    /// The action carries no key, only the epoch of the channel key its
+    /// request arrived under: the response is encrypted under that epoch's
+    /// key, taken from the channel's key ring when `accept` runs, whatever
+    /// epoch the channel has moved to since. Under that key `accept` first
+    /// checks the action's seal, so an action that was altered, built by
+    /// hand or moved to another channel or epoch is an `Err`
     /// ([`crate::Error::InvalidInput`]) and nothing is stored or sent. So is
     /// one whose channel has no stored key, which can be neither checked nor
-    /// answered.
+    /// answered, and one whose epoch's key the ring can no longer give: it is
+    /// too late to answer.
     ///
     /// `Err` is left for what cannot be answered: the checks above, a
     /// [`Action::RespondToFailure`](crate::protocol::Action::RespondToFailure) (which only `reject` resolves),
@@ -81,12 +84,15 @@ impl<
     /// with valid weights to publish to every Helper, the new one included.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(trace_id = action.trace_id())))]
     pub async fn accept(&mut self, action: PendingAction) -> Result<Vec<DeRecEvent>> {
-        self.check_seal(&action).await?;
+        let key = self.check_seal(&action).await?;
         let obligation = Obligation::for_action(&action, local!(self).policy);
         let mut events = match &obligation {
             Some(obligation) => {
+                if let Some(key) = &key {
+                    obligation.answer_under(key.clone());
+                }
                 let outcome = match self.still_answerable(&action).await? {
-                    Ok(()) => self.accept_inner(action, Some(obligation)).await,
+                    Ok(()) => self.accept_inner(action, key, Some(obligation)).await,
                     Err(failure) => Err(failure),
                 };
                 settle(
@@ -98,7 +104,7 @@ impl<
                 )
                 .await
             }
-            None => self.accept_inner(action, None).await?,
+            None => self.accept_inner(action, key, None).await?,
         };
         let auto_publish_events = self.maybe_auto_publish(&events, &HashSet::new()).await?;
         events.extend(auto_publish_events);
@@ -184,16 +190,17 @@ impl<
     /// with an `ErrorResponseMessage`. Passing the event's own `status` and
     /// `memo` sends the response `auto_respond_on_failure` would have sent.
     ///
-    /// The response is encrypted under the shared key stored for the
-    /// action's channel, loaded when `reject` runs. An action whose seal does
-    /// not verify under that key, or whose channel has no stored key, fails
-    /// with [`crate::Error::InvalidInput`] and nothing is sent.
+    /// The response is encrypted under the key of the action's epoch, taken
+    /// from the key ring of the channel it is answered on when `reject` runs.
+    /// An action whose seal does not verify under that key, whose channel has
+    /// no stored key, or whose epoch's key the ring can no longer give (too
+    /// late), fails with [`crate::Error::InvalidInput`] and nothing is sent.
     ///
-    /// The library is stateless and never expires an action, so it cannot
-    /// tell an action it has already resolved from a fresh one: rejecting the
-    /// same token twice, or rejecting a copy of an action already accepted,
-    /// sends a second response. Resolving each action once is the
-    /// application's part.
+    /// The library is stateless and never expires an action on a clock, so
+    /// it cannot tell an action it has already resolved from a fresh one:
+    /// rejecting the same token twice, or rejecting a copy of an action
+    /// already accepted, sends a second response. Resolving each action once
+    /// is the application's part.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(trace_id = action.trace_id())))]
     pub async fn reject(
         &mut self,
@@ -201,10 +208,13 @@ impl<
         status: StatusEnum,
         memo: &str,
     ) -> Result<()> {
-        self.check_seal(&action).await?;
+        let key = self.check_seal(&action).await?;
         let obligation = Obligation::for_action(&action, local!(self).policy);
-        let obligation = obligation.as_ref();
-        self.reject_inner(action, obligation, status, memo).await
+        if let (Some(obligation), Some(key)) = (&obligation, &key) {
+            obligation.answer_under(key.clone());
+        }
+        self.reject_inner(action, key, obligation.as_ref(), status, memo)
+            .await
     }
 }
 

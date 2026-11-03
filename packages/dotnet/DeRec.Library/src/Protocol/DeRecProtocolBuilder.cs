@@ -39,7 +39,7 @@ public sealed record DeRecStores(
 /// <para>
 /// Optional setters left uncalled take the library's defaults: <see cref="WithThreshold"/> (3),
 /// <see cref="WithTimeouts"/> (library defaults), <see cref="WithCommunicationInfo"/> (empty),
-/// <see cref="WithAutoRespondOnFailure"/> (false),
+/// <see cref="WithAutoRespondOnFailure"/> (false), <see cref="WithKeyRotation"/> (false),
 /// <see cref="WithUnpairAck"/> (<see cref="UnpairAck.Required"/>),
 /// <see cref="WithAutoReplyTo"/> (false), <see cref="WithReplicaId"/> (unset),
 /// <see cref="WithMaxSubshares"/> (unset, no cap).
@@ -237,6 +237,18 @@ public sealed class DeRecProtocolBuilder
     }
 
     /// <summary>
+    /// Whether the owner advances channel keys: each helper channel one epoch
+    /// in every sharing round that reaches the threshold, and the replica
+    /// group channel one epoch on every publish to replicas. Turning it off
+    /// keeps the current key. Default: false.
+    /// </summary>
+    public DeRecProtocolBuilder WithKeyRotation(bool enabled)
+    {
+        _config = _config with { KeyRotation = enabled };
+        return this;
+    }
+
+    /// <summary>
     /// Whether the unpair initiator waits for the peer's ack before
     /// dropping local state. Default: <see cref="UnpairAck.Required"/>.
     /// </summary>
@@ -382,6 +394,7 @@ public sealed class DeRecProtocolBuilder
             ParameterRange = config.ParameterRange ?? current.ParameterRange,
             AutoAccept = config.AutoAccept ?? current.AutoAccept,
             AutoRespondOnFailure = config.AutoRespondOnFailure ?? current.AutoRespondOnFailure,
+            KeyRotation = config.KeyRotation ?? current.KeyRotation,
             AutoReplyTo = config.AutoReplyTo ?? current.AutoReplyTo,
             UnpairAck = config.UnpairAck ?? current.UnpairAck,
             UnsafeConnection = config.UnsafeConnection ?? current.UnsafeConnection,

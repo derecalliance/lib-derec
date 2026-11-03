@@ -82,6 +82,9 @@ pub extern "C" fn produce_get_secret_ids_versions_request_message(
     channel_id: u64,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
     // See `produce_store_share_request_message` for the `reply_to`
     // semantics — `reply_to_len == 0` means "no override".
     reply_to_ptr: *const u8,
@@ -102,8 +105,11 @@ pub extern "C" fn produce_get_secret_ids_versions_request_message(
         Err(e) => return with_err(e),
     };
 
-    match crate::primitives::discovery::request::produce(channel_id.into(), &shared_key, &reply_to)
-    {
+    match crate::primitives::discovery::request::produce(
+        channel_id.into(),
+        &crate::types::ChannelKey::new(epoch, shared_key),
+        &reply_to,
+    ) {
         Ok(r) => ProduceGetSecretIdsVersionsRequestMessageResult {
             error: success(),
             envelope_wire_bytes: vec_into_buffer(r.envelope),
@@ -170,6 +176,9 @@ pub extern "C" fn produce_get_secret_ids_versions_response_message(
     secret_list_len: usize,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
 ) -> ProduceGetSecretIdsVersionsResponseMessageResult {
     let with_err = |error| ProduceGetSecretIdsVersionsResponseMessageResult {
         error,
@@ -194,7 +203,7 @@ pub extern "C" fn produce_get_secret_ids_versions_response_message(
     match crate::primitives::discovery::response::produce(
         channel_id.into(),
         &secret_list,
-        &shared_key,
+        &crate::types::ChannelKey::new(epoch, shared_key),
     ) {
         Ok(r) => ProduceGetSecretIdsVersionsResponseMessageResult {
             error: success(),

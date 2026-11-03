@@ -8,6 +8,8 @@ import {
   DeRecProtocolBuilder as DeRecProtocolBuilderImpl,
   envelope_apply_trace_id,
   envelope_read_trace_id,
+  envelope_read_sequence,
+  channel_key_derive,
   protocol_version as protocolVersionImpl,
   generate_replica_id as generateReplicaIdImpl,
   shareStoreRefusal as shareStoreRefusalImpl,
@@ -57,6 +59,11 @@ export function shareStoreRefusal(reason) {
 export const envelope = {
   apply_trace_id: envelope_apply_trace_id,
   read_trace_id: envelope_read_trace_id,
+  read_sequence: envelope_read_sequence,
+};
+
+export const channel_key = {
+  derive: channel_key_derive,
 };
 
 export const DeRecProtocol = DeRecProtocolWasm;

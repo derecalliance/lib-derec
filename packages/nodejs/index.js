@@ -114,6 +114,11 @@ const primitives = {
 const envelope = {
   apply_trace_id: wasm.envelope_apply_trace_id,
   read_trace_id: wasm.envelope_read_trace_id,
+  read_sequence: wasm.envelope_read_sequence,
+};
+
+const channel_key = {
+  derive: wasm.channel_key_derive,
 };
 
 /**
@@ -165,6 +170,7 @@ module.exports = {
   generate_replica_id,
   shareStoreRefusal,
   envelope,
+  channel_key,
   DeRecProtocol,
   DeRecProtocolBuilder,
   SenderKind,

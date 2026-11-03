@@ -72,6 +72,8 @@ fn generated() -> serde_json::Value {
         },
         super::envelope::ApplyTraceIdResult { error, wire_bytes },
         super::envelope::ReadTraceIdResult { error, trace_id },
+        super::envelope::ReadSequenceResult { error, sequence },
+        super::channel_key::DeriveChannelKeyResult { error, key_bytes },
         super::error::DeRecError {
             category,
             code,

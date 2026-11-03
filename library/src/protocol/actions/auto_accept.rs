@@ -51,7 +51,15 @@ impl<
                     });
                     match Obligation::for_action(&action, local!(self).policy) {
                         Some(obligation) => {
-                            let outcome = self.accept_inner(action, Some(&obligation)).await;
+                            let outcome = match self.answering_key(&action).await {
+                                Ok(key) => {
+                                    if let Some(key) = &key {
+                                        obligation.answer_under(key.clone());
+                                    }
+                                    self.accept_inner(action, key, Some(&obligation)).await
+                                }
+                                Err(error) => Err(error),
+                            };
                             out.extend(
                                 settle(
                                     &mut borrow_stores!(self),
@@ -63,7 +71,10 @@ impl<
                                 .await,
                             );
                         }
-                        None => out.extend(self.accept_inner(action, None).await?),
+                        None => {
+                            let key = self.answering_key(&action).await?;
+                            out.extend(self.accept_inner(action, key, None).await?)
+                        }
                     }
                 }
                 other => out.push(other),

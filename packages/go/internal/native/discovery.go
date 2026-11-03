@@ -39,7 +39,7 @@ type processGetSecretIdsVersionsResponseMessageResult struct {
 var (
 	produceDiscoveryReqOnce sync.Once
 	produceDiscoveryReqFn   func(channelID uint64,
-		sharedKey *byte, sharedKeyLen uintptr,
+		sharedKey *byte, sharedKeyLen uintptr, epoch uint32,
 		replyTo *byte, replyToLen uintptr) produceGetSecretIdsVersionsRequestMessageResult
 
 	extractDiscoveryReqOnce sync.Once
@@ -49,7 +49,7 @@ var (
 	produceDiscoveryRespOnce sync.Once
 	produceDiscoveryRespFn   func(channelID uint64,
 		secretList *byte, secretListLen uintptr,
-		sharedKey *byte, sharedKeyLen uintptr) produceGetSecretIdsVersionsResponseMessageResult
+		sharedKey *byte, sharedKeyLen uintptr, epoch uint32) produceGetSecretIdsVersionsResponseMessageResult
 
 	extractDiscoveryRespOnce sync.Once
 	extractDiscoveryRespFn   func(response *byte, responseLen uintptr,
@@ -61,7 +61,7 @@ var (
 
 // ProduceGetSecretIdsVersionsRequest builds the wire-encoded DeRecMessage
 // carrying a discovery request on channelID, encrypted under sharedKey.
-func ProduceGetSecretIdsVersionsRequest(channelID uint64, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
+func ProduceGetSecretIdsVersionsRequest(channelID uint64, sharedKey []byte, epoch uint32, replyTo []Endpoint) ([]byte, error) {
 	produceDiscoveryReqOnce.Do(func() {
 		purego.RegisterFunc(&produceDiscoveryReqFn, symbol("produce_get_secret_ids_versions_request_message"))
 	})
@@ -70,7 +70,7 @@ func ProduceGetSecretIdsVersionsRequest(channelID uint64, sharedKey []byte, repl
 		return nil, err
 	}
 	res := produceDiscoveryReqFn(channelID,
-		bytePtr(sharedKey), uintptr(len(sharedKey)),
+		bytePtr(sharedKey), uintptr(len(sharedKey)), epoch,
 		bytePtr(replyToBytes), uintptr(len(replyToBytes)))
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err
@@ -95,13 +95,13 @@ func ExtractGetSecretIdsVersionsRequest(request, sharedKey []byte) (uint64, []by
 // ProduceGetSecretIdsVersionsResponse builds the wire-encoded DeRecMessage
 // advertising secretList (encoded in the binary format documented at
 // library/src/interop/ffi/discovery.rs) on channelID, encrypted under sharedKey.
-func ProduceGetSecretIdsVersionsResponse(channelID uint64, secretList, sharedKey []byte) ([]byte, error) {
+func ProduceGetSecretIdsVersionsResponse(channelID uint64, secretList, sharedKey []byte, epoch uint32) ([]byte, error) {
 	produceDiscoveryRespOnce.Do(func() {
 		purego.RegisterFunc(&produceDiscoveryRespFn, symbol("produce_get_secret_ids_versions_response_message"))
 	})
 	res := produceDiscoveryRespFn(channelID,
 		bytePtr(secretList), uintptr(len(secretList)),
-		bytePtr(sharedKey), uintptr(len(sharedKey)))
+		bytePtr(sharedKey), uintptr(len(sharedKey)), epoch)
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err
 	}

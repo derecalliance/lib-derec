@@ -501,6 +501,14 @@ typedef struct DeRecBuffer {
   size_t len;
 } DeRecBuffer;
 
+typedef struct DeriveChannelKeyResult {
+  struct DeRecError error;
+  /**
+   * The 32-byte key at `to_epoch`. Empty on error.
+   */
+  struct DeRecBuffer key_bytes;
+} DeriveChannelKeyResult;
+
 typedef struct ProduceGetSecretIdsVersionsRequestMessageResult {
   struct DeRecError error;
   struct DeRecBuffer envelope_wire_bytes;
@@ -556,6 +564,14 @@ typedef struct ReadTraceIdResult {
    */
   uint64_t trace_id;
 } ReadTraceIdResult;
+
+typedef struct ReadSequenceResult {
+  struct DeRecError error;
+  /**
+   * Epoch of the channel key that encrypted the payload. Zero on error.
+   */
+  uint32_t sequence;
+} ReadSequenceResult;
 
 /**
  * Result of a message JSON codec call. `bytes` is UTF-8 JSON for
@@ -1361,6 +1377,23 @@ extern "C" {
 #endif // __cplusplus
 
 /**
+ * The channel key at `to_epoch`, derived forward from `key`, the key at
+ * `epoch`.
+ *
+ * Mirrors [`crate::types::ChannelKey::derive`]: `to_epoch` below `epoch`, or
+ * more than [`crate::types::ChannelKey::MAX_DERIVE_STEPS`] above it, is
+ * refused as invalid input.
+ *
+ * # Safety
+ *
+ * `key_ptr` must point to a readable byte range of length `key_len`.
+ */
+struct DeriveChannelKeyResult derive_channel_key(const uint8_t *key_ptr,
+                                                 size_t key_len,
+                                                 uint32_t epoch,
+                                                 uint32_t to_epoch);
+
+/**
  * Releases a [`DeRecBuffer`] previously returned by the SDK.
  *
  * Safe to call with a null pointer.
@@ -1393,6 +1426,7 @@ void derec_free_string(char *ptr);
 struct ProduceGetSecretIdsVersionsRequestMessageResult produce_get_secret_ids_versions_request_message(uint64_t channel_id,
                                                                                                        const uint8_t *shared_key_ptr,
                                                                                                        size_t shared_key_len,
+                                                                                                       uint32_t epoch,
                                                                                                        const uint8_t *reply_to_ptr,
                                                                                                        size_t reply_to_len);
 
@@ -1418,7 +1452,8 @@ struct ProduceGetSecretIdsVersionsResponseMessageResult produce_get_secret_ids_v
                                                                                                          const uint8_t *secret_list_ptr,
                                                                                                          size_t secret_list_len,
                                                                                                          const uint8_t *shared_key_ptr,
-                                                                                                         size_t shared_key_len);
+                                                                                                         size_t shared_key_len,
+                                                                                                         uint32_t epoch);
 
 /**
  * # Safety
@@ -1470,6 +1505,22 @@ struct ApplyTraceIdResult apply_trace_id_to_envelope(const uint8_t *envelope_ptr
  */
 struct ReadTraceIdResult read_trace_id_from_envelope(const uint8_t *envelope_ptr,
                                                      size_t envelope_len);
+
+/**
+ * Read `sequence` off an envelope without touching the encrypted inner
+ * payload: the epoch of the channel key that encrypted it.
+ *
+ * Mirrors [`crate::derec_message::read_sequence`]. A caller using primitives
+ * directly reads it to pick the key to pass to an `extract_*` call, deriving
+ * it forward with `derive_channel_key` when the epoch is newer than the key
+ * it holds.
+ *
+ * # Safety
+ *
+ * `envelope_ptr` must point to a readable byte range of length `envelope_len`.
+ */
+struct ReadSequenceResult read_sequence_from_envelope(const uint8_t *envelope_ptr,
+                                                      size_t envelope_len);
 
 /**
  * Releases the owned strings carried by a [`DeRecError`]. After
@@ -1830,6 +1881,7 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *   "own_transports": [{ "uri": "https://example.com/derec", "protocol": "https" }],
  *   "threshold": 3,
  *   "auto_respond_on_failure": false,
+ *   "key_rotation": false,
  *   "unpair_ack": 0,
  *   "auto_reply_to": false,
  *   "auto_accept": {
@@ -1881,6 +1933,9 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *   NotRequired; omitted means Required.
  *   Any other value is rejected with `DEREC_CODE_FFI_INVALID_ENUM`.
  * - `auto_respond_on_failure` / `auto_reply_to`: omitted means `false`.
+ * - `key_rotation`: whether each helper channel advances one key epoch in
+ *   every sharing round that reaches the threshold, and the replica group
+ *   channel on every publish to replicas; omitted means `false`.
  * - `timeouts`: the four waiting periods, in whole seconds. Each field is
  *   optional and omitted means the [`crate::protocol::types::Timeouts`]
  *   default. `expired_channels` is the automatic removal of `Pending`
@@ -2269,6 +2324,7 @@ struct ProduceGetShareRequestMessageResult produce_get_share_request_message(uin
                                                                              uint32_t version,
                                                                              const uint8_t *shared_key_ptr,
                                                                              size_t shared_key_len,
+                                                                             uint32_t epoch,
                                                                              const uint8_t *reply_to_ptr,
                                                                              size_t reply_to_len);
 
@@ -2300,7 +2356,8 @@ struct ProduceGetShareResponseMessageResult produce_get_share_response_message(u
                                                                                const uint8_t *stored_share_proto_ptr,
                                                                                size_t stored_share_proto_len,
                                                                                const uint8_t *shared_key_ptr,
-                                                                               size_t shared_key_len);
+                                                                               size_t shared_key_len,
+                                                                               uint32_t epoch);
 
 /**
  * # Safety
@@ -2369,6 +2426,7 @@ struct ProduceStoreShareRequestMessageResult produce_store_share_request_message
                                                                                  size_t description_len,
                                                                                  const uint8_t *shared_key_ptr,
                                                                                  size_t shared_key_len,
+                                                                                 uint32_t epoch,
                                                                                  const uint8_t *reply_to_ptr,
                                                                                  size_t reply_to_len);
 
@@ -2394,7 +2452,8 @@ struct ProduceStoreShareResponseMessageResult produce_store_share_response_messa
                                                                                    const uint8_t *request_proto_ptr,
                                                                                    size_t request_proto_len,
                                                                                    const uint8_t *shared_key_ptr,
-                                                                                   size_t shared_key_len);
+                                                                                   size_t shared_key_len,
+                                                                                   uint32_t epoch);
 
 /**
  * # Safety
@@ -2428,6 +2487,7 @@ struct ProduceUnpairRequestMessageResult produce_unpair_request_message(uint64_t
                                                                         size_t memo_len,
                                                                         const uint8_t *shared_key_ptr,
                                                                         size_t shared_key_len,
+                                                                        uint32_t epoch,
                                                                         const uint8_t *reply_to_ptr,
                                                                         size_t reply_to_len);
 
@@ -2448,7 +2508,8 @@ struct ExtractUnpairRequestResult extract_unpair_request(const uint8_t *request_
  */
 struct ProduceUnpairResponseMessageResult produce_unpair_response_message(uint64_t channel_id,
                                                                           const uint8_t *shared_key_ptr,
-                                                                          size_t shared_key_len);
+                                                                          size_t shared_key_len,
+                                                                          uint32_t epoch);
 
 /**
  * # Safety
@@ -2481,6 +2542,7 @@ struct ProduceVerifyShareRequestMessageResult produce_verify_share_request_messa
                                                                                    uint32_t version,
                                                                                    const uint8_t *shared_key_ptr,
                                                                                    size_t shared_key_len,
+                                                                                   uint32_t epoch,
                                                                                    const uint8_t *reply_to_ptr,
                                                                                    size_t reply_to_len);
 
@@ -2507,6 +2569,7 @@ struct ProduceVerifyShareResponseMessageResult produce_verify_share_response_mes
                                                                                      size_t request_proto_len,
                                                                                      const uint8_t *shared_key_ptr,
                                                                                      size_t shared_key_len,
+                                                                                     uint32_t epoch,
                                                                                      const uint8_t *share_content_ptr,
                                                                                      size_t share_content_len);
 

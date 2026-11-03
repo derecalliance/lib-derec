@@ -66,6 +66,7 @@ const NAME_UNIONS: Record<string, Record<string, true>> = {
     Expired: true,
     TimestampMismatch: true,
     StaleResponse: true,
+    KeyUnavailable: true,
   } satisfies Record<IgnoreReason, true>,
   NotRestoredReason: { NoTransports: true } satisfies Record<NotRestoredReason, true>,
   VerifyFailureReason: { NoSharedKey: true, NoProof: true, DispatchFailed: true } satisfies Record<
@@ -137,7 +138,7 @@ const NAME_UNIONS: Record<string, Record<string, true>> = {
 // `SecretKind` and `StateKind` reach this SDK only as the numeric `kind`
 // argument of the store callbacks, typed as a literal union of the values.
 const NUMBER_UNIONS: Record<string, Record<number, true>> = {
-  SecretKind: { 0: true, 1: true, 2: true } satisfies Record<Parameters<SecretStore['load']>[2], true>,
+  SecretKind: { 0: true, 1: true, 2: true, 3: true } satisfies Record<Parameters<SecretStore['load']>[2], true>,
   StateKind: { 0: true, 1: true, 2: true, 3: true, 4: true } satisfies Record<
     Parameters<StateStore['loadAll']>[1],
     true

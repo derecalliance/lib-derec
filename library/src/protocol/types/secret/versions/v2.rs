@@ -148,6 +148,7 @@ impl From<HelperJson> for HelperInfo {
             shared_key: j.shared_key,
             communication_info: j.communication_info,
             weight: 1,
+            key_epoch: 0,
         }
     }
 }
@@ -168,6 +169,7 @@ impl From<ReplicasJson> for Replicas {
             members: j.members.into_iter().map(ReplicaInfo::from).collect(),
             shared_key: j.shared_key,
             channel_id: j.channel_id,
+            key_epoch: 0,
         }
     }
 }

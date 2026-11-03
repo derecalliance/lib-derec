@@ -26,7 +26,11 @@ public static partial class Discovery
                 Array.Empty<TransportProtocol>();
         }
 
-        public static DeRecMessage Produce(ulong channelId, byte[] sharedKey, IReadOnlyList<TransportProtocol>? replyTo = null)
+        /// <summary>
+        /// <c>epoch</c> is the epoch of <c>sharedKey</c> in the channel's key chain,
+        /// stamped into the envelope's <c>sequence</c>; 0 for a freshly paired channel.
+        /// </summary>
+        public static DeRecMessage Produce(ulong channelId, byte[] sharedKey, uint epoch, IReadOnlyList<TransportProtocol>? replyTo = null)
         {
             byte[]? replyToBytes = replyTo is { Count: > 0 }
                 ? TransportProtocol.ToProtoBytesList(replyTo)
@@ -38,6 +42,7 @@ public static partial class Discovery
                     channelId,
                     sharedKey,
                     (UIntPtr)sharedKey.Length,
+                    epoch,
                     replyToBytes,
                     replyToLen
                 );

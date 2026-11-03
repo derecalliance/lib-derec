@@ -112,6 +112,7 @@ impl DeRecSecretStore for SqliteSecretStore {
             SecretValue::SharedKey(_) => SecretKind::SharedKey,
             SecretValue::PairingSecret(_) => SecretKind::PairingSecret,
             SecretValue::PairingContact(_) => SecretKind::PairingContact,
+            SecretValue::KeyRing(_) => SecretKind::KeyRing,
         };
         let bytes = encode_secret_value(&value);
         let conn = lock(&self.connection);

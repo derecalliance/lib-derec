@@ -33,14 +33,14 @@
 use crate::derec_message::DeRecMessageBuilder;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::secret_store::SecretStoreExt as _;
-use crate::protocol::DeRecTransport;
 use crate::protocol::context::Local;
 use crate::protocol::events::{
     Action, DeRecEvent, FailedRequest, PendingAction, PendingActionKind, ReplyTarget,
 };
 use crate::protocol::stores::{StoreSet, Stores};
+use crate::protocol::{ChannelKey, DeRecTransport};
 use crate::transport::TransportPolicy;
-use crate::types::{ChannelId, SharedKey};
+use crate::types::ChannelId;
 use crate::{Error, Result};
 use derec_proto::{MessageBody, StatusEnum, TransportProtocol};
 use prost::Message as _;
@@ -72,7 +72,7 @@ struct State {
     channel_id: ChannelId,
     /// That channel's key, when it is already known in memory. `None` loads
     /// it from the secret store at send time.
-    key: Option<SharedKey>,
+    key: Option<ChannelKey>,
     /// The endpoints the response goes to, once a flow has named them.
     endpoints: Option<Vec<TransportProtocol>>,
     /// The status and memo of the response handed to the transport, once
@@ -90,7 +90,7 @@ struct State {
 impl Obligation {
     fn new(
         channel_id: ChannelId,
-        key: Option<SharedKey>,
+        key: Option<ChannelKey>,
         trace_id: u64,
         request: FailedRequest,
         policy: TransportPolicy,
@@ -120,7 +120,7 @@ impl Obligation {
     pub(crate) fn for_body(
         body: &MessageBody,
         channel_id: ChannelId,
-        key: &SharedKey,
+        key: &ChannelKey,
         trace_id: u64,
         policy: TransportPolicy,
     ) -> Option<Self> {
@@ -155,7 +155,7 @@ impl Obligation {
     /// envelope's `trace_id`.
     pub(crate) fn undecodable(
         channel_id: ChannelId,
-        key: &SharedKey,
+        key: &ChannelKey,
         trace_id: u64,
         policy: TransportPolicy,
     ) -> Self {
@@ -231,9 +231,15 @@ impl Obligation {
         self.lock().endpoints = Some(endpoints);
     }
 
+    /// The response is encrypted under `key`, the key of the epoch the
+    /// request arrived under, on the channel it is answered on.
+    pub(crate) fn answer_under(&self, key: ChannelKey) {
+        self.lock().key = Some(key);
+    }
+
     /// The response is encrypted for `channel_id` under `key` rather than for
     /// the channel the request arrived on.
-    pub(crate) fn encrypt_for(&self, channel_id: ChannelId, key: SharedKey) {
+    pub(crate) fn encrypt_for(&self, channel_id: ChannelId, key: ChannelKey) {
         let mut state = self.lock();
         state.channel_id = channel_id;
         state.key = Some(key);
@@ -330,7 +336,7 @@ impl Obligation {
             None => {
                 stores
                     .secrets
-                    .paired_key(local.secret_id, channel_id)
+                    .current_key(local.secret_id, channel_id)
                     .await?
             }
         };
@@ -370,7 +376,7 @@ impl Obligation {
 
 /// The channel whose key encrypts a response, the endpoints it goes to, and
 /// that key.
-type Target = (ChannelId, Vec<TransportProtocol>, SharedKey);
+type Target = (ChannelId, Vec<TransportProtocol>, ChannelKey);
 
 /// Hand `envelope` to the transport as the response `obligation` is owed.
 /// `status` and `memo` are the result the envelope's response carries.
@@ -519,32 +525,40 @@ pub(crate) async fn settle<S: StoreSet>(
         }
     }
 
-    let reply = match target {
-        Ok((channel_id, endpoints, _)) => ReplyTarget {
-            channel_id,
-            endpoints,
-        },
-        Err(_) => obligation.unresolved_target(),
+    let (reply, key) = match target {
+        Ok((channel_id, endpoints, key)) => (
+            ReplyTarget {
+                channel_id,
+                endpoints,
+            },
+            Some(key),
+        ),
+        Err(_) => (obligation.unresolved_target(), None),
     };
-    // The token is sealed under the reply channel's key, which `reject` also
-    // answers under: a channel whose key cannot be read could neither seal
-    // the token nor answer it, so no token is issued.
-    let token = match stores
+    // The token is sealed under the reply channel's key at the epoch the
+    // response is encrypted under, taken from the stored ring, which `reject`
+    // also answers under: a channel whose key cannot be read from the store
+    // could neither seal the token nor answer it, so no token is issued.
+    let key = match stores
         .secrets
-        .shared_key(local.secret_id, reply.channel_id)
+        .key_ring(local.secret_id, reply.channel_id)
         .await
     {
-        Ok(Some(key)) => Some(
-            PendingAction::failure(
-                obligation.channel_id,
-                obligation.trace_id,
-                reply,
-                obligation.request.clone(),
-            )
-            .sealed_with(&key),
-        ),
+        Ok(Some(ring)) => match key {
+            Some(key) => ring.key_at(key.epoch),
+            None => Some(ring.current()),
+        },
         Ok(None) | Err(_) => None,
     };
+    let token = key.map(|key| {
+        PendingAction::failure(
+            obligation.channel_id,
+            obligation.trace_id,
+            reply,
+            obligation.request.clone(),
+        )
+        .sealed_with(&key)
+    });
     events.push(request_failed(
         obligation.channel_id,
         obligation.kind(),

@@ -52,6 +52,11 @@ pub fn encode_secret_value(value: &SecretValue) -> Vec<u8> {
         SecretValue::PairingContact(contact) => {
             (SecretKind::PairingContact as u8, contact.encode_to_vec())
         }
+        SecretValue::KeyRing(ring) => (
+            SecretKind::KeyRing as u8,
+            ring.as_bytes()
+                .expect("the protocol saves only rings it can encode"),
+        ),
     };
     let mut out = Vec::with_capacity(1 + payload.len());
     out.push(tag);
@@ -79,6 +84,10 @@ pub fn decode_secret_value(bytes: &[u8]) -> SecretValue {
                 ContactMessage::decode(payload).expect("failed to prost-decode ContactMessage");
             SecretValue::PairingContact(contact)
         }
+        t if t == SecretKind::KeyRing as u8 => SecretValue::KeyRing(
+            derec_library::protocol::KeyRing::from_bytes(payload)
+                .expect("failed to decode KeyRing blob"),
+        ),
         other => panic!("unknown SecretValue tag byte: {other}"),
     }
 }
@@ -180,4 +189,25 @@ pub fn replica_role_tag(role: ReplicaRole) -> i64 {
 
 pub fn sender_kind_tag(kind: SenderKind) -> i64 {
     kind as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use derec_library::protocol::KeyRing;
+
+    #[test]
+    fn a_key_ring_round_trips_as_opaque_bytes() {
+        let mut raw = vec![1u8, 0, 0, 0, 0];
+        raw.extend_from_slice(&[7u8; 32]);
+        raw.extend_from_slice(&[0, 0, 0, 0]);
+        let ring = KeyRing::from_bytes(&raw).expect("a fresh ring decodes");
+
+        let blob = encode_secret_value(&SecretValue::KeyRing(ring.clone()));
+        assert_eq!(blob[0], SecretKind::KeyRing as u8);
+        match decode_secret_value(&blob) {
+            SecretValue::KeyRing(back) => assert_eq!(back, ring),
+            _ => panic!("tag 3 must decode to a key ring"),
+        }
+    }
 }

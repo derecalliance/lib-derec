@@ -32,7 +32,8 @@ func runProtocolConfig() {
 	// A node built from the full fixture pairs like any other.
 	cfg := protocol.Config{SecretID: protocolSecretID}
 	must(json.Unmarshal(fixture["full"], &cfg.DeRecProtocolConfig), "unmarshal fixture `full`")
-	assertTrue(*cfg.Threshold == 3 && *cfg.ReplicaID == 9007199254740993 && len(cfg.OwnTransports) == 2,
+	assertTrue(*cfg.Threshold == 3 && *cfg.ReplicaID == 9007199254740993 && len(cfg.OwnTransports) == 2 &&
+		cfg.KeyRotation != nil && *cfg.KeyRotation,
 		"fixture `full` did not unmarshal into every field: %+v", cfg.DeRecProtocolConfig)
 	owner, err := newPeerFromConfig("owner", cfg)
 	must(err, "protocol.New(fixture `full`)")

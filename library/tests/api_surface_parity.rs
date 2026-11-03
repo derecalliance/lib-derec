@@ -1144,8 +1144,20 @@ fn rust_primitives_are_named_and_exported() {
     }
     for p in &prims {
         let path = field(p, "rust");
-        // Entries outside `primitives::` name the module file they live in.
-        if !path.starts_with("primitives::") {
+        // Entries outside `primitives::` name the module file they live in,
+        // or `module::Type::method` for an inherent method.
+        let method = path
+            .rsplit_once("::")
+            .and_then(|(owner, name)| owner.rsplit_once("::").map(|(m, ty)| (m, ty, name)))
+            .filter(|(_, ty, _)| ty.starts_with(|c: char| c.is_ascii_uppercase()));
+        if let Some((module, ty, name)) = method {
+            let rel = format!("library/src/{}.rs", module.replace("::", "/"));
+            if !rust_impl_methods(std::slice::from_ref(&rel), ty).contains(name) {
+                problems.push(format!(
+                    "api_surface.json names {path}, which {rel} does not define"
+                ));
+            }
+        } else if !path.starts_with("primitives::") {
             let (module, name) = path.rsplit_once("::").expect("a module path");
             let rel = format!("library/src/{}/mod.rs", module.replace("::", "/"));
             if !read(&rel)

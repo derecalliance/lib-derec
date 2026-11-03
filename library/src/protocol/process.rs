@@ -11,6 +11,7 @@
 use super::context::{local, pairing_config};
 use super::error::ProcessError;
 use super::events::DeRecEvent;
+use super::keychain::Lookup;
 use super::stores::borrow_stores;
 use super::traits::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport,
@@ -305,14 +306,29 @@ impl<
         ))
     }
 
+    /// Open and handle a message that arrived on a paired channel, or return
+    /// `None` when the channel has no key ring here.
+    ///
+    /// The key is chosen by the envelope's `sequence`, the epoch of the key
+    /// the payload is under. An epoch the ring cannot give a key for is
+    /// ignored as
+    /// [`IgnoreReason::KeyUnavailable`](crate::protocol::IgnoreReason::KeyUnavailable).
+    /// An epoch ahead of the newest is opened by deriving forward, within the
+    /// forward-jump limit; once the payload decrypts, the new epoch is
+    /// persisted before the message is handled, so a failure in handling does
+    /// not undo the move. An epoch below the newest is opened with the key the
+    /// ring holds or derives, and the ring does not move.
+    ///
+    /// A message that does not decrypt has no authenticated sender: it fails
+    /// with `Err`, nothing is sent, and no state changes.
     async fn process_channel_message(
         &mut self,
         message: &DeRecMessage,
         channel_id: ChannelId,
     ) -> Result<Option<Vec<DeRecEvent>>> {
-        let Some(shared_key) = self
+        let Some(ring) = self
             .secret_store
-            .shared_key(self.secret_id, channel_id)
+            .key_ring(self.secret_id, channel_id)
             .await?
         else {
             return Ok(None);
@@ -331,12 +347,42 @@ impl<
             }]));
         }
 
+        let (key, advanced) = match ring.lookup(message.sequence) {
+            Lookup::Unavailable => {
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    channel_id = channel_id.0,
+                    sequence = message.sequence,
+                    "message ignored — no key for its epoch"
+                );
+                return Ok(Some(vec![DeRecEvent::MessageIgnored {
+                    channel_id,
+                    reason: crate::protocol::IgnoreReason::KeyUnavailable,
+                    trace_id: message.trace_id,
+                }]));
+            }
+            Lookup::Held(key) | Lookup::Behind(key) => (key, None),
+            Lookup::Ahead { key, advanced } => (key, Some(advanced)),
+        };
+
+        let plaintext = crate::derec_message::decrypt_inner_message(&message.message, &key.key)?;
+
+        // The sender holds the newer key, so the move is kept even if
+        // handling then fails. A save failure leaves the ring where it was,
+        // and processing the same bytes again retries it.
+        if let Some(advanced) = advanced {
+            self.secret_store
+                .save_key_ring(self.secret_id, channel_id, &advanced)
+                .await?;
+        }
+
         let events = handlers::handle(
             &mut borrow_stores!(self),
             &local!(self),
             message,
             channel_id,
-            &shared_key,
+            &plaintext,
+            &key,
             self.auto_respond_on_failure,
         )
         .await?;
@@ -529,7 +575,7 @@ mod tests {
                     reply_to_transports: Vec::new(),
                 },
             ))
-            .encrypt(&SHARED_KEY)
+            .encrypt(&crate::types::ChannelKey::new(0, SHARED_KEY.clone()))
             .expect("encrypt")
             .build()
             .expect("build")
@@ -648,7 +694,10 @@ mod tests {
                         reply_to_transports: Vec::new(),
                     },
                 ))
-                .encrypt(&crate::types::SharedKey::new([1u8; 32]))
+                .encrypt(&crate::types::ChannelKey::new(
+                    0,
+                    crate::types::SharedKey::new([1u8; 32]),
+                ))
                 .expect("encrypt")
                 .build()
                 .expect("build")
@@ -740,7 +789,7 @@ mod tests {
                     ..Default::default()
                 },
             ))
-            .encrypt(&SHARED_KEY)
+            .encrypt(&crate::types::ChannelKey::new(0, SHARED_KEY.clone()))
             .expect("encrypt")
             .build()
             .expect("build")

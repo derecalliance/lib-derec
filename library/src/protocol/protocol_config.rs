@@ -45,6 +45,7 @@ use crate::protocol::{AutoAcceptPolicy, ExpiredChannelCleanup, UnpairAck};
 ///   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
 ///   "auto_accept": { "pairing": true, "store_share": true },
 ///   "auto_respond_on_failure": false,
+///   "key_rotation": false,
 ///   "auto_reply_to": false,
 ///   "unpair_ack": "required",
 ///   "unsafe_connection": false,
@@ -95,6 +96,8 @@ pub struct DeRecProtocolConfig {
     pub auto_accept: Option<AutoAcceptPolicy>,
     /// See [`with_auto_respond_on_failure`](crate::protocol::DeRecProtocolBuilder::with_auto_respond_on_failure).
     pub auto_respond_on_failure: Option<bool>,
+    /// See [`with_key_rotation`](crate::protocol::DeRecProtocolBuilder::with_key_rotation).
+    pub key_rotation: Option<bool>,
     /// See [`with_auto_reply_to`](crate::protocol::DeRecProtocolBuilder::with_auto_reply_to).
     pub auto_reply_to: Option<bool>,
     /// See [`with_unpair_ack`](crate::protocol::DeRecProtocolBuilder::with_unpair_ack).
@@ -217,6 +220,7 @@ impl DeRecProtocolConfig {
             parameter_range,
             auto_accept,
             auto_respond_on_failure,
+            key_rotation,
             auto_reply_to,
             unpair_ack,
             unsafe_connection,
@@ -242,6 +246,7 @@ impl DeRecProtocolConfig {
         over(&mut self.parameter_range, parameter_range);
         over(&mut self.auto_accept, auto_accept);
         over(&mut self.auto_respond_on_failure, auto_respond_on_failure);
+        over(&mut self.key_rotation, key_rotation);
         over(&mut self.auto_reply_to, auto_reply_to);
         over(&mut self.unpair_ack, unpair_ack);
         over(&mut self.unsafe_connection, unsafe_connection);
@@ -356,6 +361,8 @@ mod wire {
         auto_accept: Option<AutoAcceptWire>,
         #[serde(skip_serializing_if = "Option::is_none")]
         auto_respond_on_failure: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        key_rotation: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         auto_reply_to: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -597,6 +604,7 @@ mod wire {
                 parameter_range: w.parameter_range.map(Into::into),
                 auto_accept: w.auto_accept.map(Into::into),
                 auto_respond_on_failure: w.auto_respond_on_failure,
+                key_rotation: w.key_rotation,
                 auto_reply_to: w.auto_reply_to,
                 unpair_ack: w.unpair_ack.map(UnpairAckWire::resolve).transpose()?,
                 unsafe_connection: w.unsafe_connection,
@@ -616,6 +624,7 @@ mod wire {
                 parameter_range: c.parameter_range.map(Into::into),
                 auto_accept: c.auto_accept.map(Into::into),
                 auto_respond_on_failure: c.auto_respond_on_failure,
+                key_rotation: c.key_rotation,
                 auto_reply_to: c.auto_reply_to,
                 unpair_ack: c.unpair_ack.map(|ack| {
                     UnpairAckWire::Name(protocol_names::unpair_ack_to_name(ack).to_owned())
@@ -675,6 +684,7 @@ mod tests {
             "update_channel_info": false
         },
         "auto_respond_on_failure": true,
+        "key_rotation": true,
         "auto_reply_to": true,
         "unpair_ack": "not_required",
         "unsafe_connection": true,
@@ -724,6 +734,7 @@ mod tests {
             })
         );
         assert_eq!(c.auto_respond_on_failure, Some(true));
+        assert_eq!(c.key_rotation, Some(true));
         assert_eq!(c.auto_reply_to, Some(true));
         assert_eq!(c.unpair_ack, Some(UnpairAck::NotRequired));
         assert_eq!(c.unsafe_connection, Some(true));
@@ -757,6 +768,23 @@ mod tests {
         let original: serde_json::Value = serde_json::from_str(CANONICAL).unwrap();
         assert_eq!(written, original);
         assert_eq!(parse(&written.to_string()).expect("re-parses"), c);
+    }
+
+    #[test]
+    fn key_rotation_parses_and_layers() {
+        let on = parse(r#"{ "key_rotation": true }"#).expect("parses");
+        assert_eq!(on.key_rotation, Some(true));
+        assert_eq!(
+            serde_json::to_value(&on).expect("serializes"),
+            serde_json::json!({ "key_rotation": true })
+        );
+        assert_eq!(parse("{}").expect("parses").key_rotation, None);
+
+        let mut held = on.clone();
+        held.layer(DeRecProtocolConfig::default());
+        assert_eq!(held.key_rotation, Some(true));
+        held.layer(parse(r#"{ "key_rotation": false }"#).expect("parses"));
+        assert_eq!(held.key_rotation, Some(false));
     }
 
     #[test]

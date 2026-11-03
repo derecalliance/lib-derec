@@ -2,12 +2,13 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
-    ChannelRequest, DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore,
-    DeRecTransport, MissingPolicy, PendingAction, SecretKind, SecretValue,
+    ChannelKey, ChannelRequest, DeRecChannelStore, DeRecEvent, DeRecShareStore, DeRecTransport,
+    KeyRing, MissingPolicy, PendingAction,
 };
 use super::replicas::discovery as replica;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
+use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -21,7 +22,7 @@ use crate::{
         stores::{StoreSet, Stores},
         types::Target,
     },
-    types::{ChannelId, SharedKey},
+    types::ChannelId,
 };
 use derec_proto::{
     DeRecResult, GetSecretIdsVersionsRequestMessage, GetSecretIdsVersionsResponseMessage,
@@ -89,12 +90,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 
     let keys = stores
         .secrets
-        .load_many(
-            local.secret_id,
-            &channel_ids,
-            SecretKind::SharedKey,
-            MissingPolicy::Fail,
-        )
+        .key_rings_many(local.secret_id, &channel_ids, MissingPolicy::Fail)
         .await?;
 
     let events = dispatch_all(stores, local, keys, round).await;
@@ -138,7 +134,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
 
     let secret_list = catalog(all_shares);
 
-    let resp = response::produce(channel_id, &secret_list, exchange.shared_key)?;
+    let resp = response::produce(channel_id, &secret_list, exchange.key)?;
 
     let envelope = crate::derec_message::apply_trace_id(&resp.envelope, exchange.trace_id)?;
     let endpoint = stores
@@ -184,7 +180,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         local.secret_id,
         exchange.channel_id,
         failure_response(local, request, status, memo),
-        exchange.shared_key,
+        exchange.key,
         exchange.trace_id,
         local.policy,
         &crate::extensions::advertised_endpoints::reply_to_owned(request),
@@ -231,7 +227,7 @@ fn on_request(
             exchange.trace_id,
             ChannelRequest::Discovery(request),
         )
-        .sealed_with(exchange.shared_key),
+        .sealed_with(exchange.key),
     }])
 }
 
@@ -307,20 +303,19 @@ fn catalog(all_shares: Vec<crate::protocol::types::Share>) -> Vec<SecretVersionE
 async fn dispatch_all<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-    keys: Vec<(ChannelId, SecretValue)>,
+    keys: Vec<(ChannelId, Option<KeyRing>)>,
     round: &Round<'_>,
 ) -> Vec<DeRecEvent> {
     let mut events = Vec::with_capacity(keys.len());
-    for (channel_id, value) in keys {
-        let SecretValue::SharedKey(shared_key) = value else {
+    for (channel_id, ring) in keys {
+        let Some(ring) = ring else {
             events.push(DeRecEvent::DiscoveryFailed {
                 channel_id,
-                error: "channel has no shared key".to_owned(),
+                error: super::NO_USABLE_KEY.to_owned(),
             });
             continue;
         };
-
-        match dispatch_one(stores, local, channel_id, &shared_key, round).await {
+        match dispatch_one(stores, local, channel_id, &ring.current(), round).await {
             Ok(()) => {
                 events.push(DeRecEvent::DiscoveryStarted {
                     channel_id,
@@ -350,14 +345,14 @@ async fn dispatch_one<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     channel_id: ChannelId,
-    shared_key: &SharedKey,
+    key: &ChannelKey,
     round: &Round<'_>,
 ) -> Result<()> {
     let endpoint = stores
         .channels
         .peer_endpoints(local.secret_id, channel_id)
         .await?;
-    let msg = request::produce(channel_id, shared_key, round.reply_to)?;
+    let msg = request::produce(channel_id, key, round.reply_to)?;
     let envelope = crate::derec_message::apply_trace_id(&msg.envelope, round.trace_id)?;
     stores.transport.send(&endpoint, envelope).await?;
     Ok(())

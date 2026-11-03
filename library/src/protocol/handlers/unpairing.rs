@@ -124,11 +124,11 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         trace_id: round.trace_id,
     }];
 
-    let shared_key = stores.secrets.paired_key(secret_id, channel_id).await?;
+    let key = stores.secrets.current_key(secret_id, channel_id).await?;
 
     // Helper unpair: no member is named, which is what marks this the
     // owner ↔ helper path rather than a replica-group removal.
-    let request = produce_unpair_request(channel_id, &memo_str, &shared_key, round.reply_to, None)?;
+    let request = produce_unpair_request(channel_id, &memo_str, &key, round.reply_to, None)?;
     let envelope = crate::derec_message::apply_trace_id(&request.envelope, round.trace_id)?;
     let endpoint = stores
         .channels
@@ -186,7 +186,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     request: &UnpairRequestMessage,
 ) -> Result<Vec<DeRecEvent>> {
     let channel_id = exchange.channel_id;
-    let resp = unpairing_response::produce(channel_id, exchange.shared_key)?;
+    let resp = unpairing_response::produce(channel_id, exchange.key)?;
     let envelope = crate::derec_message::apply_trace_id(&resp.envelope, exchange.trace_id)?;
     let endpoint = stores
         .channels
@@ -243,7 +243,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         local.secret_id,
         exchange.channel_id,
         failure_response(status, memo),
-        exchange.shared_key,
+        exchange.key,
         exchange.trace_id,
         local.policy,
         &crate::extensions::advertised_endpoints::reply_to_owned(request),
@@ -291,6 +291,7 @@ pub(in crate::protocol) async fn drop_channels_state<S: StoreSet>(
         .flat_map(|&channel_id| {
             [
                 SecretKind::SharedKey,
+                SecretKind::KeyRing,
                 SecretKind::PairingSecret,
                 SecretKind::PairingContact,
             ]
@@ -319,7 +320,7 @@ fn on_request(exchange: &Exchange<'_>, request: UnpairRequestMessage) -> Result<
             exchange.trace_id,
             ChannelRequest::Unpair(request),
         )
-        .sealed_with(exchange.shared_key),
+        .sealed_with(exchange.key),
     }])
 }
 

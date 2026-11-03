@@ -49,7 +49,7 @@ func TestRecoverReconstructsOriginalSecret(t *testing.T) {
 	for _, channelID := range []uint64{1, 2} {
 		key := keys[channelID]
 
-		requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], 0, "", key, nil)
+		requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], 0, "", key, 0, nil)
 		if err != nil {
 			t.Fatalf("channel %d: store request produce: %v", channelID, err)
 		}
@@ -65,7 +65,7 @@ func TestRecoverReconstructsOriginalSecret(t *testing.T) {
 	for _, channelID := range []uint64{1, 2} {
 		key := keys[channelID]
 
-		getRequestWire, err := recovery.Request.Produce(channelID, secretID, version, key, nil)
+		getRequestWire, err := recovery.Request.Produce(channelID, secretID, version, key, 0, nil)
 		if err != nil {
 			t.Fatalf("channel %d: get-share request produce: %v", channelID, err)
 		}
@@ -78,7 +78,7 @@ func TestRecoverReconstructsOriginalSecret(t *testing.T) {
 			t.Fatalf("channel %d: extracted request channel id mismatch, got %d", channelID, extractedReq.ChannelID)
 		}
 
-		getResponseWire, err := recovery.Response.Produce(channelID, extractedReq.RequestProto, storedRequests[channelID], key)
+		getResponseWire, err := recovery.Response.Produce(channelID, extractedReq.RequestProto, storedRequests[channelID], key, 0)
 		if err != nil {
 			t.Fatalf("channel %d: get-share response produce: %v", channelID, err)
 		}
@@ -121,7 +121,7 @@ func TestRecoverBelowThresholdFails(t *testing.T) {
 	channelID := uint64(1)
 	key := sharedKey(1)
 
-	requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], 0, "", key, nil)
+	requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], 0, "", key, 0, nil)
 	if err != nil {
 		t.Fatalf("store request produce: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestRecoverBelowThresholdFails(t *testing.T) {
 		t.Fatalf("store request extract: %v", err)
 	}
 
-	getRequestWire, err := recovery.Request.Produce(channelID, secretID, version, key, nil)
+	getRequestWire, err := recovery.Request.Produce(channelID, secretID, version, key, 0, nil)
 	if err != nil {
 		t.Fatalf("get-share request produce: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestRecoverBelowThresholdFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get-share request extract: %v", err)
 	}
-	getResponseWire, err := recovery.Response.Produce(channelID, extractedReq.RequestProto, extracted.RequestProto, key)
+	getResponseWire, err := recovery.Response.Produce(channelID, extractedReq.RequestProto, extracted.RequestProto, key, 0)
 	if err != nil {
 		t.Fatalf("get-share response produce: %v", err)
 	}

@@ -13,13 +13,15 @@ use crate::protocol::traits::{
     DeRecUserSecretStore,
 };
 use crate::protocol::types::{
-    ChannelQuery, ChannelStatus, ReplicaFilter, SharingRoundState, StateItem, StateKey, StateKind,
+    ChannelQuery, ChannelStatus, MissingPolicy, ReplicaFilter, SharingRoundState, StateItem,
+    StateKey, StateKind,
 };
 use crate::types::{ChannelId, ReplicaId};
 use derec_proto::StatusEnum;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
 #[cfg(not(target_arch = "wasm32"))]
@@ -36,7 +38,8 @@ impl<
 {
     /// Settle every open sharing round: time out the participants it has
     /// waited on too long, apply the answers in `events`, persist the round or
-    /// report it complete, then drop the proofs no helper can answer anymore.
+    /// report it complete, then drop the proofs no helper can answer anymore
+    /// and the key pins no peer can still reply under (see `drop_pins`).
     ///
     /// Every open round is offered the same event list and takes only the
     /// entries carrying its own version. Rounds overlap whenever a publish
@@ -80,6 +83,15 @@ impl<
             .iter()
             .map(|(round, _)| (round.version, round.pending.clone()))
             .collect();
+        let unsynced: Vec<u32> = passes
+            .iter()
+            .filter(|(round, _)| !round.pending_replicas.is_empty())
+            .map(|(round, _)| round.version)
+            .collect();
+        let keeps: Vec<u32> = passes
+            .iter()
+            .filter_map(|(round, _)| round.keep_version)
+            .collect();
 
         let (answered, open): (Vec<_>, Vec<_>) = passes
             .into_iter()
@@ -105,6 +117,15 @@ impl<
             first_error,
         } = written;
         let timeout_events = std::mem::take(&mut settled.timeout_events);
+        self.drop_pins(
+            &settled,
+            &Awaited {
+                unanswered: &unanswered,
+                unsynced: &unsynced,
+                keeps: &keeps,
+            },
+        )
+        .await;
         self.drop_proofs(settled, &unanswered).await;
 
         events.splice(0..0, timeout_events);
@@ -191,7 +212,13 @@ impl<
         }
 
         let mut unreported: BTreeSet<u64> = removed.into_iter().collect();
-        for ((round, settled), threshold_met) in answered.into_iter().zip(thresholds_met) {
+        for ((round, mut settled), threshold_met) in answered.into_iter().zip(thresholds_met) {
+            if !round.synced_replicas.is_empty() && round.behind_replicas.is_empty() {
+                settled.synced.push(round.version);
+            }
+            if !round.synced_replicas.is_empty() || !round.behind_replicas.is_empty() {
+                settled.closed.push(round.version);
+            }
             let mut events = vec![DeRecEvent::SharingComplete {
                 version: round.version,
                 confirmed_count: round.confirmed.len(),
@@ -407,6 +434,182 @@ impl<
         }
     }
 
+    /// Drop the pins, and the keys only they named, that the rounds settled
+    /// in `settled` show no peer can still reply under. The owner's old keys
+    /// serve only answers still in flight: a restore takes each channel's key
+    /// from the published secret, not from these pins.
+    ///
+    /// - A helper that confirms version `v` sent with `keepVersion` `k` has
+    ///   removed every other version it held on the channel but `k`, so the
+    ///   pins of versions older than `v` other than `k` go. A version whose
+    ///   round still waits on that helper keeps its pin: it may reach the
+    ///   helper after `v` and be stored. A confirmation with no recorded
+    ///   `keepVersion` drops nothing.
+    /// - A helper that fails version `v`, by rejecting it or by timing out,
+    ///   is no longer awaited for it: a late answer is ignored by the closed
+    ///   round. The pins of `v` and of older versions go, except the newest
+    ///   one below `v`, which keeps a key the helper may still answer under;
+    ///   a version whose round still waits on that helper; and a version a
+    ///   round settled in this pass sends as its `keepVersion`. A helper that
+    ///   receives requests but never answers therefore leaves at most one pin
+    ///   behind, however many rounds it misses. A helper whose request could
+    ///   not be sent, reported as `ProtectSecretFailed`, is not awaited and
+    ///   never fails a round, so it keeps one pin per such round until it is
+    ///   unpaired.
+    /// - A round every member acknowledged has moved every member to its
+    ///   epoch, so the group channel's pins of older versions go, except a
+    ///   version whose round still waits on a member.
+    /// - A round that closes with a member behind keeps, on the group
+    ///   channel, the oldest pin, the pins of its own and newer versions, and
+    ///   those of versions still waiting on a member; the pins in between go.
+    ///   The source does not record which version each member last
+    ///   acknowledged. Once a round every member acknowledged has closed, the
+    ///   oldest pin is that round's version, which every member reached, so a
+    ///   member that fell behind since still reaches the source under its own
+    ///   epoch, derived from that key within the forward-jump limit. A member
+    ///   that stays behind therefore leaves a bounded number of pins.
+    ///
+    /// A store error is logged and swallowed: a pin left behind only keeps a
+    /// key longer, and a later settlement drops it.
+    async fn drop_pins(&mut self, settled: &Settled, awaited: &Awaited<'_>) {
+        let mut rules: BTreeMap<ChannelId, Vec<PinRule>> = BTreeMap::new();
+        for confirmation in &settled.confirmed {
+            if let Some(keep_version) = confirmation.keep_version {
+                rules
+                    .entry(confirmation.channel_id)
+                    .or_default()
+                    .push(PinRule::Confirmed {
+                        version: confirmation.version,
+                        keep_version,
+                    });
+            }
+        }
+        for &(channel_id, version) in &settled.failed {
+            rules
+                .entry(channel_id)
+                .or_default()
+                .push(PinRule::Failed { version });
+        }
+        if !settled.closed.is_empty() {
+            match self.group_channel().await {
+                Ok(Some(group)) => {
+                    let group_rules = rules.entry(group).or_default();
+                    if let Some(&version) = settled.synced.iter().max() {
+                        group_rules.push(PinRule::GroupSynced { version });
+                    }
+                    if let Some(&version) = settled.closed.iter().max() {
+                        group_rules.push(PinRule::GroupClosed { version });
+                    }
+                }
+                Ok(None) => {}
+                Err(_error) => {
+                    #[cfg(feature = "logging")]
+                    tracing::warn!(
+                        error = %_error,
+                        "group pin cleanup could not find the group channel; pins kept"
+                    );
+                }
+            }
+        }
+        if rules.is_empty() {
+            return;
+        }
+
+        let ids: Vec<ChannelId> = rules.keys().copied().collect();
+        let rings = match self
+            .secret_store
+            .key_rings_many(self.secret_id, &ids, MissingPolicy::Skip)
+            .await
+        {
+            Ok(rings) => rings,
+            Err(_error) => {
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    error = %_error,
+                    "pin cleanup could not load the key rings; pins kept"
+                );
+                return;
+            }
+        };
+
+        for (channel_id, ring) in rings {
+            let (Some(ring), Some(channel_rules)) = (ring, rules.get(&channel_id)) else {
+                continue;
+            };
+            let waiting = |pinned: u32| awaited.waits_on(settled, channel_id, pinned);
+            let mut pruned = ring.clone();
+            for rule in channel_rules {
+                pruned = match *rule {
+                    PinRule::Confirmed {
+                        version,
+                        keep_version,
+                    } => pruned.retain_pins(|pinned| {
+                        pinned >= version
+                            || pinned == keep_version
+                            || awaited.unanswered.iter().any(|(round, pending)| {
+                                *round == pinned && pending.contains(&channel_id)
+                            })
+                    }),
+                    PinRule::Failed { version } => {
+                        let base = newest_pin_below(&pruned, version);
+                        pruned.retain_pins(|pinned| {
+                            pinned > version
+                                || Some(pinned) == base
+                                || waiting(pinned)
+                                || awaited.keeps.contains(&pinned)
+                        })
+                    }
+                    PinRule::GroupSynced { version } => pruned.retain_pins(|pinned| {
+                        pinned >= version || awaited.unsynced.contains(&pinned)
+                    }),
+                    PinRule::GroupClosed { version } => {
+                        let oldest = pruned.pins().first().map(|(pinned, _)| *pinned);
+                        pruned.retain_pins(|pinned| {
+                            pinned >= version
+                                || Some(pinned) == oldest
+                                || awaited.unsynced.contains(&pinned)
+                        })
+                    }
+                };
+            }
+            if pruned == ring {
+                continue;
+            }
+            if let Err(_error) = self
+                .secret_store
+                .save_key_ring(self.secret_id, channel_id, &pruned)
+                .await
+            {
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    channel_id = channel_id.0,
+                    error = %_error,
+                    "pin cleanup could not save the key ring; pins kept"
+                );
+            }
+        }
+    }
+
+    /// The replica group's channel: the one on this device's own member row,
+    /// or `None` when it is not in a group.
+    async fn group_channel(&self) -> Result<Option<ChannelId>> {
+        let Some(own) = self.replica_id else {
+            return Ok(None);
+        };
+        Ok(self
+            .channel_store
+            .replicas_matching(
+                self.secret_id,
+                ReplicaFilter {
+                    ids: vec![ReplicaId(own)],
+                    ..Default::default()
+                },
+            )
+            .await?
+            .first()
+            .map(|member| member.channel_id))
+    }
+
     /// The versions of the owner's proofs stored for each channel in
     /// `confirmed` whose round recorded a `keep_version`, read in one call,
     /// leaving out the versions `failed` is about to drop.
@@ -534,6 +737,54 @@ fn time_out(round: &mut SharingRoundState) -> (Vec<ChannelId>, Vec<DeRecEvent>) 
     (timed_out, events)
 }
 
+/// The newest version below `version` that `ring` pins.
+fn newest_pin_below(ring: &crate::protocol::KeyRing, version: u32) -> Option<u32> {
+    ring.pins()
+        .iter()
+        .rev()
+        .map(|(pinned, _)| *pinned)
+        .find(|pinned| *pinned < version)
+}
+
+/// One reason, found by settling rounds, to drop pins on a channel; see
+/// [`DeRecProtocol::drop_pins`].
+enum PinRule {
+    /// The channel's helper confirmed `version`, sent with `keep_version`.
+    Confirmed { version: u32, keep_version: u32 },
+    /// The channel's helper failed `version`.
+    Failed { version: u32 },
+    /// Every member acknowledged `version`, the newest such round.
+    GroupSynced { version: u32 },
+    /// The newest round with a replica leg that closed.
+    GroupClosed { version: u32 },
+}
+
+/// What the rounds of one pass still wait for, read before their answers
+/// were applied.
+struct Awaited<'a> {
+    /// Each round's version and the helpers it was waiting on.
+    unanswered: &'a [(u32, HashSet<ChannelId>)],
+    /// The rounds that were waiting on a member.
+    unsynced: &'a [u32],
+    /// The `keepVersion` of every round.
+    keeps: &'a [u32],
+}
+
+impl Awaited<'_> {
+    /// Whether a round still waits on `channel_id`'s helper for `version`
+    /// after the answers in `settled`.
+    fn waits_on(&self, settled: &Settled, channel_id: ChannelId, version: u32) -> bool {
+        self.unanswered
+            .iter()
+            .any(|(round, pending)| *round == version && pending.contains(&channel_id))
+            && !settled.failed.contains(&(channel_id, version))
+            && !settled
+                .confirmed
+                .iter()
+                .any(|c| c.channel_id == channel_id && c.version == version)
+    }
+}
+
 /// What settling a round decided: the proofs it gives up and the timeouts it
 /// reports. Gathered across every round whose write succeeded, so
 /// [`DeRecProtocol::drop_proofs`] drops the proofs in one call.
@@ -543,6 +794,10 @@ struct Settled {
     failed: Vec<(ChannelId, u32)>,
     /// Each helper channel that confirmed a round.
     confirmed: Vec<Confirmation>,
+    /// The closed rounds every member it was sent to acknowledged.
+    synced: Vec<u32>,
+    /// The closed rounds that had a replica leg.
+    closed: Vec<u32>,
     /// The events reporting the participants a round timed out.
     timeout_events: Vec<DeRecEvent>,
 }
@@ -564,6 +819,8 @@ impl Written {
     fn record(&mut self, mut settled: Settled, events: Vec<DeRecEvent>) {
         self.settled.failed.append(&mut settled.failed);
         self.settled.confirmed.append(&mut settled.confirmed);
+        self.settled.synced.append(&mut settled.synced);
+        self.settled.closed.append(&mut settled.closed);
         self.settled
             .timeout_events
             .append(&mut settled.timeout_events);

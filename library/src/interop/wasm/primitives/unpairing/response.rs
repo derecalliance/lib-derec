@@ -32,9 +32,19 @@ pub struct ProcessResult {
 }
 
 #[wasm_bindgen(js_name = "unpairing_response_produce")]
-pub fn produce(channel_id: u64, shared_key: &[u8]) -> Result<JsValue, JsValue> {
+pub fn produce(
+    channel_id: u64,
+    shared_key: &[u8],
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
+) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
-    let result = response::produce(channel_id.into(), &shared_key).map_err(js_error_from_lib)?;
+    let result = response::produce(
+        channel_id.into(),
+        &crate::types::ChannelKey::new(epoch, shared_key),
+    )
+    .map_err(js_error_from_lib)?;
     to_js(&ProduceResult {
         envelope: result.envelope,
     })

@@ -75,6 +75,7 @@ internal static class Protocol
         RunOrchestratorProtectSecretWeightTest();
         RunShareSubsharesTest();
         RunStickyThresholdTest();
+        RunKeyRotationTest();
         RunChannelStatusRequiredOnDecodeTest();
         RunOrchestratorMaxSubsharesTest();
         RunHelperKeepVersionPrunesShareStoreTest();
@@ -1136,6 +1137,22 @@ internal static class Protocol
                 $"the recovered roster must carry t=3 and weight 2; got t={recoveredEvent.Secret.Threshold}, weight={recoveredEvent.Secret.Helpers[0].Weight}");
         Console.WriteLine("  SecretRecovered carries the roster's threshold and weights  ✓");
 
+        // A recovered roster hands each key's epoch back to restore unchanged.
+        var rotatedEvent = JsonSerializer.Deserialize<DeRecEvent>(
+            """{"type":"SecretRecovered","secret":{"helpers":[{"channel_id":"9","transports":[],"shared_key":[1],"weight":1,"key_epoch":16}],"secrets":[],"replicas":{"channel_id":"7","members":[],"shared_key":[2],"key_epoch":3}}}""")
+            as SecretRecoveredEvent
+            ?? throw new InvalidOperationException("SecretRecovered must decode");
+        if (rotatedEvent.Secret.Helpers[0].KeyEpoch != 16 || rotatedEvent.Secret.Replicas?.KeyEpoch != 3)
+            throw new InvalidOperationException(
+                $"the recovered roster must carry key epochs 16 and 3; got {rotatedEvent.Secret.Helpers[0].KeyEpoch} and {rotatedEvent.Secret.Replicas?.KeyEpoch}");
+        var restoreSecret = System.Text.Json.Nodes.JsonNode.Parse(
+            JsonSerializer.Serialize(rotatedEvent.Secret, DeRecJsonOptions.Wire))!;
+        if (restoreSecret["helpers"]![0]!["key_epoch"]!.GetValue<uint>() != 16
+            || restoreSecret["replicas"]!["key_epoch"]!.GetValue<uint>() != 3)
+            throw new InvalidOperationException(
+                $"the secret handed to restore must carry its key epochs; got {restoreSecret.ToJsonString()}");
+        Console.WriteLine("  SecretRecovered hands each key epoch back to restore  ✓");
+
         Console.WriteLine("Sticky threshold test passed.\n");
     }
 
@@ -1849,6 +1866,144 @@ internal static class Protocol
     }
 
     /// <summary>
+    /// The epoch of the key ring <paramref name="node"/> stores for
+    /// <paramref name="channelId"/>, read from its own secret store: the
+    /// ring's bytes are a version byte followed by the big-endian u32 epoch.
+    /// </summary>
+    private static uint StoredKeyEpoch(Node node, ulong secretId, ulong channelId)
+    {
+        var ring = node.SecretStore.Load(secretId, channelId, SecretKind.KeyRing)
+            ?? throw new InvalidOperationException($"channel {channelId} must store a KeyRing");
+        if (ring.Kind != SecretKind.KeyRing || ring.Bytes.Length < 5)
+            throw new InvalidOperationException($"channel {channelId} holds no KeyRing bytes");
+        return System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(ring.Bytes.AsSpan(1, 4));
+    }
+
+    /// <summary>
+    /// With key rotation on, the owner advances each helper channel one epoch
+    /// per sharing round, and both ends store the new epoch in their key ring.
+    /// An envelope whose <c>sequence</c> is past the forward-jump limit is
+    /// ignored as <see cref="IgnoreReason.KeyUnavailable"/>. The recovered
+    /// secret names each channel's epoch, and a fresh device restored from it
+    /// publishes under the next one.
+    /// </summary>
+    private static void RunKeyRotationTest()
+    {
+        Console.WriteLine("=== Key rotation test ===");
+
+        const ulong secretId = 0x0E90C4UL;
+        const string ownerUri = "https://owner-rotation.example.com";
+        const string helperAUri = "https://helper-a-rotation.example.com";
+        const string helperBUri = "https://helper-b-rotation.example.com";
+        var owner = MakeNode("Owner", ownerUri, new NodeOptions(SecretId: secretId, KeyRotation: true));
+        using var helperA = MakeNode("HelperA", helperAUri, new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", helperBUri, new NodeOptions(SecretId: secretId));
+        ulong channelA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 81UL);
+        ulong channelB = DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 82UL);
+        var helpers = new[] { (Channel: channelA, Node: helperA), (Channel: channelB, Node: helperB) };
+        (Node, string)[] Scope(Node ownerNode) =>
+            new[] { (ownerNode, ownerUri), (helperA, helperAUri), (helperB, helperBUri) };
+
+        for (uint round = 1; round <= 2; round++)
+        {
+            owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+            {
+                Secrets = new[] { new UserSecret { Id = new byte[] { 21 }, Name = "rotating", Data = new[] { (byte)round } } },
+            }).GetAwaiter().GetResult();
+            var confirmed = PumpAll(Scope(owner)).OfType<ShareConfirmedEvent>().Count(e => e.Version == round);
+            if (confirmed != 2)
+                throw new InvalidOperationException($"both helpers must confirm v{round}, got {confirmed}");
+        }
+        foreach (var (channel, helper) in helpers)
+        {
+            uint ownerEpoch = StoredKeyEpoch(owner, secretId, channel);
+            uint helperEpoch = StoredKeyEpoch(helper, secretId, channel);
+            if (ownerEpoch != 2 || helperEpoch != 2)
+                throw new InvalidOperationException(
+                    $"channel {channel} must be at KeyRing epoch 2 on both ends, got owner {ownerEpoch}, helper {helperEpoch}");
+        }
+        Console.WriteLine("  two rounds → owner and helpers store KeyRing epoch 2 on both channels  ✓");
+
+        owner.Protocol.StartAsync(FlowKind.VerifyShares, new VerifySharesParams
+        {
+            SecretId = secretId,
+            Version = 2,
+            Target = Target.All,
+        }).GetAwaiter().GetResult();
+        var verified = PumpAll(Scope(owner)).OfType<ShareVerifiedEvent>()
+            .Where(e => e.Version == 2).Select(e => e.ChannelId).ToHashSet();
+        if (!verified.SetEquals(new[] { channelA, channelB }))
+            throw new InvalidOperationException(
+                $"both channels must verify v2 at epoch 2, got [{string.Join(", ", verified)}]");
+        Console.WriteLine("  verification of v2 at epoch 2 → ShareVerified on both channels  ✓");
+
+        owner.Protocol.StartAsync(FlowKind.VerifyShares, new VerifySharesParams
+        {
+            SecretId = secretId,
+            Version = 2,
+            Target = Target.One(channelA),
+        }).GetAwaiter().GetResult();
+        var envelope = Org.Derecalliance.Derec.Protobuf.DeRecMessage.Parser.ParseFrom(owner.Transport.DrainOne());
+        if (envelope.Sequence != 2)
+            throw new InvalidOperationException($"the challenge must be under K2, sequence {envelope.Sequence}");
+        envelope.Sequence = 2 + 513;
+        var ignored = helperA.Protocol.ProcessAsync(Google.Protobuf.MessageExtensions.ToByteArray(envelope))
+            .GetAwaiter().GetResult();
+        if (ignored.Count != 1 || ignored[0] is not MessageIgnoredEvent keyIgnored
+            || keyIgnored.Reason != IgnoreReason.KeyUnavailable || keyIgnored.ChannelId != channelA)
+            throw new InvalidOperationException(
+                $"a sequence past the forward-jump limit must be MessageIgnored(KeyUnavailable); got [{string.Join(", ", ignored)}]");
+        if (helperA.Transport.Outbox.Count != 0)
+            throw new InvalidOperationException("a message with no usable key must not be answered");
+        if (StoredKeyEpoch(helperA, secretId, channelA) != 2)
+            throw new InvalidOperationException("the ignored message must not move HelperA's ring");
+        Console.WriteLine("  sequence 515 → MessageIgnored(KeyUnavailable), nothing sent, ring unchanged  ✓");
+
+        owner.Protocol.StartAsync(FlowKind.RecoverSecret, new RecoverSecretParams
+        {
+            SecretId = secretId,
+            Version = 2,
+        }).GetAwaiter().GetResult();
+        var recovered = PumpAll(Scope(owner)).OfType<SecretRecoveredEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException("RecoverSecret must surface SecretRecovered");
+        if (recovered.Secret.Helpers.Count != 2 || recovered.Secret.Helpers.Any(h => h.KeyEpoch != 2))
+            throw new InvalidOperationException(
+                $"the roster must name key epoch 2 for both helpers, got [{string.Join(", ", recovered.Secret.Helpers.Select(h => h.KeyEpoch))}]");
+        Console.WriteLine("  SecretRecovered names key_epoch 2 for both helpers  ✓");
+        owner.Dispose();
+
+        using var device = MakeNode("Device", ownerUri, new NodeOptions(SecretId: secretId, KeyRotation: true));
+        device.Protocol.RestoreAsync(recovered.Secret, version: 2).GetAwaiter().GetResult();
+        foreach (var (channel, _) in helpers)
+        {
+            uint restoredEpoch = StoredKeyEpoch(device, secretId, channel);
+            if (restoredEpoch != 2)
+                throw new InvalidOperationException(
+                    $"restore must rebuild channel {channel} at KeyRing epoch 2, got {restoredEpoch}");
+        }
+        Console.WriteLine("  restore on a fresh device → KeyRing epoch 2 on both channels  ✓");
+
+        device.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = recovered.Secret.Secrets.ToArray(),
+        }).GetAwaiter().GetResult();
+        int republished = PumpAll(Scope(device)).OfType<ShareConfirmedEvent>().Count(e => e.Version == 3);
+        if (republished != 2)
+            throw new InvalidOperationException($"both helpers must confirm v3 from the restored device, got {republished}");
+        foreach (var (channel, helper) in helpers)
+        {
+            uint deviceEpoch = StoredKeyEpoch(device, secretId, channel);
+            uint helperEpoch = StoredKeyEpoch(helper, secretId, channel);
+            if (deviceEpoch != 3 || helperEpoch != 3)
+                throw new InvalidOperationException(
+                    $"channel {channel} must be at KeyRing epoch 3 on both ends, got device {deviceEpoch}, helper {helperEpoch}");
+        }
+        Console.WriteLine("  the restored device publishes v3 → both helpers confirm, KeyRing epoch 3  ✓");
+
+        Console.WriteLine("Key rotation test passed.\n");
+    }
+
+    /// <summary>
     /// A builder that never calls <c>WithThreshold</c> must leave the Rust
     /// library's default (3) in force rather than a value restated here.
     /// </summary>
@@ -1981,19 +2136,22 @@ internal static class Protocol
         {
             Target = Target.Many(rekeyedA, rekeyedB),
         }).GetAwaiter().GetResult();
-        // The broadcast reads every target's SharedKey through one
-        // LoadMany call rather than one Load per channel.
-        if (owner.SecretStore.LoadManyCalls.Count != 1)
+        // The broadcast reads its channel keys in batches rather than one
+        // Load per channel: one LoadMany for every target's SharedKey, then
+        // one for every target's KeyRing.
+        var keyKinds = owner.SecretStore.LoadManyCalls.Select(c => c.Kind).ToArray();
+        if (!keyKinds.SequenceEqual(new[] { SecretKind.SharedKey, SecretKind.KeyRing }))
             throw new InvalidOperationException(
-                $"Discovery broadcast must call LoadMany once, got {owner.SecretStore.LoadManyCalls.Count}");
-        var keyCall = owner.SecretStore.LoadManyCalls[0];
-        if (keyCall.SecretId != secretId
-            || keyCall.Kind != SecretKind.SharedKey
-            || !keyCall.ChannelIds.OrderBy(c => c).SequenceEqual(new[] { rekeyedA, rekeyedB }.OrderBy(c => c)))
-            throw new InvalidOperationException(
-                $"LoadMany must receive both helper channels: secret={keyCall.SecretId} kind={keyCall.Kind} "
-                + $"ids=[{string.Join(", ", keyCall.ChannelIds)}]");
-        Console.WriteLine($"  Discovery broadcast → one LoadMany(SharedKey, [{string.Join(", ", keyCall.ChannelIds)}])  ✓");
+                $"Discovery broadcast must call LoadMany once per kind (SharedKey, KeyRing), got [{string.Join(", ", keyKinds)}]");
+        foreach (var keyCall in owner.SecretStore.LoadManyCalls)
+        {
+            if (keyCall.SecretId != secretId
+                || !keyCall.ChannelIds.OrderBy(c => c).SequenceEqual(new[] { rekeyedA, rekeyedB }.OrderBy(c => c)))
+                throw new InvalidOperationException(
+                    $"LoadMany must receive both helper channels: secret={keyCall.SecretId} kind={keyCall.Kind} "
+                    + $"ids=[{string.Join(", ", keyCall.ChannelIds)}]");
+        }
+        Console.WriteLine($"  Discovery broadcast → one LoadMany([{string.Join(", ", owner.SecretStore.LoadManyCalls[0].ChannelIds)}]) per kind (SharedKey, KeyRing)  ✓");
         var discoveryOut = owner.Transport.DrainAll();
         if (discoveryOut.Count != 2)
             throw new InvalidOperationException($"expected 2 Discovery requests, got {discoveryOut.Count}");
@@ -2035,9 +2193,11 @@ internal static class Protocol
         if (missingKey is null || missingKey.Code != DeRecCode.MissingSharedKey)
             throw new InvalidOperationException(
                 $"a null LoadMany entry must surface MissingSharedKey, got {(missingKey is null ? "no error" : $"{missingKey.Code}: {missingKey.Message}")}");
-        if (owner.SecretStore.LoadManyCalls.Count != 1 || !missingKey.Message.Contains(rekeyedB.ToString()))
+        if (owner.SecretStore.LoadManyCalls.Count != 1
+            || owner.SecretStore.LoadManyCalls[0].Kind != SecretKind.SharedKey
+            || !missingKey.Message.Contains(rekeyedB.ToString()))
             throw new InvalidOperationException(
-                $"MissingSharedKey must follow one LoadMany call and name channel {rekeyedB}: "
+                $"MissingSharedKey must follow one SharedKey LoadMany call and name channel {rekeyedB}: "
                 + $"calls={owner.SecretStore.LoadManyCalls.Count} message={missingKey.Message}");
         owner.SecretStore.Save(secretId, rekeyedB, removedKey);
         owner.Transport.DrainAll();
@@ -4341,7 +4501,8 @@ internal static class Protocol
         bool OmitThreshold = false,
         ulong? MaxSubshares = null,
         ParameterRange? ParameterRange = null,
-        bool? AutoRespondOnFailure = null);
+        bool? AutoRespondOnFailure = null,
+        bool? KeyRotation = null);
 
     private const int DefaultThreshold = 2;
 
@@ -4505,6 +4666,8 @@ internal static class Protocol
             builder = builder.WithParameterRange(range);
         if (options.AutoRespondOnFailure is bool autoRespond)
             builder = builder.WithAutoRespondOnFailure(autoRespond);
+        if (options.KeyRotation is bool keyRotation)
+            builder = builder.WithKeyRotation(keyRotation);
 
         return new Node(builder.Build(), transport, channelStore, shareStore, secretStore, userSecretStore, stateStore);
     }
@@ -4940,6 +5103,7 @@ internal static class Protocol
             || full.ParameterRange?.MaxUnresponsiveDeletionTimeout != 9007199254740993L
             || full.AutoAccept is not { Pairing: true, PrePair: false, StoreShare: true, Unpair: true }
             || full.AutoRespondOnFailure != true
+            || full.KeyRotation != true
             || full.AutoReplyTo != true
             || full.UnpairAck != UnpairAck.NotRequired
             || full.UnsafeConnection != false

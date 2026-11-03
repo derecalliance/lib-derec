@@ -106,6 +106,7 @@ impl DeRecSecretStore for PostgresSecretStore {
             SecretValue::SharedKey(_) => SecretKind::SharedKey,
             SecretValue::PairingSecret(_) => SecretKind::PairingSecret,
             SecretValue::PairingContact(_) => SecretKind::PairingContact,
+            SecretValue::KeyRing(_) => SecretKind::KeyRing,
         };
         let bytes = encode_secret_value(&value);
         let client = self.client.clone();

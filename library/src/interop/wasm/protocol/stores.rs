@@ -19,8 +19,9 @@
 //! ### `SecretStore`
 //! ```ts
 //! // kind 0 = SharedKey (32 raw bytes), 1 = PairingSecret (serialized key
-//! // material), 2 = PairingContact (protobuf ContactMessage).
-//! type SecretKind = 0 | 1 | 2;
+//! // material), 2 = PairingContact (protobuf ContactMessage), 3 = KeyRing
+//! // (variable-length key-ring encoding).
+//! type SecretKind = 0 | 1 | 2 | 3;
 //! interface SecretStore {
 //!   load(secretId: string, channelId: string, kind: SecretKind): Promise<Uint8Array | null | undefined>;
 //!   // Exactly one entry per id in `channelIds`, in order; `null` or
@@ -152,7 +153,7 @@
 //! }
 //! ```
 
-use derec_proto::{ContactMessage, TransportProtocol};
+use derec_proto::TransportProtocol;
 use js_sys::{Array, Function, Promise, Uint8Array};
 use prost::Message as _;
 use wasm_bindgen::JsValue;
@@ -168,9 +169,9 @@ use crate::{
             ShareStoreFuture, StateStoreFuture, TransportFuture,
         },
         types::{
-            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy,
-            PairingKeyMaterial, ReplicaFilter, ReplicaMember, SecretKind, SecretValue, Share,
-            StateItem, StateKey, StateKind, UserSecret, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
+            ReplicaMember, SecretKind, SecretValue, Share, StateItem, StateKey, StateKind,
+            UserSecret, UserSecrets,
         },
     },
     types::ChannelId,
@@ -256,25 +257,8 @@ fn share_store_call_error(method: &str, value: &JsValue) -> ShareStoreError {
 }
 
 fn decode_secret_value(kind: SecretKind, bytes: &[u8]) -> Result<SecretValue, SecretStoreError> {
-    match kind {
-        SecretKind::SharedKey => {
-            let key = crate::types::SharedKey::try_from(bytes).map_err(|_| {
-                SecretStoreError::Backend(box_err(format!(
-                    "shared key must be 32 bytes, got {}",
-                    bytes.len()
-                )))
-            })?;
-            Ok(SecretValue::SharedKey(key))
-        }
-        SecretKind::PairingSecret => Ok(SecretValue::PairingSecret(
-            PairingKeyMaterial::from_bytes(bytes.to_vec()),
-        )),
-        SecretKind::PairingContact => {
-            let contact = ContactMessage::decode(bytes)
-                .map_err(|e| SecretStoreError::Backend(box_err(e.to_string())))?;
-            Ok(SecretValue::PairingContact(contact))
-        }
-    }
+    crate::interop::secret_value::decode(kind, bytes)
+        .map_err(|e| SecretStoreError::Backend(box_err(e)))
 }
 
 /// Adapter wrapping a JS `SecretStore` object.
@@ -365,6 +349,12 @@ impl DeRecSecretStore for JsSecretStore {
                 SecretValue::SharedKey(key) => (0u32, key.as_bytes().to_vec()),
                 SecretValue::PairingSecret(material) => (1u32, material.as_bytes().to_vec()),
                 SecretValue::PairingContact(contact) => (2u32, contact.encode_to_vec()),
+                SecretValue::KeyRing(ring) => (
+                    3u32,
+                    ring.as_bytes().map_err(|e| {
+                        SecretStoreError::Backend(box_err(format!("failed to encode KeyRing: {e}")))
+                    })?,
+                ),
             };
             let js_bytes = Uint8Array::from(bytes.as_slice());
             let args = Array::new();

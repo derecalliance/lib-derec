@@ -283,6 +283,7 @@ impl<
             .flat_map(|&channel_id| {
                 [
                     SecretKind::SharedKey,
+                    SecretKind::KeyRing,
                     SecretKind::PairingSecret,
                     SecretKind::PairingContact,
                 ]

@@ -80,6 +80,9 @@ pub extern "C" fn produce_get_share_request_message(
     version: u32,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
     // See `produce_store_share_request_message` for the `reply_to`
     // semantics — `reply_to_len == 0` means "no override".
     reply_to_ptr: *const u8,
@@ -104,7 +107,7 @@ pub extern "C" fn produce_get_share_request_message(
         channel_id.into(),
         secret_id,
         version,
-        &shared_key,
+        &crate::types::ChannelKey::new(epoch, shared_key),
         &reply_to,
     ) {
         Ok(r) => ProduceGetShareRequestMessageResult {
@@ -179,6 +182,9 @@ pub extern "C" fn produce_get_share_response_message(
     stored_share_proto_len: usize,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
 ) -> ProduceGetShareResponseMessageResult {
     let with_err = |error| ProduceGetShareResponseMessageResult {
         error,
@@ -226,7 +232,7 @@ pub extern "C" fn produce_get_share_response_message(
         channel_id.into(),
         &request,
         &stored_share,
-        &shared_key,
+        &crate::types::ChannelKey::new(epoch, shared_key),
     ) {
         Ok(r) => ProduceGetShareResponseMessageResult {
             error: success(),

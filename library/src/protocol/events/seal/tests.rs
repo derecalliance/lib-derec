@@ -2,11 +2,14 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::{Seal, Sealed};
-use crate::protocol::{ChannelRequest, FailedRequest, ReplyTarget};
+use crate::protocol::{ChannelKey, ChannelRequest, FailedRequest, ReplyTarget};
 use crate::types::{ChannelId, SharedKey};
 use derec_proto::{Protocol, StoreShareRequestMessage, TransportProtocol};
 
-const KEY: SharedKey = SharedKey::new([0x11; 32]);
+const KEY: ChannelKey = ChannelKey {
+    epoch: 0,
+    key: SharedKey::new([0x11; 32]),
+};
 const CHANNEL: ChannelId = ChannelId(7);
 const TRACE: u64 = 42;
 
@@ -43,7 +46,10 @@ fn a_seal_verifies_what_it_sealed() {
 fn a_seal_is_bound_to_its_key_channel_and_trace_id() {
     let request = share(2);
     let seal = Seal::new(&KEY, CHANNEL, TRACE, Sealed::Request(&request));
-    let other_key = SharedKey::new([0x22; 32]);
+    let other_key = ChannelKey {
+        epoch: 0,
+        key: SharedKey::new([0x22; 32]),
+    };
     assert!(!seal.verifies(&other_key, CHANNEL, TRACE, Sealed::Request(&request)));
     assert!(!seal.verifies(&KEY, ChannelId(8), TRACE, Sealed::Request(&request)));
     assert!(!seal.verifies(&KEY, CHANNEL, TRACE + 1, Sealed::Request(&request)));
@@ -100,4 +106,19 @@ fn a_failure_seal_covers_its_reply_target() {
             request: &request,
         }
     ));
+}
+
+/// The same action sealed at another epoch does not verify, even under the
+/// same key bytes: the epoch an action answers under cannot be changed.
+#[test]
+fn a_seal_covers_the_epoch() {
+    let request = share(2);
+    let at = |epoch| ChannelKey {
+        epoch,
+        key: KEY.key,
+    };
+    let seal = Seal::new(&at(1), CHANNEL, TRACE, Sealed::Request(&request));
+    assert!(seal.verifies(&at(1), CHANNEL, TRACE, Sealed::Request(&request)));
+    assert!(!seal.verifies(&at(2), CHANNEL, TRACE, Sealed::Request(&request)));
+    assert!(!seal.verifies(&at(0), CHANNEL, TRACE, Sealed::Request(&request)));
 }

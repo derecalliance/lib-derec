@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_library::protocol::{SecretKind, SecretValue};
 use rusqlite::OptionalExtension;
 
-use crate::codec::u64_to_sql;
+use crate::codec::{decode_secret_value, secret_kind_tag, u64_to_sql};
 use crate::db::{SharedConnection, lock};
 
 pub fn count_channels(conn: &SharedConnection, secret_id: u64) -> i64 {
@@ -90,4 +91,25 @@ pub fn count_pending_verifications(connection: &SharedConnection, secret_id: u64
         |row| row.get(0),
     )
     .expect("count pending verifications failed")
+}
+
+/// The epoch of the `KeyRing` row (`kind = 3`) stored for `channel_id`,
+/// read from the `secrets` table and decoded from its stored bytes.
+pub fn key_ring_epoch(connection: &SharedConnection, secret_id: u64, channel_id: u64) -> u32 {
+    let conn = lock(connection);
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT data FROM secrets WHERE secret_id = ?1 AND channel_id = ?2 AND kind = ?3",
+            rusqlite::params![
+                u64_to_sql(secret_id),
+                u64_to_sql(channel_id),
+                secret_kind_tag(SecretKind::KeyRing),
+            ],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|e| panic!("no KeyRing row for channel {channel_id}: {e}"));
+    match decode_secret_value(&blob) {
+        SecretValue::KeyRing(ring) => ring.epoch(),
+        _ => panic!("the kind 3 row of channel {channel_id} is not a KeyRing"),
+    }
 }

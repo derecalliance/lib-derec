@@ -5,7 +5,7 @@ export interface SecretStore {
   load(
     secretId: string,
     channelId: string,
-    kind: 0 | 1 | 2,
+    kind: 0 | 1 | 2 | 3,
   ): Promise<Uint8Array | null | undefined>;
   /**
    * Load secrets of the same `kind` for several channels in one call,
@@ -17,15 +17,15 @@ export interface SecretStore {
   loadMany(
     secretId: string,
     channelIds: string[],
-    kind: 0 | 1 | 2,
+    kind: 0 | 1 | 2 | 3,
   ): Promise<Array<Uint8Array | null | undefined>>;
   save(
     secretId: string,
     channelId: string,
-    kind: 0 | 1 | 2,
+    kind: 0 | 1 | 2 | 3,
     value: Uint8Array,
   ): Promise<void>;
-  remove(secretId: string, channelId: string, kind: 0 | 1 | 2): Promise<void>;
+  remove(secretId: string, channelId: string, kind: 0 | 1 | 2 | 3): Promise<void>;
   /**
    * Remove every secret `entries` names, in one call. Each entry is a
    * `[channelId, kind]` pair addressed the way `remove`'s arguments are.
@@ -35,7 +35,7 @@ export interface SecretStore {
    */
   removeMany(
     secretId: string,
-    entries: [channelId: string, kind: 0 | 1 | 2][],
+    entries: [channelId: string, kind: 0 | 1 | 2 | 3][],
   ): Promise<void>;
 }
 
@@ -1009,6 +1009,9 @@ export type DeRecEvent =
            *  next publish gives it the same count. Every event carries it;
            *  `restore` reads an absent value as 1. */
           weight?: number;
+          /** The epoch of `shared_key` on the helper's channel. Absent means
+           *  0. `restore` rebuilds the channel's key at this epoch. */
+          key_epoch?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -1033,6 +1036,8 @@ export type DeRecEvent =
             communication_info?: Record<string, string> | null;
           }>;
           shared_key: Uint8Array;
+          /** The epoch of `shared_key` on the group channel. Absent means 0. */
+          key_epoch?: number;
         };
         /** The threshold the secret was split with. Absent when the roster
          *  records none. `restore` writes it into the snapshot, so the next
@@ -1114,6 +1119,9 @@ export type DeRecEvent =
            *  next publish gives it the same count. Every event carries it;
            *  `restore` reads an absent value as 1. */
           weight?: number;
+          /** The epoch of `shared_key` on the helper's channel. Absent means
+           *  0. `restore` rebuilds the channel's key at this epoch. */
+          key_epoch?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -1136,6 +1144,8 @@ export type DeRecEvent =
             communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
+          /** The epoch of `shared_key` on the group channel. Absent means 0. */
+          key_epoch?: number;
         };
         /** The threshold the secret was split with. Absent when the roster
          *  records none. `restore` writes it into the snapshot, so the next
@@ -1176,6 +1186,9 @@ export type DeRecEvent =
            *  next publish gives it the same count. Every event carries it;
            *  `restore` reads an absent value as 1. */
           weight?: number;
+          /** The epoch of `shared_key` on the helper's channel. Absent means
+           *  0. `restore` rebuilds the channel's key at this epoch. */
+          key_epoch?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -1198,6 +1211,8 @@ export type DeRecEvent =
             communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
+          /** The epoch of `shared_key` on the group channel. Absent means 0. */
+          key_epoch?: number;
         };
         /** The threshold the secret was split with. Absent when the roster
          *  records none. `restore` writes it into the snapshot, so the next
@@ -1244,6 +1259,9 @@ export type DeRecEvent =
            *  next publish gives it the same count. Every event carries it;
            *  `restore` reads an absent value as 1. */
           weight?: number;
+          /** The epoch of `shared_key` on the helper's channel. Absent means
+           *  0. `restore` rebuilds the channel's key at this epoch. */
+          key_epoch?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -1265,6 +1283,8 @@ export type DeRecEvent =
             communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
+          /** The epoch of `shared_key` on the group channel. Absent means 0. */
+          key_epoch?: number;
         };
         /** The threshold the secret was split with. Absent when the roster
          *  records none. `restore` writes it into the snapshot, so the next
@@ -1371,6 +1391,8 @@ export type DeRecEvent =
    *  non-conforming peer. `"StaleResponse"` means a verification answer to
    *  a challenge that a newer one on the channel replaced; the newer
    *  challenge stays outstanding and its own answer still completes it.
+   *  `"KeyUnavailable"` means the envelope names an epoch whose key this
+   *  device cannot obtain.
    *  `trace_id` matches the peer's `*Started` event for the same round
    *  (`"0"` when the sender set none). */
   | {
@@ -1576,6 +1598,7 @@ export interface DeRecAutoAcceptConfig {
  *   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
  *   "auto_accept": { "pairing": true, "store_share": true },
  *   "auto_respond_on_failure": false,
+ *   "key_rotation": false,
  *   "auto_reply_to": false,
  *   "unpair_ack": "required",
  *   "unsafe_connection": false,
@@ -1594,6 +1617,7 @@ export interface DeRecProtocolConfig {
   parameter_range?: DeRecParameterRangeConfig;
   auto_accept?: DeRecAutoAcceptConfig;
   auto_respond_on_failure?: boolean;
+  key_rotation?: boolean;
   auto_reply_to?: boolean;
   /** Its name, or the discriminant `0` (`"required"`) / `1`
    *  (`"not_required"`). */
@@ -1727,6 +1751,13 @@ export declare class DeRecProtocolBuilder {
    * false.
    */
   withAutoRespondOnFailure(enabled: boolean): DeRecProtocolBuilder;
+  /**
+   * Whether the owner advances channel keys: each helper channel one epoch
+   * in every sharing round that reaches the threshold, and the replica
+   * group channel one epoch on every publish to replicas. `false` keeps the
+   * current key. Default: false.
+   */
+  withKeyRotation(enabled: boolean): DeRecProtocolBuilder;
   /** Exactly `"required"` or `"not_required"`; any other string throws
    *  `invalid_unpair_ack`. Default: `"required"`. */
   withUnpairAck(ack: UnpairAck): DeRecProtocolBuilder;
@@ -2038,6 +2069,27 @@ export declare const envelope: {
    * protobuf default is indistinguishable from an explicit zero).
    */
   read_trace_id(envelope_bytes: Uint8Array): bigint;
+
+  /**
+   * Read `sequence` off an inbound envelope: the epoch of the channel key
+   * that encrypted it. A primitive-only consumer reads it to pick the key
+   * for `extract`, deriving it forward with `channel_key.derive` when the
+   * epoch is newer than the key it holds.
+   */
+  read_sequence(envelope_bytes: Uint8Array): number;
+};
+
+/**
+ * The channel key chain. A channel key moves forward one epoch at a time:
+ * `K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" || be32(e+1))`.
+ */
+export declare const channel_key: {
+  /**
+   * The 32-byte channel key at `to_epoch`, derived forward from `key`, the
+   * key at `epoch`. Throws `invalid_input` when `to_epoch` is below `epoch`
+   * (the chain does not run backward) or more than 512 epochs above it.
+   */
+  derive(key: Uint8Array, epoch: number, to_epoch: number): Uint8Array;
 };
 
 export interface Timestamp {
@@ -2114,7 +2166,7 @@ export interface CommunicationInfo {
 
 /** Why a `MessageIgnored` event dropped a message. Matches the Rust
  *  `IgnoreReason` discriminants one-for-one. */
-export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse";
+export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse" | "KeyUnavailable";
 
 /** Why a `PeerNotRestored` event left a roster entry without a channel.
  *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */
@@ -2590,6 +2642,13 @@ export interface DeRecError {
   channel_ids?: string[];
 }
 
+/**
+ * Every channel-encrypted `produce` takes `epoch` right after `shared_key`:
+ * the epoch of `shared_key` in the channel's key chain, stamped into the
+ * envelope's `sequence` so the receiver can pick the key. It is 0 for a
+ * freshly paired channel. `extract` takes the key alone; read the epoch with
+ * `envelope.read_sequence` and derive the key with `channel_key.derive`.
+ */
 export declare const primitives: {
   discovery: {
     request: {
@@ -2601,12 +2660,18 @@ export declare const primitives: {
       produce(
         channel_id: bigint,
         shared_key: Uint8Array,
+        epoch: number,
         reply_to?: TransportProtocol[],
       ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { request: GetSecretIdsVersionsRequestMessage };
     };
     response: {
-      produce(channel_id: bigint, secret_list: SecretVersionEntry[], shared_key: Uint8Array): ProduceResult;
+      produce(
+        channel_id: bigint,
+        secret_list: SecretVersionEntry[],
+        shared_key: Uint8Array,
+        epoch: number,
+      ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { response: GetSecretIdsVersionsResponseMessage };
       process(response: GetSecretIdsVersionsResponseMessage): DiscoveryProcessResult;
     };
@@ -2792,6 +2857,7 @@ export declare const primitives: {
         secret_id: bigint,
         version: number,
         shared_key: Uint8Array,
+        epoch: number,
         /** See `discovery.request.produce.reply_to`. */
         reply_to?: TransportProtocol[],
       ): ProduceResult;
@@ -2803,6 +2869,7 @@ export declare const primitives: {
         request: GetShareRequestMessage,
         stored_share_request: StoreShareRequestMessage,
         shared_key: Uint8Array,
+        epoch: number,
       ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { response: GetShareResponseMessage };
       recover(secret_id: bigint, version: number, responses: GetShareResponseMessage[]): RecoverResult;
@@ -2827,6 +2894,7 @@ export declare const primitives: {
         keep_version: number,
         description: string,
         shared_key: Uint8Array,
+        epoch: number,
         /** See `discovery.request.produce.reply_to`. */
         reply_to?: TransportProtocol[],
       ): ProduceResult;
@@ -2837,6 +2905,7 @@ export declare const primitives: {
         channel_id: bigint,
         request: StoreShareRequestMessage,
         shared_key: Uint8Array,
+        epoch: number,
       ): SharingResponseProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { response: StoreShareResponseMessage };
       process(version: number, response: StoreShareResponseMessage): void;
@@ -2848,13 +2917,14 @@ export declare const primitives: {
         channel_id: bigint,
         memo: string,
         shared_key: Uint8Array,
+        epoch: number,
         /** See `discovery.request.produce.reply_to`. */
         reply_to?: TransportProtocol[],
       ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { request: UnpairRequestMessage };
     };
     response: {
-      produce(channel_id: bigint, shared_key: Uint8Array): ProduceResult;
+      produce(channel_id: bigint, shared_key: Uint8Array, epoch: number): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { response: UnpairResponseMessage };
       process(response: UnpairResponseMessage): UnpairingProcessResult;
     };
@@ -2866,6 +2936,7 @@ export declare const primitives: {
         secret_id: bigint,
         version: number,
         shared_key: Uint8Array,
+        epoch: number,
         /** See `discovery.request.produce.reply_to`. */
         reply_to?: TransportProtocol[],
       ): ProduceResult;
@@ -2876,6 +2947,7 @@ export declare const primitives: {
         channel_id: bigint,
         request: VerifyShareRequestMessage,
         shared_key: Uint8Array,
+        epoch: number,
         share_content: Uint8Array,
       ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { response: VerifyShareResponseMessage };

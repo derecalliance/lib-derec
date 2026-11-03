@@ -37,7 +37,7 @@ pub(super) mod unpairing;
 pub(super) mod update_channel_info;
 pub(super) mod verification;
 
-use super::DeRecEvent;
+use super::{ChannelKey, DeRecEvent};
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
 use crate::{
@@ -47,7 +47,7 @@ use crate::{
         obligation::Obligation,
         stores::{StoreSet, Stores},
     },
-    types::{ChannelId, SharedKey},
+    types::ChannelId,
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{DeRecMessage, MessageBody};
@@ -55,6 +55,11 @@ use derec_proto::{DeRecMessage, MessageBody};
 /// The memo a helper sends with `UNKNOWN_SHARE_VERSION` when it is asked to
 /// serve or prove a share it does not hold.
 const NO_SHARE_FOR_VERSION: &str = "no share stored for this secret and version";
+
+/// The error a fan-out reports for a channel whose shared key or key ring
+/// the secret store answered with a value of another kind: no message can be
+/// encrypted to it.
+const NO_USABLE_KEY: &str = "the secret store holds no usable key for this channel";
 
 /// Route a decrypted channel message to the module that owns its flow.
 ///
@@ -68,10 +73,10 @@ const NO_SHARE_FOR_VERSION: &str = "no share stored for this secret and version"
 /// failure router. Which relationship a multi-valued body concerns, and what
 /// to run for it, is the owning flow's decision.
 ///
-/// A message that does not decrypt under `shared_key` has no authenticated
-/// sender and fails with `Err`; nothing is sent. One that decrypts but whose
-/// body cannot be decoded, or that carries a pairing request the channel
-/// cannot carry, is a request owed an answer: an `ErrorResponseMessage` with
+/// `plaintext` is the message already decrypted under `key`, the key of the
+/// epoch the envelope names, so the sender is authenticated. A body that
+/// cannot be decoded, or that carries a pairing request the channel cannot
+/// carry, is a request owed an answer: an `ErrorResponseMessage` with
 /// `FORMAT_ERROR`, sent by the library or handed to the application as a
 /// [`DeRecEvent::RequestFailed`] token. A received `ErrorResponseMessage` is
 /// reported as [`DeRecEvent::ErrorResponseReceived`] once it passes the
@@ -94,17 +99,17 @@ pub(super) async fn handle<S: StoreSet>(
     local: &Local<'_>,
     message: &DeRecMessage,
     channel_id: ChannelId,
-    shared_key: &SharedKey,
+    plaintext: &[u8],
+    key: &ChannelKey,
     auto_respond_on_failure: bool,
 ) -> Result<Vec<DeRecEvent>> {
-    let plaintext = crate::derec_message::decrypt_inner_message(&message.message, shared_key)?;
     // The sender holds the channel key, so a body that does not decode is
     // still a request owed an answer, though no request type can be named.
-    let inner_message = match MessageBody::decode_from_vec(&plaintext) {
+    let inner_message = match MessageBody::decode_from_vec(plaintext) {
         Ok(body) => body,
         Err(error) => {
             let obligation =
-                Obligation::undecodable(channel_id, shared_key, message.trace_id, local.policy);
+                Obligation::undecodable(channel_id, key, message.trace_id, local.policy);
             return Ok(crate::protocol::obligation::settle(
                 stores,
                 local,
@@ -133,13 +138,13 @@ pub(super) async fn handle<S: StoreSet>(
     let obligation = Obligation::for_body(
         &inner_message,
         channel_id,
-        shared_key,
+        key,
         inbound_trace_id,
         local.policy,
     );
     let exchange = &Exchange {
         channel_id,
-        shared_key,
+        key,
         trace_id: inbound_trace_id,
         obligation: obligation.as_ref(),
     };
@@ -437,7 +442,7 @@ mod timestamp_binding_tests {
                     timestamp: Some(inner_ts),
                 },
             ))
-            .encrypt(&SHARED_KEY)
+            .encrypt(&crate::types::ChannelKey::new(0, SHARED_KEY.clone()))
             .expect("encrypt")
             .build()
             .expect("build")
@@ -675,6 +680,7 @@ mod replica_channel_binding_tests {
                     shared_key: vec![0xEE; 32],
                     communication_info: std::collections::HashMap::new(),
                     weight: 1,
+                    key_epoch: 0,
                 }],
                 secrets: Vec::new(),
                 replicas: None,
@@ -713,7 +719,7 @@ mod replica_channel_binding_tests {
             .channel_id(channel_id)
             .timestamp(ts)
             .message_body(build(ts))
-            .encrypt(key)
+            .encrypt(&crate::types::ChannelKey::new(0, key.clone()))
             .expect("encrypt")
             .build()
             .expect("build")

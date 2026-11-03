@@ -33,6 +33,11 @@ impl<
     /// fingerprint for the same shared key, enabling visual out-of-band
     /// verification.
     ///
+    /// The fingerprint describes the key pairing established, which is the
+    /// channel's key while the channel is `Pending`. Once a channel rotates
+    /// its key, the value this returns differs from the one the peer was
+    /// shown at pairing; the comparison is meaningful only before that.
+    ///
     /// Returns an error if the channel has no shared key (not yet paired).
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(channel_id = channel_id.0)))]
     pub async fn get_fingerprint(&self, channel_id: ChannelId) -> Result<String> {
@@ -45,6 +50,10 @@ impl<
     }
 
     /// Verify that a fingerprint matches the one derived from a channel's shared key.
+    ///
+    /// The fingerprint describes the pairing key and is meaningful while the
+    /// channel is `Pending`; after a rotation it no longer matches the value
+    /// shown at pairing.
     ///
     /// If the fingerprint matches, the channel status is updated from `Pending`
     /// to `Paired`, enabling it to process protocol messages. Returns an error

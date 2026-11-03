@@ -181,7 +181,10 @@ fn accepting_a_failed_request_is_refused() {
                     },
                     crate::protocol::FailedRequest::Undecodable,
                 )
-                .sealed_with(&crate::types::SharedKey::new([0; 32])),
+                .sealed_with(&crate::protocol::ChannelKey {
+                    epoch: 0,
+                    key: crate::types::SharedKey::new([0; 32]),
+                }),
             )
             .await
             .expect_err("a failed request cannot be accepted");

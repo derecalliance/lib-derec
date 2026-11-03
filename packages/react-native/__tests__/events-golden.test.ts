@@ -44,7 +44,8 @@ const ENDPOINT = { fields: { uri: 'required', protocol: 'required' } } as const;
 const USER_SECRET = { fields: { id: 'bytes', name: 'required', data: 'bytes' } } as const;
 
 // `weight` is always on the wire, but the same shape is `restore`'s input,
-// which accepts a roster written before the field existed.
+// which accepts a roster written before the field existed. `key_epoch` is
+// left off the wire when `0`.
 const HELPER = {
   fields: {
     channel_id: 'required',
@@ -52,6 +53,7 @@ const HELPER = {
     shared_key: 'bytes',
     communication_info: 'optional',
     weight: 'optional',
+    key_epoch: 'optional',
   },
   nested: { transports: ENDPOINT },
 } as const;
@@ -62,7 +64,7 @@ const MEMBER = {
 } as const;
 
 const REPLICAS = {
-  fields: { channel_id: 'required', members: 'required', shared_key: 'bytes' },
+  fields: { channel_id: 'required', members: 'required', shared_key: 'bytes', key_epoch: 'optional' },
   nested: { members: MEMBER },
 } as const;
 

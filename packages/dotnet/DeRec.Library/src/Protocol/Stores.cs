@@ -181,6 +181,7 @@ public enum SecretKind : uint
     SharedKey = 0,
     PairingSecret = 1,
     PairingContact = 2,
+    KeyRing = 3,
 }
 
 /// <summary>

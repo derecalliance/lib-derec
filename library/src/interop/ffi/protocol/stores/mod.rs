@@ -243,6 +243,8 @@ impl ShareRecord {
 ///   [`PairingKeyMaterial`](crate::protocol::PairingKeyMaterial) blob
 /// - `2` = PairingContact — `bytes` is the prost-encoded
 ///   [`derec_proto::ContactMessage`]
+/// - `3` = KeyRing — `bytes` is the [`KeyRing`](crate::protocol::KeyRing)
+///   encoding, variable-length
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct SecretValueRecord {
     pub kind: u32,
@@ -266,36 +268,38 @@ impl TryFrom<&SecretValue> for SecretValueRecord {
                 kind: 2,
                 bytes: c.encode_to_vec(),
             }),
+            SecretValue::KeyRing(r) => Ok(Self {
+                kind: 3,
+                bytes: r
+                    .as_bytes()
+                    .map_err(|e| format!("failed to encode KeyRing: {e}"))?,
+            }),
         }
     }
 }
 
 impl SecretValueRecord {
     pub(crate) fn into_value(self) -> Result<SecretValue, String> {
-        match self.kind {
-            0 => {
-                let key = crate::types::SharedKey::try_from(self.bytes.as_slice())
-                    .map_err(|_| "SharedKey payload must be 32 bytes".to_string())?;
-                Ok(SecretValue::SharedKey(key))
-            }
-            1 => Ok(SecretValue::PairingSecret(
-                crate::protocol::PairingKeyMaterial::from_bytes(self.bytes),
-            )),
-            2 => {
-                let cm = derec_proto::ContactMessage::decode(self.bytes.as_slice())
-                    .map_err(|e| format!("failed to decode ContactMessage: {e}"))?;
-                Ok(SecretValue::PairingContact(cm))
-            }
-            other => Err(format!("unknown SecretKind: {other}")),
-        }
+        let kind = match self.kind {
+            0 => SecretKind::SharedKey,
+            1 => SecretKind::PairingSecret,
+            2 => SecretKind::PairingContact,
+            3 => SecretKind::KeyRing,
+            other => return Err(format!("unknown SecretKind: {other}")),
+        };
+        crate::interop::secret_value::decode(kind, &self.bytes)
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 fn secret_kind_to_u32(kind: SecretKind) -> u32 {
     match kind {
         SecretKind::SharedKey => 0,
         SecretKind::PairingSecret => 1,
         SecretKind::PairingContact => 2,
+        SecretKind::KeyRing => 3,
     }
 }
 

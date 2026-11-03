@@ -4,7 +4,7 @@
 use crate::extensions::request_message::RequestMessageExt as _;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
-    types::{ChannelId, SharedKey},
+    types::{ChannelId, ChannelKey, SharedKey},
     utils::verify_timestamps,
 };
 use derec_proto::{DeRecMessage, GetSecretIdsVersionsRequestMessage, MessageBody};
@@ -37,8 +37,9 @@ pub struct ExtractResult {
 /// # Arguments
 ///
 /// * `channel_id` - Identifier of the previously paired Helper channel.
-/// * `shared_key` - Previously established 32-byte symmetric channel key used to
-///   encrypt the inner request.
+/// * `channel_key` - The channel key and its epoch. The payload is encrypted
+///   under the key and the envelope's `sequence` carries the epoch, so the
+///   receiver can pick the key that opens it; see [`crate::types::ChannelKey`].
 ///
 /// # Returns
 ///
@@ -71,8 +72,9 @@ pub struct ExtractResult {
 ///
 /// let channel_id = ChannelId(42);
 /// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 ///
-/// let result = request::produce(channel_id, &shared_key, &[])
+/// let result = request::produce(channel_id, &channel_key, &[])
 ///     .expect("failed to build discovery request");
 ///
 /// assert!(!result.envelope.is_empty());
@@ -83,7 +85,7 @@ pub struct ExtractResult {
 )]
 pub fn produce(
     channel_id: ChannelId,
-    shared_key: &SharedKey,
+    channel_key: &ChannelKey,
     reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
@@ -99,7 +101,7 @@ pub fn produce(
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::GetSecretIdsVersionsRequest(message))
-        .encrypt(shared_key)?
+        .encrypt(channel_key)?
         .build()?
         .encode_to_vec();
 
@@ -165,8 +167,9 @@ pub fn produce(
 ///
 /// let channel_id = ChannelId(42);
 /// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 ///
-/// let request::ProduceResult { envelope } = request::produce(channel_id, &shared_key, &[])
+/// let request::ProduceResult { envelope } = request::produce(channel_id, &channel_key, &[])
 ///     .expect("failed to build discovery request");
 ///
 /// let request::ExtractResult { request } = request::extract(&envelope, &shared_key)

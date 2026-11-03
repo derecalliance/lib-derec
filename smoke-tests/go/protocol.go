@@ -14,6 +14,7 @@ package main
 import (
 	"bytes"
 	"cmp"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"slices"
@@ -181,8 +182,10 @@ type secretStoreKey struct {
 type memSecretStore struct {
 	mu   sync.Mutex
 	data map[secretStoreKey]protocol.SecretValue
-	// loadManyCalls records the channelIDs of every LoadMany call, in order.
+	// loadManyCalls records the channelIDs of every LoadMany call, in order,
+	// and loadManyKinds the kind each of those calls asked for.
 	loadManyCalls [][]uint64
+	loadManyKinds []protocol.SecretKind
 }
 
 func newMemSecretStore() *memSecretStore {
@@ -200,6 +203,7 @@ func (s *memSecretStore) LoadMany(secretID uint64, channelIDs []uint64, kind pro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadManyCalls = append(s.loadManyCalls, append([]uint64(nil), channelIDs...))
+	s.loadManyKinds = append(s.loadManyKinds, kind)
 	out := make([]*protocol.SecretValue, len(channelIDs))
 	for i, c := range channelIDs {
 		if v, ok := s.data[secretStoreKey{secretID, c, kind}]; ok {
@@ -965,7 +969,7 @@ func runProtocol() {
 
 	fmt.Println("  pairing: two channels paired, fingerprints match ✓")
 
-	owner.secretStore.loadManyCalls = nil
+	owner.secretStore.loadManyCalls, owner.secretStore.loadManyKinds = nil, nil
 	secretData := []byte("super-secret-value")
 	description := "smoke-test distribution"
 	protectEvents, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
@@ -974,13 +978,17 @@ func runProtocol() {
 	})
 	must(err, "owner.Start(ProtectSecret)")
 
-	// The broadcast reads every helper's SharedKey through one
-	// SecretStore.LoadMany call rather than one Load per channel.
-	keyCalls := owner.secretStore.loadManyCalls
-	assertTrue(len(keyCalls) == 1, "ProtectSecret broadcast must call SecretStore.LoadMany once, got %v", keyCalls)
-	assertTrue(len(keyCalls[0]) == 2 && slices.Contains(keyCalls[0], channelA) && slices.Contains(keyCalls[0], channelB),
-		"SecretStore.LoadMany must receive both helper channels [%d %d], got %v", channelA, channelB, keyCalls[0])
-	fmt.Printf("  ProtectSecret broadcast → one SecretStore.LoadMany(%v)  ✓\n", keyCalls[0])
+	// The broadcast reads its channel keys in batches rather than one Load per
+	// channel: one SecretStore.LoadMany for every helper's SharedKey, then one
+	// for every helper's KeyRing.
+	keyCalls, keyKinds := owner.secretStore.loadManyCalls, owner.secretStore.loadManyKinds
+	assertTrue(slices.Equal(keyKinds, []protocol.SecretKind{protocol.SecretKindSharedKey, protocol.SecretKindKeyRing}),
+		"ProtectSecret broadcast must call SecretStore.LoadMany once per kind (SharedKey, KeyRing), got kinds %v for calls %v", keyKinds, keyCalls)
+	for _, call := range keyCalls {
+		assertTrue(len(call) == 2 && slices.Contains(call, channelA) && slices.Contains(call, channelB),
+			"SecretStore.LoadMany must receive both helper channels [%d %d], got %v", channelA, channelB, call)
+	}
+	fmt.Printf("  ProtectSecret broadcast → one SecretStore.LoadMany(%v) per kind (SharedKey, KeyRing)  ✓\n", keyCalls[0])
 
 	protectStartedVersions := map[uint64]uint32{}
 	for _, ev := range protectEvents {
@@ -2902,4 +2910,153 @@ func runReplicaRemovalPublishesTheRoster() {
 	fmt.Println("  removal completed with no ProtectSecret from the application  ✓")
 
 	fmt.Println("Protocol replica removal publishes the roster flow test passed.")
+}
+
+// storedKeyEpoch is the epoch of the key ring p stores for channelID, read
+// from its own secret store: the ring's bytes are a version byte followed by
+// the big-endian u32 epoch.
+func storedKeyEpoch(p *peer, channelID uint64) uint32 {
+	value, ok, err := p.secretStore.Load(protocolSecretID, channelID, protocol.SecretKindKeyRing)
+	must(err, fmt.Sprintf("[%s] secretStore.Load(KeyRing)", p.label))
+	assertTrue(ok && value.Kind == protocol.SecretKindKeyRing && len(value.Bytes) >= 5,
+		"[%s] channel %d must store a KeyRing, got ok=%v %+v", p.label, channelID, ok, value)
+	return binary.BigEndian.Uint32(value.Bytes[1:5])
+}
+
+// confirmedCount counts the ShareConfirmed events for version.
+func confirmedCount(events []protocol.Event, version uint32) int {
+	n := 0
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeShareConfirmed && ev.Version != nil && *ev.Version == version {
+			n++
+		}
+	}
+	return n
+}
+
+// runKeyRotation turns key rotation on for the owner. Each sharing round moves
+// both helper channels one key epoch, and both ends store the new epoch in
+// their key ring. An envelope whose sequence is past the forward-jump limit is
+// ignored as KeyUnavailable. The recovered secret names each channel's epoch,
+// and a fresh device restored from it publishes under the next one.
+func runKeyRotation() {
+	fmt.Println("=== Protocol key rotation test ===")
+
+	const ownerURI = "https://owner-rotation.example.com"
+	rotating := func(label string) *peer {
+		p, err := newPeerWithConfig(label, ownerURI, protocol.Config{
+			DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+				Threshold:   proto.Uint32(2),
+				KeyRotation: proto.Bool(true),
+			},
+		})
+		must(err, fmt.Sprintf("protocol.New(%s)", label))
+		return p
+	}
+	owner := rotating("owner")
+	helperA := newPeer("helper-a", "https://helper-a-rotation.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-rotation.example.com", 2)
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+
+	channelA := pairPeers(owner, helperA, 1)
+	channelB := pairPeers(owner, helperB, 2)
+	helpers := map[uint64]*peer{channelA: helperA, channelB: helperB}
+
+	for round := uint32(1); round <= 2; round++ {
+		_, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+			Secrets: []protocol.UserSecret{{ID: []byte{21}, Name: "rotating", Data: []byte{byte(round)}}},
+		})
+		must(err, "owner.Start(ProtectSecret)")
+		events := pumpMany([]*peer{owner, helperA, helperB})
+		assertTrue(confirmedCount(events, round) == 2, "both helpers must confirm v%d, got %+v", round, events)
+	}
+	for channelID, helper := range helpers {
+		assertTrue(storedKeyEpoch(owner, channelID) == 2 && storedKeyEpoch(helper, channelID) == 2,
+			"channel %d must be at KeyRing epoch 2 on both ends, got owner %d, %s %d",
+			channelID, storedKeyEpoch(owner, channelID), helper.label, storedKeyEpoch(helper, channelID))
+	}
+	fmt.Println("  two rounds → owner and helpers store KeyRing epoch 2 on both channels  ✓")
+
+	_, err := owner.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+		SecretID: protocolSecretID,
+		Version:  2,
+		Target:   protocol.TargetAll(),
+	})
+	must(err, "owner.Start(VerifyShares)")
+	verified := map[uint64]bool{}
+	for _, ev := range pumpMany([]*peer{owner, helperA, helperB}) {
+		if ev.Type == protocol.EventTypeShareVerified && ev.Version != nil && *ev.Version == 2 {
+			verified[ev.ChannelID] = true
+		}
+	}
+	assertTrue(verified[channelA] && verified[channelB], "both channels must verify v2 at epoch 2, got %v", verified)
+	fmt.Println("  verification of v2 at epoch 2 → ShareVerified on both channels  ✓")
+
+	_, err = owner.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+		SecretID: protocolSecretID,
+		Version:  2,
+		Target:   protocol.TargetOne(channelA),
+	})
+	must(err, "owner.Start(VerifyShares) on helper-a")
+	sent := owner.drain()
+	assertTrue(len(sent) == 1, "one challenge to helper-a, sent %d", len(sent))
+	var envelope derecpb.DeRecMessage
+	must(proto.Unmarshal(sent[0].message, &envelope), "decode the challenge envelope")
+	assertTrue(envelope.Sequence == 2, "the challenge must be under K2, sequence %d", envelope.Sequence)
+	envelope.Sequence = 2 + 513
+	forged, err := proto.Marshal(&envelope)
+	must(err, "encode the forged envelope")
+	ignored, err := helperA.proto.Process(forged)
+	must(err, "helper-a.Process(forged sequence)")
+	assertTrue(len(ignored) == 1 && ignored[0].Type == protocol.EventTypeMessageIgnored &&
+		ignored[0].Reason == protocol.IgnoreReasonKeyUnavailable && ignored[0].ChannelID == channelA,
+		"a sequence past the forward-jump limit must be MessageIgnored(KeyUnavailable), got %+v", ignored)
+	assertTrue(len(helperA.drain()) == 0, "a message with no usable key must not be answered")
+	assertTrue(storedKeyEpoch(helperA, channelA) == 2, "the ignored message must not move helper-a's ring")
+	fmt.Println("  sequence 515 → MessageIgnored(KeyUnavailable), nothing sent, ring unchanged  ✓")
+
+	_, err = owner.proto.Start(protocol.FlowKindRecoverSecret, protocol.RecoverSecretParams{
+		SecretID: protocolSecretID,
+		Version:  2,
+	})
+	must(err, "owner.Start(RecoverSecret)")
+	var recovered *protocol.Secret
+	for _, ev := range pumpMany([]*peer{owner, helperA, helperB}) {
+		if ev.Type == protocol.EventTypeSecretRecovered && ev.Secret != nil {
+			recovered = ev.Secret
+		}
+	}
+	assertTrue(recovered != nil, "RecoverSecret must surface SecretRecovered")
+	assertTrue(len(recovered.Helpers) == 2, "the recovered roster must name both helpers, got %+v", recovered.Helpers)
+	for _, h := range recovered.Helpers {
+		assertTrue(h.KeyEpoch == 2, "the roster must name key epoch 2 for channel %d, got %d", h.ChannelID, h.KeyEpoch)
+	}
+	fmt.Println("  SecretRecovered names key_epoch 2 for both helpers  ✓")
+	owner.proto.Close()
+
+	device := rotating("device")
+	defer device.proto.Close()
+	_, err = device.proto.Restore(*recovered, 2)
+	must(err, "device.Restore")
+	for channelID := range helpers {
+		assertTrue(storedKeyEpoch(device, channelID) == 2,
+			"restore must rebuild channel %d at KeyRing epoch 2, got %d", channelID, storedKeyEpoch(device, channelID))
+	}
+	fmt.Println("  restore on a fresh device → KeyRing epoch 2 on both channels  ✓")
+
+	_, err = device.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: recovered.Secrets,
+	})
+	must(err, "device.Start(ProtectSecret) after Restore")
+	events := pumpMany([]*peer{device, helperA, helperB})
+	assertTrue(confirmedCount(events, 3) == 2, "both helpers must confirm v3 from the restored device, got %+v", events)
+	for channelID, helper := range helpers {
+		assertTrue(storedKeyEpoch(device, channelID) == 3 && storedKeyEpoch(helper, channelID) == 3,
+			"channel %d must be at KeyRing epoch 3 on both ends, got device %d, %s %d",
+			channelID, storedKeyEpoch(device, channelID), helper.label, storedKeyEpoch(helper, channelID))
+	}
+	fmt.Println("  the restored device publishes v3 → both helpers confirm, KeyRing epoch 3  ✓")
+
+	fmt.Println("Protocol key rotation test passed.")
 }

@@ -1,4 +1,4 @@
-import { primitives } from '../src/primitives';
+import { primitives, envelope, channel_key } from '../src/primitives';
 import { MessageKind } from '../src/messages';
 
 interface HostCall {
@@ -170,9 +170,9 @@ describe('message marshalling', () => {
   });
 
   it('sends an empty buffer for an absent reply_to', () => {
-    primitives.discovery.request.produce(1n, new Uint8Array(32));
+    primitives.discovery.request.produce(1n, new Uint8Array(32), 0);
     const replyTo = find('produce_get_secret_ids_versions_request_message')
-      .args[2] as Uint8Array;
+      .args[3] as Uint8Array;
     expect(replyTo).toBeInstanceOf(Uint8Array);
     expect(replyTo.length).toBe(0);
     // No encode call for an absent optional — the C ABI reads zero length as
@@ -181,7 +181,7 @@ describe('message marshalling', () => {
   });
 
   it('encodes a present reply_to as a framed TransportProtocol list', () => {
-    primitives.discovery.request.produce(1n, new Uint8Array(32), [
+    primitives.discovery.request.produce(1n, new Uint8Array(32), 0, [
       { uri: 'https://x.example', protocol: 0 },
       { uri: 'grpcs://x.example:443', protocol: 1 },
     ]);
@@ -352,5 +352,55 @@ describe('sharing.request.split', () => {
     const { args } = find('protect_secret');
     expect(args[2]).toEqual([1n, 2n]);
     expect(args[3]).toEqual([2, 3]);
+  });
+});
+
+describe('channel key epoch', () => {
+  // The C ABI takes the epoch right after the shared key; a wrapper that
+  // dropped or reordered it would stamp the wrong `sequence` on the envelope.
+  it('forwards the epoch right after the shared key on every producer', () => {
+    const key = new Uint8Array(32);
+    const req = {} as never;
+    primitives.discovery.request.produce(1n, key, 7);
+    primitives.discovery.response.produce(1n, [], key, 7);
+    primitives.recovery.request.produce(1n, 2n, 3, key, 7);
+    primitives.recovery.response.produce(1n, req, req, key, 7);
+    primitives.sharing.request.produce(1n, 3, 2n, req, 0, '', key, 7);
+    replies.produce_store_share_response_message = {
+      wire_bytes: new Uint8Array().buffer,
+      committed_share_bytes: new Uint8Array().buffer,
+      secret_id: 2n,
+      version: 3,
+    };
+    primitives.sharing.response.produce(1n, req, key, 7);
+    primitives.unpairing.request.produce(1n, 'bye', key, 7);
+    primitives.unpairing.response.produce(1n, key, 7);
+    primitives.verification.request.produce(1n, 2n, 3, key, 7);
+    primitives.verification.response.produce(1n, req, key, 7, new Uint8Array([1]));
+
+    const expectEpochAfterKey = (name: string, keyIndex: number) => {
+      const { args } = find(name);
+      expect(args[keyIndex]).toBe(key);
+      expect(args[keyIndex + 1]).toBe(7);
+    };
+    expectEpochAfterKey('produce_get_secret_ids_versions_request_message', 1);
+    expectEpochAfterKey('produce_get_secret_ids_versions_response_message', 2);
+    expectEpochAfterKey('produce_get_share_request_message', 3);
+    expectEpochAfterKey('produce_get_share_response_message', 3);
+    expectEpochAfterKey('produce_store_share_request_message', 6);
+    expectEpochAfterKey('produce_store_share_response_message', 2);
+    expectEpochAfterKey('produce_unpair_request_message', 2);
+    expectEpochAfterKey('produce_unpair_response_message', 1);
+    expectEpochAfterKey('produce_verify_share_request_message', 3);
+    expectEpochAfterKey('produce_verify_share_response_message', 2);
+  });
+
+  it('routes read_sequence and derive to their host functions', () => {
+    replies.read_sequence_from_envelope = 3;
+    expect(envelope.read_sequence(new Uint8Array([1]))).toBe(3);
+
+    const key = new Uint8Array(32);
+    channel_key.derive(key, 0, 3);
+    expect(find('derive_channel_key').args).toEqual([key, 0, 3]);
   });
 });

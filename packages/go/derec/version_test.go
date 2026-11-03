@@ -22,7 +22,7 @@ func TestCurrentProtocolVersionMatchesCore(t *testing.T) {
 
 func TestCurrentProtocolVersionMatchesEnvelopeStamp(t *testing.T) {
 	key := make([]byte, 32)
-	wire, err := unpairing.Request.Produce(1, "", key, nil)
+	wire, err := unpairing.Request.Produce(1, "", key, 0, nil)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}

@@ -210,7 +210,7 @@ fn wire(channel_id: ChannelId, key: &SharedKey, mut body: MessageBody) -> Vec<u8
         .timestamp(timestamp)
         .trace_id(TRACE)
         .message_body(body)
-        .encrypt(key)
+        .encrypt(&derec_library::types::ChannelKey::new(0, key.clone()))
         .expect("encrypt")
         .build()
         .expect("build")
@@ -229,8 +229,17 @@ fn valid_store_share() -> derec_proto::StoreShareRequestMessage {
     )
     .expect("split");
     let committed = split.shares.get(&CHANNEL).expect("share for the channel");
-    let produced =
-        request::produce(CHANNEL, 1, SECRET_ID, committed, 0, "", &KEY, &[]).expect("produce");
+    let produced = request::produce(
+        CHANNEL,
+        1,
+        SECRET_ID,
+        committed,
+        0,
+        "",
+        &derec_library::types::ChannelKey::new(0, KEY.clone()),
+        &[],
+    )
+    .expect("produce");
     request::extract(&produced.envelope, &KEY)
         .expect("extract")
         .request
@@ -252,6 +261,7 @@ fn roster(members: &[(u64, ReplicaRole, &str)]) -> Secret {
                 })
                 .collect(),
             shared_key: GROUP_KEY.as_bytes().to_vec(),
+            key_epoch: 0,
         }),
         threshold: None,
     }
@@ -1073,7 +1083,7 @@ fn exempt_messages_are_never_answered() {
                 .timestamp(stale)
                 .trace_id(TRACE)
                 .message_body(body)
-                .encrypt(&KEY)
+                .encrypt(&derec_library::types::ChannelKey::new(0, KEY.clone()))
                 .expect("encrypt")
                 .build()
                 .expect("build")
@@ -1100,7 +1110,7 @@ fn exempt_messages_are_never_answered() {
                 .timestamp(now)
                 .trace_id(TRACE)
                 .message_body(body)
-                .encrypt(&KEY)
+                .encrypt(&derec_library::types::ChannelKey::new(0, KEY.clone()))
                 .expect("encrypt")
                 .build()
                 .expect("build")
@@ -1708,7 +1718,7 @@ fn a_received_error_response_is_reported_and_never_answered() {
                 .timestamp(now)
                 .trace_id(TRACE)
                 .message_body(stale)
-                .encrypt(&KEY)
+                .encrypt(&derec_library::types::ChannelKey::new(0, KEY.clone()))
                 .expect("encrypt")
                 .build()
                 .expect("build")

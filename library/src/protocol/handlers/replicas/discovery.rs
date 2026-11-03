@@ -19,9 +19,10 @@ use crate::protocol::context::{Exchange, Local};
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{ChannelStatus, ReplicaMember};
 use crate::protocol::{
-    DeRecEvent, DeRecStateStore, DeRecTransport, DeRecUserSecretStore, StateItem, StateKey,
+    ChannelKey, DeRecEvent, DeRecStateStore, DeRecTransport, DeRecUserSecretStore, StateItem,
+    StateKey,
 };
-use crate::types::{ReplicaId, SharedKey};
+use crate::types::ReplicaId;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
 use crate::{Error, Result};
@@ -59,7 +60,7 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
                 local,
                 &member,
                 &request,
-                exchange.shared_key,
+                exchange.key,
                 exchange.trace_id,
                 exchange.obligation,
             )
@@ -119,7 +120,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     let group_channel = peers[0].channel_id;
     let key = stores
         .secrets
-        .paired_key(local.secret_id, group_channel)
+        .current_key(local.secret_id, group_channel)
         .await?;
 
     let mut asked: HashSet<ReplicaId> = HashSet::new();
@@ -187,7 +188,7 @@ async fn on_request<S: StoreSet>(
     local: &Local<'_>,
     member: &ReplicaMember,
     request: &GetSecretIdsVersionsRequestMessage,
-    shared_key: &SharedKey,
+    key: &ChannelKey,
     inbound_trace_id: u64,
     obligation: Option<&crate::protocol::obligation::Obligation>,
 ) -> Result<Vec<DeRecEvent>> {
@@ -220,7 +221,7 @@ async fn on_request<S: StoreSet>(
         .channel_id(member.channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::GetSecretIdsVersionsResponse(response))
-        .encrypt(shared_key)?
+        .encrypt(key)?
         .build()?
         .encode_to_vec();
     let envelope = crate::derec_message::apply_trace_id(&envelope, inbound_trace_id)?;
@@ -372,7 +373,7 @@ async fn finish<S: StoreSet>(
 
     let key = stores
         .secrets
-        .paired_key(local.secret_id, member.channel_id)
+        .current_key(local.secret_id, member.channel_id)
         .await?;
     let timestamp = current_timestamp();
     let reply_to_transports = std::slice::from_ref(local.primary()).to_vec();
@@ -420,6 +421,7 @@ mod tests {
         ChannelRecord, ChannelStatus, ReplicaRole, SecretValue, UserSecrets,
     };
     use crate::types::ChannelId;
+    use crate::types::SharedKey;
     use std::collections::HashSet;
 
     const SECRET_ID: u64 = 0xCA7C4;

@@ -15,6 +15,7 @@ mod sharing_round_outcome {
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
+    use crate::protocol::traits::DeRecSecretStore as _;
     use crate::types::ReplicaId;
 
     use std::collections::HashSet;
@@ -511,6 +512,38 @@ mod sharing_round_outcome {
             .iter()
             .filter(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == channel))
             .count()
+    }
+
+    /// Dropping a channel removes its key ring with the rest of its secrets.
+    #[test]
+    fn dropping_a_channel_removes_its_key_ring() {
+        run_async(async {
+            let mut protocol = build(2);
+            let channel = ChannelId(4242);
+            protocol
+                .secret_store
+                .save(
+                    SECRET_ID,
+                    channel,
+                    crate::protocol::SecretValue::KeyRing(crate::protocol::KeyRing::fresh(
+                        crate::types::SharedKey::new([3u8; 32]),
+                    )),
+                )
+                .await
+                .expect("seed ring");
+            seed_expired_unpair(&mut protocol, channel).await;
+
+            protocol.tick().await;
+
+            assert!(
+                protocol
+                    .secret_store
+                    .load(SECRET_ID, channel, crate::protocol::SecretKind::KeyRing)
+                    .await
+                    .expect("load")
+                    .is_none()
+            );
+        });
     }
 
     /// A timed-out unpair whose channel cannot be dropped keeps its pending

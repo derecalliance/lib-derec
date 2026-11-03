@@ -45,6 +45,7 @@ pub async fn run_all() {
     run_helper_without_the_version_flow().await;
     run_weighted_helpers_flow().await;
     run_sticky_threshold_flow().await;
+    run_key_rotation_flow().await;
     run_max_subshares_flow().await;
     run_share_store_refusal_flow().await;
     run_corrupted_share_flow().await;
@@ -270,6 +271,7 @@ impl DeRecSecretStore for InMemorySecretStore {
             SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
             SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
             SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
+            SecretValue::KeyRing(_) => SecretKind::KeyRing as u8,
         };
         self.data.insert((secret_id, channel_id.0, kind), value);
         Box::pin(std::future::ready(Ok(())))
@@ -301,6 +303,7 @@ fn clone_secret_value(v: &SecretValue) -> SecretValue {
         SecretValue::SharedKey(k) => SecretValue::SharedKey(k.clone()),
         SecretValue::PairingSecret(p) => SecretValue::PairingSecret(p.clone()),
         SecretValue::PairingContact(c) => SecretValue::PairingContact(c.clone()),
+        SecretValue::KeyRing(r) => SecretValue::KeyRing(r.clone()),
     }
 }
 
@@ -767,6 +770,30 @@ impl Peer {
             .with_own_transports([uri])
             .with_threshold(2)
             .with_parameter_range(range)
+            .build()
+            .expect("test fixture: builder.build() should succeed");
+        Self {
+            label,
+            uri: uri.to_owned(),
+            protocol,
+            transport,
+        }
+    }
+
+    /// Build a peer that advances each helper channel one key epoch per
+    /// sharing round that reaches the threshold.
+    fn rotating(label: &'static str, uri: &str) -> Self {
+        let transport = InProcessTransport::new();
+        let protocol = DeRecProtocolBuilder::new(DEFAULT_TEST_SECRET_ID)
+            .with_channel_store(InMemoryChannelStore::default())
+            .with_share_store(InMemoryShareStore::default())
+            .with_secret_store(InMemorySecretStore::default())
+            .with_user_secret_store(InMemoryUserSecretStore::default())
+            .with_transport(transport.clone())
+            .with_state_store(InMemoryStateStore::default())
+            .with_own_transports([uri])
+            .with_threshold(2)
+            .with_key_rotation(true)
             .build()
             .expect("test fixture: builder.build() should succeed");
         Self {
@@ -4248,6 +4275,199 @@ async fn run_sticky_threshold_flow() {
     println!("Protocol sticky threshold flow test passed.");
 }
 
+/// The epoch of the key ring `peer` stores for `channel_id`, read from its
+/// own secret store.
+async fn stored_key_epoch(peer: &Peer, channel_id: ChannelId) -> u32 {
+    match peer
+        .protocol
+        .secret_store
+        .load(peer.protocol.secret_id(), channel_id, SecretKind::KeyRing)
+        .await
+        .unwrap_or_else(|e| panic!("[{}] key ring load failed: {e}", peer.label))
+    {
+        Some(SecretValue::KeyRing(ring)) => ring.epoch(),
+        other => panic!(
+            "[{}] channel {channel_id:?} must store a KeyRing, got {}",
+            peer.label,
+            other.is_some()
+        ),
+    }
+}
+
+/// The `sequence` of an envelope: the epoch of the key its payload is under.
+fn envelope_sequence(envelope: &[u8]) -> u32 {
+    use prost::Message as _;
+    derec_proto::DeRecMessage::decode(envelope)
+        .expect("an envelope decodes")
+        .sequence
+}
+
+/// With key rotation on, the owner advances each helper channel one epoch per
+/// sharing round, and both ends store the new epoch in their key ring. An
+/// envelope whose `sequence` is beyond the forward-jump limit is ignored as
+/// `KeyUnavailable`. The recovered secret names each channel's epoch, and a
+/// fresh device restored from it publishes to the helpers under the next one.
+async fn run_key_rotation_flow() {
+    use prost::Message as _;
+    println!("=== Protocol key rotation flow test ===");
+
+    const OWNER_URI: &str = "https://owner-rotation.example.com";
+    let mut owner = Peer::rotating("owner", OWNER_URI);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a-rotation.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b-rotation.example.com");
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(1)).await;
+    let channel_b = pair(&mut owner, &mut helper_b, ChannelId(2)).await;
+    let channels = [channel_a, channel_b];
+
+    for round in 1..=2_u8 {
+        owner
+            .protocol
+            .start(DeRecFlow::ProtectSecret {
+                secrets: vec![UserSecret {
+                    id: vec![21],
+                    name: "rotating".to_owned(),
+                    data: vec![round],
+                }],
+                description: None,
+                weights: HashMap::new(),
+                threshold: None,
+            })
+            .await
+            .expect("owner start(ProtectSecret) failed");
+        let events = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+        let confirmed = events
+            .iter()
+            .filter(|e| matches!(e, DeRecEvent::ShareConfirmed { version, .. } if *version == u32::from(round)))
+            .count();
+        assert_eq!(confirmed, 2, "both helpers confirm v{round}");
+    }
+    for (channel_id, helper) in [(channel_a, &helper_a), (channel_b, &helper_b)] {
+        assert_eq!(stored_key_epoch(&owner, channel_id).await, 2);
+        assert_eq!(stored_key_epoch(helper, channel_id).await, 2);
+    }
+    println!("  two rounds → owner and helpers store KeyRing epoch 2 on both channels  ✓");
+
+    let secret_id = owner.protocol.secret_id();
+    owner
+        .protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id,
+            version: 2,
+            target: Target::All,
+        })
+        .await
+        .expect("owner start(VerifyShares) failed");
+    let events = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+    for channel_id in channels {
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                DeRecEvent::ShareVerified { channel_id: c, version: 2, .. } if *c == channel_id
+            )),
+            "{channel_id:?} verifies v2 at epoch 2: {events:?}"
+        );
+    }
+    println!("  verification of v2 at epoch 2 → ShareVerified on both channels  ✓");
+
+    owner
+        .protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id,
+            version: 2,
+            target: Target::Single(channel_a),
+        })
+        .await
+        .expect("owner start(VerifyShares) failed");
+    let sent = owner.drain();
+    assert_eq!(sent.len(), 1, "one challenge to helper-a");
+    let challenge = &sent[0].1;
+    assert_eq!(envelope_sequence(challenge), 2, "the challenge is under K2");
+    let mut forged =
+        derec_proto::DeRecMessage::decode(challenge.as_slice()).expect("an envelope decodes");
+    forged.sequence = 2 + 513;
+    let forged = forged.encode_to_vec();
+    let events = helper_a
+        .protocol
+        .process(&forged)
+        .await
+        .expect("an unusable epoch is not an error");
+    assert!(
+        matches!(
+            events.as_slice(),
+            [DeRecEvent::MessageIgnored {
+                channel_id,
+                reason: IgnoreReason::KeyUnavailable,
+                ..
+            }] if *channel_id == channel_a
+        ),
+        "a sequence past the forward-jump limit must be MessageIgnored(KeyUnavailable), got {events:?}"
+    );
+    assert!(helper_a.drain().is_empty(), "nothing is answered");
+    assert_eq!(stored_key_epoch(&helper_a, channel_a).await, 2);
+    println!("  sequence 515 → MessageIgnored(KeyUnavailable), nothing sent, ring unchanged  ✓");
+
+    owner
+        .protocol
+        .start(DeRecFlow::RecoverSecret {
+            secret_id,
+            version: 2,
+        })
+        .await
+        .expect("owner start(RecoverSecret) failed");
+    let events = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+    let recovered = events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::SecretRecovered { secret } => Some(secret.clone()),
+            _ => None,
+        })
+        .expect("expected SecretRecovered on the owner");
+    assert_eq!(recovered.helpers.len(), 2);
+    for helper in &recovered.helpers {
+        assert_eq!(helper.key_epoch, 2, "the roster names epoch 2");
+    }
+    println!("  SecretRecovered names key_epoch 2 for both helpers  ✓");
+    drop(owner);
+
+    let mut device = Peer::rotating("device", OWNER_URI);
+    device
+        .protocol
+        .restore(&recovered, 2)
+        .await
+        .expect("restore on a fresh device must succeed");
+    for channel_id in channels {
+        assert_eq!(stored_key_epoch(&device, channel_id).await, 2);
+    }
+    println!("  restore on a fresh device → KeyRing epoch 2 on both channels  ✓");
+
+    device
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: recovered.secrets.clone(),
+            description: None,
+            weights: HashMap::new(),
+            threshold: None,
+        })
+        .await
+        .expect("the restored device publishes");
+    let events = pump_many(&mut [&mut device, &mut helper_a, &mut helper_b]).await;
+    let confirmed = events
+        .iter()
+        .filter(|e| matches!(e, DeRecEvent::ShareConfirmed { version: 3, .. }))
+        .count();
+    assert_eq!(
+        confirmed, 2,
+        "both helpers confirm v3 from the restored device"
+    );
+    for (channel_id, helper) in [(channel_a, &helper_a), (channel_b, &helper_b)] {
+        assert_eq!(stored_key_epoch(&device, channel_id).await, 3);
+        assert_eq!(stored_key_epoch(helper, channel_id).await, 3);
+    }
+    println!("  the restored device publishes v3 → both helpers confirm, KeyRing epoch 3  ✓");
+
+    println!("Protocol key rotation flow test passed.");
+}
+
 fn sorted_counts(mut counts: Vec<(ChannelId, Option<u32>)>) -> Vec<(ChannelId, Option<u32>)> {
     counts.sort_unstable();
     counts
@@ -4815,7 +5035,10 @@ async fn run_reply_to_flow() {
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::GetSecretIdsVersionsRequest(crafted))
-        .encrypt(&shared_key)
+        .encrypt(&derec_library::types::ChannelKey::new(
+            0,
+            shared_key.clone(),
+        ))
         .expect("encrypt failed")
         .build()
         .expect("build failed")

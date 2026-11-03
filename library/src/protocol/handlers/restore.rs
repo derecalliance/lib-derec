@@ -42,15 +42,16 @@
 //! precondition on that publish.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecUserSecretStore, NotRestoredReason,
-    SecretValue, UnpairAck,
+    DeRecChannelStore, DeRecEvent, DeRecUserSecretStore, NotRestoredReason, UnpairAck,
     types::{
         ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole, Secret,
         UserSecrets,
     },
 };
+use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::protocol::context::Local;
 use crate::protocol::stores::{StoreSet, Stores};
+use crate::protocol::{ChannelKey, KeyRing};
 use crate::{
     Result,
     types::{ChannelId, SharedKey},
@@ -92,7 +93,7 @@ pub enum RestoreError {
 }
 
 /// Run the restore flow. On success: canonical helper channels are
-/// persisted with their `SharedKey`; canonical replica channels are
+/// persisted with their key; canonical replica channels are
 /// persisted with the group key from `secret.replicas.shared_key`; the
 /// user-secret snapshot is committed at `recovered_version`; every
 /// recovery-mode channel under `secret_id` is unpaired under the
@@ -160,11 +161,12 @@ pub enum RestoreError {
 ///    mutation. Channels at no roster id are recovery channels — wiped in
 ///    step 5, never flagged as collisions.
 /// 2. **Helper channels.** Persist each reachable helper's canonical
-///    channel record and its `SharedKey`. No tracking share — see
+///    channel record and its key ring: the roster's key at its `key_epoch`,
+///    with `recovered_version` pinned to that epoch. No tracking share — see
 ///    *Verification after a restore* above.
 /// 3. **Replica members.** Persist every reachable member of the roster
-///    against the one group channel, with the group key as that channel's
-///    `SharedKey`. Each member's `role` is taken verbatim from the roster:
+///    against the one group channel, with that channel's key ring built
+///    from the group key the same way. Each member's `role` is taken verbatim from the roster:
 ///    it is a property of the group, not of the reader.
 ///
 ///    The device's own `replica_id` is **not** adopted from the recovered
@@ -213,10 +215,10 @@ pub(in crate::protocol) async fn restore<S: StoreSet>(
     let plan = plan_restore(secret)?;
     let existing_channels = check_preconditions(stores, local, &plan).await?;
 
-    write_helper_channels(stores, local, &plan.helpers).await?;
+    write_helper_channels(stores, local, &plan.helpers, recovered_version).await?;
 
     if let Some(group) = &plan.replicas {
-        write_replica_channels(stores, local, group).await?;
+        write_replica_channels(stores, local, group, recovered_version).await?;
     }
 
     commit_snapshot(stores, local, secret, recovered_version).await?;
@@ -248,7 +250,7 @@ pub(in crate::protocol) async fn restore<S: StoreSet>(
 /// Every write restore makes, derived from the recovered [`Secret`] alone
 /// and fully validated before any store is touched.
 struct RestorePlan {
-    helpers: Vec<(HelperChannel, SharedKey)>,
+    helpers: Vec<(HelperChannel, ChannelKey)>,
     replicas: Option<GroupPlan>,
     /// One [`DeRecEvent::PeerNotRestored`] per roster entry that gets no
     /// channel, in roster order.
@@ -264,7 +266,7 @@ struct RestorePlan {
 struct GroupPlan {
     channel_id: ChannelId,
     members: Vec<ReplicaMember>,
-    group_key: SharedKey,
+    group_key: ChannelKey,
 }
 
 fn plan_restore(secret: &Secret) -> Result<RestorePlan> {
@@ -303,7 +305,10 @@ fn plan_restore(secret: &Secret) -> Result<RestorePlan> {
                 peer_role: derec_proto::SenderKind::Helper,
                 weight: h.effective_weight(),
             },
-            shared_key,
+            ChannelKey {
+                epoch: h.key_epoch,
+                key: shared_key,
+            },
         ));
     }
 
@@ -347,7 +352,10 @@ fn plan_restore(secret: &Secret) -> Result<RestorePlan> {
                 Some(GroupPlan {
                     channel_id,
                     members,
-                    group_key,
+                    group_key: ChannelKey {
+                        epoch: group.key_epoch,
+                        key: group_key,
+                    },
                 })
             }
         }
@@ -406,10 +414,11 @@ async fn check_preconditions<S: StoreSet>(
 async fn write_helper_channels<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-    helpers: &[(HelperChannel, SharedKey)],
+    helpers: &[(HelperChannel, ChannelKey)],
+    version: u32,
 ) -> Result<()> {
     let secret_id = local.secret_id;
-    for (channel, shared_key) in helpers {
+    for (channel, key) in helpers {
         let cid = channel.channel_id;
         stores
             .channels
@@ -417,7 +426,7 @@ async fn write_helper_channels<S: StoreSet>(
             .await?;
         stores
             .secrets
-            .save(secret_id, cid, SecretValue::SharedKey(shared_key.clone()))
+            .save_key_ring(secret_id, cid, &KeyRing::restored(key, version))
             .await?;
     }
     Ok(())
@@ -427,6 +436,7 @@ async fn write_replica_channels<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     group: &GroupPlan,
+    version: u32,
 ) -> Result<()> {
     for member in &group.members {
         stores
@@ -437,10 +447,10 @@ async fn write_replica_channels<S: StoreSet>(
     // One key at the one channel every member is addressed on.
     stores
         .secrets
-        .save(
+        .save_key_ring(
             local.secret_id,
             group.channel_id,
-            SecretValue::SharedKey(group.group_key.clone()),
+            &KeyRing::restored(&group.group_key, version),
         )
         .await?;
     Ok(())
@@ -588,6 +598,7 @@ mod tests {
                     shared_key: vec![0xAA; 32],
                     communication_info: HashMap::from([("name".to_owned(), "HelperA".to_owned())]),
                     weight: 1,
+                    key_epoch: 0,
                 },
                 HelperInfo {
                     channel_id: 12,
@@ -598,6 +609,7 @@ mod tests {
                     shared_key: vec![0xBB; 32],
                     communication_info: HashMap::new(),
                     weight: 1,
+                    key_epoch: 0,
                 },
             ],
             secrets: vec![
@@ -635,6 +647,7 @@ mod tests {
                     },
                 ],
                 shared_key: vec![0xCC; 32],
+                key_epoch: 0,
             }),
             threshold: None,
         }

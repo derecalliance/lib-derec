@@ -109,6 +109,12 @@ type DeRecProtocolConfig struct {
 	// to pass to Reject. Default: false.
 	AutoRespondOnFailure *bool `json:"auto_respond_on_failure,omitempty"`
 
+	// KeyRotation decides whether the owner advances channel keys: each
+	// helper channel one epoch in every sharing round that reaches the
+	// threshold, and the replica group channel one epoch on every publish
+	// to replicas. false keeps the current key. Default: false.
+	KeyRotation *bool `json:"key_rotation,omitempty"`
+
 	// AutoReplyTo controls whether outbound requests carry an ephemeral
 	// replyTo pointing at OwnTransports. Default: false.
 	AutoReplyTo *bool `json:"auto_reply_to,omitempty"`
@@ -202,6 +208,9 @@ func (c *DeRecProtocolConfig) UnmarshalJSON(data []byte) error {
 	}
 	if layer.AutoRespondOnFailure != nil {
 		c.AutoRespondOnFailure = layer.AutoRespondOnFailure
+	}
+	if layer.KeyRotation != nil {
+		c.KeyRotation = layer.KeyRotation
 	}
 	if layer.AutoReplyTo != nil {
 		c.AutoReplyTo = layer.AutoReplyTo

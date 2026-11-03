@@ -12,8 +12,9 @@ use std::collections::HashMap;
 
 use crate::{
     primitives::discovery::response::SecretVersionEntry,
+    protocol::ChannelKey,
     protocol::types::{Target, UserSecret},
-    types::{ChannelId, SharedKey},
+    types::ChannelId,
 };
 use derec_proto::{
     ContactMessage, GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PairRequestMessage,
@@ -53,6 +54,11 @@ pub enum IgnoreReason {
     /// earlier challenge that a newer one has replaced. The outstanding
     /// challenge is kept, so its own answer still completes it.
     StaleResponse,
+    /// The envelope's `sequence` names an epoch whose key this device cannot
+    /// obtain: more than 512 ahead of the newest key it holds, or with no
+    /// held key below it within 512. Nothing is decrypted and no state
+    /// changes, so a forged `sequence` costs only this drop.
+    KeyUnavailable,
 }
 
 /// Why [`DeRecEvent::VerifySharesFailed`] reached no verdict for a channel.
@@ -62,8 +68,9 @@ pub enum IgnoreReason {
 /// [`DeRecEvent::ShareVerifyInvalid`] or [`DeRecEvent::ShareVerifyRejected`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VerifyFailureReason {
-    /// The channel has no shared key, so no challenge can be encrypted to
-    /// the helper. Nothing is sent.
+    /// The secret store holds no usable key for the channel: it answered the
+    /// channel's shared key or key ring with a value of another kind. No
+    /// challenge can be encrypted to the helper, and nothing is sent.
     NoSharedKey,
     /// This device holds no proof of the share for the channel at the
     /// challenged version, so no answer could be checked. Reported when the
@@ -275,6 +282,13 @@ impl AutoAcceptPolicy {
 /// The pairing actions carry no seal: their request is one anyone holding the
 /// contact can send anyway.
 ///
+/// A sealed action also carries the epoch of the channel key its request
+/// arrived under, and the seal covers it. `accept` and `reject` answer under
+/// that epoch's key, whatever epoch the channel has moved to since. When that
+/// key can no longer be obtained, because nothing pins its epoch any more and
+/// no held key below it derives it, the action is too late: `accept` and
+/// `reject` refuse it and nothing is sent.
+///
 /// The application owns the action from the moment `process` returns it until
 /// it passes it to `accept` or `reject`. The seal catches an action that was
 /// changed; it does not stop one being resolved twice, so resolving each
@@ -284,7 +298,7 @@ impl AutoAcceptPolicy {
 /// `Debug` shows only the [`PendingActionKind`] discriminant plus
 /// `channel_id`, keeping any peer-supplied request contents out of log
 /// lines. No action carries key material: `accept` and `reject` load the
-/// channel's shared key, and the pairing secret, from the secret store (the
+/// channel's key ring, and the pairing secret, from the secret store (the
 /// single source of truth) when they run. The token can therefore be
 /// persisted or shipped across a language boundary without exposing a key.
 /// It still carries the peer's request, so it is not public data.
@@ -294,12 +308,17 @@ impl AutoAcceptPolicy {
 /// [`super::DeRecProtocol::reject`] if a
 /// [`DeRecEvent::RequestFailed`] follows.
 ///
-/// The library never expires an unresolved action: a token stays valid until
-/// the application resolves it, however long that takes.
+/// The library never expires an unresolved action on a clock: a token stays
+/// valid until the application resolves it, however long that takes, unless
+/// its epoch's key can no longer be obtained, which makes it too late.
 #[derive(Clone)]
 pub struct PendingAction {
     channel_id: ChannelId,
     trace_id: u64,
+    /// The epoch of the channel key the action is answered under: the key
+    /// its request arrived under. 0 for [`Action::Pairing`] and
+    /// [`Action::PrePair`], which no channel key answers.
+    epoch: u32,
     /// Present on every action answered under a channel key: `None` only for
     /// [`Action::Pairing`] and [`Action::PrePair`], whose request anyone
     /// holding the contact can send anyway.
@@ -491,8 +510,9 @@ impl std::fmt::Debug for PendingAction {
 }
 
 impl PendingAction {
-    /// A [`ChannelRequest`] that arrived on `channel_id`, to be sealed under
-    /// that channel's key with [`UnsealedAction::sealed_with`].
+    /// A [`ChannelRequest`] that arrived on `channel_id`, to be sealed with
+    /// [`UnsealedAction::sealed_with`] under the channel key it arrived
+    /// under.
     pub(crate) fn request(
         channel_id: ChannelId,
         trace_id: u64,
@@ -506,8 +526,8 @@ impl PendingAction {
     }
 
     /// A failed request that arrived on `channel_id` and is answered on
-    /// `reply`, to be sealed under the reply channel's key with
-    /// [`UnsealedAction::sealed_with`].
+    /// `reply`, to be sealed with [`UnsealedAction::sealed_with`] under the
+    /// reply channel's key it is answered under.
     pub(crate) fn failure(
         channel_id: ChannelId,
         trace_id: u64,
@@ -532,6 +552,7 @@ impl PendingAction {
         Self {
             channel_id,
             trace_id,
+            epoch: 0,
             seal: None,
             action: Action::Pairing {
                 request,
@@ -550,22 +571,26 @@ impl PendingAction {
         Self {
             channel_id,
             trace_id,
+            epoch: 0,
             seal: None,
             action: Action::PrePair(request),
         }
     }
 
-    /// An action read back from a token, with the seal the token carried.
+    /// An action read back from a token, with the epoch and seal the token
+    /// carried.
     #[cfg(any(feature = "ffi", target_arch = "wasm32"))]
     pub(crate) fn from_parts(
         channel_id: ChannelId,
         trace_id: u64,
+        epoch: u32,
         seal: Option<seal::Seal>,
         action: Action,
     ) -> Self {
         Self {
             channel_id,
             trace_id,
+            epoch,
             seal,
             action,
         }
@@ -588,18 +613,27 @@ impl PendingAction {
         }
     }
 
+    /// The epoch of the channel key this action is answered under: the key
+    /// its request arrived under. 0 for the pairing actions.
+    pub(crate) fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
     /// Whether this action is the one `process` raised and sealed under
-    /// `key`, the key of its [`sealing_channel`](Self::sealing_channel).
-    /// `false` for an action with no seal where one is required.
-    pub(crate) fn seal_verifies(&self, key: &SharedKey) -> bool {
+    /// `key`, the key of its [`sealing_channel`](Self::sealing_channel) at
+    /// its [`epoch`](Self::epoch). `false` for a key of another epoch, and
+    /// for an action with no seal where one is required.
+    pub(crate) fn seal_verifies(&self, key: &ChannelKey) -> bool {
         let sealed = match &self.action {
             Action::Request(request) => seal::Sealed::Request(request),
             Action::RespondToFailure { reply, request } => seal::Sealed::Failure { reply, request },
             Action::Pairing { .. } | Action::PrePair(_) => return true,
         };
-        self.seal
-            .as_ref()
-            .is_some_and(|seal| seal.verifies(key, self.channel_id, self.trace_id, sealed))
+        key.epoch == self.epoch
+            && self
+                .seal
+                .as_ref()
+                .is_some_and(|seal| seal.verifies(key, self.channel_id, self.trace_id, sealed))
     }
 
     /// The channel the request arrived on.
@@ -659,10 +693,11 @@ enum Sealable {
 }
 
 impl UnsealedAction {
-    /// Seal the action under `key`, the shared key of the channel that
-    /// answers it, and hand it out. The key is used to compute the seal and
-    /// is not kept.
-    pub(crate) fn sealed_with(self, key: &SharedKey) -> PendingAction {
+    /// Seal the action under `key`, the key of the channel that answers it
+    /// at the epoch it is answered under, and hand it out. The action keeps
+    /// `key.epoch`; the key itself is used to compute the seal and is not
+    /// kept.
+    pub(crate) fn sealed_with(self, key: &ChannelKey) -> PendingAction {
         let (sealed, action) = match self.action {
             Sealable::Request(request) => (
                 seal::Seal::new(
@@ -689,6 +724,7 @@ impl UnsealedAction {
         PendingAction {
             channel_id: self.channel_id,
             trace_id: self.trace_id,
+            epoch: key.epoch,
             seal: Some(sealed),
             action,
         }

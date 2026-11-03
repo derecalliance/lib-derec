@@ -30,13 +30,20 @@ pub struct ExtractResult {
 pub fn produce(
     channel_id: u64,
     shared_key: &[u8],
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
     // Optional `TransportProtocol`. Pass null/undefined for no override.
     reply_to: JsValue,
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
     let reply_to_proto = parse_transport_protocol_list(reply_to)?;
-    let result = request::produce(channel_id.into(), &shared_key, &reply_to_proto)
-        .map_err(js_error_from_lib)?;
+    let result = request::produce(
+        channel_id.into(),
+        &crate::types::ChannelKey::new(epoch, shared_key),
+        &reply_to_proto,
+    )
+    .map_err(js_error_from_lib)?;
     to_js(&ProduceResult {
         envelope: result.envelope,
     })

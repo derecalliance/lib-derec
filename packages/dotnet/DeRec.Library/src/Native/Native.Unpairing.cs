@@ -58,6 +58,7 @@ internal static class Unpairing
         UIntPtr memoBytesLen,
         byte[] sharedKey,
         UIntPtr sharedKeyLen,
+        uint epoch,
         byte[]? replyTo,
         UIntPtr replyToLen
     );
@@ -74,7 +75,8 @@ internal static class Unpairing
     internal static extern ProduceUnpairResponseMessageResult produce_unpair_response_message(
         ulong channelId,
         byte[] sharedKey,
-        UIntPtr sharedKeyLen
+        UIntPtr sharedKeyLen,
+        uint epoch
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

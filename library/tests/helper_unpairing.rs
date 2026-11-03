@@ -158,7 +158,10 @@ fn unpair_answer(channel_id: ChannelId, status: StatusEnum) -> Vec<u8> {
             }),
             timestamp: Some(timestamp),
         }))
-        .encrypt(&key(channel_id))
+        .encrypt(&derec_library::types::ChannelKey::new(
+            0,
+            key(channel_id).clone(),
+        ))
         .expect("encrypt")
         .build()
         .expect("build")
@@ -356,6 +359,7 @@ fn the_recovery_helpers_answers_end_their_channels_after_restore() {
             shared_key: key(channel_id).as_bytes().to_vec(),
             communication_info: HashMap::new(),
             weight: 1,
+            key_epoch: 0,
         };
         let secret = Secret {
             helpers: vec![helper(A), helper(B)],

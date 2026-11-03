@@ -48,8 +48,11 @@ var Request requestAPI
 //
 // replyTo lists the endpoints, in preference order, the peer should answer
 // on; nil or empty means answer on the endpoints recorded for the channel.
-func (requestAPI) Produce(channelID uint64, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
-	return native.ProduceGetSecretIdsVersionsRequest(channelID, sharedKey, replyTo)
+//
+// epoch is the epoch of sharedKey in the channel's key chain, stamped into
+// the envelope's sequence; 0 for a freshly paired channel.
+func (requestAPI) Produce(channelID uint64, sharedKey []byte, epoch uint32, replyTo []Endpoint) ([]byte, error) {
+	return native.ProduceGetSecretIdsVersionsRequest(channelID, sharedKey, epoch, replyTo)
 }
 
 // Extract decrypts a discovery request envelope and returns its channel id
@@ -78,8 +81,11 @@ var Response responseAPI
 
 // Produce builds the wire-encoded DeRecMessage advertising secretList on
 // channelID, encrypted under sharedKey.
-func (responseAPI) Produce(channelID uint64, secretList []SecretVersionEntry, sharedKey []byte) ([]byte, error) {
-	return native.ProduceGetSecretIdsVersionsResponse(channelID, encodeSecretList(secretList), sharedKey)
+//
+// epoch is the epoch of sharedKey in the channel's key chain, stamped into
+// the envelope's sequence; 0 for a freshly paired channel.
+func (responseAPI) Produce(channelID uint64, secretList []SecretVersionEntry, sharedKey []byte, epoch uint32) ([]byte, error) {
+	return native.ProduceGetSecretIdsVersionsResponse(channelID, encodeSecretList(secretList), sharedKey, epoch)
 }
 
 // Extract decrypts a discovery response envelope and returns its channel id

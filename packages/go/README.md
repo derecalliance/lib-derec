@@ -81,7 +81,7 @@ func main() {
 		sharedKey        = make([]byte, 32) // established during pairing
 	)
 
-	envelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey, nil)
+	envelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey, 0, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -253,10 +253,22 @@ weighted := []sharing.WeightedChannel{
 shares, err := sharing.Request.Split(secretID, secretData, weighted, threshold, version)
 
 for channelID, committedShare := range shares {
-	envelope, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", sharedKeys[channelID], nil)
+	envelope, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", sharedKeys[channelID], 0, nil)
 	// send envelope over your transport
 }
 ```
+
+Every channel `Produce` (sharing, verification, recovery, discovery, unpairing; request and response) takes `epoch uint32` right after the shared key: the epoch of that key in the channel's key chain, stamped into the envelope's `sequence`. Pass `0` for a freshly paired channel.
+
+To receive on a channel that may have rotated, read the sequence, hold or derive the key at that epoch, then extract:
+
+```go
+seq, err := envelope.ReadSequence(wire)                 // epoch of the key that encrypted it
+key, err := channelkey.Derive(heldKey, heldEpoch, seq)  // skip when you already hold the key at seq
+req, err := verification.Request.Extract(wire, key)
+```
+
+`channelkey.Derive` only moves forward and is bounded at 512 steps per call; a target below `epoch` or further than 512 above it fails with `derec.CodeInvalidInput`. `Extract` always takes the bare 32-byte key.
 
 The last argument of every request `Produce` (sharing, verification, recovery, discovery, unpairing) is `replyTo []Endpoint`: the endpoints, in preference order, the peer should answer on. `nil` means answer on the endpoints recorded for the channel.
 
@@ -270,11 +282,11 @@ The helper side extracts with `sharing.Request.Extract`, persists the request, a
 import "github.com/derecalliance/lib-derec/packages/go/primitives/verification"
 
 // Owner side: produce the challenge.
-requestEnvelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey, nil)
+requestEnvelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey, 0, nil)
 
 // Helper side: decrypt and answer with proof of possession.
 req, err := verification.Request.Extract(requestEnvelope, sharedKey)
-responseEnvelope, err := verification.Response.Produce(channelID, req.RequestProto, sharedKey, storedShareContent)
+responseEnvelope, err := verification.Response.Produce(channelID, req.RequestProto, sharedKey, 0, storedShareContent)
 
 // Owner side: decrypt and verify the proof.
 resp, err := verification.Response.Extract(responseEnvelope, sharedKey)
@@ -289,11 +301,11 @@ valid, err := verification.Response.Process(req.RequestProto, resp.ResponseProto
 import "github.com/derecalliance/lib-derec/packages/go/primitives/recovery"
 
 // Owner side: request the stored share from each paired helper.
-requestEnvelope, err := recovery.Request.Produce(channelID, secretID, version, sharedKey, nil)
+requestEnvelope, err := recovery.Request.Produce(channelID, secretID, version, sharedKey, 0, nil)
 
 // Helper side: answer using the StoreShareRequest proto it persisted at sharing time.
 req, err := recovery.Request.Extract(requestEnvelope, sharedKey)
-responseEnvelope, err := recovery.Response.Produce(channelID, req.RequestProto, storedShareProto, sharedKey)
+responseEnvelope, err := recovery.Response.Produce(channelID, req.RequestProto, storedShareProto, sharedKey, 0)
 
 // Owner side: collect at least `threshold` responses and reconstruct.
 recovered, err := recovery.Response.Recover([]recovery.ShareResponse{
@@ -345,7 +357,7 @@ recovered, err := recovery.Response.Recover([]recovery.ShareResponse{
 import "github.com/derecalliance/lib-derec/packages/go/primitives/discovery"
 
 // Owner side: ask a helper which secret ids/versions it holds.
-requestEnvelope, err := discovery.Request.Produce(channelID, sharedKey, nil)
+requestEnvelope, err := discovery.Request.Produce(channelID, sharedKey, 0, nil)
 
 // Helper side: decrypt and advertise its stored versions.
 _, err = discovery.Request.Extract(requestEnvelope, sharedKey)
@@ -353,7 +365,7 @@ responseEnvelope, err := discovery.Response.Produce(channelID, []discovery.Secre
 	{SecretID: 0xABCD, Versions: []discovery.VersionEntry{
 		{Version: 1, Description: "wallet seed"},
 	}},
-}, sharedKey)
+}, sharedKey, 0)
 
 // Owner side: decrypt and read the advertised list.
 resp, err := discovery.Response.Extract(responseEnvelope, sharedKey)
@@ -510,6 +522,7 @@ The canonical JSON (`library/tests/fixtures/protocol_config.json` holds a full e
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
   "auto_accept": { "pairing": true, "store_share": true },
   "auto_respond_on_failure": false,
+  "key_rotation": false,
   "auto_reply_to": false,
   "unpair_ack": "required",
   "unsafe_connection": false,
@@ -565,7 +578,7 @@ Every request that arrives on an authenticated channel gets exactly one response
 
 Resolve each token once. The library is stateless, so rejecting the same token twice, or rejecting an action already accepted, sends a second response.
 
-Hand the token back exactly as you received it. It is sealed to its channel, so `Accept` and `Reject` refuse one that was edited, rebuilt or moved to another channel with a `*derec.Error` whose `Code` is `derec.CodeInvalidInput`, and nothing is stored or sent. A token issued by v0.0.10 does not decode (`derec.CodeFFIBadProto`).
+Hand the token back exactly as you received it. It is sealed to its channel, so `Accept` and `Reject` refuse one that was edited, rebuilt or moved to another channel with a `*derec.Error` whose `Code` is `derec.CodeInvalidInput`, and nothing is stored or sent. A token raised under a channel key the device no longer holds, because the channel has moved on and no stored version keeps that key, is too late to answer and is refused the same way. A token issued by v0.0.10 does not decode (`derec.CodeFFIBadProto`).
 
 `Config.AutoRespondOnFailure` decides who answers. With it on, the library sends the response itself (a known failure keeps its specific status; anything else is `FAIL` with a generic memo). With it off (the default), nothing is sent and the event carries the token:
 
@@ -655,6 +668,10 @@ A stored proof is either confirmed by its helper or part of a sharing round stil
 Matching responses to requests is the app's concern. The library applies a response that changes stored state only against the flow that asked for it, and reports the rest as they arrive without matching them: `EventTypeShareConfirmed` and `EventTypeShareRejected` (a sharing round counts only the helpers it is waiting for), `EventTypeSecretsDiscovered`, `EventTypeChannelInfoUpdated`, `EventTypeChannelInfoUpdateRejected` and `EventTypeErrorResponseReceived`. An app that acts on these should record what it started and match each event against it, and decide which versions committed from `EventTypeSharingComplete` with `ThresholdMet` rather than by counting `EventTypeShareConfirmed`, since a helper can confirm twice or unasked. See [Matching responses to requests is the application's job](https://github.com/derecalliance/lib-derec/tree/main/library#matching-responses-to-requests-is-the-applications-job).
 
 Every channel message carries one timestamp, its send time, in both the envelope and the inner message. A message whose two timestamps differ, or where either or both are absent, is ignored as `EventTypeMessageIgnored` with `IgnoreReasonTimestampMismatch`; this includes replies from 0.0.8 peers.
+
+### Key rotation
+
+With `KeyRotation: proto.Bool(true)` in the config, the owner advances each helper channel's key one epoch in every sharing round that reaches the threshold (a round below it advances none), and the replica group channel's key on every publish to replicas. Each step is K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" || be32(e+1)). Rotation is off by default, and off keeps the channel on its current key. The envelope's `sequence` carries the epoch, and peers follow on their own, so the setting is the owner's alone (`KeyRotation` in `DeRecProtocolConfig`). A message under an epoch whose key the device cannot obtain is ignored as `EventTypeMessageIgnored` with `IgnoreReasonKeyUnavailable`. A device keeps its newest key and the key of every secret version it still stores, so any kept version restores. The key ring is stored as a secret of kind `protocol.SecretKindKeyRing` (`3`): persist its bytes as given, with any length, beside the kind-`0` shared key. Forward secrecy covers a compromised helper device, or a key alone, plus recorded traffic, and only for epochs older than the oldest key held; the owner and replica devices hold the plaintext secret and the keys of every version they store. A 0.0.x peer cannot follow a rotated channel: it must upgrade and re-pair.
 
 During recovery, a helper that answers with a share that cannot be part of the secret is reported as an event with `Type == EventTypeRecoveryShareCorrupted` and `Reason` one of `CorruptionReasonMalformed`, `CorruptionReasonInvalidProof` or `CorruptionReasonInconsistent`; the share is set aside and never blocks the recovery from the others. An honest helper never sends one, so treat it as a sign of a damaged or compromised helper — for example, offer to unpair it.
 

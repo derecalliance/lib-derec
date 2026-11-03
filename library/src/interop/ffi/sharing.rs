@@ -160,6 +160,9 @@ pub extern "C" fn produce_store_share_request_message(
     description_len: usize,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
     // `reply_to` is optional: pass `reply_to_len == 0` for "no override"
     // (the responder routes to the transports recorded for the channel).
     // When set, the bytes are a length-delimited sequence of
@@ -223,7 +226,7 @@ pub extern "C" fn produce_store_share_request_message(
         &committed_share,
         keep_version,
         description,
-        &shared_key,
+        &crate::types::ChannelKey::new(epoch, shared_key),
         &reply_to,
     ) {
         Ok(r) => ProduceStoreShareRequestMessageResult {
@@ -292,6 +295,9 @@ pub extern "C" fn produce_store_share_response_message(
     request_proto_len: usize,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
 ) -> ProduceStoreShareResponseMessageResult {
     let with_err = |error| ProduceStoreShareResponseMessageResult {
         error,
@@ -324,7 +330,7 @@ pub extern "C" fn produce_store_share_response_message(
     match crate::primitives::sharing::response::produce(
         ChannelId(channel_id),
         &request,
-        &shared_key,
+        &crate::types::ChannelKey::new(epoch, shared_key),
     ) {
         Ok(r) => ProduceStoreShareResponseMessageResult {
             error: success(),

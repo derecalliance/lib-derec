@@ -35,6 +35,7 @@ func main() {
 	runOwnerKeepVersionAcrossMissedRound()
 	runInvalidKeepVersionFailsRound()
 	runRecoverRestoreRepublish()
+	runKeyRotation()
 	runPairingBelowThresholdPublishesNothing()
 	runUnpairRepublishes()
 	runReplicaRemovalPublishesTheRoster()

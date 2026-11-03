@@ -94,6 +94,10 @@
         {
           "name": "StaleResponse",
           "wire": "StaleResponse"
+        },
+        {
+          "name": "KeyUnavailable",
+          "wire": "KeyUnavailable"
         }
       ]
     },
@@ -380,6 +384,10 @@
         {
           "name": "PairingContact",
           "wire": 2
+        },
+        {
+          "name": "KeyRing",
+          "wire": 3
         }
       ]
     },

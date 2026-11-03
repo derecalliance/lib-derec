@@ -391,6 +391,37 @@ fn an_expired_helper_pairing_loses_its_channel_key() {
     });
 }
 
+/// The key ring goes with the channel key.
+#[test]
+fn expired_channel_cleanup_removes_its_key_ring() {
+    run_async(async {
+        let (channels, secrets) = (InMemChannelStore::default(), InMemSecretStore::default());
+        let (mut c, mut s) = (channels.clone(), secrets.clone());
+        seed(&mut c, 1, ChannelStatus::Pending, 600).await;
+        s.save(
+            SECRET_ID,
+            ChannelId(1),
+            SecretValue::KeyRing(crate::protocol::KeyRing::fresh(
+                crate::types::SharedKey::new([3u8; 32]),
+            )),
+        )
+        .await
+        .expect("seed ring");
+
+        let mut protocol = build_with_secrets(channels, secrets.clone());
+        protocol
+            .remove_expired_channels(60)
+            .await
+            .expect("sweep succeeds");
+
+        assert!(!secrets.data.lock().unwrap().contains_key(&(
+            SECRET_ID,
+            1,
+            SecretKind::KeyRing as u8
+        )));
+    });
+}
+
 /// A replica pairing whose only peer expired leaves no channel key.
 #[test]
 fn an_expired_replica_pairing_loses_its_channel_key() {

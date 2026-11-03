@@ -329,7 +329,7 @@ pub(crate) enum Event {
     MessageIgnored {
         channel_id: String,
         /// [`ignore_reason_label`] — `"PendingVerification"`, `"Expired"`,
-        /// `"TimestampMismatch"` or `"StaleResponse"`.
+        /// `"TimestampMismatch"`, `"StaleResponse"` or `"KeyUnavailable"`.
         reason: String,
         trace_id: String,
     },
@@ -446,6 +446,13 @@ pub struct ReplicasWire {
     /// to rebuild replica channel state.
     #[serde(with = "serde_bytes")]
     pub shared_key: Vec<u8>,
+    /// The epoch of `shared_key` on the group channel, omitted when `0`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub key_epoch: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// One advertised endpoint, carrying its protocol by name (`"https"`,
@@ -479,6 +486,11 @@ pub struct Helper {
     /// The Helper's subshare count from the roster. Always present; passing
     /// this object back to `restore` writes it into the Helper's channel.
     pub weight: u32,
+    /// The epoch of `shared_key` on the Helper's channel, omitted when `0`.
+    /// Passing this object back to `restore` rebuilds the channel's key ring
+    /// at it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub key_epoch: u32,
 }
 
 #[derive(Serialize)]
@@ -515,6 +527,7 @@ impl From<Secret> for SecretWire {
                 .into_iter()
                 .map(|h| Helper {
                     weight: h.effective_weight(),
+                    key_epoch: h.key_epoch,
                     channel_id: h.channel_id.to_string(),
                     transports: h.transports.into_iter().map(Into::into).collect(),
                     shared_key: h.shared_key,
@@ -545,6 +558,7 @@ impl From<Secret> for SecretWire {
                     })
                     .collect(),
                 shared_key: g.shared_key,
+                key_epoch: g.key_epoch,
             }),
             threshold: v.threshold,
         }
@@ -1116,6 +1130,7 @@ pub(crate) fn ignore_reason_label(reason: crate::protocol::IgnoreReason) -> &'st
         IgnoreReason::Expired => "Expired",
         IgnoreReason::TimestampMismatch => "TimestampMismatch",
         IgnoreReason::StaleResponse => "StaleResponse",
+        IgnoreReason::KeyUnavailable => "KeyUnavailable",
     }
 }
 
@@ -1249,7 +1264,10 @@ mod tests {
                     ..Default::default()
                 }),
             )
-            .sealed_with(&crate::types::SharedKey::new([0; 32])),
+            .sealed_with(&crate::protocol::ChannelKey {
+                epoch: 0,
+                key: crate::types::SharedKey::new([0; 32]),
+            }),
         );
         assert_eq!(json["share_size"], 1234);
         assert_eq!(json["version"], 3);
@@ -1269,7 +1287,10 @@ mod tests {
                     ..Default::default()
                 }),
             )
-            .sealed_with(&crate::types::SharedKey::new([0; 32])),
+            .sealed_with(&crate::protocol::ChannelKey {
+                epoch: 0,
+                key: crate::types::SharedKey::new([0; 32]),
+            }),
         );
         assert_eq!(json["share_secret_id"], "42");
         assert_eq!(json["version"], 5);
@@ -1287,6 +1308,7 @@ mod tests {
             shared_key: vec![0; 32],
             communication_info: HashMap::new(),
             weight,
+            key_epoch: 0,
         };
         let wire = SecretWire::from(Secret {
             helpers: vec![helper(1, 3), helper(2, 0)],
@@ -1380,7 +1402,10 @@ mod tests {
                     ..Default::default()
                 }),
             )
-            .sealed_with(&crate::types::SharedKey::new([0; 32])),
+            .sealed_with(&crate::protocol::ChannelKey {
+                epoch: 0,
+                key: crate::types::SharedKey::new([0; 32]),
+            }),
         );
         assert_eq!(json["unpair_memo"], "moving devices");
     }
@@ -1405,7 +1430,10 @@ mod tests {
                     ..Default::default()
                 }),
             )
-            .sealed_with(&crate::types::SharedKey::new([0; 32])),
+            .sealed_with(&crate::protocol::ChannelKey {
+                epoch: 0,
+                key: crate::types::SharedKey::new([0; 32]),
+            }),
         );
         assert_eq!(json["updated_communication_info"]["name"], "Alice");
         assert_eq!(
@@ -1428,7 +1456,10 @@ mod tests {
                     ..Default::default()
                 }),
             )
-            .sealed_with(&crate::types::SharedKey::new([0; 32])),
+            .sealed_with(&crate::protocol::ChannelKey {
+                epoch: 0,
+                key: crate::types::SharedKey::new([0; 32]),
+            }),
         );
         assert!(json.get("updated_communication_info").is_none());
     }
@@ -1687,7 +1718,10 @@ mod tests {
             },
             crate::protocol::FailedRequest::Undecodable,
         )
-        .sealed_with(&crate::types::SharedKey::new([0; 32]));
+        .sealed_with(&crate::protocol::ChannelKey {
+            epoch: 0,
+            key: crate::types::SharedKey::new([0; 32]),
+        });
         let expected_bytes = pending_action_wire::serialize(action.clone()).expect("serializes");
         let mapped = Event::from_event(DeRecEvent::RequestFailed {
             channel_id: ChannelId(u64::MAX),

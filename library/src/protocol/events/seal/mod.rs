@@ -18,6 +18,7 @@
 //! fields.
 
 use super::{ChannelRequest, FailedRequest, ReplyTarget};
+use crate::protocol::ChannelKey;
 use crate::types::{ChannelId, SharedKey};
 use hmac::{Hmac, KeyInit, Mac};
 use prost::Message;
@@ -33,7 +34,7 @@ const SEAL_KEY_LABEL: &[u8] = b"derec pending action seal v1";
 /// The length of a seal, in bytes.
 pub(crate) const SEAL_LEN: usize = 32;
 
-/// What a seal covers beyond the channel and trace id: the request a
+/// What a seal covers beyond the channel, trace id and epoch: the request a
 /// channel answers, or the failed request a reply channel answers.
 pub(crate) enum Sealed<'a> {
     Request(&'a ChannelRequest),
@@ -49,8 +50,9 @@ pub(crate) struct Seal([u8; SEAL_LEN]);
 
 impl Seal {
     /// Seal `sealed`, raised on `channel_id` with `trace_id`, under `key`.
+    /// The seal covers `key.epoch`, the epoch the action is answered under.
     pub(crate) fn new(
-        key: &SharedKey,
+        key: &ChannelKey,
         channel_id: ChannelId,
         trace_id: u64,
         sealed: Sealed<'_>,
@@ -61,11 +63,11 @@ impl Seal {
         Self(tag.into())
     }
 
-    /// Whether this seal is the one `key` gives `sealed`. Compared in
-    /// constant time.
+    /// Whether this seal is the one `key` gives `sealed` at `key.epoch`.
+    /// Compared in constant time.
     pub(crate) fn verifies(
         &self,
-        key: &SharedKey,
+        key: &ChannelKey,
         channel_id: ChannelId,
         trace_id: u64,
         sealed: Sealed<'_>,
@@ -91,11 +93,12 @@ impl Seal {
 /// The MAC over `sealed`, fed with an encoding in which every field but the
 /// last has a fixed length or a length prefix, so two different actions
 /// never encode alike.
-fn mac(key: &SharedKey, channel_id: ChannelId, trace_id: u64, sealed: Sealed<'_>) -> HmacSha256 {
-    let mut mac =
-        HmacSha256::new_from_slice(&seal_key(key)[..]).expect("HMAC accepts a key of any length");
+fn mac(key: &ChannelKey, channel_id: ChannelId, trace_id: u64, sealed: Sealed<'_>) -> HmacSha256 {
+    let mut mac = HmacSha256::new_from_slice(&seal_key(&key.key)[..])
+        .expect("HMAC accepts a key of any length");
     mac.update(&channel_id.0.to_be_bytes());
     mac.update(&trace_id.to_be_bytes());
+    mac.update(&key.epoch.to_be_bytes());
     match sealed {
         Sealed::Request(request) => {
             mac.update(&[request_tag(request)]);

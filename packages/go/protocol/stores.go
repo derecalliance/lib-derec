@@ -118,6 +118,7 @@ const (
 	SecretKindSharedKey      = native.SecretKindSharedKey
 	SecretKindPairingSecret  = native.SecretKindPairingSecret
 	SecretKindPairingContact = native.SecretKindPairingContact
+	SecretKindKeyRing        = native.SecretKindKeyRing
 
 	StateKindPendingVerification     = native.StateKindPendingVerification
 	StateKindPendingRecovery         = native.StateKindPendingRecovery

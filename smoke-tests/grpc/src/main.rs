@@ -18,17 +18,18 @@ mod transport;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use derec_library::protocol::types::{
-    ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember, Target,
-    UserSecret, UserSecrets,
+    ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember, Secret,
+    Target, UserSecret, UserSecrets,
 };
 use derec_library::protocol::{
     ChannelStoreFuture, DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol,
     DeRecProtocolBuilder, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecUserSecretStore,
-    MissingPolicy, SecretKind, SecretStoreError, SecretStoreFuture, SecretValue, Share,
-    ShareStoreFuture, StateItem, StateKey, StateKind, StateStoreFuture,
+    IgnoreReason, MissingPolicy, SecretKind, SecretStoreError, SecretStoreFuture, SecretValue,
+    Share, ShareStoreFuture, StateItem, StateKey, StateKind, StateStoreFuture,
 };
 use derec_library::transport::TransportProtocol;
 use derec_library::types::ChannelId;
@@ -53,6 +54,7 @@ const SECRET_ID: u64 = 0xDE_2EC;
 const PHASE_TIMEOUT: Duration = Duration::from_secs(20);
 
 const OWNER_ADDR: &str = "127.0.0.1:50051";
+const OWNER_HTTPS_OFFER: &str = "https://owner.example.com/derec";
 const HELPER_A_ADDR: &str = "127.0.0.1:50052";
 const HELPER_B_ADDR: &str = "127.0.0.1:50053";
 
@@ -281,6 +283,7 @@ impl DeRecSecretStore for InMemorySecretStore {
             SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
             SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
             SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
+            SecretValue::KeyRing(_) => SecretKind::KeyRing as u8,
         };
         self.data.insert((secret_id, channel_id.0, kind), value);
         Box::pin(std::future::ready(Ok(())))
@@ -312,6 +315,7 @@ fn clone_secret_value(v: &SecretValue) -> SecretValue {
         SecretValue::SharedKey(k) => SecretValue::SharedKey(k.clone()),
         SecretValue::PairingSecret(p) => SecretValue::PairingSecret(p.clone()),
         SecretValue::PairingContact(c) => SecretValue::PairingContact(c.clone()),
+        SecretValue::KeyRing(r) => SecretValue::KeyRing(r.clone()),
     }
 }
 
@@ -526,6 +530,8 @@ type TaggedEvent = (&'static str, DeRecEvent);
 /// envelope was accepted, not that it was acted upon.
 struct InboundService {
     inbox: mpsc::UnboundedSender<Vec<u8>>,
+    last_inbound: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    received: Arc<AtomicUsize>,
 }
 
 #[tonic::async_trait]
@@ -534,9 +540,14 @@ impl GrpcDelivery for InboundService {
         &self,
         request: tonic::Request<derec_proto::DeRecMessage>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        let envelope = request.into_inner();
+        let envelope = request.into_inner().encode_to_vec();
+        *self
+            .last_inbound
+            .lock()
+            .expect("last inbound lock poisoned") = Some(envelope.clone());
+        self.received.fetch_add(1, Ordering::SeqCst);
         self.inbox
-            .send(envelope.encode_to_vec())
+            .send(envelope)
             .map_err(|_| tonic::Status::unavailable("node is shutting down"))?;
         Ok(tonic::Response::new(()))
     }
@@ -546,6 +557,10 @@ struct Node {
     label: &'static str,
     uri: String,
     protocol: Arc<Mutex<GrpcProtocol>>,
+    /// The envelope this node's server received last, as it arrived.
+    last_inbound: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    /// How many envelopes this node's server has received.
+    received: Arc<AtomicUsize>,
 }
 
 impl Node {
@@ -565,41 +580,18 @@ impl Node {
         threshold: usize,
         events: mpsc::UnboundedSender<TaggedEvent>,
         unserved_https_offer: Option<&str>,
+        key_rotation: bool,
     ) -> Self {
         let uri = format!("grpc://{addr}");
-        let served = TransportProtocol::new(uri.clone(), derec_proto::Protocol::Grpc);
-
-        // `with_unsafe_connection(true)` is mandatory here, loopback or not.
-        // `TransportPolicy::check_own` exempts a node's *own* loopback
-        // endpoint from the plaintext ban, but `check_peer` has no such
-        // exemption — and each node receives the other's `grpc://127.0.0.1:…`
-        // as a peer endpoint during pairing. Without the opt-in, pairing
-        // fails with `PlaintextRefused`.
-        let builder = DeRecProtocolBuilder::new(SECRET_ID)
-            .with_channel_store(InMemoryChannelStore::default())
-            .with_share_store(InMemoryShareStore::default())
-            .with_secret_store(InMemorySecretStore::default())
-            .with_user_secret_store(InMemoryUserSecretStore::default())
-            .with_state_store(InMemoryStateStore::default())
-            .with_transport(GrpcTransport);
-
-        let builder = match unserved_https_offer {
-            Some(https_uri) => builder.with_own_transports([
-                TransportProtocol::new(https_uri.to_owned(), derec_proto::Protocol::Https),
-                served,
-            ]),
-            None => builder.with_own_transports([served]),
-        };
-
-        let protocol = builder
-            .with_threshold(threshold)
-            .with_unsafe_connection(true)
-            .build()
-            .unwrap_or_else(|e| panic!("[{label}] builder.build() failed: {e}"));
+        let protocol = build_protocol(label, &uri, threshold, unserved_https_offer, key_rotation);
 
         let protocol = Arc::new(Mutex::new(protocol));
         let (inbox_tx, inbox_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let last_inbound = Arc::new(std::sync::Mutex::new(None));
 
+        let received = Arc::new(AtomicUsize::new(0));
+        let server_last_inbound = last_inbound.clone();
+        let server_received = received.clone();
         let socket = addr
             .parse()
             .unwrap_or_else(|e| panic!("[{label}] bad listen address {addr}: {e}"));
@@ -607,6 +599,8 @@ impl Node {
             tonic::transport::Server::builder()
                 .add_service(DeRecTransportServer::new(InboundService {
                     inbox: inbox_tx,
+                    last_inbound: server_last_inbound,
+                    received: server_received,
                 }))
                 .serve(socket)
                 .await
@@ -622,8 +616,50 @@ impl Node {
             label,
             uri,
             protocol,
+            last_inbound,
+            received,
         }
     }
+}
+
+/// Build the protocol instance a node at `uri` runs, over fresh in-memory
+/// stores.
+fn build_protocol(
+    label: &str,
+    uri: &str,
+    threshold: usize,
+    unserved_https_offer: Option<&str>,
+    key_rotation: bool,
+) -> GrpcProtocol {
+    let served = TransportProtocol::new(uri.to_owned(), derec_proto::Protocol::Grpc);
+    // `with_unsafe_connection(true)` is mandatory here, loopback or not.
+    // `TransportPolicy::check_own` exempts a node's *own* loopback
+    // endpoint from the plaintext ban, but `check_peer` has no such
+    // exemption — and each node receives the other's `grpc://127.0.0.1:…`
+    // as a peer endpoint during pairing. Without the opt-in, pairing
+    // fails with `PlaintextRefused`.
+    let builder = DeRecProtocolBuilder::new(SECRET_ID)
+        .with_channel_store(InMemoryChannelStore::default())
+        .with_share_store(InMemoryShareStore::default())
+        .with_secret_store(InMemorySecretStore::default())
+        .with_user_secret_store(InMemoryUserSecretStore::default())
+        .with_state_store(InMemoryStateStore::default())
+        .with_transport(GrpcTransport);
+
+    let builder = match unserved_https_offer {
+        Some(https_uri) => builder.with_own_transports([
+            TransportProtocol::new(https_uri.to_owned(), derec_proto::Protocol::Https),
+            served,
+        ]),
+        None => builder.with_own_transports([served]),
+    };
+
+    builder
+        .with_threshold(threshold)
+        .with_unsafe_connection(true)
+        .with_key_rotation(key_rotation)
+        .build()
+        .unwrap_or_else(|e| panic!("[{label}] builder.build() failed: {e}"))
 }
 
 /// Poll the listener until it accepts a connection, so the first protocol
@@ -785,26 +821,48 @@ async fn main() {
     // helpers pair against it successfully anyway, over gRPC — proof that
     // selection is driven by each helper's own served-transport preference,
     // not by the order the owner listed its offers in.
+    //
+    // The owner rotates keys: each sharing round moves both helper channels
+    // to the next key epoch.
     let owner = Node::start(
         "owner",
         OWNER_ADDR,
         THRESHOLD,
         tx.clone(),
-        Some("https://owner.example.com/derec"),
+        Some(OWNER_HTTPS_OFFER),
+        true,
     )
     .await;
-    let helper_a = Node::start("helper-a", HELPER_A_ADDR, THRESHOLD, tx.clone(), None).await;
-    let helper_b = Node::start("helper-b", HELPER_B_ADDR, THRESHOLD, tx, None).await;
+    let helper_a = Node::start(
+        "helper-a",
+        HELPER_A_ADDR,
+        THRESHOLD,
+        tx.clone(),
+        None,
+        false,
+    )
+    .await;
+    let helper_b = Node::start("helper-b", HELPER_B_ADDR, THRESHOLD, tx, None, false).await;
 
     let channel_a = pair(&owner, &helper_a, ChannelId(1), &mut bus).await;
     let channel_b = pair(&owner, &helper_b, ChannelId(2), &mut bus).await;
+    let channels = [(channel_a, &helper_a), (channel_b, &helper_b)];
+    assert_eq!(protect_secret(&owner, &mut bus).await, 1);
     let version = protect_secret(&owner, &mut bus).await;
+    assert_eq!(version, 2);
+    assert_key_epochs(&owner, &channels, 2).await;
     verify_shares(&owner, &mut bus, version).await;
+    key_unavailable(&owner, &helper_a, channel_a).await;
+    let recovered = recover_secret(&owner, &mut bus, version).await;
+    restore_on_a_fresh_device(&owner, &recovered, version).await;
+    assert_eq!(protect_secret(&owner, &mut bus).await, 3);
+    assert_key_epochs(&owner, &channels, 3).await;
 
     println!("── All gRPC transport phases passed ────────────────────────");
     println!(
         "{} paired with {} on {channel_a:?} and {} on {channel_b:?}; \
-         share v{version} stored and verified on both",
+         share v{version} stored and verified on both at key epoch 2; \
+         a fresh device restored from it published v3 at key epoch 3",
         owner.uri, helper_a.uri, helper_b.uri
     );
 }
@@ -1023,4 +1081,143 @@ async fn verify_shares(owner: &Node, bus: &mut Bus, version: u32) {
 
     println!("[verify] both helpers proved possession of v{version} ✓");
     bus.reset();
+}
+
+/// The epoch of the key ring `node` stores for `channel_id`, read from its
+/// own secret store.
+async fn stored_key_epoch(node: &Node, channel_id: ChannelId) -> u32 {
+    let protocol = node.protocol.lock().await;
+    match protocol
+        .secret_store
+        .load(SECRET_ID, channel_id, SecretKind::KeyRing)
+        .await
+        .unwrap_or_else(|e| panic!("[{}] key ring load failed: {e}", node.label))
+    {
+        Some(SecretValue::KeyRing(ring)) => ring.epoch(),
+        _ => panic!(
+            "[{}] channel {channel_id:?} must store a KeyRing",
+            node.label
+        ),
+    }
+}
+
+/// Key rotation: the owner and each helper store `epoch` as the newest key
+/// epoch of their channel.
+async fn assert_key_epochs(owner: &Node, channels: &[(ChannelId, &Node)], epoch: u32) {
+    for (channel_id, helper) in channels {
+        assert_eq!(stored_key_epoch(owner, *channel_id).await, epoch);
+        assert_eq!(stored_key_epoch(helper, *channel_id).await, epoch);
+    }
+    println!("[rotation] owner and both helpers store KeyRing epoch {epoch} ✓");
+}
+
+/// An envelope whose `sequence` names an epoch past the forward-jump limit
+/// has no usable key: the helper ignores it as `KeyUnavailable`, answers
+/// nothing, and its ring does not move.
+async fn key_unavailable(owner: &Node, helper: &Node, channel_id: ChannelId) {
+    let challenge = helper
+        .last_inbound
+        .lock()
+        .expect("last inbound lock poisoned")
+        .clone()
+        .expect("the helper received the verification challenge");
+    let mut forged =
+        derec_proto::DeRecMessage::decode(challenge.as_slice()).expect("an envelope decodes");
+    assert_eq!(forged.sequence, 2, "the challenge is under K2");
+    forged.sequence = 2 + 513;
+
+    // A send completes only once the receiving server has accepted the
+    // envelope, so anything `process` sends has reached the owner by the time
+    // it returns.
+    let received_before = owner.received.load(Ordering::SeqCst);
+    let events = helper
+        .protocol
+        .lock()
+        .await
+        .process(&forged.encode_to_vec())
+        .await
+        .expect("an unusable epoch is not an error");
+    assert!(
+        matches!(
+            events.as_slice(),
+            [DeRecEvent::MessageIgnored {
+                channel_id: c,
+                reason: IgnoreReason::KeyUnavailable,
+                ..
+            }] if *c == channel_id
+        ),
+        "a sequence past the forward-jump limit must be MessageIgnored(KeyUnavailable), got {events:?}"
+    );
+    assert_eq!(
+        owner.received.load(Ordering::SeqCst),
+        received_before,
+        "a message with no usable key must not be answered"
+    );
+    assert_eq!(stored_key_epoch(helper, channel_id).await, 2);
+    println!(
+        "[rotation] sequence 515 at {} → MessageIgnored(KeyUnavailable), nothing sent, ring unchanged ✓",
+        helper.label
+    );
+}
+
+/// Recovery: the owner collects the shares of `version` back from both
+/// helpers. The recovered roster names each helper channel's key epoch.
+async fn recover_secret(owner: &Node, bus: &mut Bus, version: u32) -> Secret {
+    owner
+        .protocol
+        .lock()
+        .await
+        .start(DeRecFlow::RecoverSecret {
+            secret_id: SECRET_ID,
+            version,
+        })
+        .await
+        .expect("owner start(RecoverSecret) failed");
+    let recovered = bus
+        .wait_for("SecretRecovered", 1, |e| {
+            matches!(e, DeRecEvent::SecretRecovered { .. })
+        })
+        .await
+        .iter()
+        .find_map(|(_, e)| match e {
+            DeRecEvent::SecretRecovered { secret } => Some(secret.clone()),
+            _ => None,
+        })
+        .expect("SecretRecovered carries the secret");
+    assert_eq!(recovered.helpers.len(), 2);
+    assert!(
+        recovered.helpers.iter().all(|h| h.key_epoch == 2),
+        "the roster names key epoch 2 for both helpers"
+    );
+    println!("[recover] owner recovered v{version}; the roster names key epoch 2 ✓");
+    bus.reset();
+    recovered
+}
+
+/// A fresh device, with empty stores, restores the recovered secret and takes
+/// over the owner's endpoint. Restore rebuilds each helper channel's key ring
+/// at the epoch the roster names.
+async fn restore_on_a_fresh_device(owner: &Node, recovered: &Secret, version: u32) {
+    let mut device = build_protocol(
+        "device",
+        &owner.uri,
+        THRESHOLD,
+        Some(OWNER_HTTPS_OFFER),
+        true,
+    );
+    device
+        .restore(recovered, version)
+        .await
+        .expect("restore on a fresh device must succeed");
+    *owner.protocol.lock().await = device;
+    for helper in &recovered.helpers {
+        assert_eq!(
+            stored_key_epoch(owner, ChannelId(helper.channel_id)).await,
+            2
+        );
+    }
+    println!(
+        "[restore] a fresh device restored v{version} at key epoch 2 on {} ✓",
+        owner.uri
+    );
 }

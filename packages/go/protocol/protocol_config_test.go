@@ -76,6 +76,7 @@ func TestDeRecProtocolConfig_FullFixtureSetsEveryField(t *testing.T) {
 			Unpair:      true,
 		},
 		AutoRespondOnFailure: proto.Bool(true),
+		KeyRotation:          proto.Bool(true),
 		AutoReplyTo:          proto.Bool(true),
 		UnpairAck:            ptr(UnpairAckNotRequired),
 		UnsafeConnection:     proto.Bool(false),
@@ -338,3 +339,22 @@ func TestNew_ValidatesTheLayeredConfig(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// key_rotation travels as a plain boolean: written only when set, and read
+// back as it was written.
+func TestDeRecProtocolConfig_KeyRotationRoundTrips(t *testing.T) {
+	written, err := json.Marshal(DeRecProtocolConfig{KeyRotation: proto.Bool(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(written) != `{"key_rotation":true}` {
+		t.Fatalf("got %s", written)
+	}
+	cfg := unmarshalConfig(t, string(written), `{"key_rotation": false}`)
+	if cfg.KeyRotation == nil || *cfg.KeyRotation {
+		t.Fatalf("a later layer's false must win, got %v", cfg.KeyRotation)
+	}
+	if empty := unmarshalConfig(t, `{}`); empty.KeyRotation != nil {
+		t.Fatalf("an absent key is unset, got %v", empty.KeyRotation)
+	}
+}

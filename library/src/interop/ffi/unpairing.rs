@@ -67,6 +67,9 @@ pub extern "C" fn produce_unpair_request_message(
     memo_len: usize,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
     // See `produce_store_share_request_message` in `sharing.rs` for the
     // `reply_to` semantics — `reply_to_len == 0` means "no override".
     reply_to_ptr: *const u8,
@@ -103,7 +106,7 @@ pub extern "C" fn produce_unpair_request_message(
     match crate::primitives::unpairing::request::produce(
         channel_id.into(),
         memo,
-        &shared_key,
+        &crate::types::ChannelKey::new(epoch, shared_key),
         &reply_to,
         // Helper path. Replica-group removal is orchestrated through the
         // `UnpairReplica` flow, which names the departing member itself.
@@ -184,6 +187,9 @@ pub extern "C" fn produce_unpair_response_message(
     channel_id: u64,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
 ) -> ProduceUnpairResponseMessageResult {
     let with_err = |error| ProduceUnpairResponseMessageResult {
         error,
@@ -195,7 +201,10 @@ pub extern "C" fn produce_unpair_response_message(
         Err(e) => return with_err(e),
     };
 
-    match crate::primitives::unpairing::response::produce(channel_id.into(), &shared_key) {
+    match crate::primitives::unpairing::response::produce(
+        channel_id.into(),
+        &crate::types::ChannelKey::new(epoch, shared_key),
+    ) {
         Ok(r) => ProduceUnpairResponseMessageResult {
             error: success(),
             response_wire_bytes: vec_into_buffer(r.envelope),

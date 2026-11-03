@@ -37,6 +37,7 @@ internal static class Primitives
         RunUnpairingFlowTest();
         RunUnpairingNonAsciiMemoTest();
         RunEnvelopeAndReplyToTest();
+        RunRotatedChannelPrimitivesTest();
     }
 
     private static void RunProtocolVersionTest()
@@ -804,7 +805,7 @@ internal static class Primitives
 
             DeRecMessage requestEnvelope = Sharing.Request.Produce(
                 channel, version, secretId, shareBytes,
-                0u, string.Empty, sharedKeys[channel]
+                0u, string.Empty, sharedKeys[channel], 0u
             );
 
             // Helper side: extract then produce response
@@ -813,7 +814,8 @@ internal static class Primitives
             var storeResponse = Sharing.Response.Produce(
                 channel,
                 extractedRequest.RequestProtoBytes,
-                sharedKeys[channel]
+                sharedKeys[channel],
+                0u
             );
 
             if (storeResponse.CommittedShareBytes.Length == 0)
@@ -842,7 +844,7 @@ internal static class Primitives
         {
             Sharing.Request.Produce(
                 firstChannel, version, secretId, shares[firstChannel],
-                0u, string.Empty, shortKey);
+                0u, string.Empty, shortKey, 0u);
         }
         catch (DeRecException e)
         {
@@ -855,7 +857,7 @@ internal static class Primitives
         int responseCode = -1;
         try
         {
-            Sharing.Response.Produce(firstChannel, Array.Empty<byte>(), shortKey);
+            Sharing.Response.Produce(firstChannel, Array.Empty<byte>(), shortKey, 0u);
         }
         catch (DeRecException e)
         {
@@ -934,16 +936,16 @@ internal static class Primitives
 
         // Helper's stored share is the *extracted* inner StoreShareRequestMessage
         DeRecMessage storeEnv1 = Sharing.Request.Produce(
-            channel1, version, secretId, shares[channel1], 0u, string.Empty, sharedKey1
+            channel1, version, secretId, shares[channel1], 0u, string.Empty, sharedKey1, 0u
         );
         DeRecMessage storeEnv2 = Sharing.Request.Produce(
-            channel2, version, secretId, shares[channel2], 0u, string.Empty, sharedKey1
+            channel2, version, secretId, shares[channel2], 0u, string.Empty, sharedKey1, 0u
         );
         byte[] storedShare1 = Sharing.Request.Extract(storeEnv1, sharedKey1).RequestProtoBytes;
         byte[] storedShare2 = Sharing.Request.Extract(storeEnv2, sharedKey1).RequestProtoBytes;
 
         // Owner side: produce request
-        DeRecMessage requestEnvelope = Verification.Request.Produce(channel1, secretId, version, sharedKey1);
+        DeRecMessage requestEnvelope = Verification.Request.Produce(channel1, secretId, version, sharedKey1, 0u);
 
         // Helper side: extract request, then produce response
         var req = Verification.Request.Extract(requestEnvelope, sharedKey1);
@@ -951,7 +953,7 @@ internal static class Primitives
             throw new InvalidOperationException("Verification test failed: channel_id mismatch.");
 
         DeRecMessage responseEnvelope = Verification.Response.Produce(
-            channel1, req.RequestProtoBytes, sharedKey1, storedShare1
+            channel1, req.RequestProtoBytes, sharedKey1, 0u, storedShare1
         );
 
         // Owner side: extract response, then process against correct share (valid) and wrong share (invalid)
@@ -999,23 +1001,23 @@ internal static class Primitives
 
         // Helper-side persisted store-share inner request bytes
         byte[] storedShare1 = Sharing.Request.Extract(
-            Sharing.Request.Produce(channel1, version, secretId, shares[channel1], 0u, string.Empty, sharedKey1),
+            Sharing.Request.Produce(channel1, version, secretId, shares[channel1], 0u, string.Empty, sharedKey1, 0u),
             sharedKey1
         ).RequestProtoBytes;
         byte[] storedShare2 = Sharing.Request.Extract(
-            Sharing.Request.Produce(channel2, version, secretId, shares[channel2], 0u, string.Empty, sharedKey2),
+            Sharing.Request.Produce(channel2, version, secretId, shares[channel2], 0u, string.Empty, sharedKey2, 0u),
             sharedKey2
         ).RequestProtoBytes;
 
         // Helper 1
-        DeRecMessage shareRequest1 = Recovery.Request.Produce(channel1, secretId, version, sharedKey1);
+        DeRecMessage shareRequest1 = Recovery.Request.Produce(channel1, secretId, version, sharedKey1, 0u);
         byte[] extractedReq1 = Recovery.Request.Extract(shareRequest1, sharedKey1).RequestProtoBytes;
-        DeRecMessage shareResponse1 = Recovery.Response.Produce(channel1, extractedReq1, storedShare1, sharedKey1);
+        DeRecMessage shareResponse1 = Recovery.Response.Produce(channel1, extractedReq1, storedShare1, sharedKey1, 0u);
 
         // Helper 2
-        DeRecMessage shareRequest2 = Recovery.Request.Produce(channel2, secretId, version, sharedKey2);
+        DeRecMessage shareRequest2 = Recovery.Request.Produce(channel2, secretId, version, sharedKey2, 0u);
         byte[] extractedReq2 = Recovery.Request.Extract(shareRequest2, sharedKey2).RequestProtoBytes;
-        DeRecMessage shareResponse2 = Recovery.Response.Produce(channel2, extractedReq2, storedShare2, sharedKey2);
+        DeRecMessage shareResponse2 = Recovery.Response.Produce(channel2, extractedReq2, storedShare2, sharedKey2, 0u);
 
         // Owner side: extract both responses
         byte[] extractedResp1 = Recovery.Response.Extract(shareResponse1, sharedKey1).ResponseProtoBytes;
@@ -1041,7 +1043,7 @@ internal static class Primitives
         byte[] sharedKey = Make32(0x11);
 
         // Owner side: produce request
-        DeRecMessage requestEnvelope = Discovery.Request.Produce(channelId, sharedKey);
+        DeRecMessage requestEnvelope = Discovery.Request.Produce(channelId, sharedKey, 0u);
 
         // Helper side: extract request
         var extractedRequest = Discovery.Request.Extract(requestEnvelope, sharedKey);
@@ -1070,7 +1072,7 @@ internal static class Primitives
             },
         };
 
-        DeRecMessage responseEnvelope = Discovery.Response.Produce(channelId, secretList, sharedKey);
+        DeRecMessage responseEnvelope = Discovery.Response.Produce(channelId, secretList, sharedKey, 0u);
 
         // Owner side: extract response, then process
         var extractedResponse = Discovery.Response.Extract(responseEnvelope, sharedKey);
@@ -1101,7 +1103,7 @@ internal static class Primitives
         byte[] sharedKey = Make32(0x23);
         const string Memo = "adiós — ✓";
 
-        var extracted = Unpairing.Request.Extract(Unpairing.Request.Produce(7, Memo, sharedKey), sharedKey);
+        var extracted = Unpairing.Request.Extract(Unpairing.Request.Produce(7, Memo, sharedKey, 0u), sharedKey);
         if (extracted.Memo != Memo)
             throw new InvalidOperationException($"non-ASCII memo must round-trip unchanged; got '{extracted.Memo}'");
 
@@ -1117,7 +1119,7 @@ internal static class Primitives
         const string Memo = "goodbye";
 
         // Initiator side: produce request
-        DeRecMessage requestEnvelope = Unpairing.Request.Produce(channelId, Memo, sharedKey);
+        DeRecMessage requestEnvelope = Unpairing.Request.Produce(channelId, Memo, sharedKey, 0u);
 
         // Responder side: extract request
         var extractedRequest = Unpairing.Request.Extract(requestEnvelope, sharedKey);
@@ -1127,7 +1129,7 @@ internal static class Primitives
             throw new InvalidOperationException($"Unpairing test failed: memo mismatch (got '{extractedRequest.Memo}').");
 
         // Responder side: produce ack response
-        DeRecMessage responseEnvelope = Unpairing.Response.Produce(channelId, sharedKey);
+        DeRecMessage responseEnvelope = Unpairing.Response.Produce(channelId, sharedKey, 0u);
 
         // Initiator side: extract response then process
         var extractedResponse = Unpairing.Response.Extract(responseEnvelope, sharedKey);
@@ -1164,7 +1166,7 @@ internal static class Primitives
         var replyTo = new[] { new TransportProtocol("https://replica.example.com") };
 
         // Primitive produce defaults to trace_id = 0 and reply_to = null.
-        DeRecMessage envWithout = Discovery.Request.Produce(channelId, sharedKey);
+        DeRecMessage envWithout = Discovery.Request.Produce(channelId, sharedKey, 0u);
         if (Envelope.ReadTraceId(envWithout) != 0)
             throw new InvalidOperationException(
                 "Envelope test failed: primitive-default trace_id must be 0.");
@@ -1173,7 +1175,7 @@ internal static class Primitives
         // The encrypted inner now carries the TransportProtocol; verify the
         // call accepts replyTo without throwing and the resulting envelope
         // still extracts cleanly via the channel's shared key.
-        DeRecMessage envWith = Discovery.Request.Produce(channelId, sharedKey, replyTo);
+        DeRecMessage envWith = Discovery.Request.Produce(channelId, sharedKey, 0u, replyTo);
 
         // Round-trip a trace_id over the envelope with replyTo set.
         const ulong token = 0xDEADBEEF_F00DCAFEUL;
@@ -1190,6 +1192,74 @@ internal static class Primitives
                 "Envelope test failed: channel_id mismatch on extract after ApplyTraceId.");
 
         Console.WriteLine("Envelope + replyTo helpers test passed.");
+    }
+
+    private static int DeriveCode(byte[] key, uint epoch, uint toEpoch)
+    {
+        try
+        {
+            ChannelKey.Derive(key, epoch, toEpoch);
+            return -1;
+        }
+        catch (DeRecException e)
+        {
+            return e.Code;
+        }
+    }
+
+    private static void RunRotatedChannelPrimitivesTest()
+    {
+        Console.WriteLine("=== Primitives on a rotated channel test ===");
+
+        ulong channelId = 42;
+        ulong secretId = 7;
+        uint version = 1;
+        byte[] k0 = Make32(0x09);
+
+        byte[] k3 = ChannelKey.Derive(k0, 0, 3);
+        if (k3.Length != 32 || k3.AsSpan().SequenceEqual(k0))
+            throw new InvalidOperationException(
+                "Rotated channel test failed: derived key must be 32 bytes and differ from the epoch-0 key.");
+
+        DeRecMessage envelope = Verification.Request.Produce(channelId, secretId, version, k3, 3u);
+        uint sequence = Envelope.ReadSequence(envelope);
+        if (sequence != 3)
+            throw new InvalidOperationException(
+                $"Rotated channel test failed: envelope sequence must be 3, got {sequence}.");
+
+        byte[] receiverKey = ChannelKey.Derive(k0, 0, sequence);
+        if (!receiverKey.AsSpan().SequenceEqual(k3))
+            throw new InvalidOperationException(
+                "Rotated channel test failed: receiver-derived key must equal the sender's key at epoch 3.");
+        var extracted = Verification.Request.Extract(envelope, receiverKey);
+        if (extracted.ChannelId != channelId)
+            throw new InvalidOperationException(
+                "Rotated channel test failed: channel_id mismatch on extract with the derived key.");
+
+        bool extractedWithK0 = true;
+        try
+        {
+            Verification.Request.Extract(envelope, k0);
+        }
+        catch (DeRecException)
+        {
+            extractedWithK0 = false;
+        }
+        if (extractedWithK0)
+            throw new InvalidOperationException(
+                "Rotated channel test failed: Extract with the epoch-0 key must fail on an epoch-3 envelope.");
+
+        int backward = DeriveCode(k3, 3, 2);
+        if (backward != DeRecCode.InvalidInput)
+            throw new InvalidOperationException(
+                $"Rotated channel test failed: backward derive must be refused as InvalidInput, got {backward}.");
+        int tooFar = DeriveCode(k0, 0, 513);
+        if (tooFar != DeRecCode.InvalidInput)
+            throw new InvalidOperationException(
+                $"Rotated channel test failed: derive beyond 512 steps must be refused as InvalidInput, got {tooFar}.");
+        ChannelKey.Derive(k0, 0, 512);
+
+        Console.WriteLine("Primitives on a rotated channel test passed.  ✓");
     }
 
     private static Dictionary<ulong, byte[]> CreateChannelSharedKeys(ulong[] channelIds)

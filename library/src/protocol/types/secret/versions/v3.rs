@@ -119,6 +119,13 @@ struct HelperJson {
         skip_serializing_if = "Option::is_none"
     )]
     weight: Option<u32>,
+    /// Absent means `0`, the epoch of the key pairing established.
+    #[serde(
+        default,
+        deserialize_with = "de_epoch",
+        skip_serializing_if = "is_zero"
+    )]
+    key_epoch: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -137,6 +144,13 @@ struct ReplicasJson {
     #[serde(with = "base64_bytes")]
     shared_key: Vec<u8>,
     members: Vec<ReplicaInfoJson>,
+    /// Absent means `0`, the epoch of the key pairing established.
+    #[serde(
+        default,
+        deserialize_with = "de_epoch",
+        skip_serializing_if = "is_zero"
+    )]
+    key_epoch: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -184,6 +198,7 @@ impl From<&HelperInfo> for HelperJson {
             shared_key: h.shared_key.clone(),
             communication_info: h.communication_info.clone(),
             weight: Some(h.effective_weight()).filter(|&w| w != 1),
+            key_epoch: h.key_epoch,
         }
     }
 }
@@ -196,6 +211,7 @@ impl From<HelperJson> for HelperInfo {
             shared_key: j.shared_key,
             communication_info: j.communication_info,
             weight: j.weight.unwrap_or(1),
+            key_epoch: j.key_epoch,
         }
     }
 }
@@ -226,6 +242,7 @@ impl From<&Replicas> for ReplicasJson {
             channel_id: r.channel_id,
             shared_key: r.shared_key.clone(),
             members: r.members.iter().map(ReplicaInfoJson::from).collect(),
+            key_epoch: r.key_epoch,
         }
     }
 }
@@ -236,6 +253,7 @@ impl From<ReplicasJson> for Replicas {
             channel_id: j.channel_id,
             shared_key: j.shared_key,
             members: j.members.into_iter().map(ReplicaInfo::from).collect(),
+            key_epoch: j.key_epoch,
         }
     }
 }
@@ -320,6 +338,19 @@ where
     }
 }
 
+/// A `null` epoch reads as absent.
+fn de_epoch<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    Ok(Option::<u32>::deserialize(d)?.unwrap_or_default())
+}
+
+fn is_zero(epoch: &u32) -> bool {
+    *epoch == 0
+}
+
 fn de_map<'de, D>(d: D) -> Result<HashMap<String, String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -342,6 +373,7 @@ mod weight_tests {
             shared_key: vec![1, 2, 3],
             communication_info: HashMap::new(),
             weight,
+            key_epoch: 0,
         }
     }
 
@@ -442,5 +474,59 @@ mod threshold_tests {
                 .expect_err("a threshold below 2 lets one subshare recover the secret");
             assert!(matches!(err, SecretError::Json(_)), "{err:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod key_epoch_tests {
+    use super::*;
+
+    fn secret_with(epoch: u32) -> Secret {
+        Secret {
+            helpers: vec![HelperInfo {
+                channel_id: 2,
+                shared_key: vec![1, 2, 3],
+                weight: 1,
+                key_epoch: epoch,
+                ..Default::default()
+            }],
+            secrets: Vec::new(),
+            replicas: Some(Replicas {
+                members: Vec::new(),
+                shared_key: vec![4, 5, 6],
+                channel_id: 9,
+                key_epoch: epoch,
+            }),
+            threshold: None,
+        }
+    }
+
+    fn json_of(secret: &Secret) -> serde_json::Value {
+        serde_json::from_slice(&gunzip(&encode(secret)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn an_epoch_of_zero_is_omitted() {
+        let json = json_of(&secret_with(0));
+        assert!(json["helpers"][0].get("key_epoch").is_none(), "{json}");
+        assert!(json["replicas"].get("key_epoch").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_key_epoch_round_trips() {
+        let secret = secret_with(16);
+        let json = json_of(&secret);
+        assert_eq!(json["helpers"][0]["key_epoch"], 16);
+        assert_eq!(json["replicas"]["key_epoch"], 16);
+        assert_eq!(decode(&encode(&secret)).unwrap(), secret);
+    }
+
+    #[test]
+    fn an_absent_key_epoch_decodes_as_zero() {
+        let json = r#"{"helpers":[{"channel_id":"2","transports":[],"shared_key":"AQID"}],
+            "replicas":{"channel_id":"9","shared_key":"BAUG","members":[]}}"#;
+        let secret = decode(&gzip(json.as_bytes())).unwrap();
+        assert_eq!(secret.helpers[0].key_epoch, 0);
+        assert_eq!(secret.replicas.unwrap().key_epoch, 0);
     }
 }

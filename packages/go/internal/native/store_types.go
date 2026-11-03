@@ -285,6 +285,9 @@ const (
 	// SecretKindPairingContact is the initiator's ContactMessage, stored
 	// transiently between start and pairing completion.
 	SecretKindPairingContact SecretKind = 2
+	// SecretKindKeyRing is the channel key ring: the current channel key and
+	// epoch plus the older keys the secret versions' pins name.
+	SecretKindKeyRing SecretKind = 3
 )
 
 // SecretValue is the opaque secret payload stored alongside a channel id
@@ -293,6 +296,7 @@ const (
 //   - SharedKey: exactly 32 bytes, the symmetric channel key.
 //   - PairingSecret: opaque PairingKeyMaterial blob.
 //   - PairingContact: a prost-encoded ContactMessage.
+//   - KeyRing: the variable-length key-ring encoding.
 type SecretValue struct {
 	Kind  SecretKind
 	Bytes []byte

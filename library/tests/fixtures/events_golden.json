@@ -26,6 +26,7 @@
             "communication_info": {
               "name": "Helper"
             },
+            "key_epoch": 16,
             "shared_key": [
               17,
               18,
@@ -42,6 +43,7 @@
         ],
         "replicas": {
           "channel_id": "7002",
+          "key_epoch": 3,
           "members": [
             {
               "communication_info": {
@@ -102,6 +104,7 @@
             "communication_info": {
               "name": "Helper"
             },
+            "key_epoch": 16,
             "shared_key": [
               17,
               18,
@@ -118,6 +121,7 @@
         ],
         "replicas": {
           "channel_id": "7002",
+          "key_epoch": 3,
           "members": [
             {
               "communication_info": {
@@ -179,6 +183,7 @@
             "communication_info": {
               "name": "Helper"
             },
+            "key_epoch": 16,
             "shared_key": [
               17,
               18,
@@ -195,6 +200,7 @@
         ],
         "replicas": {
           "channel_id": "7002",
+          "key_epoch": 3,
           "members": [
             {
               "communication_info": {
@@ -392,6 +398,7 @@
             "communication_info": {
               "name": "Helper"
             },
+            "key_epoch": 16,
             "shared_key": [
               17,
               18,
@@ -408,6 +415,7 @@
         ],
         "replicas": {
           "channel_id": "7002",
+          "key_epoch": 3,
           "members": [
             {
               "communication_info": {

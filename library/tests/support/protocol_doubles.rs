@@ -282,9 +282,15 @@ pub struct InMemSecretStore {
     /// A kind whose removal fails, for exercising a backend failure after a
     /// response was sent.
     fail_remove: Arc<Mutex<Option<SecretKind>>>,
+    /// A kind whose save fails.
+    fail_save: Arc<Mutex<Option<SecretKind>>>,
 }
 
 impl InMemSecretStore {
+    pub fn set_fail_save(&self, kind: Option<SecretKind>) {
+        *self.fail_save.lock().unwrap() = kind;
+    }
+
     pub fn set_fail_remove(&self, kind: Option<SecretKind>) {
         *self.fail_remove.lock().unwrap() = kind;
     }
@@ -331,11 +337,18 @@ impl DeRecSecretStore for InMemSecretStore {
         Box::pin(std::future::ready(Ok(out)))
     }
     fn save(&mut self, sid: u64, cid: ChannelId, value: SecretValue) -> SecretStoreFuture<'_, ()> {
-        let k = match &value {
-            SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
-            SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
-            SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
+        let kind = match &value {
+            SecretValue::SharedKey(_) => SecretKind::SharedKey,
+            SecretValue::PairingSecret(_) => SecretKind::PairingSecret,
+            SecretValue::PairingContact(_) => SecretKind::PairingContact,
+            SecretValue::KeyRing(_) => SecretKind::KeyRing,
         };
+        if *self.fail_save.lock().unwrap() == Some(kind) {
+            return Box::pin(std::future::ready(Err(SecretStoreError::Backend(
+                "secret store unavailable".into(),
+            ))));
+        }
+        let k = kind as u8;
         self.data.lock().unwrap().insert((sid, cid.0, k), value);
         Box::pin(std::future::ready(Ok(())))
     }
@@ -374,9 +387,16 @@ pub struct InMemShareStore {
     /// What [`DeRecShareStore::keep_version`] answers on every call; when
     /// unset it answers `version - 1`, the version distributed before.
     pub keep: Arc<Mutex<Option<u32>>>,
+    /// When set, every `save` fails with a backend error and stores nothing.
+    fail_save: Arc<Mutex<bool>>,
 }
 
 impl InMemShareStore {
+    /// Fail every `save` with a backend error.
+    pub fn set_fail_save(&self, fail: bool) {
+        *self.fail_save.lock().unwrap() = fail;
+    }
+
     /// The shares under `sid` on `cids` at `versions` (every version when
     /// empty), with their channels, ordered by version then channel.
     fn select(&self, sid: u64, cids: &[ChannelId], versions: &[u32]) -> Vec<(ChannelId, Share)> {
@@ -427,6 +447,11 @@ impl DeRecShareStore for InMemShareStore {
         Box::pin(std::future::ready(Ok(None)))
     }
     fn save(&mut self, sid: u64, cid: ChannelId, share: Share) -> ShareStoreFuture<'_, ()> {
+        if *self.fail_save.lock().unwrap() {
+            return Box::pin(std::future::ready(Err(ShareStoreError::Backend(
+                "share store backend unavailable".to_owned().into(),
+            ))));
+        }
         let v = share.version;
         self.data.lock().unwrap().insert((sid, cid.0, v), share);
         Box::pin(std::future::ready(Ok(())))

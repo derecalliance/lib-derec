@@ -63,6 +63,9 @@ public sealed record DeRecProtocolConfig
     /// <summary>See <see cref="DeRecProtocolBuilder.WithAutoRespondOnFailure"/>.</summary>
     public bool? AutoRespondOnFailure { get; init; }
 
+    /// <summary>See <see cref="DeRecProtocolBuilder.WithKeyRotation"/>.</summary>
+    public bool? KeyRotation { get; init; }
+
     /// <summary>See <see cref="DeRecProtocolBuilder.WithAutoReplyTo"/>.</summary>
     public bool? AutoReplyTo { get; init; }
 
@@ -137,6 +140,7 @@ internal sealed class DeRecProtocolConfigJsonConverter : JsonConverter<DeRecProt
                     UpdateChannelInfo = w.AutoAccept.UpdateChannelInfo,
                 },
             AutoRespondOnFailure = w.AutoRespondOnFailure,
+            KeyRotation = w.KeyRotation,
             AutoReplyTo = w.AutoReplyTo,
             UnpairAck = w.UnpairAck,
             UnsafeConnection = w.UnsafeConnection,
@@ -196,6 +200,7 @@ internal sealed class DeRecProtocolConfigJsonConverter : JsonConverter<DeRecProt
                     UpdateChannelInfo = value.AutoAccept.UpdateChannelInfo,
                 },
             AutoRespondOnFailure = value.AutoRespondOnFailure,
+            KeyRotation = value.KeyRotation,
             AutoReplyTo = value.AutoReplyTo,
             UnpairAck = value.UnpairAck,
             UnsafeConnection = value.UnsafeConnection,
@@ -294,6 +299,9 @@ internal sealed class DeRecProtocolConfigJsonConverter : JsonConverter<DeRecProt
 
         [JsonPropertyName("auto_respond_on_failure"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public bool? AutoRespondOnFailure { get; init; }
+
+        [JsonPropertyName("key_rotation"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public bool? KeyRotation { get; init; }
 
         [JsonPropertyName("auto_reply_to"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public bool? AutoReplyTo { get; init; }

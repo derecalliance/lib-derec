@@ -303,6 +303,21 @@
           "offset": 0
         },
         {
+          "name": "key_bytes",
+          "offset": 40
+        }
+      ],
+      "name": "DeriveChannelKeyResult",
+      "size": 56
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
           "name": "wire_bytes",
           "offset": 40
         }
@@ -953,6 +968,21 @@
       ],
       "name": "ProtectSecretResult",
       "size": 56
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "sequence",
+          "offset": 40
+        }
+      ],
+      "name": "ReadSequenceResult",
+      "size": 48
     },
     {
       "align": 8,

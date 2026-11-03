@@ -8,7 +8,7 @@ export interface SecretStore {
   load(
     secretId: string,
     channelId: string,
-    kind: 0 | 1 | 2,
+    kind: 0 | 1 | 2 | 3,
   ): Promise<Uint8Array | null | undefined>;
   /**
    * Load secrets of the same `kind` for several channels in one call,
@@ -20,15 +20,15 @@ export interface SecretStore {
   loadMany(
     secretId: string,
     channelIds: string[],
-    kind: 0 | 1 | 2,
+    kind: 0 | 1 | 2 | 3,
   ): Promise<Array<Uint8Array | null | undefined>>;
   save(
     secretId: string,
     channelId: string,
-    kind: 0 | 1 | 2,
+    kind: 0 | 1 | 2 | 3,
     value: Uint8Array,
   ): Promise<void>;
-  remove(secretId: string, channelId: string, kind: 0 | 1 | 2): Promise<void>;
+  remove(secretId: string, channelId: string, kind: 0 | 1 | 2 | 3): Promise<void>;
   /**
    * Remove every secret `entries` names, in one call. Each entry is a
    * `[channelId, kind]` pair addressed the way `remove`'s arguments are.
@@ -38,7 +38,7 @@ export interface SecretStore {
    */
   removeMany(
     secretId: string,
-    entries: [channelId: string, kind: 0 | 1 | 2][],
+    entries: [channelId: string, kind: 0 | 1 | 2 | 3][],
   ): Promise<void>;
 }
 
@@ -1008,6 +1008,9 @@ export type DeRecEvent =
            *  next publish gives it the same count. Every event carries it;
            *  `restore` reads an absent value as 1. */
           weight?: number;
+          /** The epoch of `shared_key` on the helper's channel. Absent means
+           *  0. `restore` rebuilds the channel's key at this epoch. */
+          key_epoch?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -1032,6 +1035,8 @@ export type DeRecEvent =
             communication_info?: Record<string, string> | null;
           }>;
           shared_key: Uint8Array;
+          /** The epoch of `shared_key` on the group channel. Absent means 0. */
+          key_epoch?: number;
         };
         /** The threshold the secret was split with. Absent when the roster
          *  records none. `restore` writes it into the snapshot, so the next
@@ -1113,6 +1118,9 @@ export type DeRecEvent =
            *  next publish gives it the same count. Every event carries it;
            *  `restore` reads an absent value as 1. */
           weight?: number;
+          /** The epoch of `shared_key` on the helper's channel. Absent means
+           *  0. `restore` rebuilds the channel's key at this epoch. */
+          key_epoch?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -1135,6 +1143,8 @@ export type DeRecEvent =
             communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
+          /** The epoch of `shared_key` on the group channel. Absent means 0. */
+          key_epoch?: number;
         };
         /** The threshold the secret was split with. Absent when the roster
          *  records none. `restore` writes it into the snapshot, so the next
@@ -1175,6 +1185,9 @@ export type DeRecEvent =
            *  next publish gives it the same count. Every event carries it;
            *  `restore` reads an absent value as 1. */
           weight?: number;
+          /** The epoch of `shared_key` on the helper's channel. Absent means
+           *  0. `restore` rebuilds the channel's key at this epoch. */
+          key_epoch?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -1197,6 +1210,8 @@ export type DeRecEvent =
             communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
+          /** The epoch of `shared_key` on the group channel. Absent means 0. */
+          key_epoch?: number;
         };
         /** The threshold the secret was split with. Absent when the roster
          *  records none. `restore` writes it into the snapshot, so the next
@@ -1243,6 +1258,9 @@ export type DeRecEvent =
            *  next publish gives it the same count. Every event carries it;
            *  `restore` reads an absent value as 1. */
           weight?: number;
+          /** The epoch of `shared_key` on the helper's channel. Absent means
+           *  0. `restore` rebuilds the channel's key at this epoch. */
+          key_epoch?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -1264,6 +1282,8 @@ export type DeRecEvent =
             communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
+          /** The epoch of `shared_key` on the group channel. Absent means 0. */
+          key_epoch?: number;
         };
         /** The threshold the secret was split with. Absent when the roster
          *  records none. `restore` writes it into the snapshot, so the next
@@ -1368,7 +1388,8 @@ export type DeRecEvent =
    *  and the encrypted inner message's timestamp differ, or either is
    *  absent. `"StaleResponse"` means a `VerifyShareResponse` answered an
    *  earlier challenge that a newer one on the channel has replaced; the
-   *  outstanding challenge is kept. `trace_id` matches the peer's
+   *  outstanding challenge is kept. `"KeyUnavailable"` means the envelope
+   *  names an epoch whose key this device cannot obtain. `trace_id` matches the peer's
    *  `*Started` event for the same round (`"0"` when the sender set none). */
   | {
       type: "MessageIgnored";
@@ -1570,7 +1591,7 @@ export interface CommunicationInfo {
 
 /** Why a `MessageIgnored` event dropped a message. Matches the Rust
  *  `IgnoreReason` discriminants one-for-one. */
-export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse";
+export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse" | "KeyUnavailable";
 
 /** Why a `PeerNotRestored` event left a roster entry without a channel.
  *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */
@@ -1684,6 +1705,7 @@ export interface DeRecAutoAcceptConfig {
  *   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
  *   "auto_accept": { "pairing": true, "store_share": true },
  *   "auto_respond_on_failure": false,
+ *   "key_rotation": false,
  *   "auto_reply_to": false,
  *   "unpair_ack": "required",
  *   "unsafe_connection": false,
@@ -1702,6 +1724,7 @@ export interface DeRecProtocolConfig {
   parameter_range?: DeRecParameterRangeConfig;
   auto_accept?: DeRecAutoAcceptConfig;
   auto_respond_on_failure?: boolean;
+  key_rotation?: boolean;
   auto_reply_to?: boolean;
   /** Its name, or the discriminant `0` (`"required"`) / `1`
    *  (`"not_required"`). */

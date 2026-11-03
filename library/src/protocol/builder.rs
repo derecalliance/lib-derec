@@ -115,6 +115,7 @@ pub struct DeRecProtocolBuilder<
     unsafe_connection: Option<bool>,
     communication_info: HashMap<String, String>,
     auto_respond_on_failure: bool,
+    key_rotation: bool,
     unpair_ack: UnpairAck,
     auto_reply_to: bool,
     auto_accept: crate::protocol::AutoAcceptPolicy,
@@ -153,6 +154,7 @@ impl
             unsafe_connection: None,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
+            key_rotation: false,
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
             auto_accept: crate::protocol::AutoAcceptPolicy::default(),
@@ -388,6 +390,29 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         self
     }
 
+    /// Whether this device, as an owner, advances each helper channel's key
+    /// one epoch in every sharing round that reaches the threshold, and, as a
+    /// replica source, the group channel's key one epoch on every publish to
+    /// replicas.
+    ///
+    /// Each step derives the next key from the current one,
+    /// `K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" ‖ be32(e+1))`, so a
+    /// key taken from this device or a helper does not reveal the keys before
+    /// it. The published secret records the epoch and key of every channel,
+    /// and a restored device continues from there. Peers follow on their own
+    /// the first time a message under a newer epoch decrypts, whatever their
+    /// own setting.
+    ///
+    /// Turning it off stops the advance: the channel stays on its current
+    /// key, never the one pairing established. Turning it on again continues
+    /// from that key.
+    ///
+    /// Default: `false`.
+    pub fn with_key_rotation(mut self, enabled: bool) -> Self {
+        self.key_rotation = enabled;
+        self
+    }
+
     /// Whether the unpair initiator waits for the peer's acknowledgement
     /// before dropping local state.
     ///
@@ -616,6 +641,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             parameter_range,
             auto_accept,
             auto_respond_on_failure,
+            key_rotation,
             auto_reply_to,
             unpair_ack,
             unsafe_connection,
@@ -641,6 +667,9 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         }
         if let Some(enabled) = auto_respond_on_failure {
             self = self.with_auto_respond_on_failure(enabled);
+        }
+        if let Some(enabled) = key_rotation {
+            self = self.with_key_rotation(enabled);
         }
         if let Some(enabled) = auto_reply_to {
             self = self.with_auto_reply_to(enabled);
@@ -762,6 +791,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -813,6 +843,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -864,6 +895,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -918,6 +950,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -965,6 +998,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore>
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -1021,6 +1055,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -1138,6 +1173,7 @@ impl<
         )?;
         protocol.communication_info = self.communication_info;
         protocol.auto_respond_on_failure = self.auto_respond_on_failure;
+        protocol.key_rotation = self.key_rotation;
         protocol.unpair_ack = self.unpair_ack;
         protocol.auto_reply_to = self.auto_reply_to;
         protocol.auto_accept = self.auto_accept;
@@ -2779,6 +2815,7 @@ mod tests {
         unsafe_connection: Option<bool>,
         communication_info: HashMap<String, String>,
         auto_respond_on_failure: bool,
+        key_rotation: bool,
         unpair_ack: UnpairAck,
         auto_reply_to: bool,
         auto_accept: crate::protocol::AutoAcceptPolicy,
@@ -2797,6 +2834,7 @@ mod tests {
             unsafe_connection: b.unsafe_connection,
             communication_info: b.communication_info.clone(),
             auto_respond_on_failure: b.auto_respond_on_failure,
+            key_rotation: b.key_rotation,
             unpair_ack: b.unpair_ack,
             auto_reply_to: b.auto_reply_to,
             auto_accept: b.auto_accept,
@@ -2831,6 +2869,7 @@ mod tests {
                 ..Default::default()
             }),
             auto_respond_on_failure: Some(true),
+            key_rotation: Some(true),
             auto_reply_to: Some(true),
             unpair_ack: Some(UnpairAck::NotRequired),
             unsafe_connection: Some(true),
@@ -2896,6 +2935,7 @@ mod tests {
                 ..Default::default()
             })
             .with_auto_respond_on_failure(true)
+            .with_key_rotation(true)
             .with_auto_reply_to(true)
             .with_unpair_ack(UnpairAck::NotRequired)
             .with_unsafe_connection(true)

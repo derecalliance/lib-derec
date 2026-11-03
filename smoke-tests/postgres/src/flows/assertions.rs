@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_library::protocol::{SecretKind, SecretValue};
+
+use crate::codec::{decode_secret_value, secret_kind_tag};
 use crate::db::{SharedClient, u64_to_sql};
 
 pub async fn count_channels(client: &SharedClient, secret_id: u64) -> i64 {
@@ -238,4 +241,26 @@ pub async fn snapshot_threshold(client: &SharedClient, secret_id: u64) -> Option
         .await
         .expect("snapshot_threshold failed")
         .and_then(|r| r.get::<_, Option<i64>>(0))
+}
+
+/// The epoch of the `KeyRing` row (`kind = 3`) stored for `channel_id`,
+/// read from the `secrets` table and decoded from its stored bytes.
+pub async fn key_ring_epoch(client: &SharedClient, secret_id: u64, channel_id: u64) -> u32 {
+    let blob: Vec<u8> = client
+        .query_opt(
+            "SELECT data FROM secrets WHERE secret_id = $1 AND channel_id = $2 AND kind = $3",
+            &[
+                &u64_to_sql(secret_id),
+                &u64_to_sql(channel_id),
+                &secret_kind_tag(SecretKind::KeyRing),
+            ],
+        )
+        .await
+        .expect("key ring query failed")
+        .unwrap_or_else(|| panic!("no KeyRing row for channel {channel_id}"))
+        .get(0);
+    match decode_secret_value(&blob) {
+        SecretValue::KeyRing(ring) => ring.epoch(),
+        _ => panic!("the kind 3 row of channel {channel_id} is not a KeyRing"),
+    }
 }

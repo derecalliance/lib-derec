@@ -10,9 +10,14 @@
 //! - 1 byte: discriminant (0, 7..14)
 //! - 8 bytes: channel_id (big-endian u64)
 //! - 8 bytes: trace_id (u64 BE) — echoed verbatim on the response
-//! - For channel message types and RespondToFailure: 32 bytes, the action's
-//!   seal (an HMAC-SHA256 under a key derived from the answering channel's
-//!   shared key; see `events::seal`). Pairing and PrePair carry none.
+//! - For channel message types and RespondToFailure:
+//!   - 4 bytes: epoch (u32 BE), the epoch of the channel key the action is
+//!     answered under: the key its request arrived under
+//!   - 32 bytes: the action's seal (an HMAC-SHA256 under a key derived from
+//!     the answering channel's key at that epoch; see `events::seal`)
+//!
+//!   Pairing and PrePair carry neither: they are answered under no channel
+//!   key.
 //! - For Pairing:
 //!   - 4 bytes: my_kind (i32 BE)
 //!   - 4 bytes: request_len (u32 BE)
@@ -31,12 +36,15 @@
 //!   - remaining: protobuf-encoded request message, empty for `Undecodable`
 //!
 //! No token carries key material, and none can be altered undetected: the
-//! seal covers everything after it, so `accept` and `reject` refuse a token
-//! that was edited, built by hand, or moved to another channel. A channel message is answered under the
-//! channel's shared key, and RespondToFailure under the reply channel's,
-//! each loaded from the secret store when the response is sent. Pairing and
-//! PrePair load `PairingSecret` from the secret store at accept time. The
-//! secret store is the single source of truth for every key.
+//! seal covers the channel_id, trace_id, epoch and everything after it, so
+//! `accept` and `reject` refuse a token that was edited, built by hand, or
+//! moved to another channel or epoch. A channel message is answered under
+//! the channel's key at the token's epoch, and RespondToFailure under the
+//! reply channel's, each taken from the channel's key ring in the secret
+//! store when the response is sent. A token whose epoch's key the ring can no
+//! longer give is refused as too late. Pairing and PrePair load
+//! `PairingSecret` from the secret store at accept time. The secret store is
+//! the single source of truth for every key.
 //!
 //! Tokens issued by v0.0.10, whose channel messages used discriminants 1..6
 //! and carried the shared key, are refused.
@@ -73,8 +81,12 @@ const FAILED_UNPAIR: u8 = 4;
 const FAILED_UPDATE_CHANNEL_INFO: u8 = 5;
 const FAILED_UNDECODABLE: u8 = 6;
 
+/// The length of the epoch a sealed token carries.
+const EPOCH_LEN: usize = 4;
+
 pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
     let seal = action.seal().map(|seal| *seal.as_bytes());
+    let epoch = action.epoch();
     let (channel_id, trace_id, action) = action.into_parts();
     let (tag, body) = match action {
         Action::Pairing { request, kind, .. } => {
@@ -130,11 +142,12 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
         _ => {}
     }
 
-    let mut buf = Vec::with_capacity(1 + 8 + 8 + SEAL_LEN + body.len());
+    let mut buf = Vec::with_capacity(1 + 8 + 8 + EPOCH_LEN + SEAL_LEN + body.len());
     buf.push(tag);
     buf.extend_from_slice(&channel_id.0.to_be_bytes());
     buf.extend_from_slice(&trace_id.to_be_bytes());
     if let Some(seal) = seal {
+        buf.extend_from_slice(&epoch.to_be_bytes());
         buf.extend_from_slice(&seal);
     }
     buf.extend_from_slice(&body);
@@ -155,16 +168,20 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
     }
     let channel_id = ChannelId(u64::from_be_bytes(rest[..8].try_into().unwrap()));
     let trace_id = u64::from_be_bytes(rest[8..16].try_into().unwrap());
-    let (seal, body) = if is_sealed(tag) {
-        let Some(seal) = rest.get(16..16 + SEAL_LEN) else {
+    let (epoch, seal, body) = if is_sealed(tag) {
+        let Some(epoch) = rest.get(16..16 + EPOCH_LEN) else {
+            return Err("action bytes too short for the epoch".to_owned());
+        };
+        let Some(seal) = rest.get(16 + EPOCH_LEN..16 + EPOCH_LEN + SEAL_LEN) else {
             return Err("action bytes too short for the seal".to_owned());
         };
         (
+            u32::from_be_bytes(epoch.try_into().unwrap()),
             Some(Seal::from_bytes(seal.try_into().unwrap())),
-            &rest[16 + SEAL_LEN..],
+            &rest[16 + EPOCH_LEN + SEAL_LEN..],
         )
     } else {
-        (None, &rest[16..])
+        (0, None, &rest[16..])
     };
 
     let action = match tag {
@@ -224,7 +241,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
         _ => return Err(format!("unknown action tag: {tag}")),
     };
     Ok(PendingAction::from_parts(
-        channel_id, trace_id, seal, action,
+        channel_id, trace_id, epoch, seal, action,
     ))
 }
 
@@ -315,7 +332,7 @@ fn i32_to_sender_kind(val: i32) -> Result<SenderKind, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{FailedRequest, ReplyTarget};
+    use crate::protocol::{ChannelKey, FailedRequest, ReplyTarget};
     use derec_proto::{Protocol, TransportProtocol};
 
     fn reply() -> ReplyTarget {
@@ -381,7 +398,10 @@ mod tests {
         for request in every_failed_request() {
             let bytes = serialize(
                 PendingAction::failure(ChannelId(u64::MAX), 0xDEAD_BEEF, reply(), request.clone())
-                    .sealed_with(&crate::types::SharedKey::new([0; 32])),
+                    .sealed_with(&crate::protocol::ChannelKey {
+                        epoch: 0,
+                        key: crate::types::SharedKey::new([0; 32]),
+                    }),
             )
             .unwrap_or_else(|e| panic!("{request:?} serializes: {e}"));
 
@@ -412,7 +432,10 @@ mod tests {
         };
         let bytes = serialize(
             PendingAction::failure(ChannelId(3), 1, target.clone(), FailedRequest::Undecodable)
-                .sealed_with(&crate::types::SharedKey::new([0; 32])),
+                .sealed_with(&crate::protocol::ChannelKey {
+                    epoch: 0,
+                    key: crate::types::SharedKey::new([0; 32]),
+                }),
         )
         .expect("serializes");
         let decoded = deserialize(&bytes).expect("decodes");
@@ -446,7 +469,10 @@ mod tests {
     /// it is sealed under is not in it.
     #[test]
     fn a_channel_message_token_carries_no_key() {
-        let key = crate::types::SharedKey::new([0x5A; 32]);
+        let key = ChannelKey {
+            epoch: 3,
+            key: crate::types::SharedKey::new([0x5A; 32]),
+        };
         let request = UnpairRequestMessage {
             memo: "moving devices".to_owned(),
             ..Default::default()
@@ -459,10 +485,10 @@ mod tests {
 
         assert_eq!(
             bytes.len(),
-            1 + 8 + 8 + SEAL_LEN + request.encode_to_vec().len()
+            1 + 8 + 8 + EPOCH_LEN + SEAL_LEN + request.encode_to_vec().len()
         );
         assert!(
-            !bytes.windows(32).any(|window| window == key.as_bytes()),
+            !bytes.windows(32).any(|window| window == key.key.as_bytes()),
             "the token holds no copy of the key"
         );
         let decoded = deserialize(&bytes).expect("decodes");
@@ -472,6 +498,45 @@ mod tests {
             decoded.action(),
             Action::Request(ChannelRequest::Unpair(decoded)) if *decoded == request
         ));
+    }
+
+    /// A sealed token carries the epoch of the key its request arrived under,
+    /// as 4 bytes after the trace id, and comes back with it: the action is
+    /// answered, and its seal checked, under that epoch's key.
+    #[test]
+    fn sealed_tokens_round_trip_the_epoch() {
+        let key = ChannelKey {
+            epoch: 0x0102_0304,
+            key: crate::types::SharedKey::new([0x5A; 32]),
+        };
+        let request = ChannelRequest::Unpair(UnpairRequestMessage::default());
+        let failure = PendingAction::failure(ChannelId(9), 11, reply(), FailedRequest::Undecodable);
+        for action in [
+            PendingAction::request(ChannelId(9), 11, request.clone()).sealed_with(&key),
+            failure.sealed_with(&key),
+        ] {
+            let bytes = serialize(action).expect("serializes");
+            assert_eq!(&bytes[17..21], &[0x01, 0x02, 0x03, 0x04]);
+            for len in 17..17 + EPOCH_LEN + SEAL_LEN {
+                assert!(deserialize(&bytes[..len]).is_err(), "cut at {len}");
+            }
+            let decoded = deserialize(&bytes).expect("decodes");
+            assert_eq!(decoded.epoch(), 0x0102_0304);
+            assert!(decoded.seal_verifies(&key));
+        }
+    }
+
+    /// A pairing token carries no epoch: it is answered under no channel key.
+    #[test]
+    fn a_pairing_token_is_at_epoch_zero() {
+        let bytes = serialize(PendingAction::pre_pair(
+            ChannelId(9),
+            11,
+            PrePairRequestMessage::default(),
+        ))
+        .expect("serializes");
+        assert_eq!(bytes.len(), 1 + 8 + 8);
+        assert_eq!(deserialize(&bytes).expect("decodes").epoch(), 0);
     }
 
     /// Truncated or corrupted token bytes are refused with an error, never a
@@ -485,7 +550,10 @@ mod tests {
                 reply(),
                 FailedRequest::Unpair(UnpairRequestMessage::default()),
             )
-            .sealed_with(&crate::types::SharedKey::new([0; 32])),
+            .sealed_with(&crate::protocol::ChannelKey {
+                epoch: 0,
+                key: crate::types::SharedKey::new([0; 32]),
+            }),
         )
         .expect("serializes");
         for len in 1..bytes.len() - 1 {

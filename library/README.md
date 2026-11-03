@@ -358,6 +358,7 @@ Optional setters have defaults:
 | `with_parameter_range(range)` | unset | Advertised protocol parameter bounds, checked for overlap at pairing time. A helper also enforces its own `minShareSize`/`maxShareSize` on every inbound share (see [Helper-side admission control](#helper-side-admission-control)). |
 | `with_max_subshares(max)` | unset (no cap) | Cap on a sharing round's total subshares (the sum of the Helpers' weights). Checked at sharing only, never at recovery; must be `>= threshold`. See [Weighted helpers](#weighted-helpers). |
 | `with_auto_respond_on_failure(bool)` | `false` | Who answers an inbound request whose handling failed. If `true`, the library sends the response itself; if `false`, it reports `RequestFailed` with a token the app passes to `reject`. See [Failed requests](#failed-requests). |
+| `with_key_rotation(bool)` | `false` | Whether this device advances channel keys one epoch (`K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" ‖ be32(e+1))`): each helper channel in every sharing round that reaches the threshold, and the replica group channel on every publish to replicas. Off keeps the current key, never the pairing one. Peers follow on their own. |
 | `with_unpair_ack(ack)` | `UnpairAck::Required` | Whether the unpair initiator waits for the peer's `Ok` before dropping local state. |
 | `with_auto_reply_to(bool)` | `false` | If `true`, every outbound request stamps `replyTo = own_transport` so the responder routes the reply back to this node — even if the channel's stored peer endpoint points elsewhere. Useful for replica scenarios. See [Correlation and routing on the wire](#correlation-and-routing-on-the-wire). |
 
@@ -420,6 +421,7 @@ SDK, is:
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
   "auto_accept": { "pairing": true, "store_share": true },
   "auto_respond_on_failure": false,
+  "key_rotation": false,
   "auto_reply_to": false,
   "unpair_ack": "required",
   "unsafe_connection": false,
@@ -558,7 +560,9 @@ before any target-level events are emitted.
   `IgnoreReason::TimestampMismatch` (the envelope and inner-message
   timestamps differ, or either or both are absent) or
   `IgnoreReason::StaleResponse` (a verification response to a replaced
-  challenge).
+  challenge) or `IgnoreReason::KeyUnavailable` (the envelope names an
+  epoch of the channel key this device cannot obtain; see
+  [Key rotation](#key-rotation)).
 - `NoOp` — emitted when an inbound message was processed but had no
   application-visible consequence.
 
@@ -633,6 +637,10 @@ receiver ignores a message whose two timestamps differ, or where either or
 both are absent, as `MessageIgnored` with `IgnoreReason::TimestampMismatch`.
 A peer on 0.0.8 or earlier stamps its replies separately, so they are
 ignored this way.
+
+### Key rotation
+
+With `with_key_rotation(true)`, the owner advances each helper channel's key one epoch in every sharing round that reaches the threshold (a round below it advances none), and the replica group channel's key on every publish to replicas. Each step is K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" || be32(e+1)). Rotation is off by default, and off keeps the channel on its current key. The envelope's `sequence` carries the epoch, and peers follow on their own, so the setting is the owner's alone (`key_rotation` in a config). A message under an epoch whose key the device cannot obtain is ignored as `MessageIgnored` with `IgnoreReason::KeyUnavailable`. A device keeps its newest key and the key of every secret version it still stores, so any kept version restores. The key ring is stored as a secret of kind `3` (`KeyRing`): persist its bytes as given, with any length, beside the kind-`0` shared key. Forward secrecy covers a compromised helper device, or a key alone, plus recorded traffic, and only for epochs older than the oldest key held; the owner and replica devices hold the plaintext secret and the keys of every version they store. A 0.0.x peer cannot follow a rotated channel: it must upgrade and re-pair. An application using primitives directly follows a rotated channel itself; see [`sequence` — the channel key's epoch](#sequence--the-channel-keys-epoch).
 
 ### When `process` fails
 
@@ -720,8 +728,10 @@ for event in protocol.process(&bytes).await? {
 }
 ```
 
-The library never expires an unresolved `PendingAction`, a token included:
-a request the application never answers leaves its sender to time out.
+The library never expires an unresolved `PendingAction` on a clock, a token
+included: a request the application never answers leaves its sender to time
+out. Only an action whose channel key is no longer held is refused, as too
+late (below).
 `PendingAction` is `Clone`, so an application can keep a copy of an action
 it accepts. The library is stateless, so resolving each token once is the
 application's part: rejecting the same token twice, or rejecting a copy of
@@ -732,6 +742,13 @@ channel key is sealed to that channel. `accept` and `reject` check the seal
 before anything else, so an action that was altered, built by hand or moved to
 another channel is refused with `Error::InvalidInput`, and nothing is stored
 or sent.
+
+A sealed action also records the epoch of the channel key its request arrived
+under, and the seal covers it. `accept` and `reject` answer under that epoch's
+key, even after the channel has moved to a newer one. When that key can no
+longer be obtained, because the channel has moved on and no stored version
+keeps it, the action is too late: it is refused with `Error::InvalidInput`
+before anything is stored or sent.
 
 Before acting on a persisted action, `accept` checks its channel again. A
 channel that is gone, no longer `Paired`, or without a stored shared key has
@@ -1376,7 +1393,7 @@ publishing too; see [On a replica member](#on-a-replica-member).
 
 ## Correlation and routing on the wire
 
-Two metadata fields cut across every channel-mode exchange:
+Three metadata fields cut across every channel-mode exchange:
 
 ### `traceId` — request/response correlation
 
@@ -1408,6 +1425,51 @@ The same helpers are surfaced as `envelope.apply_trace_id` /
 (plus a `Envelope.ApplyTraceId` / `Envelope.ReadTraceId` static class on
 the dotnet package). The encrypted inner message is never touched, so
 re-stamping has no crypto cost.
+
+### `sequence` — the channel key's epoch
+
+`DeRecMessage.sequence` is the epoch of the channel key that encrypted the
+payload: `0` for a freshly paired channel, one higher for each step the key
+has moved (see [Key rotation](#key-rotation)). It is set when the payload is
+encrypted, never stamped afterwards: encryption takes a
+[`ChannelKey`](https://docs.rs/derec-library/latest/derec_library/types/struct.ChannelKey.html),
+a key together with its epoch, so the two cannot disagree. Pairing envelopes
+always carry `0`. The field is not authenticated; a forged value only selects
+a key that fails to decrypt.
+
+The orchestrator handles epochs on its own. A consumer driving the protocol
+through **primitives** keeps the epoch of each channel key it holds and:
+
+- **sends** with `produce(.., &ChannelKey::new(epoch, key), ..)`; every
+  channel-encrypted `produce` takes a `ChannelKey`;
+- **receives** by reading the envelope's epoch with `read_sequence`, using the
+  key it holds at that epoch or deriving it forward with `ChannelKey::derive`,
+  then calling `extract` with the key alone.
+
+```rust,ignore
+use derec_library::derec_message::read_sequence;
+use derec_library::types::{ChannelKey, SharedKey};
+
+let k0 = ChannelKey::new(0, SharedKey::new(pairing_key_bytes));
+
+let epoch = read_sequence(&envelope_bytes)?;
+let key = k0.derive(epoch)?; // forward only, at most 512 epochs per call
+let request = request::extract(&envelope_bytes, key.key())?;
+```
+
+`derive` refuses an epoch below the key's own, since the chain only runs
+forward, and an epoch more than `ChannelKey::MAX_DERIVE_STEPS` (512) above
+it, which bounds the work a forged `sequence` can cause. To follow a channel
+further, keep the newest key you derived and derive from it. Primitives do not
+retain or prune keys: an application that answers requests about older secret
+versions keeps the keys of the epochs those versions travelled under.
+
+The same helpers are surfaced as `envelope.read_sequence` /
+`channel_key.derive` on the nodejs/web/react-native packages,
+`Envelope.ReadSequence` / `ChannelKey.Derive` on dotnet,
+`envelope.ReadSequence` / `channelkey.Derive` on Go, and
+`read_sequence_from_envelope` / `derive_channel_key` on the FFI. Their
+`produce` calls take the key bytes followed by the epoch.
 
 ### Matching responses to requests is the application's job
 
@@ -1482,7 +1544,7 @@ so implementations need no internal synchronization:
 |-------|--------|
 | [`DeRecChannelStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecChannelStore.html) | Helper channels (keyed by `channel_id`), replica-group members (keyed by `replica_id`), and the channel-link graph. |
 | [`DeRecShareStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html) | Encoded share entries keyed by `(secret_id, channel_id, version)` — the `secret_id` *argument*, which is the partition every load filters by. `Share::secret_id` is a different value and routinely differs from it; see below. |
-| [`DeRecSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecSecretStore.html) | Per-channel cryptographic material (shared keys, pairing secrets, pairing contacts). |
+| [`DeRecSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecSecretStore.html) | Per-channel cryptographic material (shared keys, pairing secrets, pairing contacts, and the channel key ring, `SecretKind::KeyRing`, whose bytes are opaque and variable-length). |
 | [`DeRecUserSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecUserSecretStore.html) | The latest user-facing secret snapshot per `secret_id` — what a freshly-paired peer is sent. |
 | [`DeRecStateStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecStateStore.html) | In-flight orchestrator state: verification challenges, recovery accumulators, pending unpairs, the active sharing round and catch-up. Must be durable in any deployment that can restart mid-flow. |
 | [`DeRecTransport`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecTransport.html) | Outbound envelope delivery to peers. |
@@ -2217,29 +2279,30 @@ let request::SplitResult { shares } = request::split(
 
 ```rust,ignore
 use derec_library::primitives::verification::{request, response};
-use derec_library::types::ChannelId;
+use derec_library::types::{ChannelId, ChannelKey};
 
 let channel_id = ChannelId(1);
 let secret_id: u64 = 42;
 let version: u32 = 7;
-let shared_key = [0u8; 32]; // established during pairing
+// The key pairing established, at epoch 0; see `ChannelKey`.
+let channel_key = ChannelKey::new(0, shared_key);
 
 // Owner side: produce and send the verification request.
-let result = request::produce(channel_id, secret_id, version, &shared_key).unwrap();
+let result = request::produce(channel_id, secret_id, version, &channel_key, &[]).unwrap();
 let request_wire_bytes = result.envelope;
 
 // Helper side: decrypt and extract the inner request.
 let request::ExtractResult { request: verify_request } =
-    request::extract(&request_wire_bytes, &shared_key).unwrap();
+    request::extract(&request_wire_bytes, channel_key.key()).unwrap();
 
 // Helper side: produce the response, proving possession of the share.
 let resp_result =
-    response::produce(channel_id, &verify_request, &shared_key, b"example_share").unwrap();
+    response::produce(channel_id, &verify_request, &channel_key, b"example_share").unwrap();
 let response_wire_bytes = resp_result.envelope;
 
 // Owner side: decrypt and verify the proof.
 let response::ExtractResult { response: verify_response } =
-    response::extract(&response_wire_bytes, &shared_key).unwrap();
+    response::extract(&response_wire_bytes, channel_key.key()).unwrap();
 let ok = response::process(&verify_response, b"example_share").unwrap();
 
 assert!(ok);
@@ -2252,17 +2315,18 @@ use derec_library::primitives::discovery::{
     request,
     response::{self, SecretVersionEntry, VersionEntry},
 };
-use derec_library::types::ChannelId;
+use derec_library::types::{ChannelId, ChannelKey};
 
 let channel_id = ChannelId(1);
-let shared_key = [0u8; 32]; // established during pairing
+// The key pairing established, at epoch 0; see `ChannelKey`.
+let channel_key = ChannelKey::new(0, shared_key);
 
 // Owner side: produce the discovery request.
 let request::ProduceResult { envelope: request_envelope } =
-    request::produce(channel_id, &shared_key).unwrap();
+    request::produce(channel_id, &channel_key, &[]).unwrap();
 
 // Helper side: extract the request, enumerate stored secrets, produce the response.
-let _req = request::extract(&request_envelope, &shared_key).unwrap();
+let _req = request::extract(&request_envelope, channel_key.key()).unwrap();
 
 let stored: Vec<SecretVersionEntry> = vec![
     SecretVersionEntry {
@@ -2278,11 +2342,11 @@ let stored: Vec<SecretVersionEntry> = vec![
     },
 ];
 let response::ProduceResult { envelope: response_envelope } =
-    response::produce(channel_id, &stored, &shared_key).unwrap();
+    response::produce(channel_id, &stored, &channel_key).unwrap();
 
 // Owner side: extract and process the response to get the secret list.
 let response::ExtractResult { response } =
-    response::extract(&response_envelope, &shared_key).unwrap();
+    response::extract(&response_envelope, channel_key.key()).unwrap();
 let response::ProcessResult { secret_list } =
     response::process(&response).unwrap();
 
@@ -2308,20 +2372,21 @@ Helper-side primitive surface:
 
 ```rust,ignore
 use derec_library::primitives::recovery::{request, response};
-use derec_library::types::ChannelId;
+use derec_library::types::{ChannelId, ChannelKey};
 
 let channel_id = ChannelId(1);
-let shared_key = [0u8; 32]; // established during pairing
+// The key at the epoch the request arrived under; see `read_sequence`.
+let channel_key = ChannelKey::new(epoch, shared_key);
 // request_envelope:        outer DeRecMessage bytes carrying a GetShareRequest
 // stored_share_request:    StoreShareRequestMessage the helper persisted at sharing time
 
 let request::ExtractResult { request: get_share_request } =
-    request::extract(&request_envelope, &shared_key).unwrap();
+    request::extract(&request_envelope, channel_key.key()).unwrap();
 let response::ProduceResult { envelope: response_envelope } = response::produce(
     channel_id,
     &get_share_request,
     &stored_share_request,
-    &shared_key,
+    &channel_key,
 ).unwrap();
 ```
 
@@ -2398,21 +2463,23 @@ the primitive surface is below.
 
 ```rust,ignore
 use derec_library::primitives::unpairing::{request, response};
-use derec_library::types::ChannelId;
+use derec_library::types::{ChannelId, ChannelKey};
 
 let channel_id = ChannelId(1);
-let shared_key = [0u8; 32]; // established during pairing
+// The key pairing established, at epoch 0; see `ChannelKey`.
+let channel_key = ChannelKey::new(0, shared_key);
 
 // Initiator side: produce and send the unpair request.
-let req_result = request::produce(channel_id, "decommissioning", &shared_key).unwrap();
+let req_result =
+    request::produce(channel_id, "decommissioning", &channel_key, &[], None).unwrap();
 
 // Responder side: extract the request, drop local state, send Ok response.
-let _extracted = request::extract(&req_result.envelope, &shared_key).unwrap();
-let resp_result = response::produce(channel_id, &shared_key).unwrap();
+let _extracted = request::extract(&req_result.envelope, channel_key.key()).unwrap();
+let resp_result = response::produce(channel_id, &channel_key).unwrap();
 
 // Initiator side: extract and validate the response.
 let response::ExtractResult { response: unpair_response } =
-    response::extract(&resp_result.envelope, &shared_key).unwrap();
+    response::extract(&resp_result.envelope, channel_key.key()).unwrap();
 let outcome = response::process(&unpair_response).unwrap();
 assert!(outcome.acknowledged);
 ```

@@ -5,7 +5,7 @@ use crate::extensions::request_message::RequestMessageExt as _;
 use crate::primitives::sharing::SharingError;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
-    types::{ChannelId, SharedKey, WeightedChannel},
+    types::{ChannelId, ChannelKey, SharedKey, WeightedChannel},
     utils::{generate_seed, verify_timestamps},
 };
 use derec_cryptography::vss;
@@ -200,8 +200,9 @@ pub fn split(
 /// * `keep_version` - The one version, other than `version`, the Helper keeps; it removes
 ///   every other version it holds on the channel. `0` keeps no other version.
 /// * `description` - Human-readable description of this share distribution. May be empty.
-/// * `shared_key` - Previously established 32-byte symmetric channel key used to
-///   encrypt the inner request.
+/// * `channel_key` - The channel key and its epoch. The payload is encrypted
+///   under the key and the envelope's `sequence` carries the epoch, so the
+///   receiver can pick the key that opens it; see [`crate::types::ChannelKey`].
 ///
 /// # Returns
 ///
@@ -226,11 +227,12 @@ pub fn split(
 ///     .expect("split failed");
 ///
 /// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 /// let channel_id = ChannelId(1);
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =
-///     produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
+///     produce(channel_id, 1, 1, committed_share, 0, "", &channel_key, &[])
 ///         .expect("produce failed");
 ///
 /// assert!(!envelope.is_empty());
@@ -247,7 +249,7 @@ pub fn produce(
     committed_share: &CommittedDeRecShare,
     keep_version: u32,
     description: impl Into<String>,
-    shared_key: &SharedKey,
+    channel_key: &ChannelKey,
     reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<ProduceResult, crate::Error> {
     validate_keep_version(keep_version, version)?;
@@ -271,7 +273,7 @@ pub fn produce(
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::StoreShareRequest(msg))
-        .encrypt(shared_key)?
+        .encrypt(channel_key)?
         .build()?
         .encode_to_vec();
 
@@ -371,10 +373,11 @@ pub(crate) fn validate_keep_version(keep_version: u32, version: u32) -> Result<(
 ///
 /// let channel_id = ChannelId(1);
 /// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =
-///     produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
+///     produce(channel_id, 1, 1, committed_share, 0, "", &channel_key, &[])
 ///         .expect("produce failed");
 ///
 /// let ExtractResult { request } = extract(&envelope, &shared_key).expect("extract failed");

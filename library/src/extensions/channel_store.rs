@@ -21,7 +21,7 @@ use crate::{
         ChannelQuery, ChannelStatus, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember,
         Target,
     },
-    types::{ChannelId, SharedKey},
+    types::ChannelId,
 };
 use derec_proto::{MessageBody, SenderKind, TransportProtocol};
 use prost::Message;
@@ -317,7 +317,7 @@ pub(crate) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
     secret_id: u64,
     channel_id: ChannelId,
     mut body: MessageBody,
-    shared_key: &SharedKey,
+    key: &crate::protocol::ChannelKey,
     inbound_trace_id: u64,
     policy: TransportPolicy,
     reply_to: &[TransportProtocol],
@@ -334,7 +334,7 @@ pub(crate) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
         .timestamp(timestamp)
         .message_body(body)
         .trace_id(inbound_trace_id)
-        .encrypt(shared_key)?
+        .encrypt(key)?
         .build()?;
 
     let wire_bytes = envelope.encode_to_vec();
@@ -603,8 +603,10 @@ mod send_channel_message_tests {
     use super::*;
     use crate::extensions::derec_result::DeRecResultExt as _;
     use crate::extensions::message_body::MessageBodyExt as _;
+    use crate::protocol::ChannelKey;
     use crate::protocol::tests::{InMemChannelStore, RecordingTransport, run_async};
     use crate::protocol::types::{ChannelRecord, HelperChannel};
+    use crate::types::SharedKey;
 
     const SECRET_ID: u64 = 0x5E4D;
     const CHANNEL: ChannelId = ChannelId(77);
@@ -652,7 +654,7 @@ mod send_channel_message_tests {
                 SECRET_ID,
                 CHANNEL,
                 body,
-                &KEY,
+                &ChannelKey { epoch: 0, key: KEY },
                 0,
                 TransportPolicy::new(false),
                 &[],
@@ -670,6 +672,64 @@ mod send_channel_message_tests {
                 .expect("decrypt");
             assert!(envelope.timestamp.is_some());
             assert_eq!(envelope.timestamp.as_ref(), inner.timestamp());
+        });
+    }
+
+    /// The envelope's `sequence` is the epoch of the key the body is
+    /// encrypted under, and that key opens it.
+    #[test]
+    fn send_channel_message_stamps_the_key_epoch() {
+        run_async(async {
+            let mut channels = InMemChannelStore::default();
+            channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Helper(HelperChannel {
+                        channel_id: CHANNEL,
+                        transports: vec![TransportProtocol {
+                            uri: "https://peer.example".to_owned(),
+                            protocol: derec_proto::Protocol::Https as i32,
+                        }],
+                        communication_info: std::collections::HashMap::new(),
+                        peer_role: SenderKind::Owner,
+                        status: ChannelStatus::Paired,
+                        created_at: 0,
+                        weight: 1,
+                    }),
+                )
+                .await
+                .expect("seed channel");
+            let transport = RecordingTransport::default();
+            let key = ChannelKey { epoch: 3, key: KEY };
+            let body = MessageBody::UpdateChannelInfoResponse(
+                derec_proto::UpdateChannelInfoResponseMessage {
+                    result: Some(derec_proto::DeRecResult::ok()),
+                    timestamp: None,
+                },
+            );
+
+            send_channel_message(
+                &channels,
+                &transport,
+                SECRET_ID,
+                CHANNEL,
+                body,
+                &key,
+                0,
+                TransportPolicy::new(false),
+                &[],
+                None,
+                derec_proto::StatusEnum::Ok,
+                "",
+            )
+            .await
+            .expect("send");
+
+            let sent = transport.sent_envelopes();
+            let envelope = derec_proto::DeRecMessage::decode(sent[0].as_slice()).expect("decode");
+            assert_eq!(envelope.sequence, 3);
+            crate::derec_message::extract_inner_message(&envelope.message, &key.key)
+                .expect("the epoch-3 key opens the envelope");
         });
     }
 }

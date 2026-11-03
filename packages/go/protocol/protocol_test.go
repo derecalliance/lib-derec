@@ -167,8 +167,10 @@ type secretStoreKey struct {
 type inMemorySecretStore struct {
 	mu   sync.Mutex
 	data map[secretStoreKey]SecretValue
-	// loadManyCalls records the channelIDs of every LoadMany call, in order.
+	// loadManyCalls records the channelIDs of every LoadMany call, in order,
+	// and loadManyKinds the kind each of those calls asked for.
 	loadManyCalls [][]uint64
+	loadManyKinds []SecretKind
 }
 
 func newInMemorySecretStore() *inMemorySecretStore {
@@ -186,6 +188,7 @@ func (s *inMemorySecretStore) LoadMany(secretID uint64, channelIDs []uint64, kin
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadManyCalls = append(s.loadManyCalls, append([]uint64(nil), channelIDs...))
+	s.loadManyKinds = append(s.loadManyKinds, kind)
 	out := make([]*SecretValue, len(channelIDs))
 	for i, c := range channelIDs {
 		if v, ok := s.data[secretStoreKey{secretID, c, kind}]; ok {

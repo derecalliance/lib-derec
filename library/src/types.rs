@@ -178,6 +178,76 @@ impl std::fmt::Debug for SharedKey {
     }
 }
 
+/// A channel key together with its epoch, the key's position in the
+/// channel's key chain.
+///
+/// A channel starts at epoch 0 under the key pairing established. When the
+/// owner rotates keys, the chain moves forward one epoch at a time:
+/// K₍ₑ₊₁₎ = `HMAC-SHA256(Kₑ, "derec channel key v1" ‖ be32(e+1))`. The chain
+/// only runs forward, so a key does not reveal the ones before it.
+///
+/// Every channel envelope carries the epoch of the key that encrypted it in
+/// `DeRecMessage.sequence`, which tells the receiver which key opens it.
+/// Encrypting under a `ChannelKey` stamps that epoch, so key and epoch cannot
+/// drift apart in the envelope. Build a key with [`ChannelKey::new`] from a
+/// key and the epoch it belongs to, and move it forward with
+/// [`ChannelKey::derive`]; a key paired with the wrong epoch produces
+/// envelopes the peer cannot open.
+///
+/// `Debug` prints no key material.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ChannelKey {
+    pub(crate) epoch: u32,
+    pub(crate) key: SharedKey,
+}
+
+impl ChannelKey {
+    /// The most epochs [`ChannelKey::derive`] moves a key in one call. It
+    /// matches how far a party following the protocol derives to open a
+    /// message, which bounds the work a forged `sequence` can cause.
+    pub const MAX_DERIVE_STEPS: u32 = crate::protocol::FORWARD_JUMP_LIMIT;
+
+    /// Pair `key` with the epoch it belongs to. A freshly paired channel's
+    /// key is at epoch 0.
+    pub const fn new(epoch: u32, key: SharedKey) -> Self {
+        Self { epoch, key }
+    }
+
+    /// The key's epoch.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// The key itself.
+    pub fn key(&self) -> &SharedKey {
+        &self.key
+    }
+
+    /// The key at `epoch`, derived forward from this one.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidInput`] if `epoch` is below this key's epoch,
+    /// since the chain does not run backward, or more than
+    /// [`ChannelKey::MAX_DERIVE_STEPS`] above it.
+    pub fn derive(&self, epoch: u32) -> crate::Result<ChannelKey> {
+        let Some(steps) = epoch.checked_sub(self.epoch) else {
+            return Err(crate::Error::InvalidInput(
+                "a channel key derives forward only",
+            ));
+        };
+        if steps > Self::MAX_DERIVE_STEPS {
+            return Err(crate::Error::InvalidInput(
+                "a channel key derives at most MAX_DERIVE_STEPS epochs at once",
+            ));
+        }
+        Ok(ChannelKey {
+            epoch,
+            key: crate::protocol::derive_key(&self.key, self.epoch, epoch),
+        })
+    }
+}
+
 #[cfg(test)]
 mod replica_id_tests {
     use super::ReplicaId;
@@ -247,5 +317,54 @@ mod shared_key_tests {
         assert_eq!(as_key, as_array);
         let read: SharedKey = serde_json::from_str(&as_array).expect("deserialize");
         assert_eq!(read, SharedKey::new(bytes));
+    }
+}
+
+#[cfg(test)]
+mod channel_key_tests {
+    use super::{ChannelKey, SharedKey};
+
+    const K0: ChannelKey = ChannelKey::new(0, SharedKey::new([3u8; 32]));
+
+    /// Deriving one epoch at a time and deriving straight to the target
+    /// reach the same key: the chain has one key per epoch.
+    #[test]
+    fn derive_walks_the_chain_one_epoch_at_a_time() {
+        let mut stepped = K0.clone();
+        for epoch in 1..=5 {
+            stepped = stepped.derive(epoch).expect("one step forward");
+        }
+        let direct = K0.derive(5).expect("five steps forward");
+
+        assert_eq!(direct, stepped);
+        assert_eq!(direct.epoch(), 5);
+        assert_ne!(direct.key(), K0.key());
+    }
+
+    #[test]
+    fn derive_to_its_own_epoch_is_the_same_key() {
+        assert_eq!(K0.derive(0).expect("no steps"), K0);
+    }
+
+    #[test]
+    fn derive_refuses_an_earlier_epoch() {
+        let k3 = K0.derive(3).expect("forward");
+        assert!(matches!(k3.derive(2), Err(crate::Error::InvalidInput(_))));
+    }
+
+    #[test]
+    fn derive_is_bounded_by_max_derive_steps() {
+        assert!(K0.derive(ChannelKey::MAX_DERIVE_STEPS).is_ok());
+        assert!(matches!(
+            K0.derive(ChannelKey::MAX_DERIVE_STEPS + 1),
+            Err(crate::Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn debug_prints_no_key_material() {
+        let rendered = format!("{:?}", ChannelKey::new(4, SharedKey::new([0xAB; 32])));
+        assert!(!rendered.contains("171") && !rendered.to_lowercase().contains("ab, "));
+        assert!(rendered.contains("epoch: 4"));
     }
 }

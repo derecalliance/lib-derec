@@ -25,7 +25,7 @@ func TestVerificationRequestRoundTrip(t *testing.T) {
 	const channelID, secretID, version = uint64(7), uint64(42), uint32(1)
 	key := sharedKey()
 
-	envelope, err := verification.Request.Produce(channelID, secretID, version, key, nil)
+	envelope, err := verification.Request.Produce(channelID, secretID, version, key, 0, nil)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestVerificationRequestRoundTrip(t *testing.T) {
 }
 
 func TestVerificationRequestRejectsShortKey(t *testing.T) {
-	_, err := verification.Request.Produce(1, 1, 1, make([]byte, 16), nil)
+	_, err := verification.Request.Produce(1, 1, 1, make([]byte, 16), 0, nil)
 	if err == nil {
 		t.Fatal("expected an error for a 16-byte shared key")
 	}
@@ -80,7 +80,7 @@ func TestVerificationResponseRoundTrip(t *testing.T) {
 	shareContent1 := shares[channel1]
 	shareContent2 := shares[channel2]
 
-	challengeEnvelope, err := verification.Request.Produce(channel1, secretID, version, key, nil)
+	challengeEnvelope, err := verification.Request.Produce(channel1, secretID, version, key, 0, nil)
 	if err != nil {
 		t.Fatalf("request produce: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestVerificationResponseRoundTrip(t *testing.T) {
 		t.Fatalf("request extract: %v", err)
 	}
 
-	respEnvelope, err := verification.Response.Produce(channel1, extractedReq.RequestProto, key, shareContent1)
+	respEnvelope, err := verification.Response.Produce(channel1, extractedReq.RequestProto, key, 0, shareContent1)
 	if err != nil {
 		t.Fatalf("response produce: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestVerificationResponseRoundTrip(t *testing.T) {
 
 	// Negative case: an honestly-produced response is processed against a
 	// different channel's share content, which must not validate.
-	respEnvelope2, err := verification.Response.Produce(channel1, extractedReq.RequestProto, key, shareContent1)
+	respEnvelope2, err := verification.Response.Produce(channel1, extractedReq.RequestProto, key, 0, shareContent1)
 	if err != nil {
 		t.Fatalf("second response produce: %v", err)
 	}

@@ -7,7 +7,119 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
-### Unreleased
+### 1.0.0-alpha.1 (unreleased)
+
+- **Added: shared-key rotation.** *(security; breaking for any custom store
+  and for 0.0.x peers)*
+
+  A channel's key used to stay the one pairing established for as long as the
+  channel lived. It can now move forward: with rotation on, the owner advances
+  each helper channel one epoch in every sharing round that reaches the
+  threshold (a round below it advances none), and the replica group channel
+  one epoch per publish, so a key taken from a helper later does not open the
+  traffic that preceded the oldest key it still holds.
+
+  - **Opt-in.** `DeRecProtocolBuilder::with_key_rotation(bool)`
+    (`withKeyRotation` / `WithKeyRotation`), or `key_rotation` in a config.
+    Off by default. Off keeps a channel on its current key; it never returns
+    to the pairing key. Following a rotated peer needs no setting.
+  - **The chain.** K(e+1) = HMAC-SHA256(K(e), `"derec channel key v1"` ||
+    be32(e+1)), K(0) being the pairing key. `DeRecMessage.sequence` is now the
+    epoch of the key the payload is encrypted under (0 at pairing); it was
+    unused before. A receiver derives at most 512 steps from a key it holds,
+    and a forged epoch changes no state.
+  - **Retention follows stored versions.** A party holds its newest key and the
+    key of every secret version it still stores, and drops a key when the last
+    version under it goes. Any version kept with `keepVersion` therefore
+    restores. The published secret records each helper's and each replica's
+    `key_epoch` (JSON `key_epoch`, omitted when 0), and the recovered-secret
+    JSON the SDKs pass back carries it. The publishing device keeps an old key
+    only for answers still in flight: when a helper fails or times out of a
+    round, that round's pin on its channel goes, so a helper that receives
+    requests but never answers leaves at most one pin behind. A helper the
+    request cannot even be sent to, reported as `ProtectSecretFailed`, keeps
+    one pin, and with rotation on one key, per such round until it is
+    unpaired: an application that sees `ProtectSecretFailed` for the same
+    helper round after round should tell the user the helper is unreachable
+    and offer to unpair it, which drops its keys. On the replica group
+    channel, a round that closes with a member behind keeps only the oldest
+    pin, its own and newer ones. A publish refused before anything is sent
+    moves no epoch.
+  - **New secret kind: `SecretKind::KeyRing = 3`.** Every `DeRecSecretStore`
+    implementation must persist it: the key ring is the authoritative copy,
+    and the `SharedKey` row is a mirror written after it. Migration: store the
+    `(kind, bytes)` row opaquely, with `bytes` of any length, and do not
+    assume 32 bytes or validate the content. Rust implementors store
+    `KeyRing::as_bytes`; in .NET (`SecretKind.KeyRing`), Go
+    (`SecretKindKeyRing`), Node, web and React Native (kind `3`) the bytes
+    arrive already encoded. A table or column that fixed the secret length at
+    32 bytes, or limited `kind` to 0 to 2, must be widened. A channel with no
+    `KeyRing` row is at epoch 0 under its `SharedKey`. `KeyRing::as_bytes`
+    returns a `Result`: a ring with more than 65,535 pins or old keys is an
+    `Error::Invariant`, and the protocol refuses to save it, rather than
+    writing a truncated count. With the `serde` feature, a deserialized
+    `KeyRing` is checked by the same rules as `KeyRing::from_bytes`. A store
+    that answers a `KeyRing` query with another kind is an error, not epoch 0.
+  - **`VerifyFailureReason::NoSharedKey` is reported** for a channel whose
+    shared key or key ring the store answered with a value of another kind;
+    Discovery, UpdateChannelInfo and RecoverSecret report their per-channel
+    `*Failed` event for it, and ProtectSecret fails with `Error::Invariant`.
+  - **New event reason: `IgnoreReason::KeyUnavailable`** (`"KeyUnavailable"`),
+    reported as `MessageIgnored` when a message names an epoch whose key the
+    device cannot obtain. Every SDK exposes it.
+  - **Pending actions.** The token records the epoch it is answered under, and
+    accepting or rejecting a token whose epoch's key can no longer be obtained
+    fails with "the action can no longer be answered: its channel key is no
+    longer held".
+  - **Fingerprints** describe the pairing key. They are meaningful while a
+    channel is `Pending`; after a rotation a fingerprint differs from the one
+    shown at pairing.
+  - **Peers on 0.0.x cannot follow a rotated channel.** There is no
+    negotiation: once an owner rotates, a 0.0.x helper cannot open the
+    messages and times out. Upgrade it and pair again.
+  - **Scope of the guarantee.** Every key derives from the one before it, so a
+    party holding K(e) can compute every later key; forward secrecy covers
+    only epochs older than the oldest key a party still holds. It is claimed
+    against the compromise of a helper device, or of a key alone, plus
+    recorded transport traffic. A compromised helper plus a recording exposes
+    the shares sent to that helper from its oldest held key on; the threshold
+    still applies. It is not claimed against the owner device or replica
+    devices, which hold the plaintext secret and the keys of the versions they
+    store. A key does not heal the chain, and the helper never starts a
+    rotation.
+  - **Primitives take the key's epoch.** *(breaking for every SDK's
+    primitives)* An application driving the protocol through primitives
+    could only send at epoch 0. Every channel `produce` now takes the epoch
+    along with the key, and stamps it into the envelope's `sequence`:
+    - Rust: `produce(.., &ChannelKey, ..)` in place of `&SharedKey`.
+      `ChannelKey` is new and public in `derec_library::types`:
+      `ChannelKey::new(epoch, key)`, `epoch()`, `key()`.
+    - FFI, WASM and every SDK: a new `epoch` argument right after the shared
+      key in every `produce_*` call, for discovery, recovery, sharing,
+      unpairing and verification requests and responses. Pass `0` for a
+      freshly paired channel.
+    - `extract` calls are unchanged and take the key alone. Pairing
+      primitives are unchanged; pairing envelopes always carry epoch 0.
+    - `DeRecMessageBuilder::encrypt` takes `&ChannelKey` and sets `sequence`
+      from it. `DeRecMessageBuilder::sequence` is removed: the epoch is set by
+      encryption, so key and epoch cannot disagree.
+
+    Two helpers let a primitives caller follow a rotated channel. They have
+    the same spelling in every SDK:
+    - **`read_sequence`** reads an envelope's epoch without decrypting it.
+      Rust `derec_message::read_sequence`; .NET `Envelope.ReadSequence`; Go
+      `envelope.ReadSequence`; Node/web/React Native `envelope.read_sequence`;
+      C `read_sequence_from_envelope`.
+    - **`derive`** returns the key at a later epoch. Rust
+      `ChannelKey::derive`; .NET `ChannelKey.Derive`; Go `channelkey.Derive`;
+      Node/web/React Native `channel_key.derive`; C `derive_channel_key`.
+      It is forward only, and refuses more than 512 epochs in one call
+      (`ChannelKey::MAX_DERIVE_STEPS`) as invalid input.
+
+    To receive, read the sequence, then use the key held at that epoch or
+    derive it, then call `extract`. Primitives keep no keys: tracking each
+    channel's newest epoch, and the keys older versions travelled under, is
+    the caller's job.
 
 - **Changed: `SharedKey` is a type that wipes the key on drop.** *(security
   hardening; breaking for Rust only)*
@@ -34,8 +146,10 @@ all of them unless it names a specific binding.
   | `key.to_vec()`, `&key[..]` | `key.as_bytes().to_vec()`, `key.as_bytes()` |
   | `SecretValue::SharedKey(*key)` | `SecretValue::SharedKey(key.clone())` |
 
-  `DeRecMessageBuilder::encrypt` and `derec_message::extract_inner_message`
-  take `&SharedKey`, as the primitives already did.
+  `derec_message::extract_inner_message` takes `&SharedKey`, as the
+  primitives' `extract` calls do. `DeRecMessageBuilder::encrypt` and the
+  primitives' `produce` calls take a `&ChannelKey`, which wraps a `SharedKey`
+  with its epoch; see shared-key rotation above.
 
 - **Fixed: `scripts/lib/build-env.sh` can be sourced from zsh.** Sourced
   from zsh it failed on `BASH_SOURCE` and silently dropped the repository's
@@ -176,8 +290,10 @@ all of them unless it names a specific binding.
     when the reply channel has no key.
   - The seal does not stop an action being resolved twice; resolving each
     once stays the application's part.
-  - The token grows by 32 bytes. .NET, Go, Node, web and React Native pass
-    it through unchanged: no code change.
+  - The token grows by 36 bytes: the 32-byte seal and the 4-byte epoch of
+    the channel key the action is answered under, which the seal covers.
+    .NET, Go, Node, web and React Native pass it through unchanged: no code
+    change.
   - New dependency: `hmac` 0.13 (RustCrypto), on the `sha2` the library
     already uses.
 

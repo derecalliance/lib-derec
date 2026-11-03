@@ -95,7 +95,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     };
 
     let group_channel = member.channel_id;
-    let key = stores.secrets.paired_key(secret_id, group_channel).await?;
+    let key = stores.secrets.current_key(secret_id, group_channel).await?;
 
     // Every member is told, the departing one included. The remaining members
     // need the flag to satisfy the safety rule when the new roster arrives;
@@ -282,6 +282,7 @@ async fn drop_channel<S: StoreSet>(
     let _ = stores.shares.remove_channel(secret_id, channel_id).await;
     for kind in [
         SecretKind::SharedKey,
+        SecretKind::KeyRing,
         SecretKind::PairingSecret,
         SecretKind::PairingContact,
     ] {

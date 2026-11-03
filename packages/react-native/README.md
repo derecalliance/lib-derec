@@ -209,6 +209,32 @@ envelope and the inner message. A message whose two timestamps differ, or
 where either or both are absent, is ignored as `MessageIgnored` with
 `reason: 'TimestampMismatch'`; this includes replies from 0.0.8 peers.
 
+### Key rotation
+
+With `withKeyRotation(true)`, the owner advances each helper channel's key one epoch in every sharing round that reaches the threshold (a round below it advances none), and the replica group channel's key on every publish to replicas. Each step is K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" || be32(e+1)). Rotation is off by default, and off keeps the channel on its current key. The envelope's `sequence` carries the epoch, and peers follow on their own, so the setting is the owner's alone (`key_rotation` in a config). A message under an epoch whose key the device cannot obtain is ignored as `MessageIgnored` with `reason: 'KeyUnavailable'`. A device keeps its newest key and the key of every secret version it still stores, so any kept version restores. The key ring is stored as a secret of kind `3` (`KeyRing`): persist its bytes as given, with any length, beside the kind-`0` shared key. Forward secrecy covers a compromised helper device, or a key alone, plus recorded traffic, and only for epochs older than the oldest key held; the owner and replica devices hold the plaintext secret and the keys of every version they store. A 0.0.x peer cannot follow a rotated channel: it must upgrade and re-pair.
+
+#### Primitives on a rotated channel
+
+`DeRecProtocol` tracks epochs for you. A caller driving the protocol through
+`primitives.*` does it by hand:
+
+- Every channel-encrypted `produce` (discovery, recovery, sharing, unpairing
+  and verification, request and response) takes `epoch` right after
+  `shared_key`: the epoch of that key in the channel's key chain, stamped into
+  the envelope's `sequence`. It is `0` for a freshly paired channel. Pairing
+  envelopes are always epoch `0`.
+- `extract` takes the key alone. To receive, read the epoch with
+  `envelope.read_sequence(bytes)`, use the key you hold at that epoch or derive
+  it with `channel_key.derive(key, epoch, toEpoch)`, then `extract`.
+- `channel_key.derive` runs forward only and at most 512 epochs per call; a
+  `toEpoch` below `epoch` or more than 512 above it throws `invalid_input`.
+
+```ts
+const epoch = envelope.read_sequence(bytes);
+const key = channel_key.derive(k0, 0, epoch);
+const { request } = primitives.verification.request.extract(bytes, key);
+```
+
 ---
 
 ## When `process()` fails
@@ -267,7 +293,7 @@ response.
 Hand the token back exactly as you received it. It is sealed to its channel,
 so `accept` and `reject` refuse one that was edited, rebuilt or moved to
 another channel with a `DeRecError` whose `code` is `"invalid_input"`, and
-nothing is stored or sent. A token issued by v0.0.10 does not decode
+nothing is stored or sent. A token raised under a channel key the device no longer holds, because the channel has moved on and no stored version keeps that key, is too late to answer and is refused the same way. A token issued by v0.0.10 does not decode
 (`"ffi_bad_proto"`).
 
 `withAutoRespondOnFailure` decides who answers. With it on, the library sends
@@ -449,7 +475,7 @@ can take an unbounded amount of time (disk I/O, network requests). Those
 methods return a `Promise`.
 
 **Primitives are the exception.** The functions under `primitives.*` (and
-`envelope.*`) are pure byte transforms with no store or transport callbacks,
+`envelope.*` and `channel_key.*`) are pure byte transforms with no store or transport callbacks,
 so they run synchronously, in-line, on the calling JavaScript thread —
 including `primitives.sharing.request.split` (`protect_secret`), which does
 real cryptographic work: Shamir secret splitting, AES-GCM encryption, and
@@ -660,6 +686,7 @@ The canonical JSON, shared by every SDK, is:
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
   "auto_accept": { "pairing": true, "store_share": true },
   "auto_respond_on_failure": false,
+  "key_rotation": false,
   "auto_reply_to": false,
   "unpair_ack": "required",
   "unsafe_connection": false,

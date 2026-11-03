@@ -30,8 +30,11 @@ var Request requestAPI
 //
 // replyTo lists the endpoints, in preference order, the peer should answer
 // on; nil or empty means answer on the endpoints recorded for the channel.
-func (requestAPI) Produce(channelID, secretID uint64, version uint32, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
-	return native.ProduceVerifyShareRequest(channelID, secretID, version, sharedKey, replyTo)
+//
+// epoch is the epoch of sharedKey in the channel's key chain, stamped into
+// the envelope's sequence; 0 for a freshly paired channel.
+func (requestAPI) Produce(channelID, secretID uint64, version uint32, sharedKey []byte, epoch uint32, replyTo []Endpoint) ([]byte, error) {
+	return native.ProduceVerifyShareRequest(channelID, secretID, version, sharedKey, epoch, replyTo)
 }
 
 // Extract decrypts a verification request envelope and returns its channel id
@@ -61,8 +64,11 @@ var Response responseAPI
 // Produce builds the wire-encoded DeRecMessage proving possession of
 // shareContent in answer to requestProto (the RequestProto returned by
 // Request.Extract), encrypted under sharedKey.
-func (responseAPI) Produce(channelID uint64, requestProto, sharedKey, shareContent []byte) ([]byte, error) {
-	return native.ProduceVerifyShareResponse(channelID, requestProto, sharedKey, shareContent)
+//
+// epoch is the epoch of sharedKey in the channel's key chain, stamped into
+// the envelope's sequence; 0 for a freshly paired channel.
+func (responseAPI) Produce(channelID uint64, requestProto, sharedKey []byte, epoch uint32, shareContent []byte) ([]byte, error) {
+	return native.ProduceVerifyShareResponse(channelID, requestProto, sharedKey, epoch, shareContent)
 }
 
 // Extract decrypts a verification response envelope and returns its channel

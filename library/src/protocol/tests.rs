@@ -234,6 +234,7 @@ impl DeRecSecretStore for InMemSecretStore {
             SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
             SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
             SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
+            SecretValue::KeyRing(_) => SecretKind::KeyRing as u8,
         };
         self.data.lock().unwrap().insert((sid, cid.0, k), value);
         Box::pin(std::future::ready(Ok(())))
@@ -911,6 +912,7 @@ impl LocalFixture {
             policy: self.policy,
             communication_info: &self.communication_info,
             parameter_range: self.parameter_range.as_ref(),
+            key_rotation: false,
         }
     }
 }

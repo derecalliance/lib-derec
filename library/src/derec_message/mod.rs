@@ -113,6 +113,20 @@ pub fn read_trace_id(envelope_bytes: &[u8]) -> Result<u64, crate::Error> {
     Ok(envelope.trace_id)
 }
 
+/// Read the `sequence` field off an inbound DeRecMessage envelope without
+/// touching the encrypted inner payload.
+///
+/// On a channel envelope, `sequence` is the epoch of the channel key that
+/// encrypted the payload. A caller driving the protocol through primitives
+/// reads it to pick the key that opens the message: the key it holds at that
+/// epoch, or one derived forward with [`crate::types::ChannelKey::derive`].
+/// The field is not authenticated; a forged value only selects a key that
+/// fails to decrypt.
+pub fn read_sequence(envelope_bytes: &[u8]) -> Result<u32, crate::Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+    Ok(envelope.sequence)
+}
+
 pub fn extract_inner_pairing_message(
     message_bytes: &[u8],
     pairing_secret: &PairingSecretKeyMaterial,

@@ -82,6 +82,7 @@ pub(crate) mod context;
 pub(crate) mod fingerprint;
 pub(crate) mod flows;
 mod handlers;
+pub(crate) mod keychain;
 pub(crate) mod obligation;
 pub(crate) mod process;
 pub(crate) mod protocol_config;
@@ -95,11 +96,14 @@ pub(crate) mod sweeps;
 #[cfg(test)]
 pub(crate) mod tests;
 
+pub(crate) use crate::types::ChannelKey;
 pub use builder::{DEFAULT_THRESHOLD, DeRecProtocolBuilder, DeRecStores};
 use derec_proto::TransportProtocol;
 pub use error::{
     ChannelStoreError, ProcessError, Refusal, SecretStoreError, ShareStoreError, StateStoreError,
 };
+pub use keychain::KeyRing;
+pub(crate) use keychain::{FORWARD_JUMP_LIMIT, derive as derive_key};
 pub use protocol_config::{DeRecProtocolConfig, ExpiredChannelsConfig, TimeoutsConfig};
 use std::collections::HashMap;
 pub use traits::{
@@ -210,6 +214,12 @@ pub struct DeRecProtocol<
     pub(crate) communication_info: HashMap<String, String>,
     /// Configured via [`DeRecProtocolBuilder::with_auto_respond_on_failure`](crate::protocol::DeRecProtocolBuilder::with_auto_respond_on_failure).
     pub(crate) auto_respond_on_failure: bool,
+    /// Whether the owner advances channel keys: helper channels in each
+    /// sharing round that reaches the threshold, the group channel on each
+    /// publish to replicas.
+    ///
+    /// Configured via [`DeRecProtocolBuilder::with_key_rotation`](crate::protocol::DeRecProtocolBuilder::with_key_rotation).
+    pub(crate) key_rotation: bool,
     /// Configured via [`DeRecProtocolBuilder::with_auto_reply_to`](crate::protocol::DeRecProtocolBuilder::with_auto_reply_to).
     ///
     /// When `true`, every outbound request envelope carries

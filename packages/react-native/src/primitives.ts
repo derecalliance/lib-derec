@@ -114,12 +114,14 @@ const discovery = {
     produce(
       channel_id: bigint,
       shared_key: Uint8Array,
+      epoch: number,
       reply_to?: TransportProtocol[],
     ): ProduceResult {
       const envelope = call(
         'produce_get_secret_ids_versions_request_message',
         channel_id,
         shared_key,
+        epoch,
         replyTo(reply_to),
       );
       return { envelope: bytes(envelope) };
@@ -148,12 +150,14 @@ const discovery = {
       channel_id: bigint,
       secret_list: SecretVersionEntry[],
       shared_key: Uint8Array,
+      epoch: number,
     ): ProduceResult {
       const envelope = call(
         'produce_get_secret_ids_versions_response_message',
         channel_id,
         encodeSecretList(secret_list),
         shared_key,
+        epoch,
       );
       return { envelope: bytes(envelope) };
     },
@@ -520,6 +524,7 @@ const recovery = {
       secret_id: bigint,
       version: number,
       shared_key: Uint8Array,
+      epoch: number,
       reply_to?: TransportProtocol[],
     ): ProduceResult {
       const envelope = call(
@@ -528,6 +533,7 @@ const recovery = {
         secret_id,
         version,
         shared_key,
+        epoch,
         replyTo(reply_to),
       );
       return { envelope: bytes(envelope) };
@@ -555,6 +561,7 @@ const recovery = {
       request: GetShareRequestMessage,
       stored_share_request: StoreShareRequestMessage,
       shared_key: Uint8Array,
+      epoch: number,
     ): ProduceResult {
       const envelope = call(
         'produce_get_share_response_message',
@@ -562,6 +569,7 @@ const recovery = {
         encodeMessage(MessageKind.GetShareRequest, request),
         encodeMessage(MessageKind.StoreShareRequest, stored_share_request),
         shared_key,
+        epoch,
       );
       return { envelope: bytes(envelope) };
     },
@@ -633,6 +641,7 @@ const sharing = {
       keep_version: number,
       description: string,
       shared_key: Uint8Array,
+      epoch: number,
       reply_to?: TransportProtocol[],
     ): ProduceResult {
       const envelope = call(
@@ -644,6 +653,7 @@ const sharing = {
         keep_version,
         utf8Encode(description),
         shared_key,
+        epoch,
         replyTo(reply_to),
       );
       return { envelope: bytes(envelope) };
@@ -670,12 +680,14 @@ const sharing = {
       channel_id: bigint,
       request: StoreShareRequestMessage,
       shared_key: Uint8Array,
+      epoch: number,
     ): SharingResponseProduceResult {
       const result = call(
         'produce_store_share_response_message',
         channel_id,
         encodeMessage(MessageKind.StoreShareRequest, request),
         shared_key,
+        epoch,
       ) as {
         wire_bytes: ArrayBuffer;
         committed_share_bytes: ArrayBuffer;
@@ -724,6 +736,7 @@ const unpairing = {
       channel_id: bigint,
       memo: string,
       shared_key: Uint8Array,
+      epoch: number,
       reply_to?: TransportProtocol[],
     ): ProduceResult {
       const envelope = call(
@@ -731,6 +744,7 @@ const unpairing = {
         channel_id,
         utf8Encode(memo),
         shared_key,
+        epoch,
         replyTo(reply_to),
       );
       return { envelope: bytes(envelope) };
@@ -753,8 +767,8 @@ const unpairing = {
   },
 
   response: {
-    produce(channel_id: bigint, shared_key: Uint8Array): ProduceResult {
-      const envelope = call('produce_unpair_response_message', channel_id, shared_key);
+    produce(channel_id: bigint, shared_key: Uint8Array, epoch: number): ProduceResult {
+      const envelope = call('produce_unpair_response_message', channel_id, shared_key, epoch);
       return { envelope: bytes(envelope) };
     },
 
@@ -796,6 +810,7 @@ const verification = {
       secret_id: bigint,
       version: number,
       shared_key: Uint8Array,
+      epoch: number,
       reply_to?: TransportProtocol[],
     ): ProduceResult {
       const envelope = call(
@@ -804,6 +819,7 @@ const verification = {
         secret_id,
         version,
         shared_key,
+        epoch,
         replyTo(reply_to),
       );
       return { envelope: bytes(envelope) };
@@ -830,6 +846,7 @@ const verification = {
       channel_id: bigint,
       request: VerifyShareRequestMessage,
       shared_key: Uint8Array,
+      epoch: number,
       share_content: Uint8Array,
     ): ProduceResult {
       const envelope = call(
@@ -837,6 +854,7 @@ const verification = {
         channel_id,
         encodeMessage(MessageKind.VerifyShareRequest, request),
         shared_key,
+        epoch,
         share_content,
       );
       return { envelope: bytes(envelope) };
@@ -875,6 +893,13 @@ const verification = {
   },
 };
 
+/**
+ * Every channel-encrypted `produce` takes `epoch` right after `shared_key`:
+ * the epoch of `shared_key` in the channel's key chain, stamped into the
+ * envelope's `sequence` so the receiver can pick the key. It is 0 for a
+ * freshly paired channel. `extract` takes the key alone; read the epoch with
+ * `envelope.read_sequence` and derive the key with `channel_key.derive`.
+ */
 export const primitives = {
   discovery,
   pairing,
@@ -894,5 +919,27 @@ export const envelope = {
   },
   read_trace_id(envelope_bytes: Uint8Array): bigint {
     return call('read_trace_id_from_envelope', envelope_bytes) as bigint;
+  },
+  /**
+   * Read `sequence` off an inbound envelope: the epoch of the channel key
+   * that encrypted it. Pick or derive the key at that epoch before `extract`.
+   */
+  read_sequence(envelope_bytes: Uint8Array): number {
+    return call('read_sequence_from_envelope', envelope_bytes) as number;
+  },
+};
+
+/**
+ * The channel key chain. A channel key moves forward one epoch at a time:
+ * K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" || be32(e+1)).
+ */
+export const channel_key = {
+  /**
+   * The 32-byte channel key at `to_epoch`, derived forward from `key`, the
+   * key at `epoch`. Throws `invalid_input` when `to_epoch` is below `epoch`
+   * or more than 512 epochs above it.
+   */
+  derive(key: Uint8Array, epoch: number, to_epoch: number): Uint8Array {
+    return bytes(call('derive_channel_key', key, epoch, to_epoch));
   },
 };

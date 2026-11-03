@@ -53,6 +53,10 @@ struct HelperIn {
     /// The Helper's subshare count. Absent or `null` is `1`.
     #[serde(default)]
     weight: Option<u32>,
+    /// The epoch of `shared_key` on the Helper's channel. Absent or `null`
+    /// is `0`.
+    #[serde(default)]
+    key_epoch: Option<u32>,
 }
 
 #[derive(serde::Deserialize)]
@@ -75,6 +79,10 @@ struct ReplicasIn {
     members: Vec<ReplicaIn>,
     #[serde(default)]
     shared_key: Vec<u8>,
+    /// The epoch of `shared_key` on the group channel. Absent or `null` is
+    /// `0`.
+    #[serde(default)]
+    key_epoch: Option<u32>,
 }
 
 #[derive(serde::Deserialize)]
@@ -136,6 +144,7 @@ impl RecoveredSecretIn {
                     shared_key: h.shared_key,
                     communication_info: h.communication_info.unwrap_or_default(),
                     weight,
+                    key_epoch: h.key_epoch.unwrap_or_default(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -168,6 +177,7 @@ impl RecoveredSecretIn {
                     channel_id: parse_decimal_u64(&g.channel_id, "replicas.channel_id")?,
                     members,
                     shared_key: g.shared_key,
+                    key_epoch: g.key_epoch.unwrap_or_default(),
                 })
             })
             .transpose()?;

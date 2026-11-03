@@ -374,6 +374,15 @@ impl DeRecProtocolBuilderWasm {
         self
     }
 
+    /// Whether the owner advances channel keys: each helper channel one epoch
+    /// in every sharing round that reaches the threshold, and the replica
+    /// group channel one epoch on every publish to replicas. Default: false.
+    #[wasm_bindgen(js_name = withKeyRotation)]
+    pub fn with_key_rotation(mut self, enabled: bool) -> DeRecProtocolBuilderWasm {
+        self.config.key_rotation = Some(enabled);
+        self
+    }
+
     /// `ack` is exactly `"required"` (default) or `"not_required"`, naming
     /// [`crate::protocol::UnpairAck::Required`] and
     /// [`crate::protocol::UnpairAck::NotRequired`].
