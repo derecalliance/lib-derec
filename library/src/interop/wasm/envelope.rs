@@ -4,6 +4,7 @@
 //! WASM bindings for envelope-level helpers that operate on raw
 //! `DeRecMessage` bytes. Mirrors the FFI shape in `crate::interop::ffi::envelope`.
 
+use crate::derec_message;
 use crate::interop::wasm::ts_bindings_utils::js_error;
 use wasm_bindgen::prelude::*;
 
@@ -16,7 +17,7 @@ use wasm_bindgen::prelude::*;
 /// end-to-end on its own).
 #[wasm_bindgen(js_name = "envelope_apply_trace_id")]
 pub fn apply_trace_id(envelope_bytes: &[u8], trace_id: u64) -> Result<Vec<u8>, JsValue> {
-    crate::derec_message::apply_trace_id(envelope_bytes, trace_id)
+    derec_message::apply_trace_id(envelope_bytes, trace_id)
         .map_err(|e| js_error("envelope_decode_error", e.to_string()))
 }
 
@@ -25,6 +26,6 @@ pub fn apply_trace_id(envelope_bytes: &[u8], trace_id: u64) -> Result<Vec<u8>, J
 /// default is indistinguishable from an explicit zero.
 #[wasm_bindgen(js_name = "envelope_read_trace_id")]
 pub fn read_trace_id(envelope_bytes: &[u8]) -> Result<u64, JsValue> {
-    crate::derec_message::read_trace_id(envelope_bytes)
+    derec_message::read_trace_id(envelope_bytes)
         .map_err(|e| js_error("envelope_decode_error", e.to_string()))
 }

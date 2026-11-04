@@ -3,10 +3,11 @@
 
 use super::*;
 use crate::{
-    derec_message::DeRecMessageBuilder, protocol_version::ProtocolVersion, types::ChannelId,
+    Error, derec_message::DeRecMessageBuilder, protocol_version::ProtocolVersion, types::ChannelId,
+    utils::os_rng,
 };
 use derec_cryptography::pairing::ecies;
-use derec_proto::{MessageBody, PairRequestMessage};
+use derec_proto::{DeRecMessage, MessageBody, PairRequestMessage};
 use prost::Message;
 
 const CHANNEL_ID: ChannelId = ChannelId(42);
@@ -14,7 +15,7 @@ const SEQUENCE: u32 = 7;
 const SHARED_KEY: [u8; 32] = [0xAB; 32];
 
 fn pairing_keypair() -> (Vec<u8>, Vec<u8>) {
-    ecies::generate_key(&mut crate::utils::os_rng()).unwrap()
+    ecies::generate_key(&mut os_rng()).unwrap()
 }
 
 fn sample_message() -> PairRequestMessage {
@@ -336,8 +337,7 @@ fn test_trace_id_round_trips_through_proto_encoding() {
         .expect("build should succeed");
 
     let wire_bytes = original.encode_to_vec();
-    let decoded =
-        derec_proto::DeRecMessage::decode(wire_bytes.as_slice()).expect("envelope should decode");
+    let decoded = DeRecMessage::decode(wire_bytes.as_slice()).expect("envelope should decode");
 
     assert_eq!(decoded.trace_id, 0xFEED_FACE_BAAD_F00D);
 }
@@ -361,7 +361,7 @@ fn test_extract_inner_plaintext_message_rejects_garbage() {
     let err = extract_inner_plaintext_message(b"not a valid protobuf")
         .expect_err("garbage bytes must not decode as a MessageBody");
 
-    assert!(matches!(err, crate::Error::ProtobufDecode(_)));
+    assert!(matches!(err, Error::ProtobufDecode(_)));
 }
 
 #[test]

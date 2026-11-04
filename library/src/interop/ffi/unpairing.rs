@@ -8,6 +8,7 @@
 
 use std::ffi::CString;
 use std::os::raw::c_char;
+use std::{ptr, slice, str};
 
 use crate::interop::ffi::common::{
     DeRecBuffer, empty_buffer, parse_transport_protocol_list, vec_into_buffer,
@@ -17,6 +18,7 @@ use crate::interop::ffi::error::{
     DEREC_CODE_FFI_NUL_IN_STRING, DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error,
     success,
 };
+use crate::primitives::unpairing::{request, response};
 use derec_proto::{DeRecMessage, UnpairResponseMessage};
 use prost::Message as _;
 
@@ -81,7 +83,7 @@ pub extern "C" fn produce_unpair_request_message(
         Ok(b) => b,
         Err(e) => return with_err(e),
     };
-    let memo = match std::str::from_utf8(memo_bytes) {
+    let memo = match str::from_utf8(memo_bytes) {
         Ok(s) => s,
         Err(_) => {
             return with_err(ffi_error(
@@ -100,7 +102,7 @@ pub extern "C" fn produce_unpair_request_message(
         Err(e) => return with_err(e),
     };
 
-    match crate::primitives::unpairing::request::produce(
+    match request::produce(
         channel_id.into(),
         memo,
         &shared_key,
@@ -130,7 +132,7 @@ pub extern "C" fn extract_unpair_request(
     let with_err = |error| ExtractUnpairRequestResult {
         error,
         channel_id: 0,
-        memo: std::ptr::null_mut(),
+        memo: ptr::null_mut(),
         request_proto_bytes: empty_buffer(),
     };
 
@@ -153,7 +155,7 @@ pub extern "C" fn extract_unpair_request(
         }
     };
 
-    match crate::primitives::unpairing::request::extract(request_bytes, &shared_key) {
+    match request::extract(request_bytes, &shared_key) {
         Ok(r) => {
             let request_proto_bytes = vec_into_buffer(r.request.encode_to_vec());
             let memo_c = match CString::new(r.request.memo) {
@@ -195,7 +197,7 @@ pub extern "C" fn produce_unpair_response_message(
         Err(e) => return with_err(e),
     };
 
-    match crate::primitives::unpairing::response::produce(channel_id.into(), &shared_key) {
+    match response::produce(channel_id.into(), &shared_key) {
         Ok(r) => ProduceUnpairResponseMessageResult {
             error: success(),
             response_wire_bytes: vec_into_buffer(r.envelope),
@@ -239,7 +241,7 @@ pub extern "C" fn extract_unpair_response(
         }
     };
 
-    match crate::primitives::unpairing::response::extract(response_bytes, &shared_key) {
+    match response::extract(response_bytes, &shared_key) {
         Ok(r) => ExtractUnpairResponseResult {
             error: success(),
             channel_id,
@@ -278,7 +280,7 @@ pub extern "C" fn process_unpair_response_message(
         }
     };
 
-    match crate::primitives::unpairing::response::process(&response) {
+    match response::process(&response) {
         Ok(_) => ProcessUnpairResponseResult { error: success() },
         Err(e) => with_err(from_lib_error(e)),
     }
@@ -294,7 +296,7 @@ fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], 
     if len == 0 {
         Ok(&[])
     } else {
-        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+        Ok(unsafe { slice::from_raw_parts(ptr, len) })
     }
 }
 

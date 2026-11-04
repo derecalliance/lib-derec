@@ -3,8 +3,11 @@
 
 use crate::extensions::committed_derec_share::CommittedDeRecShareExt as _;
 use crate::extensions::derec_result::DeRecResultExt as _;
+use crate::extensions::derec_share::into_vss_subshares;
 use crate::primitives::sharing::SharingError;
+use crate::primitives::sharing::request::validate_keep_version;
 use crate::{
+    Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, SharedKey},
     utils::verify_timestamps,
@@ -127,7 +130,7 @@ pub fn produce(
     channel_id: ChannelId,
     request: &StoreShareRequestMessage,
     shared_key: &SharedKey,
-) -> Result<ProduceResult, crate::Error> {
+) -> Result<ProduceResult, Error> {
     let (committed_share, secret_id) = validate_produce_inputs(request)?;
     let version = request.version;
 
@@ -240,18 +243,15 @@ pub fn produce(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
-pub fn extract(
-    envelope_bytes: &[u8],
-    shared_key: &SharedKey,
-) -> Result<ExtractResult, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractResult, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
     let response = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::StoreShareResponse(message) => message,
         _ => {
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected StoreShareResponseMessage");
-            return Err(crate::Error::Invariant(
+            return Err(Error::Invariant(
                 "Invalid message. Expected: StoreShareResponseMessage",
             ));
         }
@@ -331,8 +331,8 @@ pub fn extract(
     feature = "logging",
     tracing::instrument(skip_all, fields(version = version))
 )]
-pub fn process(version: u32, response: &StoreShareResponseMessage) -> Result<(), crate::Error> {
-    let result = response.result.as_ref().ok_or(crate::Error::Invariant(
+pub fn process(version: u32, response: &StoreShareResponseMessage) -> Result<(), Error> {
+    let result = response.result.as_ref().ok_or(Error::Invariant(
         "StoreShareResponseMessage is missing result field",
     ))?;
 
@@ -360,7 +360,7 @@ pub fn process(version: u32, response: &StoreShareResponseMessage) -> Result<(),
 
 fn validate_produce_inputs(
     request: &StoreShareRequestMessage,
-) -> Result<(CommittedDeRecShare, u64), crate::Error> {
+) -> Result<(CommittedDeRecShare, u64), Error> {
     validate_share(request).map_err(|fault| fault.error)
 }
 
@@ -375,11 +375,11 @@ pub(crate) struct ShareFault {
     /// Human-readable reason sent to the Owner.
     pub(crate) memo: &'static str,
     /// The same failure as [`produce`] reports it.
-    error: crate::Error,
+    error: Error,
 }
 
 impl ShareFault {
-    fn format(memo: &'static str, error: crate::Error) -> Self {
+    fn format(memo: &'static str, error: Error) -> Self {
         Self {
             status: StatusEnum::FormatError,
             memo,
@@ -406,10 +406,7 @@ pub(crate) fn validate_share(
 ) -> Result<(CommittedDeRecShare, u64), ShareFault> {
     const BAD_KEEP_VERSION: &str = "keepVersion must be below version";
 
-    if let Err(error) = crate::primitives::sharing::request::validate_keep_version(
-        request.keep_version,
-        request.version,
-    ) {
+    if let Err(error) = validate_keep_version(request.keep_version, request.version) {
         return Err(ShareFault::format(BAD_KEEP_VERSION, error.into()));
     }
     validate_committed_share(&request.share)
@@ -431,27 +428,27 @@ pub(crate) fn validate_committed_share(
     if share.is_empty() {
         #[cfg(feature = "logging")]
         tracing::warn!("committed share is empty");
-        return Err(ShareFault::format(EMPTY, crate::Error::Invariant(EMPTY)));
+        return Err(ShareFault::format(EMPTY, Error::Invariant(EMPTY)));
     }
 
     let committed_share = CommittedDeRecShare::decode(share)
-        .map_err(|e| ShareFault::format(NOT_COMMITTED, crate::Error::ProtobufDecode(e)))?;
+        .map_err(|e| ShareFault::format(NOT_COMMITTED, Error::ProtobufDecode(e)))?;
 
     committed_share.validate().map_err(|error| {
         let memo = match error {
-            crate::Error::Invariant(memo) => memo,
+            Error::Invariant(memo) => memo,
             _ => NOT_COMMITTED,
         };
         ShareFault::format(memo, error)
     })?;
 
     let inner_share = DeRecShare::decode(committed_share.de_rec_share.as_slice())
-        .map_err(|e| ShareFault::format(NOT_DEREC_SHARE, crate::Error::ProtobufDecode(e)))?;
+        .map_err(|e| ShareFault::format(NOT_DEREC_SHARE, Error::ProtobufDecode(e)))?;
 
     let secret_id = inner_share.secret_id;
 
     let vss_share = vss::VSSShare {
-        subshares: crate::extensions::derec_share::into_vss_subshares(inner_share.subshares),
+        subshares: into_vss_subshares(inner_share.subshares),
         encrypted_secret: inner_share.encrypted_secret,
         commitment: committed_share.commitment.clone(),
         merkle_path: committed_share
@@ -467,7 +464,7 @@ pub(crate) fn validate_committed_share(
         return Err(ShareFault {
             status: StatusEnum::VerificationFailed,
             memo: UNVERIFIED,
-            error: crate::Error::Invariant(UNVERIFIED),
+            error: Error::Invariant(UNVERIFIED),
         });
     }
 

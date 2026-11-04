@@ -30,6 +30,8 @@
 //! under a bare `cargo test`. The Makefile's `cargo test -p derec-library
 //! --features ffi` (`ffi` implies `serde`) is the run that exercises it.
 
+use std::fs;
+
 use derec_library::interop::dto;
 
 /// Pairs each DTO with its field names, and makes the pairing self-checking.
@@ -166,8 +168,7 @@ fn typescript_surfaces_declare_every_dto_field() {
 
     for surface in SURFACES {
         let path = format!("{root}/{surface}");
-        let source =
-            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
 
         for (name, fields) in &expected {
             let Some(declared) = declared_fields(&source, name) else {
@@ -220,7 +221,7 @@ fn typescript_surfaces_forward_unsafe_connection_and_grpc() {
 
     for pkg in ["nodejs", "web"] {
         let path = format!("{root}/packages/{pkg}/index.d.ts");
-        let dts = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        let dts = fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
         assert!(
             dts.contains("withUnsafeConnection(allow: boolean): DeRecProtocolBuilder;"),
             "{path} does not declare withUnsafeConnection"
@@ -228,7 +229,7 @@ fn typescript_surfaces_forward_unsafe_connection_and_grpc() {
     }
 
     let rn_path = format!("{root}/packages/react-native/src/protocol.ts");
-    let rn = std::fs::read_to_string(&rn_path).unwrap_or_else(|e| panic!("reading {rn_path}: {e}"));
+    let rn = fs::read_to_string(&rn_path).unwrap_or_else(|e| panic!("reading {rn_path}: {e}"));
     assert!(
         rn.contains("withUnsafeConnection(allow: boolean): this")
             && rn.contains("this.config.unsafe_connection = allow;"),
@@ -250,7 +251,7 @@ fn typescript_surfaces_forward_unsafe_connection_and_grpc() {
         format!("{root}/packages/web/index.d.ts"),
         format!("{root}/packages/react-native/src/types.ts"),
     ] {
-        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
         assert!(
             src.contains(r#"export type TransportProtocolName = "https" | "grpc";"#),
             "{path} does not name both transport protocols"

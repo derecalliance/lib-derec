@@ -9,6 +9,9 @@
 //! correlation token described on `DeRecMessage.traceId` — but the module is
 //! the natural home for any future envelope-level utilities.
 
+use std::slice;
+
+use crate::derec_message::{apply_trace_id, read_trace_id};
 use crate::interop::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
 use crate::interop::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, success,
@@ -57,10 +60,10 @@ pub extern "C" fn apply_trace_id_to_envelope(
     let bytes = if envelope_len == 0 {
         &[][..]
     } else {
-        unsafe { std::slice::from_raw_parts(envelope_ptr, envelope_len) }
+        unsafe { slice::from_raw_parts(envelope_ptr, envelope_len) }
     };
 
-    match crate::derec_message::apply_trace_id(bytes, trace_id) {
+    match apply_trace_id(bytes, trace_id) {
         Ok(out) => ApplyTraceIdResult {
             error: success(),
             wire_bytes: vec_into_buffer(out),
@@ -93,10 +96,10 @@ pub extern "C" fn read_trace_id_from_envelope(
     let bytes = if envelope_len == 0 {
         &[][..]
     } else {
-        unsafe { std::slice::from_raw_parts(envelope_ptr, envelope_len) }
+        unsafe { slice::from_raw_parts(envelope_ptr, envelope_len) }
     };
 
-    match crate::derec_message::read_trace_id(bytes) {
+    match read_trace_id(bytes) {
         Ok(trace_id) => ReadTraceIdResult {
             error: success(),
             trace_id,

@@ -5,26 +5,35 @@
 //!
 //! Nothing in the protocol runs on its own clock: [`DeRecProtocol::tick`] is
 //! the application handing over control so deadlines can be checked. A round
-//! that never completes, an unpair that is never acknowledged, and a channel
-//! that outlives its pairing window are all settled from here.
+//! that never completes, an unpair that is never acknowledged, a recovery
+//! still waiting on a silent helper, and a channel that outlives its pairing
+//! window are all settled from here.
 
+use super::DeRecProtocol;
 use super::context::local;
 use super::events::DeRecEvent;
+use super::handlers::{recovery, unpairing};
 use super::stores::borrow_stores;
 use super::traits::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport,
     DeRecUserSecretStore,
 };
 use super::types::{SecretKind, StateItem, StateKey, StateKind};
-use super::{DeRecProtocol, handlers};
 use crate::{Result, types::ChannelId};
-use derec_proto::StatusEnum;
+use derec_proto::{CommittedDeRecShare, DeRecShare, StatusEnum};
 
 use crate::extensions::channel_store::ChannelStoreExt as _;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
+use crate::protocol::ExpiredChannelCleanup;
+use crate::protocol::types::{
+    ChannelQuery, ChannelStatus, HelperFilter, ReplicaFilter, ReplicaMember, SharingRoundState,
+};
+use crate::types::ReplicaId;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
+use std::collections::HashSet;
+use std::mem;
 
 impl<
     Ch: DeRecChannelStore,
@@ -72,7 +81,11 @@ impl<
     ///    [`DeRecEvent::ShareRejected`], every member still pending is
     ///    reported [`DeRecEvent::ReplicaSyncFailed`].
     /// 3. Unpair-acknowledgement timeouts.
-    /// 4. The round tally, which is what turns a fully-drained round into
+    /// 4. Recovery timeouts — a recovery still waiting on a helper past
+    ///    [`Timeouts::get_share_response`](crate::protocol::types::Timeouts::get_share_response)
+    ///    reports each silent helper as [`DeRecEvent::RecoverSecretFailed`]
+    ///    and decides on the shares it holds.
+    /// 5. The round tally, which is what turns a fully-drained round into
     ///    [`DeRecEvent::SharingComplete`] and clears its state row. Step 2
     ///    only marks the participants; without this the round would report
     ///    failures and still never close.
@@ -146,8 +159,8 @@ impl<
             .channel_store
             .helpers_matching(
                 self.secret_id,
-                crate::protocol::types::HelperFilter {
-                    status: vec![crate::protocol::types::ChannelStatus::Pending],
+                HelperFilter {
+                    status: vec![ChannelStatus::Pending],
                     ..Default::default()
                 },
             )
@@ -159,7 +172,7 @@ impl<
                 self.channel_store
                     .remove(
                         self.secret_id,
-                        crate::protocol::types::ChannelQuery::Helper {
+                        ChannelQuery::Helper {
                             channel_id: channel.channel_id,
                         },
                     )
@@ -181,8 +194,8 @@ impl<
             .channel_store
             .replicas_matching(
                 self.secret_id,
-                crate::protocol::types::ReplicaFilter {
-                    status: vec![crate::protocol::types::ChannelStatus::Pending],
+                ReplicaFilter {
+                    status: vec![ChannelStatus::Pending],
                     exclude: self.exclude_self(),
                     ..Default::default()
                 },
@@ -193,7 +206,7 @@ impl<
                 self.channel_store
                     .remove(
                         self.secret_id,
-                        crate::protocol::types::ChannelQuery::Replica {
+                        ChannelQuery::Replica {
                             channel_id: member.channel_id,
                             replica_id: member.replica_id,
                         },
@@ -215,7 +228,7 @@ impl<
         }
 
         if let Some(own) = self.own_member().await?
-            && own.status == crate::protocol::types::ChannelStatus::Pending
+            && own.status == ChannelStatus::Pending
             && now.saturating_sub(own.created_at) > timeout
             && self.release_if_unused(own.channel_id).await?
             && !removed.contains(&own.channel_id)
@@ -229,7 +242,7 @@ impl<
     }
 
     /// This device's own member row, whichever channel it is on.
-    async fn own_member(&self) -> Result<Option<crate::protocol::types::ReplicaMember>> {
+    async fn own_member(&self) -> Result<Option<ReplicaMember>> {
         let Some(own) = self.replica_id else {
             return Ok(None);
         };
@@ -237,8 +250,8 @@ impl<
             .channel_store
             .replicas_matching(
                 self.secret_id,
-                crate::protocol::types::ReplicaFilter {
-                    ids: vec![crate::types::ReplicaId(own)],
+                ReplicaFilter {
+                    ids: vec![ReplicaId(own)],
                     ..Default::default()
                 },
             )
@@ -255,8 +268,6 @@ impl<
     /// pairing material. A `Paired` own row is the device's place in a group
     /// and keeps the channel. Returns whether the channel was released.
     pub(super) async fn release_if_unused(&mut self, channel_id: ChannelId) -> Result<bool> {
-        use crate::protocol::types::{ChannelQuery, ChannelStatus};
-
         if self
             .channel_store
             .load(self.secret_id, ChannelQuery::Helper { channel_id })
@@ -273,7 +284,7 @@ impl<
             .into_iter()
             .filter(|m| m.channel_id == channel_id)
             .collect();
-        let own = self.replica_id.map(crate::types::ReplicaId);
+        let own = self.replica_id.map(ReplicaId);
         if on_channel
             .iter()
             .any(|m| Some(m.replica_id) != own || m.status == ChannelStatus::Paired)
@@ -319,9 +330,7 @@ impl<
     /// at the end, over these events together with the message's own, and
     /// running it here as well would reorder what `process` reports.
     pub(super) async fn run_timeout_sweeps(&mut self) -> Vec<DeRecEvent> {
-        if let crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs } =
-            self.timeouts.expired_channels
-        {
+        if let ExpiredChannelCleanup::Enabled { timeout_in_secs } = self.timeouts.expired_channels {
             // Best effort: a cleanup failure must not fail the `process` or
             // `tick` that ran it, or a store hiccup would reject a message
             // that has nothing to do with expiry. Logged rather than dropped
@@ -337,6 +346,79 @@ impl<
 
         let mut events = self.check_sharing_round_timeouts().await;
         events.append(&mut self.check_unpair_timeouts().await);
+        events.append(&mut self.check_recovery_timeouts().await);
+        events
+    }
+
+    /// Close every recovery whose share requests have waited longer than
+    /// [`Timeouts::get_share_response`](crate::protocol::types::Timeouts::get_share_response),
+    /// deciding it on the shares it holds.
+    ///
+    /// Each Helper still silent is reported as
+    /// [`DeRecEvent::RecoverSecretFailed`] with error `"timeout"`, followed by
+    /// the recovery's decision. The row is removed before the decision is
+    /// reported, so a store failure leaves the recovery open for the next
+    /// sweep rather than deciding it twice.
+    async fn check_recovery_timeouts(&mut self) -> Vec<DeRecEvent> {
+        let Ok(recoveries) = self
+            .state_store
+            .load_all(self.secret_id, StateKind::PendingRecovery)
+            .await
+        else {
+            return vec![];
+        };
+
+        let now = now_secs();
+        let mut events = Vec::new();
+        for item in recoveries {
+            let StateItem::PendingRecovery {
+                secret_id,
+                version,
+                shares,
+                pending,
+                started_at,
+            } = item
+            else {
+                continue;
+            };
+            if now.saturating_sub(started_at) <= self.timeouts.get_share_response.as_secs() {
+                continue;
+            }
+            let Ok(helpers) =
+                recovery::describe_helpers(&self.channel_store, self.secret_id, &shares).await
+            else {
+                continue;
+            };
+            if self
+                .state_store
+                .remove(
+                    self.secret_id,
+                    StateKey::PendingRecovery { secret_id, version },
+                )
+                .await
+                .is_err()
+            {
+                continue;
+            }
+
+            let mut silent: Vec<ChannelId> = pending.into_iter().collect();
+            silent.sort_unstable_by_key(|c| c.0);
+            for channel_id in silent {
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    channel_id = channel_id.0,
+                    secret_id,
+                    version,
+                    "recovery: helper timed out"
+                );
+                events.push(DeRecEvent::RecoverSecretFailed {
+                    channel_id,
+                    version,
+                    error: "timeout".to_owned(),
+                });
+            }
+            events.extend(recovery::settle(secret_id, version, &shares, &helpers));
+        }
         events
     }
 
@@ -400,7 +482,7 @@ impl<
         channel_id: ChannelId,
         version: u32,
         keep_version: Option<u32>,
-        unanswered: &[(u32, std::collections::HashSet<ChannelId>)],
+        unanswered: &[(u32, HashSet<ChannelId>)],
     ) {
         let Some(keep_version) = keep_version else {
             return;
@@ -478,10 +560,8 @@ impl<
         shares
             .iter()
             .find(|share| share.version == version)
-            .and_then(|share| derec_proto::CommittedDeRecShare::decode(share.bytes.as_slice()).ok())
-            .and_then(|committed| {
-                derec_proto::DeRecShare::decode(committed.de_rec_share.as_slice()).ok()
-            })
+            .and_then(|share| CommittedDeRecShare::decode(share.bytes.as_slice()).ok())
+            .and_then(|committed| DeRecShare::decode(committed.de_rec_share.as_slice()).ok())
             .map(|share| share.subshares.len() as u64)
             .filter(|&subshares| subshares > 0)
             .unwrap_or(1)
@@ -511,7 +591,7 @@ impl<
         // Which helpers each open round is still waiting on, as loaded and
         // before any of this batch is applied: a version a helper has not
         // yet answered may still reach it, so its proof is never pruned.
-        let unanswered: Vec<(u32, std::collections::HashSet<ChannelId>)> = rounds
+        let unanswered: Vec<(u32, HashSet<ChannelId>)> = rounds
             .iter()
             .filter_map(|item| match item {
                 StateItem::SharingRound(round) => Some((round.version, round.pending.clone())),
@@ -523,7 +603,7 @@ impl<
             let StateItem::SharingRound(round) = item else {
                 continue;
             };
-            let crate::protocol::types::SharingRoundState {
+            let SharingRoundState {
                 version: round_version,
                 mut pending,
                 mut confirmed,
@@ -584,7 +664,7 @@ impl<
             let StateItem::SharingRound(round) = item else {
                 continue;
             };
-            let crate::protocol::types::SharingRoundState {
+            let SharingRoundState {
                 version,
                 mut pending,
                 confirmed,
@@ -618,8 +698,7 @@ impl<
                 );
             }
             self.drop_failed_proofs(version, &timed_out).await;
-            let timed_out_replicas: Vec<crate::types::ReplicaId> =
-                pending_replicas.drain().collect();
+            let timed_out_replicas: Vec<ReplicaId> = pending_replicas.drain().collect();
             for replica_id in timed_out_replicas {
                 behind_replicas.insert(replica_id);
                 events.push(DeRecEvent::ReplicaSyncFailed {
@@ -640,7 +719,7 @@ impl<
                 .state_store
                 .save(
                     self.secret_id,
-                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    StateItem::SharingRound(Box::new(SharingRoundState {
                         version,
                         pending,
                         confirmed,
@@ -689,13 +768,9 @@ impl<
                 .state_store
                 .remove(self.secret_id, StateKey::PendingUnpair { channel_id: cid })
                 .await;
-            if handlers::unpairing::drop_channel_state(
-                &mut borrow_stores!(self),
-                &local!(self),
-                cid,
-            )
-            .await
-            .is_ok()
+            if unpairing::drop_channel_state(&mut borrow_stores!(self), &local!(self), cid)
+                .await
+                .is_ok()
             {
                 events.push(DeRecEvent::Unpaired { channel_id: cid });
             }
@@ -724,16 +799,16 @@ impl<
         inbound: &[DeRecEvent],
         produced: &mut Vec<DeRecEvent>,
         round_version: u32,
-        pending: &mut std::collections::HashSet<ChannelId>,
-        confirmed: &mut std::collections::HashSet<ChannelId>,
-        failed: &mut std::collections::HashSet<ChannelId>,
-        pending_replicas: &mut std::collections::HashSet<crate::types::ReplicaId>,
-        synced_replicas: &mut std::collections::HashSet<crate::types::ReplicaId>,
-        behind_replicas: &mut std::collections::HashSet<crate::types::ReplicaId>,
+        pending: &mut HashSet<ChannelId>,
+        confirmed: &mut HashSet<ChannelId>,
+        failed: &mut HashSet<ChannelId>,
+        pending_replicas: &mut HashSet<ReplicaId>,
+        synced_replicas: &mut HashSet<ReplicaId>,
+        behind_replicas: &mut HashSet<ReplicaId>,
         started_at: u64,
         keep_version: Option<u32>,
         threshold: Option<u32>,
-        unanswered: &[(u32, std::collections::HashSet<ChannelId>)],
+        unanswered: &[(u32, HashSet<ChannelId>)],
     ) {
         let events = inbound;
         let mut newly_failed: Vec<ChannelId> = Vec::new();
@@ -775,7 +850,7 @@ impl<
                     version,
                     ..
                 } if *version == round_version => {
-                    if let Ok(replica_id) = crate::types::ReplicaId::try_from(*from_replica_id) {
+                    if let Ok(replica_id) = ReplicaId::try_from(*from_replica_id) {
                         pending_replicas.remove(&replica_id);
                         synced_replicas.insert(replica_id);
                     }
@@ -785,7 +860,7 @@ impl<
                     version,
                     ..
                 } if *version == round_version => {
-                    if let Ok(replica_id) = crate::types::ReplicaId::try_from(*replica_id) {
+                    if let Ok(replica_id) = ReplicaId::try_from(*replica_id) {
                         pending_replicas.remove(&replica_id);
                         behind_replicas.insert(replica_id);
                     }
@@ -838,9 +913,9 @@ impl<
                 self.channel_store
                     .replicas_matching(
                         self.secret_id,
-                        crate::protocol::types::ReplicaFilter {
+                        ReplicaFilter {
                             ids: synced_replicas.iter().copied().collect(),
-                            status: vec![crate::protocol::types::ChannelStatus::Unpairing],
+                            status: vec![ChannelStatus::Unpairing],
                             ..Default::default()
                         },
                     )
@@ -852,7 +927,7 @@ impl<
                         .channel_store
                         .remove(
                             self.secret_id,
-                            crate::protocol::types::ChannelQuery::Replica {
+                            ChannelQuery::Replica {
                                 channel_id: member.channel_id,
                                 replica_id: member.replica_id,
                             },
@@ -905,14 +980,14 @@ impl<
                 .state_store
                 .save(
                     self.secret_id,
-                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    StateItem::SharingRound(Box::new(SharingRoundState {
                         version: round_version,
-                        pending: std::mem::take(pending),
-                        confirmed: std::mem::take(confirmed),
-                        failed: std::mem::take(failed),
-                        pending_replicas: std::mem::take(pending_replicas),
-                        synced_replicas: std::mem::take(synced_replicas),
-                        behind_replicas: std::mem::take(behind_replicas),
+                        pending: mem::take(pending),
+                        confirmed: mem::take(confirmed),
+                        failed: mem::take(failed),
+                        pending_replicas: mem::take(pending_replicas),
+                        synced_replicas: mem::take(synced_replicas),
+                        behind_replicas: mem::take(behind_replicas),
                         started_at,
                         keep_version,
                         threshold,
@@ -933,15 +1008,19 @@ mod expired_channel_sweep_tests {
     };
     use crate::protocol::types::{
         ChannelRecord, ChannelStatus, ExpiredChannelCleanup, HelperChannel, ReplicaMember,
-        ReplicaRole, SecretValue,
+        ReplicaRole, SecretValue, Timeouts,
     };
+    use crate::types::ReplicaId;
+    use derec_proto::{Protocol, SenderKind, TransportProtocol};
+    use std::collections::HashMap;
+    use std::time::Duration;
 
     const SECRET_ID: u64 = 0xC1;
 
-    fn endpoint() -> derec_proto::TransportProtocol {
-        derec_proto::TransportProtocol {
+    fn endpoint() -> TransportProtocol {
+        TransportProtocol {
             uri: "https://peer.example.com".to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         }
     }
 
@@ -958,10 +1037,10 @@ mod expired_channel_sweep_tests {
                 ChannelRecord::Helper(HelperChannel {
                     channel_id: ChannelId(cid),
                     transports: vec![endpoint()],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     status,
                     created_at: now_secs().saturating_sub(age_secs),
-                    peer_role: derec_proto::SenderKind::Helper,
+                    peer_role: SenderKind::Helper,
                     weight: 1,
                 }),
             )
@@ -990,10 +1069,11 @@ mod expired_channel_sweep_tests {
             .with_state_store(InMemStateStore)
             .with_own_transports(["https://owner.example.com"])
             .with_threshold(2)
-            .with_timeouts(crate::protocol::types::Timeouts {
-                sharing_round: std::time::Duration::from_secs(timeout_in_secs),
-                unpair_ack: std::time::Duration::from_secs(timeout_in_secs),
-                inbound_message: std::time::Duration::from_secs(timeout_in_secs),
+            .with_timeouts(Timeouts {
+                sharing_round: Duration::from_secs(timeout_in_secs),
+                unpair_ack: Duration::from_secs(timeout_in_secs),
+                inbound_message: Duration::from_secs(timeout_in_secs),
+                get_share_response: Duration::from_secs(timeout_in_secs),
                 expired_channels: policy,
             })
             .build()
@@ -1032,9 +1112,9 @@ mod expired_channel_sweep_tests {
                 SECRET_ID,
                 ChannelRecord::Replica(ReplicaMember {
                     channel_id: ChannelId(9000),
-                    replica_id: crate::types::ReplicaId(replica_id),
+                    replica_id: ReplicaId(replica_id),
                     transports: vec![endpoint()],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     role: ReplicaRole::Destination,
                     status,
                     created_at: now_secs().saturating_sub(age_secs),
@@ -1164,7 +1244,7 @@ mod expired_channel_sweep_tests {
                 .with_state_store(InMemStateStore)
                 .with_own_transports(["https://owner.example.com"])
                 .with_threshold(2)
-                .with_timeouts(crate::protocol::types::Timeouts {
+                .with_timeouts(Timeouts {
                     expired_channels: ExpiredChannelCleanup::Disabled,
                     ..Default::default()
                 })
@@ -1245,7 +1325,7 @@ mod expired_channel_sweep_tests {
             .with_state_store(InMemStateStore)
             .with_own_transports(["https://owner.example.com"])
             .with_threshold(2)
-            .with_timeouts(crate::protocol::types::Timeouts {
+            .with_timeouts(Timeouts {
                 expired_channels: ExpiredChannelCleanup::Disabled,
                 ..Default::default()
             })
@@ -1265,9 +1345,9 @@ mod expired_channel_sweep_tests {
                 SECRET_ID,
                 ChannelRecord::Replica(ReplicaMember {
                     channel_id: ChannelId(channel_id),
-                    replica_id: crate::types::ReplicaId(replica_id),
+                    replica_id: ReplicaId(replica_id),
                     transports: vec![endpoint()],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     role: ReplicaRole::Destination,
                     status,
                     created_at: now_secs().saturating_sub(age_secs),
@@ -1424,7 +1504,18 @@ mod sharing_round_outcome_tests {
     };
     use crate::types::ReplicaId;
 
-    use std::collections::HashSet;
+    use crate::primitives::sharing::request;
+    use crate::protocol::types::{
+        ChannelRecord, ChannelStatus, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember,
+        ReplicaRole, Secret, SharingRoundState, UserSecret,
+    };
+    use crate::protocol::{CollectedShare, ExpiredChannelCleanup};
+    use derec_proto::{
+        DeRecResult, DeRecSecret, GetShareResponseMessage, Protocol, SenderKind, StatusEnum,
+        TransportProtocol,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
 
     const SECRET_ID: u64 = 0xF00D;
 
@@ -1463,7 +1554,7 @@ mod sharing_round_outcome_tests {
             .state_store
             .save(
                 SECRET_ID,
-                StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                StateItem::SharingRound(Box::new(SharingRoundState {
                     version,
                     pending: helpers.iter().copied().map(ChannelId).collect(),
                     confirmed: HashSet::new(),
@@ -1575,7 +1666,7 @@ mod sharing_round_outcome_tests {
     fn tick_closes_a_round_that_no_message_will_ever_finish() {
         run_async(async {
             let mut protocol = build(2);
-            protocol.timeouts.sharing_round = std::time::Duration::from_secs(60);
+            protocol.timeouts.sharing_round = Duration::from_secs(60);
 
             // A round started well outside the timeout window, with one helper
             // and one member that never answered.
@@ -1583,7 +1674,7 @@ mod sharing_round_outcome_tests {
                 .state_store
                 .save(
                     SECRET_ID,
-                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    StateItem::SharingRound(Box::new(SharingRoundState {
                         version: 3,
                         pending: [ChannelId(9001)].into_iter().collect(),
                         confirmed: [ChannelId(9002)].into_iter().collect(),
@@ -1642,12 +1733,12 @@ mod sharing_round_outcome_tests {
     fn a_failing_process_still_reports_the_timeouts_it_settled() {
         run_async(async {
             let mut protocol = build(2);
-            protocol.timeouts.sharing_round = std::time::Duration::from_secs(60);
+            protocol.timeouts.sharing_round = Duration::from_secs(60);
             protocol
                 .state_store
                 .save(
                     SECRET_ID,
-                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    StateItem::SharingRound(Box::new(SharingRoundState {
                         version: 3,
                         pending: [ChannelId(9001)].into_iter().collect(),
                         confirmed: [ChannelId(9002)].into_iter().collect(),
@@ -1703,7 +1794,7 @@ mod sharing_round_outcome_tests {
     fn tick_expires_an_unacknowledged_unpair() {
         run_async(async {
             let mut protocol = build(2);
-            protocol.timeouts.unpair_ack = std::time::Duration::from_secs(60);
+            protocol.timeouts.unpair_ack = Duration::from_secs(60);
 
             protocol
                 .state_store
@@ -1748,7 +1839,7 @@ mod sharing_round_outcome_tests {
     fn tick_leaves_a_recent_unpair_pending() {
         run_async(async {
             let mut protocol = build(2);
-            protocol.timeouts.unpair_ack = std::time::Duration::from_secs(600);
+            protocol.timeouts.unpair_ack = Duration::from_secs(600);
 
             protocol
                 .state_store
@@ -1782,6 +1873,186 @@ mod sharing_round_outcome_tests {
         });
     }
 
+    /// Shares of a recoverable secret named `name`, split at threshold 2
+    /// over `channels`, as the Helpers on those channels would answer them.
+    fn recovery_shares(name: &str, channels: &[u64]) -> Vec<CollectedShare> {
+        use crate::extensions::derec_result::DeRecResultExt as _;
+        use prost::Message as _;
+        let secret = Secret {
+            secrets: vec![UserSecret {
+                id: vec![0x01],
+                name: name.to_owned(),
+                data: b"seed".to_vec(),
+            }],
+            threshold: Some(2),
+            ..Default::default()
+        };
+        let payload = DeRecSecret {
+            secret_data: secret.encode(),
+            creation_time: None,
+            helper_threshold_for_recovery: 2,
+            helper_threshold_for_confirming_share_receipt: 2,
+            helpers: Vec::new(),
+        }
+        .encode_to_vec();
+        let weighted: Vec<_> = channels.iter().map(|&c| (ChannelId(c), 1)).collect();
+        let split = request::split(&weighted, 77, 1, &payload, 2).expect("split");
+        channels
+            .iter()
+            .map(|&c| CollectedShare {
+                channel_id: ChannelId(c),
+                response: GetShareResponseMessage {
+                    result: Some(DeRecResult::ok()),
+                    committed_de_rec_share: split.shares[&ChannelId(c)].encode_to_vec(),
+                    secret_id: 77,
+                    version: 1,
+                    ..Default::default()
+                },
+            })
+            .collect()
+    }
+
+    /// A recovery whose Helpers go quiet still decides. `tick` reports each
+    /// silent Helper as timed out and settles on the shares already in hand.
+    #[test]
+    fn tick_settles_a_recovery_whose_helpers_went_silent() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeouts.get_share_response = Duration::from_secs(60);
+
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingRecovery {
+                        secret_id: 77,
+                        version: 1,
+                        shares: recovery_shares("real", &[9001, 9002]),
+                        pending: [ChannelId(9003)].into_iter().collect(),
+                        started_at: now_secs().saturating_sub(600),
+                    },
+                )
+                .await
+                .expect("seed pending recovery");
+
+            let events = protocol.tick().await;
+
+            match events.as_slice() {
+                [
+                    DeRecEvent::RecoverSecretFailed {
+                        channel_id,
+                        version: 1,
+                        error,
+                    },
+                    DeRecEvent::SecretRecovered { secret },
+                ] => {
+                    assert_eq!(*channel_id, ChannelId(9003));
+                    assert_eq!(error, "timeout");
+                    assert_eq!(secret.secrets[0].name, "real");
+                }
+                other => panic!("expected a timeout then SecretRecovered, got {other:?}"),
+            }
+            assert!(
+                protocol
+                    .state_store
+                    .load(
+                        SECRET_ID,
+                        StateKey::PendingRecovery {
+                            secret_id: 77,
+                            version: 1
+                        }
+                    )
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "the recovery is closed"
+            );
+        });
+    }
+
+    /// The timeout settles a recovery holding two complete secrets as a
+    /// conflict, never by picking one.
+    #[test]
+    fn tick_settles_conflicting_shares_as_a_conflict() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeouts.get_share_response = Duration::from_secs(60);
+
+            let mut shares = recovery_shares("forged", &[9001, 9002]);
+            shares.extend(recovery_shares("real", &[9003, 9004]));
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingRecovery {
+                        secret_id: 77,
+                        version: 1,
+                        shares,
+                        pending: [ChannelId(9005)].into_iter().collect(),
+                        started_at: now_secs().saturating_sub(600),
+                    },
+                )
+                .await
+                .expect("seed pending recovery");
+
+            let events = protocol.tick().await;
+
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [
+                        DeRecEvent::RecoverSecretFailed { .. },
+                        DeRecEvent::RecoveryConflict { version: 1, candidates, disputed_by },
+                    ] if candidates.len() == 2 && disputed_by.is_empty()
+                ),
+                "got {events:?}"
+            );
+        });
+    }
+
+    /// A recovery still inside its window survives a `tick`.
+    #[test]
+    fn tick_leaves_a_recent_recovery_open() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeouts.get_share_response = Duration::from_secs(600);
+
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingRecovery {
+                        secret_id: 77,
+                        version: 1,
+                        shares: recovery_shares("real", &[9001, 9002]),
+                        pending: [ChannelId(9003)].into_iter().collect(),
+                        started_at: now_secs(),
+                    },
+                )
+                .await
+                .expect("seed pending recovery");
+
+            let events = protocol.tick().await;
+
+            assert!(events.is_empty(), "got {events:?}");
+            assert!(
+                protocol
+                    .state_store
+                    .load(
+                        SECRET_ID,
+                        StateKey::PendingRecovery {
+                            secret_id: 77,
+                            version: 1
+                        }
+                    )
+                    .await
+                    .expect("load")
+                    .is_some(),
+                "a Helper's answer is still due"
+            );
+        });
+    }
+
     /// Expired-channel cleanup is part of `tick`, and follows the same
     /// configuration `process` honours rather than a rule of its own.
     ///
@@ -1792,11 +2063,8 @@ mod sharing_round_outcome_tests {
     fn tick_honours_the_expired_channel_policy() {
         run_async(async {
             for (cleanup, expect_removed) in [
-                (crate::protocol::ExpiredChannelCleanup::Disabled, false),
-                (
-                    crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 },
-                    true,
-                ),
+                (ExpiredChannelCleanup::Disabled, false),
+                (ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }, true),
             ] {
                 let mut protocol = build(2);
                 protocol.timeouts.expired_channels = cleanup;
@@ -1804,20 +2072,18 @@ mod sharing_round_outcome_tests {
                     .channel_store
                     .save(
                         SECRET_ID,
-                        crate::protocol::types::ChannelRecord::Helper(
-                            crate::protocol::types::HelperChannel {
-                                channel_id: ChannelId(77),
-                                transports: vec![derec_proto::TransportProtocol {
-                                    uri: "https://stale.example".to_owned(),
-                                    protocol: derec_proto::Protocol::Https as i32,
-                                }],
-                                communication_info: std::collections::HashMap::new(),
-                                peer_role: derec_proto::SenderKind::Helper,
-                                status: crate::protocol::types::ChannelStatus::Pending,
-                                created_at: now_secs().saturating_sub(3600),
-                                weight: 1,
-                            },
-                        ),
+                        ChannelRecord::Helper(HelperChannel {
+                            channel_id: ChannelId(77),
+                            transports: vec![TransportProtocol {
+                                uri: "https://stale.example".to_owned(),
+                                protocol: Protocol::Https as i32,
+                            }],
+                            communication_info: HashMap::new(),
+                            peer_role: SenderKind::Helper,
+                            status: ChannelStatus::Pending,
+                            created_at: now_secs().saturating_sub(3600),
+                            weight: 1,
+                        }),
                     )
                     .await
                     .expect("seed stale pending channel");
@@ -1826,7 +2092,7 @@ mod sharing_round_outcome_tests {
 
                 let gone = protocol
                     .channel_store
-                    .helpers(SECRET_ID, crate::protocol::types::HelperFilter::default())
+                    .helpers(SECRET_ID, HelperFilter::default())
                     .await
                     .expect("helpers")
                     .is_empty();
@@ -1855,7 +2121,7 @@ mod sharing_round_outcome_tests {
     fn tick_leaves_a_round_inside_its_window_open() {
         run_async(async {
             let mut protocol = build(2);
-            protocol.timeouts.sharing_round = std::time::Duration::from_secs(600);
+            protocol.timeouts.sharing_round = Duration::from_secs(600);
             seed_round(&mut protocol, 4, &[9001], &[1002]).await;
 
             let events = protocol.tick().await;
@@ -1888,27 +2154,25 @@ mod sharing_round_outcome_tests {
             seed_round(&mut protocol, 7, &[9001], &[1002, 1003]).await;
 
             for (id, status) in [
-                (1002u64, crate::protocol::types::ChannelStatus::Paired),
-                (1003, crate::protocol::types::ChannelStatus::Unpairing),
+                (1002u64, ChannelStatus::Paired),
+                (1003, ChannelStatus::Unpairing),
             ] {
                 protocol
                     .channel_store
                     .save(
                         SECRET_ID,
-                        crate::protocol::types::ChannelRecord::Replica(
-                            crate::protocol::types::ReplicaMember {
-                                channel_id: ChannelId(5001),
-                                replica_id: ReplicaId(id),
-                                transports: vec![derec_proto::TransportProtocol {
-                                    uri: "https://peer.example".to_owned(),
-                                    protocol: derec_proto::Protocol::Https as i32,
-                                }],
-                                communication_info: std::collections::HashMap::new(),
-                                role: crate::protocol::types::ReplicaRole::Destination,
-                                status,
-                                created_at: 0,
-                            },
-                        ),
+                        ChannelRecord::Replica(ReplicaMember {
+                            channel_id: ChannelId(5001),
+                            replica_id: ReplicaId(id),
+                            transports: vec![TransportProtocol {
+                                uri: "https://peer.example".to_owned(),
+                                protocol: Protocol::Https as i32,
+                            }],
+                            communication_info: HashMap::new(),
+                            role: ReplicaRole::Destination,
+                            status,
+                            created_at: 0,
+                        }),
                     )
                     .await
                     .expect("seed member");
@@ -1940,7 +2204,7 @@ mod sharing_round_outcome_tests {
 
             let remaining: Vec<u64> = protocol
                 .channel_store
-                .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
+                .replicas(SECRET_ID, ReplicaFilter::default())
                 .await
                 .expect("roster")
                 .into_iter()
@@ -1976,20 +2240,18 @@ mod sharing_round_outcome_tests {
                 .channel_store
                 .save(
                     SECRET_ID,
-                    crate::protocol::types::ChannelRecord::Replica(
-                        crate::protocol::types::ReplicaMember {
-                            channel_id: ChannelId(5001),
-                            replica_id: ReplicaId(1003),
-                            transports: vec![derec_proto::TransportProtocol {
-                                uri: "https://peer.example".to_owned(),
-                                protocol: derec_proto::Protocol::Https as i32,
-                            }],
-                            communication_info: std::collections::HashMap::new(),
-                            role: crate::protocol::types::ReplicaRole::Destination,
-                            status: crate::protocol::types::ChannelStatus::Unpairing,
-                            created_at: 0,
-                        },
-                    ),
+                    ChannelRecord::Replica(ReplicaMember {
+                        channel_id: ChannelId(5001),
+                        replica_id: ReplicaId(1003),
+                        transports: vec![TransportProtocol {
+                            uri: "https://peer.example".to_owned(),
+                            protocol: Protocol::Https as i32,
+                        }],
+                        communication_info: HashMap::new(),
+                        role: ReplicaRole::Destination,
+                        status: ChannelStatus::Unpairing,
+                        created_at: 0,
+                    }),
                 )
                 .await
                 .expect("seed member");
@@ -2012,7 +2274,7 @@ mod sharing_round_outcome_tests {
 
             let remaining: Vec<u64> = protocol
                 .channel_store
-                .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
+                .replicas(SECRET_ID, ReplicaFilter::default())
                 .await
                 .expect("roster")
                 .into_iter()
@@ -2113,7 +2375,7 @@ mod sharing_round_outcome_tests {
                 .state_store
                 .save(
                     SECRET_ID,
-                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    StateItem::SharingRound(Box::new(SharingRoundState {
                         version: 4,
                         pending: HashSet::from([ChannelId(9001), ChannelId(9002)]),
                         confirmed: HashSet::new(),
@@ -2175,14 +2437,14 @@ mod sharing_round_outcome_tests {
                 DeRecEvent::ShareRejected {
                     channel_id: ChannelId(9003),
                     version: 4,
-                    status: derec_proto::StatusEnum::VersionConflict as i32,
+                    status: StatusEnum::VersionConflict as i32,
                     memo: "conflict".to_owned(),
                 },
                 DeRecEvent::ReplicaSyncRejected {
                     replica_id: 1002,
                     secret_id: SECRET_ID,
                     version: 4,
-                    status: derec_proto::StatusEnum::VersionConflict as i32,
+                    status: StatusEnum::VersionConflict as i32,
                     memo: "conflict".to_owned(),
                 },
                 DeRecEvent::ReplicaSecretAcked {
@@ -2257,12 +2519,13 @@ mod sharing_round_outcome_tests {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+    use crate::protocol::ExpiredChannelCleanup;
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
-    use crate::protocol::types::Timeouts;
+    use crate::protocol::types::{SharingRoundState, Timeouts};
     use derec_proto::DeRecMessage;
     use std::collections::HashSet;
     use std::time::Duration;
@@ -2314,7 +2577,7 @@ mod timeout_tests {
         assert_eq!(d.unpair_ack, Duration::from_secs(60));
         assert_eq!(
             d.expired_channels,
-            crate::protocol::ExpiredChannelCleanup::Enabled {
+            ExpiredChannelCleanup::Enabled {
                 timeout_in_secs: 300
             }
         );
@@ -2392,7 +2655,7 @@ mod timeout_tests {
                 .state_store
                 .save(
                     SECRET_ID,
-                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    StateItem::SharingRound(Box::new(SharingRoundState {
                         version: 1,
                         pending: [ChannelId(9001)].into_iter().collect(),
                         confirmed: HashSet::new(),
@@ -2428,9 +2691,10 @@ mod proof_cleanup_tests {
         InMemUserSecretStore, NoopTransport, run_async,
     };
     use crate::protocol::traits::ShareStoreFuture;
-    use crate::protocol::types::Share;
+    use crate::protocol::types::{Share, SharingRoundState};
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     const SECRET_ID: u64 = 0xBEEF;
 
@@ -2566,7 +2830,7 @@ mod proof_cleanup_tests {
             .state_store
             .save(
                 SECRET_ID,
-                StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                StateItem::SharingRound(Box::new(SharingRoundState {
                     version,
                     pending: helpers.iter().copied().map(ChannelId).collect(),
                     confirmed: HashSet::new(),
@@ -2649,12 +2913,12 @@ mod proof_cleanup_tests {
             let shares = InMemShareStore::default();
             seed_proof(&shares, 9001, 4);
             let mut protocol = build(2, shares.clone());
-            protocol.timeouts.sharing_round = std::time::Duration::from_secs(60);
+            protocol.timeouts.sharing_round = Duration::from_secs(60);
             protocol
                 .state_store
                 .save(
                     SECRET_ID,
-                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    StateItem::SharingRound(Box::new(SharingRoundState {
                         version: 4,
                         pending: [ChannelId(9001)].into_iter().collect(),
                         confirmed: HashSet::new(),
@@ -2820,12 +3084,12 @@ mod proof_cleanup_tests {
         run_async(async {
             let shares = CountingShareStore::default();
             let mut protocol = build_counting(2, shares.clone());
-            protocol.timeouts.sharing_round = std::time::Duration::from_secs(60);
+            protocol.timeouts.sharing_round = Duration::from_secs(60);
             protocol
                 .state_store
                 .save(
                     SECRET_ID,
-                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    StateItem::SharingRound(Box::new(SharingRoundState {
                         version: 4,
                         pending: [ChannelId(9001)].into_iter().collect(),
                         confirmed: HashSet::new(),
@@ -2864,7 +3128,7 @@ mod proof_cleanup_tests {
                 .state_store
                 .save(
                     SECRET_ID,
-                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    StateItem::SharingRound(Box::new(SharingRoundState {
                         version: 4,
                         pending: [ChannelId(9001)].into_iter().collect(),
                         confirmed: HashSet::new(),
@@ -2910,12 +3174,13 @@ mod proof_cleanup_tests {
 #[cfg(test)]
 mod weighted_tally_tests {
     use super::*;
+    use crate::primitives::sharing::request;
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
-    use crate::protocol::types::Share;
+    use crate::protocol::types::{Share, SharingRoundState};
     use prost::Message as _;
     use std::collections::HashSet;
 
@@ -2955,7 +3220,7 @@ mod weighted_tally_tests {
             (ChannelId(C), 1),
             (ChannelId(D), 1),
         ];
-        let split = crate::primitives::sharing::request::split(
+        let split = request::split(
             &channels,
             SECRET_ID,
             VERSION,
@@ -2992,7 +3257,7 @@ mod weighted_tally_tests {
             .state_store
             .save(
                 SECRET_ID,
-                StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                StateItem::SharingRound(Box::new(SharingRoundState {
                     version: VERSION,
                     pending: channels.iter().map(|&(c, _)| c).collect(),
                     confirmed: HashSet::new(),
@@ -3123,6 +3388,7 @@ mod weighted_tally_tests {
 mod keep_version_proof_tests {
     use super::*;
     use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
+    use crate::primitives::sharing::request::extract;
     use crate::protocol::DeRecFlow;
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::events::VerifyFailureReason;
@@ -3131,10 +3397,15 @@ mod keep_version_proof_tests {
         InMemUserSecretStore, RecordingTransport, run_async,
     };
     use crate::protocol::types::{
-        ChannelRecord, ChannelStatus, HelperChannel, SecretValue, Target, UserSecret,
+        ChannelRecord, ChannelStatus, HelperChannel, SecretValue, Share, SharingRoundState, Target,
+        UserSecret,
     };
-    use derec_proto::{DeRecResult, MessageBody, StoreShareResponseMessage};
+    use derec_proto::{
+        DeRecResult, MessageBody, Protocol, SenderKind, StatusEnum, StoreShareRequestMessage,
+        StoreShareResponseMessage, TransportProtocol,
+    };
     use prost::Message as _;
+    use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0x4EE9;
     const A: u64 = 31;
@@ -3166,12 +3437,12 @@ mod keep_version_proof_tests {
                     SECRET_ID,
                     ChannelRecord::Helper(HelperChannel {
                         channel_id: ChannelId(channel),
-                        transports: vec![derec_proto::TransportProtocol {
+                        transports: vec![TransportProtocol {
                             uri: uri(channel),
-                            protocol: derec_proto::Protocol::Https as i32,
+                            protocol: Protocol::Https as i32,
                         }],
-                        communication_info: std::collections::HashMap::new(),
-                        peer_role: derec_proto::SenderKind::Helper,
+                        communication_info: HashMap::new(),
+                        peer_role: SenderKind::Helper,
                         status: ChannelStatus::Paired,
                         created_at: now_secs(),
                         weight: 1,
@@ -3203,9 +3474,7 @@ mod keep_version_proof_tests {
 
     /// The channel each envelope sent so far went to, with the request it
     /// carried.
-    fn sent_requests(
-        transport: &RecordingTransport,
-    ) -> Vec<(u64, derec_proto::StoreShareRequestMessage)> {
+    fn sent_requests(transport: &RecordingTransport) -> Vec<(u64, StoreShareRequestMessage)> {
         transport
             .sent
             .lock()
@@ -3216,16 +3485,15 @@ mod keep_version_proof_tests {
                     .into_iter()
                     .find(|c| endpoints[0].uri == uri(*c))
                     .expect("every send goes to a seeded helper");
-                let request =
-                    crate::primitives::sharing::request::extract(envelope, &key_of(channel))
-                        .expect("a store-share request")
-                        .request;
+                let request = extract(envelope, &key_of(channel))
+                    .expect("a store-share request")
+                    .request;
                 (channel, request)
             })
             .collect()
     }
 
-    fn answer(channel: u64, version: u32, status: derec_proto::StatusEnum) -> Vec<u8> {
+    fn answer(channel: u64, version: u32, status: StatusEnum) -> Vec<u8> {
         let timestamp = current_timestamp();
         DeRecMessageBuilder::channel()
             .channel_id(ChannelId(channel))
@@ -3252,7 +3520,7 @@ mod keep_version_proof_tests {
     async fn round(
         protocol: &mut TestProtocol,
         transport: &RecordingTransport,
-        status_of: impl Fn(u64) -> derec_proto::StatusEnum,
+        status_of: impl Fn(u64) -> StatusEnum,
     ) -> u32 {
         transport.sent.lock().unwrap().clear();
         protocol
@@ -3263,7 +3531,7 @@ mod keep_version_proof_tests {
                     data: b"data".to_vec(),
                 }],
                 description: None,
-                weights: std::collections::HashMap::new(),
+                weights: HashMap::new(),
                 threshold: None,
             })
             .await
@@ -3293,8 +3561,8 @@ mod keep_version_proof_tests {
         versions
     }
 
-    fn ok(_: u64) -> derec_proto::StatusEnum {
-        derec_proto::StatusEnum::Ok
+    fn ok(_: u64) -> StatusEnum {
+        StatusEnum::Ok
     }
 
     /// An application keeping no older version: once both Helpers confirm
@@ -3361,9 +3629,9 @@ mod keep_version_proof_tests {
             *shares.keep.lock().unwrap() = Some(0);
             let version = round(&mut protocol, &transport, |channel| {
                 if channel == B {
-                    derec_proto::StatusEnum::Fail
+                    StatusEnum::Fail
                 } else {
-                    derec_proto::StatusEnum::Ok
+                    StatusEnum::Ok
                 }
             })
             .await;
@@ -3400,7 +3668,7 @@ mod keep_version_proof_tests {
     fn seed_proof(shares: &InMemShareStore, channel: u64, version: u32) {
         shares.data.lock().unwrap().insert(
             (SECRET_ID, channel, version),
-            crate::protocol::types::Share {
+            Share {
                 secret_id: SECRET_ID,
                 version,
                 bytes: vec![0xAB],
@@ -3415,7 +3683,7 @@ mod keep_version_proof_tests {
             .state_store
             .save(
                 SECRET_ID,
-                StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                StateItem::SharingRound(Box::new(SharingRoundState {
                     version,
                     pending: [ChannelId(A), ChannelId(B)].into_iter().collect(),
                     confirmed: Default::default(),

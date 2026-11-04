@@ -8,10 +8,12 @@ use super::{
 };
 use crate::{
     interop::wasm::{
-        primitives::helpers::{from_js, to_js},
+        primitives::helpers::{from_js, parse_shared_key, to_js},
         ts_bindings_utils::js_error_from_lib,
     },
-    primitives::pairing::response,
+    primitives::pairing::{self, response},
+    transport::TransportPolicy,
+    types::ChannelId,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -71,12 +73,12 @@ pub fn produce(
     let parameter_range_proto = super::optional_parameter_range(parameter_range)?;
 
     let result = response::produce(
-        crate::types::ChannelId(channel_id),
+        ChannelId(channel_id),
         &request_proto,
         &pairing_sk,
         communication_info_proto,
         parameter_range_proto,
-        crate::transport::TransportPolicy::new(unsafe_connection),
+        TransportPolicy::new(unsafe_connection),
     )
     .map_err(js_error_from_lib)?;
 
@@ -171,12 +173,8 @@ pub fn produce_pre_pair(
     let request: PrePairRequestMessage = from_js(request)?;
     let request_proto: derec_proto::PrePairRequestMessage = request.into();
 
-    let result = response::produce_pre_pair(
-        crate::types::ChannelId(channel_id),
-        &request_proto,
-        &pairing_sk,
-    )
-    .map_err(js_error_from_lib)?;
+    let result = response::produce_pre_pair(ChannelId(channel_id), &request_proto, &pairing_sk)
+        .map_err(js_error_from_lib)?;
 
     to_js(&ProducePrePairResult {
         envelope: result.envelope,
@@ -194,9 +192,8 @@ pub fn produce_pre_pair_no_keys(channel_id: u64, request: JsValue) -> Result<JsV
     let request: PrePairRequestMessage = from_js(request)?;
     let request_proto: derec_proto::PrePairRequestMessage = request.into();
 
-    let result =
-        response::produce_pre_pair_no_keys(crate::types::ChannelId(channel_id), &request_proto)
-            .map_err(js_error_from_lib)?;
+    let result = response::produce_pre_pair_no_keys(ChannelId(channel_id), &request_proto)
+        .map_err(js_error_from_lib)?;
 
     to_js(&ProducePrePairNoKeysResult {
         envelope: result.envelope,
@@ -264,6 +261,6 @@ pub fn process_pre_pair_no_keys(
 /// the same value; comparing it out of band confirms the pairing.
 #[wasm_bindgen(js_name = "pairing_fingerprint")]
 pub fn fingerprint(shared_key: &[u8]) -> Result<String, JsValue> {
-    let shared_key = crate::interop::wasm::primitives::helpers::parse_shared_key(shared_key)?;
-    Ok(crate::primitives::pairing::fingerprint(&shared_key))
+    let shared_key = parse_shared_key(shared_key)?;
+    Ok(pairing::fingerprint(&shared_key))
 }

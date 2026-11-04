@@ -3,10 +3,12 @@
 
 use derec_library::protocol::DeRecChannelStore;
 use derec_library::protocol::events::DeRecEvent;
-use derec_library::protocol::types::{HelperFilter, ReplicaFilter, Secret, UserSecret};
+use derec_library::protocol::types::{
+    HelperFilter, ReplicaFilter, ReplicaRole, Secret, UserSecret,
+};
 use derec_library::protocol::{ChannelShare, DeRecFlow, DeRecUserSecretStore};
 use derec_library::types::ChannelId;
-use derec_proto::SenderKind;
+use derec_proto::{ContactMode, SenderKind};
 use std::collections::HashMap;
 
 use crate::db::Database;
@@ -104,10 +106,8 @@ pub async fn run() {
     let cid_h2 = ChannelId(12);
     let cid_h3 = ChannelId(13);
 
-    let mut rekeyed: std::collections::HashMap<ChannelId, ChannelId> =
-        std::collections::HashMap::new();
-    let capture_rekey = |rekeyed: &mut std::collections::HashMap<ChannelId, ChannelId>,
-                         events: &[DeRecEvent]| {
+    let mut rekeyed: HashMap<ChannelId, ChannelId> = HashMap::new();
+    let capture_rekey = |rekeyed: &mut HashMap<ChannelId, ChannelId>, events: &[DeRecEvent]| {
         for ev in events {
             if let DeRecEvent::PairingCompleted {
                 channel_id,
@@ -119,7 +119,7 @@ pub async fn run() {
             }
         }
     };
-    let rk = |rekeyed: &std::collections::HashMap<ChannelId, ChannelId>, cid: ChannelId| {
+    let rk = |rekeyed: &HashMap<ChannelId, ChannelId>, cid: ChannelId| {
         *rekeyed
             .get(&cid)
             .unwrap_or_else(|| panic!("no rekeyed id for transient {cid:?}"))
@@ -436,7 +436,7 @@ async fn assert_hydrated(
     );
     let sources = roster
         .iter()
-        .filter(|m| m.role == derec_library::protocol::types::ReplicaRole::Source)
+        .filter(|m| m.role == ReplicaRole::Source)
         .count();
     assert_eq!(
         sources, 1,
@@ -461,7 +461,7 @@ async fn pair_replica_handshake(
 ) -> ChannelId {
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys, None)
+        .create_contact(Some(channel_id), ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
     replica
@@ -508,7 +508,7 @@ async fn cross_confirm_fingerprint(owner: &mut Peer, replica: &mut Peer, channel
 async fn helper_start_pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) {
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys, None)
+        .create_contact(Some(channel_id), ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
     helper

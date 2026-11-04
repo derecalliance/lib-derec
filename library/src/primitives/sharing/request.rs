@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::extensions::derec_share::to_wire_subshares;
 use crate::extensions::request_message::RequestMessageExt as _;
 use crate::primitives::sharing::SharingError;
 use crate::{
+    Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, SharedKey, WeightedChannel},
     utils::{generate_seed, verify_timestamps},
@@ -11,7 +13,7 @@ use crate::{
 use derec_cryptography::vss;
 use derec_proto::{
     CommittedDeRecShare, DeRecMessage, DeRecShare, MessageBody, StoreShareRequestMessage,
-    committed_de_rec_share::SiblingHash,
+    TransportProtocol, committed_de_rec_share::SiblingHash,
 };
 use prost::Message;
 use std::collections::HashMap;
@@ -166,7 +168,7 @@ pub fn split(
     version: u32,
     secret_data: impl AsRef<[u8]>,
     threshold: usize,
-) -> Result<SplitResult, crate::Error> {
+) -> Result<SplitResult, Error> {
     let secret_data = secret_data.as_ref();
 
     let ordered_channels = validate_split_inputs(channels, secret_data, threshold)?;
@@ -248,8 +250,8 @@ pub fn produce(
     keep_version: u32,
     description: impl Into<String>,
     shared_key: &SharedKey,
-    reply_to: &[derec_proto::TransportProtocol],
-) -> Result<ProduceResult, crate::Error> {
+    reply_to: &[TransportProtocol],
+) -> Result<ProduceResult, Error> {
     validate_keep_version(keep_version, version)?;
 
     let timestamp = current_timestamp();
@@ -397,18 +399,15 @@ pub(crate) fn validate_keep_version(keep_version: u32, version: u32) -> Result<(
 /// [`DeRecProtocol`](crate::protocol::DeRecProtocol), owns that decision and
 /// should run [`TransportPolicy::check_peer`](crate::transport::TransportPolicy::check_peer)
 /// on any endpoint this returns.
-pub fn extract(
-    envelope_bytes: &[u8],
-    shared_key: &SharedKey,
-) -> Result<ExtractResult, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractResult, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
     let request = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::StoreShareRequest(message) => message,
         _ => {
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected StoreShareRequestMessage");
-            return Err(crate::Error::Invariant(
+            return Err(Error::Invariant(
                 "Invalid message. Expected: StoreShareRequestMessage",
             ));
         }
@@ -428,7 +427,7 @@ fn generate_vss_shares(
     secret_data: &[u8],
     threshold: usize,
     ordered_channels: &[WeightedChannel],
-) -> Result<Vec<derec_cryptography::vss::VSSShare>, SharingError> {
+) -> Result<Vec<vss::VSSShare>, SharingError> {
     let entropy = generate_seed::<32>();
     let t = threshold as u64;
     let weights: Vec<u64> = ordered_channels
@@ -442,7 +441,7 @@ fn generate_vss_shares(
 
 fn build_shares(
     ordered_channels: Vec<WeightedChannel>,
-    vss_shares: Vec<derec_cryptography::vss::VSSShare>,
+    vss_shares: Vec<vss::VSSShare>,
     secret_id: u64,
     version: u32,
 ) -> HashMap<ChannelId, CommittedDeRecShare> {
@@ -451,7 +450,7 @@ fn build_shares(
     for ((channel_id, _), share) in ordered_channels.into_iter().zip(vss_shares) {
         let derec_share = DeRecShare {
             encrypted_secret: share.encrypted_secret.clone(),
-            subshares: crate::extensions::derec_share::to_wire_subshares(&share.subshares),
+            subshares: to_wire_subshares(&share.subshares),
             secret_id,
             version,
         };
@@ -479,7 +478,7 @@ fn validate_split_inputs(
     channels: &[WeightedChannel],
     secret_data: &[u8],
     threshold: usize,
-) -> Result<Vec<WeightedChannel>, crate::Error> {
+) -> Result<Vec<WeightedChannel>, Error> {
     if channels.is_empty() {
         #[cfg(feature = "logging")]
         tracing::warn!("channels list is empty");

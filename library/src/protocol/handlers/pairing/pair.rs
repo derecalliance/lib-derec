@@ -10,15 +10,18 @@
 //! [`pre_pair`](super::pre_pair) has fetched it. Both arrive here the
 //! same way, so nothing below reads the contact mode.
 
+use crate::derec_message::apply_trace_id;
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::sender_kind::SenderKindExt as _;
 use crate::protocol::context::{Local, PairingConfig};
 use crate::protocol::stores::{StoreSet, Stores};
+use crate::protocol::types::{ChannelQuery, ChannelStatus, ReplicaFilter};
 use crate::protocol::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecTransport, PairingKeyMaterial,
-    PendingAction, SecretKind, SecretValue, now_secs,
+    PendingAction, PendingActionKind, SecretKind, SecretValue, now_secs, obligation,
 };
+use crate::types::ReplicaId;
 use crate::{
     Error, Result,
     derec_message::{DeRecMessageBuilder, current_timestamp},
@@ -114,21 +117,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     )
     .await?;
 
-    // The responder is a group member too, and only it knows its own id and
-    // endpoints. Without this row the roster it publishes would omit itself.
-    if kind.is_replica() {
-        super::persist_own_member(
-            stores,
-            local,
-            new_channel_id,
-            kind,
-            local.replica_id,
-            status,
-        )
-        .await?;
-    }
-
-    let envelope = crate::derec_message::apply_trace_id(&resp.envelope, trace_id)?;
+    let envelope = apply_trace_id(&resp.envelope, trace_id)?;
     let sent = stores.transport.send(&resp.peer_transports, envelope).await;
 
     // The response was handed to the transport, so the peer may already hold
@@ -153,9 +142,9 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         peer_replica_id,
     );
     if let Err(error) = sent.and(cleaned) {
-        events.push(crate::protocol::obligation::request_failed(
+        events.push(obligation::request_failed(
             new_channel_id,
-            crate::protocol::PendingActionKind::Pairing,
+            PendingActionKind::Pairing,
             true,
             StatusEnum::Ok as i32,
             "",
@@ -184,10 +173,7 @@ async fn drop_transient_material<S: StoreSet>(
         .await?;
     stores
         .channels
-        .remove(
-            secret_id,
-            crate::protocol::types::ChannelQuery::Helper { channel_id },
-        )
+        .remove(secret_id, ChannelQuery::Helper { channel_id })
         .await?;
     Ok(())
 }
@@ -324,7 +310,7 @@ pub(super) async fn on_response<S: StoreSet>(
     local: &Local<'_>,
     pairing: &PairingConfig<'_>,
     channel_id: ChannelId,
-    response: &derec_proto::PairResponseMessage,
+    response: &PairResponseMessage,
     pairing_secret: &PairingSecretKeyMaterial,
 ) -> Result<Vec<DeRecEvent>> {
     let replica_id = local.replica_id;
@@ -347,46 +333,17 @@ pub(super) async fn on_response<S: StoreSet>(
 
     let new_channel_id = result.channel_id;
 
-    // Which flow is this? A helper pairing left a `HelperChannel`
-    // placeholder; a replica pairing left this device's own member row.
-    // Try the helper key first — testing the local `ReplicaId` alone would
-    // be wrong, since a device may have one configured while pairing with a
-    // helper.
+    // Every pairing this device initiates left a `HelperChannel` placeholder
+    // carrying the peer's role; see `persist_start_record`.
     let helper_placeholder = stores
         .channels
-        .load(
-            secret_id,
-            crate::protocol::types::ChannelQuery::Helper { channel_id },
-        )
+        .load(secret_id, ChannelQuery::Helper { channel_id })
         .await?
-        .and_then(|r| r.as_helper().cloned());
-
-    let own_member = match (helper_placeholder.as_ref(), replica_id) {
-        (None, Some(own)) => stores
-            .channels
-            .load(
-                secret_id,
-                crate::protocol::types::ChannelQuery::Replica {
-                    channel_id,
-                    replica_id: crate::types::ReplicaId::try_from(own)?,
-                },
-            )
-            .await?
-            .and_then(|r| r.as_replica().cloned()),
-        _ => None,
-    };
-
-    // The peer's kind: from the placeholder for a helper pairing, or the
-    // counterpart of our own role for a replica one.
-    let peer_kind = match (helper_placeholder.as_ref(), own_member.as_ref()) {
-        (Some(placeholder), _) => placeholder.peer_role,
-        (None, Some(mine)) => mine.role.counterparty().to_sender_kind(),
-        (None, None) => {
-            return Err(Error::Invariant(
-                "no pairing record on pair response — start must be called first",
-            ));
-        }
-    };
+        .and_then(|r| r.as_helper().cloned())
+        .ok_or(Error::Invariant(
+            "no pairing record on pair response — start must be called first",
+        ))?;
+    let peer_kind = helper_placeholder.peer_role;
     let kind = peer_kind.counterparty();
 
     let status = completed_pairing_status(kind, Some(contact.contact_mode));
@@ -411,21 +368,8 @@ pub(super) async fn on_response<S: StoreSet>(
         });
     }
 
-    // The peer's endpoints come from the helper placeholder when one
-    // exists. A replica pairing has none, so it re-filters the contact we
-    // already loaded — dropping the placeholder for replica pairings costs
-    // nothing.
-    let peer_transport = match helper_placeholder.as_ref() {
-        Some(p) => p.transports.clone(),
-        None => local
-            .policy
-            .admit_peer_endpoints(contact.advertised_endpoints())?,
-    };
-
-    let mut merged_info = helper_placeholder
-        .as_ref()
-        .map(|p| p.communication_info.clone())
-        .unwrap_or_default();
+    let peer_transport = helper_placeholder.transports.clone();
+    let mut merged_info = helper_placeholder.communication_info.clone();
     for (k, v) in &peer_communication_info {
         merged_info.insert(k.clone(), v.clone());
     }
@@ -442,21 +386,6 @@ pub(super) async fn on_response<S: StoreSet>(
     )
     .await?;
 
-    if let Some(mine) = own_member.filter(|m| m.channel_id == channel_id) {
-        stores
-            .channels
-            .save(
-                secret_id,
-                crate::protocol::types::ChannelRecord::Replica(
-                    crate::protocol::types::ReplicaMember {
-                        channel_id: new_channel_id,
-                        ..mine
-                    },
-                ),
-            )
-            .await?;
-    }
-
     stores
         .secrets
         .save(
@@ -468,10 +397,7 @@ pub(super) async fn on_response<S: StoreSet>(
 
     stores
         .channels
-        .remove(
-            secret_id,
-            crate::protocol::types::ChannelQuery::Helper { channel_id },
-        )
+        .remove(secret_id, ChannelQuery::Helper { channel_id })
         .await?;
     stores
         .secrets
@@ -546,14 +472,13 @@ pub(super) async fn start<S: StoreSet>(
         endpoints.clone(),
         peer_communication_info,
         kind,
-        replica_id_to_inject,
     )
     .await?;
 
     #[cfg(feature = "logging")]
     tracing::info!("pairing request sent");
 
-    let envelope = crate::derec_message::apply_trace_id(&result.envelope, trace_id)?;
+    let envelope = apply_trace_id(&result.envelope, trace_id)?;
     stores.transport.send(&endpoints, envelope).await?;
 
     Ok(channel_id.0)
@@ -578,7 +503,7 @@ pub(super) async fn abandon_pairing<S: StoreSet>(
     // member", which is a fact about the whole roster's size.
     let roster = stores
         .channels
-        .replicas_matching(secret_id, crate::protocol::types::ReplicaFilter::default())
+        .replicas_matching(secret_id, ReplicaFilter::default())
         .await?;
     if let Some(own) = local.replica_id
         && roster.len() == 1
@@ -588,7 +513,7 @@ pub(super) async fn abandon_pairing<S: StoreSet>(
             .channels
             .remove(
                 secret_id,
-                crate::protocol::types::ChannelQuery::Replica {
+                ChannelQuery::Replica {
                     channel_id: roster[0].channel_id,
                     replica_id: roster[0].replica_id,
                 },
@@ -606,10 +531,7 @@ pub(super) async fn abandon_pairing<S: StoreSet>(
         .await;
     stores
         .channels
-        .remove(
-            secret_id,
-            crate::protocol::types::ChannelQuery::Helper { channel_id },
-        )
+        .remove(secret_id, ChannelQuery::Helper { channel_id })
         .await?;
     Ok(())
 }
@@ -640,12 +562,12 @@ pub(super) async fn abandon_pairing<S: StoreSet>(
 pub(super) fn completed_pairing_status(
     kind: SenderKind,
     contact_mode: Option<i32>,
-) -> crate::protocol::types::ChannelStatus {
+) -> ChannelStatus {
     let awaits_confirmation = kind.is_replica() || contact_mode == Some(ContactMode::NoKeys as i32);
     if awaits_confirmation {
-        crate::protocol::types::ChannelStatus::Pending
+        ChannelStatus::Pending
     } else {
-        crate::protocol::types::ChannelStatus::Paired
+        ChannelStatus::Paired
     }
 }
 
@@ -699,7 +621,7 @@ pub(super) async fn persist_peer_record<S: StoreSet>(
     communication_info: HashMap<String, String>,
     peer_kind: SenderKind,
     peer_replica_id: Option<u64>,
-    status: crate::protocol::types::ChannelStatus,
+    status: ChannelStatus,
 ) -> Result<()> {
     use crate::protocol::types::{ChannelRecord, HelperChannel, ReplicaMember, ReplicaRole};
     let record = match ReplicaRole::from_sender_kind(peer_kind) {
@@ -708,7 +630,7 @@ pub(super) async fn persist_peer_record<S: StoreSet>(
                 .ok_or(Error::Invariant(
                     "replica pairing completed without the peer's replica_id",
                 ))
-                .and_then(crate::types::ReplicaId::try_from)?;
+                .and_then(ReplicaId::try_from)?;
             ChannelRecord::Replica(ReplicaMember {
                 channel_id,
                 replica_id,

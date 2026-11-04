@@ -15,8 +15,11 @@
 //! contact-responder side).
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use std::ffi::c_char;
+use serde_json::Value;
+use std::ffi::{CString, c_char};
+use std::{ptr, slice};
 
+use crate::Error;
 use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::interop::dto::ContactMessage as ContactMessageDto;
 use crate::interop::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
@@ -24,13 +27,17 @@ use crate::interop::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_INVALID_ENUM,
     DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error, success,
 };
+use crate::primitives::pairing::{self, request, response};
+use crate::transport::TransportPolicy;
+use crate::types::ChannelId;
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
     CommunicationInfo, ContactMessage, ContactMode, DeRecMessage, PairRequestMessage,
-    PairResponseMessage, PrePairRequestMessage, PrePairResponseMessage, SenderKind,
+    PairResponseMessage, ParameterRange, PrePairRequestMessage, PrePairResponseMessage, SenderKind,
     TransportProtocol,
 };
 use prost::Message as _;
+use prost::encoding::{decode_varint, encode_varint};
 
 #[repr(C)]
 pub struct CreateContactMessageResult {
@@ -228,12 +235,7 @@ pub extern "C" fn create_contact_message(
 
     let nonce = if has_nonce != 0 { Some(nonce) } else { None };
 
-    match crate::primitives::pairing::request::create_contact(
-        channel_id.into(),
-        contact_mode,
-        own,
-        nonce,
-    ) {
+    match request::create_contact(channel_id.into(), contact_mode, own, nonce) {
         Ok(r) => CreateContactMessageResult {
             error: success(),
             contact_wire_bytes: vec_into_buffer(r.contact_message.encode_to_vec()),
@@ -274,7 +276,7 @@ pub extern "C" fn encode_contact_message(
         Ok(b) => b,
         Err(e) => return with_err(e),
     };
-    let mut json: serde_json::Value = match serde_json::from_slice(json_bytes) {
+    let mut json: Value = match serde_json::from_slice(json_bytes) {
         Ok(v) => v,
         Err(e) => {
             return with_err(ffi_error(
@@ -297,7 +299,7 @@ pub extern "C" fn encode_contact_message(
     };
 
     let contact_message: ContactMessage = dto.into();
-    match crate::primitives::pairing::request::encode_contact(&contact_message) {
+    match request::encode_contact(&contact_message) {
         Ok(bytes) => EncodeContactMessageResult {
             error: success(),
             wire_bytes: vec_into_buffer(bytes),
@@ -328,7 +330,7 @@ pub extern "C" fn decode_contact_message(
         Ok(b) => b,
         Err(e) => return with_err(e),
     };
-    let contact_message = match crate::primitives::pairing::request::decode_contact(wire_bytes) {
+    let contact_message = match request::decode_contact(wire_bytes) {
         Ok(c) => c,
         Err(e) => return with_err(from_lib_error(e)),
     };
@@ -429,7 +431,7 @@ pub extern "C" fn produce_pair_request_message(
             Err(e) => return with_err(e),
         };
 
-    match crate::primitives::pairing::request::produce(
+    match request::produce(
         sender_kind,
         own,
         &contact_message,
@@ -498,7 +500,7 @@ pub extern "C" fn extract_pair_request(
         }
     };
 
-    match crate::primitives::pairing::request::extract(
+    match request::extract(
         request_bytes,
         pairing_secret_key_material.ecies_secret_key(),
         parameter_range.as_ref(),
@@ -575,13 +577,13 @@ pub extern "C" fn produce_pair_response_message(
             Err(e) => return with_err(e),
         };
 
-    match crate::primitives::pairing::response::produce(
-        crate::types::ChannelId(channel_id),
+    match response::produce(
+        ChannelId(channel_id),
         &request,
         &pairing_secret_key_material,
         communication_info,
         parameter_range,
-        crate::transport::TransportPolicy::new(unsafe_connection != 0),
+        TransportPolicy::new(unsafe_connection != 0),
     ) {
         Ok(r) => ProducePairResponseMessageResult {
             error: success(),
@@ -630,7 +632,7 @@ pub extern "C" fn extract_pair_response(
         }
     };
 
-    match crate::primitives::pairing::response::extract(
+    match response::extract(
         response_bytes,
         pairing_secret_key_material.ecies_secret_key(),
     ) {
@@ -714,7 +716,7 @@ pub extern "C" fn process_pair_response_message(
             Err(e) => return with_err(e),
         };
 
-    match crate::primitives::pairing::response::process(
+    match response::process(
         &contact_message,
         &response,
         &pairing_secret_key_material,
@@ -772,10 +774,7 @@ pub extern "C" fn produce_pre_pair_request_message(
         }
     };
 
-    match crate::primitives::pairing::request::produce_pre_pair_request(
-        transport_protocols,
-        &contact_message,
-    ) {
+    match request::produce_pre_pair_request(transport_protocols, &contact_message) {
         Ok(r) => ProducePrePairRequestMessageResult {
             error: success(),
             envelope_wire_bytes: vec_into_buffer(r.envelope),
@@ -815,7 +814,7 @@ pub extern "C" fn extract_pre_pair_request(
         }
     };
 
-    match crate::primitives::pairing::request::extract_pre_pair(envelope_bytes) {
+    match request::extract_pre_pair(envelope_bytes) {
         Ok(r) => ExtractPrePairRequestResult {
             error: success(),
             channel_id,
@@ -868,8 +867,8 @@ pub extern "C" fn produce_pre_pair_response_message(
             Err(e) => return with_err(e),
         };
 
-    match crate::primitives::pairing::response::produce_pre_pair(
-        crate::types::ChannelId(channel_id),
+    match response::produce_pre_pair(
+        ChannelId(channel_id),
         &request,
         &pairing_secret_key_material,
     ) {
@@ -912,7 +911,7 @@ pub extern "C" fn extract_pre_pair_response(
         }
     };
 
-    match crate::primitives::pairing::response::extract_pre_pair(envelope_bytes) {
+    match response::extract_pre_pair(envelope_bytes) {
         Ok(r) => ExtractPrePairResponseResult {
             error: success(),
             channel_id,
@@ -963,10 +962,7 @@ pub extern "C" fn produce_pre_pair_no_keys_response_message(
         }
     };
 
-    match crate::primitives::pairing::response::produce_pre_pair_no_keys(
-        crate::types::ChannelId(channel_id),
-        &request,
-    ) {
+    match response::produce_pre_pair_no_keys(ChannelId(channel_id), &request) {
         Ok(r) => ProducePrePairNoKeysResponseMessageResult {
             error: success(),
             envelope_wire_bytes: vec_into_buffer(r.envelope),
@@ -1036,10 +1032,7 @@ pub extern "C" fn process_pre_pair_no_keys_response_message(
         }
     };
 
-    match crate::primitives::pairing::response::process_pre_pair_no_keys(
-        &contact_message,
-        &response,
-    ) {
+    match response::process_pre_pair_no_keys(&contact_message, &response) {
         Ok(r) => ProcessPrePairResponseMessageResult {
             error: success(),
             mlkem_encapsulation_key: vec_into_buffer(r.mlkem_encapsulation_key),
@@ -1064,13 +1057,13 @@ pub extern "C" fn pairing_fingerprint(
 ) -> PairingFingerprintResult {
     let with_err = |error| PairingFingerprintResult {
         error,
-        fingerprint: std::ptr::null_mut(),
+        fingerprint: ptr::null_mut(),
     };
     let shared_key = match parse_shared_key(shared_key_ptr, shared_key_len) {
         Ok(k) => k,
         Err(e) => return with_err(e),
     };
-    match std::ffi::CString::new(crate::primitives::pairing::fingerprint(&shared_key)) {
+    match CString::new(pairing::fingerprint(&shared_key)) {
         Ok(c) => PairingFingerprintResult {
             error: success(),
             fingerprint: c.into_raw(),
@@ -1141,7 +1134,7 @@ pub extern "C" fn process_pre_pair_response_message(
         }
     };
 
-    match crate::primitives::pairing::response::process_pre_pair(&contact_message, &response) {
+    match response::process_pre_pair(&contact_message, &response) {
         Ok(r) => ProcessPrePairResponseMessageResult {
             error: success(),
             mlkem_encapsulation_key: vec_into_buffer(r.mlkem_encapsulation_key),
@@ -1154,31 +1147,31 @@ pub extern "C" fn process_pre_pair_response_message(
 }
 
 /// Rewrites [`CONTACT_U64_ID_FIELDS`] from JSON numbers to decimal strings.
-fn u64_id_fields_to_strings(value: &mut serde_json::Value) {
+fn u64_id_fields_to_strings(value: &mut Value) {
     let Some(object) = value.as_object_mut() else {
         return;
     };
     for field in CONTACT_U64_ID_FIELDS {
-        if let Some(n) = object.get(field).and_then(serde_json::Value::as_u64) {
-            object.insert(field.to_owned(), serde_json::Value::String(n.to_string()));
+        if let Some(n) = object.get(field).and_then(Value::as_u64) {
+            object.insert(field.to_owned(), Value::String(n.to_string()));
         }
     }
 }
 
 /// Reverse of [`u64_id_fields_to_strings`]. A field already holding a JSON
 /// number is left untouched.
-fn u64_id_fields_to_numbers(value: &mut serde_json::Value) -> Result<(), String> {
+fn u64_id_fields_to_numbers(value: &mut Value) -> Result<(), String> {
     let Some(object) = value.as_object_mut() else {
         return Ok(());
     };
     for field in CONTACT_U64_ID_FIELDS {
-        let Some(serde_json::Value::String(raw)) = object.get(field) else {
+        let Some(Value::String(raw)) = object.get(field) else {
             continue;
         };
         let parsed: u64 = raw
             .parse()
             .map_err(|e| format!("{field} must be a decimal u64 string, got {raw:?}: {e}"))?;
-        object.insert(field.to_owned(), serde_json::Value::Number(parsed.into()));
+        object.insert(field.to_owned(), Value::Number(parsed.into()));
     }
     Ok(())
 }
@@ -1193,7 +1186,7 @@ fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], 
     if len == 0 {
         Ok(&[])
     } else {
-        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+        Ok(unsafe { slice::from_raw_parts(ptr, len) })
     }
 }
 
@@ -1213,7 +1206,7 @@ fn encode_transport_list(endpoints: &[TransportProtocol]) -> Vec<u8> {
     let mut out = Vec::new();
     for endpoint in endpoints {
         let entry = endpoint.encode_to_vec();
-        prost::encoding::encode_varint(entry.len() as u64, &mut out);
+        encode_varint(entry.len() as u64, &mut out);
         out.extend_from_slice(&entry);
     }
     out
@@ -1227,7 +1220,7 @@ fn decode_transport_protocol_list(
     let mut out = Vec::new();
 
     while !bytes.is_empty() {
-        let entry_len = prost::encoding::decode_varint(&mut bytes).map_err(|_| {
+        let entry_len = decode_varint(&mut bytes).map_err(|_| {
             ffi_error(
                 DEREC_CODE_FFI_BAD_PROTO,
                 "transport_protocols_bytes has a malformed length prefix",
@@ -1251,7 +1244,7 @@ fn decode_transport_protocol_list(
             )
         })?;
         tp.validate()
-            .map_err(|e| from_lib_error(crate::Error::Transport(e)))?;
+            .map_err(|e| from_lib_error(Error::Transport(e)))?;
         out.push(tp);
     }
 
@@ -1272,7 +1265,7 @@ fn decode_optional_communication_info(
     if ptr.is_null() || len == 0 {
         return Ok(None);
     }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let bytes = unsafe { slice::from_raw_parts(ptr, len) };
     CommunicationInfo::decode(bytes).map(Some).map_err(|_| {
         ffi_error(
             DEREC_CODE_FFI_BAD_PROTO,
@@ -1284,19 +1277,17 @@ fn decode_optional_communication_info(
 fn decode_optional_parameter_range(
     ptr: *const u8,
     len: usize,
-) -> Result<Option<derec_proto::ParameterRange>, DeRecError> {
+) -> Result<Option<ParameterRange>, DeRecError> {
     if ptr.is_null() || len == 0 {
         return Ok(None);
     }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    derec_proto::ParameterRange::decode(bytes)
-        .map(Some)
-        .map_err(|_| {
-            ffi_error(
-                DEREC_CODE_FFI_BAD_PROTO,
-                "parameter_range_bytes is not a valid ParameterRange",
-            )
-        })
+    let bytes = unsafe { slice::from_raw_parts(ptr, len) };
+    ParameterRange::decode(bytes).map(Some).map_err(|_| {
+        ffi_error(
+            DEREC_CODE_FFI_BAD_PROTO,
+            "parameter_range_bytes is not a valid ParameterRange",
+        )
+    })
 }
 
 fn parse_shared_key(ptr: *const u8, len: usize) -> Result<[u8; 32], DeRecError> {
@@ -1333,7 +1324,9 @@ fn serialize_pairing_secret_key_material(sk: &PairingSecretKeyMaterial) -> Vec<u
 mod contact_message_json_tests {
     use super::*;
     use crate::interop::ffi::common::derec_free_buffer;
-    use crate::interop::ffi::error::{DEREC_CATEGORY_OK, derec_free_error};
+    use crate::interop::ffi::error::{
+        DEREC_CATEGORY_OK, DEREC_CODE_INVALID_CONTACT_MESSAGE, derec_free_error,
+    };
 
     /// Copies a returned buffer out and releases it, matching the ABI
     /// contract foreign callers follow.
@@ -1341,7 +1334,7 @@ mod contact_message_json_tests {
         if buffer.ptr.is_null() {
             return Vec::new();
         }
-        let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) }.to_vec();
+        let bytes = unsafe { slice::from_raw_parts(buffer.ptr, buffer.len) }.to_vec();
         derec_free_buffer(buffer.ptr, buffer.len);
         bytes
     }
@@ -1384,7 +1377,7 @@ mod contact_message_json_tests {
         let decoded = decode(&wire);
         assert_eq!(release(decoded.error), 0);
         let json_bytes = take_buffer(decoded.contact_json);
-        let value: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+        let value: Value = serde_json::from_slice(&json_bytes).unwrap();
 
         assert_eq!(value["channel_id"], "18446744073709551615");
         assert_eq!(value["nonce"], "9007199254740993");
@@ -1432,10 +1425,7 @@ mod contact_message_json_tests {
         }"#;
 
         let encoded = encode(invalid_json);
-        assert_eq!(
-            release(encoded.error),
-            crate::interop::ffi::error::DEREC_CODE_INVALID_CONTACT_MESSAGE
-        );
+        assert_eq!(release(encoded.error), DEREC_CODE_INVALID_CONTACT_MESSAGE);
         assert_eq!(take_buffer(encoded.wire_bytes), Vec::<u8>::new());
 
         // The same invalid value built as proto bytes without going through
@@ -1457,10 +1447,7 @@ mod contact_message_json_tests {
         .encode_to_vec();
 
         let decoded = decode(&invalid_wire);
-        assert_eq!(
-            release(decoded.error),
-            crate::interop::ffi::error::DEREC_CODE_INVALID_CONTACT_MESSAGE
-        );
+        assert_eq!(release(decoded.error), DEREC_CODE_INVALID_CONTACT_MESSAGE);
         assert_eq!(take_buffer(decoded.contact_json), Vec::<u8>::new());
     }
 
@@ -1472,7 +1459,7 @@ mod contact_message_json_tests {
         let mut out = Vec::new();
         for tp in entries {
             let bytes = tp.encode_to_vec();
-            prost::encoding::encode_varint(bytes.len() as u64, &mut out);
+            encode_varint(bytes.len() as u64, &mut out);
             out.extend_from_slice(&bytes);
         }
         out
@@ -1498,8 +1485,7 @@ mod contact_message_json_tests {
 
         let decoded = decode(&wire);
         assert_eq!(release(decoded.error), DEREC_CATEGORY_OK);
-        let value: serde_json::Value =
-            serde_json::from_slice(&take_buffer(decoded.contact_json)).unwrap();
+        let value: Value = serde_json::from_slice(&take_buffer(decoded.contact_json)).unwrap();
         assert_eq!(value["channel_id"], "42");
         assert_eq!(value["nonce"], "99");
         assert_eq!(value["contact_mode"], 0);
@@ -1515,14 +1501,16 @@ mod contact_message_json_tests {
 #[cfg(test)]
 mod pairing_entry_point_tests {
     use super::*;
-    use crate::interop::ffi::common::derec_free_buffer;
+    use crate::interop::ffi::common::{derec_free_buffer, derec_free_string};
     use crate::interop::ffi::error::{DEREC_CATEGORY_OK, derec_free_error};
+    use derec_proto::Protocol;
+    use std::ffi::CStr;
 
     fn take(buffer: DeRecBuffer) -> Vec<u8> {
         if buffer.ptr.is_null() {
             return Vec::new();
         }
-        let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) }.to_vec();
+        let bytes = unsafe { slice::from_raw_parts(buffer.ptr, buffer.len) }.to_vec();
         derec_free_buffer(buffer.ptr, buffer.len);
         bytes
     }
@@ -1533,7 +1521,7 @@ mod pairing_entry_point_tests {
         code
     }
 
-    fn endpoint(uri: &str, protocol: derec_proto::Protocol) -> TransportProtocol {
+    fn endpoint(uri: &str, protocol: Protocol) -> TransportProtocol {
         TransportProtocol {
             uri: uri.to_owned(),
             protocol: protocol as i32,
@@ -1545,10 +1533,7 @@ mod pairing_entry_point_tests {
         encode_transport_list(entries)
     }
 
-    fn create_contact(
-        mode: derec_proto::ContactMode,
-        framed_list: &[u8],
-    ) -> CreateContactMessageResult {
+    fn create_contact(mode: ContactMode, framed_list: &[u8]) -> CreateContactMessageResult {
         create_contact_message(
             42,
             mode as i32,
@@ -1563,15 +1548,14 @@ mod pairing_entry_point_tests {
     #[test]
     fn create_contact_accepts_a_framed_endpoint_list() {
         let list = framed(&[
-            endpoint("grpcs://a.example:443", derec_proto::Protocol::Grpc),
-            endpoint("https://a.example/derec", derec_proto::Protocol::Https),
+            endpoint("grpcs://a.example:443", Protocol::Grpc),
+            endpoint("https://a.example/derec", Protocol::Https),
         ]);
-        let result = create_contact(derec_proto::ContactMode::InlineKeys, &list);
+        let result = create_contact(ContactMode::InlineKeys, &list);
 
         assert_eq!(result.error.category, DEREC_CATEGORY_OK, "unexpected error");
-        let contact =
-            derec_proto::ContactMessage::decode(take(result.contact_wire_bytes).as_slice())
-                .expect("the produced contact decodes");
+        let contact = ContactMessage::decode(take(result.contact_wire_bytes).as_slice())
+            .expect("the produced contact decodes");
         let _ = take(result.secret_key_material);
 
         assert_eq!(contact.supported_transports.len(), 2);
@@ -1582,7 +1566,7 @@ mod pairing_entry_point_tests {
     /// Rejected at the seam rather than producing a contact nobody can answer.
     #[test]
     fn create_contact_rejects_an_empty_endpoint_list() {
-        let result = create_contact(derec_proto::ContactMode::InlineKeys, &[]);
+        let result = create_contact(ContactMode::InlineKeys, &[]);
 
         assert_ne!(
             release(result.error),
@@ -1599,7 +1583,7 @@ mod pairing_entry_point_tests {
     fn a_length_prefix_overrunning_the_buffer_is_refused() {
         // Varint 0x7F promises 127 bytes; only two follow.
         let malformed = [0x7Fu8, 0x00, 0x00];
-        let result = create_contact(derec_proto::ContactMode::InlineKeys, &malformed);
+        let result = create_contact(ContactMode::InlineKeys, &malformed);
 
         assert_ne!(
             release(result.error),
@@ -1614,8 +1598,8 @@ mod pairing_entry_point_tests {
     /// cannot smuggle a mismatched scheme past the seam.
     #[test]
     fn a_scheme_mismatched_endpoint_in_the_list_is_refused() {
-        let list = framed(&[endpoint("ws://a.example", derec_proto::Protocol::Https)]);
-        let result = create_contact(derec_proto::ContactMode::InlineKeys, &list);
+        let list = framed(&[endpoint("ws://a.example", Protocol::Https)]);
+        let result = create_contact(ContactMode::InlineKeys, &list);
 
         assert_ne!(
             release(result.error),
@@ -1630,17 +1614,14 @@ mod pairing_entry_point_tests {
     /// list for the same reason: the reply would have nowhere to go.
     #[test]
     fn produce_pre_pair_request_requires_at_least_one_endpoint() {
-        let list = framed(&[endpoint(
-            "https://a.example/derec",
-            derec_proto::Protocol::Https,
-        )]);
-        let contact = create_contact(derec_proto::ContactMode::HashedKeys, &list);
+        let list = framed(&[endpoint("https://a.example/derec", Protocol::Https)]);
+        let contact = create_contact(ContactMode::HashedKeys, &list);
         assert_eq!(contact.error.category, DEREC_CATEGORY_OK);
         let contact_bytes = take(contact.contact_wire_bytes);
         let _ = take(contact.secret_key_material);
 
         let empty = produce_pre_pair_request_message(
-            std::ptr::null(),
+            ptr::null(),
             0,
             contact_bytes.as_ptr(),
             contact_bytes.len(),
@@ -1671,13 +1652,10 @@ mod pairing_entry_point_tests {
     #[test]
     fn a_no_keys_pre_pair_completes_through_the_c_abi() {
         const NONCE: u64 = 4242;
-        let list = framed(&[endpoint(
-            "https://a.example/derec",
-            derec_proto::Protocol::Https,
-        )]);
+        let list = framed(&[endpoint("https://a.example/derec", Protocol::Https)]);
         let contact = create_contact_message(
             42,
-            derec_proto::ContactMode::NoKeys as i32,
+            ContactMode::NoKeys as i32,
             list.as_ptr(),
             list.len(),
             1,
@@ -1738,11 +1716,11 @@ mod pairing_entry_point_tests {
         let key = [0x5A; 32];
         let result = pairing_fingerprint(key.as_ptr(), key.len());
         assert_eq!(result.error.category, DEREC_CATEGORY_OK);
-        let text = unsafe { std::ffi::CStr::from_ptr(result.fingerprint) }
+        let text = unsafe { CStr::from_ptr(result.fingerprint) }
             .to_string_lossy()
             .into_owned();
-        crate::interop::ffi::common::derec_free_string(result.fingerprint);
-        assert_eq!(text, crate::primitives::pairing::fingerprint(&key));
+        derec_free_string(result.fingerprint);
+        assert_eq!(text, pairing::fingerprint(&key));
 
         let short = [0x5A; 31];
         let refused = pairing_fingerprint(short.as_ptr(), short.len());
@@ -1754,7 +1732,7 @@ mod pairing_entry_point_tests {
     /// failure — it must be reported rather than dereferenced.
     #[test]
     fn a_null_pointer_with_a_non_zero_length_is_refused() {
-        let result = create_contact_message(42, 0, std::ptr::null(), 8, 0, 0);
+        let result = create_contact_message(42, 0, ptr::null(), 8, 0, 0);
 
         assert_ne!(
             release(result.error),

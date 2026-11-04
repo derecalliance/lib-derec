@@ -18,11 +18,14 @@
 //! [`tear_down`] are the second half, driven from the sharing flow as each new
 //! roster lands.
 use super::flag_unpairing;
+use crate::derec_message::apply_trace_id;
 use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::primitives::unpairing::request;
 use crate::protocol::context::Local;
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{
-    ChannelRecord, ChannelStatus, ReplicaFilter, ReplicaMember, ReplicaRole,
+    ChannelQuery, ChannelRecord, ChannelStatus, HelperFilter, ReplicaFilter, ReplicaMember,
+    ReplicaRole, SecretValue,
 };
 use crate::protocol::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
@@ -99,7 +102,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         .load(secret_id, group_channel, SecretKind::SharedKey)
         .await?
     {
-        Some(crate::protocol::types::SecretValue::SharedKey(k)) => k,
+        Some(SecretValue::SharedKey(k)) => k,
         _ => {
             return Err(Error::InvalidInput(
                 "channel has no shared key — not yet paired",
@@ -113,14 +116,8 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     let memo = memo.unwrap_or_default();
     let mut notified = Vec::new();
     for peer in roster.iter().filter(|m| m.replica_id.0 != own) {
-        let request = crate::primitives::unpairing::request::produce(
-            peer.channel_id,
-            &memo,
-            &key,
-            &[],
-            Some(target.0),
-        )?;
-        let envelope = crate::derec_message::apply_trace_id(&request.envelope, trace_id)?;
+        let request = request::produce(peer.channel_id, &memo, &key, &[], Some(target.0))?;
+        let envelope = apply_trace_id(&request.envelope, trace_id)?;
         if stores
             .transport
             .send(&peer.transports, envelope)
@@ -213,7 +210,7 @@ pub(in crate::protocol) async fn reconcile<S: StoreSet>(
             .channels
             .remove(
                 local.secret_id,
-                crate::protocol::types::ChannelQuery::Replica {
+                ChannelQuery::Replica {
                     channel_id: member.channel_id,
                     replica_id: member.replica_id,
                 },
@@ -243,14 +240,14 @@ pub(in crate::protocol) async fn tear_down<S: StoreSet>(
     let secret_id = local.secret_id;
     for helper in stores
         .channels
-        .helpers_matching(secret_id, crate::protocol::types::HelperFilter::default())
+        .helpers_matching(secret_id, HelperFilter::default())
         .await?
     {
         drop_channel(
             stores,
             local,
             helper.channel_id,
-            crate::protocol::types::ChannelQuery::Helper {
+            ChannelQuery::Helper {
                 channel_id: helper.channel_id,
             },
         )
@@ -266,7 +263,7 @@ pub(in crate::protocol) async fn tear_down<S: StoreSet>(
             stores,
             local,
             member.channel_id,
-            crate::protocol::types::ChannelQuery::Replica {
+            ChannelQuery::Replica {
                 channel_id: member.channel_id,
                 replica_id: member.replica_id,
             },
@@ -282,7 +279,7 @@ async fn drop_channel<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     channel_id: ChannelId,
-    query: crate::protocol::types::ChannelQuery,
+    query: ChannelQuery,
 ) -> Result<()> {
     let secret_id = local.secret_id;
     // The share and secret rows may or may not exist — a member removed
@@ -348,18 +345,22 @@ async fn on_request<S: StoreSet>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::tests::LocalFixture;
     use crate::protocol::tests::{InMemChannelStore, InMemSecretStore, StoreRig, run_async};
-    use crate::protocol::types::{HelperChannel, SecretValue, UserSecrets};
+    use crate::protocol::tests::{LocalFixture, NoopTransport};
+    use crate::protocol::types::{
+        HelperChannel, HelperFilter, ReplicaFilter, SecretValue, UserSecrets,
+    };
     use crate::protocol::{DeRecSecretStore, DeRecUserSecretStore};
+    use derec_proto::{Protocol, SenderKind, TransportProtocol};
+    use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0xDE9A27;
     const GROUP: ChannelId = ChannelId(5001);
 
-    fn endpoint(uri: &str) -> derec_proto::TransportProtocol {
-        derec_proto::TransportProtocol {
+    fn endpoint(uri: &str) -> TransportProtocol {
+        TransportProtocol {
             uri: uri.to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         }
     }
 
@@ -376,7 +377,7 @@ mod tests {
                     channel_id: GROUP,
                     replica_id: ReplicaId(id),
                     transports: vec![endpoint("https://peer.example")],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     role,
                     status,
                     created_at: 0,
@@ -420,7 +421,7 @@ mod tests {
             assert!(matches!(outcome, RemovalOutcome::Nothing));
             assert_eq!(
                 rig.channels
-                    .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
+                    .replicas(SECRET_ID, ReplicaFilter::default())
                     .await
                     .expect("roster")
                     .len(),
@@ -460,7 +461,7 @@ mod tests {
             assert!(matches!(outcome, RemovalOutcome::Nothing));
             assert_eq!(
                 rig.channels
-                    .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
+                    .replicas(SECRET_ID, ReplicaFilter::default())
                     .await
                     .expect("roster")
                     .len(),
@@ -497,8 +498,8 @@ mod tests {
                     ChannelRecord::Helper(HelperChannel {
                         channel_id: ChannelId(9001),
                         transports: vec![endpoint("https://helper.example")],
-                        communication_info: std::collections::HashMap::new(),
-                        peer_role: derec_proto::SenderKind::Helper,
+                        communication_info: HashMap::new(),
+                        peer_role: SenderKind::Helper,
                         status: ChannelStatus::Paired,
                         created_at: 0,
                         weight: 1,
@@ -514,7 +515,7 @@ mod tests {
             assert!(matches!(outcome, RemovalOutcome::Removed(ref ids) if ids == &[1002]));
             let roster = rig
                 .channels
-                .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
+                .replicas(SECRET_ID, ReplicaFilter::default())
                 .await
                 .expect("roster");
             assert_eq!(roster.len(), 1, "only the departing row goes");
@@ -524,7 +525,7 @@ mod tests {
             );
             assert_eq!(
                 rig.channels
-                    .helpers(SECRET_ID, crate::protocol::types::HelperFilter::default())
+                    .helpers(SECRET_ID, HelperFilter::default())
                     .await
                     .expect("helpers")
                     .len(),
@@ -566,7 +567,7 @@ mod tests {
             );
             assert_eq!(
                 rig.channels
-                    .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
+                    .replicas(SECRET_ID, ReplicaFilter::default())
                     .await
                     .expect("roster")
                     .len(),
@@ -603,8 +604,8 @@ mod tests {
                     ChannelRecord::Helper(HelperChannel {
                         channel_id: ChannelId(9001),
                         transports: vec![endpoint("https://helper.example")],
-                        communication_info: std::collections::HashMap::new(),
-                        peer_role: derec_proto::SenderKind::Helper,
+                        communication_info: HashMap::new(),
+                        peer_role: SenderKind::Helper,
                         status: ChannelStatus::Paired,
                         created_at: 0,
                         weight: 1,
@@ -636,14 +637,14 @@ mod tests {
 
             assert!(
                 rig.channels
-                    .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
+                    .replicas(SECRET_ID, ReplicaFilter::default())
                     .await
                     .expect("roster")
                     .is_empty()
             );
             assert!(
                 rig.channels
-                    .helpers(SECRET_ID, crate::protocol::types::HelperFilter::default())
+                    .helpers(SECRET_ID, HelperFilter::default())
                     .await
                     .expect("helpers")
                     .is_empty()
@@ -676,7 +677,7 @@ mod tests {
 
     async fn role_of(channels: &InMemChannelStore, id: u64) -> ReplicaRole {
         channels
-            .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
+            .replicas(SECRET_ID, ReplicaFilter::default())
             .await
             .expect("roster")
             .into_iter()
@@ -691,7 +692,7 @@ mod tests {
     fn removing_the_source_promotes_a_remaining_member() {
         run_async(async {
             let lf = LocalFixture::with_replica(SECRET_ID, 1002);
-            let mut rig = StoreRig::with_transport(crate::protocol::tests::NoopTransport);
+            let mut rig = StoreRig::with_transport(NoopTransport);
             seed_group_key(&mut rig.secrets).await;
             seed_member(
                 &mut rig.channels,
@@ -733,7 +734,7 @@ mod tests {
     fn a_departing_member_is_not_eligible_to_succeed() {
         run_async(async {
             let lf = LocalFixture::with_replica(SECRET_ID, 1003);
-            let mut rig = StoreRig::with_transport(crate::protocol::tests::NoopTransport);
+            let mut rig = StoreRig::with_transport(NoopTransport);
             seed_group_key(&mut rig.secrets).await;
             seed_member(
                 &mut rig.channels,
@@ -772,7 +773,7 @@ mod tests {
     fn a_sole_source_leaves_no_successor() {
         run_async(async {
             let lf = LocalFixture::with_replica(SECRET_ID, 1001);
-            let mut rig = StoreRig::with_transport(crate::protocol::tests::NoopTransport);
+            let mut rig = StoreRig::with_transport(NoopTransport);
             seed_group_key(&mut rig.secrets).await;
             seed_member(
                 &mut rig.channels,
@@ -800,7 +801,7 @@ mod tests {
     fn removing_a_destination_promotes_nobody() {
         run_async(async {
             let lf = LocalFixture::with_replica(SECRET_ID, 1001);
-            let mut rig = StoreRig::with_transport(crate::protocol::tests::NoopTransport);
+            let mut rig = StoreRig::with_transport(NoopTransport);
             seed_group_key(&mut rig.secrets).await;
             seed_member(
                 &mut rig.channels,

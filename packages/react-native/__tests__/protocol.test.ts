@@ -707,7 +707,7 @@ describe('event byte fields', () => {
   });
 
   it('passes RecoveryShareCorrupted through with every reason', async () => {
-    const reasons: CorruptionReason[] = ['Malformed', 'InvalidProof', 'Inconsistent'];
+    const reasons: CorruptionReason[] = ['Malformed', 'InvalidProof', 'Forged'];
     const events = reasons.map(reason => ({
       type: 'RecoveryShareCorrupted',
       channel_id: '18446744073709551615',

@@ -7,7 +7,7 @@ use derec_library::protocol::DeRecUserSecretStore;
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::{ChannelQuery, Target, UserSecret};
 use derec_library::types::ChannelId;
-use derec_proto::SenderKind;
+use derec_proto::{ContactMode, SenderKind};
 use std::collections::HashMap;
 
 use crate::db::Database;
@@ -153,7 +153,7 @@ pub async fn run() {
     {
         let contact = user_wallet
             .protocol
-            .create_contact(Some(fresh_cid), derec_proto::ContactMode::InlineKeys, None)
+            .create_contact(Some(fresh_cid), ContactMode::InlineKeys, None)
             .await
             .unwrap_or_else(|e| panic!("wallet recovery create_contact({label}) failed: {e}"));
         helper

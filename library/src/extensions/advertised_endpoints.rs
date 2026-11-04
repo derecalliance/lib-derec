@@ -1,3 +1,9 @@
+use derec_proto::{
+    ContactMessage, GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PairRequestMessage,
+    PrePairRequestMessage, StoreShareRequestMessage, TransportProtocol, UnpairRequestMessage,
+    UpdateChannelInfoRequestMessage, VerifyShareRequestMessage,
+};
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
@@ -16,29 +22,29 @@ pub trait AdvertisedEndpoints {
     /// the result to [`TransportPolicy::admit_peer_endpoints`](crate::transport::TransportPolicy::admit_peer_endpoints) before
     /// recording any of it. Borrows rather than clones — nothing is copied
     /// until the policy has decided what survives.
-    fn advertised_endpoints(&self) -> Vec<&derec_proto::TransportProtocol>;
+    fn advertised_endpoints(&self) -> Vec<&TransportProtocol>;
 }
 
-impl AdvertisedEndpoints for derec_proto::ContactMessage {
-    fn advertised_endpoints(&self) -> Vec<&derec_proto::TransportProtocol> {
+impl AdvertisedEndpoints for ContactMessage {
+    fn advertised_endpoints(&self) -> Vec<&TransportProtocol> {
         self.supported_transports.iter().collect()
     }
 }
 
-impl AdvertisedEndpoints for derec_proto::PairRequestMessage {
-    fn advertised_endpoints(&self) -> Vec<&derec_proto::TransportProtocol> {
+impl AdvertisedEndpoints for PairRequestMessage {
+    fn advertised_endpoints(&self) -> Vec<&TransportProtocol> {
         self.supported_transports.iter().collect()
     }
 }
 
-impl AdvertisedEndpoints for derec_proto::PrePairRequestMessage {
-    fn advertised_endpoints(&self) -> Vec<&derec_proto::TransportProtocol> {
+impl AdvertisedEndpoints for PrePairRequestMessage {
+    fn advertised_endpoints(&self) -> Vec<&TransportProtocol> {
         self.supported_transports.iter().collect()
     }
 }
 
-impl AdvertisedEndpoints for derec_proto::UpdateChannelInfoRequestMessage {
-    fn advertised_endpoints(&self) -> Vec<&derec_proto::TransportProtocol> {
+impl AdvertisedEndpoints for UpdateChannelInfoRequestMessage {
+    fn advertised_endpoints(&self) -> Vec<&TransportProtocol> {
         self.supported_transports.iter().collect()
     }
 }
@@ -60,7 +66,7 @@ pub trait ReplyToEndpoints {
     /// Empty means the requester named none, which is distinct from naming an
     /// unreachable one: the responder then falls back to the endpoints stored
     /// on the channel rather than failing to answer.
-    fn reply_to_endpoints(&self) -> Vec<&derec_proto::TransportProtocol>;
+    fn reply_to_endpoints(&self) -> Vec<&TransportProtocol>;
 }
 
 /// Implement [`ReplyToEndpoints`] for a request carrying `replyToTransports`.
@@ -81,11 +87,11 @@ macro_rules! impl_reply_to_endpoints {
 }
 
 impl_reply_to_endpoints!(
-    derec_proto::StoreShareRequestMessage,
-    derec_proto::VerifyShareRequestMessage,
-    derec_proto::GetSecretIdsVersionsRequestMessage,
-    derec_proto::GetShareRequestMessage,
-    derec_proto::UnpairRequestMessage,
+    StoreShareRequestMessage,
+    VerifyShareRequestMessage,
+    GetSecretIdsVersionsRequestMessage,
+    GetShareRequestMessage,
+    UnpairRequestMessage,
 );
 
 /// [`ReplyToEndpoints::reply_to_endpoints`] as owned values.
@@ -94,36 +100,33 @@ impl_reply_to_endpoints!(
 /// what it inspects. A response path instead keeps everything it resolves and
 /// hands it to a transport that outlives the request, so it would clone
 /// immediately anyway.
-pub(crate) fn reply_to_owned(
-    request: &impl ReplyToEndpoints,
-) -> Vec<derec_proto::TransportProtocol> {
+pub(crate) fn reply_to_owned(request: &impl ReplyToEndpoints) -> Vec<TransportProtocol> {
     request.reply_to_endpoints().into_iter().cloned().collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
     use crate::transport::TransportPolicy;
     use derec_proto::Protocol;
 
-    fn endpoint(uri: &str, protocol: Protocol) -> derec_proto::TransportProtocol {
-        derec_proto::TransportProtocol {
+    fn endpoint(uri: &str, protocol: Protocol) -> TransportProtocol {
+        TransportProtocol {
             uri: uri.to_owned(),
             protocol: protocol as i32,
         }
     }
 
-    fn contact(offers: Vec<derec_proto::TransportProtocol>) -> derec_proto::ContactMessage {
-        derec_proto::ContactMessage {
+    fn contact(offers: Vec<TransportProtocol>) -> ContactMessage {
+        ContactMessage {
             supported_transports: offers,
             ..Default::default()
         }
     }
 
-    fn pair_request(
-        offers: Vec<derec_proto::TransportProtocol>,
-    ) -> derec_proto::PairRequestMessage {
-        derec_proto::PairRequestMessage {
+    fn pair_request(offers: Vec<TransportProtocol>) -> PairRequestMessage {
+        PairRequestMessage {
             supported_transports: offers,
             ..Default::default()
         }
@@ -210,10 +213,7 @@ mod tests {
             .admit_peer_endpoints(message.advertised_endpoints())
             .expect_err("the only endpoint is plaintext");
 
-        assert!(matches!(
-            error,
-            crate::Error::NoUsableEndpoint { offered: 1 },
-        ));
+        assert!(matches!(error, Error::NoUsableEndpoint { offered: 1 },));
     }
 
     /// `offered` counts what the peer advertised, not what survived — the
@@ -227,9 +227,6 @@ mod tests {
             .admit_peer_endpoints(message.advertised_endpoints())
             .expect_err("nothing was advertised");
 
-        assert!(matches!(
-            error,
-            crate::Error::NoUsableEndpoint { offered: 0 },
-        ));
+        assert!(matches!(error, Error::NoUsableEndpoint { offered: 0 },));
     }
 }

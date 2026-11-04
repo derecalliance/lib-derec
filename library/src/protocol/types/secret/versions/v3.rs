@@ -20,7 +20,9 @@
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 
+use derec_proto::TransportProtocol;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use serde::de;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::types::secret::SecretError;
@@ -28,6 +30,7 @@ use crate::protocol::types::{HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Sec
 
 mod base64_bytes {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::de;
     use serde::{Deserialize as _, Deserializer, Serializer};
 
     #[allow(clippy::ptr_arg)]
@@ -37,11 +40,12 @@ mod base64_bytes {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
-        STANDARD.decode(s).map_err(serde::de::Error::custom)
+        STANDARD.decode(s).map_err(de::Error::custom)
     }
 }
 
 mod u64_string {
+    use serde::de;
     use serde::{Deserialize as _, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
@@ -50,7 +54,7 @@ mod u64_string {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
         let s = String::deserialize(d)?;
-        s.parse::<u64>().map_err(serde::de::Error::custom)
+        s.parse::<u64>().map_err(de::Error::custom)
     }
 }
 
@@ -79,8 +83,8 @@ struct EndpointJson {
     protocol: i32,
 }
 
-impl From<&derec_proto::TransportProtocol> for EndpointJson {
-    fn from(t: &derec_proto::TransportProtocol) -> Self {
+impl From<&TransportProtocol> for EndpointJson {
+    fn from(t: &TransportProtocol) -> Self {
         EndpointJson {
             uri: t.uri.clone(),
             protocol: t.protocol,
@@ -88,9 +92,9 @@ impl From<&derec_proto::TransportProtocol> for EndpointJson {
     }
 }
 
-impl From<EndpointJson> for derec_proto::TransportProtocol {
+impl From<EndpointJson> for TransportProtocol {
     fn from(j: EndpointJson) -> Self {
-        derec_proto::TransportProtocol {
+        TransportProtocol {
             uri: j.uri,
             protocol: j.protocol,
         }
@@ -302,7 +306,7 @@ where
 {
     use serde::Deserialize as _;
     match Option::<u32>::deserialize(d)? {
-        Some(0) => Err(serde::de::Error::custom("helper weight must be at least 1")),
+        Some(0) => Err(de::Error::custom("helper weight must be at least 1")),
         other => Ok(other),
     }
 }
@@ -315,7 +319,7 @@ where
 {
     use serde::Deserialize as _;
     match Option::<u32>::deserialize(d)? {
-        Some(t) if t < 2 => Err(serde::de::Error::custom("threshold must be at least 2")),
+        Some(t) if t < 2 => Err(de::Error::custom("threshold must be at least 2")),
         other => Ok(other),
     }
 }
@@ -331,13 +335,14 @@ where
 #[cfg(test)]
 mod weight_tests {
     use super::*;
+    use derec_proto::Protocol;
 
     fn helper(weight: u32) -> HelperInfo {
         HelperInfo {
             channel_id: 2,
-            transports: vec![derec_proto::TransportProtocol {
+            transports: vec![TransportProtocol {
                 uri: "https://h.example/derec".to_owned(),
-                protocol: derec_proto::Protocol::Https as i32,
+                protocol: Protocol::Https as i32,
             }],
             shared_key: vec![1, 2, 3],
             communication_info: HashMap::new(),

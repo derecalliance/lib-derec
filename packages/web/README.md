@@ -483,9 +483,39 @@ main();
 When driving the protocol layer instead of the primitives, a helper that
 answers with a share that cannot be part of the secret is reported as a
 `RecoveryShareCorrupted` event (`reason`: `"Malformed"`, `"InvalidProof"` or
-`"Inconsistent"`); the share is set aside and never blocks the recovery from
+`"Forged"`); the share is set aside and never blocks the recovery from
 the others. An honest helper never sends one, so treat it as a sign of a
-damaged or compromised helper — for example, offer to unpair it.
+damaged or compromised helper — for example, offer to unpair it. A share that
+only disagrees with the others is never reported this way: it is a dispute,
+not evidence against its helper.
+
+A recovery reconstructs nothing until every helper it asked has answered (a
+share, a refusal or a corrupted share all count) or
+`timeouts.get_share_response_secs` has passed since the requests went out;
+each silent helper is then reported as `RecoverSecretFailed` with
+`error: "timeout"` from `tick()`. It then decides exactly once:
+
+- `SecretRecovered` — one secret reconstructs and every collected share is
+  part of it;
+- `RecoveryDisputed { version, secret, supported_by, disputed_by }` — one
+  secret reconstructs, but other helpers hold valid shares of a different
+  split that does not. Either side can be the owner's: colluding helpers can
+  forge a complete split, and the honest ones may be too few to reconstruct
+  theirs. Show the owner what `secret` holds and who stands on each side, and
+  pass it to `restore` only once they confirm it;
+- `RecoveryConflict { version, candidates, disputed_by }` — two or more
+  different secrets reconstruct. Each candidate carries the `secret` and
+  `supported_by`. The library never picks: involve the owner, and pass the
+  candidate they confirm to `restore`;
+- `RecoveryIncomplete { version, shares_received }` — nothing reconstructs.
+  The recovery is closed; start it again to retry.
+
+`supported_by` / `disputed_by` name helpers as `RecoveryHelper { channel_id,
+communication_info }`, the `communication_info` being what the helper
+advertised when it paired, so the app can tell the owner who is on each side.
+That is the helper's own configured communication info, not the
+`peer_communication_info` it passed to `start(Pairing)`: a helper that
+configures none is named by its channel alone.
 
 The recovering device receives a `SecretRecovered` event carrying the typed
 `secret`. Pass it
@@ -825,6 +855,7 @@ The canonical JSON, shared by every SDK, is:
     "inbound_message_secs": 300,
     "sharing_round_secs": 60,
     "unpair_ack_secs": 60,
+    "get_share_response_secs": 300,
     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
   },
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },

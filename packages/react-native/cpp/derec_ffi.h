@@ -1804,6 +1804,7 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *     "inbound_message_secs": 300,
  *     "sharing_round_secs": 60,
  *     "unpair_ack_secs": 60,
+ *     "get_share_response_secs": 300,
  *     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
  *   },
  *   "unsafe_connection": false,

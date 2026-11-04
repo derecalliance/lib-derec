@@ -494,8 +494,9 @@ public sealed class DeRecProtocol : IDisposable
     /// <para>
     /// Timeouts are otherwise only evaluated by <see cref="ProcessAsync"/>, so
     /// a publish whose helpers all go quiet has nothing left to close it: the
-    /// round stays open and no <c>SharingComplete</c> is ever raised. Call
-    /// this from a scheduler — a timer, a hosted background service, a cron
+    /// round stays open and no <c>SharingComplete</c> is ever raised. A
+    /// recovery waiting on a silent helper is likewise decided only here once
+    /// its timeout has passed. Call this from a scheduler — a timer, a hosted background service, a cron
     /// trigger — at an interval shorter than the configured timeout.
     /// </para>
     /// <para>
@@ -1557,7 +1558,7 @@ public sealed record RemoveExpiredChannelsPolicy(bool Enabled, ulong TimeoutInSe
 /// These were one setting until it became clear they answer different
 /// questions. <see cref="InboundMessage"/> is a <b>security</b> boundary — it
 /// bounds how stale a message may be and still be accepted, so it must
-/// tolerate transport latency and clock skew. The other three are
+/// tolerate transport latency and clock skew. The others are
 /// <b>liveness</b> budgets: how long to keep hoping a peer will answer.
 /// </para>
 /// </remarks>
@@ -1576,6 +1577,14 @@ public sealed record RemoveExpiredChannelsPolicy(bool Enabled, ulong TimeoutInSe
 /// How long to wait for an unpair acknowledgement before dropping local
 /// channel state anyway. Library default: 60s.
 /// </param>
+/// <param name="GetShareResponse">
+/// How long a recovery waits for a helper to answer its share request. A
+/// recovery decides only once every helper it asked has answered or this has
+/// elapsed since the requests went out; on expiry each silent helper is
+/// reported as <c>RecoverSecretFailedEvent</c> with error <c>"timeout"</c>.
+/// The budget is a <b>human</b> one when helpers approve share requests by
+/// hand. Library default: 300s.
+/// </param>
 /// <param name="ExpiredChannels">
 /// Removal of channels still awaiting out-of-band fingerprint confirmation.
 /// Unlike the others this can be disabled. The budget is a <b>human</b> one —
@@ -1586,6 +1595,7 @@ public sealed record Timeouts(
     TimeSpan? InboundMessage = null,
     TimeSpan? SharingRound = null,
     TimeSpan? UnpairAck = null,
+    TimeSpan? GetShareResponse = null,
     RemoveExpiredChannelsPolicy? ExpiredChannels = null);
 
 public sealed class AutoAcceptPolicy

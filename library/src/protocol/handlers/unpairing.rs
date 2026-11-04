@@ -48,10 +48,13 @@ use super::super::{
     DeRecTransport, PendingAction, SecretKind, SecretValue, StateItem, StateKey, events::UnpairAck,
 };
 use super::replicas::unpairing as replica;
-use crate::derec_message::current_timestamp;
-use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::derec_message::{apply_trace_id, current_timestamp};
+use crate::extensions::advertised_endpoints::reply_to_owned;
+use crate::extensions::channel_store::{ChannelStoreExt as _, send_channel_message};
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
+use crate::primitives::unpairing::UnpairingError;
 use crate::protocol::context::{Exchange, Local, Round};
+use crate::protocol::obligation;
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{ChannelQuery, ChannelRecord, ChannelStatus};
 use crate::{
@@ -129,7 +132,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     {
         Some(SecretValue::SharedKey(k)) => k,
         _ => {
-            return Err(crate::Error::InvalidInput(
+            return Err(Error::InvalidInput(
                 "channel has no shared key — not yet paired",
             ));
         }
@@ -138,7 +141,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     // Helper unpair: no member is named, which is what marks this the
     // owner ↔ helper path rather than a replica-group removal.
     let request = produce_unpair_request(channel_id, &memo_str, &shared_key, round.reply_to, None)?;
-    let envelope = crate::derec_message::apply_trace_id(&request.envelope, round.trace_id)?;
+    let envelope = apply_trace_id(&request.envelope, round.trace_id)?;
     let endpoint = stores
         .channels
         .peer_endpoints(secret_id, channel_id)
@@ -196,17 +199,17 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
 ) -> Result<Vec<DeRecEvent>> {
     let channel_id = exchange.channel_id;
     let resp = unpairing_response::produce(channel_id, exchange.shared_key)?;
-    let envelope = crate::derec_message::apply_trace_id(&resp.envelope, exchange.trace_id)?;
+    let envelope = apply_trace_id(&resp.envelope, exchange.trace_id)?;
     let endpoint = stores
         .channels
         .resolve_response_endpoints(
             local.secret_id,
             channel_id,
             local.policy,
-            &crate::extensions::advertised_endpoints::reply_to_owned(request),
+            &reply_to_owned(request),
         )
         .await?;
-    let sent = crate::protocol::obligation::deliver(
+    let sent = obligation::deliver(
         exchange.obligation,
         stores.transport,
         &endpoint,
@@ -215,7 +218,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         "",
     )
     .await;
-    if sent.is_err() && !crate::protocol::obligation::attempted(exchange.obligation) {
+    if sent.is_err() && !obligation::attempted(exchange.obligation) {
         return sent.map(|()| Vec::new());
     }
 
@@ -227,7 +230,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     #[cfg(feature = "logging")]
     tracing::info!("unpair accepted; local state dropped");
 
-    crate::protocol::obligation::reported(
+    obligation::reported(
         exchange.obligation,
         vec![DeRecEvent::Unpaired { channel_id }],
         sent.and(dropped),
@@ -246,7 +249,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
-    crate::extensions::channel_store::send_channel_message(
+    send_channel_message(
         stores.channels,
         stores.transport,
         local.secret_id,
@@ -255,7 +258,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         exchange.shared_key,
         exchange.trace_id,
         local.policy,
-        &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        &reply_to_owned(request),
         exchange.obligation,
         status,
         memo,
@@ -298,10 +301,7 @@ pub(in crate::protocol) async fn drop_channel_state<S: StoreSet>(
 
     let _ = stores
         .channels
-        .remove(
-            secret_id,
-            crate::protocol::types::ChannelQuery::Helper { channel_id },
-        )
+        .remove(secret_id, ChannelQuery::Helper { channel_id })
         .await?;
     Ok(())
 }
@@ -352,10 +352,7 @@ async fn on_response<S: StoreSet>(
                 channel_id: exchange.channel_id,
             }])
         }
-        Err(Error::Unpairing(crate::primitives::unpairing::UnpairingError::NonOkStatus {
-            status,
-            memo,
-        })) => {
+        Err(Error::Unpairing(UnpairingError::NonOkStatus { status, memo })) => {
             set_status(
                 stores,
                 local,

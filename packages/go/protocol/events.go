@@ -40,10 +40,12 @@ const (
 	EventTypeShareVerifyRejected       = "ShareVerifyRejected"
 	EventTypeSecretsDiscovered         = "SecretsDiscovered"
 	EventTypeRecoveryShareReceived     = "RecoveryShareReceived"
-	EventTypeRecoveryShareError        = "RecoveryShareError"
 	EventTypeRecoveryShareRefused      = "RecoveryShareRefused"
 	EventTypeRecoveryShareCorrupted    = "RecoveryShareCorrupted"
 	EventTypeSecretRecovered           = "SecretRecovered"
+	EventTypeRecoveryDisputed          = "RecoveryDisputed"
+	EventTypeRecoveryConflict          = "RecoveryConflict"
+	EventTypeRecoveryIncomplete        = "RecoveryIncomplete"
 	EventTypeUnpaired                  = "Unpaired"
 	EventTypeUnpairRejected            = "UnpairRejected"
 	EventTypePrePairRejected           = "PrePairRejected"
@@ -201,8 +203,8 @@ type Event struct {
 	// RecoveryShareRefused is a helper answering a recovery share request
 	// with a non-OK Status (e.g. UNKNOWN_SHARE_VERSION) instead of a share.
 	// The refusal is not collected — it does not count towards
-	// SharesReceived and the recovery stays open for the other helpers'
-	// shares — but it does answer that helper's RecoverSecretStarted.
+	// SharesReceived — but it is that helper's answer: it answers that
+	// helper's RecoverSecretStarted and counts towards the recovery deciding.
 	//
 	// ShareRefused is this helper's library refusing an inbound share
 	// instead of raising ActionRequired: FORMAT_ERROR (it does not decode),
@@ -251,13 +253,16 @@ type Event struct {
 	// RecoveryShareCorrupted — why a helper's share was set aside, one of the
 	// CorruptionReason* constants. CorruptionReasonMalformed and
 	// CorruptionReasonInvalidProof are judged as the share arrives;
-	// CorruptionReasonInconsistent (valid on its own, but disagreeing with
-	// the shares the secret was rebuilt from) is reported alongside
-	// SecretRecovered, once per helper. The share does not count towards
+	// CorruptionReasonForged (its group reconstructs under one key but not
+	// to a secret, or a single share reconstructs alone) is reported with the
+	// recovery's decision, once per helper. The share does not count towards
 	// SharesReceived and never blocks the recovery. An honest helper never
 	// sends one, so the application may treat it as a sign of a damaged or
-	// compromised helper, e.g. offer to unpair it. ChannelID and Version are
-	// set too, and the event answers that helper's RecoverSecretStarted.
+	// compromised helper, e.g. offer to unpair it. A share that only
+	// disagrees with the others is never reported here: it is a dispute, not
+	// evidence against its helper, and lands in DisputedBy. ChannelID and
+	// Version are set too, and the event answers that helper's
+	// RecoverSecretStarted.
 	Reason string `json:"reason"`
 
 	// ReplicaSyncComplete. Synced acknowledged; Behind refused, timed out, or
@@ -291,10 +296,39 @@ type Event struct {
 	// SecretsDiscovered.
 	Secrets []DiscoveredSecret `json:"secrets"`
 
-	// RecoveryShareReceived, RecoveryShareError.
+	// RecoveryShareReceived, RecoveryIncomplete.
+	//
+	// A recovery reconstructs nothing until every helper it asked has
+	// answered (a share, a refusal or a corrupted share), or the
+	// get_share_response timeout has passed since the requests went out —
+	// each silent helper is then reported as RecoverSecretFailed with Error
+	// "timeout". It then decides exactly once: SecretRecovered (one secret
+	// reconstructs and every collected share is part of it),
+	// RecoveryDisputed (one secret reconstructs, but other helpers hold valid
+	// shares of a different split that does not), RecoveryConflict (two or
+	// more different secrets reconstruct) or RecoveryIncomplete (nothing
+	// reconstructs; the recovery is closed, start it again to retry). Version
+	// is set on the last three.
 	SharesReceived uint32 `json:"shares_received"`
 
-	// RecoveryShareError, DiscoveryFailed, ProtectSecretFailed,
+	// RecoveryConflict — every secret that reconstructs, each with the
+	// helpers whose shares rebuild it. The library never picks: involve the
+	// owner, and pass the candidate they confirm to Restore.
+	Candidates []RecoveryCandidate `json:"candidates"`
+
+	// RecoveryDisputed — Secret is the one secret that reconstructs,
+	// SupportedBy the helpers whose shares rebuild it. Either side can be the
+	// owner's: colluding helpers can forge a complete split, and the honest
+	// ones may be too few to reconstruct theirs. Show the owner what Secret
+	// holds and who stands on each side, and pass it to Restore only once
+	// they confirm it.
+	//
+	// RecoveryDisputed, RecoveryConflict — DisputedBy are the helpers whose
+	// valid shares belong to no secret that reconstructs.
+	SupportedBy []RecoveryHelper `json:"supported_by"`
+	DisputedBy  []RecoveryHelper `json:"disputed_by"`
+
+	// DiscoveryFailed, ProtectSecretFailed,
 	// VerifySharesFailed, RecoverSecretFailed, UnpairFailed,
 	// UpdateChannelInfoFailed.
 	Error string `json:"error"`
@@ -404,10 +438,10 @@ const (
 	// CorruptionReasonInvalidProof: the share fails its own Merkle proof,
 	// e.g. a value altered after it was split.
 	CorruptionReasonInvalidProof = "InvalidProof"
-	// CorruptionReasonInconsistent: the share is valid on its own, but its
-	// commitment root or ciphertext disagrees with the shares the secret was
-	// rebuilt from.
-	CorruptionReasonInconsistent = "Inconsistent"
+	// CorruptionReasonForged: the share's group reconstructs under one key,
+	// but not to a secret, or a single share reconstructs alone. Neither
+	// happens with an honest split.
+	CorruptionReasonForged = "Forged"
 )
 
 // The label vocabulary for Event.Reason on a VerifySharesFailed event.
@@ -473,6 +507,25 @@ func (s Secret) MarshalJSON() ([]byte, error) {
 		Replicas:  s.Replicas,
 		Threshold: s.Threshold,
 	})
+}
+
+// RecoveryCandidate mirrors RecoveryCandidateWire in wire.rs — one secret a
+// RecoveryConflict reconstructs. Secret has the same shape as
+// SecretRecovered's, so a chosen candidate is passed to Restore the same way.
+// SupportedBy are the helpers whose shares rebuild it.
+type RecoveryCandidate struct {
+	Secret      Secret           `json:"secret"`
+	SupportedBy []RecoveryHelper `json:"supported_by"`
+}
+
+// RecoveryHelper mirrors RecoveryHelperWire in wire.rs — one helper on a side
+// of a RecoveryDisputed or RecoveryConflict. CommunicationInfo is what the
+// helper advertised when it paired, read from its channel record, so the
+// application can tell the owner who is on each side; it is absent from the
+// wire when empty.
+type RecoveryHelper struct {
+	ChannelID         uint64            `json:"channel_id,string"`
+	CommunicationInfo map[string]string `json:"communication_info,omitempty"`
 }
 
 // Replicas mirrors ReplicasWire in wire.rs — the full member roster plus

@@ -57,6 +57,8 @@
 //! the typed [`TransportProtocol`] in the first place.
 
 use derec_proto::Protocol;
+
+use crate::extensions::transport_protocol::TransportProtocolExt;
 #[cfg(any(feature = "serde", target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 
@@ -122,6 +124,7 @@ pub struct TransportProtocol {
 #[cfg(any(feature = "serde", target_arch = "wasm32"))]
 mod protocol_as_i32 {
     use super::Protocol;
+    use serde::de::Error;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(p: &Protocol, ser: S) -> Result<S::Ok, S::Error> {
@@ -131,7 +134,7 @@ mod protocol_as_i32 {
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Protocol, D::Error> {
         let raw = i32::deserialize(de)?;
         Protocol::try_from(raw)
-            .map_err(|_| serde::de::Error::custom(format!("unknown Protocol discriminant {raw}")))
+            .map_err(|_| Error::custom(format!("unknown Protocol discriminant {raw}")))
     }
 }
 
@@ -781,7 +784,7 @@ impl TransportPolicy {
         endpoint: &derec_proto::TransportProtocol,
         loopback_is_free: bool,
     ) -> Result<(), TransportValidationError> {
-        crate::extensions::transport_protocol::TransportProtocolExt::validate(endpoint)?;
+        TransportProtocolExt::validate(endpoint)?;
 
         let Some(scheme) = PLAINTEXT_SCHEMES
             .iter()
@@ -1080,18 +1083,8 @@ mod transport_policy_tests {
     /// the policy. Both http-family schemes are structurally sound.
     #[test]
     fn validate_is_structural_only() {
-        assert!(
-            crate::extensions::transport_protocol::TransportProtocolExt::validate(&ep(
-                "http://anything.example.com"
-            ))
-            .is_ok()
-        );
-        assert!(
-            crate::extensions::transport_protocol::TransportProtocolExt::validate(&ep(
-                "https://anything.example.com"
-            ))
-            .is_ok()
-        );
+        assert!(TransportProtocolExt::validate(&ep("http://anything.example.com")).is_ok());
+        assert!(TransportProtocolExt::validate(&ep("https://anything.example.com")).is_ok());
     }
 
     fn grpc_ep(uri: &str) -> derec_proto::TransportProtocol {

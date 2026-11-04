@@ -3,7 +3,8 @@
 
 //! The pairing protocol's message and key-material types.
 
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError};
+use std::io::{Read, Write};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(CanonicalSerialize, CanonicalDeserialize, Clone)]
@@ -102,7 +103,7 @@ impl PairingSecretKeyMaterial {
 }
 
 impl ark_serialize::Valid for PairingSecretKeyMaterial {
-    fn check(&self) -> Result<(), ark_serialize::SerializationError> {
+    fn check(&self) -> Result<(), SerializationError> {
         match self {
             Self::Initiator(m) => m.check(),
             Self::Responder(m) => m.check(),
@@ -111,11 +112,11 @@ impl ark_serialize::Valid for PairingSecretKeyMaterial {
 }
 
 impl ark_serialize::CanonicalSerialize for PairingSecretKeyMaterial {
-    fn serialize_with_mode<W: std::io::Write>(
+    fn serialize_with_mode<W: Write>(
         &self,
         mut writer: W,
         compress: ark_serialize::Compress,
-    ) -> Result<(), ark_serialize::SerializationError> {
+    ) -> Result<(), SerializationError> {
         match self {
             Self::Initiator(m) => {
                 0u8.serialize_with_mode(&mut writer, compress)?;
@@ -137,11 +138,11 @@ impl ark_serialize::CanonicalSerialize for PairingSecretKeyMaterial {
 }
 
 impl ark_serialize::CanonicalDeserialize for PairingSecretKeyMaterial {
-    fn deserialize_with_mode<R: std::io::Read>(
+    fn deserialize_with_mode<R: Read>(
         mut reader: R,
         compress: ark_serialize::Compress,
         validate: ark_serialize::Validate,
-    ) -> Result<Self, ark_serialize::SerializationError> {
+    ) -> Result<Self, SerializationError> {
         let tag = u8::deserialize_with_mode(&mut reader, compress, validate)?;
         match tag {
             0 => Ok(Self::Initiator(
@@ -150,7 +151,7 @@ impl ark_serialize::CanonicalDeserialize for PairingSecretKeyMaterial {
             1 => Ok(Self::Responder(
                 ResponderSecretKeyMaterial::deserialize_with_mode(reader, compress, validate)?,
             )),
-            _ => Err(ark_serialize::SerializationError::InvalidData),
+            _ => Err(SerializationError::InvalidData),
         }
     }
 }

@@ -379,6 +379,7 @@ fn commit_shares<R: rand::CryptoRng + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::random;
 
     const ENTROPY: &[u8; λ] = &[0u8; λ];
 
@@ -700,7 +701,7 @@ mod tests {
     /// Re-commits `leaves` under a fresh Merkle tree, so every share's proof opens to the
     /// root and only the subshare-list checks stand between a malformed share and `verify`.
     fn commit(leaves: Vec<Vec<Subshare>>, encrypted_secret: &[u8]) -> Vec<VSSShare> {
-        commit_shares(leaves, encrypted_secret, &mut crate::random::os_rng())
+        commit_shares(leaves, encrypted_secret, &mut random::os_rng())
     }
 
     fn leaves_of(shares: &[VSSShare]) -> Vec<Vec<Subshare>> {

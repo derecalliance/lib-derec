@@ -2,6 +2,7 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::transport_protocol::TransportProtocolExt as _;
+use crate::Error;
 use derec_proto::{
     GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, StoreShareRequestMessage,
     UnpairRequestMessage, VerifyShareRequestMessage,
@@ -25,7 +26,7 @@ pub(crate) trait RequestMessageExt {
     /// Says nothing about whether those endpoints are *acceptable* — that is
     /// [`TransportPolicy`](crate::transport::TransportPolicy)'s decision, made
     /// later against configuration this validator cannot see.
-    fn validate(&self) -> Result<(), crate::Error>;
+    fn validate(&self) -> Result<(), Error>;
 }
 
 macro_rules! impl_request_message_ext {

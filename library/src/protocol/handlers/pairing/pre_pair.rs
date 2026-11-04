@@ -16,10 +16,13 @@
 //! in [`DeRecProtocol::process`](crate::protocol::DeRecProtocol::process)
 //! decodes the body before any key is available and calls them directly.
 
+use crate::derec_message::{apply_trace_id, fresh_trace_id};
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::sender_kind::SenderKindExt as _;
+use crate::primitives::pairing::PairingError;
 use crate::protocol::context::{Local, PairingConfig};
 use crate::protocol::stores::{StoreSet, Stores};
+use crate::protocol::types::ChannelQuery;
 use crate::protocol::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecTransport, PairingKeyMaterial,
     PendingAction, SecretKind, SecretValue,
@@ -36,6 +39,7 @@ use derec_proto::{
 };
 use prost::Message;
 use std::collections::HashMap;
+use std::slice;
 
 // The same pairing inputs its sibling `pair::start` takes, and one more:
 // the round token. Both legs are the same flow entered two ways.
@@ -70,14 +74,13 @@ pub(super) async fn start<S: StoreSet>(
         endpoints.clone(),
         peer_communication_info,
         kind,
-        local.replica_id,
     )
     .await?;
 
     #[cfg(feature = "logging")]
     tracing::info!("PrePair request sent (scanner side)");
 
-    let envelope = crate::derec_message::apply_trace_id(&result.envelope, trace_id)?;
+    let envelope = apply_trace_id(&result.envelope, trace_id)?;
     stores.transport.send(&endpoints, envelope).await?;
 
     Ok(channel_id.0)
@@ -115,10 +118,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
                 channel_id = channel_id.0,
                 "NoKeys PrePair nonce mismatch — rejecting"
             );
-            return Err(crate::primitives::pairing::PairingError::ProtocolViolation(
-                "NoKeys PrePair nonce mismatch",
-            )
-            .into());
+            return Err(PairingError::ProtocolViolation("NoKeys PrePair nonce mismatch").into());
         }
 
         let result = response::produce_pre_pair_no_keys(channel_id, request)?;
@@ -133,7 +133,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
             )
             .await?;
 
-        let envelope = crate::derec_message::apply_trace_id(&result.envelope, trace_id)?;
+        let envelope = apply_trace_id(&result.envelope, trace_id)?;
         // Every endpoint the requester advertised, so a reply that cannot
         // reach the first can fall back. Never empty: `validate` refuses a
         // request naming none.
@@ -146,7 +146,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         policy.check_peer(&endpoint)?;
         stores
             .transport
-            .send(std::slice::from_ref(&endpoint), envelope)
+            .send(slice::from_ref(&endpoint), envelope)
             .await?;
 
         #[cfg(feature = "logging")]
@@ -170,7 +170,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     let pairing_secret = pairing_secret.to_secret()?;
 
     let result = response::produce_pre_pair(channel_id, request, &pairing_secret)?;
-    let envelope = crate::derec_message::apply_trace_id(&result.envelope, trace_id)?;
+    let envelope = apply_trace_id(&result.envelope, trace_id)?;
 
     // Same as the NoKeys branch: take every advertised endpoint, filtered.
     let endpoints = policy.admit_peer_endpoints(request.advertised_endpoints())?;
@@ -180,7 +180,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     policy.check_peer(&endpoint)?;
     stores
         .transport
-        .send(std::slice::from_ref(&endpoint), envelope)
+        .send(slice::from_ref(&endpoint), envelope)
         .await?;
 
     #[cfg(feature = "logging")]
@@ -240,7 +240,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
 
     stores
         .transport
-        .send(std::slice::from_ref(&endpoint), envelope)
+        .send(slice::from_ref(&endpoint), envelope)
         .await?;
 
     #[cfg(feature = "logging")]
@@ -290,10 +290,7 @@ pub(in crate::protocol) async fn on_response<S: StoreSet>(
     };
     let validated = match processed {
         Ok(v) => v,
-        Err(Error::Pairing(crate::primitives::pairing::PairingError::NonOkStatus {
-            status,
-            memo,
-        })) => {
+        Err(Error::Pairing(PairingError::NonOkStatus { status, memo })) => {
             #[cfg(feature = "logging")]
             tracing::warn!(
                 channel_id = channel_id.0,
@@ -335,38 +332,16 @@ pub(in crate::protocol) async fn on_response<S: StoreSet>(
         ..filled_in_contact.clone()
     };
 
-    let local_kind = match stores
+    let local_kind = stores
         .channels
-        .load(
-            secret_id,
-            crate::protocol::types::ChannelQuery::Helper { channel_id },
-        )
+        .load(secret_id, ChannelQuery::Helper { channel_id })
         .await?
         .and_then(|r| r.as_helper().cloned())
-    {
-        Some(helper) => helper.peer_role.counterparty(),
-        None => {
-            let own_replica_id = replica_id.ok_or(Error::Invariant(
-                "channel record missing on PrePair response — start must be called first",
-            ))?;
-            stores
-                .channels
-                .load(
-                    secret_id,
-                    crate::protocol::types::ChannelQuery::Replica {
-                        channel_id,
-                        replica_id: crate::types::ReplicaId::try_from(own_replica_id)?,
-                    },
-                )
-                .await?
-                .and_then(|r| r.as_replica().cloned())
-                .ok_or(Error::Invariant(
-                    "channel record missing on PrePair response — start must be called first",
-                ))?
-                .role
-                .to_sender_kind()
-        }
-    };
+        .ok_or(Error::Invariant(
+            "channel record missing on PrePair response — start must be called first",
+        ))?
+        .peer_role
+        .counterparty();
 
     let replica_id_to_inject = super::require_replica_id_for_kind(local_kind, replica_id)?;
     let comm_info = super::build_communication_info(local.communication_info, replica_id_to_inject);
@@ -398,10 +373,7 @@ pub(in crate::protocol) async fn on_response<S: StoreSet>(
     let endpoints = local
         .policy
         .admit_peer_endpoints(original_contact.advertised_endpoints())?;
-    let envelope = crate::derec_message::apply_trace_id(
-        &result.envelope,
-        crate::derec_message::fresh_trace_id(),
-    )?;
+    let envelope = apply_trace_id(&result.envelope, fresh_trace_id())?;
     stores.transport.send(&endpoints, envelope).await?;
 
     #[cfg(feature = "logging")]

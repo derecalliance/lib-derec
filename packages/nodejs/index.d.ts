@@ -807,6 +807,13 @@ export interface Timeouts {
   /** How long to wait for an unpair acknowledgement before dropping local
    *  channel state anyway. Library default: 60. */
   unpair_ack_secs?: number;
+  /** How long a recovery waits for a helper to answer its share request. A
+   *  recovery decides only once every helper it asked has answered or this
+   *  has elapsed since the requests went out; each silent helper is then
+   *  reported as `RecoverSecretFailed` with error `"timeout"`. The budget is
+   *  a **human** one when helpers approve share requests by hand. Library
+   *  default: 300. */
+  get_share_response_secs?: number;
   /** Removal of channels still awaiting out-of-band fingerprint
    *  confirmation — every replica pairing, and every `NoKeys` pairing.
    *  Unlike the others this can be disabled, leaving the sweep to the
@@ -836,6 +843,26 @@ export interface UnpairReplicaParams {
   replica_id: string;
 
   memo?: string;
+}
+
+/** A helper named by a recovery decision (`RecoveryDisputed`,
+ *  `RecoveryConflict`), so the app can tell the owner who is on each side.
+ *  `channel_id` is the `u64` as a **decimal** string; `communication_info`
+ *  is what the helper advertised when it paired, read from its channel
+ *  record, and is absent when it advertised none. */
+export interface RecoveryHelper {
+  channel_id: string;
+  communication_info?: Record<string, string>;
+}
+
+/** One secret a recovery reconstructed, reported in `RecoveryConflict`.
+ *  `secret` has the shape of `SecretRecovered.secret`, so a confirmed
+ *  candidate is passed to `restore` the same way. `supported_by` are the
+ *  helpers whose shares reconstruct it, in the order their shares were
+ *  collected. */
+export interface RecoveryCandidate {
+  secret: Extract<DeRecEvent, { type: "SecretRecovered" }>["secret"];
+  supported_by: RecoveryHelper[];
 }
 
 export type DeRecEvent =
@@ -977,25 +1004,36 @@ export type DeRecEvent =
 
       secrets: Array<{ secret_id: string; versions: Array<{ version: number; description: string }> }>;
     }
+  /** A helper's share was collected for a recovery. Nothing is
+   *  reconstructed until every helper asked has answered or
+   *  `timeouts.get_share_response_secs` has passed since the requests went
+   *  out (each silent helper is then reported as `RecoverSecretFailed` with
+   *  error `"timeout"`). The recovery then decides exactly once:
+   *  `SecretRecovered`, `RecoveryDisputed`, `RecoveryConflict` or
+   *  `RecoveryIncomplete`. */
   | { type: "RecoveryShareReceived"; channel_id: string; shares_received: number }
-  | { type: "RecoveryShareError"; channel_id: string; shares_received: number; error: string }
   /** A helper refused a recovery share request: its response carried a
    *  non-OK `status` (e.g. `UNKNOWN_SHARE_VERSION`) instead of a share. The
-   *  refusal is not collected — it does not count towards `shares_received`
-   *  and the recovery stays open for the other helpers' shares — but it does
-   *  answer that helper's `RecoverSecretStarted`. */
+   *  refusal is not collected and does not count towards `shares_received`,
+   *  but it is that helper's answer: it answers the helper's
+   *  `RecoverSecretStarted`, and when it is the last answer due the recovery
+   *  decides on the shares it holds. */
   | { type: "RecoveryShareRefused"; channel_id: string; version: number; status: StatusEnum; memo: string }
   /** A helper answered with a share that cannot be part of the secret;
    *  `reason` says how it failed. `Malformed` and `InvalidProof` are judged
-   *  on arrival; `Inconsistent` (valid on its own but disagreeing with the
-   *  shares the secret was rebuilt from) is reported alongside
-   *  `SecretRecovered`, once per helper. The share is set aside — it does
-   *  not count towards `shares_received` and never blocks the recovery. An
-   *  honest helper never sends one, so the app may treat it as a sign of a
-   *  damaged or compromised helper, e.g. offer to unpair it. It also
-   *  answers that helper's `RecoverSecretStarted`. */
+   *  on arrival and count as that helper's answer; `Forged` (its group
+   *  reconstructs under one key, but not to a secret, or a single share
+   *  reconstructs alone) is reported with the recovery's decision, once per
+   *  helper. The share is set aside — it does not count towards
+   *  `shares_received` and never blocks the recovery. An honest helper never
+   *  sends one, so the app may treat it as a sign of a damaged or
+   *  compromised helper, e.g. offer to unpair it. A share that only
+   *  disagrees with the others is never reported here: it is a dispute
+   *  (`RecoveryDisputed` / `RecoveryConflict`), not evidence against its
+   *  helper. It also answers that helper's `RecoverSecretStarted`. */
   | { type: "RecoveryShareCorrupted"; channel_id: string; version: number; reason: CorruptionReason }
-  /** Recovery completed — the typed `Secret` snapshot the owner
+  /** Recovery completed — one secret reconstructed and every collected
+   *  share is part of it. `secret` is the typed `Secret` snapshot the owner
    *  originally protected. Mirrors `ReplicaSecretReceived.secret`:
    *  `secrets` is the user-facing `Vec<UserSecret>` the application
    *  fed to `start(FlowKind.ProtectSecret)`; `helpers` and `replicas`
@@ -1047,6 +1085,45 @@ export type DeRecEvent =
         threshold?: number;
       };
     }
+  /** A recovery reconstructed two or more different secrets for `version`,
+   *  so it cannot tell which is the owner's. Each candidate is a complete,
+   *  self-consistent secret, rebuilt from the shares of the helpers in its
+   *  `supported_by`. Fewer than the threshold of colluding helpers can forge
+   *  one, so the library never picks: involve the owner and pass the
+   *  candidate's `secret` they confirm to `restore`, exactly as the `secret`
+   *  of `SecretRecovered`. The helpers backing a rejected candidate are
+   *  suspect. `disputed_by` names the helpers holding valid shares of yet
+   *  another split that does not reconstruct, so no helper's answer goes
+   *  unshown. The recovery is closed when this is emitted. */
+  | {
+      type: "RecoveryConflict";
+      version: number;
+      candidates: RecoveryCandidate[];
+      disputed_by: RecoveryHelper[];
+    }
+  /** A recovery reconstructed one secret for `version`, but other helpers
+   *  hold valid shares of a different split that does not reconstruct.
+   *  `secret` is complete and self-consistent, rebuilt from the shares of
+   *  `supported_by`, and has the shape of `SecretRecovered.secret`. The
+   *  shares of `disputed_by` each pass their own proof but belong to another
+   *  split at the same version, which an honest sharing never produces.
+   *  Either side can be the owner's: colluding helpers can forge a complete
+   *  split, and the honest helpers may be too few to reconstruct theirs. The
+   *  library never picks: show the owner what `secret` holds and who stands
+   *  on each side, and pass `secret` to `restore` only once they confirm it.
+   *  The recovery is closed when this is emitted. */
+  | {
+      type: "RecoveryDisputed";
+      version: number;
+      secret: Extract<DeRecEvent, { type: "SecretRecovered" }>["secret"];
+      supported_by: RecoveryHelper[];
+      disputed_by: RecoveryHelper[];
+    }
+  /** A recovery for `version` closed without reconstructing a secret: every
+   *  helper asked has answered, or the rest timed out, and no collected
+   *  shares reconstruct. `shares_received` is the number of helpers whose
+   *  shares were collected. Start `RecoverSecret` again to retry. */
+  | { type: "RecoveryIncomplete"; version: number; shares_received: number }
 
   | { type: "Unpaired"; channel_id: string }
 
@@ -1919,7 +1996,9 @@ export declare class DeRecProtocol {
    *
    * Timeouts are otherwise only evaluated by `process`, so a publish whose
    * helpers all go quiet has nothing left to close it: the round stays open
-   * and no `SharingComplete` is ever emitted. Call this from a timer —
+   * and no `SharingComplete` is ever emitted. A recovery waiting on a silent
+   * helper is likewise decided only here once its timeout has passed. Call
+   * this from a timer —
    * `setInterval`, a service-worker alarm, a job runner — at an interval
    * shorter than the configured timeout.
    *
@@ -2133,9 +2212,9 @@ export type VerifyFailureReason = "NoSharedKey" | "NoProof" | "DispatchFailed";
  *  Matches the Rust `CorruptionReason` discriminants one-for-one:
  *  `Malformed` — no decodable share for the requested secret and version;
  *  `InvalidProof` — the share fails its own Merkle proof;
- *  `Inconsistent` — valid on its own, but its commitment root or ciphertext
- *  disagrees with the shares the secret was rebuilt from. */
-export type CorruptionReason = "Malformed" | "InvalidProof" | "Inconsistent";
+ *  `Forged` — its group reconstructs under one key, but not to a secret, or
+ *  a single share reconstructs alone; an honest split produces neither. */
+export type CorruptionReason = "Malformed" | "InvalidProof" | "Forged";
 
 /**
  * The label vocabulary for `ActionRequired.action_kind`,

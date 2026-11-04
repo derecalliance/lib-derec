@@ -138,8 +138,8 @@
           "wire": "InvalidProof"
         },
         {
-          "name": "Inconsistent",
-          "wire": "Inconsistent"
+          "name": "Forged",
+          "wire": "Forged"
         }
       ]
     },
@@ -224,8 +224,16 @@
           "wire": "RecoveryShareCorrupted"
         },
         {
-          "name": "RecoveryShareError",
-          "wire": "RecoveryShareError"
+          "name": "RecoveryConflict",
+          "wire": "RecoveryConflict"
+        },
+        {
+          "name": "RecoveryIncomplete",
+          "wire": "RecoveryIncomplete"
+        },
+        {
+          "name": "RecoveryDisputed",
+          "wire": "RecoveryDisputed"
         },
         {
           "name": "RecoveryShareReceived",

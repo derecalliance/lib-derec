@@ -194,9 +194,10 @@ impl MessageBodyExt for MessageBody {
 mod tests {
     use super::*;
     use derec_proto::{
-        GetSecretIdsVersionsRequestMessage, GetShareResponseMessage, StoreShareRequestMessage,
-        UnpairRequestMessage, UnpairResponseMessage, UpdateChannelInfoRequestMessage,
-        VerifyShareRequestMessage, VerifyShareResponseMessage,
+        ErrorResponseMessage, GetSecretIdsVersionsRequestMessage, GetShareRequestMessage,
+        GetShareResponseMessage, Protocol, StoreShareRequestMessage, UnpairRequestMessage,
+        UnpairResponseMessage, UpdateChannelInfoRequestMessage, VerifyShareRequestMessage,
+        VerifyShareResponseMessage,
     };
 
     /// Every body that carries the field routes on it, so a new replica-aware
@@ -290,7 +291,7 @@ mod tests {
             seconds: 1_700_000_000,
             nanos: 5,
         };
-        let mut body = MessageBody::ErrorResponse(derec_proto::ErrorResponseMessage::default());
+        let mut body = MessageBody::ErrorResponse(ErrorResponseMessage::default());
         assert_eq!(body.timestamp(), None);
         body.set_timestamp(ts);
         assert_eq!(body.timestamp(), Some(&ts));
@@ -302,9 +303,9 @@ mod tests {
     fn a_reply_to_is_reported_as_peer_supplied() {
         let endpoint = TransportProtocol {
             uri: "https://peer.example".to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         };
-        let body = MessageBody::GetShareRequest(derec_proto::GetShareRequestMessage {
+        let body = MessageBody::GetShareRequest(GetShareRequestMessage {
             reply_to_transports: vec![endpoint.clone()],
             ..Default::default()
         });

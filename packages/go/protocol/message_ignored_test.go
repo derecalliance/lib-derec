@@ -115,7 +115,7 @@ func TestCorruptionReasonConstantsMatchTheFixture(t *testing.T) {
 	constants := map[string]bool{
 		CorruptionReasonMalformed:    true,
 		CorruptionReasonInvalidProof: true,
-		CorruptionReasonInconsistent: true,
+		CorruptionReasonForged:       true,
 	}
 	variants := reasons.Variants
 	for _, v := range variants {

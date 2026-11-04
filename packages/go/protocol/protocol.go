@@ -137,6 +137,13 @@ type Timeouts struct {
 	// UnpairAckSecs bounds the wait for an unpair acknowledgement before
 	// local channel state is dropped anyway. Default: 60.
 	UnpairAckSecs *uint64 `json:"unpair_ack_secs,omitempty"`
+	// GetShareResponseSecs bounds how long a recovery waits for a helper to
+	// answer its share request. A recovery decides only once every helper it
+	// asked has answered or this has elapsed since the requests went out; on
+	// expiry each silent helper is reported as RecoverSecretFailed and the
+	// recovery settles on the shares it holds. The budget is a human one
+	// when helpers approve share requests by hand. Default: 300.
+	GetShareResponseSecs *uint64 `json:"get_share_response_secs,omitempty"`
 	// ExpiredChannels governs removal of channels still awaiting out-of-band
 	// fingerprint confirmation — every replica pairing, and every NoKeys
 	// pairing. Unlike the others it can be disabled, leaving the sweep to
@@ -427,7 +434,9 @@ func (e *ProcessError) Unwrap() error {
 //
 // Timeouts are otherwise only evaluated by Process, so a publish whose
 // helpers all go quiet has nothing left to close it: the round stays open
-// and no SharingComplete is ever emitted. Call this from a scheduler — a
+// and no SharingComplete is ever emitted. A recovery waiting on a silent
+// helper is likewise decided only here once its timeout has passed. Call
+// this from a scheduler — a
 // time.Ticker, a cron job, a queue heartbeat — at an interval shorter than
 // the configured timeout.
 //

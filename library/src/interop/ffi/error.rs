@@ -24,8 +24,12 @@
 
 use std::ffi::CString;
 use std::os::raw::c_char;
+use std::{mem, ptr};
 
+use crate::Error;
+use crate::error_codes::classify;
 use crate::primitives::{recovery::RecoveryError, sharing::SharingError};
+use crate::protocol::RestoreError;
 
 #[repr(C)]
 pub struct DeRecError {
@@ -214,9 +218,9 @@ pub(crate) fn success() -> DeRecError {
     DeRecError {
         category: DEREC_CATEGORY_OK,
         code: DEREC_CODE_OK,
-        message: std::ptr::null_mut(),
+        message: ptr::null_mut(),
         peer_status: 0,
-        peer_memo: std::ptr::null_mut(),
+        peer_memo: ptr::null_mut(),
         expected: 0,
         got: 0,
     }
@@ -228,7 +232,7 @@ pub(crate) fn ffi_error(code: i32, msg: impl AsRef<str>) -> DeRecError {
         code,
         message: to_owned_cstring(msg.as_ref()),
         peer_status: 0,
-        peer_memo: std::ptr::null_mut(),
+        peer_memo: ptr::null_mut(),
         expected: 0,
         got: 0,
     }
@@ -236,11 +240,11 @@ pub(crate) fn ffi_error(code: i32, msg: impl AsRef<str>) -> DeRecError {
 
 /// Maps a [`crate::Error`] into a typed FFI error. Single source of truth for
 /// category/code mapping — extend the arms here when adding new variants.
-pub(crate) fn from_lib_error(err: crate::Error) -> DeRecError {
+pub(crate) fn from_lib_error(err: Error) -> DeRecError {
     // Restore errors carry richer per-variant messages (e.g. the
     // colliding channel-id list on `Conflict`); delegate so callers
     // see the formatted detail instead of the bare thiserror string.
-    if let crate::Error::Restore(e) = err {
+    if let Error::Restore(e) = err {
         return from_restore_error(e);
     }
     let (category, code) = categorize(&err);
@@ -249,13 +253,11 @@ pub(crate) fn from_lib_error(err: crate::Error) -> DeRecError {
     let (peer_status, peer_memo) = err
         .as_non_ok_status()
         .map(|(s, m)| (s, to_owned_cstring(m)))
-        .unwrap_or((0, std::ptr::null_mut()));
+        .unwrap_or((0, ptr::null_mut()));
 
     let (expected, got) = match &err {
-        crate::Error::Sharing(SharingError::VersionMismatch { expected, got })
-        | crate::Error::Recovery(RecoveryError::VersionMismatch { expected, got }) => {
-            (*expected, *got)
-        }
+        Error::Sharing(SharingError::VersionMismatch { expected, got })
+        | Error::Recovery(RecoveryError::VersionMismatch { expected, got }) => (*expected, *got),
         _ => (0, 0),
     };
 
@@ -271,8 +273,7 @@ pub(crate) fn from_lib_error(err: crate::Error) -> DeRecError {
 }
 
 /// Map a [`crate::protocol::RestoreError`] to a typed FFI error.
-pub(crate) fn from_restore_error(err: crate::protocol::RestoreError) -> DeRecError {
-    use crate::protocol::RestoreError;
+pub(crate) fn from_restore_error(err: RestoreError) -> DeRecError {
     let message = match &err {
         RestoreError::Conflict(ids) => {
             let id_list: Vec<String> = ids.iter().map(|c| c.0.to_string()).collect();
@@ -281,13 +282,13 @@ pub(crate) fn from_restore_error(err: crate::protocol::RestoreError) -> DeRecErr
         RestoreError::Invariant(msg) => msg.to_string(),
         RestoreError::AlreadyRestored => err.to_string(),
     };
-    let (category, code) = categorize(&crate::Error::Restore(err));
+    let (category, code) = categorize(&Error::Restore(err));
     DeRecError {
         category,
         code,
         message: to_owned_cstring(&message),
         peer_status: 0,
-        peer_memo: std::ptr::null_mut(),
+        peer_memo: ptr::null_mut(),
         expected: 0,
         got: 0,
     }
@@ -317,7 +318,7 @@ pub unsafe extern "C" fn derec_free_error(error: *mut DeRecError) {
     // struct.
     let error = unsafe { &mut *error };
     if !error.message.is_null() {
-        let message = std::mem::replace(&mut error.message, std::ptr::null_mut());
+        let message = mem::replace(&mut error.message, ptr::null_mut());
         // SAFETY: `message` was produced by `CString::into_raw` in
         // `to_owned_cstring`. We swapped in null above so even if a
         // future caller invokes us again on the same struct, the
@@ -325,14 +326,14 @@ pub unsafe extern "C" fn derec_free_error(error: *mut DeRecError) {
         unsafe { drop(CString::from_raw(message)) };
     }
     if !error.peer_memo.is_null() {
-        let peer_memo = std::mem::replace(&mut error.peer_memo, std::ptr::null_mut());
+        let peer_memo = mem::replace(&mut error.peer_memo, ptr::null_mut());
         // SAFETY: same as `message`.
         unsafe { drop(CString::from_raw(peer_memo)) };
     }
 }
 
-fn categorize(err: &crate::Error) -> (i32, i32) {
-    let (category, code) = crate::error_codes::classify(err);
+fn categorize(err: &Error) -> (i32, i32) {
+    let (category, code) = classify(err);
     (category as i32, code as i32)
 }
 

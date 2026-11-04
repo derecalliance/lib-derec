@@ -7,17 +7,21 @@
 
 #![cfg(feature = "serde")]
 
+use std::fs;
+
 use derec_library::protocol::{
     AutoAcceptPolicy, DeRecProtocolConfig, ExpiredChannelsConfig, TimeoutsConfig, UnpairAck,
 };
+use derec_proto::Protocol;
+use serde_json::Value;
 
-fn fixture(name: &str) -> serde_json::Value {
+fn fixture(name: &str) -> Value {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/protocol_config.json"
     );
-    let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
-    let all: serde_json::Value = serde_json::from_str(&raw).expect("fixture is JSON");
+    let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+    let all: Value = serde_json::from_str(&raw).expect("fixture is JSON");
     all.get(name)
         .unwrap_or_else(|| panic!("fixture has no `{name}` config"))
         .clone()
@@ -54,6 +58,7 @@ fn full_fixture_sets_every_field() {
             inbound_message_secs: Some(120),
             sharing_round_secs: Some(30),
             unpair_ack_secs: Some(45),
+            get_share_response_secs: Some(900),
             expired_channels: Some(ExpiredChannelsConfig {
                 enabled: true,
                 timeout_in_secs: 600,
@@ -89,8 +94,8 @@ fn full_fixture_sets_every_field() {
     let transports = own_transports.expect("own_transports is set");
     assert_eq!(transports.len(), 2);
     assert_eq!(transports[0].uri, "https://me.example.com/derec");
-    assert_eq!(transports[0].protocol, derec_proto::Protocol::Https);
-    assert_eq!(transports[1].protocol, derec_proto::Protocol::Grpc);
+    assert_eq!(transports[0].protocol, Protocol::Https);
+    assert_eq!(transports[1].protocol, Protocol::Grpc);
     assert_eq!(replica_id, Some(9_007_199_254_740_993));
 }
 
@@ -120,15 +125,12 @@ fn fixtures_are_canonical() {
 
 /// The fixture writes one parameter-range bound as a decimal string to pin
 /// that form; serialization writes every bound as a number.
-fn normalized(mut v: serde_json::Value) -> serde_json::Value {
-    if let Some(range) = v
-        .get_mut("parameter_range")
-        .and_then(serde_json::Value::as_object_mut)
-    {
+fn normalized(mut v: Value) -> Value {
+    if let Some(range) = v.get_mut("parameter_range").and_then(Value::as_object_mut) {
         for bound in range.values_mut() {
             if let Some(s) = bound.as_str() {
                 let n: i64 = s.parse().expect("decimal bound");
-                *bound = serde_json::Value::from(n);
+                *bound = Value::from(n);
             }
         }
     }

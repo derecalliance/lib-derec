@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+
+use derec_proto::{CommunicationInfo, CommunicationInfoKeyValue, communication_info_key_value};
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
@@ -24,22 +28,22 @@ pub(crate) trait CommunicationInfoExt {
     /// Entries carrying `bytes` — or no value at all — are skipped: the core
     /// protocol's map has nowhere to put them, and the alternative is failing
     /// a whole message over an entry no flow reads.
-    fn to_map(&self) -> std::collections::HashMap<String, String>;
+    fn to_map(&self) -> HashMap<String, String>;
 
     /// The proto carrying `map` as string-valued entries.
     ///
     /// Entry order follows the map's iteration order, which is unspecified.
     /// Nothing in the protocol reads communication info positionally, so the
     /// conversion does not sort to make it deterministic.
-    fn from_map(map: &std::collections::HashMap<String, String>) -> Self;
+    fn from_map(map: &HashMap<String, String>) -> Self;
 }
 
-impl CommunicationInfoExt for derec_proto::CommunicationInfo {
-    fn to_map(&self) -> std::collections::HashMap<String, String> {
+impl CommunicationInfoExt for CommunicationInfo {
+    fn to_map(&self) -> HashMap<String, String> {
         self.communication_info_entries
             .iter()
             .filter_map(|e| match &e.value {
-                Some(derec_proto::communication_info_key_value::Value::StringValue(s)) => {
+                Some(communication_info_key_value::Value::StringValue(s)) => {
                     Some((e.key.to_owned(), s.to_owned()))
                 }
                 _ => None,
@@ -47,15 +51,15 @@ impl CommunicationInfoExt for derec_proto::CommunicationInfo {
             .collect()
     }
 
-    fn from_map(map: &std::collections::HashMap<String, String>) -> Self {
+    fn from_map(map: &HashMap<String, String>) -> Self {
         Self {
             communication_info_entries: map
                 .iter()
-                .map(|(k, v)| derec_proto::CommunicationInfoKeyValue {
+                .map(|(k, v)| CommunicationInfoKeyValue {
                     key: k.to_owned(),
-                    value: Some(
-                        derec_proto::communication_info_key_value::Value::StringValue(v.to_owned()),
-                    ),
+                    value: Some(communication_info_key_value::Value::StringValue(
+                        v.to_owned(),
+                    )),
                 })
                 .collect(),
         }

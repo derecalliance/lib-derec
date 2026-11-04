@@ -46,20 +46,26 @@
 //! pairings are refused up-front by the missing-id check.
 
 use super::super::{DeRecChannelStore, DeRecEvent, now_secs};
+use crate::error_codes::classify;
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::contact_message::ContactMessageExt as _;
 use crate::extensions::sender_kind::SenderKindExt as _;
+use crate::primitives::pairing::request::check_parameter_range;
 use crate::protocol::context::{Local, PairingConfig};
 use crate::protocol::stores::{StoreSet, Stores};
+use crate::protocol::types::{ChannelQuery, ChannelStatus, ReplicaFilter, ReplicaRole};
+use crate::protocol::{PendingActionKind, obligation};
+use crate::types::ReplicaId;
 use crate::{
     Error, Result, primitives::pairing::PairingError, protocol::utils::reserved_keys,
     types::ChannelId,
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
+use derec_proto::communication_info_key_value::Value;
 use derec_proto::{
-    CommunicationInfo, ContactMessage, MessageBody, PairRequestMessage, SenderKind, StatusEnum,
-    TransportProtocol,
+    CommunicationInfo, CommunicationInfoKeyValue, ContactMessage, MessageBody, PairRequestMessage,
+    SenderKind, StatusEnum, TransportProtocol,
 };
 use std::collections::HashMap;
 
@@ -83,10 +89,7 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 ) -> Result<Vec<DeRecEvent>> {
     match message {
         MessageBody::PairRequest(request) => {
-            if let Err(err) = crate::primitives::pairing::request::check_parameter_range(
-                request,
-                pairing.parameter_range,
-            ) {
+            if let Err(err) = check_parameter_range(request, pairing.parameter_range) {
                 let memo = parameter_range_memo(&err);
                 return refuse(
                     stores,
@@ -186,13 +189,13 @@ async fn refuse<S: StoreSet>(
         channel_id,
         status: status as i32,
         memo: memo.to_owned(),
-        error_code: crate::error_codes::classify(error).1.name().to_owned(),
+        error_code: classify(error).1.name().to_owned(),
         message: error.to_string(),
     }];
     if let Some(error) = after {
-        events.push(crate::protocol::obligation::request_failed(
+        events.push(obligation::request_failed(
             channel_id,
-            crate::protocol::PendingActionKind::Pairing,
+            PendingActionKind::Pairing,
             true,
             status as i32,
             memo,
@@ -261,22 +264,16 @@ fn build_communication_info(
         .iter()
         .filter(|(k, _)| !is_reserved_key(k))
         .filter(|(_, v)| !v.trim().is_empty())
-        .map(|(k, v)| derec_proto::CommunicationInfoKeyValue {
+        .map(|(k, v)| CommunicationInfoKeyValue {
             key: k.to_owned(),
-            value: Some(
-                derec_proto::communication_info_key_value::Value::StringValue(v.to_owned()),
-            ),
+            value: Some(Value::StringValue(v.to_owned())),
         })
         .collect();
 
     if let Some(id) = replica_id_to_inject {
-        entries.push(derec_proto::CommunicationInfoKeyValue {
+        entries.push(CommunicationInfoKeyValue {
             key: reserved_keys::DEREC_REPLICA_ID_KEY.to_owned(),
-            value: Some(
-                derec_proto::communication_info_key_value::Value::StringValue(
-                    reserved_keys::encode_replica_id(id),
-                ),
-            ),
+            value: Some(Value::StringValue(reserved_keys::encode_replica_id(id))),
         });
     }
 
@@ -307,8 +304,7 @@ fn extract_communication_info(
     let mut peer_replica_id: Option<u64> = None;
 
     for e in &info.communication_info_entries {
-        let Some(derec_proto::communication_info_key_value::Value::StringValue(s)) = &e.value
-        else {
+        let Some(Value::StringValue(s)) = &e.value else {
             continue;
         };
         let trimmed = s.trim();
@@ -356,12 +352,16 @@ pub(in crate::protocol) fn own_communication_info(local: &Local<'_>) -> HashMap<
         .collect()
 }
 
-/// Write this device's own member row when it *initiates* a replica pairing.
+/// Record a pairing this device *initiates*, until its response arrives.
 ///
-/// The initiator knows its identity and role at `start`, and the peer's role is
-/// simply the counterpart — which is what lets the handshake proceed without
-/// recording anything about a peer whose `replica_id` has not arrived yet.
-/// Helper pairings write a [`HelperChannel`] placeholder instead, unchanged.
+/// Every kind writes the same `Pending` [`HelperChannel`] placeholder at the
+/// contact's channel, carrying the peer's role, the endpoints and the
+/// `communication_info` to record for it. That is all the response handler
+/// needs: the local kind is the counterpart of the peer's, and a replica
+/// peer's `replica_id`, unknown until the response, goes on the row written
+/// then. Nothing is put in the replica roster: a pairing in flight is not
+/// group membership, and this device's own row is written only when a
+/// replica pairing is confirmed (see [`claim_own_member`]).
 async fn persist_start_record<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -369,20 +369,8 @@ async fn persist_start_record<S: StoreSet>(
     peer_endpoints: Vec<TransportProtocol>,
     peer_communication_info: HashMap<String, String>,
     own_kind: SenderKind,
-    own_replica_id: Option<u64>,
 ) -> Result<()> {
-    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel};
-    if own_kind.is_replica() {
-        return persist_own_member(
-            stores,
-            local,
-            channel_id,
-            own_kind,
-            own_replica_id,
-            ChannelStatus::Pending,
-        )
-        .await;
-    }
+    use crate::protocol::types::{ChannelRecord, HelperChannel};
     stores
         .channels
         .save(
@@ -401,46 +389,39 @@ async fn persist_start_record<S: StoreSet>(
     Ok(())
 }
 
-/// Write this device's own row into the replica roster.
+/// Write this device's own row into the replica roster, on the group channel
+/// `channel_id`, as `role`.
 ///
-/// Both ends of a replica handshake do this — the initiator at `start`, the
-/// responder when it accepts — because the roster is absolute, not a view from
-/// one side. A group whose members cannot name themselves cannot be published.
-///
-/// Never called for helper pairings: a helper channel has exactly two ends and
-/// one record, so there is no self-row to write.
-async fn persist_own_member<S: StoreSet>(
+/// Called when a replica pairing is confirmed: the first confirmed pairing
+/// fixes the group's channel. A device that already holds a `Paired` own row
+/// is in a group, and keeps that row — a later pairing admits a joiner on an
+/// ephemeral channel, and moving this row onto it would redefine the group's
+/// channel, and with it the group key, on every admission. Any other own row
+/// is replaced.
+pub(in crate::protocol) async fn claim_own_member<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     channel_id: ChannelId,
-    own_kind: SenderKind,
-    own_replica_id: Option<u64>,
-    status: crate::protocol::types::ChannelStatus,
+    role: ReplicaRole,
 ) -> Result<()> {
-    use crate::protocol::types::{ChannelQuery, ChannelRecord, ReplicaMember, ReplicaRole};
-    let role = ReplicaRole::from_sender_kind(own_kind).ok_or(Error::Invariant(
-        "own member row requested for a non-replica pairing",
-    ))?;
-    let replica_id = own_replica_id
-        .ok_or(Error::ReplicaIdNotConfigured)
-        .and_then(crate::types::ReplicaId::try_from)?;
+    use crate::protocol::types::{ChannelRecord, ReplicaMember};
+    let replica_id = ReplicaId::try_from(local.replica_id.ok_or(Error::ReplicaIdNotConfigured)?)?;
 
-    // A device already in a group keeps the row it has. Its `channel_id` is
-    // the group's, and a later pairing mints an ephemeral channel for the
-    // *joiner* only — moving this row onto it would redefine the group's
-    // channel, and with it the group key, on every admission.
-    if stores
+    let holds_a_group = stores
         .channels
-        .load(
+        .replicas_matching(
             local.secret_id,
-            ChannelQuery::Replica {
-                channel_id,
-                replica_id,
+            ReplicaFilter {
+                ids: vec![replica_id],
+                status: vec![ChannelStatus::Paired],
+                ..Default::default()
             },
         )
         .await?
-        .is_some()
-    {
+        .into_iter()
+        .next()
+        .is_some();
+    if holds_a_group {
         return Ok(());
     }
 
@@ -454,7 +435,7 @@ async fn persist_own_member<S: StoreSet>(
                 transports: local.own_transports.to_vec(),
                 communication_info: own_communication_info(local),
                 role,
-                status,
+                status: ChannelStatus::Paired,
                 created_at: now_secs(),
             }),
         )
@@ -469,12 +450,9 @@ async fn reject_start_on_paired_channel<S: StoreSet>(
 ) -> Result<()> {
     if let Some(record) = stores
         .channels
-        .load(
-            local.secret_id,
-            crate::protocol::types::ChannelQuery::Helper { channel_id },
-        )
+        .load(local.secret_id, ChannelQuery::Helper { channel_id })
         .await?
-        && record.status() != crate::protocol::types::ChannelStatus::Pending
+        && record.status() != ChannelStatus::Pending
     {
         return Err(Error::ChannelAlreadyPaired { channel_id });
     }
@@ -507,8 +485,8 @@ async fn replica_id_is_taken<S: StoreSet>(
         .channels
         .replicas_matching(
             local.secret_id,
-            crate::protocol::types::ReplicaFilter {
-                ids: vec![crate::types::ReplicaId(candidate)],
+            ReplicaFilter {
+                ids: vec![ReplicaId(candidate)],
                 ..Default::default()
             },
         )

@@ -415,6 +415,7 @@ SDK, is:
     "inbound_message_secs": 300,
     "sharing_round_secs": 60,
     "unpair_ack_secs": 60,
+    "get_share_response_secs": 300,
     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
   },
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
@@ -510,26 +511,53 @@ before any target-level events are emitted.
   still an error from `process`. See
   [Which versions to verify](#which-versions-to-verify).
 - `SecretsDiscovered { channel_id, secrets }`
-- `RecoveryShareReceived { … }` /
-  `SecretRecovered { secret: Secret }` (typed; `secret.secrets` is the
-  list of `UserSecret` the owner protected, alongside the captured
-  helper/replica roster) /
-  `RecoveryShareError { … }` /
-  `RecoveryShareRefused { channel_id, version, status, memo }` — a helper
+- `RecoveryShareReceived { channel_id, shares_received }` — a helper's
+  share was collected. A recovery reconstructs nothing until every helper it
+  asked has answered, or `timeouts.get_share_response_secs` has passed since
+  the requests went out (each silent helper is then reported as
+  `RecoverSecretFailed { …, error: "timeout" }`). It then decides exactly
+  once:
+  - `SecretRecovered { secret: Secret }` (typed; `secret.secrets` is the
+    list of `UserSecret` the owner protected, alongside the captured
+    helper/replica roster) — one secret reconstructs and every collected
+    share is part of it;
+  - `RecoveryDisputed { version, secret, supported_by, disputed_by }` — one
+    secret reconstructs, but other helpers hold valid shares of a different
+    split that does not. Either side can be the owner's: colluding helpers
+    can forge a complete split, and the honest ones may be too few to
+    reconstruct theirs. Show the owner what `secret` holds and who stands on
+    each side, and pass it to `restore` only once they confirm it;
+  - `RecoveryConflict { version, candidates, disputed_by }` — two or more
+    different secrets reconstruct. Each candidate carries the `secret` and
+    `supported_by`. The library never picks: involve the owner, and pass
+    the candidate they confirm to `restore`;
+  - `RecoveryIncomplete { version, shares_received }` — nothing
+    reconstructs. The recovery is closed; start it again to retry.
+
+  `supported_by` / `disputed_by` name helpers as `RecoveryHelper
+  { channel_id, communication_info }`, the `communication_info` being what
+  the helper advertised when it paired, so the app can tell the owner who
+  is on each side. That is the helper's own configured communication info
+  (`with_communication_info`), not the `peer_communication_info` the
+  helper passed to `start(Pairing)`: a helper that configures none is named
+  by its channel alone.
+- `RecoveryShareRefused { channel_id, version, status, memo }` — a helper
   answered with a non-OK status (e.g. `UNKNOWN_SHARE_VERSION`) instead of a
-  share; it is not collected and the recovery stays open for the others
+  share; it is not collected, but it is that helper's answer
 - `RecoveryShareCorrupted { channel_id, version, reason }` — a helper
   answered with a share that cannot be part of the secret. `reason` is a
   `CorruptionReason`: `Malformed` (no decodable share for the requested
   secret and version, or a share bigger than this device's own configured
   `max_share_size`, rejected before it is even parsed) or `InvalidProof`
   (the share fails its own Merkle proof, e.g. a tampered value), both
-  reported as the share arrives; or `Inconsistent` (valid on its own, but
-  its commitment root or ciphertext disagrees with the shares the secret
-  was rebuilt from), reported alongside `SecretRecovered`. The share is set
-  aside and never blocks the recovery.
+  reported as the share arrives; or `Forged` (its group reconstructs under
+  one key, but not to a secret, or a single share reconstructs alone —
+  neither happens with an honest split), reported with the recovery's
+  decision. The share is set aside and never blocks the recovery.
   An honest helper never sends one, so the app may treat it as a sign of a
-  damaged or compromised helper — e.g. offer to unpair it
+  damaged or compromised helper — e.g. offer to unpair it. A share that
+  only disagrees with the others is never reported here: it is a dispute,
+  not evidence against its helper
 - `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }` /
   `UnpairFailed { channel_id, error }` — emitted by `restore` when an
   ephemeral recovery channel's teardown could not be delivered. The restore
@@ -2341,13 +2369,16 @@ than allowed to block the recovery:
   secret and version, and pass its Merkle proof. A share that fails is
   reported as `RecoveryShareCorrupted` (`Malformed` / `InvalidProof`) and
   never collected.
-- Shares that are each valid can still disagree, carrying different
-  commitment roots or ciphertexts. They are grouped by `(root, ciphertext)`
-  and the groups are tried largest first (ties go to the group whose first
-  share arrived earliest); the first that reconstructs is the secret, so the
-  shares used always agree. Every share outside it is reported as
-  `RecoveryShareCorrupted` (`Inconsistent`), once per helper, alongside
-  `SecretRecovered`. No group is ever reconstructed from a single share.
+- Nothing is reconstructed until every helper asked has answered, or
+  `get_share_response_secs` has passed. Shares that are each valid can still
+  disagree, carrying different commitment roots or ciphertexts. They are
+  grouped by `(root, ciphertext)` and every group is tried; a group is a
+  secret only if it holds shares from at least two helpers, decrypts,
+  decodes, and fits the threshold it declares. A group that reconstructs
+  anything else is reported as `RecoveryShareCorrupted` (`Forged`). Any
+  other share outside the secret is a dispute: the decision is
+  `RecoveryDisputed` (or `RecoveryConflict` when several secrets
+  reconstruct) naming the helpers on each side, never a corruption.
 
 Since an honest helper never sends a corrupted share, the application may
 take `RecoveryShareCorrupted` as a sign that the helper's device or storage is

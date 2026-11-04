@@ -10,14 +10,16 @@
 //! [`handlers::discovery`](super::super::discovery), which routes here when
 //! the payload names an author.
 use super::load_channel_key;
-use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
-use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::derec_message::{DeRecMessageBuilder, apply_trace_id, current_timestamp};
+use crate::extensions::advertised_endpoints::reply_to_owned;
+use crate::extensions::channel_store::{ChannelStoreExt as _, filter_reply_to};
 use crate::extensions::derec_result::DeRecResultExt as _;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
 use crate::protocol::context::{Exchange, Local};
+use crate::protocol::obligation::{Obligation, deliver};
 use crate::protocol::stores::{StoreSet, Stores};
-use crate::protocol::types::ReplicaMember;
+use crate::protocol::types::{ReplicaFilter, ReplicaMember, ReplicaRole};
 use crate::protocol::{
     DeRecEvent, DeRecStateStore, DeRecTransport, DeRecUserSecretStore, StateItem, StateKey,
 };
@@ -27,11 +29,13 @@ use crate::utils::now_secs;
 use crate::{Error, Result};
 use derec_proto::{
     DeRecResult, GetSecretIdsVersionsRequestMessage, GetSecretIdsVersionsResponseMessage,
-    GetShareRequestMessage, MessageBody, get_secret_ids_versions_response_message::VersionList,
+    GetShareRequestMessage, MessageBody, StatusEnum,
+    get_secret_ids_versions_response_message::VersionList,
     get_secret_ids_versions_response_message::version_list::VersionEntry,
 };
 use prost::Message as _;
 use std::collections::{HashMap, HashSet};
+use std::slice;
 
 /// Handle a discovery message a group member authored.
 ///
@@ -92,7 +96,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         .channels
         .replicas_matching(
             secret_id,
-            crate::protocol::types::ReplicaFilter {
+            ReplicaFilter {
                 exclude: local.exclude_self(),
                 ..Default::default()
             },
@@ -116,7 +120,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     let mut asked: HashSet<ReplicaId> = HashSet::new();
     for peer in &peers {
         let timestamp = current_timestamp();
-        let reply_to_transports = std::slice::from_ref(local.primary()).to_vec();
+        let reply_to_transports = slice::from_ref(local.primary()).to_vec();
         let request = GetSecretIdsVersionsRequestMessage {
             timestamp: Some(timestamp),
             // The asker names itself so the answer can be routed back to a
@@ -180,7 +184,7 @@ async fn on_request<S: StoreSet>(
     request: &GetSecretIdsVersionsRequestMessage,
     shared_key: SharedKey,
     inbound_trace_id: u64,
-    obligation: Option<&crate::protocol::obligation::Obligation>,
+    obligation: Option<&Obligation>,
 ) -> Result<Vec<DeRecEvent>> {
     let version = stores
         .user_secrets
@@ -214,26 +218,23 @@ async fn on_request<S: StoreSet>(
         .encrypt(&shared_key)?
         .build()?
         .encode_to_vec();
-    let envelope = crate::derec_message::apply_trace_id(&envelope, inbound_trace_id)?;
+    let envelope = apply_trace_id(&envelope, inbound_trace_id)?;
     // A reply-to overrides the recorded endpoints for this exchange only,
     // and only once it has passed the same transport policy every other
     // peer-supplied endpoint is held to; an offer refused in full is no
     // reply-to at all.
-    let reply_to = crate::extensions::channel_store::filter_reply_to(
-        local.policy,
-        &crate::extensions::advertised_endpoints::reply_to_owned(request),
-    );
+    let reply_to = filter_reply_to(local.policy, &reply_to_owned(request));
     let endpoint = if reply_to.is_empty() {
         member.transports.clone()
     } else {
         reply_to
     };
-    crate::protocol::obligation::deliver(
+    deliver(
         obligation,
         stores.transport,
         &endpoint,
         envelope,
-        derec_proto::StatusEnum::Ok,
+        StatusEnum::Ok,
         "",
     )
     .await?;
@@ -324,14 +325,14 @@ async fn finish<S: StoreSet>(
         .channels
         .replicas_matching(
             secret_id,
-            crate::protocol::types::ReplicaFilter {
-                role: Some(crate::protocol::types::ReplicaRole::Source),
+            ReplicaFilter {
+                role: Some(ReplicaRole::Source),
                 ..Default::default()
             },
         )
         .await?
         .iter()
-        .find(|m| m.role == crate::protocol::types::ReplicaRole::Source)
+        .find(|m| m.role == ReplicaRole::Source)
         .map(|m| m.replica_id);
 
     // Ties resolve to the Source; failing that, to the lowest id, so the
@@ -349,7 +350,7 @@ async fn finish<S: StoreSet>(
         .channels
         .replicas_matching(
             secret_id,
-            crate::protocol::types::ReplicaFilter {
+            ReplicaFilter {
                 ids: vec![winner],
                 ..Default::default()
             },
@@ -363,7 +364,7 @@ async fn finish<S: StoreSet>(
 
     let key = load_channel_key(stores, local, member.channel_id).await?;
     let timestamp = current_timestamp();
-    let reply_to_transports = std::slice::from_ref(local.primary()).to_vec();
+    let reply_to_transports = slice::from_ref(local.primary()).to_vec();
     let request = GetShareRequestMessage {
         secret_id,
         version: group_version,
@@ -413,14 +414,15 @@ mod tests {
     const SECRET_ID: u64 = 0xCA7C4;
     const GROUP: ChannelId = ChannelId(5001);
 
-    fn endpoint(uri: &str) -> derec_proto::TransportProtocol {
-        derec_proto::TransportProtocol {
+    fn endpoint(uri: &str) -> TransportProtocol {
+        TransportProtocol {
             uri: uri.to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         }
     }
 
     use crate::protocol::DeRecChannelStore as _;
+    use derec_proto::{Protocol, TransportProtocol};
 
     async fn seed(channels: &mut InMemChannelStore, id: u64, role: ReplicaRole, uri: &str) {
         channels
@@ -430,7 +432,7 @@ mod tests {
                     channel_id: GROUP,
                     replica_id: ReplicaId(id),
                     transports: vec![endpoint(uri)],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     role,
                     status: ChannelStatus::Paired,
                     created_at: 0,

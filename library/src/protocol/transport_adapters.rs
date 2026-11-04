@@ -204,7 +204,9 @@ impl<T> SingleEndpointTransport<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
     use derec_proto::Protocol;
+    use std::pin::Pin;
     use std::sync::Mutex;
 
     fn endpoint(uri: &str) -> TransportProtocol {
@@ -240,7 +242,7 @@ mod tests {
             let refused = self.fail.contains(&endpoint.uri);
             Box::pin(async move {
                 if refused {
-                    Err(crate::Error::InvalidInput("endpoint refused"))
+                    Err(Error::InvalidInput("endpoint refused"))
                 } else {
                     Ok(())
                 }
@@ -259,7 +261,7 @@ mod tests {
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         // SAFETY: `f` is owned by this frame and never moved after pinning.
-        let mut f = unsafe { std::pin::Pin::new_unchecked(&mut f) };
+        let mut f = unsafe { Pin::new_unchecked(&mut f) };
         loop {
             match f.as_mut().poll(&mut cx) {
                 Poll::Ready(v) => return v,

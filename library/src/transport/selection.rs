@@ -20,7 +20,10 @@
 //! there. Keeping them apart means a caller cannot reach the second without
 //! passing through the first.
 
+use derec_proto::TransportProtocol;
+
 use super::TransportPolicy;
+use crate::Error;
 
 impl TransportPolicy {
     /// Keep the advertised endpoints this library is willing to record.
@@ -45,12 +48,12 @@ impl TransportPolicy {
     /// empty `Vec` each caller must remember to check.
     pub fn admit_peer_endpoints(
         &self,
-        advertised: Vec<&derec_proto::TransportProtocol>,
-    ) -> Result<Vec<derec_proto::TransportProtocol>, crate::Error> {
+        advertised: Vec<&TransportProtocol>,
+    ) -> Result<Vec<TransportProtocol>, Error> {
         let offered = advertised.len();
 
         let mut seen: Vec<i32> = Vec::new();
-        let kept: Vec<derec_proto::TransportProtocol> = advertised
+        let kept: Vec<TransportProtocol> = advertised
             .into_iter()
             .filter(|endpoint| match self.check_peer(endpoint) {
                 Ok(()) => true,
@@ -94,7 +97,7 @@ impl TransportPolicy {
             .collect();
 
         if kept.is_empty() {
-            return Err(crate::Error::NoUsableEndpoint { offered });
+            return Err(Error::NoUsableEndpoint { offered });
         }
 
         Ok(kept)

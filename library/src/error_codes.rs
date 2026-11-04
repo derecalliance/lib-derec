@@ -15,10 +15,12 @@
 //! [`Category::Ffi`] with the `ffi_*` codes, and WASM under its own `wasm`
 //! category.
 
+use crate::Error;
 use crate::primitives::{
     discovery::DiscoveryError, pairing::PairingError, recovery::RecoveryError,
     sharing::SharingError, unpairing::UnpairingError, verification::VerificationError,
 };
+use crate::protocol::{SecretKind, SecretStoreError};
 
 macro_rules! vocabulary {
     ($(#[$meta:meta])* $enum:ident { $($variant:ident = $value:literal => $name:literal,)* }) => {
@@ -151,7 +153,7 @@ vocabulary! {
 
 /// Classifies a library error into the category and code every binding
 /// reports for it.
-pub(crate) fn classify(err: &crate::Error) -> (Category, Code) {
+pub(crate) fn classify(err: &Error) -> (Category, Code) {
     use crate::Error as E;
     match err {
         E::Pairing(e) => (Category::Pairing, pairing_code(e)),
@@ -163,8 +165,8 @@ pub(crate) fn classify(err: &crate::Error) -> (Category, Code) {
         E::DeRecMessage(_) => (Category::DeRecMessage, Code::BuilderError),
         E::SecretStore(e) => {
             let code = match e {
-                crate::protocol::SecretStoreError::MissingEntries {
-                    kind: crate::protocol::SecretKind::SharedKey,
+                SecretStoreError::MissingEntries {
+                    kind: SecretKind::SharedKey,
                     ..
                 } => Code::MissingSharedKey,
                 _ => Code::StoreError,
@@ -271,6 +273,7 @@ fn unpairing_code(e: &UnpairingError) -> Code {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn every_member_round_trips_through_its_discriminant() {
@@ -291,7 +294,7 @@ mod tests {
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         };
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for &code in Code::ALL {
             assert!(is_snake(code.name()), "{:?}", code);
             assert!(seen.insert(code.name()), "duplicate {}", code.name());
@@ -306,11 +309,11 @@ mod tests {
     fn restore_errors_are_classified_like_every_other_error() {
         use crate::protocol::RestoreError;
         assert_eq!(
-            classify(&crate::Error::Restore(RestoreError::AlreadyRestored)),
+            classify(&Error::Restore(RestoreError::AlreadyRestored)),
             (Category::InvalidInput, Code::AlreadyRestored)
         );
         assert_eq!(
-            classify(&crate::Error::Restore(RestoreError::Conflict(Vec::new()))),
+            classify(&Error::Restore(RestoreError::Conflict(Vec::new()))),
             (Category::InvalidInput, Code::RestoreConflict)
         );
     }

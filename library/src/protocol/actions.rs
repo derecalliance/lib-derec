@@ -17,9 +17,17 @@ use super::traits::{
     DeRecUserSecretStore,
 };
 use super::{DeRecProtocol, handlers};
+use crate::Error;
 use crate::Result;
+use crate::derec_message;
 use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::protocol::types::ReplicaFilter;
+use crate::protocol::types::ReplicaRole;
+use crate::protocol::types::{ChannelQuery, ChannelStatus};
+use crate::types::ReplicaId;
+use derec_proto::SenderKind;
 use derec_proto::StatusEnum;
+use derec_proto::TransportProtocol;
 
 impl<
     Ch: DeRecChannelStore,
@@ -96,9 +104,6 @@ impl<
     /// longer holds the role the flow requires, or the channel could not be
     /// read — for the router to answer.
     async fn still_answerable(&self, action: &PendingAction) -> Result<Result<()>> {
-        use crate::protocol::types::{ChannelQuery, ChannelStatus};
-        use derec_proto::SenderKind;
-
         let (channel_id, required) = match action {
             PendingAction::StoreShare { channel_id, .. }
             | PendingAction::VerifyShare { channel_id, .. }
@@ -123,12 +128,12 @@ impl<
             .and_then(|r| r.as_helper())
             .filter(|c| c.status == ChannelStatus::Paired)
         else {
-            return Err(crate::Error::InvalidInput(
+            return Err(Error::InvalidInput(
                 "the action's channel is no longer paired",
             ));
         };
         Ok(match required {
-            Some(expected) if channel.peer_role != expected => Err(crate::Error::RoleMismatch {
+            Some(expected) if channel.peer_role != expected => Err(Error::RoleMismatch {
                 channel_id,
                 expected,
                 actual: channel.peer_role,
@@ -497,7 +502,7 @@ impl<
         let mut a_usable_helper_just_paired = false;
         for event in events {
             let DeRecEvent::PairingCompleted {
-                kind: derec_proto::SenderKind::Owner,
+                kind: SenderKind::Owner,
                 channel_id,
                 ..
             } = event
@@ -508,14 +513,12 @@ impl<
                 .channel_store
                 .load(
                     self.secret_id,
-                    crate::protocol::types::ChannelQuery::Helper {
+                    ChannelQuery::Helper {
                         channel_id: *channel_id,
                     },
                 )
                 .await?
-                .is_some_and(|record| {
-                    record.status() == crate::protocol::types::ChannelStatus::Paired
-                })
+                .is_some_and(|record| record.status() == ChannelStatus::Paired)
             {
                 a_usable_helper_just_paired = true;
                 break;
@@ -534,7 +537,7 @@ impl<
                 (Vec::new(), None)
             }
         };
-        let reply_to: Vec<derec_proto::TransportProtocol> = if self.auto_reply_to {
+        let reply_to: Vec<TransportProtocol> = if self.auto_reply_to {
             self.own_transports.clone()
         } else {
             Vec::new()
@@ -546,7 +549,7 @@ impl<
             None,
             &Round {
                 reply_to: &reply_to,
-                trace_id: crate::derec_message::fresh_trace_id(),
+                trace_id: derec_message::fresh_trace_id(),
             },
         )
         .await
@@ -560,9 +563,9 @@ impl<
             .channel_store
             .replicas_matching(
                 self.secret_id,
-                crate::protocol::types::ReplicaFilter {
-                    status: vec![crate::protocol::types::ChannelStatus::Paired],
-                    role: Some(crate::protocol::types::ReplicaRole::Destination),
+                ReplicaFilter {
+                    status: vec![ChannelStatus::Paired],
+                    role: Some(ReplicaRole::Destination),
                     exclude: self.exclude_self(),
                     ..Default::default()
                 },
@@ -574,11 +577,8 @@ impl<
     /// This device's own row, as a
     /// [`ReplicaFilter::exclude`](crate::protocol::types::ChannelFilter::exclude)
     /// list. See [`Local::exclude_self`](crate::protocol::context::Local::exclude_self).
-    pub(super) fn exclude_self(&self) -> Vec<crate::types::ReplicaId> {
-        self.replica_id
-            .map(crate::types::ReplicaId)
-            .into_iter()
-            .collect()
+    pub(super) fn exclude_self(&self) -> Vec<ReplicaId> {
+        self.replica_id.map(ReplicaId).into_iter().collect()
     }
 
     async fn accept_inner(
@@ -733,9 +733,9 @@ impl<
                 )
                 .await
             }
-            PendingAction::RespondToFailure { .. } => Err(crate::Error::InvalidInput(
-                "a failed request can only be rejected",
-            )),
+            PendingAction::RespondToFailure { .. } => {
+                Err(Error::InvalidInput("a failed request can only be rejected"))
+            }
         }
     }
 }
@@ -743,6 +743,8 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::FailedRequest;
+    use crate::protocol::ReplyTarget;
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::tests::{
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
@@ -750,6 +752,10 @@ mod tests {
     };
     use crate::protocol::types::SecretValue;
     use crate::types::ChannelId;
+    use derec_proto::ContactMessage;
+    use derec_proto::ContactMode;
+    use derec_proto::PrePairRequestMessage;
+    use derec_proto::Protocol;
 
     const SECRET_ID: u64 = 0xF2;
     const CHANNEL: ChannelId = ChannelId(4242);
@@ -762,9 +768,9 @@ mod tests {
             .save(
                 SECRET_ID,
                 CHANNEL,
-                SecretValue::PairingContact(derec_proto::ContactMessage {
+                SecretValue::PairingContact(ContactMessage {
                     channel_id: CHANNEL.0,
-                    contact_mode: derec_proto::ContactMode::NoKeys as i32,
+                    contact_mode: ContactMode::NoKeys as i32,
                     nonce: NONCE,
                     ..Default::default()
                 }),
@@ -773,12 +779,12 @@ mod tests {
             .expect("seed NoKeys pairing contact");
     }
 
-    fn request_answering_on(uri: &str, protocol: derec_proto::Protocol) -> PendingAction {
+    fn request_answering_on(uri: &str, protocol: Protocol) -> PendingAction {
         PendingAction::PrePair {
             channel_id: CHANNEL,
-            request: derec_proto::PrePairRequestMessage {
+            request: PrePairRequestMessage {
                 nonce: NONCE,
-                supported_transports: vec![derec_proto::TransportProtocol {
+                supported_transports: vec![TransportProtocol {
                     uri: uri.to_owned(),
                     protocol: protocol as i32,
                 }],
@@ -827,7 +833,7 @@ mod tests {
             let err = protocol
                 .accept(request_answering_on(
                     "http://192.168.1.42:8080",
-                    derec_proto::Protocol::Https,
+                    Protocol::Https,
                 ))
                 .await
                 .expect_err("LAN plaintext must not be dialled without the flag");
@@ -836,7 +842,7 @@ mod tests {
             // whose *every* endpoint is refused reports that none was usable.
             // The guarantee is unchanged: plaintext is not dialled.
             assert!(
-                matches!(err, crate::Error::NoUsableEndpoint { offered: 1 }),
+                matches!(err, Error::NoUsableEndpoint { offered: 1 }),
                 "expected a no-usable-endpoint refusal, got {err:?}"
             );
         });
@@ -855,7 +861,7 @@ mod tests {
             protocol
                 .accept(request_answering_on(
                     "http://192.168.1.42:8080",
-                    derec_proto::Protocol::Https,
+                    Protocol::Https,
                 ))
                 .await
                 .expect("plaintext is dialled once unsafe_connection is set");
@@ -875,16 +881,16 @@ mod tests {
             protocol
                 .accept(PendingAction::PrePair {
                     channel_id: CHANNEL,
-                    request: derec_proto::PrePairRequestMessage {
+                    request: PrePairRequestMessage {
                         nonce: NONCE,
                         supported_transports: vec![
-                            derec_proto::TransportProtocol {
+                            TransportProtocol {
                                 uri: "http://192.168.1.42:8080".to_owned(),
-                                protocol: derec_proto::Protocol::Https as i32,
+                                protocol: Protocol::Https as i32,
                             },
-                            derec_proto::TransportProtocol {
+                            TransportProtocol {
                                 uri: "https://helper.example.com".to_owned(),
-                                protocol: derec_proto::Protocol::Https as i32,
+                                protocol: Protocol::Https as i32,
                             },
                         ],
                         timestamp: None,
@@ -906,18 +912,18 @@ mod tests {
                 .accept(PendingAction::RespondToFailure {
                     channel_id: CHANNEL,
                     trace_id: 1,
-                    reply: crate::protocol::ReplyTarget {
+                    reply: ReplyTarget {
                         channel_id: CHANNEL,
                         endpoints: Vec::new(),
                     },
-                    request: crate::protocol::FailedRequest::Undecodable,
+                    request: FailedRequest::Undecodable,
                 })
                 .await
                 .expect_err("a failed request cannot be accepted");
             assert!(
                 matches!(
                     err,
-                    crate::Error::InvalidInput("a failed request can only be rejected")
+                    Error::InvalidInput("a failed request can only be rejected")
                 ),
                 "expected InvalidInput, got {err:?}"
             );
@@ -936,7 +942,7 @@ mod tests {
             protocol
                 .accept(request_answering_on(
                     "https://helper.example.com",
-                    derec_proto::Protocol::Https,
+                    Protocol::Https,
                 ))
                 .await
                 .expect("a secure reply endpoint is dialled by default");

@@ -23,10 +23,13 @@ use crate::{Error, Result, types::ChannelId};
 use derec_proto::DeRecMessage;
 use prost::Message;
 
+use crate::derec_message;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
+use crate::protocol::IgnoreReason;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
+use std::result;
 
 impl<
     Ch: DeRecChannelStore,
@@ -141,7 +144,7 @@ impl<
     pub async fn process(
         &mut self,
         message: &[u8],
-    ) -> std::result::Result<Vec<DeRecEvent>, ProcessError> {
+    ) -> result::Result<Vec<DeRecEvent>, ProcessError> {
         let mut events = self.run_timeout_sweeps().await;
 
         let handled = self.handle_message(message).await;
@@ -178,7 +181,7 @@ impl<
     async fn handle_message(
         &mut self,
         message: &[u8],
-    ) -> std::result::Result<(ChannelId, Vec<DeRecEvent>), (Option<ChannelId>, Error)> {
+    ) -> result::Result<(ChannelId, Vec<DeRecEvent>), (Option<ChannelId>, Error)> {
         let envelope =
             DeRecMessage::decode(message).map_err(|e| (None, Error::ProtobufDecode(e)))?;
         let channel_id = ChannelId(envelope.channel_id);
@@ -254,7 +257,7 @@ impl<
         if self.is_message_expired(message, channel_id) {
             return Ok(vec![DeRecEvent::MessageIgnored {
                 channel_id,
-                reason: crate::protocol::IgnoreReason::Expired,
+                reason: IgnoreReason::Expired,
                 trace_id: message.trace_id,
             }]);
         }
@@ -296,7 +299,7 @@ impl<
             );
             return Ok(Some(vec![DeRecEvent::MessageIgnored {
                 channel_id,
-                reason: crate::protocol::IgnoreReason::PendingVerification,
+                reason: IgnoreReason::PendingVerification,
                 trace_id: message.trace_id,
             }]));
         }
@@ -339,7 +342,7 @@ impl<
     ) -> Result<Option<Vec<DeRecEvent>>> {
         use derec_proto::MessageBody;
 
-        if let Ok(inner) = crate::derec_message::extract_inner_plaintext_message(&message.message) {
+        if let Ok(inner) = derec_message::extract_inner_plaintext_message(&message.message) {
             match inner {
                 MessageBody::PrePairRequest(request) => {
                     let has_pairing_secret = matches!(
@@ -412,21 +415,34 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::derec_message::DeRecMessageBuilder;
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::tests::{
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
         InMemUserSecretStore, RecordingTransport, run_async,
     };
+    use crate::protocol::types::ReplicaMember;
+    use crate::protocol::types::ReplicaRole;
     use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, SecretValue};
+    use crate::types::ReplicaId;
+    use crate::types::SharedKey;
+    use derec_proto::MessageBody;
+    use derec_proto::Protocol;
+    use derec_proto::SenderKind;
+    use derec_proto::StatusEnum;
+    use derec_proto::StoreShareRequestMessage;
+    use derec_proto::TransportProtocol;
+    use derec_proto::VerifyShareRequestMessage;
+    use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0xAF;
     const CHANNEL: ChannelId = ChannelId(808);
-    const SHARED_KEY: crate::types::SharedKey = [9u8; 32];
+    const SHARED_KEY: SharedKey = [9u8; 32];
 
-    fn endpoint() -> derec_proto::TransportProtocol {
-        derec_proto::TransportProtocol {
+    fn endpoint() -> TransportProtocol {
+        TransportProtocol {
             uri: "https://peer.example.com/derec".to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         }
     }
 
@@ -440,10 +456,10 @@ mod tests {
                 ChannelRecord::Helper(HelperChannel {
                     channel_id: CHANNEL,
                     transports: vec![endpoint()],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     status: ChannelStatus::Paired,
                     created_at: now_secs(),
-                    peer_role: derec_proto::SenderKind::Helper,
+                    peer_role: SenderKind::Helper,
                     weight: 1,
                 }),
             )
@@ -486,19 +502,17 @@ mod tests {
     /// fails the role gate — a response is only legal from a Helper, so the
     /// request direction is what this channel refuses.
     fn failing_request() -> Vec<u8> {
-        let timestamp = crate::derec_message::current_timestamp();
-        crate::derec_message::DeRecMessageBuilder::channel()
+        let timestamp = derec_message::current_timestamp();
+        DeRecMessageBuilder::channel()
             .channel_id(CHANNEL)
             .timestamp(timestamp)
-            .message_body(derec_proto::MessageBody::VerifyShareRequest(
-                derec_proto::VerifyShareRequestMessage {
-                    secret_id: SECRET_ID,
-                    version: 1,
-                    nonce: 7,
-                    timestamp: Some(timestamp),
-                    reply_to_transports: Vec::new(),
-                },
-            ))
+            .message_body(MessageBody::VerifyShareRequest(VerifyShareRequestMessage {
+                secret_id: SECRET_ID,
+                version: 1,
+                nonce: 7,
+                timestamp: Some(timestamp),
+                reply_to_transports: Vec::new(),
+            }))
             .encrypt(&SHARED_KEY)
             .expect("encrypt")
             .build()
@@ -540,7 +554,7 @@ mod tests {
                 .expect("a RequestFailed carrying a token");
 
             protocol
-                .reject(token, derec_proto::StatusEnum::Rejected, "declined")
+                .reject(token, StatusEnum::Rejected, "declined")
                 .await
                 .expect("the token answers the request");
             assert_eq!(transport.sent_envelopes().len(), 1, "exactly one response");
@@ -580,15 +594,15 @@ mod tests {
 
             // It is a real, decryptable VerifyShareResponse carrying the
             // role-mismatch status — not merely "some bytes were sent".
-            let envelope = derec_proto::DeRecMessage::decode(sent[0].as_slice())
-                .expect("the response is a DeRec envelope");
-            let inner = crate::derec_message::extract_inner_message(&envelope.message, &SHARED_KEY)
+            let envelope =
+                DeRecMessage::decode(sent[0].as_slice()).expect("the response is a DeRec envelope");
+            let inner = derec_message::extract_inner_message(&envelope.message, &SHARED_KEY)
                 .expect("the peer can decrypt it under the channel key");
-            let derec_proto::MessageBody::VerifyShareResponse(response) = inner else {
+            let MessageBody::VerifyShareResponse(response) = inner else {
                 panic!("expected a VerifyShareResponse, got {inner:?}");
             };
             let status = response.result.expect("a result is present").status;
-            assert_eq!(status, derec_proto::StatusEnum::Rejected as i32);
+            assert_eq!(status, StatusEnum::Rejected as i32);
         });
     }
 
@@ -605,19 +619,17 @@ mod tests {
             seed(&mut c, &mut s).await;
 
             // Right channel, wrong key: decryption fails before dispatch.
-            let timestamp = crate::derec_message::current_timestamp();
-            let envelope = crate::derec_message::DeRecMessageBuilder::channel()
+            let timestamp = derec_message::current_timestamp();
+            let envelope = DeRecMessageBuilder::channel()
                 .channel_id(CHANNEL)
                 .timestamp(timestamp)
-                .message_body(derec_proto::MessageBody::VerifyShareRequest(
-                    derec_proto::VerifyShareRequestMessage {
-                        secret_id: SECRET_ID,
-                        version: 1,
-                        nonce: 7,
-                        timestamp: Some(timestamp),
-                        reply_to_transports: Vec::new(),
-                    },
-                ))
+                .message_body(MessageBody::VerifyShareRequest(VerifyShareRequestMessage {
+                    secret_id: SECRET_ID,
+                    version: 1,
+                    nonce: 7,
+                    timestamp: Some(timestamp),
+                    reply_to_transports: Vec::new(),
+                }))
                 .encrypt(&[1u8; 32])
                 .expect("encrypt")
                 .build()
@@ -645,17 +657,17 @@ mod tests {
         channels: &mut InMemChannelStore,
         channel_id: ChannelId,
         replica_id: u64,
-        role: crate::protocol::types::ReplicaRole,
+        role: ReplicaRole,
         status: ChannelStatus,
     ) {
         channels
             .save(
                 SECRET_ID,
-                ChannelRecord::Replica(crate::protocol::types::ReplicaMember {
+                ChannelRecord::Replica(ReplicaMember {
                     channel_id,
-                    replica_id: crate::types::ReplicaId(replica_id),
+                    replica_id: ReplicaId(replica_id),
                     transports: vec![endpoint()],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     role,
                     status,
                     created_at: now_secs(),
@@ -697,19 +709,17 @@ mod tests {
     }
 
     fn replica_push(channel_id: ChannelId, sent_at: prost_types::Timestamp) -> Vec<u8> {
-        crate::derec_message::DeRecMessageBuilder::channel()
+        DeRecMessageBuilder::channel()
             .channel_id(channel_id)
             .timestamp(sent_at)
             .trace_id(TRACE)
-            .message_body(derec_proto::MessageBody::StoreShareRequest(
-                derec_proto::StoreShareRequestMessage {
-                    secret_id: SECRET_ID,
-                    version: 1,
-                    timestamp: Some(sent_at),
-                    replica_id: Some(SOURCE_ID),
-                    ..Default::default()
-                },
-            ))
+            .message_body(MessageBody::StoreShareRequest(StoreShareRequestMessage {
+                secret_id: SECRET_ID,
+                version: 1,
+                timestamp: Some(sent_at),
+                replica_id: Some(SOURCE_ID),
+                ..Default::default()
+            }))
             .encrypt(&SHARED_KEY)
             .expect("encrypt")
             .build()
@@ -744,10 +754,7 @@ mod tests {
             .expect("test protocol builds")
     }
 
-    fn ignored(
-        reason: crate::protocol::IgnoreReason,
-        channel_id: ChannelId,
-    ) -> impl Fn(&DeRecEvent) -> bool {
+    fn ignored(reason: IgnoreReason, channel_id: ChannelId) -> impl Fn(&DeRecEvent) -> bool {
         move |e| {
             matches!(e, DeRecEvent::MessageIgnored { channel_id: c, reason: r, trace_id }
                 if *c == channel_id && *r == reason && *trace_id == TRACE)
@@ -774,16 +781,15 @@ mod tests {
             let events = protocol
                 .process(&replica_push(
                     PAIRING_CHANNEL,
-                    crate::derec_message::current_timestamp(),
+                    derec_message::current_timestamp(),
                 ))
                 .await
                 .expect("an ignored message is not an error");
 
             assert!(
-                events.iter().any(ignored(
-                    crate::protocol::IgnoreReason::PendingVerification,
-                    PAIRING_CHANNEL
-                )),
+                events
+                    .iter()
+                    .any(ignored(IgnoreReason::PendingVerification, PAIRING_CHANNEL)),
                 "expected MessageIgnored(PendingVerification) on the pairing channel, got {events:?}"
             );
             assert!(
@@ -853,7 +859,7 @@ mod tests {
                     e,
                     DeRecEvent::MessageIgnored {
                         channel_id,
-                        reason: crate::protocol::IgnoreReason::PendingVerification,
+                        reason: IgnoreReason::PendingVerification,
                         ..
                     } if *channel_id == CHANNEL
                 )),
@@ -895,7 +901,7 @@ mod tests {
             let outcome = protocol
                 .process(&replica_push(
                     GROUP_CHANNEL,
-                    crate::derec_message::current_timestamp(),
+                    derec_message::current_timestamp(),
                 ))
                 .await;
 
@@ -935,10 +941,9 @@ mod tests {
                 .expect("an expired message is not an error");
 
             assert!(
-                events.iter().any(ignored(
-                    crate::protocol::IgnoreReason::Expired,
-                    PAIRING_CHANNEL
-                )),
+                events
+                    .iter()
+                    .any(ignored(IgnoreReason::Expired, PAIRING_CHANNEL)),
                 "expected MessageIgnored(Expired), got {events:?}"
             );
             assert!(transport.sent_envelopes().is_empty());

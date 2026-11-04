@@ -13,11 +13,19 @@
 //! can write `use derec_library::protocol::Channel;` rather than
 //! `use derec_library::protocol::types::Channel;`.
 
+use crate::Error;
+use crate::types::SharedKey;
 use crate::types::{ChannelId, ReplicaId};
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::ContactMessage;
+use derec_proto::GetShareResponseMessage;
+use derec_proto::SenderKind;
+use derec_proto::TransportProtocol;
+use derec_proto::VerifyShareRequestMessage;
 #[cfg(any(feature = "serde", target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -218,6 +226,17 @@ pub struct Timeouts {
     ///
     /// Default: **60 seconds**.
     pub unpair_ack: Duration,
+    /// How long a recovery waits for a Helper to answer its `GetShareRequest`.
+    ///
+    /// A recovery decides only once every Helper it asked has answered or
+    /// this has elapsed since the requests went out, so a secret is never
+    /// chosen while an answer that could contradict it is still due. On
+    /// expiry the silent Helpers are reported failed and the recovery settles
+    /// on the shares it holds. The budget is a **human** one when Helpers
+    /// approve share requests by hand.
+    ///
+    /// Default: **300 seconds**.
+    pub get_share_response: Duration,
     /// When to remove a channel still awaiting out-of-band fingerprint
     /// confirmation — every replica pairing, and every
     /// [`derec_proto::ContactMode::NoKeys`] pairing.
@@ -237,6 +256,7 @@ impl Default for Timeouts {
             inbound_message: Duration::from_secs(300),
             sharing_round: Duration::from_secs(60),
             unpair_ack: Duration::from_secs(60),
+            get_share_response: Duration::from_secs(300),
             expired_channels: ExpiredChannelCleanup::default(),
         }
     }
@@ -318,19 +338,19 @@ impl ReplicaRole {
     }
 
     /// Map from the wire `SenderKind`, or `None` for non-replica kinds.
-    pub fn from_sender_kind(kind: derec_proto::SenderKind) -> Option<Self> {
+    pub fn from_sender_kind(kind: SenderKind) -> Option<Self> {
         match kind {
-            derec_proto::SenderKind::ReplicaSource => Some(ReplicaRole::Source),
-            derec_proto::SenderKind::ReplicaDestination => Some(ReplicaRole::Destination),
+            SenderKind::ReplicaSource => Some(ReplicaRole::Source),
+            SenderKind::ReplicaDestination => Some(ReplicaRole::Destination),
             _ => None,
         }
     }
 
     /// Map to the wire `SenderKind`.
-    pub fn to_sender_kind(self) -> derec_proto::SenderKind {
+    pub fn to_sender_kind(self) -> SenderKind {
         match self {
-            ReplicaRole::Source => derec_proto::SenderKind::ReplicaSource,
-            ReplicaRole::Destination => derec_proto::SenderKind::ReplicaDestination,
+            ReplicaRole::Source => SenderKind::ReplicaSource,
+            ReplicaRole::Destination => SenderKind::ReplicaDestination,
         }
     }
 }
@@ -370,12 +390,12 @@ pub struct HelperChannel {
     /// empty list would yield a channel that looks paired and is unreachable,
     /// which is worse than one that refuses to load, so they stay a loud
     /// deserialization error.
-    pub transports: Vec<derec_proto::TransportProtocol>,
+    pub transports: Vec<TransportProtocol>,
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
-    pub communication_info: std::collections::HashMap<String, String>,
+    pub communication_info: HashMap<String, String>,
     /// The **peer's** role: `Owner` when this node is the helper, `Helper`
     /// when this node is the owner.
-    pub peer_role: derec_proto::SenderKind,
+    pub peer_role: SenderKind,
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub status: ChannelStatus,
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
@@ -426,9 +446,9 @@ pub struct ReplicaMember {
     /// Every endpoint this member advertised. See
     /// [`HelperChannel::transports`] for the ordering and compatibility
     /// contract.
-    pub transports: Vec<derec_proto::TransportProtocol>,
+    pub transports: Vec<TransportProtocol>,
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
-    pub communication_info: std::collections::HashMap<String, String>,
+    pub communication_info: HashMap<String, String>,
     pub role: ReplicaRole,
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub status: ChannelStatus,
@@ -479,6 +499,8 @@ mod channel_wire {
         CHANNEL_RECORD_SCHEMA_VERSION, ChannelId, ChannelStatus, HelperChannel, ReplicaId,
         ReplicaMember, ReplicaRole,
     };
+    use derec_proto::SenderKind;
+    use derec_proto::TransportProtocol;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
@@ -488,10 +510,10 @@ mod channel_wire {
     /// the list without deleting the superseded object is doing the sane
     /// thing, and refusing it would punish the more careful migration.
     fn endpoints(
-        transport: Option<derec_proto::TransportProtocol>,
-        transports: Option<Vec<derec_proto::TransportProtocol>>,
+        transport: Option<TransportProtocol>,
+        transports: Option<Vec<TransportProtocol>>,
         record: &'static str,
-    ) -> Result<Vec<derec_proto::TransportProtocol>, String> {
+    ) -> Result<Vec<TransportProtocol>, String> {
         let resolved = match (transports, transport) {
             (Some(list), _) => list,
             (None, Some(one)) => vec![one],
@@ -538,12 +560,12 @@ mod channel_wire {
         channel_id: ChannelId,
         /// Pre-0.0.3 spelling. Read, never written.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        transport: Option<derec_proto::TransportProtocol>,
+        transport: Option<TransportProtocol>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        transports: Option<Vec<derec_proto::TransportProtocol>>,
+        transports: Option<Vec<TransportProtocol>>,
         #[serde(default)]
         communication_info: HashMap<String, String>,
-        peer_role: derec_proto::SenderKind,
+        peer_role: SenderKind,
         #[serde(default)]
         status: ChannelStatus,
         #[serde(default)]
@@ -593,9 +615,9 @@ mod channel_wire {
         replica_id: ReplicaId,
         /// Pre-0.0.3 spelling. Read, never written.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        transport: Option<derec_proto::TransportProtocol>,
+        transport: Option<TransportProtocol>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        transports: Option<Vec<derec_proto::TransportProtocol>>,
+        transports: Option<Vec<TransportProtocol>>,
         #[serde(default)]
         communication_info: HashMap<String, String>,
         role: ReplicaRole,
@@ -758,7 +780,7 @@ pub type ReplicaFilter = ChannelFilter<ReplicaRole, ReplicaId>;
 ///
 /// Ids are [`HelperChannel::channel_id`] and the role is the **peer's**
 /// [`HelperChannel::peer_role`].
-pub type HelperFilter = ChannelFilter<derec_proto::SenderKind, ChannelId>;
+pub type HelperFilter = ChannelFilter<SenderKind, ChannelId>;
 
 /// A record returned by [`crate::protocol::DeRecChannelStore::load`].
 #[derive(Clone, Debug)]
@@ -788,13 +810,13 @@ impl ChannelRecord {
     ///
     /// Never empty for a recorded channel: the library refuses to record a
     /// peer whose endpoints were all filtered away.
-    pub fn transports(&self) -> &[derec_proto::TransportProtocol] {
+    pub fn transports(&self) -> &[TransportProtocol] {
         match self {
             ChannelRecord::Helper(h) => &h.transports,
             ChannelRecord::Replica(r) => &r.transports,
         }
     }
-    pub fn communication_info(&self) -> &std::collections::HashMap<String, String> {
+    pub fn communication_info(&self) -> &HashMap<String, String> {
         match self {
             ChannelRecord::Helper(h) => &h.communication_info,
             ChannelRecord::Replica(r) => &r.communication_info,
@@ -1059,7 +1081,7 @@ impl PairingKeyMaterial {
     pub(crate) fn to_secret(&self) -> crate::Result<PairingSecretKeyMaterial> {
         use ark_serialize::CanonicalDeserialize as _;
         PairingSecretKeyMaterial::deserialize_compressed(self.0.as_slice())
-            .map_err(|_| crate::Error::Invariant("stored PairingSecret bytes failed to decode"))
+            .map_err(|_| Error::Invariant("stored PairingSecret bytes failed to decode"))
     }
 }
 
@@ -1092,6 +1114,7 @@ impl<'de> Deserialize<'de> for PairingKeyMaterial {
 mod contact_serde {
     use super::ContactMessage;
     use prost::Message as _;
+    use serde::de;
     use serde::{Deserialize as _, Deserializer, Serialize as _, Serializer};
 
     pub(super) fn serialize<S>(contact: &ContactMessage, serializer: S) -> Result<S::Ok, S::Error>
@@ -1106,7 +1129,7 @@ mod contact_serde {
         D: Deserializer<'de>,
     {
         let bytes = Vec::<u8>::deserialize(deserializer)?;
-        ContactMessage::decode(bytes.as_slice()).map_err(serde::de::Error::custom)
+        ContactMessage::decode(bytes.as_slice()).map_err(de::Error::custom)
     }
 }
 
@@ -1128,7 +1151,7 @@ mod contact_serde {
 pub enum SecretValue {
     /// The post-pairing symmetric channel key. Established by pairing and used
     /// to authenticate and encrypt every subsequent message on the channel.
-    SharedKey(crate::types::SharedKey),
+    SharedKey(SharedKey),
     /// The ephemeral ECIES / ML-KEM key material created by `start` and
     /// consumed when the pairing response arrives. Removed once the shared
     /// key is derived. Held as an opaque [`PairingKeyMaterial`] blob so
@@ -1256,7 +1279,7 @@ pub enum StateItem {
     /// `(secret_id, channel_id)`; the most recent challenge wins.
     PendingVerification {
         channel_id: ChannelId,
-        request: derec_proto::VerifyShareRequestMessage,
+        request: VerifyShareRequestMessage,
     },
 
     /// Accumulator for one in-progress recovery target.
@@ -1298,6 +1321,12 @@ pub enum StateItem {
         secret_id: u64,
         version: u32,
         shares: Vec<CollectedShare>,
+        /// The Helpers asked for a share that have not answered yet. The
+        /// recovery decides once this is empty, or once `started_at` is
+        /// older than [`Timeouts::get_share_response`].
+        pending: HashSet<ChannelId>,
+        /// Unix seconds at which the share requests went out.
+        started_at: u64,
     },
 
     /// Outstanding unpair acknowledgement window. `started_at` is the
@@ -1327,9 +1356,9 @@ pub enum StateItem {
         /// The version the asker held when the check started.
         local_version: u32,
         /// Members asked that have not yet answered.
-        pending: std::collections::HashSet<ReplicaId>,
+        pending: HashSet<ReplicaId>,
         /// Versions reported so far, by member.
-        reported: std::collections::HashMap<ReplicaId, u32>,
+        reported: HashMap<ReplicaId, u32>,
         started_at: u64,
     },
     /// An in-flight publishing round. Boxed because it is by far the largest
@@ -1349,17 +1378,17 @@ pub enum StateItem {
 pub struct SharingRoundState {
     pub version: u32,
     /// Helpers written to that have not yet answered.
-    pub pending: std::collections::HashSet<ChannelId>,
+    pub pending: HashSet<ChannelId>,
     /// Helpers that confirmed storage.
-    pub confirmed: std::collections::HashSet<ChannelId>,
+    pub confirmed: HashSet<ChannelId>,
     /// Helpers that rejected or timed out.
-    pub failed: std::collections::HashSet<ChannelId>,
+    pub failed: HashSet<ChannelId>,
     /// Members written to that have not yet answered.
-    pub pending_replicas: std::collections::HashSet<ReplicaId>,
+    pub pending_replicas: HashSet<ReplicaId>,
     /// Members that acknowledged.
-    pub synced_replicas: std::collections::HashSet<ReplicaId>,
+    pub synced_replicas: HashSet<ReplicaId>,
     /// Members that refused, timed out, or could not be reached.
-    pub behind_replicas: std::collections::HashSet<ReplicaId>,
+    pub behind_replicas: HashSet<ReplicaId>,
     pub started_at: u64,
     /// The `keepVersion` every Helper received in this round. A Helper that
     /// confirms the round has removed every version it held on that channel
@@ -1420,7 +1449,7 @@ pub struct CollectedShare {
     /// The helper channel the response arrived on.
     pub channel_id: ChannelId,
     /// The helper's response, carrying its committed share.
-    pub response: derec_proto::GetShareResponseMessage,
+    pub response: GetShareResponseMessage,
 }
 
 /// A single stored share entry, fully self-describing.
@@ -1476,11 +1505,12 @@ pub struct Share {
 #[cfg(all(test, feature = "serde"))]
 mod channel_record_format_tests {
     use super::*;
+    use derec_proto::Protocol;
 
-    fn endpoint(uri: &str) -> derec_proto::TransportProtocol {
-        derec_proto::TransportProtocol {
+    fn endpoint(uri: &str) -> TransportProtocol {
+        TransportProtocol {
             uri: uri.to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         }
     }
 
@@ -1587,8 +1617,8 @@ mod channel_record_format_tests {
         let record = HelperChannel {
             channel_id: ChannelId(42),
             transports: vec![endpoint("https://helper.example/derec")],
-            communication_info: std::collections::HashMap::new(),
-            peer_role: derec_proto::SenderKind::Helper,
+            communication_info: HashMap::new(),
+            peer_role: SenderKind::Helper,
             status: ChannelStatus::Paired,
             created_at: 1_700_000_000,
             weight: 3,
@@ -1652,8 +1682,8 @@ mod channel_record_format_tests {
         let record = HelperChannel {
             channel_id: ChannelId(42),
             transports: vec![endpoint("https://helper.example/derec")],
-            communication_info: std::collections::HashMap::new(),
-            peer_role: derec_proto::SenderKind::Helper,
+            communication_info: HashMap::new(),
+            peer_role: SenderKind::Helper,
             status: ChannelStatus::Paired,
             created_at: 1_700_000_000,
             weight: 1,
@@ -2068,18 +2098,10 @@ mod channel_filter_tests {
     #[test]
     fn the_helper_alias_filters_on_sender_kind() {
         let filter = HelperFilter {
-            role: Some(derec_proto::SenderKind::Helper),
+            role: Some(SenderKind::Helper),
             ..Default::default()
         };
-        assert!(filter.matches(
-            &ChannelId(1),
-            ChannelStatus::Paired,
-            &derec_proto::SenderKind::Helper
-        ));
-        assert!(!filter.matches(
-            &ChannelId(1),
-            ChannelStatus::Paired,
-            &derec_proto::SenderKind::Owner
-        ));
+        assert!(filter.matches(&ChannelId(1), ChannelStatus::Paired, &SenderKind::Helper));
+        assert!(!filter.matches(&ChannelId(1), ChannelStatus::Paired, &SenderKind::Owner));
     }
 }

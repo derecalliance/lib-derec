@@ -41,6 +41,9 @@ mod decl;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::mem;
+use std::ops::Range;
 use std::path::PathBuf;
 
 use decl::{Kind, Lang, Member, norm};
@@ -56,7 +59,7 @@ fn repo_root() -> PathBuf {
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
 fn fixture() -> serde_json::Value {
@@ -99,7 +102,7 @@ fn files_under(rel: &str, ext: &str) -> Vec<String> {
     let mut stack = vec![root.join(rel)];
     while let Some(dir) = stack.pop() {
         let entries =
-            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+            fs::read_dir(&dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
         for entry in entries {
             let path = entry.expect("a readable directory entry").path();
             if path.is_dir() {
@@ -119,7 +122,7 @@ fn files_under(rel: &str, ext: &str) -> Vec<String> {
 /// Non-test Go files directly in one package directory.
 fn go_package(rel: &str) -> Vec<(String, String)> {
     let root = repo_root();
-    let mut out: Vec<(String, String)> = std::fs::read_dir(root.join(rel))
+    let mut out: Vec<(String, String)> = fs::read_dir(root.join(rel))
         .unwrap_or_else(|e| panic!("reading {rel}: {e}"))
         .map(|e| e.expect("a readable directory entry").path())
         .filter(|p| {
@@ -187,6 +190,12 @@ const RECORD_FIELDS: &[Allow] = &[
         "dotnet",
         "Timeouts",
         "unpairacksecs=unpairack",
+        "a TimeSpan carries its unit, so the name drops `Secs`; the wire DTO converts to seconds",
+    ),
+    (
+        "dotnet",
+        "Timeouts",
+        "getshareresponsesecs=getshareresponse",
         "a TimeSpan carries its unit, so the name drops `Secs`; the wire DTO converts to seconds",
     ),
 ];
@@ -1727,7 +1736,7 @@ fn locate_ts(rel: &str, path: &str) -> Located {
     let masked = decl::mask(&src, Lang::Ts);
     let segs: Vec<&str> = path.split('.').collect();
     let (owners, leaf) = segs.split_at(segs.len() - 1);
-    let const_block = |name: &str| -> Option<std::ops::Range<usize>> {
+    let const_block = |name: &str| -> Option<Range<usize>> {
         decl::word_positions(&masked, "const")
             .into_iter()
             .find_map(|at| {
@@ -2027,7 +2036,7 @@ fn allow_lists_have_no_stale_entries() {
 /// across nine modules, most of them not re-exported anywhere this test could
 /// name them, and an exhaustive match on each would be more code than the
 /// check it serves.
-fn error_variants() -> std::collections::BTreeMap<String, BTreeSet<String>> {
+fn error_variants() -> BTreeMap<String, BTreeSet<String>> {
     const SOURCES: &[&str] = &[
         "library/src/error.rs",
         "library/src/derec_message/error.rs",
@@ -2043,8 +2052,7 @@ fn error_variants() -> std::collections::BTreeMap<String, BTreeSet<String>> {
         "library/src/primitives/unpairing/error.rs",
     ];
 
-    let mut found: std::collections::BTreeMap<String, BTreeSet<String>> =
-        std::collections::BTreeMap::new();
+    let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for rel in SOURCES {
         let src = read(rel);
@@ -2105,18 +2113,18 @@ fn error_variants() -> std::collections::BTreeMap<String, BTreeSet<String>> {
 #[test]
 fn changelog_error_variants_resolve() {
     let known = error_variants();
-    let retired: std::collections::BTreeMap<(String, String), String> = fixture()["documented_api"]
-        ["retired_error_variants"]
-        .as_array()
-        .expect("documented_api.retired_error_variants is an array")
-        .iter()
-        .map(|e| {
-            (
-                (field(e, "enum"), field(e, "variant")),
-                field(e, "replaced_by"),
-            )
-        })
-        .collect();
+    let retired: BTreeMap<(String, String), String> =
+        fixture()["documented_api"]["retired_error_variants"]
+            .as_array()
+            .expect("documented_api.retired_error_variants is an array")
+            .iter()
+            .map(|e| {
+                (
+                    (field(e, "enum"), field(e, "variant")),
+                    field(e, "replaced_by"),
+                )
+            })
+            .collect();
 
     let changelog = read("CHANGELOG.md");
     let mut unresolved: BTreeSet<String> = BTreeSet::new();
@@ -2187,7 +2195,7 @@ fn paragraphs(doc: &str) -> Vec<Paragraph<'_>> {
             if !lines.is_empty() {
                 out.push(Paragraph {
                     first_line: start + 1,
-                    lines: std::mem::take(&mut lines),
+                    lines: mem::take(&mut lines),
                 });
             }
             continue;
@@ -2441,7 +2449,7 @@ fn rust_sources(rel: &str) -> Vec<String> {
     let mut stack = vec![root.join(rel)];
     while let Some(dir) = stack.pop() {
         let entries =
-            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+            fs::read_dir(&dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
         for entry in entries {
             let path = entry.expect("a readable directory entry").path();
             if path.is_dir() {

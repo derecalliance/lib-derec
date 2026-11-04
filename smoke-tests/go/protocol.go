@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/derecpb"
@@ -329,7 +330,11 @@ func (s *memShareStore) Save(secretID, channelID uint64, share protocol.Share) e
 	if s.failSaves {
 		return errors.New("share backend unavailable")
 	}
-	s.data[shareStoreKey{channelID, share.SecretID, share.Version}] = share
+	// Keyed by the partition, which is what every read here filters by.
+	// share.SecretID names the Owner's secret and differs from the partition
+	// whenever this peer is a Helper, so keying on it would put rows where no
+	// read looks.
+	s.data[shareStoreKey{channelID, secretID, share.Version}] = share
 	return nil
 }
 
@@ -2161,6 +2166,105 @@ func runUnconfirmedDestination() {
 	fmt.Println()
 }
 
+// startReplicaScan has scanner start a replica pairing of kind on a fresh
+// InlineKeys contact from creator — mirroring `start_replica_scan` in
+// smoke-tests/rust/src/protocol.rs. Nothing is delivered.
+func startReplicaScan(scanner, creator *peer, transient uint64, kind protocol.SenderKind) {
+	contact, err := creator.proto.CreateContact(&transient, protocol.ContactModeInlineKeys, nil)
+	must(err, fmt.Sprintf("[%s] CreateContact", creator.label))
+	_, err = scanner.proto.Start(protocol.FlowKindPairing, protocol.PairingParams{
+		Kind:    kind,
+		Contact: contact.ContactBytes,
+	})
+	must(err, fmt.Sprintf("[%s] Start(Pairing)", scanner.label))
+}
+
+// assertProtects fails unless owner can start a ProtectSecret round —
+// mirroring `assert_protects` in smoke-tests/rust/src/protocol.rs.
+func assertProtects(owner *peer, name string) {
+	_, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{11}, Name: name, Data: []byte(name)}},
+	})
+	must(err, fmt.Sprintf("ProtectSecret (%s) must succeed", name))
+}
+
+// crossConfirmFingerprint has both ends of a replica channel confirm the
+// other's fingerprint.
+func crossConfirmFingerprint(a, b *peer, channelID uint64) {
+	aFp, err := a.proto.GetFingerprint(channelID)
+	must(err, fmt.Sprintf("[%s] GetFingerprint", a.label))
+	bFp, err := b.proto.GetFingerprint(channelID)
+	must(err, fmt.Sprintf("[%s] GetFingerprint", b.label))
+	assertTrue(aFp == bFp, "both ends must derive the same fingerprint, got %q and %q", aFp, bFp)
+	must(a.proto.VerifyFingerprint(channelID, bFp), fmt.Sprintf("[%s] VerifyFingerprint", a.label))
+	must(b.proto.VerifyFingerprint(channelID, aFp), fmt.Sprintf("[%s] VerifyFingerprint", b.label))
+}
+
+// runAbandonedReplicaPairing: a replica pairing the peer never answers leaves
+// only a Pending placeholder, so publishing to helpers still works while it
+// is in flight, a later confirmed pairing fixes the group channel, and the
+// expiry sweep of the abandoned one does not disturb it — mirroring
+// `run_abandoned_replica_pairing_flow` in smoke-tests/rust/src/protocol.rs.
+func runAbandonedReplicaPairing() {
+	fmt.Println("=== Protocol abandoned replica pairing test ===")
+
+	aID, bID, cID := uint64(0xA1A1), uint64(0xB2B2), uint64(0xC3C3)
+	a, err := newPeerWithConfig("replica-a", "https://replica-a-abandoned.example.com", protocol.Config{
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold: proto.Uint32(2),
+			ReplicaID: &aID,
+			Timeouts: &protocol.Timeouts{
+				ExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{Enabled: true, TimeoutInSecs: 1},
+			},
+		},
+	})
+	must(err, "protocol.New(replica-a)")
+	defer a.proto.Close()
+	b := newPeerWithReplicaID("replica-b", "https://replica-b-abandoned.example.com", 2, &bID)
+	c := newPeerWithReplicaID("replica-c", "https://replica-c-abandoned.example.com", 2, &cID)
+	defer b.proto.Close()
+	defer c.proto.Close()
+
+	// B never hears of the request.
+	startReplicaScan(a, b, 100, protocol.SenderKindReplicaSource)
+	a.drain()
+	assertProtects(a, "while a replica pairing is pending")
+	fmt.Println("  ProtectSecret succeeds while a replica pairing is pending  ✓")
+
+	startReplicaScan(a, c, 200, protocol.SenderKindReplicaSource)
+	handshake := append(pump(a, c), pump(c, a)...)
+	var groupChannel uint64
+	for _, ev := range handshake {
+		if ev.Type == protocol.EventTypePairingCompleted && ev.PairingChannelID == 200 {
+			groupChannel = ev.ChannelID
+		}
+	}
+	assertTrue(groupChannel != 0, "the pairing with C must complete, got %+v", handshake)
+	crossConfirmFingerprint(a, c, groupChannel)
+	pumpMany([]*peer{a, c})
+	assertProtects(a, "after a later pairing is confirmed")
+	pumpMany([]*peer{a, c})
+	fmt.Println("  ProtectSecret succeeds after the pairing with C is confirmed  ✓")
+
+	time.Sleep(2100 * time.Millisecond)
+	_, err = a.proto.Tick()
+	must(err, "replica-a.Tick()")
+	assertProtects(a, "after the expiry sweep")
+	pumpMany([]*peer{a, c})
+	fmt.Println("  ProtectSecret succeeds after the expiry sweep  ✓")
+
+	own, err := a.channelStore.ListReplicas(a.proto.SecretID(), protocol.ReplicaFilter{
+		ChannelFilter: protocol.ChannelFilter{IDs: []uint64{aID}},
+	})
+	must(err, "replica-a.channelStore.ListReplicas")
+	assertTrue(len(own) == 1, "A must keep its own row, got %+v", own)
+	assertTrue(own[0].ChannelID == groupChannel, "A's own row must be on the confirmed group channel %d, got %d", groupChannel, own[0].ChannelID)
+	assertTrue(own[0].Status == protocol.ChannelStatusPaired, "A's own row must be Paired, got %v", own[0].Status)
+	fmt.Println("  A's own row is on the C channel and Paired  ✓")
+
+	fmt.Println("Protocol abandoned replica pairing test passed.")
+}
+
 // runRecoverRestoreRepublish protects a weighted secret, loses the owner,
 // recovers the secret on a new device at the same endpoint, restores it there
 // and republishes with the stored weights. The weights and the threshold reach
@@ -2329,6 +2433,395 @@ func runRecoverRestoreRepublish() {
 	fmt.Printf("  verifying the recovered v%d → VerifySharesFailed(NoProof) on both helpers, nothing sent  ✓\n", v1)
 
 	fmt.Println("Protocol recover → restore → republish test passed.")
+}
+
+// runSilentHelperRecovery recovers with three helpers while one never
+// receives its request — mirroring `run_silent_helper_recovery_flow` in
+// smoke-tests/rust/src/protocol.rs. Nothing is decided while that helper's
+// answer is due; once get_share_response has elapsed, Tick reports it as
+// timed out and settles the recovery on the two shares it holds.
+func runSilentHelperRecovery() {
+	fmt.Println("=== Protocol silent helper recovery test ===")
+
+	owner, err := newPeerWithConfig("owner", "https://owner-silent.example.com", protocol.Config{
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold: proto.Uint32(2),
+			Timeouts:  &protocol.Timeouts{GetShareResponseSecs: proto.Uint64(1)},
+		},
+	})
+	must(err, "protocol.New(owner)")
+	defer owner.proto.Close()
+	helperA := newPeer("helper-a", "https://helper-a-silent.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-silent.example.com", 2)
+	helperC := newPeer("helper-c", "https://helper-c-silent.example.com", 2)
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+	defer helperC.proto.Close()
+
+	pairPeers(owner, helperA, 1)
+	pairPeers(owner, helperB, 2)
+	channelC := pairPeers(owner, helperC, 3)
+
+	secretData := []byte("three helpers, one silent")
+	events, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{9}, Name: "silent-helper secret", Data: secretData}},
+	})
+	must(err, "owner.Start(ProtectSecret)")
+	var version uint32
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeProtectSecretStarted && ev.Version != nil {
+			version = *ev.Version
+		}
+	}
+	assertTrue(version != 0, "Start(ProtectSecret) must emit ProtectSecretStarted, got %+v", events)
+	pumpMany([]*peer{owner, helperA, helperB, helperC})
+
+	_, err = owner.proto.Start(protocol.FlowKindRecoverSecret, protocol.RecoverSecretParams{
+		SecretID: protocolSecretID,
+		Version:  version,
+	})
+	must(err, "owner.Start(RecoverSecret)")
+
+	// helper-c never sees its request.
+	var recoveryEvents []protocol.Event
+	for _, entry := range owner.drain() {
+		switch entry.uri {
+		case helperA.uri:
+			recoveryEvents = append(recoveryEvents, deliver(helperA, entry.message)...)
+		case helperB.uri:
+			recoveryEvents = append(recoveryEvents, deliver(helperB, entry.message)...)
+		}
+	}
+	recoveryEvents = append(recoveryEvents, pumpMany([]*peer{owner, helperA, helperB})...)
+
+	received := 0
+	for _, ev := range recoveryEvents {
+		assertTrue(ev.Type != protocol.EventTypeSecretRecovered,
+			"nothing is decided while helper-c's answer is due, got %+v", recoveryEvents)
+		if ev.Type == protocol.EventTypeRecoveryShareReceived {
+			received++
+		}
+	}
+	assertTrue(received == 2, "helper-a and helper-b must answer, got %d shares", received)
+	idle, err := owner.proto.Tick()
+	must(err, "owner.Tick() inside the window")
+	assertTrue(len(idle) == 0, "the recovery must wait out its window, got %+v", idle)
+	fmt.Println("  two of three helpers answer → no SecretRecovered, Tick() empty  ✓")
+
+	time.Sleep(2100 * time.Millisecond)
+	settled, err := owner.proto.Tick()
+	must(err, "owner.Tick() after the window")
+	assertTrue(len(settled) == 2, "expected a timeout then SecretRecovered, got %+v", settled)
+	failed, recovered := settled[0], settled[1]
+	assertTrue(failed.Type == protocol.EventTypeRecoverSecretFailed && failed.ChannelID == channelC &&
+		failed.Version != nil && *failed.Version == version && failed.Error == "timeout",
+		"helper-c must be reported as timed out, got %+v", failed)
+	assertTrue(recovered.Type == protocol.EventTypeSecretRecovered && recovered.Secret != nil,
+		"the recovery must settle as SecretRecovered, got %+v", recovered)
+	carried := false
+	for _, s := range recovered.Secret.Secrets {
+		if bytes.Equal(s.ID, []byte{9}) && bytes.Equal(s.Data, secretData) {
+			carried = true
+		}
+	}
+	assertTrue(carried, "the recovered secret must carry the protected bytes, got %+v", recovered.Secret.Secrets)
+	fmt.Println("  after the window Tick() → [RecoverSecretFailed(helper-c, \"timeout\"), SecretRecovered]  ✓")
+
+	closed, err := owner.proto.Tick()
+	must(err, "owner.Tick() after the decision")
+	assertTrue(len(closed) == 0, "the recovery is closed once decided, got %+v", closed)
+	fmt.Println("  Tick() afterwards is empty  ✓")
+
+	fmt.Println("Protocol silent helper recovery test passed.")
+}
+
+// disputeSecretID is the secret both owners of the dispute scenarios protect,
+// so the two splits share a secret id and a version.
+const disputeSecretID uint64 = 44
+
+// newPeerWithSecretID builds a peer of secretID at threshold, addressed by an
+// HTTPS own transport at uri.
+func newPeerWithSecretID(label, uri string, secretID uint64, threshold uint32) *peer {
+	p, err := newPeerFromConfig(label, protocol.Config{
+		SecretID: secretID,
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold:     proto.Uint32(threshold),
+			OwnTransports: []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
+		},
+	})
+	must(err, fmt.Sprintf("protocol.New(%s)", label))
+	return p
+}
+
+// newDisputeOwner builds an owner of disputeSecretID at threshold.
+func newDisputeOwner(label, uri string, threshold uint32) *peer {
+	return newPeerWithSecretID(label, uri, disputeSecretID, threshold)
+}
+
+// protectAcross publishes one secret named name from owner to helpers and
+// returns the version it published — mirroring `protect_across` in
+// smoke-tests/rust/src/protocol.rs.
+func protectAcross(owner *peer, helpers []*peer, name string) uint32 {
+	events, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{10}, Name: name, Data: []byte(name)}},
+	})
+	must(err, fmt.Sprintf("[%s] Start(ProtectSecret)", owner.label))
+	var version uint32
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeProtectSecretStarted && ev.Version != nil {
+			version = *ev.Version
+		}
+	}
+	assertTrue(version != 0, "[%s] the round must report the version it published, got %+v", owner.label, events)
+	pumpMany(append([]*peer{owner}, helpers...))
+	return version
+}
+
+// heldShare loads the one share p's share store holds for channel and
+// version.
+func heldShare(p *peer, channel uint64, version uint32) protocol.Share {
+	shares, err := p.shareStore.Load(p.proto.SecretID(), channel, []uint32{version})
+	must(err, fmt.Sprintf("[%s] shareStore.Load", p.label))
+	assertTrue(len(shares) == 1, "[%s] must hold one share for channel %d v%d, got %d", p.label, channel, version, len(shares))
+	return shares[0]
+}
+
+// transplantShare overwrites the bytes to holds on toChannel for version with
+// the bytes from holds on fromChannel, through the helpers' own share stores
+// — mirroring `transplant_share` in smoke-tests/rust/src/protocol.rs.
+func transplantShare(from *peer, fromChannel uint64, to *peer, toChannel uint64, version uint32) {
+	held := heldShare(to, toChannel, version)
+	held.Bytes = heldShare(from, fromChannel, version).Bytes
+	must(to.shareStore.Save(to.proto.SecretID(), toChannel, held), fmt.Sprintf("[%s] shareStore.Save", to.label))
+}
+
+// recoverWithTwoOfFiveFromAnotherSplit has owner A (threshold 3) protect
+// "owner-a secret" across five helpers that advertise themselves as
+// helper-1..helper-5, and owner B (bThreshold) protect "owner-b secret" at the
+// same secret id and version across three helpers of its own. The shares
+// helper-4 and helper-5 hold for A are then replaced with two of B's, and A
+// recovers with all five answering — mirroring
+// `recover_with_two_of_five_from_another_split` in
+// smoke-tests/rust/src/protocol.rs. Returns the recovery's events and A's
+// five helper channels.
+func recoverWithTwoOfFiveFromAnotherSplit(tag string, bThreshold uint32) ([]protocol.Event, []uint64) {
+	owner := newDisputeOwner("owner-a", "https://owner-a-"+tag+".example.com", 3)
+	defer owner.proto.Close()
+	helpers := make([]*peer, 5)
+	channels := make([]uint64, 5)
+	for i := range helpers {
+		label := fmt.Sprintf("helper-%d", i+1)
+		helpers[i] = newPeer(label, "https://"+label+"-"+tag+".example.com", 2)
+		defer helpers[i].proto.Close()
+		must(helpers[i].proto.SetCommunicationInfo(map[string]string{"name": label}), label+" SetCommunicationInfo")
+		channels[i] = pairPeers(owner, helpers[i], uint64(10+i))
+	}
+	version := protectAcross(owner, helpers, "owner-a secret")
+
+	other := newDisputeOwner("owner-b", "https://owner-b-"+tag+".example.com", bThreshold)
+	defer other.proto.Close()
+	xs := make([]*peer, 3)
+	xChannels := make([]uint64, 3)
+	for i := range xs {
+		label := fmt.Sprintf("x%d", i+1)
+		xs[i] = newPeer(label, "https://"+label+"-"+tag+".example.com", 2)
+		defer xs[i].proto.Close()
+		xChannels[i] = pairPeers(other, xs[i], uint64(21+i))
+	}
+	otherVersion := protectAcross(other, xs, "owner-b secret")
+	assertTrue(otherVersion == version, "both splits must be of the same version, got v%d and v%d", version, otherVersion)
+
+	transplantShare(xs[0], xChannels[0], helpers[3], channels[3], version)
+	transplantShare(xs[1], xChannels[1], helpers[4], channels[4], version)
+
+	_, err := owner.proto.Start(protocol.FlowKindRecoverSecret, protocol.RecoverSecretParams{
+		SecretID: disputeSecretID,
+		Version:  version,
+	})
+	must(err, "owner-a.Start(RecoverSecret)")
+	events := pumpMany(append([]*peer{owner}, helpers...))
+	for _, ev := range events {
+		assertTrue(ev.Type != protocol.EventTypeRecoveryShareCorrupted,
+			"a share of another split is not evidence against its helper, got %+v", events)
+	}
+	return events, channels
+}
+
+func recoveryHelperChannels(helpers []protocol.RecoveryHelper) []uint64 {
+	out := make([]uint64, len(helpers))
+	for i, h := range helpers {
+		out[i] = h.ChannelID
+	}
+	return out
+}
+
+func recoveryHelperNames(helpers []protocol.RecoveryHelper) []string {
+	out := make([]string, len(helpers))
+	for i, h := range helpers {
+		out[i] = h.CommunicationInfo["name"]
+	}
+	return out
+}
+
+// runDisputedRecovery: three helpers back the owner's split; two hold valid
+// shares of another split that cannot reconstruct. The library cannot tell
+// which side is the owner's, so it reports RecoveryDisputed naming both
+// sides — mirroring `run_disputed_recovery_flow` in
+// smoke-tests/rust/src/protocol.rs.
+func runDisputedRecovery() {
+	fmt.Println("=== Protocol disputed recovery test ===")
+
+	events, channels := recoverWithTwoOfFiveFromAnotherSplit("disputed", 3)
+	var disputed *protocol.Event
+	for i := range events {
+		assertTrue(events[i].Type != protocol.EventTypeSecretRecovered,
+			"a disputed secret is never reported as recovered, got %+v", events)
+		if events[i].Type == protocol.EventTypeRecoveryDisputed {
+			disputed = &events[i]
+		}
+	}
+	assertTrue(disputed != nil, "expected RecoveryDisputed, got %+v", events)
+	assertTrue(disputed.Secret != nil && len(disputed.Secret.Secrets) > 0 && disputed.Secret.Secrets[0].Name == "owner-a secret",
+		"the disputed secret must be owner A's, got %+v", disputed.Secret)
+	assertTrue(slices.Equal(recoveryHelperChannels(disputed.SupportedBy), channels[:3]),
+		"supported_by must be helper-1..3's channels, got %v", recoveryHelperChannels(disputed.SupportedBy))
+	assertTrue(slices.Equal(recoveryHelperChannels(disputed.DisputedBy), channels[3:]),
+		"disputed_by must be helper-4..5's channels, got %v", recoveryHelperChannels(disputed.DisputedBy))
+	assertTrue(slices.Equal(recoveryHelperNames(disputed.SupportedBy), []string{"helper-1", "helper-2", "helper-3"}),
+		"each side names the helpers as they advertised themselves, got %v", recoveryHelperNames(disputed.SupportedBy))
+	assertTrue(slices.Equal(recoveryHelperNames(disputed.DisputedBy), []string{"helper-4", "helper-5"}),
+		"disputed_by must name helper-4, helper-5, got %v", recoveryHelperNames(disputed.DisputedBy))
+	fmt.Println("  two of five shares from another split → RecoveryDisputed(owner-a secret, [helper-1..3] vs [helper-4, helper-5]), no corruption  ✓")
+
+	fmt.Println("Protocol disputed recovery test passed.")
+}
+
+// runConflictingRecovery: the other split was made at threshold 2, so its two
+// shares reconstruct too and the library reports RecoveryConflict with both
+// candidates — mirroring `run_conflicting_recovery_flow` in
+// smoke-tests/rust/src/protocol.rs.
+func runConflictingRecovery() {
+	fmt.Println("=== Protocol conflicting recovery test ===")
+
+	events, channels := recoverWithTwoOfFiveFromAnotherSplit("conflict", 2)
+	var conflict *protocol.Event
+	for i := range events {
+		if events[i].Type == protocol.EventTypeRecoveryConflict {
+			conflict = &events[i]
+		}
+	}
+	assertTrue(conflict != nil, "expected RecoveryConflict, got %+v", events)
+	assertTrue(len(conflict.Candidates) == 2, "expected two candidates, got %+v", conflict.Candidates)
+	want := []struct {
+		name     string
+		channels []uint64
+	}{{"owner-a secret", channels[:3]}, {"owner-b secret", channels[3:]}}
+	for i, w := range want {
+		c := conflict.Candidates[i]
+		assertTrue(len(c.Secret.Secrets) > 0 && c.Secret.Secrets[0].Name == w.name &&
+			slices.Equal(recoveryHelperChannels(c.SupportedBy), w.channels),
+			"candidate %d must be (%s, %v), got (%+v, %v)", i, w.name, w.channels, c.Secret.Secrets, recoveryHelperChannels(c.SupportedBy))
+	}
+	assertTrue(len(conflict.DisputedBy) == 0, "every share is on one side or the other, got %+v", conflict.DisputedBy)
+	fmt.Println("  two of five shares from a threshold-2 split → RecoveryConflict[(owner-a secret, helper-1..3), (owner-b secret, helper-4..5)]  ✓")
+
+	fmt.Println("Protocol conflicting recovery test passed.")
+}
+
+// runRestoreKeepsHelperDuties: a device that already helps another owner
+// recovers and restores its own secret. Restore wipes only the recovery
+// channels to its own helpers; the channel to the other owner, and the share
+// held for it, survive — mirroring `run_restore_keeps_helper_duties_flow` in
+// smoke-tests/rust/src/protocol.rs.
+func runRestoreKeepsHelperDuties() {
+	fmt.Println("=== Protocol restore keeps helper duties test ===")
+
+	const ownSecretID uint64 = 4545
+	lost := newPeerWithSecretID("lost-device", "https://lost-duties.example.com", ownSecretID, 2)
+	helperA := newPeer("helper-a", "https://helper-a-duties.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-duties.example.com", 2)
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+	channelA := pairPeers(lost, helperA, 1)
+	channelB := pairPeers(lost, helperB, 2)
+	version := protectAcross(lost, []*peer{helperA, helperB}, "own secret")
+	lost.proto.Close()
+
+	device := newPeerWithSecretID("new-device", "https://device-duties.example.com", ownSecretID, 2)
+	defer device.proto.Close()
+
+	// The new device helps another owner first.
+	otherOwner := newPeerWithSecretID("other-owner", "https://other-duties.example.com", 9090, 2)
+	otherHelper := newPeer("other-helper", "https://other-helper-duties.example.com", 2)
+	defer otherOwner.proto.Close()
+	defer otherHelper.proto.Close()
+	dutyChannel := pairPeers(otherOwner, device, 3)
+	pairPeers(otherOwner, otherHelper, 4)
+	otherVersion := protectAcross(otherOwner, []*peer{device, otherHelper}, "other owner's secret")
+	heldForOther := func() int {
+		shares, err := device.shareStore.Load(device.proto.SecretID(), dutyChannel, []uint32{otherVersion})
+		must(err, "device.shareStore.Load")
+		return len(shares)
+	}
+	assertTrue(heldForOther() == 1, "the device must hold the other owner's share, got %d", heldForOther())
+
+	// Then it recovers its own secret over fresh recovery channels.
+	recoveryA := pairPeers(device, helperA, 100)
+	recoveryB := pairPeers(device, helperB, 101)
+	must(helperA.channelStore.LinkChannel(helperA.proto.SecretID(), channelA, recoveryA), "helper-a LinkChannel")
+	must(helperB.channelStore.LinkChannel(helperB.proto.SecretID(), channelB, recoveryB), "helper-b LinkChannel")
+	all := []*peer{device, helperA, helperB}
+
+	_, err := device.proto.Start(protocol.FlowKindRecoverSecret, protocol.RecoverSecretParams{
+		SecretID: ownSecretID,
+		Version:  version,
+	})
+	must(err, "device.Start(RecoverSecret)")
+	var recovered *protocol.Secret
+	for _, ev := range pumpMany(all) {
+		if ev.Type == protocol.EventTypeSecretRecovered && ev.Secret != nil {
+			recovered = ev.Secret
+		}
+	}
+	assertTrue(recovered != nil, "the device must recover its own secret")
+
+	restoreEvents, err := device.proto.Restore(*recovered, version)
+	must(err, "device.Restore")
+	touched := map[uint64]bool{}
+	for _, ev := range restoreEvents {
+		switch ev.Type {
+		case protocol.EventTypeUnpairStarted, protocol.EventTypeUnpaired, protocol.EventTypeUnpairFailed:
+			touched[ev.ChannelID] = true
+		}
+	}
+	assertTrue(!touched[dutyChannel], "restore must not unpair the channel to the other owner, got %+v", restoreEvents)
+	assertTrue(touched[recoveryA] && touched[recoveryB], "restore must still wipe both recovery channels, got %+v", restoreEvents)
+	fmt.Println("  Restore unpairs both recovery channels, never the channel to the other owner  ✓")
+	pumpMany(all)
+
+	record, ok, err := device.channelStore.Load(device.proto.SecretID(), dutyChannel, 0)
+	must(err, "device.channelStore.Load")
+	assertTrue(ok && record.Helper != nil && record.Helper.Status == protocol.ChannelStatusPaired,
+		"the channel to the other owner must survive restore as Paired, got ok=%v %+v", ok, record)
+	assertTrue(heldForOther() == 1, "the share held for the other owner must survive restore, got %d", heldForOther())
+	fmt.Println("  the channel to the other owner stays Paired and its share stays stored  ✓")
+
+	_, err = otherOwner.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+		SecretID: otherOwner.proto.SecretID(),
+		Version:  otherVersion,
+		Target:   protocol.TargetAll(),
+	})
+	must(err, "other-owner.Start(VerifyShares)")
+	verified := map[uint64]bool{}
+	for _, ev := range pumpMany([]*peer{otherOwner, device, otherHelper}) {
+		if ev.Type == protocol.EventTypeShareVerified {
+			verified[ev.ChannelID] = true
+		}
+	}
+	assertTrue(verified[dutyChannel], "the other owner must still verify the restored device's share, got %v", verified)
+	fmt.Println("  the other owner still verifies the restored device's share  ✓")
+
+	fmt.Println("Protocol restore keeps helper duties test passed.")
 }
 
 // runHelperShareRefused gives one helper a ParameterRange whose share-size

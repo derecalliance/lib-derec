@@ -7,6 +7,146 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
+### 0.0.11
+
+Recovery no longer accepts whichever group of shares reconstructs first. It
+waits for an answer from every helper it asked, tries every group, and when
+the answers disagree it reports the disagreement to the application instead
+of choosing a side. Fewer than the threshold of helpers can no longer have
+the owner silently recover a forged secret, and with it a forged helper
+list. No wire message changes: an owner on this version recovers from
+helpers on 0.0.10, and helpers need no upgrade.
+
+- **Fixed (security): one helper could forge the recovered secret.**
+  *(bug fix; every SDK)*
+
+  Recovery took the first group of matching shares that decrypted and needed
+  only two subshares, which one weighted helper's share could hold on its
+  own. A single helper could send its own complete split of a secret it
+  made up, have the owner recover it, and — through the helper list inside
+  it — have `restore` replace every real helper with ones it controlled. The
+  honest helpers' shares were then reported as corrupted. A group now needs
+  shares from at least two helpers, and the secret it reconstructs must fit
+  the threshold it declares.
+
+- **Changed: a recovery decides only once every helper has answered.**
+  *(breaking; every SDK)*
+
+  `SecretRecovered` used to arrive with the share that first completed a
+  group. Now nothing is reconstructed until every helper asked has answered
+  — a share, a refusal or a corrupted share — or until
+  `get_share_response` has passed since the requests went out. On that
+  timeout `tick` reports each silent helper as `RecoverSecretFailed` with
+  error `"timeout"` and decides on the shares in hand. The timeout is a new
+  field, `Timeouts::get_share_response` (`get_share_response_secs` in the
+  config JSON; .NET `Timeouts.GetShareResponse`, Go
+  `Timeouts.GetShareResponseSecs`, TypeScript `get_share_response_secs`),
+  default 300 seconds. A recovery started with no helper to ask closes at
+  once with `RecoveryIncomplete`.
+
+  The `PendingRecovery` state row records the helpers still to answer and
+  when the requests went out, as `pending` and `started_at` in the state
+  JSON (`StateItem.Pending` and `StartedAt` in .NET and Go; the .NET
+  `StateItem.PendingRecovery` factory takes both). A row written by an
+  earlier version decodes as none pending, sent at `0`, so the next `tick`
+  decides it on the shares it holds. A custom state store that keeps rows as
+  opaque JSON needs no change; one that maps fields must carry `pending` and
+  `started_at`.
+
+  **Migration:** keep calling `tick` while a recovery is open, at an
+  interval shorter than `get_share_response`, or a helper that never answers
+  holds the decision until the next `process`. Do not count shares to
+  predict when `SecretRecovered` arrives.
+
+- **Added: `RecoveryDisputed`, `RecoveryConflict` and `RecoveryIncomplete`.**
+  *(breaking; every SDK)*
+
+  A recovery now ends in exactly one of four events:
+
+  - `SecretRecovered { secret }` — one secret reconstructs, and every
+    collected share is part of it;
+  - `RecoveryDisputed { version, secret, supported_by, disputed_by }` — one
+    secret reconstructs, but other helpers hold valid shares of a different
+    split that does not. Either side can be the owner's: colluding helpers
+    can forge a complete split, and the honest ones may be too few to
+    reconstruct theirs;
+  - `RecoveryConflict { version, candidates, disputed_by }` — two or more
+    different secrets reconstruct; each candidate carries its `secret` and
+    `supported_by`;
+  - `RecoveryIncomplete { version, shares_received }` — nothing
+    reconstructs. The recovery is closed.
+
+  `supported_by` and `disputed_by` name helpers as `RecoveryHelper
+  { channel_id, communication_info }`, where `communication_info` is what
+  the helper itself configured and advertised when it paired — not the
+  `peer_communication_info` passed to `start(Pairing)`.
+
+  **Migration:** handle all four. On `RecoveryDisputed` or
+  `RecoveryConflict`, show the owner what each secret holds and which
+  helpers stand behind it, and pass the one the owner confirms to `restore`
+  exactly as the `secret` of `SecretRecovered`. Never restore either
+  automatically. On `RecoveryIncomplete`, start the recovery again once more
+  helpers are reachable.
+
+- **Changed: a share that only disagrees is no longer reported as
+  corrupted.** *(breaking; every SDK)*
+
+  `CorruptionReason::Inconsistent` is removed. A valid share outside the
+  recovered secret was reported as corrupted, with the advice to unpair its
+  helper — but when a forged group wins, that share is the honest helper's.
+  Such shares now appear in `disputed_by`. `CorruptionReason::Forged`
+  (wire `"Forged"`) is added for what an honest split never produces: a
+  group that reconstructs under one key but not to a secret, or to one whose
+  declared threshold its own shares contradict, or a single share that
+  reconstructs alone. `RecoveryShareCorrupted` therefore reports only what
+  the shares themselves prove, and unpairing on it stays safe.
+
+  **Migration:** replace any handling of `Inconsistent` with `Forged`. Do
+  not unpair helpers named in `disputed_by` without the owner's decision.
+
+- **Removed: `RecoveryShareError`.** *(breaking; every SDK)*
+
+  Nothing emits it any more: a group whose reconstructed bytes do not decode
+  is reported as `Forged`, and a recovery that reconstructs nothing ends in
+  `RecoveryIncomplete`.
+
+  **Migration:** remove its handler and handle `RecoveryIncomplete`.
+
+- **Fixed (security): restore unpaired the owners this device helps.**
+  *(bug fix; every SDK)*
+
+  After a recovery, `restore` unpairs the recovery-mode channels it no
+  longer needs. It picked them as every channel the recovered roster does
+  not list, whatever the peer's role, so on a device that is also a helper
+  for other owners it unpaired those channels too and deleted the shares it
+  held for them — at once without a required acknowledgement, on the
+  timeout with one, since an owner refuses an unpair from its helper. Those
+  owners went on counting the device as a helper holding their share. Only
+  channels whose peer is a helper are recovery channels now; a channel whose
+  peer is an owner is left untouched, with its key and its share.
+
+- **Fixed: one unfinished replica pairing could stop a device from
+  protecting, for good.** *(bug fix; every SDK)*
+
+  A device starting a replica pairing wrote its own row into the replica
+  roster at once, pointing at the contact's channel, and a device holds a
+  single own row. When that pairing never completed — declined, or one
+  message lost — every `ProtectSecret` failed until the expiry sweep, since
+  the row pointed at a channel with no key. A later pairing could not claim
+  the row, so confirming it failed as well, and once the sweep deleted the
+  stale row the device was left in a group with no row of its own, unable to
+  protect again. The responder had the same problem with a pairing it
+  accepted but whose peer never confirmed. A pairing in flight now leaves
+  only its `Pending` placeholder, and a device writes its own row when it
+  confirms a replica pairing's fingerprint: the first confirmed pairing
+  fixes the group's channel, as before. A roster holding only unconfirmed
+  peers is no group, so publishing to helpers is unaffected.
+
+  **Migration:** this device's own row now appears in the channel store only
+  after `verify_fingerprint`, not when the handshake completes; code that
+  reads the roster in between sees only the peer. A replica pairing in
+  progress during the upgrade must be started again.
+
 ### 0.0.10
 
 A body naming a group member is accepted only on that member's own channel,

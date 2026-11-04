@@ -52,6 +52,7 @@
 use rand::Rng as _;
 use rand::SeedableRng;
 use rand::rngs::ChaCha20Rng;
+use std::array;
 use zeroize::Zeroizing;
 
 pub mod ecies;
@@ -416,7 +417,7 @@ pub fn finish_pairing_responder(
         "XOR combiner inputs — lengths only, no secret bytes"
     );
 
-    let handshake_key: Zeroizing<[u8; 32]> = Zeroizing::new(std::array::from_fn(|i| {
+    let handshake_key: Zeroizing<[u8; 32]> = Zeroizing::new(array::from_fn(|i| {
         mlkem_shared_key[i] ^ ecies_shared_key[i]
     }));
     let shared_key = channel_key(&handshake_key, fingerprint_nonce);
@@ -505,7 +506,7 @@ pub fn finish_pairing_initiator(
         "XOR combiner inputs — lengths only, no secret bytes"
     );
 
-    let handshake_key: Zeroizing<[u8; 32]> = Zeroizing::new(std::array::from_fn(|i| {
+    let handshake_key: Zeroizing<[u8; 32]> = Zeroizing::new(array::from_fn(|i| {
         mlkem_shared_key[i] ^ ecies_shared_key[i]
     }));
     let shared_key = channel_key(&handshake_key, &secrets.fingerprint_nonce);

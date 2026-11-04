@@ -8,7 +8,12 @@ pub(crate) mod wire;
 mod tests;
 
 use std::collections::HashMap;
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
 
+use crate::protocol::types::ChannelShare;
+use crate::protocol::types::Secret;
 use crate::{
     primitives::discovery::response::SecretVersionEntry,
     protocol::types::{Target, UserSecret},
@@ -19,6 +24,30 @@ use derec_proto::{
     PrePairRequestMessage, SenderKind, StoreShareRequestMessage, TransportProtocol,
     UnpairRequestMessage, UpdateChannelInfoRequestMessage, VerifyShareRequestMessage,
 };
+
+/// A Helper as the recovering owner knows it, named in
+/// [`DeRecEvent::RecoveryConflict`] and [`DeRecEvent::RecoveryDisputed`] so
+/// the application can tell the owner who is on which side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryHelper {
+    /// The channel the Helper answered on.
+    pub channel_id: ChannelId,
+    /// What the Helper advertised about itself when it paired, as stored on
+    /// its channel. Empty when the channel is no longer stored.
+    pub communication_info: HashMap<String, String>,
+}
+
+/// One secret a recovery reconstructed, reported in
+/// [`DeRecEvent::RecoveryConflict`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecoveryCandidate {
+    /// The reconstructed secret, decoded as [`DeRecEvent::SecretRecovered`]
+    /// would carry it.
+    pub secret: Secret,
+    /// The Helpers whose shares reconstruct it, in the order their shares
+    /// were collected.
+    pub supported_by: Vec<RecoveryHelper>,
+}
 
 /// Why [`DeRecEvent::MessageIgnored`] dropped an inbound message.
 ///
@@ -109,11 +138,13 @@ pub enum CorruptionReason {
     /// commitment root — for example a share whose value was altered after it
     /// was split. Judged on arrival.
     InvalidProof,
-    /// The share verifies on its own, but its commitment root or ciphertext
-    /// disagrees with the shares the secret was reconstructed from — a share
-    /// of some other split, or one built from scratch. Only judgeable against
-    /// the other shares, so it is reported when the secret is recovered.
-    Inconsistent,
+    /// The share belongs to a group of shares that reconstructs under one
+    /// key, but what it reconstructs is not a secret: it does not decode, or
+    /// it does not fit the threshold it declares. An honest split never
+    /// produces that, so every Helper in the group is reported. Only
+    /// judgeable against the other shares, so it is reported with the
+    /// recovery's decision.
+    Forged,
 }
 
 /// Lightweight discriminant of [`PendingAction`].
@@ -460,8 +491,8 @@ pub enum FailedRequest {
     Undecodable,
 }
 
-impl std::fmt::Debug for FailedRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for FailedRequest {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             FailedRequest::StoreShare(_) => "StoreShare",
             FailedRequest::VerifyShare(_) => "VerifyShare",
@@ -474,8 +505,8 @@ impl std::fmt::Debug for FailedRequest {
     }
 }
 
-impl std::fmt::Debug for PendingAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for PendingAction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let channel_id = match self {
             PendingAction::Pairing { channel_id, .. }
             | PendingAction::PrePair { channel_id, .. }
@@ -557,7 +588,7 @@ pub enum DeRecFlow {
         /// Stored verbatim on the resulting [`crate::protocol::types::HelperChannel`]
         /// (`channel.communication_info`). The protocol does not inspect
         /// it — pass an empty map to record nothing.
-        peer_communication_info: std::collections::HashMap<String, String>,
+        peer_communication_info: HashMap<String, String>,
     },
     Discovery {
         target: Target,
@@ -710,24 +741,38 @@ pub enum DeRecFlow {
         target: Target,
     },
     /// Ask every paired Helper for its share of `(secret_id, version)` and
-    /// reconstruct the secret as the shares arrive.
+    /// reconstruct the secret once every Helper asked has answered.
     ///
     /// Each answer settles as one of [`DeRecEvent::RecoveryShareReceived`],
-    /// [`DeRecEvent::RecoveryShareRefused`],
-    /// [`DeRecEvent::RecoveryShareCorrupted`] or, once enough consistent
-    /// shares are in, [`DeRecEvent::SecretRecovered`].
+    /// [`DeRecEvent::RecoveryShareRefused`] or
+    /// [`DeRecEvent::RecoveryShareCorrupted`]. Nothing is reconstructed
+    /// while an answer is still due: a secret chosen early could be
+    /// contradicted by a share still on its way. The recovery decides when
+    /// the last Helper answers, or when
+    /// [`Timeouts::get_share_response`](crate::protocol::types::Timeouts::get_share_response)
+    /// has elapsed since the requests went out — each silent Helper is then
+    /// reported as [`DeRecEvent::RecoverSecretFailed`] with error
+    /// `"timeout"`. The decision is exactly one of:
     ///
-    /// A corrupted share is reported per Helper and set aside, so it never
-    /// blocks recovery from the honest shares. A share that fails on its own
-    /// — it does not decode, or fails its Merkle proof — is reported as it
-    /// arrives and never collected. Shares that are each valid but disagree
-    /// (a different commitment root or ciphertext) are grouped by
-    /// `(root, ciphertext)`; groups are tried largest first, ties going to
-    /// the group whose first share arrived earliest, and the first that
-    /// reconstructs is the secret. Every share outside it is reported as
-    /// [`CorruptionReason::Inconsistent`] alongside `SecretRecovered`. The
-    /// shares a secret is rebuilt from therefore always share one root and
-    /// one ciphertext. No group is reconstructed from a single share.
+    /// - [`DeRecEvent::SecretRecovered`] — one secret reconstructs and
+    ///   every collected share is part of it;
+    /// - [`DeRecEvent::RecoveryDisputed`] — one secret reconstructs, but
+    ///   other Helpers hold valid shares of a different split, and the owner
+    ///   has to confirm it;
+    /// - [`DeRecEvent::RecoveryConflict`] — two or more different secrets
+    ///   reconstruct, and the owner has to choose;
+    /// - [`DeRecEvent::RecoveryIncomplete`] — none does. The recovery is
+    ///   closed; start it again to retry.
+    ///
+    /// A share that fails on its own — it does not decode, or fails its
+    /// Merkle proof — is reported as it arrives and never collected. Shares
+    /// that are each valid are grouped by `(root, ciphertext)`, and every
+    /// group is tried: it needs shares from at least two Helpers, must
+    /// decrypt, and must fit the threshold its own secret declares. A group
+    /// that decrypts to something that is not a secret is reported as
+    /// [`CorruptionReason::Forged`]. Every other share outside the
+    /// reconstructing groups is a dispute, never a corruption: how many
+    /// Helpers back a split says nothing about which split is the owner's.
     ///
     /// An honest Helper never sends a corrupted share, so the application
     /// may treat [`DeRecEvent::RecoveryShareCorrupted`] as a sign that the
@@ -850,7 +895,7 @@ pub enum DeRecFlow {
         target: Target,
         /// Updated communication info. `None` leaves the peer's stored map
         /// untouched; `Some(_)` replaces it (an empty `HashMap` clears it).
-        communication_info: Option<std::collections::HashMap<String, String>>,
+        communication_info: Option<HashMap<String, String>>,
         /// Every endpoint this device can now be reached on, in its own
         /// preference order. Empty leaves the peer's stored set untouched;
         /// non-empty replaces it outright.
@@ -1014,12 +1059,12 @@ pub enum DeRecEvent {
         /// Decoded full secret — same shape the sender wrote. The
         /// `helpers`, `replicas` and `secrets` fields carry the canonical
         /// roster snapshot for this version.
-        secret: crate::protocol::types::Secret,
+        secret: Secret,
         /// Per-helper VSS share map. Each entry pairs a helper's
         /// `channel_id` with the serialized `CommittedDeRecShare` bytes
         /// the helper received — sufficient material for the receiver
         /// to drive a recovery against those helpers if needed.
-        shares: Vec<crate::protocol::types::ChannelShare>,
+        shares: Vec<ChannelShare>,
     },
 
     /// The first sync for a `secret_id` this device had no snapshot for —
@@ -1051,9 +1096,9 @@ pub enum DeRecEvent {
         /// `version` echoed from the inbound `StoreShareRequest`.
         version: u32,
         /// Decoded full secret, already written to the stores.
-        secret: crate::protocol::types::Secret,
+        secret: Secret,
         /// Per-helper VSS share map, as on [`Self::ReplicaSecretReceived`].
-        shares: Vec<crate::protocol::types::ChannelShare>,
+        shares: Vec<ChannelShare>,
     },
 
     /// A member offered a different copy of the version this device holds.
@@ -1091,7 +1136,7 @@ pub enum DeRecEvent {
         /// member's snapshot records no author.
         incoming_author_replica_id: Option<u64>,
         /// The incoming copy's full state: secrets, helpers and replicas.
-        secret: crate::protocol::types::Secret,
+        secret: Secret,
     },
 
     /// This device refused a group member's copy of the secret.
@@ -1433,8 +1478,9 @@ pub enum DeRecEvent {
         secrets: Vec<SecretVersionEntry>,
     },
 
-    /// A recovery share response was received from a Helper but reconstruction
-    /// cannot succeed yet — more shares are needed to meet the threshold.
+    /// A Helper's share was collected for a recovery (Owner side). Nothing is
+    /// reconstructed until every Helper asked has answered or the recovery
+    /// times out; see [`DeRecFlow::RecoverSecret`].
     ///
     /// - `channel_id` identifies the Helper that sent this share response.
     /// - `shares_received` is the number of Helpers whose shares are collected
@@ -1445,30 +1491,14 @@ pub enum DeRecEvent {
         shares_received: usize,
     },
 
-    /// A recovery share response was received and reconstruction succeeded,
-    /// but the reconstructed bytes did not decode as a secret.
-    ///
-    /// A corrupted share never causes this: it is set aside and reported as
-    /// [`Self::RecoveryShareCorrupted`] instead.
-    ///
-    /// - `channel_id` identifies the Helper that sent this share response.
-    /// - `shares_received` is the total number of share responses collected so far.
-    /// - `error` describes the failure cause.
-    RecoveryShareError {
-        channel_id: ChannelId,
-        shares_received: usize,
-        error: String,
-    },
-
     /// A Helper refused a recovery share request (Owner side): its
     /// `GetShareResponse` carried a non-OK status instead of a share — for
     /// example `UNKNOWN_SHARE_VERSION` when it holds no share for `version`.
     ///
-    /// The refusal is not collected: it does not count towards
-    /// `shares_received`, triggers no reconstruction attempt, and leaves the
-    /// recovery open for the other Helpers' shares. It still answers the
-    /// [`Self::RecoverSecretStarted`] issued for `channel_id`, so an
-    /// application counting answers against those requests counts it.
+    /// The refusal is not collected and does not count towards
+    /// `shares_received`. It is still that Helper's answer: it answers the
+    /// [`Self::RecoverSecretStarted`] issued for `channel_id`, and when it is
+    /// the last answer due the recovery decides on the shares it holds.
     RecoveryShareRefused {
         channel_id: ChannelId,
         version: u32,
@@ -1486,13 +1516,16 @@ pub enum DeRecEvent {
     /// count towards `shares_received`, and cannot block the recovery — the
     /// other Helpers' shares still complete it. A share that fails on its
     /// own ([`CorruptionReason::Malformed`],
-    /// [`CorruptionReason::InvalidProof`]) is reported as it arrives; one that
-    /// only disagrees with the rest ([`CorruptionReason::Inconsistent`]) is
-    /// reported alongside [`Self::SecretRecovered`], once per Helper.
+    /// [`CorruptionReason::InvalidProof`]) is reported as it arrives, and
+    /// counts as that Helper's answer; one in a group that reconstructs
+    /// something that is not a secret ([`CorruptionReason::Forged`]) is
+    /// reported with the recovery's decision, once per Helper.
     ///
     /// An honest Helper never sends a corrupted share, so the application may
     /// treat this as a sign that the Helper's device or storage is damaged or
-    /// compromised — for example by offering to unpair it. It also answers
+    /// compromised — for example by offering to unpair it. A share that only
+    /// disagrees with the others is never reported here; see
+    /// [`Self::RecoveryDisputed`] and [`Self::RecoveryConflict`]. It also answers
     /// the [`Self::RecoverSecretStarted`] issued for `channel_id`.
     ///
     /// A share bigger than this device's own configured `max_share_size` is
@@ -1527,16 +1560,70 @@ pub enum DeRecEvent {
     /// restore. See [`super::DeRecProtocol::restore`] for why.
     ///
     /// The library decodes the two-layer (`DeRecSecret` → `Secret`)
-    /// protobuf wrapping internally; a decode failure surfaces as
-    /// [`Self::RecoveryShareError`] for that final share, not as
-    /// `SecretRecovered` with bogus contents.
+    /// wrapping internally; a group whose bytes do not decode is not a
+    /// secret, and never surfaces here with bogus contents.
     ///
     /// Pass `secret` to [`super::DeRecProtocol::restore`] on the same
     /// protocol instance that ran recovery — it holds the recovery-mode
     /// channels `restore` unpairs — to commit canonical helper / replica
     /// state and wipe those throwaway channels.
-    SecretRecovered {
-        secret: crate::protocol::types::Secret,
+    SecretRecovered { secret: Secret },
+
+    /// A recovery reconstructed two or more different secrets for `version`
+    /// (Owner side), so it cannot tell which is the owner's.
+    ///
+    /// Each candidate is a complete, self-consistent secret, rebuilt from the
+    /// shares of the Helpers it names. Fewer than the threshold of colluding
+    /// Helpers can forge one, so the library never picks: the application has
+    /// to involve the owner — for example by showing what each candidate
+    /// holds and who backs it — and pass the one the owner confirms to
+    /// [`super::DeRecProtocol::restore`], exactly as it would the `secret` of
+    /// [`Self::SecretRecovered`]. The Helpers backing a rejected candidate are
+    /// suspect.
+    ///
+    /// `disputed_by` names the Helpers holding valid shares of yet another
+    /// split that does not reconstruct, so no Helper's answer goes unshown.
+    ///
+    /// The recovery is closed when this is emitted.
+    RecoveryConflict {
+        version: u32,
+        candidates: Vec<RecoveryCandidate>,
+        disputed_by: Vec<RecoveryHelper>,
+    },
+
+    /// A recovery reconstructed one secret for `version`, but other Helpers
+    /// hold valid shares of a different split that does not reconstruct
+    /// (Owner side).
+    ///
+    /// `secret` is complete and self-consistent, rebuilt from the shares of
+    /// `supported_by`. The shares of `disputed_by` each pass their own proof
+    /// but belong to another split at the same version, which an honest
+    /// sharing never produces. Either side can be the owner's: colluding
+    /// Helpers can forge a complete split, and the honest Helpers may be too
+    /// few to reconstruct theirs. The library never picks: the application
+    /// has to involve the owner — for example by showing what `secret`
+    /// holds and who stands on each side — and pass `secret` to
+    /// [`super::DeRecProtocol::restore`] only once the owner confirms it.
+    ///
+    /// The recovery is closed when this is emitted.
+    RecoveryDisputed {
+        version: u32,
+        secret: Secret,
+        supported_by: Vec<RecoveryHelper>,
+        disputed_by: Vec<RecoveryHelper>,
+    },
+
+    /// A recovery for `version` closed without reconstructing a secret (Owner
+    /// side): every Helper asked has answered, or the rest timed out, and no
+    /// collected shares reconstruct.
+    ///
+    /// `shares_received` is the number of Helpers whose shares were
+    /// collected. The recovery is closed; run
+    /// [`DeRecFlow::RecoverSecret`] again to retry, for example once more
+    /// Helpers are reachable.
+    RecoveryIncomplete {
+        version: u32,
+        shares_received: usize,
     },
 
     /// An incoming request requires application confirmation before the library responds.
@@ -1892,10 +1979,10 @@ pub enum DeRecEvent {
     },
 
     /// A recovery share request was dispatched to `channel_id` for
-    /// `version`. Followed by [`Self::RecoveryShareReceived`] /
-    /// [`Self::RecoveryShareError`] / [`Self::RecoveryShareRefused`] /
-    /// [`Self::RecoveryShareCorrupted`] / [`Self::SecretRecovered`] as helper
-    /// responses arrive.
+    /// `version`. Answered by [`Self::RecoveryShareReceived`] /
+    /// [`Self::RecoveryShareRefused`] / [`Self::RecoveryShareCorrupted`], or
+    /// by [`Self::RecoverSecretFailed`] with error `"timeout"` when the
+    /// Helper stays silent; see [`DeRecFlow::RecoverSecret`].
     RecoverSecretStarted {
         channel_id: ChannelId,
         version: u32,
@@ -1907,7 +1994,9 @@ pub enum DeRecEvent {
     },
 
     /// A recovery share request could not be dispatched to `channel_id`
-    /// for `version`.
+    /// for `version`, or the Helper did not answer it within
+    /// [`Timeouts::get_share_response`](crate::protocol::types::Timeouts::get_share_response)
+    /// (error `"timeout"`).
     RecoverSecretFailed {
         channel_id: ChannelId,
         version: u32,

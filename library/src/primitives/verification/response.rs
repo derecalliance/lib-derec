@@ -4,6 +4,7 @@
 use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::extensions::verify_share_response::VerifyShareResponseExt as _;
 use crate::{
+    Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     primitives::verification::VerificationError,
     types::{ChannelId, SharedKey},
@@ -105,7 +106,7 @@ pub fn produce(
     request: &VerifyShareRequestMessage,
     shared_key: &SharedKey,
     share_content: impl AsRef<[u8]>,
-) -> Result<ProduceResult, crate::Error> {
+) -> Result<ProduceResult, Error> {
     let hash = hash_content(share_content, request.nonce);
     let timestamp = current_timestamp();
 
@@ -209,11 +210,8 @@ pub fn produce(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
-pub fn extract(
-    envelope_bytes: &[u8],
-    shared_key: &SharedKey,
-) -> Result<ExtractResult, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractResult, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
     let response = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::VerifyShareResponse(message) => message,
@@ -221,7 +219,7 @@ pub fn extract(
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected VerifyShareResponseMessage");
 
-            return Err(crate::Error::Invariant(
+            return Err(Error::Invariant(
                 "Invalid message. Expected: VerifyShareResponseMessage",
             ));
         }
@@ -333,13 +331,13 @@ pub fn extract(
     tracing::instrument(skip_all, fields(share_content_len = share_content.as_ref().len()))
 )]
 pub fn process(
-    request: &derec_proto::VerifyShareRequestMessage,
+    request: &VerifyShareRequestMessage,
     response: &VerifyShareResponseMessage,
     share_content: impl AsRef<[u8]>,
-) -> Result<bool, crate::Error> {
+) -> Result<bool, Error> {
     response.validate_binding(request)?;
 
-    let result = response.result.as_ref().ok_or(crate::Error::Invariant(
+    let result = response.result.as_ref().ok_or(Error::Invariant(
         "VerifyShareResponseMessage is missing result field",
     ))?;
 

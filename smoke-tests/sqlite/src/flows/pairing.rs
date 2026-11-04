@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_library::Error;
 use derec_library::protocol::types::{
     ChannelQuery, ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole,
 };
@@ -10,6 +11,7 @@ use derec_library::protocol::{
 use derec_library::protocol::{DeRecEvent, DeRecFlow};
 use derec_library::types::{ChannelId, ReplicaId};
 use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
+use std::array;
 use std::collections::{HashMap, HashSet};
 
 use crate::db::Database;
@@ -302,7 +304,7 @@ async fn no_keys_fingerprint_mismatch_revokes_the_pairing() {
         .await
         .expect_err("a mismatched fingerprint must not verify");
     assert!(
-        matches!(err, derec_library::Error::FingerprintMismatch { channel_id } if channel_id == channel),
+        matches!(err, Error::FingerprintMismatch { channel_id } if channel_id == channel),
         "expected FingerprintMismatch, got {err:?}"
     );
     println!("  NoKeys verify_fingerprint(wrong) fails with FingerprintMismatch  ✓");
@@ -457,7 +459,7 @@ async fn seed_channel(peer: &mut Peer, record: ChannelRecord) {
         .save(
             DEFAULT_TEST_SECRET_ID,
             channel_id,
-            SecretValue::SharedKey(std::array::from_fn(|i| (i * 11 + 5) as u8)),
+            SecretValue::SharedKey(array::from_fn(|i| (i * 11 + 5) as u8)),
         )
         .await
         .expect("seed channel key");

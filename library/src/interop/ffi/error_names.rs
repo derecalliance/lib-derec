@@ -36,6 +36,11 @@ pub extern "C" fn derec_error_code_name(code: i32) -> *const c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interop::ffi::error::{
+        DEREC_CATEGORY_FFI, DEREC_CATEGORY_INVALID_INPUT, DEREC_CATEGORY_OK,
+        DEREC_CATEGORY_PAIRING, DEREC_CATEGORY_SHARE_STORE, DEREC_CODE_MISSING_SHARED_KEY,
+        DEREC_CODE_NON_OK_STATUS, DEREC_CODE_OK,
+    };
     use std::ffi::CStr;
 
     fn category(value: i32) -> String {
@@ -52,39 +57,18 @@ mod tests {
 
     #[test]
     fn category_names_match_the_wasm_surface() {
-        assert_eq!(
-            category(crate::interop::ffi::error::DEREC_CATEGORY_OK),
-            "ok"
-        );
-        assert_eq!(
-            category(crate::interop::ffi::error::DEREC_CATEGORY_FFI),
-            "ffi"
-        );
-        assert_eq!(
-            category(crate::interop::ffi::error::DEREC_CATEGORY_PAIRING),
-            "pairing"
-        );
-        assert_eq!(
-            category(crate::interop::ffi::error::DEREC_CATEGORY_SHARE_STORE),
-            "share_store"
-        );
-        assert_eq!(
-            category(crate::interop::ffi::error::DEREC_CATEGORY_INVALID_INPUT),
-            "input"
-        );
+        assert_eq!(category(DEREC_CATEGORY_OK), "ok");
+        assert_eq!(category(DEREC_CATEGORY_FFI), "ffi");
+        assert_eq!(category(DEREC_CATEGORY_PAIRING), "pairing");
+        assert_eq!(category(DEREC_CATEGORY_SHARE_STORE), "share_store");
+        assert_eq!(category(DEREC_CATEGORY_INVALID_INPUT), "input");
     }
 
     #[test]
     fn code_names_are_stable() {
-        assert_eq!(code(crate::interop::ffi::error::DEREC_CODE_OK), "ok");
-        assert_eq!(
-            code(crate::interop::ffi::error::DEREC_CODE_NON_OK_STATUS),
-            "non_ok_status"
-        );
-        assert_eq!(
-            code(crate::interop::ffi::error::DEREC_CODE_MISSING_SHARED_KEY),
-            "missing_shared_key"
-        );
+        assert_eq!(code(DEREC_CODE_OK), "ok");
+        assert_eq!(code(DEREC_CODE_NON_OK_STATUS), "non_ok_status");
+        assert_eq!(code(DEREC_CODE_MISSING_SHARED_KEY), "missing_shared_key");
     }
 
     #[test]

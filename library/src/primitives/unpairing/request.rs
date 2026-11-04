@@ -3,11 +3,12 @@
 
 use crate::extensions::request_message::RequestMessageExt as _;
 use crate::{
+    Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, SharedKey},
     utils::verify_timestamps,
 };
-use derec_proto::{DeRecMessage, MessageBody, UnpairRequestMessage};
+use derec_proto::{DeRecMessage, MessageBody, TransportProtocol, UnpairRequestMessage};
 use prost::Message;
 
 pub struct ProduceResult {
@@ -92,9 +93,9 @@ pub fn produce(
     channel_id: ChannelId,
     memo: &str,
     shared_key: &SharedKey,
-    reply_to: &[derec_proto::TransportProtocol],
+    reply_to: &[TransportProtocol],
     replica_id: Option<u64>,
-) -> Result<ProduceResult, crate::Error> {
+) -> Result<ProduceResult, Error> {
     let timestamp = current_timestamp();
 
     let reply_to_transports = reply_to.to_vec();
@@ -200,11 +201,8 @@ pub fn produce(
 /// [`DeRecProtocol`](crate::protocol::DeRecProtocol), owns that decision and
 /// should run [`TransportPolicy::check_peer`](crate::transport::TransportPolicy::check_peer)
 /// on any endpoint this returns.
-pub fn extract(
-    envelope_bytes: &[u8],
-    shared_key: &SharedKey,
-) -> Result<ExtractResult, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractResult, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
     let request = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::UnpairRequest(message) => message,
@@ -212,7 +210,7 @@ pub fn extract(
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected UnpairRequestMessage");
 
-            return Err(crate::Error::Invariant(
+            return Err(Error::Invariant(
                 "Invalid message. Expected: UnpairRequestMessage",
             ));
         }

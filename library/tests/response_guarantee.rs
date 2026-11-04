@@ -13,18 +13,33 @@
 #[path = "support/protocol_doubles.rs"]
 mod protocol_doubles;
 
-use derec_library::derec_message::{DeRecMessageBuilder, current_timestamp};
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use derec_cryptography::channel::encrypt_message;
+use derec_library::Error;
+use derec_library::derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message};
+use derec_library::primitives::pairing::PairingError;
+use derec_library::primitives::sharing::request;
 use derec_library::protocol::types::{
     ChannelQuery, ChannelRecord, ChannelStatus, HelperChannel, ReplicaInfo, ReplicaMember,
     ReplicaRole, ReplicaSecretPayload, Replicas, Secret, SecretValue, Share,
 };
 use derec_library::protocol::{
-    AutoAcceptPolicy, DeRecChannelStore as _, DeRecEvent, DeRecProtocol, DeRecProtocolBuilder,
-    DeRecSecretStore as _, DeRecShareStore as _, PendingActionKind,
+    AutoAcceptPolicy, DeRecChannelStore as _, DeRecEvent, DeRecFlow, DeRecProtocol,
+    DeRecProtocolBuilder, DeRecSecretStore as _, DeRecShareStore as _, IgnoreReason, PendingAction,
+    PendingActionKind, SecretKind,
 };
 use derec_library::types::{ChannelId, ReplicaId, SharedKey};
-use derec_proto::{DeRecMessage, MessageBody, SenderKind, StatusEnum, TransportProtocol};
+use derec_proto::{
+    ContactMode, DeRecMessage, DeRecResult, ErrorResponseMessage,
+    GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, MessageBody, ParameterRange,
+    PrePairRequestMessage, Protocol, SenderKind, StatusEnum, StoreShareRequestMessage,
+    TransportProtocol, UnpairRequestMessage, UpdateChannelInfoRequestMessage,
+    VerifyShareRequestMessage,
+};
 use prost::Message as _;
+use prost_types::Timestamp;
 use protocol_doubles::{
     FlakyChannelStore, FlakyUserSecretStore, InMemSecretStore, InMemStateStore, RecordingTransport,
     RefusingShareStore, run_async,
@@ -56,7 +71,7 @@ type Proto = DeRecProtocol<
 fn endpoint(uri: &str) -> TransportProtocol {
     TransportProtocol {
         uri: uri.to_owned(),
-        protocol: derec_proto::Protocol::Https as i32,
+        protocol: Protocol::Https as i32,
     }
 }
 
@@ -103,7 +118,7 @@ impl Rig {
                 ChannelRecord::Helper(HelperChannel {
                     channel_id: CHANNEL,
                     transports: vec![endpoint(OWNER_URI)],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     peer_role,
                     status: ChannelStatus::Paired,
                     created_at: now_secs(),
@@ -134,7 +149,7 @@ impl Rig {
                     channel_id: GROUP,
                     replica_id: ReplicaId(replica_id),
                     transports: vec![endpoint(uri)],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     role,
                     status,
                     created_at: now_secs(),
@@ -167,14 +182,14 @@ impl Rig {
 }
 
 fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .expect("clock after the epoch")
         .as_secs()
 }
 
 /// The inner message's own timestamp, which the envelope must repeat.
-fn timestamp_slot(body: &mut MessageBody) -> &mut Option<prost_types::Timestamp> {
+fn timestamp_slot(body: &mut MessageBody) -> &mut Option<Timestamp> {
     match body {
         MessageBody::PairRequest(m) => &mut m.timestamp,
         MessageBody::PairResponse(m) => &mut m.timestamp,
@@ -198,7 +213,7 @@ fn timestamp_slot(body: &mut MessageBody) -> &mut Option<prost_types::Timestamp>
 
 /// Stamp the inner message with the time it is being sent, so the envelope
 /// can carry the same value.
-fn set_timestamp(body: &mut MessageBody, ts: prost_types::Timestamp) {
+fn set_timestamp(body: &mut MessageBody, ts: Timestamp) {
     *timestamp_slot(body) = Some(ts);
 }
 
@@ -218,8 +233,7 @@ fn wire(channel_id: ChannelId, key: &SharedKey, mut body: MessageBody) -> Vec<u8
 }
 
 /// A share the helper-side validation accepts.
-fn valid_store_share() -> derec_proto::StoreShareRequestMessage {
-    use derec_library::primitives::sharing::request;
+fn valid_store_share() -> StoreShareRequestMessage {
     let split = request::split(
         &[(CHANNEL, 1), (ChannelId(42), 1)],
         SECRET_ID,
@@ -248,7 +262,7 @@ fn roster(members: &[(u64, ReplicaRole, &str)]) -> Secret {
                     replica_id: *replica_id,
                     transports: vec![endpoint(uri)],
                     role: *role as i32,
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                 })
                 .collect(),
             shared_key: GROUP_KEY.to_vec(),
@@ -265,7 +279,7 @@ fn replica_sync(secret: Secret) -> MessageBody {
         version: 1,
         author_replica_id: None,
     };
-    MessageBody::StoreShareRequest(derec_proto::StoreShareRequestMessage {
+    MessageBody::StoreShareRequest(StoreShareRequestMessage {
         secret_id: SECRET_ID,
         share: payload.encode_to_vec(),
         version: 1,
@@ -288,7 +302,7 @@ fn response(bytes: &[u8], key: &SharedKey) -> (&'static str, i32, String) {
         envelope.trace_id, TRACE,
         "the response echoes the request's trace id"
     );
-    let inner = derec_library::derec_message::extract_inner_message(&envelope.message, key)
+    let inner = extract_inner_message(&envelope.message, key)
         .expect("the requester can decrypt the response");
     let (name, result) = match inner {
         MessageBody::StoreShareResponse(r) => ("StoreShareResponse", r.result),
@@ -380,48 +394,44 @@ impl Req {
     fn body(self) -> MessageBody {
         match self {
             Req::StoreShare => MessageBody::StoreShareRequest(valid_store_share()),
-            Req::VerifyShare => {
-                MessageBody::VerifyShareRequest(derec_proto::VerifyShareRequestMessage {
-                    secret_id: SECRET_ID,
-                    version: 1,
-                    nonce: 7,
-                    ..Default::default()
-                })
-            }
+            Req::VerifyShare => MessageBody::VerifyShareRequest(VerifyShareRequestMessage {
+                secret_id: SECRET_ID,
+                version: 1,
+                nonce: 7,
+                ..Default::default()
+            }),
             Req::Discovery => MessageBody::GetSecretIdsVersionsRequest(Default::default()),
-            Req::GetShare => MessageBody::GetShareRequest(derec_proto::GetShareRequestMessage {
+            Req::GetShare => MessageBody::GetShareRequest(GetShareRequestMessage {
                 secret_id: SECRET_ID,
                 version: 1,
                 ..Default::default()
             }),
             // The reply-to is what leaves the request answerable while the
             // channel store itself is failing.
-            Req::Unpair => MessageBody::UnpairRequest(derec_proto::UnpairRequestMessage {
+            Req::Unpair => MessageBody::UnpairRequest(UnpairRequestMessage {
                 memo: "leaving".to_owned(),
                 reply_to_transports: vec![endpoint(OWNER_URI)],
                 ..Default::default()
             }),
-            Req::UpdateChannelInfo => MessageBody::UpdateChannelInfoRequest(
-                derec_proto::UpdateChannelInfoRequestMessage {
+            Req::UpdateChannelInfo => {
+                MessageBody::UpdateChannelInfoRequest(UpdateChannelInfoRequestMessage {
                     supported_transports: vec![endpoint(OWNER_URI)],
                     ..Default::default()
-                },
-            ),
+                })
+            }
             Req::ReplicaStoreShare => replica_sync(full_roster()),
-            Req::ReplicaDiscovery => MessageBody::GetSecretIdsVersionsRequest(
-                derec_proto::GetSecretIdsVersionsRequestMessage {
-                    replica_id: Some(SOURCE_ID),
-                    ..Default::default()
-                },
-            ),
-            Req::ReplicaGetShare => {
-                MessageBody::GetShareRequest(derec_proto::GetShareRequestMessage {
-                    secret_id: SECRET_ID,
-                    version: 1,
+            Req::ReplicaDiscovery => {
+                MessageBody::GetSecretIdsVersionsRequest(GetSecretIdsVersionsRequestMessage {
                     replica_id: Some(SOURCE_ID),
                     ..Default::default()
                 })
             }
+            Req::ReplicaGetShare => MessageBody::GetShareRequest(GetShareRequestMessage {
+                secret_id: SECRET_ID,
+                version: 1,
+                replica_id: Some(SOURCE_ID),
+                ..Default::default()
+            }),
         }
     }
 
@@ -432,7 +442,7 @@ impl Req {
         }
         rig.seed_helper_channel(SenderKind::Owner).await;
         if matches!(self, Req::VerifyShare) {
-            let stored = derec_proto::StoreShareRequestMessage {
+            let stored = StoreShareRequestMessage {
                 secret_id: SECRET_ID,
                 version: 1,
                 share: b"a committed share".to_vec(),
@@ -657,7 +667,7 @@ fn an_unresolvable_target_yields_a_token_even_when_on() {
         let rig = Rig::default();
         rig.seed_helper_channel(SenderKind::Owner).await;
         let mut protocol = rig.build(true, AutoAcceptPolicy::default(), false);
-        let body = MessageBody::UnpairRequest(derec_proto::UnpairRequestMessage::default());
+        let body = MessageBody::UnpairRequest(UnpairRequestMessage::default());
         let raised = protocol
             .process(&wire(CHANNEL, &KEY, body))
             .await
@@ -795,21 +805,17 @@ fn a_pair_cleanup_failure_after_the_answer_is_reported_not_reanswered() {
             false,
         );
         let contact = helper_protocol
-            .create_contact(
-                Some(ChannelId(9191)),
-                derec_proto::ContactMode::InlineKeys,
-                None,
-            )
+            .create_contact(Some(ChannelId(9191)), ContactMode::InlineKeys, None)
             .await
             .expect("contact");
 
         let owner = Rig::default();
         let mut owner_protocol = owner.build(false, AutoAcceptPolicy::default(), false);
         owner_protocol
-            .start(derec_library::protocol::DeRecFlow::Pairing {
+            .start(DeRecFlow::Pairing {
                 kind: SenderKind::Owner,
                 contact,
-                peer_communication_info: std::collections::HashMap::new(),
+                peer_communication_info: HashMap::new(),
             })
             .await
             .expect("pairing starts");
@@ -917,7 +923,7 @@ fn a_replica_refusal_send_failure_keeps_the_refusal_and_is_not_retried() {
             rig.seed_group(ChannelStatus::Paired).await;
             rig.transport.set_fail_after_record(true);
             let mut protocol = rig.build(respond, AutoAcceptPolicy::default(), true);
-            let body = MessageBody::StoreShareRequest(derec_proto::StoreShareRequestMessage {
+            let body = MessageBody::StoreShareRequest(StoreShareRequestMessage {
                 secret_id: SECRET_ID,
                 share: vec![0xFF; 8],
                 version: 1,
@@ -987,10 +993,7 @@ fn a_stale_store_share_action_on_an_unpaired_channel_is_refused() {
                 .accept(action)
                 .await
                 .expect_err("a stale action is refused");
-            assert!(
-                matches!(err, derec_library::Error::InvalidInput(_)),
-                "{err:?}"
-            );
+            assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
             assert_eq!(rig.shares_held(), 0, "no share is stored");
             assert!(rig.sends().is_empty(), "nothing is sent");
         });
@@ -1058,7 +1061,7 @@ fn exempt_messages_are_never_answered() {
             let rig = Rig::default();
             rig.seed_helper_channel(SenderKind::Owner).await;
             let mut protocol = rig.build(respond, policy, false);
-            let stale = prost_types::Timestamp {
+            let stale = Timestamp {
                 seconds: now_secs() as i64 - 24 * 60 * 60,
                 nanos: 0,
             };
@@ -1086,7 +1089,7 @@ fn exempt_messages_are_never_answered() {
             let mut body = Req::Discovery.body();
             set_timestamp(
                 &mut body,
-                prost_types::Timestamp {
+                Timestamp {
                     seconds: now.seconds - 1,
                     nanos: now.nanos,
                 },
@@ -1152,20 +1155,16 @@ fn exempt_messages_are_never_answered() {
             let rig = Rig::default();
             let mut protocol = rig.build(respond, policy, false);
             let contact = protocol
-                .create_contact(
-                    Some(ChannelId(9292)),
-                    derec_proto::ContactMode::InlineKeys,
-                    None,
-                )
+                .create_contact(Some(ChannelId(9292)), ContactMode::InlineKeys, None)
                 .await
                 .expect("contact");
             let joiner = Rig::default();
             let mut joiner_protocol = joiner.build(false, AutoAcceptPolicy::default(), true);
             joiner_protocol
-                .start(derec_library::protocol::DeRecFlow::Pairing {
+                .start(DeRecFlow::Pairing {
                     kind: SenderKind::ReplicaSource,
                     contact,
-                    peer_communication_info: std::collections::HashMap::new(),
+                    peer_communication_info: HashMap::new(),
                 })
                 .await
                 .expect("pairing starts");
@@ -1177,7 +1176,7 @@ fn exempt_messages_are_never_answered() {
             let rig = Rig::default();
             rig.seed_group(ChannelStatus::Paired).await;
             let mut protocol = rig.build(respond, policy, true);
-            let body = MessageBody::UnpairRequest(derec_proto::UnpairRequestMessage {
+            let body = MessageBody::UnpairRequest(UnpairRequestMessage {
                 replica_id: Some(0xBAD),
                 ..Default::default()
             });
@@ -1188,17 +1187,13 @@ fn exempt_messages_are_never_answered() {
             let rig = Rig::default();
             let mut protocol = rig.build(respond, policy, false);
             let contact = protocol
-                .create_contact(
-                    Some(ChannelId(8181)),
-                    derec_proto::ContactMode::NoKeys,
-                    Some(5),
-                )
+                .create_contact(Some(ChannelId(8181)), ContactMode::NoKeys, Some(5))
                 .await
                 .expect("contact");
             let pre_pair = DeRecMessage {
                 channel_id: contact.channel_id,
                 timestamp: Some(current_timestamp()),
-                message: MessageBody::PrePairRequest(derec_proto::PrePairRequestMessage {
+                message: MessageBody::PrePairRequest(PrePairRequestMessage {
                     nonce: 6,
                     supported_transports: vec![endpoint(OWNER_URI)],
                     timestamp: Some(current_timestamp()),
@@ -1223,13 +1218,13 @@ fn a_replica_request_with_a_refused_reply_to_is_answered_on_the_member() {
             let rig = Rig::default();
             rig.seed_group(ChannelStatus::Paired).await;
             let mut protocol = rig.build(respond, AutoAcceptPolicy::default(), true);
-            let body = MessageBody::GetShareRequest(derec_proto::GetShareRequestMessage {
+            let body = MessageBody::GetShareRequest(GetShareRequestMessage {
                 secret_id: SECRET_ID,
                 version: 1,
                 replica_id: Some(SOURCE_ID),
                 reply_to_transports: vec![TransportProtocol {
                     uri: "http://192.168.1.42:8080".to_owned(),
-                    protocol: derec_proto::Protocol::Https as i32,
+                    protocol: Protocol::Https as i32,
                 }],
                 ..Default::default()
             });
@@ -1288,7 +1283,7 @@ async fn failing_handover(rig: &Rig, respond: bool) -> Vec<DeRecEvent> {
                 channel_id: EPHEMERAL,
                 replica_id: ReplicaId(SOURCE_ID),
                 transports: vec![endpoint(SOURCE_URI)],
-                communication_info: std::collections::HashMap::new(),
+                communication_info: HashMap::new(),
                 role: ReplicaRole::Source,
                 status: ChannelStatus::Paired,
                 created_at: now_secs(),
@@ -1311,7 +1306,7 @@ async fn failing_handover(rig: &Rig, respond: bool) -> Vec<DeRecEvent> {
         version: 1,
         author_replica_id: None,
     };
-    let body = MessageBody::StoreShareRequest(derec_proto::StoreShareRequestMessage {
+    let body = MessageBody::StoreShareRequest(StoreShareRequestMessage {
         secret_id: SECRET_ID,
         share: payload.encode_to_vec(),
         version: 1,
@@ -1351,8 +1346,7 @@ fn a_handover_failure_is_answered_on_the_group_channel() {
             "answered on the group channel"
         );
         assert!(
-            derec_library::derec_message::extract_inner_message(&envelope.message, &EPHEMERAL_KEY)
-                .is_err(),
+            extract_inner_message(&envelope.message, &EPHEMERAL_KEY).is_err(),
             "never under the dropped ephemeral key"
         );
         let (name, status, memo) = response(&sent[0], &GROUP_KEY);
@@ -1494,19 +1488,14 @@ fn undecodable(channel_id: ChannelId, key: &SharedKey) -> Vec<u8> {
     let mut envelope =
         DeRecMessage::decode(wire(channel_id, key, Req::Discovery.body()).as_slice())
             .expect("a DeRec envelope");
-    envelope.message =
-        derec_cryptography::channel::encrypt_message(b"not a message body", key, &[7u8; 32])
-            .expect("encrypt");
+    envelope.message = encrypt_message(b"not a message body", key, &[7u8; 32]).expect("encrypt");
     envelope.encode_to_vec()
 }
 
 /// The envelope and `ErrorResponseMessage` of a sent envelope.
-fn error_response(
-    bytes: &[u8],
-    key: &SharedKey,
-) -> (DeRecMessage, derec_proto::ErrorResponseMessage) {
+fn error_response(bytes: &[u8], key: &SharedKey) -> (DeRecMessage, ErrorResponseMessage) {
     let envelope = DeRecMessage::decode(bytes).expect("a DeRec envelope");
-    let inner = derec_library::derec_message::extract_inner_message(&envelope.message, key)
+    let inner = extract_inner_message(&envelope.message, key)
         .expect("the requester can decrypt the response");
     match inner {
         MessageBody::ErrorResponse(r) => (envelope, r),
@@ -1659,8 +1648,8 @@ fn a_received_error_response_is_reported_and_never_answered() {
             rig.seed_helper_channel(SenderKind::Helper).await;
             let mut protocol = rig.build(respond, AutoAcceptPolicy::all(), false);
             let body = || {
-                MessageBody::ErrorResponse(derec_proto::ErrorResponseMessage {
-                    result: Some(derec_proto::DeRecResult {
+                MessageBody::ErrorResponse(ErrorResponseMessage {
+                    result: Some(DeRecResult {
                         status: StatusEnum::FormatError as i32,
                         memo: UNDECODABLE_MEMO.to_owned(),
                     }),
@@ -1686,7 +1675,7 @@ fn a_received_error_response_is_reported_and_never_answered() {
             let mut stale = body();
             set_timestamp(
                 &mut stale,
-                prost_types::Timestamp {
+                Timestamp {
                     seconds: now.seconds - 1,
                     nanos: now.nanos,
                 },
@@ -1706,7 +1695,7 @@ fn a_received_error_response_is_reported_and_never_answered() {
                 matches!(
                     events.as_slice(),
                     [DeRecEvent::MessageIgnored {
-                        reason: derec_library::protocol::IgnoreReason::TimestampMismatch,
+                        reason: IgnoreReason::TimestampMismatch,
                         ..
                     }]
                 ),
@@ -1796,18 +1785,14 @@ async fn refused_pairing(
     kind: SenderKind,
 ) -> (Vec<DeRecEvent>, Vec<Vec<u8>>, ChannelId) {
     let contact = responder_protocol
-        .create_contact(
-            Some(ChannelId(9393)),
-            derec_proto::ContactMode::InlineKeys,
-            None,
-        )
+        .create_contact(Some(ChannelId(9393)), ContactMode::InlineKeys, None)
         .await
         .expect("contact");
     joiner_protocol
-        .start(derec_library::protocol::DeRecFlow::Pairing {
+        .start(DeRecFlow::Pairing {
             kind,
             contact,
-            peer_communication_info: std::collections::HashMap::new(),
+            peer_communication_info: HashMap::new(),
         })
         .await
         .expect("pairing starts");
@@ -1825,7 +1810,7 @@ async fn refused_pairing(
 fn a_parameter_range_refusal_is_reported_as_pairing_refused() {
     for respond in [true, false] {
         run_async(async move {
-            let range = |min_share_size, max_share_size| derec_proto::ParameterRange {
+            let range = |min_share_size, max_share_size| ParameterRange {
                 min_share_size,
                 max_share_size,
                 ..Default::default()
@@ -1877,15 +1862,13 @@ fn a_parameter_range_refusal_is_reported_as_pairing_refused() {
                  the accepted range [1000000000, 5000000000]";
             assert_eq!(memo, expected_memo);
             assert_eq!(error_code, "incompatible_parameter_range");
-            let expected_message = derec_library::Error::from(
-                derec_library::primitives::pairing::PairingError::IncompatibleParameterRange {
-                    field: "shareSize",
-                    local_min: 1_000_000_000,
-                    local_max: 5_000_000_000,
-                    peer_min: 10_000_000,
-                    peer_max: 500_000_000,
-                },
-            )
+            let expected_message = Error::from(PairingError::IncompatibleParameterRange {
+                field: "shareSize",
+                local_min: 1_000_000_000,
+                local_max: 5_000_000_000,
+                peer_min: 10_000_000,
+                peer_max: 500_000_000,
+            })
             .to_string();
             assert_eq!(message, &expected_message);
             assert_eq!(sent.len(), 1, "the refusal is sent: respond={respond}");
@@ -1918,7 +1901,7 @@ fn a_pairing_refusal_whose_cleanup_fails_is_still_reported() {
             let mut joiner_protocol = joiner.build(respond, AutoAcceptPolicy::default(), true);
             responder
                 .secrets
-                .set_fail_remove(Some(derec_library::protocol::SecretKind::PairingSecret));
+                .set_fail_remove(Some(SecretKind::PairingSecret));
 
             let (events, sent, channel) = refused_pairing(
                 &responder,
@@ -2001,7 +1984,7 @@ fn a_replica_id_conflict_is_reported_as_pairing_refused() {
             assert_eq!(error_code, "replica_id_conflict");
             assert_eq!(
                 message,
-                &derec_library::Error::ReplicaIdConflict {
+                &Error::ReplicaIdConflict {
                     replica_id: SELF_ID
                 }
                 .to_string()
@@ -2136,22 +2119,20 @@ async fn fail(case: Answerable, rig: &Rig, protocol: &mut Proto) -> Vec<DeRecEve
 /// dropped) and the encoded inner body.
 fn without_timestamps(bytes: &[u8]) -> (DeRecMessage, Vec<u8>) {
     let mut envelope = DeRecMessage::decode(bytes).expect("a DeRec envelope");
-    let mut inner = derec_library::derec_message::extract_inner_message(&envelope.message, &KEY)
+    let mut inner = extract_inner_message(&envelope.message, &KEY)
         .expect("the requester can decrypt the response");
     assert!(
         timestamp_slot(&mut inner).is_some(),
         "the response is stamped"
     );
-    set_timestamp(&mut inner, prost_types::Timestamp::default());
+    set_timestamp(&mut inner, Timestamp::default());
     envelope.timestamp = None;
     envelope.message = Vec::new();
     (envelope, inner.encode_to_vec())
 }
 
 /// The one `RequestFailed` of `events`: its status, memo and token.
-fn the_failure(
-    events: &[DeRecEvent],
-) -> (i32, String, Option<derec_library::protocol::PendingAction>) {
+fn the_failure(events: &[DeRecEvent]) -> (i32, String, Option<PendingAction>) {
     match request_failures(events).as_slice() {
         [
             DeRecEvent::RequestFailed {

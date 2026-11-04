@@ -512,12 +512,15 @@ func TestStateItemRoundTrip_PendingVerification(t *testing.T) {
 func TestStateItemRoundTrip_PendingRecovery(t *testing.T) {
 	sid := uint64(0xA0)
 	ver := uint32(4)
+	started := uint64(1_700_000_000)
 	want := StateItem{
 		Kind:          StateKindPendingRecovery,
 		SecretID:      &sid,
 		Version:       &ver,
+		StartedAt:     &started,
 		Shares:        [][]byte{{1, 2}, {3, 4, 5}},
 		ShareChannels: []uint64{math.MaxUint64, 7},
+		Pending:       []uint64{6, math.MaxUint64 - 1},
 	}
 	wire, err := EncodeStateItem(want)
 	if err != nil {
@@ -526,13 +529,53 @@ func TestStateItemRoundTrip_PendingRecovery(t *testing.T) {
 	if !strings.Contains(string(wire), `"share_channels":["18446744073709551615","7"]`) {
 		t.Fatalf("share_channels must travel as decimal strings, got %s", wire)
 	}
+	if !strings.Contains(string(wire), `"pending":["6","18446744073709551614"]`) ||
+		!strings.Contains(string(wire), `"started_at":"1700000000"`) {
+		t.Fatalf("pending and started_at must travel as decimal strings, got %s", wire)
+	}
 	got, err := DecodeStateItem(wire)
 	if err != nil {
 		t.Fatalf("DecodeStateItem: %v", err)
 	}
 	if got.Kind != want.Kind || *got.Version != *want.Version || len(got.Shares) != 2 ||
-		len(got.ShareChannels) != 2 || got.ShareChannels[0] != math.MaxUint64 || got.ShareChannels[1] != 7 {
+		len(got.ShareChannels) != 2 || got.ShareChannels[0] != math.MaxUint64 || got.ShareChannels[1] != 7 ||
+		len(got.Pending) != 2 || got.Pending[0] != 6 || got.Pending[1] != math.MaxUint64-1 ||
+		got.StartedAt == nil || *got.StartedAt != started {
 		t.Fatalf("mismatch: got %+v want %+v", got, want)
+	}
+}
+
+// A recovery the library has heard back from every helper carries an empty
+// pending set, which must stay present rather than collapse to absent.
+func TestEncodeStateItem_PendingRecoveryEmptyPendingStillPresent(t *testing.T) {
+	sid := uint64(0xA0)
+	ver := uint32(1)
+	got, err := EncodeStateItem(StateItem{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver, Shares: [][]byte{}, Pending: []uint64{}})
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	if !strings.Contains(string(got), `"pending":[]`) {
+		t.Fatalf("expected an empty pending set to stay present, got %s", got)
+	}
+}
+
+// A row written before a recovery tracked who was asked carries neither
+// pending nor started_at; both stay absent so the library reads the row as
+// none pending, sent at 0.
+func TestStateItemRoundTrip_PendingRecoveryWithoutPending(t *testing.T) {
+	got, err := DecodeStateItem([]byte(`{"kind":1,"secret_id":"11","version":3,"shares":[],"share_channels":[]}`))
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if got.Pending != nil || got.StartedAt != nil {
+		t.Fatalf("absent pending/started_at must stay absent, got %+v", got)
+	}
+	wire, err := EncodeStateItem(got)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	if strings.Contains(string(wire), "pending") || strings.Contains(string(wire), "started_at") {
+		t.Fatalf("absent pending/started_at must not be invented, got %s", wire)
 	}
 }
 

@@ -24,6 +24,8 @@
 //!     [description: UTF-8 bytes]
 //! ```
 
+use std::slice;
+
 use crate::interop::ffi::common::{
     DeRecBuffer, empty_buffer, parse_transport_protocol_list, read_exact, read_u32_le,
     vec_into_buffer, write_u32_le, write_u64_le,
@@ -32,7 +34,8 @@ use crate::interop::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_NULL_PTR, DeRecError,
     ffi_error, from_lib_error, success,
 };
-use crate::primitives::discovery::response::{SecretVersionEntry, VersionEntry};
+use crate::primitives::discovery::request;
+use crate::primitives::discovery::response::{self, SecretVersionEntry, VersionEntry};
 use derec_proto::{DeRecMessage, GetSecretIdsVersionsResponseMessage};
 use prost::Message as _;
 
@@ -102,8 +105,7 @@ pub extern "C" fn produce_get_secret_ids_versions_request_message(
         Err(e) => return with_err(e),
     };
 
-    match crate::primitives::discovery::request::produce(channel_id.into(), &shared_key, &reply_to)
-    {
+    match request::produce(channel_id.into(), &shared_key, &reply_to) {
         Ok(r) => ProduceGetSecretIdsVersionsRequestMessageResult {
             error: success(),
             envelope_wire_bytes: vec_into_buffer(r.envelope),
@@ -147,7 +149,7 @@ pub extern "C" fn extract_get_secret_ids_versions_request(
         }
     };
 
-    match crate::primitives::discovery::request::extract(request_bytes, &shared_key) {
+    match request::extract(request_bytes, &shared_key) {
         Ok(r) => ExtractGetSecretIdsVersionsRequestResult {
             error: success(),
             channel_id,
@@ -191,11 +193,7 @@ pub extern "C" fn produce_get_secret_ids_versions_response_message(
         Err(e) => return with_err(ffi_error(DEREC_CODE_FFI_BAD_PROTO, e)),
     };
 
-    match crate::primitives::discovery::response::produce(
-        channel_id.into(),
-        &secret_list,
-        &shared_key,
-    ) {
+    match response::produce(channel_id.into(), &secret_list, &shared_key) {
         Ok(r) => ProduceGetSecretIdsVersionsResponseMessageResult {
             error: success(),
             envelope_wire_bytes: vec_into_buffer(r.envelope),
@@ -239,7 +237,7 @@ pub extern "C" fn extract_get_secret_ids_versions_response(
         }
     };
 
-    match crate::primitives::discovery::response::extract(response_bytes, &shared_key) {
+    match response::extract(response_bytes, &shared_key) {
         Ok(r) => ExtractGetSecretIdsVersionsResponseResult {
             error: success(),
             channel_id,
@@ -282,7 +280,7 @@ pub extern "C" fn process_get_secret_ids_versions_response_message(
         }
     };
 
-    match crate::primitives::discovery::response::process(&response) {
+    match response::process(&response) {
         Ok(r) => ProcessGetSecretIdsVersionsResponseMessageResult {
             error: success(),
             secret_list_bytes: vec_into_buffer(serialize_secret_list(&r.secret_list)),
@@ -301,7 +299,7 @@ fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], 
     if len == 0 {
         Ok(&[])
     } else {
-        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+        Ok(unsafe { slice::from_raw_parts(ptr, len) })
     }
 }
 

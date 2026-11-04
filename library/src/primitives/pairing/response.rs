@@ -1,23 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
+use super::parameter_range::check_compatibility;
+use super::request::check_parameter_range;
+use crate::Error;
+use crate::derec_message::{
+    DeRecMessageBuilder, current_timestamp, extract_inner_plaintext_message,
+};
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::contact_message::ContactMessageExt as _;
 use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::extensions::pair_request::PairRequestMessageExt as _;
 use crate::primitives::pairing::PairingError;
 use crate::protocol_version::ProtocolVersion;
+use crate::transport::TransportPolicy;
 use crate::types::ChannelId;
-use crate::utils::verify_timestamps;
+use crate::utils::{generate_seed, verify_timestamps};
 use derec_cryptography::pairing::{
     self as cryptography_pairing, DerecPairingError, FingerprintCommitment, FingerprintNonce,
-    PairingSecretKeyMaterial, PairingSharedKey,
+    PairingSecretKeyMaterial, PairingSharedKey, envelope as pairing_envelope,
 };
 use derec_proto::{
     CommunicationInfo, ContactMessage, ContactMode, DeRecMessage, DeRecResult, MessageBody,
-    PairRequestMessage, PairResponseMessage, PrePairRequestMessage, PrePairResponseMessage,
-    StatusEnum, TransportProtocol,
+    PairRequestMessage, PairResponseMessage, ParameterRange, PrePairRequestMessage,
+    PrePairResponseMessage, StatusEnum, TransportProtocol,
 };
 use prost::Message;
 use sha2::{Digest, Sha384};
@@ -241,12 +247,12 @@ pub fn produce(
     request: &PairRequestMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
     communication_info: Option<CommunicationInfo>,
-    parameter_range: Option<derec_proto::ParameterRange>,
-    policy: crate::transport::TransportPolicy,
-) -> Result<ProduceResult, crate::Error> {
+    parameter_range: Option<ParameterRange>,
+    policy: TransportPolicy,
+) -> Result<ProduceResult, Error> {
     request.validate()?;
 
-    super::request::check_parameter_range(request, parameter_range.as_ref())?;
+    check_parameter_range(request, parameter_range.as_ref())?;
 
     let peer_transports = policy.admit_peer_endpoints(request.advertised_endpoints())?;
 
@@ -256,7 +262,7 @@ pub fn produce(
     };
 
     let initiator_material = match pairing_secret_key_material {
-        cryptography_pairing::PairingSecretKeyMaterial::Initiator(m) => m,
+        PairingSecretKeyMaterial::Initiator(m) => m,
         _ => {
             return Err(PairingError::Invariant(
                 "expected Initiator key material for pairing response",
@@ -354,7 +360,7 @@ pub fn produce_pre_pair(
     channel_id: ChannelId,
     request: &PrePairRequestMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
-) -> Result<ProducePrePairResult, crate::Error> {
+) -> Result<ProducePrePairResult, Error> {
     let initiator_material = match pairing_secret_key_material {
         PairingSecretKeyMaterial::Initiator(m) => m,
         _ => {
@@ -451,8 +457,8 @@ pub fn produce_pre_pair(
 pub fn produce_pre_pair_no_keys(
     channel_id: ChannelId,
     request: &PrePairRequestMessage,
-) -> Result<ProducePrePairNoKeysResult, crate::Error> {
-    let seed = crate::utils::generate_seed::<32>();
+) -> Result<ProducePrePairNoKeysResult, Error> {
+    let seed = generate_seed::<32>();
     let (pk, secret_key) = cryptography_pairing::contact_message(*seed)
         .map_err(|e| PairingError::ContactMessageKeygen { source: e })?;
 
@@ -604,29 +610,24 @@ pub fn produce_pre_pair_no_keys(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
-pub fn extract(
-    envelope_bytes: &[u8],
-    ecies_secret_key: &[u8],
-) -> Result<ExtractResult, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn extract(envelope_bytes: &[u8], ecies_secret_key: &[u8]) -> Result<ExtractResult, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
-    let plaintext =
-        derec_cryptography::pairing::envelope::decrypt(&envelope.message, ecies_secret_key)
-            .map_err(PairingError::PairingEncryption)?;
+    let plaintext = pairing_envelope::decrypt(&envelope.message, ecies_secret_key)
+        .map_err(PairingError::PairingEncryption)?;
 
-    let response = match MessageBody::decode_from_vec(plaintext.as_slice())
-        .map_err(crate::Error::ProtobufDecode)?
-    {
-        MessageBody::PairResponse(r) => r,
-        _ => {
-            #[cfg(feature = "logging")]
-            tracing::warn!("unexpected message type; expected PairResponseMessage");
+    let response =
+        match MessageBody::decode_from_vec(plaintext.as_slice()).map_err(Error::ProtobufDecode)? {
+            MessageBody::PairResponse(r) => r,
+            _ => {
+                #[cfg(feature = "logging")]
+                tracing::warn!("unexpected message type; expected PairResponseMessage");
 
-            return Err(crate::Error::Invariant(
-                "Invalid message. Expected: PairResponseMessage",
-            ));
-        }
-    };
+                return Err(Error::Invariant(
+                    "Invalid message. Expected: PairResponseMessage",
+                ));
+            }
+        };
 
     verify_timestamps(envelope.timestamp, response.timestamp)?;
 
@@ -688,16 +689,16 @@ pub fn extract(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
-pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
-    let response = match crate::derec_message::extract_inner_plaintext_message(&envelope.message)? {
+    let response = match extract_inner_plaintext_message(&envelope.message)? {
         MessageBody::PrePairResponse(r) => r,
         _ => {
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected PrePairResponseMessage");
 
-            return Err(crate::Error::Invariant(
+            return Err(Error::Invariant(
                 "Invalid message. Expected: PrePairResponseMessage",
             ));
         }
@@ -850,12 +851,9 @@ pub fn process(
     contact_message: &ContactMessage,
     response: &PairResponseMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
-    parameter_range: Option<&derec_proto::ParameterRange>,
-) -> Result<ProcessResult, crate::Error> {
-    super::parameter_range::check_compatibility(
-        parameter_range,
-        response.parameter_range.as_ref(),
-    )?;
+    parameter_range: Option<&ParameterRange>,
+) -> Result<ProcessResult, Error> {
+    check_compatibility(parameter_range, response.parameter_range.as_ref())?;
 
     let responder_material =
         validate_process_inputs(contact_message, response, pairing_secret_key_material)?;
@@ -943,7 +941,7 @@ pub fn process(
 pub fn process_pre_pair(
     contact_message: &ContactMessage,
     response: &PrePairResponseMessage,
-) -> Result<ProcessPrePairResult, crate::Error> {
+) -> Result<ProcessPrePairResult, Error> {
     validate_process_pre_pair_inputs(contact_message, response, ContactMode::HashedKeys)?;
 
     let (mlkem_encapsulation_key, ecies_public_key) =
@@ -1003,7 +1001,7 @@ pub fn process_pre_pair(
 pub fn process_pre_pair_no_keys(
     contact_message: &ContactMessage,
     response: &PrePairResponseMessage,
-) -> Result<ProcessPrePairResult, crate::Error> {
+) -> Result<ProcessPrePairResult, Error> {
     validate_process_pre_pair_inputs(contact_message, response, ContactMode::NoKeys)?;
 
     let mlkem_encapsulation_key = response
@@ -1033,7 +1031,7 @@ fn validate_process_inputs<'a>(
     contact_message: &ContactMessage,
     response: &PairResponseMessage,
     pairing_secret_key_material: &'a PairingSecretKeyMaterial,
-) -> Result<&'a cryptography_pairing::ResponderSecretKeyMaterial, crate::Error> {
+) -> Result<&'a cryptography_pairing::ResponderSecretKeyMaterial, Error> {
     let res = response
         .result
         .as_ref()
@@ -1091,7 +1089,7 @@ fn validate_process_inputs<'a>(
 fn fingerprint_opening(
     contact_message: &ContactMessage,
     response: &PairResponseMessage,
-) -> Result<(FingerprintCommitment, FingerprintNonce), crate::Error> {
+) -> Result<(FingerprintCommitment, FingerprintNonce), Error> {
     let commitment = contact_message
         .fingerprint_commitment
         .as_deref()
@@ -1132,7 +1130,7 @@ fn validate_rekeyed_channel_id(
     response: &PairResponseMessage,
     original_channel_id: ChannelId,
     shared_key: &PairingSharedKey,
-) -> Result<ChannelId, crate::Error> {
+) -> Result<ChannelId, Error> {
     let expected_channel_id = derive_rekeyed_channel_id(original_channel_id, shared_key);
     if response.channel_id != u64::from(expected_channel_id) {
         #[cfg(feature = "logging")]
@@ -1150,7 +1148,7 @@ fn validate_process_pre_pair_inputs(
     contact_message: &ContactMessage,
     response: &PrePairResponseMessage,
     expected_mode: ContactMode,
-) -> Result<(), crate::Error> {
+) -> Result<(), Error> {
     let res = response
         .result
         .as_ref()
@@ -1234,7 +1232,7 @@ fn derive_rekeyed_channel_id(
 fn validate_contact_binding_hash(
     contact_message: &ContactMessage,
     response: &PrePairResponseMessage,
-) -> Result<(Vec<u8>, Vec<u8>), crate::Error> {
+) -> Result<(Vec<u8>, Vec<u8>), Error> {
     let mlkem_encapsulation_key = response
         .mlkem_encapsulation_key
         .clone()
@@ -1248,7 +1246,7 @@ fn validate_contact_binding_hash(
         .as_ref()
         .expect("validate_process_pre_pair_inputs guarantees contact_binding_hash is Some");
 
-    let recomputed = derec_cryptography::pairing::contact_binding_hash(
+    let recomputed = cryptography_pairing::contact_binding_hash(
         &mlkem_encapsulation_key,
         &ecies_public_key,
         contact_message.nonce,

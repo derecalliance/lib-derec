@@ -55,6 +55,7 @@ pub fn random_oracle(msg: &[u8], rand: &[u8], tag: &[u8]) -> [u8; 4 * λ] {
 
 #[cfg(test)]
 mod tests {
+    use crate::random;
     use crate::vss;
     use rand::Rng as _;
 
@@ -62,7 +63,7 @@ mod tests {
     fn test_vss_correctness() {
         // test if recovery on shares produces the shared secret
 
-        let mut rng = crate::random::os_rng();
+        let mut rng = random::os_rng();
 
         let mut rand = [0u8; 32];
         rng.fill_bytes(&mut rand);

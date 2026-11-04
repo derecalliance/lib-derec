@@ -189,6 +189,9 @@ func (c *DeRecProtocolConfig) UnmarshalJSON(data []byte) error {
 		if t.UnpairAckSecs != nil {
 			merged.UnpairAckSecs = t.UnpairAckSecs
 		}
+		if t.GetShareResponseSecs != nil {
+			merged.GetShareResponseSecs = t.GetShareResponseSecs
+		}
 		if t.ExpiredChannels != nil {
 			merged.ExpiredChannels = t.ExpiredChannels
 		}

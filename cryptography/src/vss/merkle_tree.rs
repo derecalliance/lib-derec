@@ -166,12 +166,13 @@ fn compute_sha256_hash(input: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::random;
     use crate::vss;
     use rand::Rng as _;
 
     #[test]
     fn test_merkle_tree_correctness() {
-        let mut rng = crate::random::os_rng();
+        let mut rng = random::os_rng();
 
         let mut seed1 = [0u8; 32];
         rng.fill_bytes(&mut seed1);
@@ -184,7 +185,7 @@ mod tests {
 
         let shares = vss::share(5, &[1; 7], &msg, &seed1).unwrap();
         let leaves: Vec<Vec<Subshare>> = shares.iter().map(|s| s.subshares.clone()).collect();
-        let merkle_tree = build(&leaves, &mut crate::random::os_rng());
+        let merkle_tree = build(&leaves, &mut random::os_rng());
         assert_merkle_tree_wff(&merkle_tree);
     }
 

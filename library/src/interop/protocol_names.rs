@@ -3,6 +3,11 @@
 
 //! The enum names every binding exposes to its host.
 
+use derec_proto::Protocol;
+use serde::de::Error;
+
+use crate::protocol::UnpairAck;
+
 /// Maps a transport protocol *name* to its wire discriminant.
 ///
 /// Case-insensitive; accepts exactly `"https"` and `"grpc"` — the two
@@ -18,8 +23,8 @@
 /// between bindings.
 pub(crate) fn protocol_name_to_discriminant(name: &str) -> Option<i32> {
     match name.to_lowercase().as_str() {
-        "https" => Some(derec_proto::Protocol::Https.into()),
-        "grpc" => Some(derec_proto::Protocol::Grpc.into()),
+        "https" => Some(Protocol::Https.into()),
+        "grpc" => Some(Protocol::Grpc.into()),
         _ => None,
     }
 }
@@ -28,9 +33,9 @@ pub(crate) fn protocol_name_to_discriminant(name: &str) -> Option<i32> {
 /// back to its lowercase protocol name. `None` for any discriminant outside
 /// the defined `Protocol` variants.
 pub(crate) fn protocol_discriminant_to_name(discriminant: i32) -> Option<&'static str> {
-    match derec_proto::Protocol::try_from(discriminant).ok()? {
-        derec_proto::Protocol::Https => Some("https"),
-        derec_proto::Protocol::Grpc => Some("grpc"),
+    match Protocol::try_from(discriminant).ok()? {
+        Protocol::Https => Some("https"),
+        Protocol::Grpc => Some("grpc"),
     }
 }
 
@@ -51,9 +56,8 @@ where
     }
     match <NameOrDiscriminant as serde::Deserialize>::deserialize(de)? {
         NameOrDiscriminant::Discriminant(d) => Ok(d),
-        NameOrDiscriminant::Name(name) => protocol_name_to_discriminant(&name).ok_or_else(|| {
-            serde::de::Error::custom(format!("unknown transport protocol {name:?}"))
-        }),
+        NameOrDiscriminant::Name(name) => protocol_name_to_discriminant(&name)
+            .ok_or_else(|| Error::custom(format!("unknown transport protocol {name:?}"))),
     }
 }
 
@@ -65,7 +69,7 @@ where
 {
     let name = <String as serde::Deserialize>::deserialize(de)?;
     protocol_name_to_discriminant(&name)
-        .ok_or_else(|| serde::de::Error::custom(format!("unknown transport protocol {name:?}")))
+        .ok_or_else(|| Error::custom(format!("unknown transport protocol {name:?}")))
 }
 
 /// Maps an unpair-ack *name* to its [`crate::protocol::UnpairAck`] variant.
@@ -73,20 +77,20 @@ where
 /// Accepts exactly `"required"` and `"not_required"`, the names every binding
 /// exposes, so the host passes the name through and the library decides
 /// whether it is valid.
-pub(crate) fn unpair_ack_from_name(name: &str) -> Option<crate::protocol::UnpairAck> {
+pub(crate) fn unpair_ack_from_name(name: &str) -> Option<UnpairAck> {
     match name {
-        "required" => Some(crate::protocol::UnpairAck::Required),
-        "not_required" => Some(crate::protocol::UnpairAck::NotRequired),
+        "required" => Some(UnpairAck::Required),
+        "not_required" => Some(UnpairAck::NotRequired),
         _ => None,
     }
 }
 
 /// Inverse of [`unpair_ack_from_name`]: the name every binding exposes for
 /// an unpair-ack variant.
-pub(crate) fn unpair_ack_to_name(ack: crate::protocol::UnpairAck) -> &'static str {
+pub(crate) fn unpair_ack_to_name(ack: UnpairAck) -> &'static str {
     match ack {
-        crate::protocol::UnpairAck::Required => "required",
-        crate::protocol::UnpairAck::NotRequired => "not_required",
+        UnpairAck::Required => "required",
+        UnpairAck::NotRequired => "not_required",
     }
 }
 
@@ -111,13 +115,10 @@ mod tests {
 
     #[test]
     fn unpair_ack_names_are_exact() {
-        assert_eq!(
-            unpair_ack_from_name("required"),
-            Some(crate::protocol::UnpairAck::Required)
-        );
+        assert_eq!(unpair_ack_from_name("required"), Some(UnpairAck::Required));
         assert_eq!(
             unpair_ack_from_name("not_required"),
-            Some(crate::protocol::UnpairAck::NotRequired)
+            Some(UnpairAck::NotRequired)
         );
         for alias in ["Required", "notrequired", "fire_and_forget", ""] {
             assert_eq!(unpair_ack_from_name(alias), None, "{alias:?}");
@@ -126,17 +127,14 @@ mod tests {
 
     #[test]
     fn every_unpair_ack_round_trips_through_its_name() {
-        for ack in [
-            crate::protocol::UnpairAck::Required,
-            crate::protocol::UnpairAck::NotRequired,
-        ] {
+        for ack in [UnpairAck::Required, UnpairAck::NotRequired] {
             assert_eq!(unpair_ack_from_name(unpair_ack_to_name(ack)), Some(ack));
         }
     }
 
     #[test]
     fn every_protocol_round_trips_through_its_name() {
-        for protocol in [derec_proto::Protocol::Https, derec_proto::Protocol::Grpc] {
+        for protocol in [Protocol::Https, Protocol::Grpc] {
             let name = protocol_discriminant_to_name(protocol.into()).expect("defined protocol");
             assert_eq!(protocol_name_to_discriminant(name), Some(protocol.into()));
         }

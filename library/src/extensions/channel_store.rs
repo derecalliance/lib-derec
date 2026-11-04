@@ -12,6 +12,7 @@
 //! every store the same methods for free, and leaves the trait an
 //! application must satisfy as small as it was.
 
+use crate::protocol::obligation::{Obligation, deliver};
 use crate::protocol::{DeRecChannelStore, DeRecTransport};
 use crate::transport::TransportPolicy;
 use crate::{
@@ -21,9 +22,9 @@ use crate::{
         ChannelQuery, ChannelStatus, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember,
         Target,
     },
-    types::{ChannelId, SharedKey},
+    types::{ChannelId, ReplicaId, SharedKey},
 };
-use derec_proto::{MessageBody, SenderKind, TransportProtocol};
+use derec_proto::{MessageBody, SenderKind, StatusEnum, TransportProtocol};
 use prost::Message;
 
 /// Channel reads every flow needs, as methods on the store that holds them.
@@ -221,7 +222,7 @@ pub(crate) trait ChannelStoreExt: DeRecChannelStore {
         channel_id: ChannelId,
         author: u64,
     ) -> Result<ReplicaMember> {
-        let replica_id = crate::types::ReplicaId::try_from(author)?;
+        let replica_id = ReplicaId::try_from(author)?;
         self.load(
             secret_id,
             ChannelQuery::Replica {
@@ -289,8 +290,8 @@ pub(crate) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
     inbound_trace_id: u64,
     policy: TransportPolicy,
     reply_to: &[TransportProtocol],
-    obligation: Option<&crate::protocol::obligation::Obligation>,
-    status: derec_proto::StatusEnum,
+    obligation: Option<&Obligation>,
+    status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
     use crate::extensions::message_body::MessageBodyExt as _;
@@ -309,8 +310,7 @@ pub(crate) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
     let endpoint = channel_store
         .resolve_response_endpoints(secret_id, channel_id, policy, reply_to)
         .await?;
-    crate::protocol::obligation::deliver(obligation, transport, &endpoint, wire_bytes, status, memo)
-        .await
+    deliver(obligation, transport, &endpoint, wire_bytes, status, memo).await
 }
 
 /// Drop rows the store returned that the filter excluded.
@@ -353,6 +353,8 @@ mod defiant_store_tests {
         ChannelQuery, ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole,
     };
     use crate::types::ReplicaId;
+    use derec_proto::Protocol;
+    use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0xDEF1;
     const GROUP: ChannelId = ChannelId(500);
@@ -417,9 +419,9 @@ mod defiant_store_tests {
                     replica_id: ReplicaId(replica_id),
                     transports: vec![TransportProtocol {
                         uri: "https://peer.example".to_owned(),
-                        protocol: derec_proto::Protocol::Https as i32,
+                        protocol: Protocol::Https as i32,
                     }],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     role: ReplicaRole::Destination,
                     status,
                     created_at: 0,
@@ -532,7 +534,7 @@ mod defiant_store_tests {
                             channel_id: GROUP,
                             replica_id: ReplicaId(id),
                             transports: Vec::new(),
-                            communication_info: std::collections::HashMap::new(),
+                            communication_info: HashMap::new(),
                             role: ReplicaRole::Destination,
                             status,
                             created_at: 0,
@@ -562,10 +564,13 @@ mod defiant_store_tests {
 #[cfg(test)]
 mod send_channel_message_tests {
     use super::*;
+    use crate::derec_message::extract_inner_message;
     use crate::extensions::derec_result::DeRecResultExt as _;
     use crate::extensions::message_body::MessageBodyExt as _;
     use crate::protocol::tests::{InMemChannelStore, RecordingTransport, run_async};
     use crate::protocol::types::{ChannelRecord, HelperChannel};
+    use derec_proto::{DeRecMessage, DeRecResult, Protocol, UpdateChannelInfoResponseMessage};
+    use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0x5E4D;
     const CHANNEL: ChannelId = ChannelId(77);
@@ -584,9 +589,9 @@ mod send_channel_message_tests {
                         channel_id: CHANNEL,
                         transports: vec![TransportProtocol {
                             uri: "https://peer.example".to_owned(),
-                            protocol: derec_proto::Protocol::Https as i32,
+                            protocol: Protocol::Https as i32,
                         }],
-                        communication_info: std::collections::HashMap::new(),
+                        communication_info: HashMap::new(),
                         peer_role: SenderKind::Owner,
                         status: ChannelStatus::Paired,
                         created_at: 0,
@@ -597,15 +602,13 @@ mod send_channel_message_tests {
                 .expect("seed channel");
             let transport = RecordingTransport::default();
 
-            let body = MessageBody::UpdateChannelInfoResponse(
-                derec_proto::UpdateChannelInfoResponseMessage {
-                    result: Some(derec_proto::DeRecResult::ok()),
-                    timestamp: Some(prost_types::Timestamp {
-                        seconds: 1,
-                        nanos: 0,
-                    }),
-                },
-            );
+            let body = MessageBody::UpdateChannelInfoResponse(UpdateChannelInfoResponseMessage {
+                result: Some(DeRecResult::ok()),
+                timestamp: Some(prost_types::Timestamp {
+                    seconds: 1,
+                    nanos: 0,
+                }),
+            });
 
             send_channel_message(
                 &channels,
@@ -618,7 +621,7 @@ mod send_channel_message_tests {
                 TransportPolicy::new(false),
                 &[],
                 None,
-                derec_proto::StatusEnum::Ok,
+                StatusEnum::Ok,
                 "",
             )
             .await
@@ -626,9 +629,8 @@ mod send_channel_message_tests {
 
             let sent = transport.sent_envelopes();
             assert_eq!(sent.len(), 1);
-            let envelope = derec_proto::DeRecMessage::decode(sent[0].as_slice()).expect("decode");
-            let inner = crate::derec_message::extract_inner_message(&envelope.message, &KEY)
-                .expect("decrypt");
+            let envelope = DeRecMessage::decode(sent[0].as_slice()).expect("decode");
+            let inner = extract_inner_message(&envelope.message, &KEY).expect("decrypt");
             assert!(envelope.timestamp.is_some());
             assert_eq!(envelope.timestamp.as_ref(), inner.timestamp());
         });
@@ -646,6 +648,7 @@ mod resolve_response_endpoints_tests {
     use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel};
     use crate::transport::TransportPolicy;
     use derec_proto::Protocol;
+    use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0x1234;
     const CHANNEL: ChannelId = ChannelId(42);
@@ -666,7 +669,7 @@ mod resolve_response_endpoints_tests {
                 ChannelRecord::Helper(HelperChannel {
                     channel_id: CHANNEL,
                     transports: vec![endpoint("https://recorded.example")],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     peer_role: SenderKind::Owner,
                     status: ChannelStatus::Paired,
                     created_at: 0,

@@ -3,6 +3,8 @@
 
 //! C FFI accessor for the current DeRec protocol version.
 
+use crate::protocol_version::ProtocolVersion;
+
 #[repr(C)]
 pub struct DeRecProtocolVersion {
     pub major: u32,
@@ -11,7 +13,7 @@ pub struct DeRecProtocolVersion {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn derec_protocol_version() -> DeRecProtocolVersion {
-    let version = crate::protocol_version::ProtocolVersion::current();
+    let version = ProtocolVersion::current();
     DeRecProtocolVersion {
         major: version.major,
         minor: version.minor,

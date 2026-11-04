@@ -11,25 +11,26 @@
 //! only the keys the target names, so `deny_unknown_fields` would never see a
 //! misspelled one.
 
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+
 /// `value` read as `T`, refusing anything but a JSON object and every key
 /// `T` does not define.
-pub(crate) fn object_into<T: serde::de::DeserializeOwned>(
-    value: serde_json::Value,
-) -> Result<T, String> {
+pub(crate) fn object_into<T: DeserializeOwned>(value: Value) -> Result<T, String> {
     if !value.is_object() {
         return Err(format!("expected an object, got {}", kind(&value)));
     }
     serde_json::from_value(value).map_err(|e| e.to_string())
 }
 
-fn kind(value: &serde_json::Value) -> &'static str {
+fn kind(value: &Value) -> &'static str {
     match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "a boolean",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "an array",
-        serde_json::Value::Object(_) => "an object",
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 

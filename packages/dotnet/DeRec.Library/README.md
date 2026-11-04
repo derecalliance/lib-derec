@@ -451,10 +451,13 @@ byte[] recovered = Recovery.Response.Recover(
 When driving the orchestrator instead of the primitives, a helper that
 answers with a share that cannot be part of the secret is reported as a
 `RecoveryShareCorruptedEvent` (`Reason` is a `CorruptionReason` constant:
-`Malformed`, `InvalidProof` or `Inconsistent`); the share is set aside and
-never blocks the recovery from the others. An honest helper never sends one,
-so treat it as a sign of a damaged or compromised helper — for example, offer
-to unpair it.
+`Malformed`, `InvalidProof` or `Forged` — its group reconstructs under one
+key, but not to a secret, or a single share reconstructs alone, reported with
+the recovery's decision); the share is set aside and never blocks the
+recovery from the others. An honest helper never sends one, so treat it as a
+sign of a damaged or compromised helper — for example, offer to unpair it. A
+share that only disagrees with the others is never reported this way: it is a
+dispute, not evidence against its helper.
 
 ### Helpers and shares
 
@@ -481,6 +484,36 @@ to unpair it.
   recovery channel resolving to a distinct share: either links stay
   one-to-one, or its share store returns, for each requesting channel, the
   share intended for it first, in a deterministic order.
+
+Each helper's answer to a recovery request surfaces as
+`RecoveryShareReceivedEvent`, `RecoveryShareRefusedEvent` or
+`RecoveryShareCorruptedEvent`. A recovery reconstructs nothing until every
+helper it asked has answered, or `Timeouts.GetShareResponse`
+(`timeouts.get_share_response_secs`) has passed since the requests went out —
+each silent helper is then reported as `RecoverSecretFailedEvent` with
+`Error` `"timeout"` by the next `TickAsync`. It then decides exactly once:
+
+- `SecretRecoveredEvent { Secret }` — one secret reconstructs and every
+  collected share is part of it;
+- `RecoveryDisputedEvent { Version, Secret, SupportedBy, DisputedBy }` — one
+  secret reconstructs, but other helpers hold valid shares of a different
+  split that does not. Either side can be the owner's: colluding helpers can
+  forge a complete split, and the honest ones may be too few to reconstruct
+  theirs. Show the owner what `Secret` holds and who stands on each side, and
+  pass it to `RestoreAsync` only once they confirm it;
+- `RecoveryConflictEvent { Version, Candidates, DisputedBy }` — two or more
+  different secrets reconstruct. Each `RecoveryCandidate` carries the
+  `Secret` and `SupportedBy`. The library never picks: involve the owner, and
+  pass the candidate they confirm to `RestoreAsync`;
+- `RecoveryIncompleteEvent { Version, SharesReceived }` — nothing
+  reconstructs. The recovery is closed; start it again to retry.
+
+`SupportedBy` / `DisputedBy` name helpers as `RecoveryHelper(ChannelId,
+CommunicationInfo)`, the `CommunicationInfo` being what the helper advertised
+when it paired, so the app can tell the owner who is on each side.
+That is the helper's own configured communication info, not the peer
+communication info it passed when starting the pairing: a helper that
+configures none is named by its channel alone.
 
 The recovering device receives a `SecretRecoveredEvent` carrying the typed
 `Secret`. Pass it
@@ -883,6 +916,7 @@ The record reads and writes the canonical JSON shared by every SDK
     "inbound_message_secs": 300,
     "sharing_round_secs": 60,
     "unpair_ack_secs": 60,
+    "get_share_response_secs": 300,
     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
   },
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },

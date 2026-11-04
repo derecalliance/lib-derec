@@ -9,6 +9,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use derec_library::protocol::types::{
     HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret,
 };
+use derec_proto::{Protocol, TransportProtocol};
 use flate2::read::GzDecoder;
 use serde_json::Value;
 
@@ -17,9 +18,9 @@ fn recovered_secret_decodes_without_the_protocol() {
     let secret = Secret {
         helpers: vec![HelperInfo {
             channel_id: 1_000_000,
-            transports: vec![derec_proto::TransportProtocol {
+            transports: vec![TransportProtocol {
                 uri: "https://helper-0.example.org/derec".to_owned(),
-                protocol: derec_proto::Protocol::Https as i32,
+                protocol: Protocol::Https as i32,
             }],
             shared_key: vec![0xAB; 32],
             communication_info: HashMap::from([("name".to_owned(), "Helper 0".to_owned())]),
@@ -36,18 +37,18 @@ fn recovered_secret_decodes_without_the_protocol() {
             members: vec![
                 ReplicaInfo {
                     replica_id: 1001,
-                    transports: vec![derec_proto::TransportProtocol {
+                    transports: vec![TransportProtocol {
                         uri: "https://alice.example.org/derec".to_owned(),
-                        protocol: derec_proto::Protocol::Https as i32,
+                        protocol: Protocol::Https as i32,
                     }],
                     role: ReplicaRole::Source as i32,
                     communication_info: HashMap::new(),
                 },
                 ReplicaInfo {
                     replica_id: 1002,
-                    transports: vec![derec_proto::TransportProtocol {
+                    transports: vec![TransportProtocol {
                         uri: "https://alice-2.example.org/derec".to_owned(),
-                        protocol: derec_proto::Protocol::Https as i32,
+                        protocol: Protocol::Https as i32,
                     }],
                     role: ReplicaRole::Destination as i32,
                     communication_info: HashMap::new(),

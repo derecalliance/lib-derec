@@ -3,10 +3,11 @@
 
 use crate::{
     Error,
-    derec_message::extract_inner_message,
+    derec_message::{DeRecMessageBuilder, extract_inner_message},
     primitives::verification::{
+        VerificationError,
         request::{
-            extract as extract_verify_share_request,
+            ExtractResult, extract as extract_verify_share_request,
             produce as produce_verify_share_request_message,
         },
         response::{
@@ -15,16 +16,17 @@ use crate::{
             produce as produce_verify_share_response_message,
         },
     },
+    transport::TransportValidationError,
     types::ChannelId,
 };
-use derec_proto::{DeRecMessage, MessageBody, StatusEnum};
+use derec_proto::{
+    DeRecMessage, MessageBody, Protocol, StatusEnum, TransportProtocol, VerifyShareRequestMessage,
+};
 use prost::Message;
 use sha2::{Digest, Sha384};
+use std::slice;
 
-fn parse_request(
-    envelope_bytes: &[u8],
-    shared_key: &[u8; 32],
-) -> crate::primitives::verification::request::ExtractResult {
+fn parse_request(envelope_bytes: &[u8], shared_key: &[u8; 32]) -> ExtractResult {
     extract_verify_share_request(envelope_bytes, shared_key)
         .expect("extract_verify_share_request failed")
 }
@@ -110,7 +112,7 @@ fn test_extract_verify_share_request_rejects_tampered_timestamp() {
     tampered_timestamp.seconds += 1;
 
     // Build a tampered envelope with a mismatched outer timestamp.
-    let tampered_envelope = crate::derec_message::DeRecMessageBuilder::channel()
+    let tampered_envelope = DeRecMessageBuilder::channel()
         .channel_id(channel_id)
         .timestamp(tampered_timestamp)
         .message_body(MessageBody::VerifyShareRequest(message))
@@ -315,7 +317,7 @@ fn test_verification_fails_with_modified_response_nonce() {
 
     response_message.nonce = 123;
 
-    let tampered_envelope = crate::derec_message::DeRecMessageBuilder::channel()
+    let tampered_envelope = DeRecMessageBuilder::channel()
         .channel_id(channel_id)
         .timestamp(
             response_outer
@@ -337,10 +339,7 @@ fn test_verification_fails_with_modified_response_nonce() {
     assert!(matches!(
         process_verify_share_response_message(&req.request, &resp_result.response, share_content),
         Err(Error::Verification(
-            crate::primitives::verification::VerificationError::ResponseBindingMismatch {
-                field: "nonce",
-                ..
-            }
+            VerificationError::ResponseBindingMismatch { field: "nonce", .. }
         ))
     ));
 }
@@ -375,7 +374,7 @@ fn test_process_verify_share_response_message_rejects_tampered_envelope_timestam
     let mut tampered_timestamp = original_timestamp;
     tampered_timestamp.seconds += 1;
 
-    let tampered_envelope = crate::derec_message::DeRecMessageBuilder::channel()
+    let tampered_envelope = DeRecMessageBuilder::channel()
         .channel_id(channel_id)
         .timestamp(tampered_timestamp)
         .message_body(MessageBody::VerifyShareResponse(response_message))
@@ -498,10 +497,7 @@ fn test_process_rejects_response_with_mismatched_request_nonce() {
     assert!(matches!(
         result,
         Err(Error::Verification(
-            crate::primitives::verification::VerificationError::ResponseBindingMismatch {
-                field: "nonce",
-                ..
-            }
+            VerificationError::ResponseBindingMismatch { field: "nonce", .. }
         ))
     ));
 }
@@ -534,7 +530,7 @@ fn test_process_rejects_response_with_mismatched_secret_id() {
 
     // Pretend the owner is checking against a different originating request
     // that carried a different secret_id.
-    let mismatched_request = derec_proto::VerifyShareRequestMessage {
+    let mismatched_request = VerifyShareRequestMessage {
         secret_id: 999,
         version: req.request.version,
         nonce: req.request.nonce,
@@ -546,7 +542,7 @@ fn test_process_rejects_response_with_mismatched_secret_id() {
     assert!(matches!(
         result,
         Err(Error::Verification(
-            crate::primitives::verification::VerificationError::ResponseBindingMismatch {
+            VerificationError::ResponseBindingMismatch {
                 field: "secret_id",
                 ..
             }
@@ -580,7 +576,7 @@ fn test_process_rejects_response_with_mismatched_version() {
     )
     .expect("extract response");
 
-    let mismatched_request = derec_proto::VerifyShareRequestMessage {
+    let mismatched_request = VerifyShareRequestMessage {
         secret_id: req.request.secret_id,
         version: req.request.version + 1,
         nonce: req.request.nonce,
@@ -592,7 +588,7 @@ fn test_process_rejects_response_with_mismatched_version() {
     assert!(matches!(
         result,
         Err(Error::Verification(
-            crate::primitives::verification::VerificationError::ResponseBindingMismatch {
+            VerificationError::ResponseBindingMismatch {
                 field: "version",
                 ..
             }
@@ -611,9 +607,9 @@ fn test_extract_verify_share_request_rejects_scheme_mismatched_reply_to() {
     let channel_id = ChannelId(11);
     let shared_key = [42u8; 32];
 
-    let malicious_reply_to = derec_proto::TransportProtocol {
+    let malicious_reply_to = TransportProtocol {
         uri: "ws://attacker.example/inbox".to_owned(),
-        protocol: derec_proto::Protocol::Https as i32,
+        protocol: Protocol::Https as i32,
     };
 
     let produced = produce_verify_share_request_message(
@@ -621,7 +617,7 @@ fn test_extract_verify_share_request_rejects_scheme_mismatched_reply_to() {
         1,
         1,
         &shared_key,
-        std::slice::from_ref(&malicious_reply_to),
+        slice::from_ref(&malicious_reply_to),
     )
     .expect("failed to produce verification request");
 
@@ -630,7 +626,7 @@ fn test_extract_verify_share_request_rejects_scheme_mismatched_reply_to() {
     assert!(matches!(
         result,
         Err(Error::Transport(
-            crate::transport::TransportValidationError::SchemeMismatch { .. }
+            TransportValidationError::SchemeMismatch { .. }
         ))
     ));
 }

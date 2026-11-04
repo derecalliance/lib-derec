@@ -11,9 +11,7 @@ mod handshake_tests {
         c.communication_info_entries
             .iter()
             .filter_map(|e| match &e.value {
-                Some(derec_proto::communication_info_key_value::Value::StringValue(s)) => {
-                    Some((e.key.clone(), s.clone()))
-                }
+                Some(Value::StringValue(s)) => Some((e.key.clone(), s.clone())),
                 _ => None,
             })
             .collect()
@@ -73,21 +71,13 @@ mod handshake_tests {
     fn extract_strips_reserved_key_and_returns_typed_id() {
         let info = Some(CommunicationInfo {
             communication_info_entries: vec![
-                derec_proto::CommunicationInfoKeyValue {
+                CommunicationInfoKeyValue {
                     key: "name".to_owned(),
-                    value: Some(
-                        derec_proto::communication_info_key_value::Value::StringValue(
-                            "Bob".to_owned(),
-                        ),
-                    ),
+                    value: Some(Value::StringValue("Bob".to_owned())),
                 },
-                derec_proto::CommunicationInfoKeyValue {
+                CommunicationInfoKeyValue {
                     key: reserved_keys::DEREC_REPLICA_ID_KEY.to_owned(),
-                    value: Some(
-                        derec_proto::communication_info_key_value::Value::StringValue(
-                            "3405691582".to_owned(),
-                        ),
-                    ),
+                    value: Some(Value::StringValue("3405691582".to_owned())),
                 },
             ],
         });
@@ -104,11 +94,9 @@ mod handshake_tests {
     #[test]
     fn extract_rejects_replica_pairing_missing_reserved_key() {
         let info = Some(CommunicationInfo {
-            communication_info_entries: vec![derec_proto::CommunicationInfoKeyValue {
+            communication_info_entries: vec![CommunicationInfoKeyValue {
                 key: "name".to_owned(),
-                value: Some(
-                    derec_proto::communication_info_key_value::Value::StringValue("Bob".to_owned()),
-                ),
+                value: Some(Value::StringValue("Bob".to_owned())),
             }],
         });
 
@@ -127,13 +115,9 @@ mod handshake_tests {
     #[test]
     fn extract_rejects_non_replica_pairing_carrying_reserved_key() {
         let info = Some(CommunicationInfo {
-            communication_info_entries: vec![derec_proto::CommunicationInfoKeyValue {
+            communication_info_entries: vec![CommunicationInfoKeyValue {
                 key: reserved_keys::DEREC_REPLICA_ID_KEY.to_owned(),
-                value: Some(
-                    derec_proto::communication_info_key_value::Value::StringValue(
-                        "12345".to_owned(),
-                    ),
-                ),
+                value: Some(Value::StringValue("12345".to_owned())),
             }],
         });
 
@@ -190,11 +174,11 @@ mod handshake_tests {
         let own = [
             TransportProtocol {
                 uri: "grpcs://me.example:443".to_owned(),
-                protocol: derec_proto::Protocol::Grpc as i32,
+                protocol: Protocol::Grpc as i32,
             },
             TransportProtocol {
                 uri: "https://me.example/derec".to_owned(),
-                protocol: derec_proto::Protocol::Https as i32,
+                protocol: Protocol::Https as i32,
             },
         ];
 
@@ -214,7 +198,7 @@ mod handshake_tests {
     fn prepair_advertises_the_sole_endpoint_when_only_one_is_served() {
         let own = [TransportProtocol {
             uri: "https://me.example/derec".to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         }];
 
         let lf = LocalFixture {
@@ -243,6 +227,11 @@ mod handshake_tests {
         ChannelQuery, ChannelRecord, ChannelStatus, HelperChannel, HelperFilter, ReplicaFilter,
         ReplicaMember,
     };
+    use derec_proto::communication_info_key_value::Value;
+    use derec_proto::{CommunicationInfoKeyValue, Protocol};
+    use std::future;
+    use std::future::Future;
+    use tokio::runtime::Builder;
 
     struct FixedChannelStore {
         seeded: Option<ChannelRecord>,
@@ -251,19 +240,19 @@ mod handshake_tests {
     impl DeRecChannelStore for FixedChannelStore {
         fn load(&self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
             let v = self.seeded.clone();
-            Box::pin(std::future::ready(Ok(v)))
+            Box::pin(future::ready(Ok(v)))
         }
         fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
-            Box::pin(std::future::ready(Ok(())))
+            Box::pin(future::ready(Ok(())))
         }
         fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
-            Box::pin(std::future::ready(Ok(false)))
+            Box::pin(future::ready(Ok(false)))
         }
         fn helpers(&self, _: u64, _: HelperFilter) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
-            Box::pin(std::future::ready(Ok(Vec::new())))
+            Box::pin(future::ready(Ok(Vec::new())))
         }
         fn replicas(&self, _: u64, _: ReplicaFilter) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
-            Box::pin(std::future::ready(Ok(Vec::new())))
+            Box::pin(future::ready(Ok(Vec::new())))
         }
         fn link_channel(
             &mut self,
@@ -271,14 +260,14 @@ mod handshake_tests {
             _: ChannelId,
             _: ChannelId,
         ) -> ChannelStoreFuture<'_, ()> {
-            Box::pin(std::future::ready(Ok(())))
+            Box::pin(future::ready(Ok(())))
         }
         fn linked_channels(
             &self,
             _: u64,
             cid: ChannelId,
         ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
-            Box::pin(std::future::ready(Ok(vec![cid])))
+            Box::pin(future::ready(Ok(vec![cid])))
         }
     }
 
@@ -297,8 +286,8 @@ mod handshake_tests {
         })
     }
 
-    fn run_async<F: std::future::Future<Output = ()>>(f: F) {
-        tokio::runtime::Builder::new_current_thread()
+    fn run_async<F: Future<Output = ()>>(f: F) {
+        Builder::new_current_thread()
             .build()
             .expect("test runtime")
             .block_on(f)
@@ -385,8 +374,13 @@ mod prepair_record_shape_tests {
     use super::super::*;
     use crate::protocol::tests::LocalFixture;
     use crate::protocol::tests::{StoreRig, run_async};
-    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember};
+    use crate::protocol::types::{
+        ChannelQuery, ChannelRecord, ChannelStatus, HelperChannel, ReplicaFilter, ReplicaMember,
+        ReplicaRole,
+    };
     use crate::types::ReplicaId;
+    use derec_proto::Protocol;
+    use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0x0B0E_9A19;
     const CHANNEL: ChannelId = ChannelId(6000);
@@ -395,7 +389,7 @@ mod prepair_record_shape_tests {
     fn endpoint() -> TransportProtocol {
         TransportProtocol {
             uri: "https://peer.example".to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         }
     }
 
@@ -403,14 +397,12 @@ mod prepair_record_shape_tests {
         vec![endpoint()]
     }
 
-    /// `start` records a replica scanner as its own roster row, not as a
-    /// helper channel, so the PrePair-response handler has to resolve the
-    /// local sender kind from either shape.
-    ///
-    /// Reading only the helper shape made `HashedKeys` and `NoKeys` — the two
-    /// modes with a PrePair leg — unusable for admitting a replica at all.
+    /// A replica scanner records its pairing like any other: a `Pending`
+    /// placeholder carrying the peer's role, from which the PrePair and pair
+    /// responses resolve the local kind. Nothing enters the replica roster —
+    /// a pairing in flight is not group membership.
     #[test]
-    fn a_replica_scanner_is_recorded_as_its_own_roster_row() {
+    fn a_replica_scanner_is_recorded_as_a_pending_placeholder() {
         run_async(async {
             let lf = LocalFixture::new(SECRET_ID);
             let mut rig = StoreRig::new();
@@ -419,46 +411,33 @@ mod prepair_record_shape_tests {
                 &lf.local(),
                 CHANNEL,
                 endpoints(),
-                std::collections::HashMap::new(),
+                HashMap::new(),
                 SenderKind::ReplicaDestination,
-                Some(OWN_REPLICA),
             )
             .await
             .expect("persist start record");
 
-            assert!(
-                rig.channels
-                    .load(
-                        SECRET_ID,
-                        crate::protocol::types::ChannelQuery::Helper {
-                            channel_id: CHANNEL
-                        }
-                    )
-                    .await
-                    .expect("load")
-                    .and_then(|r| r.as_helper().cloned())
-                    .is_none(),
-                "a replica scanner writes no helper record — resolving only that \
-                 shape is what broke PrePair for replicas"
-            );
-
-            let member = rig
+            let placeholder = rig
                 .channels
                 .load(
                     SECRET_ID,
-                    crate::protocol::types::ChannelQuery::Replica {
+                    ChannelQuery::Helper {
                         channel_id: CHANNEL,
-                        replica_id: ReplicaId(OWN_REPLICA),
                     },
                 )
                 .await
                 .expect("load")
-                .and_then(|r| r.as_replica().cloned())
-                .expect("the replica scanner records its own roster row");
-            assert_eq!(
-                member.role.to_sender_kind(),
-                SenderKind::ReplicaDestination,
-                "the row carries the local kind the PrePair response needs"
+                .and_then(|r| r.as_helper().cloned())
+                .expect("the replica scanner records a placeholder");
+            assert_eq!(placeholder.peer_role, SenderKind::ReplicaSource);
+            assert_eq!(placeholder.status, ChannelStatus::Pending);
+            assert!(
+                rig.channels
+                    .replicas(SECRET_ID, ReplicaFilter::default())
+                    .await
+                    .expect("list members")
+                    .is_empty(),
+                "no roster row is written before the pairing is confirmed"
             );
         });
     }
@@ -475,34 +454,27 @@ mod prepair_record_shape_tests {
                     endpoint(),
                     TransportProtocol {
                         uri: "grpcs://peer.example:443".to_owned(),
-                        protocol: derec_proto::Protocol::Grpc as i32,
+                        protocol: Protocol::Grpc as i32,
                     },
                 ],
-                communication_info: std::collections::HashMap::from([
+                communication_info: HashMap::from([
                     ("name".to_owned(), "Alice-1".to_owned()),
                     ("blank".to_owned(), "  ".to_owned()),
                     ("derec.replica_id".to_owned(), "spoofed".to_owned()),
                 ]),
+                replica_id: Some(OWN_REPLICA),
                 ..LocalFixture::new(SECRET_ID)
             };
             let mut rig = StoreRig::new();
-            persist_start_record(
-                &mut rig.stores(),
-                &lf.local(),
-                CHANNEL,
-                endpoints(),
-                std::collections::HashMap::new(),
-                SenderKind::ReplicaSource,
-                Some(OWN_REPLICA),
-            )
-            .await
-            .expect("persist start record");
+            claim_own_member(&mut rig.stores(), &lf.local(), CHANNEL, ReplicaRole::Source)
+                .await
+                .expect("claim own row");
 
             let member = rig
                 .channels
                 .load(
                     SECRET_ID,
-                    crate::protocol::types::ChannelQuery::Replica {
+                    ChannelQuery::Replica {
                         channel_id: CHANNEL,
                         replica_id: ReplicaId(OWN_REPLICA),
                     },
@@ -511,13 +483,68 @@ mod prepair_record_shape_tests {
                 .expect("load")
                 .and_then(|r| r.as_replica().cloned())
                 .expect("own roster row present");
+            assert_eq!(member.status, ChannelStatus::Paired);
             assert_eq!(
                 member.transports, lf.own_transports,
                 "every advertised endpoint, in preference order"
             );
             assert_eq!(
                 member.communication_info,
-                std::collections::HashMap::from([("name".to_owned(), "Alice-1".to_owned())]),
+                HashMap::from([("name".to_owned(), "Alice-1".to_owned())]),
+            );
+        });
+    }
+
+    /// The first confirmed pairing fixes the group's channel: a later one
+    /// leaves a `Paired` own row where it is, while an own row that is not
+    /// `Paired` names no group and is replaced.
+    #[test]
+    fn claiming_the_own_row_keeps_a_group_and_replaces_anything_else() {
+        run_async(async {
+            const GROUP: ChannelId = ChannelId(5001);
+            const LATER: ChannelId = ChannelId(7001);
+            let lf = LocalFixture {
+                replica_id: Some(OWN_REPLICA),
+                ..LocalFixture::new(SECRET_ID)
+            };
+            let own_channel = |rig: &StoreRig| {
+                rig.channels
+                    .member_rows
+                    .lock()
+                    .unwrap()
+                    .get(&(SECRET_ID, OWN_REPLICA))
+                    .map(|m| (m.channel_id, m.status))
+            };
+
+            let mut rig = StoreRig::new();
+            rig.channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Replica(ReplicaMember {
+                        channel_id: ChannelId(100),
+                        replica_id: ReplicaId(OWN_REPLICA),
+                        transports: endpoints(),
+                        communication_info: HashMap::new(),
+                        role: ReplicaRole::Source,
+                        status: ChannelStatus::Pending,
+                        created_at: 0,
+                    }),
+                )
+                .await
+                .expect("seed a leftover own row");
+
+            claim_own_member(&mut rig.stores(), &lf.local(), GROUP, ReplicaRole::Source)
+                .await
+                .expect("first claim");
+            assert_eq!(own_channel(&rig), Some((GROUP, ChannelStatus::Paired)));
+
+            claim_own_member(&mut rig.stores(), &lf.local(), LATER, ReplicaRole::Source)
+                .await
+                .expect("later claim");
+            assert_eq!(
+                own_channel(&rig),
+                Some((GROUP, ChannelStatus::Paired)),
+                "a device in a group keeps its channel"
             );
         });
     }
@@ -534,9 +561,8 @@ mod prepair_record_shape_tests {
                 &lf.local(),
                 CHANNEL,
                 endpoints(),
-                std::collections::HashMap::new(),
+                HashMap::new(),
                 SenderKind::Owner,
-                None,
             )
             .await
             .expect("persist start record");
@@ -545,7 +571,7 @@ mod prepair_record_shape_tests {
                 .channels
                 .load(
                     SECRET_ID,
-                    crate::protocol::types::ChannelQuery::Helper {
+                    ChannelQuery::Helper {
                         channel_id: CHANNEL,
                     },
                 )
@@ -559,8 +585,8 @@ mod prepair_record_shape_tests {
                 channel_id: CHANNEL,
                 replica_id: ReplicaId(OWN_REPLICA),
                 transports: endpoints(),
-                communication_info: std::collections::HashMap::new(),
-                role: crate::protocol::types::ReplicaRole::Destination,
+                communication_info: HashMap::new(),
+                role: ReplicaRole::Destination,
                 status: ChannelStatus::Pending,
                 created_at: 0,
             });
@@ -622,13 +648,21 @@ mod pairing_material_cleanup_tests {
 
 #[cfg(test)]
 mod replica_id_conflict_tests {
+    use super::super::pair::abandon_pairing;
+    use super::super::replica_id_is_taken;
     use crate::protocol::context::PairingConfig;
     use crate::protocol::tests::LocalFixture;
     use crate::protocol::tests::StoreRig;
     use crate::protocol::tests::{InMemChannelStore, run_async};
-    use crate::protocol::types::{ChannelRecord, ChannelStatus, ReplicaMember, ReplicaRole};
-    use crate::protocol::{DeRecChannelStore, DeRecSecretStore, SecretKind, SecretValue};
+    use crate::protocol::types::{
+        ChannelRecord, ChannelStatus, ReplicaFilter, ReplicaMember, ReplicaRole,
+    };
+    use crate::protocol::{
+        DeRecChannelStore, DeRecSecretStore, PairingKeyMaterial, SecretKind, SecretValue,
+    };
     use crate::types::{ChannelId, ReplicaId};
+    use derec_proto::{Protocol, TransportProtocol};
+    use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0xD6;
     const GROUP: ChannelId = ChannelId(5001);
@@ -641,11 +675,11 @@ mod replica_id_conflict_tests {
                 ChannelRecord::Replica(ReplicaMember {
                     channel_id,
                     replica_id: ReplicaId(id),
-                    transports: vec![derec_proto::TransportProtocol {
+                    transports: vec![TransportProtocol {
                         uri: "https://peer.example".to_owned(),
-                        protocol: derec_proto::Protocol::Https as i32,
+                        protocol: Protocol::Https as i32,
                     }],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     role: ReplicaRole::Source,
                     status: ChannelStatus::Paired,
                     created_at: 0,
@@ -666,13 +700,13 @@ mod replica_id_conflict_tests {
             seed_member(&mut rig.channels, 1001, GROUP).await;
 
             assert!(
-                super::super::replica_id_is_taken(&mut rig.stores(), &lf.local(), 1001)
+                replica_id_is_taken(&mut rig.stores(), &lf.local(), 1001)
                     .await
                     .expect("check"),
                 "a peer announcing our own id must be refused"
             );
             assert!(
-                !super::super::replica_id_is_taken(&mut rig.stores(), &lf.local(), 1002)
+                !replica_id_is_taken(&mut rig.stores(), &lf.local(), 1002)
                     .await
                     .expect("check"),
                 "a distinct id is free"
@@ -694,13 +728,13 @@ mod replica_id_conflict_tests {
                 .await
                 .expect("seed key");
 
-            super::super::pair::abandon_pairing(&mut rig.stores(), &lf.local(), PAIRING)
+            abandon_pairing(&mut rig.stores(), &lf.local(), PAIRING)
                 .await
                 .expect("abandon succeeds");
 
             assert!(
                 rig.channels
-                    .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
+                    .replicas(SECRET_ID, ReplicaFilter::default())
                     .await
                     .expect("roster")
                     .is_empty(),
@@ -720,13 +754,13 @@ mod replica_id_conflict_tests {
             seed_member(&mut rig.channels, 1001, GROUP).await;
             seed_member(&mut rig.channels, 1002, GROUP).await;
 
-            super::super::pair::abandon_pairing(&mut rig.stores(), &lf.local(), PAIRING)
+            abandon_pairing(&mut rig.stores(), &lf.local(), PAIRING)
                 .await
                 .expect("abandon succeeds");
 
             let roster = rig
                 .channels
-                .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
+                .replicas(SECRET_ID, ReplicaFilter::default())
                 .await
                 .expect("roster");
             assert_eq!(
@@ -747,14 +781,12 @@ mod replica_id_conflict_tests {
                 .save(
                     SECRET_ID,
                     PAIRING,
-                    SecretValue::PairingSecret(
-                        crate::protocol::types::PairingKeyMaterial::from_bytes(vec![0x01, 0x02]),
-                    ),
+                    SecretValue::PairingSecret(PairingKeyMaterial::from_bytes(vec![0x01, 0x02])),
                 )
                 .await
                 .expect("seed pairing secret");
 
-            super::super::pair::abandon_pairing(&mut rig.stores(), &lf.local(), PAIRING)
+            abandon_pairing(&mut rig.stores(), &lf.local(), PAIRING)
                 .await
                 .expect("abandon succeeds");
 
@@ -776,10 +808,7 @@ mod replica_id_conflict_tests {
     fn accept_offers_the_transport_every_advertised_endpoint() {
         use super::super::pair::accept;
         use crate::primitives::pairing::request;
-        use crate::protocol::tests::run_async;
-        use crate::protocol::{DeRecSecretStore, PairingKeyMaterial, SecretValue};
-        use crate::types::ChannelId;
-        use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
+        use derec_proto::{ContactMode, SenderKind};
 
         run_async(async {
             let channel_id = ChannelId(0xACCE_9701);
@@ -875,11 +904,11 @@ mod replica_id_conflict_tests {
             assert_eq!(
                 rig.transport.sent_endpoint_sets(),
                 vec![vec![
-                    derec_proto::TransportProtocol {
+                    TransportProtocol {
                         uri: "https://peer.example.com/derec".to_owned(),
                         protocol: Protocol::Https as i32,
                     },
-                    derec_proto::TransportProtocol {
+                    TransportProtocol {
                         uri: "grpcs://peer.example.com:443".to_owned(),
                         protocol: Protocol::Grpc as i32,
                     },
@@ -971,6 +1000,7 @@ mod fingerprint_gate_tests {
 /// completes.
 #[cfg(test)]
 mod own_member_channel_tests {
+    use super::super::{build_communication_info, claim_own_member, pair, start};
     use crate::primitives::pairing::{request, response};
     use crate::protocol::context::PairingConfig;
     use crate::protocol::tests::{LocalFixture, StoreRig, run_async};
@@ -980,6 +1010,7 @@ mod own_member_channel_tests {
     use crate::protocol::{DeRecChannelStore, DeRecSecretStore, SecretKind, SecretValue};
     use crate::types::{ChannelId, ReplicaId};
     use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
+    use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0x0A11_CE00;
     const OWN: u64 = 1001;
@@ -1033,13 +1064,13 @@ mod own_member_channel_tests {
         let joiner_secret = secret_key.expect("InlineKeys returns key material");
 
         let sent_before = rig.transport.sent_envelopes().len();
-        super::super::start(
+        start(
             &mut rig.stores(),
             &lf.local(),
             &pairing_cfg,
             SenderKind::ReplicaSource,
             contact_message,
-            std::collections::HashMap::new(),
+            HashMap::new(),
             0,
         )
         .await
@@ -1054,10 +1085,7 @@ mod own_member_channel_tests {
             contact_channel,
             &pair_request,
             &joiner_secret,
-            super::super::build_communication_info(
-                &std::collections::HashMap::new(),
-                Some(joiner_id),
-            ),
+            build_communication_info(&HashMap::new(), Some(joiner_id)),
             None,
             lf.policy,
         )
@@ -1077,7 +1105,7 @@ mod own_member_channel_tests {
         } = response::extract(&produced.envelope, own_secret.ecies_secret_key())
             .expect("initiator extracts the response");
 
-        super::super::pair::on_response(
+        pair::on_response(
             &mut rig.stores(),
             &lf.local(),
             &pairing_cfg,
@@ -1104,7 +1132,7 @@ mod own_member_channel_tests {
                         channel_id: GROUP,
                         replica_id: ReplicaId(OWN),
                         transports: lf.own_transports.clone(),
-                        communication_info: std::collections::HashMap::new(),
+                        communication_info: HashMap::new(),
                         role: ReplicaRole::Source,
                         status: ChannelStatus::Paired,
                         created_at: 0,
@@ -1124,11 +1152,11 @@ mod own_member_channel_tests {
         });
     }
 
-    /// A first-time initiator's row moves from the contact-time channel onto
-    /// the rekeyed one, which becomes the group's; a second admission leaves
-    /// it there.
+    /// A first-time initiator holds no own row until it confirms a pairing;
+    /// the first confirmed channel becomes the group's, and confirming a later
+    /// admission leaves it there.
     #[test]
-    fn joiners_admitted_in_sequence_keep_the_first_group_channel() {
+    fn joiners_admitted_in_sequence_keep_the_first_confirmed_group_channel() {
         run_async(async {
             let lf = LocalFixture::with_replica(SECRET_ID, OWN);
             let mut rig = StoreRig::new();
@@ -1136,14 +1164,25 @@ mod own_member_channel_tests {
             let first_contact = ChannelId(0x0C0_0002);
             let group = admit_joiner(&mut rig, &lf, first_contact, 2002).await;
             assert_ne!(group, first_contact);
-            assert_eq!(
-                own_channel(&rig).await,
-                group,
-                "a first-time initiator is re-pointed onto the rekeyed channel"
+            assert!(
+                rig.channels
+                    .member_rows
+                    .lock()
+                    .unwrap()
+                    .get(&(SECRET_ID, OWN))
+                    .is_none(),
+                "a completed but unconfirmed pairing writes no own row"
             );
+            claim_own_member(&mut rig.stores(), &lf.local(), group, ReplicaRole::Source)
+                .await
+                .expect("confirming claims the group channel");
+            assert_eq!(own_channel(&rig).await, group);
 
             let second = admit_joiner(&mut rig, &lf, ChannelId(0x0C0_0003), 2003).await;
             assert_ne!(second, group);
+            claim_own_member(&mut rig.stores(), &lf.local(), second, ReplicaRole::Source)
+                .await
+                .expect("confirming a later admission");
             assert_eq!(
                 own_channel(&rig).await,
                 group,

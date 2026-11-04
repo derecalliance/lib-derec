@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_cryptography::vss::DerecVSSError;
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SharingError {
@@ -41,7 +43,7 @@ pub enum SharingError {
     #[error("VSS failed to generate shares")]
     VssShareFailed {
         #[source]
-        source: derec_cryptography::vss::DerecVSSError,
+        source: DerecVSSError,
     },
 
     #[error("share response indicates a non-OK status (status={status}): {memo}")]

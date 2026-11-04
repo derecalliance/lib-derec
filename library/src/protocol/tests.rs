@@ -8,6 +8,13 @@
 //! owns the impl, so the only post-construction mutation path is through the
 //! trait), and inspect the persisted state afterwards.
 
+use crate::Error;
+use crate::protocol::Refusal;
+use crate::protocol::SecretStoreError;
+use crate::protocol::ShareStoreError;
+use crate::protocol::context::Local;
+use crate::protocol::stores::Set;
+use crate::protocol::stores::Stores;
 use crate::protocol::traits::{
     ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
     DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture, TransportFuture,
@@ -17,10 +24,18 @@ use crate::protocol::types::{
     ReplicaMember, SecretKind, SecretValue, Share, UserSecrets,
 };
 use crate::protocol::{DeRecStateStore, StateItem, StateKey, StateKind, StateStoreFuture};
+use crate::transport::TransportPolicy;
 use crate::types::ChannelId;
+use derec_proto::ParameterRange;
+use derec_proto::Protocol;
 use derec_proto::TransportProtocol;
+use derec_proto::de_rec_share::Subshare;
+use prost::Message;
 use std::collections::HashMap;
+use std::future;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
+use tokio::runtime::Builder;
 
 /// Two maps, mirroring the two primary keys the trait defines, plus the
 /// channel-link graph recovery walks.
@@ -51,7 +66,7 @@ impl DeRecChannelStore for InMemChannelStore {
                 .cloned()
                 .map(ChannelRecord::Replica),
         };
-        Box::pin(std::future::ready(Ok(found)))
+        Box::pin(future::ready(Ok(found)))
     }
 
     fn save(&mut self, sid: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
@@ -69,7 +84,7 @@ impl DeRecChannelStore for InMemChannelStore {
                     .insert((sid, r.replica_id.0), r);
             }
         }
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 
     fn remove(&mut self, sid: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
@@ -87,7 +102,7 @@ impl DeRecChannelStore for InMemChannelStore {
                 .remove(&(sid, replica_id.0))
                 .is_some(),
         };
-        Box::pin(std::future::ready(Ok(removed)))
+        Box::pin(future::ready(Ok(removed)))
     }
 
     fn helpers(
@@ -104,7 +119,7 @@ impl DeRecChannelStore for InMemChannelStore {
             .map(|(_, c)| c.clone())
             .filter(|c| filter.matches(&c.channel_id, c.status, &c.peer_role))
             .collect();
-        Box::pin(std::future::ready(Ok(v)))
+        Box::pin(future::ready(Ok(v)))
     }
 
     fn replicas(
@@ -121,7 +136,7 @@ impl DeRecChannelStore for InMemChannelStore {
             .map(|(_, m)| m.clone())
             .filter(|m| filter.matches(&m.replica_id, m.status, &m.role))
             .collect();
-        Box::pin(std::future::ready(Ok(v)))
+        Box::pin(future::ready(Ok(v)))
     }
 
     fn link_channel(&mut self, sid: u64, a: ChannelId, b: ChannelId) -> ChannelStoreFuture<'_, ()> {
@@ -133,7 +148,7 @@ impl DeRecChannelStore for InMemChannelStore {
             }
         }
         drop(links);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 
     /// Transitive closure including the start node — the same walk a SQL
@@ -152,10 +167,7 @@ impl DeRecChannelStore for InMemChannelStore {
             }
         }
         drop(links);
-        Box::pin(std::future::ready(Ok(seen
-            .into_iter()
-            .map(ChannelId)
-            .collect())))
+        Box::pin(future::ready(Ok(seen.into_iter().map(ChannelId).collect())))
     }
 }
 
@@ -178,7 +190,7 @@ impl DeRecSecretStore for InMemSecretStore {
             .unwrap()
             .get(&(sid, cid.0, kind as u8))
             .cloned();
-        Box::pin(std::future::ready(Ok(v)))
+        Box::pin(future::ready(Ok(v)))
     }
     fn load_many(
         &self,
@@ -198,14 +210,12 @@ impl DeRecSecretStore for InMemSecretStore {
         }
         drop(data);
         if missing_policy == MissingPolicy::Fail && !missing.is_empty() {
-            return Box::pin(std::future::ready(Err(
-                crate::protocol::SecretStoreError::MissingEntries {
-                    kind,
-                    channel_ids: missing,
-                },
-            )));
+            return Box::pin(future::ready(Err(SecretStoreError::MissingEntries {
+                kind,
+                channel_ids: missing,
+            })));
         }
-        Box::pin(std::future::ready(Ok(out)))
+        Box::pin(future::ready(Ok(out)))
     }
     fn save(&mut self, sid: u64, cid: ChannelId, value: SecretValue) -> SecretStoreFuture<'_, ()> {
         let k = match &value {
@@ -214,11 +224,11 @@ impl DeRecSecretStore for InMemSecretStore {
             SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
         };
         self.data.lock().unwrap().insert((sid, cid.0, k), value);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn remove(&mut self, sid: u64, cid: ChannelId, kind: SecretKind) -> SecretStoreFuture<'_, ()> {
         self.data.lock().unwrap().remove(&(sid, cid.0, kind as u8));
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 }
 
@@ -247,7 +257,7 @@ impl DeRecShareStore for InMemShareStore {
             })
             .map(|(_, s)| s.clone())
             .collect();
-        Box::pin(std::future::ready(Ok(out)))
+        Box::pin(future::ready(Ok(out)))
     }
     /// Ordered by `(version, channel_id)`. A store backed by a real database
     /// returns rows in whatever order the plan produces, so a caller that
@@ -270,7 +280,7 @@ impl DeRecShareStore for InMemShareStore {
             .map(|((_, c, _), share)| (*c, share.clone()))
             .collect();
         out.sort_by_key(|(c, share)| (share.version, *c));
-        Box::pin(std::future::ready(Ok(out
+        Box::pin(future::ready(Ok(out
             .into_iter()
             .map(|(_, share)| share)
             .collect())))
@@ -279,15 +289,15 @@ impl DeRecShareStore for InMemShareStore {
         self.load_many(sid, cids, &[])
     }
     fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
-        Box::pin(std::future::ready(Ok(None)))
+        Box::pin(future::ready(Ok(None)))
     }
     fn save(&mut self, sid: u64, cid: ChannelId, share: Share) -> ShareStoreFuture<'_, ()> {
         let v = share.version;
         self.data.lock().unwrap().insert((sid, cid.0, v), share);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn remove_versions(
         &mut self,
@@ -299,23 +309,21 @@ impl DeRecShareStore for InMemShareStore {
             .lock()
             .unwrap()
             .retain(|(s, c, v), _| !(*s == sid && *c == cid.0 && versions.contains(v)));
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn keep_version(&self, sid: u64, version: u32) -> ShareStoreFuture<'_, u32> {
         self.keep_version_calls.lock().unwrap().push((sid, version));
         if *self.keep_version_error.lock().unwrap() {
-            return Box::pin(std::future::ready(Err(
-                crate::protocol::ShareStoreError::Backend(
-                    "share store backend unavailable".to_owned().into(),
-                ),
-            )));
+            return Box::pin(future::ready(Err(ShareStoreError::Backend(
+                "share store backend unavailable".to_owned().into(),
+            ))));
         }
         let keep = self
             .keep
             .lock()
             .unwrap()
             .unwrap_or(version.saturating_sub(1));
-        Box::pin(std::future::ready(Ok(keep)))
+        Box::pin(future::ready(Ok(keep)))
     }
 }
 
@@ -327,9 +335,9 @@ impl DeRecShareStore for InMemShareStore {
 #[derive(Default, Clone)]
 pub(crate) struct RefusingShareStore {
     pub(crate) inner: InMemShareStore,
-    save_refusal: Arc<Mutex<Option<crate::protocol::Refusal>>>,
+    save_refusal: Arc<Mutex<Option<Refusal>>>,
     save_backend_error: Arc<Mutex<bool>>,
-    verification_refusal: Arc<Mutex<Option<crate::protocol::Refusal>>>,
+    verification_refusal: Arc<Mutex<Option<Refusal>>>,
     verification_backend_error: Arc<Mutex<bool>>,
     /// Every `(secret_id, channel_id, version)` `record_verification` was
     /// called with, in call order.
@@ -338,7 +346,7 @@ pub(crate) struct RefusingShareStore {
 }
 
 impl RefusingShareStore {
-    pub(crate) fn set_refusal(&self, refusal: Option<crate::protocol::Refusal>) {
+    pub(crate) fn set_refusal(&self, refusal: Option<Refusal>) {
         *self.save_refusal.lock().unwrap() = refusal;
     }
 
@@ -346,7 +354,7 @@ impl RefusingShareStore {
         *self.save_backend_error.lock().unwrap() = fail;
     }
 
-    pub(crate) fn set_verification_refusal(&self, refusal: Option<crate::protocol::Refusal>) {
+    pub(crate) fn set_verification_refusal(&self, refusal: Option<Refusal>) {
         *self.verification_refusal.lock().unwrap() = refusal;
     }
 
@@ -393,16 +401,12 @@ impl DeRecShareStore for RefusingShareStore {
         share: Share,
     ) -> ShareStoreFuture<'_, ()> {
         if let Some(refusal) = *self.save_refusal.lock().unwrap() {
-            return Box::pin(std::future::ready(Err(
-                crate::protocol::ShareStoreError::Refused(refusal),
-            )));
+            return Box::pin(future::ready(Err(ShareStoreError::Refused(refusal))));
         }
         if *self.save_backend_error.lock().unwrap() {
-            return Box::pin(std::future::ready(Err(
-                crate::protocol::ShareStoreError::Backend(
-                    "share store backend unavailable".to_owned().into(),
-                ),
-            )));
+            return Box::pin(future::ready(Err(ShareStoreError::Backend(
+                "share store backend unavailable".to_owned().into(),
+            ))));
         }
         self.inner.save(secret_id, channel_id, share)
     }
@@ -435,18 +439,14 @@ impl DeRecShareStore for RefusingShareStore {
             .unwrap()
             .push((secret_id, channel_id, version));
         if let Some(refusal) = *self.verification_refusal.lock().unwrap() {
-            return Box::pin(std::future::ready(Err(
-                crate::protocol::ShareStoreError::Refused(refusal),
-            )));
+            return Box::pin(future::ready(Err(ShareStoreError::Refused(refusal))));
         }
         if *self.verification_backend_error.lock().unwrap() {
-            return Box::pin(std::future::ready(Err(
-                crate::protocol::ShareStoreError::Backend(
-                    "share store backend unavailable".to_owned().into(),
-                ),
-            )));
+            return Box::pin(future::ready(Err(ShareStoreError::Backend(
+                "share store backend unavailable".to_owned().into(),
+            ))));
         }
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 }
 
@@ -458,15 +458,15 @@ pub(crate) struct InMemUserSecretStore {
 impl DeRecUserSecretStore for InMemUserSecretStore {
     fn load_latest(&self, sid: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
         let v = self.data.lock().unwrap().get(&sid).cloned();
-        Box::pin(std::future::ready(Ok(v)))
+        Box::pin(future::ready(Ok(v)))
     }
     fn save_latest(&mut self, sid: u64, value: UserSecrets) -> ShareStoreFuture<'_, ()> {
         self.data.lock().unwrap().insert(sid, value);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn remove(&mut self, sid: u64) -> ShareStoreFuture<'_, ()> {
         self.data.lock().unwrap().remove(&sid);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 }
 
@@ -475,16 +475,16 @@ impl DeRecUserSecretStore for InMemUserSecretStore {
 pub(crate) struct InMemStateStore;
 impl DeRecStateStore for InMemStateStore {
     fn save(&mut self, _: u64, _: StateItem) -> StateStoreFuture<'_, ()> {
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn load(&self, _: u64, _: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
-        Box::pin(std::future::ready(Ok(None)))
+        Box::pin(future::ready(Ok(None)))
     }
     fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
-        Box::pin(std::future::ready(Ok(false)))
+        Box::pin(future::ready(Ok(false)))
     }
     fn load_all(&self, _: u64, _: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
-        Box::pin(std::future::ready(Ok(Vec::new())))
+        Box::pin(future::ready(Ok(Vec::new())))
     }
 }
 
@@ -500,15 +500,15 @@ pub(crate) struct InMemPersistedStateStore {
 impl DeRecStateStore for InMemPersistedStateStore {
     fn save(&mut self, sid: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
         self.data.lock().unwrap().insert((sid, item.key()), item);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn load(&self, sid: u64, key: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
         let v = self.data.lock().unwrap().get(&(sid, key)).cloned();
-        Box::pin(std::future::ready(Ok(v)))
+        Box::pin(future::ready(Ok(v)))
     }
     fn remove(&mut self, sid: u64, key: StateKey) -> StateStoreFuture<'_, bool> {
         let removed = self.data.lock().unwrap().remove(&(sid, key)).is_some();
-        Box::pin(std::future::ready(Ok(removed)))
+        Box::pin(future::ready(Ok(removed)))
     }
     fn load_all(&self, sid: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
         let v: Vec<StateItem> = self
@@ -519,7 +519,7 @@ impl DeRecStateStore for InMemPersistedStateStore {
             .filter(|((s, k), _)| *s == sid && k.kind() == kind)
             .map(|(_, i)| i.clone())
             .collect();
-        Box::pin(std::future::ready(Ok(v)))
+        Box::pin(future::ready(Ok(v)))
     }
 }
 
@@ -527,7 +527,7 @@ impl DeRecStateStore for InMemPersistedStateStore {
 pub(crate) struct NoopTransport;
 impl DeRecTransport for NoopTransport {
     fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 }
 
@@ -538,7 +538,7 @@ impl DeRecTransport for NoopTransport {
 pub(crate) struct FailingTransport;
 impl DeRecTransport for FailingTransport {
     fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
-        Box::pin(std::future::ready(Err(crate::Error::InvalidInput(
+        Box::pin(future::ready(Err(Error::InvalidInput(
             "transport unreachable",
         ))))
     }
@@ -598,13 +598,13 @@ impl DeRecTransport for RecordingTransport {
             "the library must never send to a peer with no endpoints"
         );
         self.sent.lock().unwrap().push((endpoints.to_vec(), bytes));
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 }
 
 /// Drive an async test body to completion on a fresh current-thread runtime.
-pub(crate) fn run_async<F: std::future::Future<Output = ()>>(f: F) {
-    tokio::runtime::Builder::new_current_thread()
+pub(crate) fn run_async<F: Future<Output = ()>>(f: F) {
+    Builder::new_current_thread()
         .build()
         .expect("test runtime")
         .block_on(f)
@@ -724,11 +724,8 @@ where
     T: DeRecTransport,
 {
     /// Borrow every slot as the bundle a handler takes.
-    pub(crate) fn stores(
-        &mut self,
-    ) -> crate::protocol::stores::Stores<'_, crate::protocol::stores::Set<Ch, Sh, Ss, Us, St, T>>
-    {
-        crate::protocol::stores::Stores::new(
+    pub(crate) fn stores(&mut self) -> Stores<'_, Set<Ch, Sh, Ss, Us, St, T>> {
+        Stores::new(
             &mut self.channels,
             &mut self.shares,
             &mut self.secrets,
@@ -749,9 +746,9 @@ pub(crate) struct LocalFixture {
     pub(crate) secret_id: u64,
     pub(crate) replica_id: Option<u64>,
     pub(crate) own_transports: Vec<TransportProtocol>,
-    pub(crate) policy: crate::transport::TransportPolicy,
-    pub(crate) communication_info: std::collections::HashMap<String, String>,
-    pub(crate) parameter_range: Option<derec_proto::ParameterRange>,
+    pub(crate) policy: TransportPolicy,
+    pub(crate) communication_info: HashMap<String, String>,
+    pub(crate) parameter_range: Option<ParameterRange>,
 }
 
 impl LocalFixture {
@@ -762,10 +759,10 @@ impl LocalFixture {
             replica_id: None,
             own_transports: vec![TransportProtocol {
                 uri: "https://self.example".to_owned(),
-                protocol: derec_proto::Protocol::Https as i32,
+                protocol: Protocol::Https as i32,
             }],
-            policy: crate::transport::TransportPolicy::new(false),
-            communication_info: std::collections::HashMap::new(),
+            policy: TransportPolicy::new(false),
+            communication_info: HashMap::new(),
             parameter_range: None,
         }
     }
@@ -780,15 +777,15 @@ impl LocalFixture {
 
     /// The same, enforcing `range` as this device's helper-side share-size
     /// limits.
-    pub(crate) fn with_parameter_range(secret_id: u64, range: derec_proto::ParameterRange) -> Self {
+    pub(crate) fn with_parameter_range(secret_id: u64, range: ParameterRange) -> Self {
         Self {
             parameter_range: Some(range),
             ..Self::new(secret_id)
         }
     }
 
-    pub(crate) fn local(&self) -> crate::protocol::context::Local<'_> {
-        crate::protocol::context::Local {
+    pub(crate) fn local(&self) -> Local<'_> {
+        Local {
             secret_id: self.secret_id,
             replica_id: self.replica_id,
             own_transports: &self.own_transports,
@@ -818,10 +815,10 @@ pub(crate) fn pre_0_0_9_fields_before_y() -> Vec<u8> {
     use prost::encoding::bytes;
     let mut buf = Vec::new();
     bytes::encode(1, &vec![0xAB_u8; 4], &mut buf);
-    let x = derec_proto::de_rec_share::Subshare {
+    let x = Subshare {
         x: vec![0x01; 48],
         y: vec![0x03; 48],
     };
-    bytes::encode(2, &prost::Message::encode_to_vec(&x), &mut buf);
+    bytes::encode(2, &Message::encode_to_vec(&x), &mut buf);
     buf
 }

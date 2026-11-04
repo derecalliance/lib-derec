@@ -10,6 +10,7 @@ use std::io::Read as _;
 #[cfg(test)]
 use std::io::Write as _;
 
+use derec_proto::TransportProtocol;
 use flate2::read::GzDecoder;
 #[cfg(test)]
 use flate2::{Compression, write::GzEncoder};
@@ -17,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::types::secret::SecretError;
 use crate::protocol::types::{HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret};
+use crate::transport;
 
 /// Only the tests build v2 payloads now — decoding is v2's whole remaining
 /// job, so nothing in production compresses one.
@@ -38,6 +40,7 @@ fn gunzip(data: &[u8]) -> Result<Vec<u8>, SecretError> {
 
 mod base64_bytes {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::de;
     use serde::{Deserialize as _, Deserializer, Serializer};
 
     #[allow(clippy::ptr_arg)]
@@ -47,11 +50,12 @@ mod base64_bytes {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
-        STANDARD.decode(s).map_err(serde::de::Error::custom)
+        STANDARD.decode(s).map_err(de::Error::custom)
     }
 }
 
 mod u64_string {
+    use serde::de;
     use serde::{Deserialize as _, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
@@ -60,7 +64,7 @@ mod u64_string {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
         let s = String::deserialize(d)?;
-        s.parse::<u64>().map_err(serde::de::Error::custom)
+        s.parse::<u64>().map_err(de::Error::custom)
     }
 }
 
@@ -202,8 +206,8 @@ pub fn decode(payload: &[u8]) -> Result<Secret, SecretError> {
 /// An unparseable URI yields an empty list rather than a guessed endpoint:
 /// a peer with no reachable endpoint is recoverable information, a peer with
 /// a *wrong* one is not.
-fn lift_endpoint(uri: &str) -> Vec<derec_proto::TransportProtocol> {
-    match crate::transport::TransportProtocol::try_from(uri) {
+fn lift_endpoint(uri: &str) -> Vec<TransportProtocol> {
+    match transport::TransportProtocol::try_from(uri) {
         Ok(tp) => vec![tp.into()],
         Err(_error) => {
             #[cfg(feature = "logging")]
@@ -269,7 +273,7 @@ mod tests {
         assert_eq!(secret.helpers[0].channel_id, 7);
         assert_eq!(
             secret.helpers[0].transports,
-            vec![derec_proto::TransportProtocol {
+            vec![TransportProtocol {
                 uri: "https://helper-a.example/derec".to_owned(),
                 protocol: Protocol::Https as i32,
             }],

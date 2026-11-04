@@ -33,8 +33,9 @@
 //! depth is bounded by `prost`'s decoder, and the DeRec schema is shallow
 //! enough that no additional caller-side recursion limit is needed.
 
-use crate::{primitives::pairing::PairingError, types::SharedKey};
-use derec_cryptography::pairing::PairingSecretKeyMaterial;
+use crate::{Error, primitives::pairing::PairingError, types::SharedKey, utils::random_u64};
+use derec_cryptography::channel;
+use derec_cryptography::pairing::{PairingSecretKeyMaterial, envelope};
 use derec_proto::{DeRecMessage, MessageBody};
 use prost::Message;
 
@@ -49,10 +50,10 @@ mod tests;
 pub fn extract_inner_message(
     message_bytes: &[u8],
     shared_key: &SharedKey,
-) -> Result<MessageBody, crate::Error> {
+) -> Result<MessageBody, Error> {
     let decrypted = decrypt_inner_message(message_bytes, shared_key)?;
 
-    let inner = MessageBody::decode_from_vec(&decrypted).map_err(crate::Error::ProtobufDecode)?;
+    let inner = MessageBody::decode_from_vec(&decrypted).map_err(Error::ProtobufDecode)?;
 
     Ok(inner)
 }
@@ -67,11 +68,9 @@ pub fn extract_inner_message(
 pub(crate) fn decrypt_inner_message(
     message_bytes: &[u8],
     shared_key: &SharedKey,
-) -> Result<Vec<u8>, crate::Error> {
-    Ok(
-        derec_cryptography::channel::decrypt_message(message_bytes, shared_key)
-            .map_err(DeRecMessageBuilderError::Encryption)?,
-    )
+) -> Result<Vec<u8>, Error> {
+    Ok(channel::decrypt_message(message_bytes, shared_key)
+        .map_err(DeRecMessageBuilderError::Encryption)?)
 }
 
 /// Re-stamp the `trace_id` field on an already-produced DeRecMessage envelope.
@@ -85,9 +84,8 @@ pub(crate) fn decrypt_inner_message(
 /// callers who want correlation can produce + then [`apply_trace_id`] to set
 /// their own. The orchestrator (`DeRecProtocol`) already does this
 /// automatically on every outbound request.
-pub fn apply_trace_id(envelope_bytes: &[u8], trace_id: u64) -> Result<Vec<u8>, crate::Error> {
-    let mut envelope =
-        DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn apply_trace_id(envelope_bytes: &[u8], trace_id: u64) -> Result<Vec<u8>, Error> {
+    let mut envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
     envelope.trace_id = trace_id;
     Ok(envelope.encode_to_vec())
 }
@@ -100,7 +98,7 @@ pub fn apply_trace_id(envelope_bytes: &[u8], trace_id: u64) -> Result<Vec<u8>, c
 /// there is a 2^-64 chance of drawing a token downstream code might read as
 /// "no correlation requested" — not worth coding around.
 pub(crate) fn fresh_trace_id() -> u64 {
-    crate::utils::random_u64()
+    random_u64()
 }
 
 /// Read the `trace_id` field off an inbound DeRecMessage envelope without
@@ -108,22 +106,19 @@ pub(crate) fn fresh_trace_id() -> u64 {
 ///
 /// Pair with [`apply_trace_id`] for request/response correlation when
 /// driving the protocol through primitives directly.
-pub fn read_trace_id(envelope_bytes: &[u8]) -> Result<u64, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn read_trace_id(envelope_bytes: &[u8]) -> Result<u64, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
     Ok(envelope.trace_id)
 }
 
 pub fn extract_inner_pairing_message(
     message_bytes: &[u8],
     pairing_secret: &PairingSecretKeyMaterial,
-) -> Result<MessageBody, crate::Error> {
-    let decrypted = derec_cryptography::pairing::envelope::decrypt(
-        message_bytes,
-        pairing_secret.ecies_secret_key(),
-    )
-    .map_err(PairingError::PairingEncryption)?;
+) -> Result<MessageBody, Error> {
+    let decrypted = envelope::decrypt(message_bytes, pairing_secret.ecies_secret_key())
+        .map_err(PairingError::PairingEncryption)?;
 
-    let inner = MessageBody::decode_from_vec(&decrypted).map_err(crate::Error::ProtobufDecode)?;
+    let inner = MessageBody::decode_from_vec(&decrypted).map_err(Error::ProtobufDecode)?;
 
     Ok(inner)
 }
@@ -139,6 +134,6 @@ pub fn extract_inner_pairing_message(
 /// see [`crate::primitives::pairing::request::produce_pre_pair_request`]
 /// and [`crate::primitives::pairing::response::produce_pre_pair`] for the
 /// producers that emit the bytes this function decodes.
-pub fn extract_inner_plaintext_message(message_bytes: &[u8]) -> Result<MessageBody, crate::Error> {
-    MessageBody::decode_from_vec(message_bytes).map_err(crate::Error::ProtobufDecode)
+pub fn extract_inner_plaintext_message(message_bytes: &[u8]) -> Result<MessageBody, Error> {
+    MessageBody::decode_from_vec(message_bytes).map_err(Error::ProtobufDecode)
 }

@@ -93,6 +93,11 @@ internal static class Protocol
         RunUnsafeConnectionConfigTest();
         RunNewFlowParamsTest();
         RunOrchestratorShareAndDiscoverFlowTest();
+        RunOrchestratorSilentHelperRecoveryTest();
+        RunOrchestratorDisputedRecoveryTest();
+        RunOrchestratorConflictingRecoveryTest();
+        RunRestoreKeepsHelperDutiesTest();
+        RunAbandonedReplicaPairingTest();
         RunOrchestratorUnpairingFlowTest();
         RunOrchestratorUpdateChannelInfoFlowTest();
         RunOrchestratorReplyToFlowTest();
@@ -2165,6 +2170,469 @@ internal static class Protocol
     }
 
     /// <summary>
+    /// A recovery decides only once every helper it asked has answered, so a
+    /// helper that never answers holds the decision until
+    /// <see cref="Timeouts.GetShareResponse"/> elapses. <c>TickAsync</c> then
+    /// reports that helper as timed out and recovers from the shares in hand.
+    /// </summary>
+    private static void RunOrchestratorSilentHelperRecoveryTest()
+    {
+        Console.WriteLine("=== Orchestrator silent helper recovery test ===");
+
+        using var owner = MakeNode("Owner", "https://owner.example.com",
+            new NodeOptions(Timeouts: new Timeouts(GetShareResponse: TimeSpan.FromSeconds(1))));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com");
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com");
+        using var helperC = MakeNode("HelperC", "https://helper-c.example.com");
+
+        DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 1UL);
+        DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 2UL);
+        ulong channelC = DoOrchestratorPair(helperC, helperC.Transport, owner, owner.Transport, 3UL);
+
+        byte[] secretData = Encoding.UTF8.GetBytes("three helpers, one silent");
+        var protectEvents = owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret { Id = new byte[] { 0x09 }, Name = "silent-helper secret", Data = secretData },
+            },
+        }).GetAwaiter().GetResult();
+        uint version = protectEvents.OfType<ProtectSecretStartedEvent>().FirstOrDefault()?.Version
+            ?? throw new InvalidOperationException("the round must report the version it published");
+        PumpAll(new[]
+        {
+            (owner, "https://owner.example.com"),
+            (helperA, "https://helper-a.example.com"),
+            (helperB, "https://helper-b.example.com"),
+            (helperC, "https://helper-c.example.com"),
+        });
+
+        owner.Protocol.StartAsync(FlowKind.RecoverSecret, new RecoverSecretParams
+        {
+            SecretId = owner.Protocol.SecretId,
+            Version = version,
+        }).GetAwaiter().GetResult();
+
+        // HelperC never sees its request.
+        var recoveryEvents = new List<DeRecEvent>();
+        foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
+        {
+            var helper = uri switch
+            {
+                "https://helper-a.example.com" => helperA,
+                "https://helper-b.example.com" => helperB,
+                _ => null,
+            };
+            if (helper is not null)
+                recoveryEvents.AddRange(helper.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult());
+        }
+        recoveryEvents.AddRange(PumpAll(new[]
+        {
+            (owner, "https://owner.example.com"),
+            (helperA, "https://helper-a.example.com"),
+            (helperB, "https://helper-b.example.com"),
+        }));
+
+        int received = recoveryEvents.OfType<RecoveryShareReceivedEvent>().Count();
+        if (received != 2)
+            throw new InvalidOperationException($"HelperA and HelperB must answer; got {received} RecoveryShareReceived");
+        if (recoveryEvents.Any(e => e is SecretRecoveredEvent or RecoveryDisputedEvent or RecoveryConflictEvent or RecoveryIncompleteEvent))
+            throw new InvalidOperationException(
+                $"nothing is decided while HelperC's answer is due: [{string.Join(", ", recoveryEvents.Select(e => e.EventType))}]");
+        var early = owner.Protocol.TickAsync().GetAwaiter().GetResult();
+        if (early.Count != 0)
+            throw new InvalidOperationException(
+                $"the recovery waits out its window; TickAsync returned [{string.Join(", ", early.Select(e => e.EventType))}]");
+        Console.WriteLine("  two answers in, one due → no decision, TickAsync empty  ✓");
+
+        Thread.Sleep(TimeSpan.FromMilliseconds(2100));
+        var settled = owner.Protocol.TickAsync().GetAwaiter().GetResult();
+        if (settled.Count != 2
+            || settled[0] is not RecoverSecretFailedEvent failed
+            || settled[1] is not SecretRecoveredEvent recovered)
+            throw new InvalidOperationException(
+                $"expected a timeout then SecretRecovered, got [{string.Join(", ", settled.Select(e => e.EventType))}]");
+        if (failed.ChannelId != channelC || failed.Version != version || failed.Error != "timeout")
+            throw new InvalidOperationException(
+                $"HelperC must time out: channel={failed.ChannelId} (want {channelC}) v={failed.Version} error={failed.Error}");
+        if (!recovered.Secret.Secrets.Any(u => u.Id.SequenceEqual(new byte[] { 0x09 }) && u.Data.SequenceEqual(secretData)))
+            throw new InvalidOperationException("recovered secret must carry the protected bytes");
+        Console.WriteLine($"  after the window → RecoverSecretFailed({channelC}, \"timeout\"), SecretRecovered  ✓");
+
+        var after = owner.Protocol.TickAsync().GetAwaiter().GetResult();
+        if (after.Count != 0)
+            throw new InvalidOperationException(
+                $"the recovery is closed once decided; TickAsync returned [{string.Join(", ", after.Select(e => e.EventType))}]");
+        Console.WriteLine("  the recovery is closed once decided  ✓");
+
+        Console.WriteLine("Orchestrator silent helper recovery test passed.\n");
+    }
+
+    /// <summary>
+    /// Protect a one-entry secret from <paramref name="owner"/> across every
+    /// helper in <paramref name="helpers"/>, deliver the round, and return the
+    /// version it published.
+    /// </summary>
+    private static uint ProtectAcross(Node owner, string ownerUri, (Node Node, string Uri)[] helpers, string name)
+    {
+        var events = owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret { Id = new byte[] { 0x0a }, Name = name, Data = Encoding.UTF8.GetBytes(name) },
+            },
+        }).GetAwaiter().GetResult();
+        uint version = events.OfType<ProtectSecretStartedEvent>().FirstOrDefault()?.Version
+            ?? throw new InvalidOperationException("the round must report the version it published");
+        PumpAll(new[] { (owner, ownerUri) }.Concat(helpers).ToArray());
+        return version;
+    }
+
+    /// <summary>
+    /// Replace the share <paramref name="to"/> holds on
+    /// <paramref name="toChannel"/> with the one <paramref name="from"/> holds
+    /// on <paramref name="fromChannel"/>, both at <paramref name="version"/>.
+    /// Both splits are of the same <c>(secretId, version)</c>, so the moved
+    /// share still passes every check it is put to on its own.
+    /// </summary>
+    private static void TransplantShare(Node from, ulong fromChannel, Node to, ulong toChannel, uint version)
+    {
+        var foreign = from.ShareStore.Load(from.Protocol.SecretId, fromChannel, new[] { version }).LastOrDefault()
+            ?? throw new InvalidOperationException("the foreign helper holds a share for the version");
+        ulong toSid = to.Protocol.SecretId;
+        var held = to.ShareStore.Load(toSid, toChannel, new[] { version }).LastOrDefault()
+            ?? throw new InvalidOperationException("the helper holds a share for the version");
+        to.ShareStore.Save(toSid, toChannel, held with { Bytes = foreign.Bytes });
+    }
+
+    /// <summary>
+    /// Owner A splits its secret at threshold 3 across five helpers. A second
+    /// owner, B, with the same secret id, splits a different secret at
+    /// version 1 across its own helpers at <paramref name="bThreshold"/>; two
+    /// of A's helpers end up holding B's shares instead of A's. Returns A's
+    /// decision events and the channels of the five helpers, in order.
+    /// </summary>
+    private static (List<DeRecEvent> Events, List<ulong> Channels) RecoverWithTwoOfFiveFromAnotherSplit(int bThreshold)
+    {
+        const ulong secretIdShared = 44UL;
+        const string ownerUri = "https://owner-a.example.com";
+        using var owner = MakeNode("owner-a", ownerUri,
+            new NodeOptions(Threshold: 3, SecretId: secretIdShared));
+        var h = Enumerable.Range(1, 5)
+            .Select(i => (Node: MakeNode($"helper-{i}", $"https://helper-{i}.example.com"),
+                Uri: $"https://helper-{i}.example.com"))
+            .ToArray();
+        using var otherOwner = MakeNode("owner-b", "https://owner-b.example.com",
+            new NodeOptions(Threshold: bThreshold, SecretId: secretIdShared));
+        var x = Enumerable.Range(1, 3)
+            .Select(i => (Node: MakeNode($"x{i}", $"https://x{i}.example.com"), Uri: $"https://x{i}.example.com"))
+            .ToArray();
+        try
+        {
+            var channels = new List<ulong>();
+            for (int i = 0; i < h.Length; i++)
+                channels.Add(DoOrchestratorPair(h[i].Node, h[i].Node.Transport, owner, owner.Transport, 10UL + (ulong)i));
+            uint version = ProtectAcross(owner, ownerUri, h, "owner-a secret");
+
+            ulong x1Channel = DoOrchestratorPair(x[0].Node, x[0].Node.Transport, otherOwner, otherOwner.Transport, 21UL);
+            ulong x2Channel = DoOrchestratorPair(x[1].Node, x[1].Node.Transport, otherOwner, otherOwner.Transport, 22UL);
+            DoOrchestratorPair(x[2].Node, x[2].Node.Transport, otherOwner, otherOwner.Transport, 23UL);
+            uint otherVersion = ProtectAcross(otherOwner, "https://owner-b.example.com", x, "owner-b secret");
+            if (otherVersion != version)
+                throw new InvalidOperationException(
+                    $"both splits are of the same version; got {otherVersion} and {version}");
+
+            TransplantShare(x[0].Node, x1Channel, h[3].Node, channels[3], version);
+            TransplantShare(x[1].Node, x2Channel, h[4].Node, channels[4], version);
+
+            owner.Protocol.StartAsync(FlowKind.RecoverSecret, new RecoverSecretParams
+            {
+                SecretId = owner.Protocol.SecretId,
+                Version = version,
+            }).GetAwaiter().GetResult();
+            var events = PumpAll(new[] { (owner, ownerUri) }.Concat(h).ToArray());
+            if (events.OfType<RecoveryShareCorruptedEvent>().Any())
+                throw new InvalidOperationException(
+                    $"a share of another split is not evidence against its helper: [{string.Join(", ", events.Select(e => e.EventType))}]");
+            return (events, channels);
+        }
+        finally
+        {
+            foreach (var (node, _) in h) node.Dispose();
+            foreach (var (node, _) in x) node.Dispose();
+        }
+    }
+
+    private static string HelperNames(IEnumerable<RecoveryHelper> helpers) =>
+        string.Join(",", helpers.Select(r => r.CommunicationInfo.TryGetValue("name", out var n) ? n : "?"));
+
+    /// <summary>
+    /// Three helpers back the owner's split; two hold valid shares of another
+    /// split that cannot reconstruct. The library cannot tell which side is
+    /// the owner's, so it reports a dispute naming both, not a recovery.
+    /// </summary>
+    private static void RunOrchestratorDisputedRecoveryTest()
+    {
+        Console.WriteLine("=== Orchestrator disputed recovery test ===");
+
+        var (events, channels) = RecoverWithTwoOfFiveFromAnotherSplit(3);
+        var disputed = events.OfType<RecoveryDisputedEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException(
+                $"expected RecoveryDisputed, got [{string.Join(", ", events.Select(e => e.EventType))}]");
+        if (events.OfType<SecretRecoveredEvent>().Any())
+            throw new InvalidOperationException("a disputed secret is never reported as recovered");
+        if (disputed.Secret.Secrets[0].Name != "owner-a secret")
+            throw new InvalidOperationException($"the disputed secret must be owner A's; got {disputed.Secret.Secrets[0].Name}");
+        if (!disputed.SupportedBy.Select(r => r.ChannelId).SequenceEqual(channels.Take(3))
+            || !disputed.DisputedBy.Select(r => r.ChannelId).SequenceEqual(channels.Skip(3)))
+            throw new InvalidOperationException(
+                $"sides mismatch: supported_by=[{string.Join(",", disputed.SupportedBy.Select(r => r.ChannelId))}] "
+                + $"disputed_by=[{string.Join(",", disputed.DisputedBy.Select(r => r.ChannelId))}] "
+                + $"channels=[{string.Join(",", channels)}]");
+        if (HelperNames(disputed.SupportedBy) != "helper-1,helper-2,helper-3"
+            || HelperNames(disputed.DisputedBy) != "helper-4,helper-5")
+            throw new InvalidOperationException(
+                $"each side names the helpers as they advertised themselves: "
+                + $"supported_by={HelperNames(disputed.SupportedBy)} disputed_by={HelperNames(disputed.DisputedBy)}");
+        Console.WriteLine("  RecoveryDisputed: owner-a secret, supported_by helper-1..3, disputed_by helper-4..5, no SecretRecovered  ✓");
+
+        Console.WriteLine("Orchestrator disputed recovery test passed.\n");
+    }
+
+    /// <summary>
+    /// When the other split's two shares reconstruct too, the owner faces two
+    /// complete secrets and has to choose between them.
+    /// </summary>
+    private static void RunOrchestratorConflictingRecoveryTest()
+    {
+        Console.WriteLine("=== Orchestrator conflicting recovery test ===");
+
+        var (events, channels) = RecoverWithTwoOfFiveFromAnotherSplit(2);
+        var conflict = events.OfType<RecoveryConflictEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException(
+                $"expected RecoveryConflict, got [{string.Join(", ", events.Select(e => e.EventType))}]");
+        var got = conflict.Candidates
+            .Select(c => $"{c.Secret.Secrets[0].Name}:[{string.Join(",", c.SupportedBy.Select(r => r.ChannelId))}]");
+        var want = new[]
+        {
+            $"owner-a secret:[{string.Join(",", channels.Take(3))}]",
+            $"owner-b secret:[{string.Join(",", channels.Skip(3))}]",
+        };
+        if (!got.SequenceEqual(want))
+            throw new InvalidOperationException(
+                $"candidates mismatch: got [{string.Join("; ", got)}], want [{string.Join("; ", want)}]");
+        if (conflict.DisputedBy.Count != 0)
+            throw new InvalidOperationException(
+                $"every share is on one side or the other; disputed_by=[{string.Join(",", conflict.DisputedBy.Select(r => r.ChannelId))}]");
+        Console.WriteLine("  RecoveryConflict: [owner-a secret ← helper-1..3, owner-b secret ← helper-4..5], disputed_by empty  ✓");
+
+        Console.WriteLine("Orchestrator conflicting recovery test passed.\n");
+    }
+
+    /// <summary>
+    /// A replacement device becomes a helper for another owner before it
+    /// recovers its own secret. Restoring must wipe only the recovery
+    /// channels: the channel to the other owner stays paired, the share held
+    /// for it stays, and that owner can still verify it.
+    /// </summary>
+    private static void RunRestoreKeepsHelperDutiesTest()
+    {
+        Console.WriteLine("=== Orchestrator restore keeps helper duties test ===");
+
+        const ulong ownSecretId = 4545UL;
+        const string lostUri = "https://lost.example.com";
+        const string helperAUri = "https://helper-a.example.com";
+        const string helperBUri = "https://helper-b.example.com";
+        const string deviceUri = "https://device.example.com";
+        const string otherUri = "https://other.example.com";
+        const string otherHelperUri = "https://other-helper.example.com";
+
+        using var lost = MakeNode("lost-device", lostUri, new NodeOptions(SecretId: ownSecretId));
+        using var helperA = MakeNode("helper-a", helperAUri);
+        using var helperB = MakeNode("helper-b", helperBUri);
+        ulong channelA = DoOrchestratorPair(helperA, helperA.Transport, lost, lost.Transport, 1UL);
+        ulong channelB = DoOrchestratorPair(helperB, helperB.Transport, lost, lost.Transport, 2UL);
+        uint version = ProtectAcross(lost, lostUri, new[] { (helperA, helperAUri), (helperB, helperBUri) }, "own secret");
+
+        using var device = MakeNode("new-device", deviceUri, new NodeOptions(SecretId: ownSecretId));
+
+        // The new device helps another owner first.
+        using var otherOwner = MakeNode("other-owner", otherUri, new NodeOptions(SecretId: 9090UL));
+        using var otherHelper = MakeNode("other-helper", otherHelperUri);
+        ulong dutyChannel = DoOrchestratorPair(device, device.Transport, otherOwner, otherOwner.Transport, 3UL);
+        DoOrchestratorPair(otherHelper, otherHelper.Transport, otherOwner, otherOwner.Transport, 4UL);
+        uint otherVersion = ProtectAcross(otherOwner, otherUri,
+            new[] { (device, deviceUri), (otherHelper, otherHelperUri) }, "other owner's secret");
+        ulong deviceSid = device.Protocol.SecretId;
+        int held = device.ShareStore.Load(deviceSid, dutyChannel, new[] { otherVersion }).Count();
+        if (held != 1)
+            throw new InvalidOperationException($"the device must hold the other owner's share; holds {held}");
+        Console.WriteLine($"  device holds the other owner's share on duty channel {dutyChannel}  ✓");
+
+        // Then it recovers its own secret over fresh recovery channels.
+        var recoveryChannels = new List<ulong>();
+        foreach (var (helper, original, transient) in new[] { (helperA, channelA, 100UL), (helperB, channelB, 101UL) })
+        {
+            ulong recoveryChannel = DoOrchestratorPair(device, device.Transport, helper, helper.Transport,
+                transient, Pairing.SenderKind.Helper);
+            helper.ChannelStore.LinkChannel(helper.Protocol.SecretId, original, recoveryChannel);
+            recoveryChannels.Add(recoveryChannel);
+        }
+
+        var recoveryScope = new[] { (device, deviceUri), (helperA, helperAUri), (helperB, helperBUri) };
+        device.Protocol.StartAsync(FlowKind.RecoverSecret, new RecoverSecretParams
+        {
+            SecretId = ownSecretId,
+            Version = version,
+        }).GetAwaiter().GetResult();
+        var recovered = PumpAll(recoveryScope).OfType<SecretRecoveredEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException("the device must recover its own secret");
+
+        var restoreEvents = device.Protocol.RestoreAsync(recovered.Secret, version).GetAwaiter().GetResult();
+        var touched = restoreEvents
+            .Select(e => e switch
+            {
+                UnpairStartedEvent u => (ulong?)u.ChannelId,
+                UnpairedEvent u => u.ChannelId,
+                UnpairFailedEvent u => u.ChannelId,
+                _ => null,
+            })
+            .OfType<ulong>()
+            .ToList();
+        if (touched.Contains(dutyChannel))
+            throw new InvalidOperationException(
+                $"restore must not unpair the channel to the other owner: [{string.Join(", ", restoreEvents.Select(e => e.EventType))}]");
+        foreach (ulong recoveryChannel in recoveryChannels)
+        {
+            if (!touched.Contains(recoveryChannel))
+                throw new InvalidOperationException($"restore must still wipe recovery channel {recoveryChannel}");
+        }
+        Console.WriteLine("  restore unpairs both recovery channels and leaves the duty channel alone  ✓");
+        PumpAll(recoveryScope);
+
+        var duty = device.ChannelStore.Load(deviceSid, dutyChannel, 0)
+            ?? throw new InvalidOperationException("the channel to the other owner must survive restore");
+        if (duty.Status != ChannelStatus.Paired)
+            throw new InvalidOperationException($"the duty channel must stay Paired; is {duty.Status}");
+        held = device.ShareStore.Load(deviceSid, dutyChannel, new[] { otherVersion }).Count();
+        if (held != 1)
+            throw new InvalidOperationException($"the share held for the other owner must survive restore; holds {held}");
+        Console.WriteLine("  duty channel still Paired and the other owner's share still stored  ✓");
+
+        otherOwner.Protocol.StartAsync(FlowKind.VerifyShares, new VerifySharesParams
+        {
+            SecretId = otherOwner.Protocol.SecretId,
+            Version = otherVersion,
+        }).GetAwaiter().GetResult();
+        var verified = PumpAll(new[] { (otherOwner, otherUri), (device, deviceUri), (otherHelper, otherHelperUri) })
+            .OfType<ShareVerifiedEvent>()
+            .Select(e => e.ChannelId)
+            .ToList();
+        if (!verified.Contains(dutyChannel))
+            throw new InvalidOperationException(
+                $"the other owner must still verify the restored device's share; verified [{string.Join(", ", verified)}]");
+        Console.WriteLine("  the other owner still verifies the device's share  ✓");
+
+        Console.WriteLine("Orchestrator restore keeps helper duties test passed.\n");
+    }
+
+    /// <summary>
+    /// Start a replica pairing from <paramref name="scanner"/>, as
+    /// <paramref name="kind"/>, against a fresh contact from
+    /// <paramref name="creator"/> at <paramref name="transient"/>.
+    /// </summary>
+    private static void StartReplicaScan(Node scanner, Node creator, ulong transient, Pairing.SenderKind kind)
+    {
+        byte[] contact = creator.Protocol.CreateContactAsync(transient, ContactMode.InlineKeys)
+            .GetAwaiter().GetResult();
+        scanner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
+        {
+            Kind = kind,
+            Contact = contact,
+        }).GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// <c>ProtectSecret</c> on <paramref name="owner"/> must be accepted: a
+    /// replica pairing that never completed is no group, and must never stop
+    /// the device from protecting.
+    /// </summary>
+    private static void AssertProtects(Node owner, string name)
+    {
+        try
+        {
+            owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+            {
+                Secrets = new[]
+                {
+                    new UserSecret { Id = new byte[] { 0x0b }, Name = name, Data = Encoding.UTF8.GetBytes(name) },
+                },
+            }).GetAwaiter().GetResult();
+        }
+        catch (DeRecException e)
+        {
+            throw new InvalidOperationException($"ProtectSecret ({name}) must succeed: {e.CodeName}: {e.Message}", e);
+        }
+    }
+
+    /// <summary>
+    /// A replica pairing that never completes must not leave this device
+    /// unable to protect: neither while it is pending, nor after a later
+    /// pairing completes, nor once the expiry sweep has cleared it. The
+    /// device's own row lands on the channel of the pairing that was
+    /// confirmed.
+    /// </summary>
+    private static void RunAbandonedReplicaPairingTest()
+    {
+        Console.WriteLine("=== Orchestrator abandoned replica pairing test ===");
+
+        const ulong aId = 0xA1A1UL;
+        const string aUri = "https://replica-a.example.com";
+        const string cUri = "https://replica-c.example.com";
+        using var a = MakeNode("replica-a", aUri, new NodeOptions(
+            ReplicaId: aId,
+            Timeouts: new Timeouts(ExpiredChannels: new RemoveExpiredChannelsPolicy(Enabled: true, TimeoutInSecs: 1))));
+        using var b = MakeNode("replica-b", "https://replica-b.example.com", new NodeOptions(ReplicaId: 0xB2B2UL));
+        using var c = MakeNode("replica-c", cUri, new NodeOptions(ReplicaId: 0xC3C3UL));
+        var scope = new[] { (a, aUri), (c, cUri) };
+
+        // B never hears of the request.
+        StartReplicaScan(a, b, 100UL, Pairing.SenderKind.ReplicaSource);
+        a.Transport.DrainAll();
+        AssertProtects(a, "while a replica pairing is pending");
+        Console.WriteLine("  ProtectSecret accepted while a replica pairing is pending  ✓");
+
+        StartReplicaScan(a, c, 200UL, Pairing.SenderKind.ReplicaSource);
+        var pairing = PumpAll(scope).OfType<PairingCompletedEvent>().ToList();
+        if (pairing.Count != 2 || pairing[0].ChannelId != pairing[1].ChannelId)
+            throw new InvalidOperationException(
+                $"the pairing with C must complete on both sides; got [{string.Join(", ", pairing.Select(p => p.ChannelId))}]");
+        ulong groupChannel = pairing[0].ChannelId;
+        CrossConfirmFingerprint(a, c, groupChannel);
+        PumpAll(scope);
+        AssertProtects(a, "after a later pairing is confirmed");
+        PumpAll(scope);
+        Console.WriteLine($"  paired and confirmed C on {groupChannel}; ProtectSecret accepted  ✓");
+
+        Thread.Sleep(TimeSpan.FromMilliseconds(2100));
+        a.Protocol.TickAsync().GetAwaiter().GetResult();
+        AssertProtects(a, "after the expiry sweep");
+        PumpAll(scope);
+        Console.WriteLine("  ProtectSecret accepted after the expiry sweep  ✓");
+
+        var own = a.ChannelStore
+            .ListReplicas(a.Protocol.SecretId, ReplicaFilter.Any with { Ids = new[] { aId } })
+            .FirstOrDefault()
+            ?? throw new InvalidOperationException("A must keep its own row");
+        if (own.ChannelId != groupChannel || own.Status != ChannelStatus.Paired)
+            throw new InvalidOperationException(
+                $"A's own row must be Paired on the confirmed group channel {groupChannel}; got {own.Status} on {own.ChannelId}");
+        Console.WriteLine("  A's own row is Paired on the confirmed group channel  ✓");
+
+        Console.WriteLine("Orchestrator abandoned replica pairing test passed.\n");
+    }
+
+    /// <summary>
     /// Ids above 2^53, up to <c>u64::MAX</c>, decode from the wire's decimal
     /// strings to exact <see cref="ulong"/> values and go back to Rust as the
     /// same decimal strings: a recovered <see cref="Secret"/> carrying them is
@@ -2701,7 +3169,7 @@ internal static class Protocol
     {
         Console.WriteLine("=== RecoveryShareCorrupted parse test ===");
 
-        foreach (var reason in new[] { CorruptionReason.Malformed, CorruptionReason.InvalidProof, CorruptionReason.Inconsistent })
+        foreach (var reason in new[] { CorruptionReason.Malformed, CorruptionReason.InvalidProof, CorruptionReason.Forged })
         {
             var json = $$"""{ "type": "RecoveryShareCorrupted", "channel_id": "18446744073709551615", "version": 2, "reason": "{{reason}}" }""";
             var ev = JsonSerializer.Deserialize<DeRecEvent>(json) as RecoveryShareCorruptedEvent
@@ -4116,7 +4584,8 @@ internal static class Protocol
         bool OmitThreshold = false,
         ulong? MaxSubshares = null,
         ParameterRange? ParameterRange = null,
-        bool? AutoRespondOnFailure = null);
+        bool? AutoRespondOnFailure = null,
+        Timeouts? Timeouts = null);
 
     private const int DefaultThreshold = 2;
 
@@ -4280,6 +4749,8 @@ internal static class Protocol
             builder = builder.WithParameterRange(range);
         if (options.AutoRespondOnFailure is bool autoRespond)
             builder = builder.WithAutoRespondOnFailure(autoRespond);
+        if (options.Timeouts is Timeouts timeouts)
+            builder = builder.WithTimeouts(timeouts);
 
         return new Node(builder.Build(), transport, channelStore, shareStore, secretStore, userSecretStore, stateStore);
     }
@@ -4502,7 +4973,8 @@ internal static class Protocol
             .WithTimeouts(new Timeouts(
                 InboundMessage: TimeSpan.FromMinutes(10),
                 SharingRound: TimeSpan.FromSeconds(30),
-                UnpairAck: TimeSpan.FromSeconds(45)))
+                UnpairAck: TimeSpan.FromSeconds(45),
+                GetShareResponse: TimeSpan.FromSeconds(600)))
             .Build())
         {
             Console.WriteLine("  whole-second timeouts accepted  ✓");
@@ -4711,6 +5183,7 @@ internal static class Protocol
             || full.Timeouts?.InboundMessage != TimeSpan.FromSeconds(120)
             || full.Timeouts?.SharingRound != TimeSpan.FromSeconds(30)
             || full.Timeouts?.UnpairAck != TimeSpan.FromSeconds(45)
+            || full.Timeouts?.GetShareResponse != TimeSpan.FromSeconds(900)
             || full.Timeouts?.ExpiredChannels != new RemoveExpiredChannelsPolicy(true, 600)
             || full.ParameterRange?.MaxUnresponsiveDeletionTimeout != 9007199254740993L
             || full.AutoAccept is not { Pairing: true, PrePair: false, StoreShare: true, Unpair: true }

@@ -18,8 +18,13 @@
 //! unconditionally since the WASM store shim always needs it.
 
 use super::{CollectedShare, StateItem, StateKey};
-use crate::types::ChannelId;
+use crate::protocol::types::SharingRoundState;
+use crate::types::{ChannelId, ReplicaId};
+use derec_proto::GetShareResponseMessage;
+use derec_proto::VerifyShareRequestMessage;
 use prost::Message;
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 /// JSON-on-the-wire shape of a [`StateKey`]. `kind` matches
 /// [`crate::protocol::StateKind`]:
@@ -88,7 +93,11 @@ impl From<&StateKey> for StateKeyRecord {
 ///   being recovered), `version`, `shares` (each entry is a
 ///   prost-encoded [`derec_proto::GetShareResponseMessage`]),
 ///   `share_channels` (the channel each share arrived on, stringified
-///   u64, index-aligned with `shares`)
+///   u64, index-aligned with `shares`), `pending` (the Helpers still to
+///   answer, stringified u64s), `started_at` (stringified u64 unix-seconds
+///   at which the requests went out). A row without `pending` or
+///   `started_at` decodes as none pending, sent at `0`, so the next sweep
+///   settles it on the shares it holds
 /// - `2` = PendingUnpair — `channel_id`, `started_at` (stringified u64
 ///   unix-seconds)
 /// - `3` = SharingRound — `version`, `pending`, `confirmed`, `failed`
@@ -199,17 +208,19 @@ impl From<&StateItem> for StateItemRecord {
                 secret_id,
                 version,
                 shares,
+                pending,
+                started_at,
             } => Self {
                 kind: 1,
                 channel_id: None,
                 secret_id: Some(secret_id.to_string()),
                 version: Some(*version),
-                started_at: None,
+                started_at: Some(started_at.to_string()),
                 local_version: None,
                 bytes: None,
                 shares: Some(shares.iter().map(|s| s.response.encode_to_vec()).collect()),
                 share_channels: Some(shares.iter().map(|s| s.channel_id.0.to_string()).collect()),
-                pending: None,
+                pending: Some(pending.iter().map(|c| c.0.to_string()).collect()),
                 confirmed: None,
                 failed: None,
                 pending_replicas: None,
@@ -323,14 +334,14 @@ impl From<&StateItem> for StateItemRecord {
 fn parse_replica_id_set(
     raw: Option<Vec<String>>,
     field: &str,
-) -> Result<std::collections::HashSet<crate::types::ReplicaId>, String> {
+) -> Result<HashSet<ReplicaId>, String> {
     raw.unwrap_or_default()
         .into_iter()
         .map(|s| {
             s.parse::<u64>()
                 .map_err(|e| format!("{field} entry not a decimal u64: {e}"))
                 .and_then(|v| {
-                    crate::types::ReplicaId::try_from(v)
+                    ReplicaId::try_from(v)
                         .map_err(|e| format!("{field} entry is not a valid replica_id: {e}"))
                 })
         })
@@ -340,7 +351,7 @@ fn parse_replica_id_set(
 fn parse_channel_id_set(
     raw: Option<Vec<String>>,
     field: &str,
-) -> Result<std::collections::HashSet<ChannelId>, String> {
+) -> Result<HashSet<ChannelId>, String> {
     raw.ok_or_else(|| format!("SharingRound requires {field}"))?
         .into_iter()
         .map(|s| {
@@ -365,7 +376,7 @@ impl StateItemRecord {
                 let bytes = self
                     .bytes
                     .ok_or_else(|| "PendingVerification requires bytes".to_string())?;
-                let request = derec_proto::VerifyShareRequestMessage::decode(bytes.as_slice())
+                let request = VerifyShareRequestMessage::decode(bytes.as_slice())
                     .map_err(|e| format!("VerifyShareRequestMessage decode: {e}"))?;
                 Ok(StateItem::PendingVerification {
                     channel_id,
@@ -394,9 +405,8 @@ impl StateItemRecord {
                         ));
                     }
                     for (i, (blob, channel)) in raw_shares.into_iter().zip(channels).enumerate() {
-                        let response =
-                            derec_proto::GetShareResponseMessage::decode(blob.as_slice())
-                                .map_err(|e| format!("GetShareResponseMessage[{i}] decode: {e}"))?;
+                        let response = GetShareResponseMessage::decode(blob.as_slice())
+                            .map_err(|e| format!("GetShareResponseMessage[{i}] decode: {e}"))?;
                         let channel_id = channel
                             .parse::<u64>()
                             .map(ChannelId)
@@ -407,10 +417,25 @@ impl StateItemRecord {
                         });
                     }
                 }
+                let pending = self
+                    .pending
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|c| c.parse::<u64>().map(ChannelId))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| format!("pending not a decimal u64: {e}"))?;
+                let started_at = self
+                    .started_at
+                    .map(|s| s.parse::<u64>())
+                    .transpose()
+                    .map_err(|e| format!("started_at not a decimal u64: {e}"))?
+                    .unwrap_or(0);
                 Ok(StateItem::PendingRecovery {
                     secret_id,
                     version,
                     shares,
+                    pending,
+                    started_at,
                 })
             }
             2 => {
@@ -451,20 +476,18 @@ impl StateItemRecord {
                     parse_replica_id_set(self.synced_replicas, "synced_replicas")?;
                 let behind_replicas =
                     parse_replica_id_set(self.behind_replicas, "behind_replicas")?;
-                Ok(StateItem::SharingRound(Box::new(
-                    crate::protocol::types::SharingRoundState {
-                        version,
-                        pending,
-                        confirmed,
-                        failed,
-                        pending_replicas,
-                        synced_replicas,
-                        behind_replicas,
-                        started_at,
-                        keep_version: self.keep_version,
-                        threshold: self.threshold,
-                    },
-                )))
+                Ok(StateItem::SharingRound(Box::new(SharingRoundState {
+                    version,
+                    pending,
+                    confirmed,
+                    failed,
+                    pending_replicas,
+                    synced_replicas,
+                    behind_replicas,
+                    started_at,
+                    keep_version: self.keep_version,
+                    threshold: self.threshold,
+                })))
             }
             4 => {
                 let local_version = self
@@ -477,14 +500,14 @@ impl StateItemRecord {
                     .parse::<u64>()
                     .map_err(|e| format!("started_at not a decimal u64: {e}"))?;
                 let pending = parse_replica_id_set(self.pending_replicas, "pending_replicas")?;
-                let mut reported = std::collections::HashMap::new();
+                let mut reported = HashMap::new();
                 for entry in self.reported.unwrap_or_default() {
                     let id = entry
                         .replica_id
                         .parse::<u64>()
                         .map_err(|e| format!("reported.replica_id not a decimal u64: {e}"))
                         .and_then(|v| {
-                            crate::types::ReplicaId::try_from(v)
+                            ReplicaId::try_from(v)
                                 .map_err(|e| format!("reported.replica_id invalid: {e}"))
                         })?;
                     reported.insert(id, entry.version);
@@ -510,12 +533,14 @@ mod tests {
         vec![
             StateItem::PendingVerification {
                 channel_id: ChannelId(7),
-                request: derec_proto::VerifyShareRequestMessage::default(),
+                request: VerifyShareRequestMessage::default(),
             },
             StateItem::PendingRecovery {
                 secret_id: 11,
                 version: 3,
                 shares: Vec::new(),
+                pending: [ChannelId(4)].into_iter().collect(),
+                started_at: 100,
             },
             StateItem::PendingUnpair {
                 channel_id: ChannelId(9),
@@ -527,7 +552,7 @@ mod tests {
                 reported: [(ReplicaId(22), 6)].into_iter().collect(),
                 started_at: 100,
             },
-            StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+            StateItem::SharingRound(Box::new(SharingRoundState {
                 version: 4,
                 pending: Default::default(),
                 confirmed: Default::default(),
@@ -556,7 +581,7 @@ mod tests {
 
     #[test]
     fn a_recovery_row_round_trips_with_the_channel_of_each_share() {
-        let response = |version| derec_proto::GetShareResponseMessage {
+        let response = |version| GetShareResponseMessage {
             secret_id: 11,
             version,
             ..Default::default()
@@ -574,14 +599,30 @@ mod tests {
                     response: response(3),
                 },
             ],
+            pending: [ChannelId(6), ChannelId(u64::MAX - 1)]
+                .into_iter()
+                .collect(),
+            started_at: 1_700_000_000,
         };
         let json = serde_json::to_string(&StateItemRecord::from(&item)).expect("encodes");
         let back: StateItemRecord = serde_json::from_str(&json).expect("decodes");
         match back.into_item().expect("valid row") {
-            StateItem::PendingRecovery { shares, .. } => {
+            StateItem::PendingRecovery {
+                shares,
+                pending,
+                started_at,
+                ..
+            } => {
                 let channels: Vec<ChannelId> = shares.iter().map(|s| s.channel_id).collect();
                 assert_eq!(channels, vec![ChannelId(u64::MAX), ChannelId(5)]);
                 assert!(shares.iter().all(|s| s.response == response(3)));
+                assert_eq!(
+                    pending,
+                    [ChannelId(6), ChannelId(u64::MAX - 1)]
+                        .into_iter()
+                        .collect()
+                );
+                assert_eq!(started_at, 1_700_000_000);
             }
             other => panic!("decoded as {other:?}"),
         }
@@ -589,7 +630,7 @@ mod tests {
 
     #[test]
     fn a_recovery_row_without_share_channels_decodes_as_nothing_collected() {
-        let blob = derec_proto::GetShareResponseMessage::default().encode_to_vec();
+        let blob = GetShareResponseMessage::default().encode_to_vec();
         let record: StateItemRecord = serde_json::from_value(serde_json::json!({
             "kind": 1,
             "secret_id": "11",
@@ -603,9 +644,34 @@ mod tests {
         }
     }
 
+    /// A row written before a recovery tracked who was asked decodes as none
+    /// pending, sent at `0`: the next sweep settles it on the shares it holds.
+    #[test]
+    fn a_recovery_row_without_pending_decodes_as_due() {
+        let record: StateItemRecord = serde_json::from_value(serde_json::json!({
+            "kind": 1,
+            "secret_id": "11",
+            "version": 3,
+            "shares": [],
+            "share_channels": [],
+        }))
+        .expect("a row written before pending existed parses");
+        match record.into_item().expect("valid row") {
+            StateItem::PendingRecovery {
+                pending,
+                started_at,
+                ..
+            } => {
+                assert!(pending.is_empty());
+                assert_eq!(started_at, 0);
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
     #[test]
     fn a_recovery_row_whose_channels_do_not_match_its_shares_is_rejected() {
-        let blob = derec_proto::GetShareResponseMessage::default().encode_to_vec();
+        let blob = GetShareResponseMessage::default().encode_to_vec();
         let record: StateItemRecord = serde_json::from_value(serde_json::json!({
             "kind": 1,
             "secret_id": "11",
@@ -654,7 +720,7 @@ mod tests {
 
     #[test]
     fn a_sharing_round_row_round_trips_its_keep_version() {
-        let round = crate::protocol::types::SharingRoundState {
+        let round = SharingRoundState {
             version: 4,
             pending: [ChannelId(u64::MAX)].into_iter().collect(),
             confirmed: Default::default(),
@@ -690,7 +756,7 @@ mod tests {
 
     #[test]
     fn a_sharing_round_row_round_trips_its_threshold() {
-        let round = crate::protocol::types::SharingRoundState {
+        let round = SharingRoundState {
             version: 4,
             pending: [ChannelId(7)].into_iter().collect(),
             confirmed: Default::default(),
@@ -720,7 +786,7 @@ mod tests {
             StateItem::SharingRound(round) => assert_eq!(round.threshold, None),
             other => panic!("decoded as {other:?}"),
         }
-        let round = crate::protocol::types::SharingRoundState {
+        let round = SharingRoundState {
             version: 4,
             pending: Default::default(),
             confirmed: Default::default(),

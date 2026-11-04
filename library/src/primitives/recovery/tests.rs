@@ -23,16 +23,21 @@ use crate::{
             },
         },
         sharing::request::{
-            SplitResult, extract as extract_store_share_request, split as sharing_split,
+            ExtractResult as ExtractStoreShareRequestResult, SplitResult,
+            extract as extract_store_share_request, split as sharing_split,
         },
     },
+    protocol::tests::{pre_0_0_9_derec_share, pre_0_0_9_fields_before_y},
+    transport::TransportValidationError,
     types::ChannelId,
 };
 use derec_proto::{
-    CommittedDeRecShare, DeRecResult, DeRecShare, GetShareResponseMessage, MessageBody, StatusEnum,
-    StoreShareRequestMessage, de_rec_share::Subshare,
+    CommittedDeRecShare, DeRecResult, DeRecShare, GetShareRequestMessage, GetShareResponseMessage,
+    MessageBody, Protocol, StatusEnum, StoreShareRequestMessage, TransportProtocol,
+    de_rec_share::Subshare,
 };
 use prost::Message;
+use std::slice;
 
 fn make_channel_ids(ids: &[u64]) -> Vec<ChannelId> {
     ids.iter().copied().map(ChannelId).collect()
@@ -168,7 +173,7 @@ fn test_produce_get_share_response_message_empty_committed_share() {
 
     let stored_share_envelope =
         create_store_share_request_envelope(channel_id, &shared_key, vec![]);
-    let crate::primitives::sharing::request::ExtractResult {
+    let ExtractStoreShareRequestResult {
         request: stored_share_request,
     } = extract_store_share_request(&stored_share_envelope, &shared_key)
         .expect("extract_store_share_request should succeed");
@@ -191,7 +196,7 @@ fn test_recover_from_share_responses_empty_responses() {
     let secret_id = 1;
     let version = 0;
 
-    let empty: Vec<&derec_proto::GetShareResponseMessage> = vec![];
+    let empty: Vec<&GetShareResponseMessage> = vec![];
     let result = recover_from_share_responses(secret_id, version, &empty);
 
     assert!(matches!(
@@ -336,7 +341,7 @@ fn test_recover_from_share_responses_decode_derec_share_error() {
 
 fn committed_pre_0_0_9_share(secret_id: u64, version: u32) -> Vec<u8> {
     CommittedDeRecShare {
-        de_rec_share: crate::protocol::tests::pre_0_0_9_derec_share(secret_id, version),
+        de_rec_share: pre_0_0_9_derec_share(secret_id, version),
         commitment: vec![0xCD; 32],
         merkle_path: vec![],
     }
@@ -346,12 +351,10 @@ fn committed_pre_0_0_9_share(secret_id: u64, version: u32) -> Vec<u8> {
 #[test]
 fn test_pre_0_0_9_layout_fails_only_at_the_old_y_field() {
     assert!(
-        DeRecShare::decode(crate::protocol::tests::pre_0_0_9_fields_before_y().as_slice()).is_ok(),
+        DeRecShare::decode(pre_0_0_9_fields_before_y().as_slice()).is_ok(),
         "the old x field must not be what fails"
     );
-    assert!(
-        DeRecShare::decode(crate::protocol::tests::pre_0_0_9_derec_share(1, 0).as_slice()).is_err()
-    );
+    assert!(DeRecShare::decode(pre_0_0_9_derec_share(1, 0).as_slice()).is_err());
 }
 
 #[test]
@@ -518,7 +521,7 @@ fn test_produce_get_share_response_message_request_timestamp_mismatch() {
     let mut envelope_timestamp = message_timestamp;
     envelope_timestamp.seconds += 1;
 
-    let tampered_request_message = derec_proto::GetShareRequestMessage {
+    let tampered_request_message = GetShareRequestMessage {
         secret_id,
         version,
         timestamp: Some(message_timestamp),
@@ -602,7 +605,7 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
         &shared_key,
         create_committed_share_bytes(secret_id, version),
     );
-    let crate::primitives::sharing::request::ExtractResult {
+    let ExtractStoreShareRequestResult {
         request: stored_share_request,
     } = extract_store_share_request(&stored_share_envelope, &shared_key)
         .expect("extract should succeed");
@@ -644,7 +647,7 @@ fn test_produce_get_share_response_message_secret_id_mismatch() {
         &shared_key,
         create_committed_share_bytes(stored_secret_id, version),
     );
-    let crate::primitives::sharing::request::ExtractResult {
+    let ExtractStoreShareRequestResult {
         request: stored_share_request,
     } = extract_store_share_request(&stored_share_envelope, &shared_key)
         .expect("extract_store_share_request should succeed");
@@ -690,7 +693,7 @@ fn test_produce_get_share_response_message_version_mismatch() {
         &shared_key,
         create_committed_share_bytes(secret_id, stored_version),
     );
-    let crate::primitives::sharing::request::ExtractResult {
+    let ExtractStoreShareRequestResult {
         request: stored_share_request,
     } = extract_store_share_request(&stored_share_envelope, &shared_key)
         .expect("extract_store_share_request should succeed");
@@ -760,7 +763,7 @@ fn test_recovery_end_to_end() {
             .expect("build should succeed")
             .encode_to_vec();
 
-        let crate::primitives::sharing::request::ExtractResult {
+        let ExtractStoreShareRequestResult {
             request: stored_share_request,
         } = extract_store_share_request(&stored_share_envelope, &shared_key)
             .expect("extract_store_share_request should succeed");
@@ -802,9 +805,9 @@ fn test_extract_get_share_request_rejects_scheme_mismatched_reply_to() {
     let channel_id = ChannelId(13);
     let shared_key = [97u8; 32];
 
-    let malicious_reply_to = derec_proto::TransportProtocol {
+    let malicious_reply_to = TransportProtocol {
         uri: "ws://attacker.example/inbox".to_owned(),
-        protocol: derec_proto::Protocol::Https as i32,
+        protocol: Protocol::Https as i32,
     };
 
     let ProduceGetShareRequestMessageResult { envelope } = produce_get_share_request_message(
@@ -812,7 +815,7 @@ fn test_extract_get_share_request_rejects_scheme_mismatched_reply_to() {
         1,
         1,
         &shared_key,
-        std::slice::from_ref(&malicious_reply_to),
+        slice::from_ref(&malicious_reply_to),
     )
     .expect("failed to produce get share request");
 
@@ -821,7 +824,7 @@ fn test_extract_get_share_request_rejects_scheme_mismatched_reply_to() {
     assert!(matches!(
         result,
         Err(Error::Transport(
-            crate::transport::TransportValidationError::SchemeMismatch { .. }
+            TransportValidationError::SchemeMismatch { .. }
         ))
     ));
 }

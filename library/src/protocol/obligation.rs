@@ -30,20 +30,28 @@
 //! response body, the pairing handshake, and a replica `UnpairRequest`, which
 //! is a one-way notice.
 
+use crate::derec_message;
 use crate::derec_message::DeRecMessageBuilder;
+use crate::error_codes;
+use crate::extensions::channel_store;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::protocol::context::Local;
 use crate::protocol::events::{
     DeRecEvent, FailedRequest, PendingAction, PendingActionKind, ReplyTarget,
 };
 use crate::protocol::stores::{StoreSet, Stores};
+use crate::protocol::types::ReplicaFilter;
 use crate::protocol::{DeRecSecretStore as _, DeRecTransport, SecretKind, SecretValue};
 use crate::transport::TransportPolicy;
 use crate::types::{ChannelId, SharedKey};
 use crate::{Error, Result};
+use derec_proto::DeRecResult;
+use derec_proto::ErrorResponseMessage;
 use derec_proto::{MessageBody, StatusEnum, TransportProtocol};
 use prost::Message as _;
+use std::mem;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 
 /// The memo sent with a failure that has no protocol meaning of its own.
 ///
@@ -94,10 +102,7 @@ impl Obligation {
         request: FailedRequest,
         policy: TransportPolicy,
     ) -> Self {
-        let reply_to = crate::extensions::channel_store::filter_reply_to(
-            policy,
-            &requested_reply_to(&request),
-        );
+        let reply_to = channel_store::filter_reply_to(policy, &requested_reply_to(&request));
         Self {
             channel_id,
             trace_id,
@@ -265,7 +270,7 @@ impl Obligation {
         obligation
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+    fn lock(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -410,10 +415,7 @@ impl Obligation {
     ) -> Result<bool> {
         Ok(stores
             .channels
-            .replicas_matching(
-                local.secret_id,
-                crate::protocol::types::ReplicaFilter::default(),
-            )
+            .replicas_matching(local.secret_id, ReplicaFilter::default())
             .await?
             .iter()
             .any(|member| member.channel_id == self.channel_id))
@@ -531,7 +533,7 @@ pub(crate) async fn settle<S: StoreSet>(
     };
     let (known, mut events) = {
         let mut state = obligation.lock();
-        (state.known.take(), std::mem::take(&mut state.carried))
+        (state.known.take(), mem::take(&mut state.carried))
     };
     if let Some(sent) = obligation.answered() {
         events.push(obligation.failed_after_answer(sent, &error));
@@ -661,7 +663,7 @@ async fn send_failure<S: StoreSet>(
     use crate::extensions::message_body::MessageBodyExt as _;
 
     let mut body = failure_body(local, &obligation.request, status, memo);
-    let timestamp = crate::derec_message::current_timestamp();
+    let timestamp = derec_message::current_timestamp();
     body.set_timestamp(timestamp);
     let envelope = DeRecMessageBuilder::channel()
         .channel_id(*channel_id)
@@ -704,15 +706,13 @@ fn failure_body(
         FailedRequest::UpdateChannelInfo(_) => {
             handlers::update_channel_info::failure_response(status, memo)
         }
-        FailedRequest::Undecodable => {
-            MessageBody::ErrorResponse(derec_proto::ErrorResponseMessage {
-                result: Some(derec_proto::DeRecResult {
-                    status: status as i32,
-                    memo: memo.to_owned(),
-                }),
-                timestamp: None,
-            })
-        }
+        FailedRequest::Undecodable => MessageBody::ErrorResponse(ErrorResponseMessage {
+            result: Some(DeRecResult {
+                status: status as i32,
+                memo: memo.to_owned(),
+            }),
+            timestamp: None,
+        }),
     }
 }
 
@@ -757,7 +757,7 @@ pub(crate) fn request_failed(
         responded,
         status,
         memo: memo.to_owned(),
-        error_code: crate::error_codes::classify(error).1.name().to_owned(),
+        error_code: error_codes::classify(error).1.name().to_owned(),
         message: error.to_string(),
         action,
     }

@@ -9,6 +9,9 @@ use crate::protocol::types::{
 };
 use crate::types::ChannelId;
 use derec_proto::TransportProtocol;
+use std::future;
+use std::result;
+use std::sync::Arc;
 use std::{future::Future, pin::Pin};
 
 /// Type-erased future returned by [`DeRecSecretStore`] methods.
@@ -22,7 +25,7 @@ use std::{future::Future, pin::Pin};
 /// `Box::pin(std::future::ready(...))` at zero cost.
 #[cfg(target_arch = "wasm32")]
 pub type SecretStoreFuture<'a, T> =
-    Pin<Box<dyn Future<Output = std::result::Result<T, SecretStoreError>> + 'a>>;
+    Pin<Box<dyn Future<Output = result::Result<T, SecretStoreError>> + 'a>>;
 /// Type-erased future returned by [`DeRecSecretStore`] methods.
 ///
 /// `Send` on every native target so multi-threaded executors (e.g.
@@ -34,29 +37,29 @@ pub type SecretStoreFuture<'a, T> =
 /// `Box::pin(std::future::ready(...))` at zero cost.
 #[cfg(not(target_arch = "wasm32"))]
 pub type SecretStoreFuture<'a, T> =
-    Pin<Box<dyn Future<Output = std::result::Result<T, SecretStoreError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = result::Result<T, SecretStoreError>> + Send + 'a>>;
 
 /// Type-erased future returned by [`DeRecChannelStore`] methods. See
 /// [`SecretStoreFuture`] for the `Send` rules.
 #[cfg(target_arch = "wasm32")]
 pub type ChannelStoreFuture<'a, T> =
-    Pin<Box<dyn Future<Output = std::result::Result<T, ChannelStoreError>> + 'a>>;
+    Pin<Box<dyn Future<Output = result::Result<T, ChannelStoreError>> + 'a>>;
 /// Type-erased future returned by [`DeRecChannelStore`] methods. See
 /// [`SecretStoreFuture`] for the `Send` rules.
 #[cfg(not(target_arch = "wasm32"))]
 pub type ChannelStoreFuture<'a, T> =
-    Pin<Box<dyn Future<Output = std::result::Result<T, ChannelStoreError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = result::Result<T, ChannelStoreError>> + Send + 'a>>;
 
 /// Type-erased future returned by [`DeRecShareStore`] methods. See
 /// [`SecretStoreFuture`] for the `Send` rules.
 #[cfg(target_arch = "wasm32")]
 pub type ShareStoreFuture<'a, T> =
-    Pin<Box<dyn Future<Output = std::result::Result<T, ShareStoreError>> + 'a>>;
+    Pin<Box<dyn Future<Output = result::Result<T, ShareStoreError>> + 'a>>;
 /// Type-erased future returned by [`DeRecShareStore`] methods. See
 /// [`SecretStoreFuture`] for the `Send` rules.
 #[cfg(not(target_arch = "wasm32"))]
 pub type ShareStoreFuture<'a, T> =
-    Pin<Box<dyn Future<Output = std::result::Result<T, ShareStoreError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = result::Result<T, ShareStoreError>> + Send + 'a>>;
 
 /// Type-erased future returned by [`DeRecTransport::send`]. See
 /// [`SecretStoreFuture`] for the `Send` rules.
@@ -71,12 +74,12 @@ pub type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 
 /// [`SecretStoreFuture`] for the `Send` rules.
 #[cfg(target_arch = "wasm32")]
 pub type StateStoreFuture<'a, T> =
-    Pin<Box<dyn Future<Output = std::result::Result<T, StateStoreError>> + 'a>>;
+    Pin<Box<dyn Future<Output = result::Result<T, StateStoreError>> + 'a>>;
 /// Type-erased future returned by [`DeRecStateStore`] methods. See
 /// [`SecretStoreFuture`] for the `Send` rules.
 #[cfg(not(target_arch = "wasm32"))]
 pub type StateStoreFuture<'a, T> =
-    Pin<Box<dyn Future<Output = std::result::Result<T, StateStoreError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = result::Result<T, StateStoreError>> + Send + 'a>>;
 
 /// Fails to compile if any store future loses `Send` on a native target.
 ///
@@ -605,7 +608,7 @@ pub trait DeRecShareStore {
         version: u32,
     ) -> ShareStoreFuture<'_, ()> {
         let _ = (secret_id, channel_id, version);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 }
 
@@ -1277,7 +1280,7 @@ impl<T: DeRecTransport + ?Sized> DeRecTransport for &mut T {
 ///
 /// Use [`Box<T>`](Box) or `&mut T` for the stores; both are implemented for
 /// every trait here.
-impl<T: DeRecTransport + ?Sized> DeRecTransport for std::sync::Arc<T> {
+impl<T: DeRecTransport + ?Sized> DeRecTransport for Arc<T> {
     fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
         (**self).send(endpoints, message)
     }
@@ -1304,7 +1307,7 @@ mod pointer_forwarding_tests {
         Box<dyn DeRecSecretStore>,
         Box<dyn DeRecUserSecretStore>,
         Box<dyn DeRecStateStore>,
-        std::sync::Arc<NoopTransport>,
+        Arc<NoopTransport>,
     >;
 
     fn build_erased() -> ErasedProtocol {
@@ -1318,7 +1321,7 @@ mod pointer_forwarding_tests {
             .with_state_store(
                 Box::new(InMemPersistedStateStore::default()) as Box<dyn DeRecStateStore>
             )
-            .with_transport(std::sync::Arc::new(NoopTransport))
+            .with_transport(Arc::new(NoopTransport))
             .with_own_transports(["https://erased.example.com"])
             .with_threshold(2)
             .build()
@@ -1400,8 +1403,8 @@ mod pointer_forwarding_tests {
     #[test]
     fn a_transport_can_be_shared_behind_an_arc() {
         fn assert_transport<T: DeRecTransport>() {}
-        assert_transport::<std::sync::Arc<NoopTransport>>();
-        assert_transport::<std::sync::Arc<dyn DeRecTransport>>();
+        assert_transport::<Arc<NoopTransport>>();
+        assert_transport::<Arc<dyn DeRecTransport>>();
         assert_transport::<Box<dyn DeRecTransport>>();
     }
 }

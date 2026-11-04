@@ -27,6 +27,7 @@ import type {
   ParameterRange,
   ReplicaFilter,
   ReplicaRoleName,
+  RecoveryHelper,
   SecretStore,
   SenderKindName,
   Share,
@@ -496,6 +497,7 @@ function makeNode(
     parameterRange?: Partial<ParameterRange>;
     channelStore?: InMemoryChannelStore;
     autoRespondOnFailure?: boolean;
+    timeouts?: import("@derec-alliance/nodejs").Timeouts;
   } = {},
 ): Node {
   const channelStore = options.channelStore ?? new InMemoryChannelStore();
@@ -535,6 +537,9 @@ function makeNode(
   }
   if (options.autoRespondOnFailure !== undefined) {
     builder = builder.withAutoRespondOnFailure(options.autoRespondOnFailure);
+  }
+  if (options.timeouts !== undefined) {
+    builder = builder.withTimeouts(options.timeouts);
   }
   const protocol = builder.build();
   return { protocol, transport, channelStore, shareStore, secretStore, userSecretStore, stateStore };
@@ -2479,6 +2484,508 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   console.log("\n✓ Discovery & Recovery flow passed.\n");
 }
 
+/**
+ * A recovery decides only once every helper it asked has answered, so a
+ * helper that never answers holds the decision until
+ * `timeouts.get_share_response_secs` elapses. `tick()` then reports that
+ * helper as timed out and recovers from the shares in hand.
+ */
+async function runSilentHelperRecoveryFlow(): Promise<void> {
+  console.log("=== [Protocol] Silent Helper Recovery Flow ===\n");
+
+  const owner = makeNode("Owner", "https://owner.example.com", {
+    timeouts: { get_share_response_secs: 1 },
+  });
+  const helperA = makeNode("HelperA", "https://helper-a.example.com");
+  const helperB = makeNode("HelperB", "https://helper-b.example.com");
+  const helperC = makeNode("HelperC", "https://helper-c.example.com");
+
+  await doPair(helperA, owner, 1n, "Owner↔HelperA");
+  await doPair(helperB, owner, 2n, "Owner↔HelperB");
+  const { longTermChannelId: channelC } = await doPair(helperC, owner, 3n, "Owner↔HelperC");
+  console.log();
+
+  const helpersByUri: Record<string, [Node, string]> = {
+    "https://helper-a.example.com": [helperA, "HelperA"],
+    "https://helper-b.example.com": [helperB, "HelperB"],
+    "https://helper-c.example.com": [helperC, "HelperC"],
+  };
+
+  const secretData = new TextEncoder().encode("three helpers, one silent");
+  const protectEvents = await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([9]), name: "silent-helper secret", data: secretData }],
+  });
+  const version = requireEvent(protectEvents, "ProtectSecretStarted", "Owner").version;
+  for (const outbound of owner.transport.drain()) {
+    const [helper, label] = helpersByUri[outbound.endpoint.uri]!;
+    const helperEvents = await processAll(helper, outbound.message);
+    requireEvent(helperEvents, "ShareStored", label);
+    await owner.protocol.process(drainOne(helper, label));
+  }
+  console.log(`  [Owner]  start(ProtectSecret) → version ${version} stored on all three helpers`);
+
+  await owner.protocol.start(FlowKind.RecoverSecret, {
+    secretId: owner.protocol.secretId(),
+    version,
+  });
+
+  // HelperC never sees its request.
+  const recoveryEvents: DeRecEvent[] = [];
+  for (const outbound of owner.transport.drain()) {
+    if (outbound.endpoint.uri === "https://helper-c.example.com") continue;
+    const [helper, label] = helpersByUri[outbound.endpoint.uri]!;
+    await processAll(helper, outbound.message);
+    recoveryEvents.push(...(await owner.protocol.process(drainOne(helper, label))));
+  }
+
+  const received = recoveryEvents.filter((e) => e.type === "RecoveryShareReceived").length;
+  if (received !== 2) {
+    throw new Error(`HelperA and HelperB answer: expected 2 RecoveryShareReceived, got ${received}`);
+  }
+  if (recoveryEvents.some((e) => e.type === "SecretRecovered")) {
+    throw new Error(
+      `nothing is decided while HelperC's answer is due: [${recoveryEvents.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  const waiting = await owner.protocol.tick();
+  if (waiting.length !== 0) {
+    throw new Error(
+      `the recovery waits out its window: tick() → [${waiting.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  console.log("  [Owner]  2 shares in, HelperC silent → no SecretRecovered, tick() empty  ✓");
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 2100));
+  const settled = await owner.protocol.tick();
+  const [failed, recovered, ...rest] = settled;
+  if (
+    failed?.type !== "RecoverSecretFailed" ||
+    recovered?.type !== "SecretRecovered" ||
+    rest.length !== 0
+  ) {
+    throw new Error(
+      `expected a timeout then SecretRecovered, got [${settled.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  if (failed.channel_id !== channelC) {
+    throw new Error(`HelperC (${channelC}) is the one that timed out, got ${failed.channel_id}`);
+  }
+  if (failed.version !== version) {
+    throw new Error(`RecoverSecretFailed.version: expected ${version}, got ${failed.version}`);
+  }
+  if (failed.error !== "timeout") {
+    throw new Error(`RecoverSecretFailed.error: expected "timeout", got "${failed.error}"`);
+  }
+  const recoveredSecret = recovered.secret.secrets.find((s) => s.id.length === 1 && s.id[0] === 9);
+  if (!recoveredSecret || !byteArraysEqual(recoveredSecret.data, secretData)) {
+    throw new Error("recovered secret must carry the protected bytes");
+  }
+  console.log(
+    `  [Owner]  after the window, tick() → RecoverSecretFailed(${channelC}, "timeout"), SecretRecovered("${recoveredSecret.name}")  ✓`,
+  );
+
+  const closed = await owner.protocol.tick();
+  if (closed.length !== 0) {
+    throw new Error(
+      `the recovery is closed once decided: tick() → [${closed.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  console.log("  [Owner]  tick() after the decision is empty  ✓");
+
+  console.log("\n✓ Silent helper recovery flow passed.\n");
+}
+
+/**
+ * Protect a one-entry secret named `name` from `owner` across every helper in
+ * `helpers`, deliver the round, and return the version it published.
+ */
+async function protectAcross(
+  owner: AddressedNode,
+  helpers: AddressedNode[],
+  name: string,
+): Promise<number> {
+  const events = await owner.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([10]), name, data: new TextEncoder().encode(name) }],
+  });
+  const version = requireEvent(events, "ProtectSecretStarted", name).version;
+  await pumpAll([owner, ...helpers]);
+  return version;
+}
+
+/**
+ * Replace the share `to` holds on `toChannel` with the one `from` holds on
+ * `fromChannel`, both at `version`, through the helpers' own share stores.
+ * Both splits are of the same `(secret_id, version)`, so the moved share
+ * still passes every check it is put to on its own.
+ */
+async function transplantShare(
+  from: Node,
+  fromChannel: string,
+  to: Node,
+  toChannel: string,
+  version: number,
+): Promise<void> {
+  const [foreign] = await from.shareStore.load(String(from.protocol.secretId()), fromChannel, [version]);
+  if (!foreign) throw new Error("the foreign helper holds a share for the version");
+  const toSid = String(to.protocol.secretId());
+  const [held] = await to.shareStore.load(toSid, toChannel, [version]);
+  if (!held) throw new Error("the helper holds a share for the version");
+  await to.shareStore.save(toSid, toChannel, { ...held, bytes: foreign.bytes });
+}
+
+/**
+ * Owner A splits its secret at threshold 3 across five helpers. A second
+ * owner, B, with the same secret id, splits a different secret at version 1
+ * across its own helpers at `bThreshold`; two of A's helpers end up holding
+ * B's shares instead of A's. Returns A's decision events and the channels of
+ * the five helpers, in order.
+ */
+async function recoverWithTwoOfFiveFromAnotherSplit(
+  bThreshold: number,
+): Promise<{ events: DeRecEvent[]; channels: string[] }> {
+  const secretId = 44n;
+  const owner: AddressedNode = {
+    node: makeNode("owner-a", "https://owner-a.example.com", { secretId, threshold: 3 }),
+    uri: "https://owner-a.example.com",
+  };
+  // Each helper advertises its own name; that is what the owner records.
+  const helpers: AddressedNode[] = [1, 2, 3, 4, 5].map((i) => ({
+    node: makeNode(`helper-${i}`, `https://helper-${i}.example.com`),
+    uri: `https://helper-${i}.example.com`,
+  }));
+  const channels: string[] = [];
+  for (const [i, helper] of helpers.entries()) {
+    const { longTermChannelId } = await doPair(helper.node, owner.node, BigInt(10 + i), `OwnerA↔helper-${i + 1}`);
+    channels.push(longTermChannelId);
+  }
+  const version = await protectAcross(owner, helpers, "owner-a secret");
+
+  const other: AddressedNode = {
+    node: makeNode("owner-b", "https://owner-b.example.com", { secretId, threshold: bThreshold }),
+    uri: "https://owner-b.example.com",
+  };
+  const xs: AddressedNode[] = [1, 2, 3].map((i) => ({
+    node: makeNode(`x${i}`, `https://x${i}.example.com`),
+    uri: `https://x${i}.example.com`,
+  }));
+  const xChannels: string[] = [];
+  for (const [i, x] of xs.entries()) {
+    const { longTermChannelId } = await doPair(x.node, other.node, BigInt(21 + i), `OwnerB↔x${i + 1}`);
+    xChannels.push(longTermChannelId);
+  }
+  const otherVersion = await protectAcross(other, xs, "owner-b secret");
+  if (otherVersion !== version) {
+    throw new Error(`both splits are of the same version: ${otherVersion} ≠ ${version}`);
+  }
+
+  await transplantShare(xs[0]!.node, xChannels[0]!, helpers[3]!.node, channels[3]!, version);
+  await transplantShare(xs[1]!.node, xChannels[1]!, helpers[4]!.node, channels[4]!, version);
+
+  await owner.node.protocol.start(FlowKind.RecoverSecret, { secretId, version });
+  const events = await pumpAll([owner, ...helpers]);
+  if (events.some((e) => e.type === "RecoveryShareCorrupted")) {
+    throw new Error(
+      `a share of another split is not evidence against its helper: [${events.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  return { events, channels };
+}
+
+function helperChannels(helpers: RecoveryHelper[]): string[] {
+  return helpers.map((h) => h.channel_id);
+}
+
+function helperNames(helpers: RecoveryHelper[]): string[] {
+  return helpers.map((h) => h.communication_info?.["name"] ?? "");
+}
+
+function expectSame(label: string, got: unknown, want: unknown): void {
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    throw new Error(`${label}: expected ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
+  }
+}
+
+/**
+ * Three helpers back the owner's split; two hold valid shares of another
+ * split that cannot reconstruct. The library cannot tell which side is the
+ * owner's, so it reports a dispute naming both, not a recovery.
+ */
+async function runDisputedRecoveryFlow(): Promise<void> {
+  console.log("=== [Protocol] Disputed Recovery Flow ===\n");
+
+  const { events, channels } = await recoverWithTwoOfFiveFromAnotherSplit(3);
+  const disputed = requireEvent(events, "RecoveryDisputed", "OwnerA");
+  if (events.some((e) => e.type === "SecretRecovered")) {
+    throw new Error("a disputed secret is never reported as recovered");
+  }
+  expectSame("RecoveryDisputed.secret name", disputed.secret.secrets[0]?.name, "owner-a secret");
+  expectSame("RecoveryDisputed.supported_by channels", helperChannels(disputed.supported_by), channels.slice(0, 3));
+  expectSame("RecoveryDisputed.disputed_by channels", helperChannels(disputed.disputed_by), channels.slice(3));
+  expectSame("RecoveryDisputed.supported_by names", helperNames(disputed.supported_by), ["helper-1", "helper-2", "helper-3"]);
+  expectSame("RecoveryDisputed.disputed_by names", helperNames(disputed.disputed_by), ["helper-4", "helper-5"]);
+  console.log(
+    "  [OwnerA]  RecoveryDisputed(\"owner-a secret\") supported_by [helper-1..3], disputed_by [helper-4, helper-5], no SecretRecovered  ✓",
+  );
+
+  console.log("\n✓ Disputed recovery flow passed.\n");
+}
+
+/**
+ * When the other split's two shares reconstruct too, the owner faces two
+ * complete secrets and has to choose between them.
+ */
+async function runConflictingRecoveryFlow(): Promise<void> {
+  console.log("=== [Protocol] Conflicting Recovery Flow ===\n");
+
+  const { events, channels } = await recoverWithTwoOfFiveFromAnotherSplit(2);
+  const conflict = requireEvent(events, "RecoveryConflict", "OwnerA");
+  expectSame(
+    "RecoveryConflict.candidates",
+    conflict.candidates.map((c) => [c.secret.secrets[0]?.name, helperChannels(c.supported_by)]),
+    [
+      ["owner-a secret", channels.slice(0, 3)],
+      ["owner-b secret", channels.slice(3)],
+    ],
+  );
+  expectSame("RecoveryConflict.disputed_by (every share is on one side or the other)", conflict.disputed_by, []);
+  console.log(
+    "  [OwnerA]  RecoveryConflict candidates [(\"owner-a secret\", helper-1..3), (\"owner-b secret\", helper-4..5)], disputed_by []  ✓",
+  );
+
+  console.log("\n✓ Conflicting recovery flow passed.\n");
+}
+
+/**
+ * A recovering device can already be a helper for another owner. `restore`
+ * wipes only the recovery channels whose peer is a helper; the channel on
+ * which this device helps that owner, and the share it holds there, survive.
+ */
+async function runRestoreKeepsHelperDutiesFlow(): Promise<void> {
+  console.log("=== [Protocol] Restore Keeps Helper Duties Flow ===\n");
+
+  const ownSecretId = 4545n;
+  const lost: AddressedNode = {
+    node: makeNode("lost-device", "https://lost.example.com", { secretId: ownSecretId }),
+    uri: "https://lost.example.com",
+  };
+  const helperA: AddressedNode = {
+    node: makeNode("helper-a", "https://helper-a.example.com"),
+    uri: "https://helper-a.example.com",
+  };
+  const helperB: AddressedNode = {
+    node: makeNode("helper-b", "https://helper-b.example.com"),
+    uri: "https://helper-b.example.com",
+  };
+  const { longTermChannelId: channelA } = await doPair(helperA.node, lost.node, 1n, "Lost↔HelperA");
+  const { longTermChannelId: channelB } = await doPair(helperB.node, lost.node, 2n, "Lost↔HelperB");
+  const version = await protectAcross(lost, [helperA, helperB], "own secret");
+
+  const device: AddressedNode = {
+    node: makeNode("new-device", "https://device.example.com", { secretId: ownSecretId }),
+    uri: "https://device.example.com",
+  };
+  const deviceSid = String(device.node.protocol.secretId());
+
+  // The new device helps another owner first.
+  const otherOwner: AddressedNode = {
+    node: makeNode("other-owner", "https://other.example.com", { secretId: 9090n }),
+    uri: "https://other.example.com",
+  };
+  const otherHelper: AddressedNode = {
+    node: makeNode("other-helper", "https://other-helper.example.com"),
+    uri: "https://other-helper.example.com",
+  };
+  const { longTermChannelId: dutyChannel } = await doPair(device.node, otherOwner.node, 3n, "Other↔Device");
+  await doPair(otherHelper.node, otherOwner.node, 4n, "Other↔OtherHelper");
+  const otherVersion = await protectAcross(otherOwner, [device, otherHelper], "other owner's secret");
+  const heldBefore = await device.node.shareStore.load(deviceSid, dutyChannel, [otherVersion]);
+  if (heldBefore.length !== 1) {
+    throw new Error(`the device holds the other owner's share: got ${heldBefore.length} share(s)`);
+  }
+  console.log(`  [Device]  helps the other owner on duty channel ${dutyChannel}, holding its v${otherVersion} share  ✓`);
+
+  // Then it recovers its own secret over fresh recovery channels.
+  const recoveryChannels: string[] = [];
+  for (const [helper, original, transient] of [
+    [helperA, channelA, 100n],
+    [helperB, channelB, 101n],
+  ] as const) {
+    const contact: ContactMessage = await device.node.protocol.createContact(transient, ContactMode.InlineKeys);
+    await helper.node.protocol.start(FlowKind.Pairing, { kind: SenderKind.Helper, contact });
+    const events = await pumpAll([device, helper]);
+    const paired = events.find(
+      (e) => e.type === "PairingCompleted" && e.pairing_channel_id === String(transient),
+    ) as Extract<DeRecEvent, { type: "PairingCompleted" }> | undefined;
+    if (!paired) {
+      throw new Error(`the recovery pairing on ${transient} completes: [${events.map((e) => e.type).join(", ")}]`);
+    }
+    await helper.node.channelStore.linkChannel(
+      String(helper.node.protocol.secretId()),
+      original,
+      paired.channel_id,
+    );
+    recoveryChannels.push(paired.channel_id);
+  }
+
+  await device.node.protocol.start(FlowKind.RecoverSecret, { secretId: ownSecretId, version });
+  const recoveryEvents = await pumpAll([device, helperA, helperB]);
+  const recovered = requireEvent(recoveryEvents, "SecretRecovered", "Device").secret;
+  console.log("  [Device]  recovers its own secret over fresh recovery channels  ✓");
+
+  const restoreEvents = await device.node.protocol.restore(recovered, version);
+  const touched = restoreEvents.flatMap((e) =>
+    e.type === "UnpairStarted" || e.type === "Unpaired" || e.type === "UnpairFailed" ? [e.channel_id] : [],
+  );
+  if (touched.includes(dutyChannel)) {
+    throw new Error(
+      `restore must not unpair the channel to the other owner: [${restoreEvents.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  for (const recoveryChannel of recoveryChannels) {
+    if (!touched.includes(recoveryChannel)) {
+      throw new Error(`restore still wipes recovery channel ${recoveryChannel}`);
+    }
+  }
+  console.log("  [Device]  restore unpairs both recovery channels, never the duty channel  ✓");
+  await pumpAll([device, helperA, helperB]);
+
+  const dutyBytes = await device.node.channelStore.load(deviceSid, dutyChannel, "0");
+  if (!dutyBytes) throw new Error("the channel to the other owner survives restore");
+  const dutyStatus = JSON.parse(new TextDecoder().decode(dutyBytes)).Helper.status;
+  if (dutyStatus !== "Paired") {
+    throw new Error(`the channel to the other owner stays Paired, got ${dutyStatus}`);
+  }
+  const heldAfter = await device.node.shareStore.load(deviceSid, dutyChannel, [otherVersion]);
+  if (heldAfter.length !== 1) {
+    throw new Error(`the share held for the other owner survives restore: got ${heldAfter.length} share(s)`);
+  }
+  console.log("  [Device]  duty channel still Paired and the other owner's share still held  ✓");
+
+  await otherOwner.node.protocol.start(FlowKind.VerifyShares, {
+    secretId: otherOwner.node.protocol.secretId(),
+    version: otherVersion,
+  });
+  const verified = (await pumpAll([otherOwner, device, otherHelper])).flatMap((e) =>
+    e.type === "ShareVerified" ? [e.channel_id] : [],
+  );
+  if (!verified.includes(dutyChannel)) {
+    throw new Error(`the other owner can still verify the restored device's share: [${verified.join(", ")}]`);
+  }
+  console.log("  [Other]   VerifyShares → ShareVerified on the duty channel  ✓");
+
+  console.log("\n✓ Restore keeps helper duties flow passed.\n");
+}
+
+/**
+ * Start a replica pairing from `scanner`, as `kind`, against a fresh contact
+ * from `creator` at `transient`.
+ */
+async function startReplicaScan(
+  scanner: Node,
+  creator: Node,
+  transient: bigint,
+  kind: SenderKind,
+): Promise<void> {
+  const contact = await creator.protocol.createContact(transient, ContactMode.InlineKeys);
+  await scanner.protocol.start(FlowKind.Pairing, { kind, contact });
+}
+
+/**
+ * `ProtectSecret` on `owner` must be accepted: a replica pairing that never
+ * completed is no group, and must never stop the device from protecting.
+ */
+async function assertProtects(owner: Node, name: string): Promise<void> {
+  try {
+    await owner.protocol.start(FlowKind.ProtectSecret, {
+      secrets: [{ id: new Uint8Array([11]), name, data: new TextEncoder().encode(name) }],
+    });
+  } catch (e) {
+    throw new Error(`ProtectSecret (${name}) must succeed: ${JSON.stringify(e)}`);
+  }
+  console.log(`  [ReplicaA] ProtectSecret ${name}  ✓`);
+}
+
+/**
+ * A replica pairing that never completes must not leave this device unable
+ * to protect: neither while it is pending, nor after a later pairing
+ * completes, nor once the expiry sweep has cleared it. The device's own row
+ * lands on the channel of the pairing that was confirmed.
+ */
+async function runAbandonedReplicaPairingFlow(): Promise<void> {
+  console.log("=== [Protocol] Abandoned Replica Pairing Flow ===\n");
+
+  const aId = 0xA1A1n;
+  const a: AddressedNode = {
+    node: makeNode("replica-a", "https://replica-a.example.com", {
+      replicaId: aId,
+      timeouts: { expired_channels: { enabled: true, timeout_in_secs: 1 } },
+    }),
+    uri: "https://replica-a.example.com",
+  };
+  const b: AddressedNode = {
+    node: makeNode("replica-b", "https://replica-b.example.com", { replicaId: 0xB2B2n }),
+    uri: "https://replica-b.example.com",
+  };
+  const c: AddressedNode = {
+    node: makeNode("replica-c", "https://replica-c.example.com", { replicaId: 0xC3C3n }),
+    uri: "https://replica-c.example.com",
+  };
+
+  // B never hears of the request.
+  await startReplicaScan(a.node, b.node, 100n, SenderKind.ReplicaSource);
+  a.node.transport.drain();
+  await assertProtects(a.node, "while a replica pairing is pending");
+
+  await startReplicaScan(a.node, c.node, 200n, SenderKind.ReplicaSource);
+  const pairingEvents = await pumpAll([a, c]);
+  const completed = pairingEvents.find(
+    (e) => e.type === "PairingCompleted" && e.pairing_channel_id === "200",
+  ) as Extract<DeRecEvent, { type: "PairingCompleted" }> | undefined;
+  if (!completed) {
+    throw new Error(`the pairing with C completes: [${pairingEvents.map((e) => e.type).join(", ")}]`);
+  }
+  const groupChannel = completed.channel_id;
+  await crossConfirmFingerprint(a.node, c.node, BigInt(groupChannel));
+  await pumpAll([a, c]);
+  await assertProtects(a.node, "after a later pairing is confirmed");
+  await pumpAll([a, c]);
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 2100));
+  await a.node.protocol.tick();
+  await assertProtects(a.node, "after the expiry sweep");
+  await pumpAll([a, c]);
+
+  const aSid = String(a.node.protocol.secretId());
+  // The stored record carries ids as bare JSON numbers, beyond what a JS
+  // number holds exactly, so they are read from the text.
+  const roster = new TextDecoder().decode(
+    await a.node.channelStore.listReplicas(aSid, {
+      ids: [String(aId)],
+      status: [],
+      role: null,
+      exclude: [],
+    }),
+  );
+  const own = {
+    replica_id: /"replica_id":(\d+)/.exec(roster)?.[1],
+    channel_id: /"channel_id":(\d+)/.exec(roster)?.[1],
+    status: /"status":"(\w+)"/.exec(roster)?.[1],
+  };
+  if ((roster.match(/"replica_id":/g) ?? []).length !== 1 || own.replica_id !== String(aId)) {
+    const all = new TextDecoder().decode(await a.node.channelStore.listReplicas(aSid, ANY_REPLICAS));
+    throw new Error(`A keeps its own row: roster ${all}`);
+  }
+  if (own.channel_id !== groupChannel) {
+    throw new Error(`A's own row is on the confirmed group channel ${groupChannel}, got ${own.channel_id}`);
+  }
+  if (own.status !== "Paired") {
+    throw new Error(`A's own row is Paired, got ${own.status}`);
+  }
+  console.log(`  [ReplicaA] own row on the confirmed group channel ${groupChannel}, Paired  ✓`);
+
+  console.log("\n✓ Abandoned replica pairing flow passed.\n");
+}
+
 // Verifies that an Owner-initiated unpair (Required-ack mode, the default)
 // produces a successful round-trip:
 //   1. Owner → Helper: UnpairRequest
@@ -3852,6 +4359,11 @@ export async function runProtocolSmoke(): Promise<void> {
   await runOwnerKeepVersionMissedRoundFlow();
   await runInvalidKeepVersionFlow();
   await runDiscoveryAndRecoveryFlow();
+  await runSilentHelperRecoveryFlow();
+  await runDisputedRecoveryFlow();
+  await runConflictingRecoveryFlow();
+  await runRestoreKeepsHelperDutiesFlow();
+  await runAbandonedReplicaPairingFlow();
   await runUnpairingFlow();
   await runUpdateChannelInfoFlow();
   await runReplyToFlow();

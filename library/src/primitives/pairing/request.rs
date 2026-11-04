@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use super::parameter_range::check_compatibility;
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::contact_message::ContactMessageExt as _;
 use crate::extensions::pair_request::PairRequestMessageExt as _;
@@ -8,17 +9,19 @@ use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::primitives::pairing::PairingError;
 use crate::utils::verify_timestamps;
 use crate::{
-    derec_message::{DeRecMessageBuilder, current_timestamp},
+    Error,
+    derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_plaintext_message},
     protocol_version::ProtocolVersion,
     types::ChannelId,
-    utils::generate_seed,
+    utils::{generate_seed, random_u64},
 };
 use derec_cryptography::pairing::{
-    self as cryptography_pairing, PairingContactMessageMaterial, PairingSecretKeyMaterial,
+    self as cryptography_pairing, InitiatorSecretKeyMaterial, PairingContactMessageMaterial,
+    PairingSecretKeyMaterial, envelope as pairing_envelope,
 };
 use derec_proto::{
     CommunicationInfo, ContactMessage, ContactMode, DeRecMessage, MessageBody, PairRequestMessage,
-    PrePairRequestMessage, SenderKind, TransportProtocol,
+    ParameterRange, PrePairRequestMessage, SenderKind, TransportProtocol,
 };
 use prost::Message;
 
@@ -150,12 +153,12 @@ pub fn create_contact(
     contact_mode: ContactMode,
     own: Vec<TransportProtocol>,
     nonce: Option<u64>,
-) -> Result<CreateContactResult, crate::Error> {
+) -> Result<CreateContactResult, Error> {
     let primary = own.first().ok_or_else(|| {
         #[cfg(feature = "logging")]
         tracing::warn!("no transport protocols supplied");
 
-        crate::Error::from(PairingError::EmptyTransportUri)
+        Error::from(PairingError::EmptyTransportUri)
     })?;
 
     if primary.uri.trim().is_empty() {
@@ -165,7 +168,7 @@ pub fn create_contact(
         return Err(PairingError::EmptyTransportUri.into());
     }
 
-    let nonce = nonce.unwrap_or_else(crate::utils::random_u64);
+    let nonce = nonce.unwrap_or_else(random_u64);
 
     let (contact_message, secret_key) = match contact_mode {
         ContactMode::InlineKeys => {
@@ -233,7 +236,7 @@ pub fn create_contact(
 /// let bytes = request::encode_contact(&contact_message).expect("encode_contact failed");
 /// assert_eq!(request::decode_contact(&bytes).expect("decode_contact failed"), contact_message);
 /// ```
-pub fn encode_contact(contact_message: &ContactMessage) -> Result<Vec<u8>, crate::Error> {
+pub fn encode_contact(contact_message: &ContactMessage) -> Result<Vec<u8>, Error> {
     contact_message.validate()?;
     Ok(contact_message.encode_to_vec())
 }
@@ -250,8 +253,8 @@ pub fn encode_contact(contact_message: &ContactMessage) -> Result<Vec<u8>, crate
 /// - [`crate::Error::ProtobufDecode`] if the bytes are not a `ContactMessage`.
 /// - [`PairingError::InvalidContactMessage`] if the decoded contact violates the
 ///   invariants of its declared mode.
-pub fn decode_contact(bytes: &[u8]) -> Result<ContactMessage, crate::Error> {
-    let contact_message = ContactMessage::decode(bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn decode_contact(bytes: &[u8]) -> Result<ContactMessage, Error> {
+    let contact_message = ContactMessage::decode(bytes).map_err(Error::ProtobufDecode)?;
     contact_message.validate()?;
     Ok(contact_message)
 }
@@ -367,13 +370,13 @@ pub fn produce(
     own: Vec<TransportProtocol>,
     contact_message: &ContactMessage,
     communication_info: Option<CommunicationInfo>,
-    parameter_range: Option<derec_proto::ParameterRange>,
-) -> Result<ProduceResult, crate::Error> {
+    parameter_range: Option<ParameterRange>,
+) -> Result<ProduceResult, Error> {
     let transport_protocol = own.first().cloned().ok_or_else(|| {
         #[cfg(feature = "logging")]
         tracing::warn!("no transport protocols supplied");
 
-        crate::Error::from(PairingError::EmptyTransportUri)
+        Error::from(PairingError::EmptyTransportUri)
     })?;
     validate_inputs(
         &transport_protocol,
@@ -475,12 +478,12 @@ pub fn produce(
 pub fn produce_pre_pair_request(
     own: Vec<TransportProtocol>,
     contact_message: &ContactMessage,
-) -> Result<ProducePrePairResult, crate::Error> {
+) -> Result<ProducePrePairResult, Error> {
     let primary = own.first().ok_or_else(|| {
         #[cfg(feature = "logging")]
         tracing::warn!("no transport protocols supplied");
 
-        crate::Error::from(PairingError::EmptyTransportUri)
+        Error::from(PairingError::EmptyTransportUri)
     })?;
 
     validate_pre_pair_inputs(primary, contact_message)?;
@@ -621,27 +624,25 @@ pub fn produce_pre_pair_request(
 pub fn extract(
     envelope_bytes: &[u8],
     ecies_secret_key: &[u8],
-    parameter_range: Option<&derec_proto::ParameterRange>,
-) -> Result<ExtractResult, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+    parameter_range: Option<&ParameterRange>,
+) -> Result<ExtractResult, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
-    let plaintext =
-        derec_cryptography::pairing::envelope::decrypt(&envelope.message, ecies_secret_key)
-            .map_err(PairingError::PairingEncryption)?;
+    let plaintext = pairing_envelope::decrypt(&envelope.message, ecies_secret_key)
+        .map_err(PairingError::PairingEncryption)?;
 
-    let request = match MessageBody::decode_from_vec(plaintext.as_slice())
-        .map_err(crate::Error::ProtobufDecode)?
-    {
-        MessageBody::PairRequest(r) => r,
-        _ => {
-            #[cfg(feature = "logging")]
-            tracing::warn!("unexpected message type; expected PairRequestMessage");
+    let request =
+        match MessageBody::decode_from_vec(plaintext.as_slice()).map_err(Error::ProtobufDecode)? {
+            MessageBody::PairRequest(r) => r,
+            _ => {
+                #[cfg(feature = "logging")]
+                tracing::warn!("unexpected message type; expected PairRequestMessage");
 
-            return Err(crate::Error::Invariant(
-                "Invalid message. Expected: PairRequestMessage",
-            ));
-        }
-    };
+                return Err(Error::Invariant(
+                    "Invalid message. Expected: PairRequestMessage",
+                ));
+            }
+        };
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
@@ -700,16 +701,16 @@ pub fn extract(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
-pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
-    let request = match crate::derec_message::extract_inner_plaintext_message(&envelope.message)? {
+    let request = match extract_inner_plaintext_message(&envelope.message)? {
         MessageBody::PrePairRequest(r) => r,
         _ => {
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected PrePairRequestMessage");
 
-            return Err(crate::Error::Invariant(
+            return Err(Error::Invariant(
                 "Invalid message. Expected: PrePairRequestMessage",
             ));
         }
@@ -730,16 +731,16 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 /// at the same point, before the request reaches the application.
 pub(crate) fn check_parameter_range(
     request: &PairRequestMessage,
-    local: Option<&derec_proto::ParameterRange>,
+    local: Option<&ParameterRange>,
 ) -> Result<(), PairingError> {
-    super::parameter_range::check_compatibility(local, request.parameter_range.as_ref())
+    check_compatibility(local, request.parameter_range.as_ref())
 }
 
 fn validate_inputs(
     transport_protocol: &TransportProtocol,
     contact_message: &ContactMessage,
     expected_mode: ContactMode,
-) -> Result<(), crate::Error> {
+) -> Result<(), Error> {
     if transport_protocol.uri.trim().is_empty() {
         #[cfg(feature = "logging")]
         tracing::warn!("transport URI is empty");
@@ -771,7 +772,7 @@ fn validate_inputs(
 fn validate_pre_pair_inputs(
     transport_protocol: &TransportProtocol,
     contact_message: &ContactMessage,
-) -> Result<(), crate::Error> {
+) -> Result<(), Error> {
     let expected_mode = if contact_message.contact_mode == ContactMode::HashedKeys as i32 {
         ContactMode::HashedKeys
     } else if contact_message.contact_mode == ContactMode::NoKeys as i32 {
@@ -792,7 +793,7 @@ fn create_pairing_request_material(
         cryptography_pairing::PairingRequestMessageMaterial,
         cryptography_pairing::ResponderSecretKeyMaterial,
     ),
-    crate::Error,
+    Error,
 > {
     let mlkem_encapsulation_key = contact_message
         .mlkem_encapsulation_key
@@ -814,13 +815,8 @@ fn create_pairing_request_material(
         .map_err(|e| PairingError::PairRequestKeygen { source: e }.into())
 }
 
-fn generate_pairing_keys() -> Result<
-    (
-        PairingContactMessageMaterial,
-        derec_cryptography::pairing::InitiatorSecretKeyMaterial,
-    ),
-    crate::Error,
-> {
+fn generate_pairing_keys()
+-> Result<(PairingContactMessageMaterial, InitiatorSecretKeyMaterial), Error> {
     let seed = generate_seed::<32>();
     cryptography_pairing::contact_message(*seed)
         .map_err(|e| PairingError::ContactMessageKeygen { source: e }.into())

@@ -72,7 +72,7 @@ const NAME_UNIONS: Record<string, Record<string, true>> = {
     VerifyFailureReason,
     true
   >,
-  CorruptionReason: { Malformed: true, InvalidProof: true, Inconsistent: true } satisfies Record<
+  CorruptionReason: { Malformed: true, InvalidProof: true, Forged: true } satisfies Record<
     CorruptionReason,
     true
   >,
@@ -101,10 +101,12 @@ const NAME_UNIONS: Record<string, Record<string, true>> = {
     ShareVerifyRejected: true,
     SecretsDiscovered: true,
     RecoveryShareReceived: true,
-    RecoveryShareError: true,
     RecoveryShareRefused: true,
     RecoveryShareCorrupted: true,
     SecretRecovered: true,
+    RecoveryDisputed: true,
+    RecoveryConflict: true,
+    RecoveryIncomplete: true,
     Unpaired: true,
     UnpairRejected: true,
     PrePairRejected: true,

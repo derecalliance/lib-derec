@@ -3,6 +3,7 @@
 
 use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::{
+    Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     primitives::unpairing::UnpairingError,
     types::{ChannelId, SharedKey},
@@ -62,10 +63,7 @@ pub struct ProcessResult {
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
-pub fn produce(
-    channel_id: ChannelId,
-    shared_key: &SharedKey,
-) -> Result<ProduceResult, crate::Error> {
+pub fn produce(channel_id: ChannelId, shared_key: &SharedKey) -> Result<ProduceResult, Error> {
     let envelope = build_response(channel_id, StatusEnum::Ok, "", shared_key)?;
 
     #[cfg(feature = "logging")]
@@ -134,18 +132,15 @@ pub fn produce(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
-pub fn extract(
-    envelope_bytes: &[u8],
-    shared_key: &SharedKey,
-) -> Result<ExtractResult, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractResult, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
     let response = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::UnpairResponse(message) => message,
         _ => {
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected UnpairResponseMessage");
-            return Err(crate::Error::Invariant(
+            return Err(Error::Invariant(
                 "Invalid message. Expected: UnpairResponseMessage",
             ));
         }
@@ -197,8 +192,8 @@ pub fn extract(
 /// assert!(acknowledged);
 /// ```
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
-pub fn process(response: &UnpairResponseMessage) -> Result<ProcessResult, crate::Error> {
-    let result = response.result.as_ref().ok_or(crate::Error::Invariant(
+pub fn process(response: &UnpairResponseMessage) -> Result<ProcessResult, Error> {
+    let result = response.result.as_ref().ok_or(Error::Invariant(
         "UnpairResponseMessage is missing result field",
     ))?;
 
@@ -215,7 +210,7 @@ fn build_response(
     status: StatusEnum,
     memo: &str,
     shared_key: &SharedKey,
-) -> Result<Vec<u8>, crate::Error> {
+) -> Result<Vec<u8>, Error> {
     let timestamp = current_timestamp();
 
     let response = UnpairResponseMessage {

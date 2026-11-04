@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::Error;
+use crate::error_codes::classify;
 use crate::primitives::{recovery::RecoveryError, sharing::SharingError};
+use crate::protocol::RestoreError;
+use js_sys::Reflect;
 use serde::Serialize;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -38,7 +42,7 @@ pub(crate) fn js_error(code: &'static str, message: impl Into<String>) -> JsValu
         .unwrap_or_else(|_| JsValue::from_str("failed to serialize error"))
 }
 
-pub(crate) fn js_error_from_lib(err: crate::Error) -> JsValue {
+pub(crate) fn js_error_from_lib(err: Error) -> JsValue {
     let (category, code) = categorize(&err);
     let message = err.to_string();
     let (status, memo) = err
@@ -46,14 +50,14 @@ pub(crate) fn js_error_from_lib(err: crate::Error) -> JsValue {
         .map(|(s, m)| (Some(s), Some(m.to_owned())))
         .unwrap_or((None, None));
     let (expected, got) = match &err {
-        crate::Error::Sharing(SharingError::VersionMismatch { expected, got })
-        | crate::Error::Recovery(RecoveryError::VersionMismatch { expected, got }) => {
+        Error::Sharing(SharingError::VersionMismatch { expected, got })
+        | Error::Recovery(RecoveryError::VersionMismatch { expected, got }) => {
             (Some(*expected), Some(*got))
         }
         _ => (None, None),
     };
     let channel_ids = match &err {
-        crate::Error::Restore(crate::protocol::RestoreError::Conflict(ids)) => {
+        Error::Restore(RestoreError::Conflict(ids)) => {
             Some(ids.iter().map(|c| c.0.to_string()).collect())
         }
         _ => None,
@@ -100,7 +104,7 @@ pub fn share_store_refusal(reason: &str) -> Result<js_sys::Error, JsValue> {
         ));
     }
     let error = js_sys::Error::new(&format!("share store refused: {reason}"));
-    js_sys::Reflect::set(
+    Reflect::set(
         &error,
         &JsValue::from_str("refusal"),
         &JsValue::from_str(reason),
@@ -109,7 +113,7 @@ pub fn share_store_refusal(reason: &str) -> Result<js_sys::Error, JsValue> {
     Ok(error)
 }
 
-fn categorize(err: &crate::Error) -> (&'static str, &'static str) {
-    let (category, code) = crate::error_codes::classify(err);
+fn categorize(err: &Error) -> (&'static str, &'static str) {
+    let (category, code) = classify(err);
     (category.name(), code.name())
 }

@@ -12,10 +12,12 @@
 
 use std::collections::HashMap;
 use std::io::Read as _;
+use std::str;
 
 use derec_library::protocol::types::{
     HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret,
 };
+use derec_proto::{Protocol, TransportProtocol};
 use flate2::read::GzDecoder;
 
 fn assert_matches_golden(secret: &Secret, fixture: &[u8]) {
@@ -29,8 +31,8 @@ fn assert_matches_golden(secret: &Secret, fixture: &[u8]) {
     // Fixtures are stored with a trailing newline for tooling friendliness.
     let expected = fixture.strip_suffix(b"\n").unwrap_or(fixture);
     assert_eq!(
-        std::str::from_utf8(&json).unwrap(),
-        std::str::from_utf8(expected).unwrap(),
+        str::from_utf8(&json).unwrap(),
+        str::from_utf8(expected).unwrap(),
         "encoder JSON diverged from the golden vector",
     );
 }
@@ -39,9 +41,9 @@ fn golden_secret() -> Secret {
     Secret {
         helpers: vec![HelperInfo {
             channel_id: 2,
-            transports: vec![derec_proto::TransportProtocol {
+            transports: vec![TransportProtocol {
                 uri: "https://u.example/derec".to_owned(),
-                protocol: derec_proto::Protocol::Https as i32,
+                protocol: Protocol::Https as i32,
             }],
             shared_key: vec![0x01, 0x02, 0x03],
             communication_info: HashMap::new(),
@@ -65,9 +67,9 @@ fn golden_secret_full() -> Secret {
     Secret {
         helpers: vec![HelperInfo {
             channel_id: 2,
-            transports: vec![derec_proto::TransportProtocol {
+            transports: vec![TransportProtocol {
                 uri: "https://h.example/derec".to_owned(),
-                protocol: derec_proto::Protocol::Https as i32,
+                protocol: Protocol::Https as i32,
             }],
             shared_key: vec![0x01, 0x02, 0x03],
             communication_info: HashMap::from([("k".to_owned(), "v".to_owned())]),
@@ -83,18 +85,18 @@ fn golden_secret_full() -> Secret {
             members: vec![
                 ReplicaInfo {
                     replica_id: 4,
-                    transports: vec![derec_proto::TransportProtocol {
+                    transports: vec![TransportProtocol {
                         uri: "https://r.example/derec".to_owned(),
-                        protocol: derec_proto::Protocol::Https as i32,
+                        protocol: Protocol::Https as i32,
                     }],
                     role: ReplicaRole::Source as i32,
                     communication_info: HashMap::from([("a".to_owned(), "b".to_owned())]),
                 },
                 ReplicaInfo {
                     replica_id: 6,
-                    transports: vec![derec_proto::TransportProtocol {
+                    transports: vec![TransportProtocol {
                         uri: "https://r2.example/derec".to_owned(),
-                        protocol: derec_proto::Protocol::Https as i32,
+                        protocol: Protocol::Https as i32,
                     }],
                     role: ReplicaRole::Destination as i32,
                     communication_info: HashMap::new(),
@@ -112,9 +114,9 @@ fn golden_secret_full() -> Secret {
 fn golden_secret_weighted() -> Secret {
     let helper = |channel_id: u64, uri: &str, weight: u32| HelperInfo {
         channel_id,
-        transports: vec![derec_proto::TransportProtocol {
+        transports: vec![TransportProtocol {
             uri: uri.to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         }],
         shared_key: vec![0x01, 0x02, 0x03],
         communication_info: HashMap::new(),

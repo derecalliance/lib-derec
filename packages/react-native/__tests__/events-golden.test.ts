@@ -31,7 +31,12 @@ interface Desc {
 }
 
 type Variant<T extends DeRecEvent['type']> = Extract<DeRecEvent, { type: T }>;
-type SecretEvent = 'SecretRecovered' | 'ReplicaSecretReceived' | 'ReplicaSecretInstalled' | 'ReplicaVersionConflict';
+type SecretEvent =
+  | 'SecretRecovered'
+  | 'RecoveryDisputed'
+  | 'ReplicaSecretReceived'
+  | 'ReplicaSecretInstalled'
+  | 'ReplicaVersionConflict';
 type SecretOf<T extends SecretEvent> = Variant<T>['secret'];
 type Replicas<T extends SecretEvent> = NonNullable<SecretOf<T>['replicas']>;
 
@@ -69,6 +74,13 @@ const REPLICAS = {
 const SECRET = {
   fields: { helpers: 'required', secrets: 'required', replicas: 'optional', threshold: 'optional' },
   nested: { helpers: HELPER, secrets: USER_SECRET, replicas: REPLICAS },
+} as const;
+
+const RECOVERY_HELPER = { fields: { channel_id: 'required', communication_info: 'optional' } } as const;
+
+const CANDIDATE = {
+  fields: { secret: 'required', supported_by: 'required' },
+  nested: { secret: SECRET, supported_by: RECOVERY_HELPER },
 } as const;
 
 const SHARE = { fields: { channel_id: 'required', committed_share: 'bytes' } } as const;
@@ -180,14 +192,26 @@ const EVENTS = {
     nested: { secrets: DISCOVERED_SECRET },
   },
   RecoveryShareReceived: { fields: { type: 'required', channel_id: 'required', shares_received: 'required' } },
-  RecoveryShareError: {
-    fields: { type: 'required', channel_id: 'required', shares_received: 'required', error: 'required' },
-  },
   RecoveryShareRefused: { fields: { type: 'required', channel_id: 'required', version: 'required', ...STATUS_MEMO } },
   RecoveryShareCorrupted: {
     fields: { type: 'required', channel_id: 'required', version: 'required', reason: 'required' },
   },
   SecretRecovered: { fields: { type: 'required', secret: 'required' }, nested: { secret: SECRET } },
+  RecoveryConflict: {
+    fields: { type: 'required', version: 'required', candidates: 'required', disputed_by: 'required' },
+    nested: { candidates: CANDIDATE, disputed_by: RECOVERY_HELPER },
+  },
+  RecoveryDisputed: {
+    fields: {
+      type: 'required',
+      version: 'required',
+      secret: 'required',
+      supported_by: 'required',
+      disputed_by: 'required',
+    },
+    nested: { secret: SECRET, supported_by: RECOVERY_HELPER, disputed_by: RECOVERY_HELPER },
+  },
+  RecoveryIncomplete: { fields: { type: 'required', version: 'required', shares_received: 'required' } },
   Unpaired: { fields: { type: 'required', channel_id: 'required' } },
   UnpairRejected: { fields: { type: 'required', channel_id: 'required', ...STATUS_MEMO } },
   PrePairRejected: { fields: { type: 'required', channel_id: 'required', ...STATUS_MEMO } },
@@ -283,6 +307,13 @@ const EVENTS = {
 export type DeclarationChecks = [
   Assert<Same<{ [T in DeRecEvent['type']]: Fields<Variant<T>> }, { -readonly [T in keyof typeof EVENTS]: (typeof EVENTS)[T]['fields'] }>>,
   Assert<Same<Fields<SecretOf<'SecretRecovered'>>, typeof SECRET.fields>>,
+  Assert<Same<Fields<Variant<'RecoveryConflict'>['candidates'][number]>, typeof CANDIDATE.fields>>,
+  Assert<Same<Variant<'RecoveryConflict'>['candidates'][number]['secret'], SecretOf<'SecretRecovered'>>>,
+  Assert<Same<SecretOf<'RecoveryDisputed'>, SecretOf<'SecretRecovered'>>>,
+  Assert<Same<Fields<Variant<'RecoveryConflict'>['candidates'][number]['supported_by'][number]>, typeof RECOVERY_HELPER.fields>>,
+  Assert<Same<Fields<Variant<'RecoveryConflict'>['disputed_by'][number]>, typeof RECOVERY_HELPER.fields>>,
+  Assert<Same<Fields<Variant<'RecoveryDisputed'>['supported_by'][number]>, typeof RECOVERY_HELPER.fields>>,
+  Assert<Same<Fields<Variant<'RecoveryDisputed'>['disputed_by'][number]>, typeof RECOVERY_HELPER.fields>>,
   Assert<Same<Fields<SecretOf<'ReplicaSecretReceived'>>, typeof SECRET.fields>>,
   Assert<Same<Fields<SecretOf<'ReplicaSecretInstalled'>>, typeof SECRET.fields>>,
   Assert<Same<Fields<SecretOf<'ReplicaVersionConflict'>>, typeof SECRET.fields>>,

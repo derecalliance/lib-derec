@@ -212,10 +212,12 @@ mod golden {
     //! and update every SDK that the change breaks.
 
     use std::collections::HashMap;
+    use std::env;
+    use std::fs;
 
     use crate::protocol::events::wire::{
-        DiscoveredSecret, DiscoveredVersion, Endpoint, Event, Helper, Replica, ReplicasWire,
-        SecretWire, Share, UserSecret,
+        DiscoveredSecret, DiscoveredVersion, Endpoint, Event, Helper, RecoveryCandidateWire,
+        RecoveryHelperWire, Replica, ReplicasWire, SecretWire, Share, UserSecret,
     };
 
     const FIXTURE: &str = concat!(
@@ -249,10 +251,12 @@ mod golden {
             Event::ShareVerifyRejected { .. } => "ShareVerifyRejected",
             Event::SecretsDiscovered { .. } => "SecretsDiscovered",
             Event::RecoveryShareReceived { .. } => "RecoveryShareReceived",
-            Event::RecoveryShareError { .. } => "RecoveryShareError",
             Event::RecoveryShareRefused { .. } => "RecoveryShareRefused",
             Event::RecoveryShareCorrupted { .. } => "RecoveryShareCorrupted",
             Event::SecretRecovered { .. } => "SecretRecovered",
+            Event::RecoveryConflict { .. } => "RecoveryConflict",
+            Event::RecoveryDisputed { .. } => "RecoveryDisputed",
+            Event::RecoveryIncomplete { .. } => "RecoveryIncomplete",
             Event::Unpaired { .. } => "Unpaired",
             Event::UnpairRejected { .. } => "UnpairRejected",
             Event::PrePairRejected { .. } => "PrePairRejected",
@@ -284,6 +288,13 @@ mod golden {
 
     fn info(key: &str, value: &str) -> HashMap<String, String> {
         HashMap::from([(key.to_owned(), value.to_owned())])
+    }
+
+    fn recovery_helper(channel_id: &str, name: &str) -> RecoveryHelperWire {
+        RecoveryHelperWire {
+            channel_id: channel_id.into(),
+            communication_info: info("name", name),
+        }
     }
 
     fn endpoint(uri: &str, protocol: &'static str) -> Endpoint {
@@ -468,11 +479,6 @@ mod golden {
                 channel_id: "1039".into(),
                 shares_received: 2,
             },
-            Event::RecoveryShareError {
-                channel_id: "1040".into(),
-                shares_received: 1,
-                error: "share error".into(),
-            },
             Event::RecoveryShareRefused {
                 channel_id: "1041".into(),
                 version: 24,
@@ -485,6 +491,39 @@ mod golden {
                 reason: "InvalidProof".into(),
             },
             Event::SecretRecovered { secret: secret() },
+            Event::RecoveryConflict {
+                version: 26,
+                candidates: vec![
+                    RecoveryCandidateWire {
+                        secret: secret(),
+                        supported_by: vec![
+                            recovery_helper("1040", "alice"),
+                            recovery_helper("1046", "bob"),
+                        ],
+                    },
+                    RecoveryCandidateWire {
+                        secret: secret(),
+                        supported_by: vec![
+                            recovery_helper("1047", "carol"),
+                            recovery_helper("1048", "dave"),
+                        ],
+                    },
+                ],
+                disputed_by: vec![recovery_helper("1049", "erin")],
+            },
+            Event::RecoveryDisputed {
+                version: 28,
+                secret: secret(),
+                supported_by: vec![
+                    recovery_helper("1050", "frank"),
+                    recovery_helper("1051", "grace"),
+                ],
+                disputed_by: vec![recovery_helper("1052", "heidi")],
+            },
+            Event::RecoveryIncomplete {
+                version: 27,
+                shares_received: 3,
+            },
             Event::Unpaired {
                 channel_id: "1043".into(),
             },
@@ -637,13 +676,13 @@ mod golden {
     #[test]
     fn the_events_golden_fixture_matches_the_wire_shape() {
         let generated = generated();
-        if std::env::var_os("DEREC_BLESS_FIXTURES").is_some() {
+        if env::var_os("DEREC_BLESS_FIXTURES").is_some() {
             let text = serde_json::to_string_pretty(&generated).expect("fixture serializes") + "\n";
-            std::fs::write(FIXTURE, text).expect("fixture is writable");
+            fs::write(FIXTURE, text).expect("fixture is writable");
             return;
         }
         let checked_in: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(FIXTURE)
+            &fs::read_to_string(FIXTURE)
                 .expect("events_golden.json exists; regenerate with DEREC_BLESS_FIXTURES=1"),
         )
         .expect("events_golden.json is valid JSON");
