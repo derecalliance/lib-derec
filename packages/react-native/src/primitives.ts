@@ -44,6 +44,7 @@ import type {
   GetSecretIdsVersionsResponseMessage,
   GetShareRequestMessage,
   GetShareResponseMessage,
+  MessageId,
   PairRequestMessage,
   PairResponseMessage,
   PairingProcessResult,
@@ -894,5 +895,19 @@ export const envelope = {
   },
   read_trace_id(envelope_bytes: Uint8Array): bigint {
     return call('read_trace_id_from_envelope', envelope_bytes) as bigint;
+  },
+  /**
+   * Identify an envelope for replay and reflection detection. `id` is the
+   * same for every copy of one message, whatever its unauthenticated
+   * cleartext fields say, and different for every other message. Keep the
+   * `id` of every envelope sent and of every envelope `process` accepted,
+   * and drop an inbound envelope whose `id` is kept.
+   */
+  message_id(envelope_bytes: Uint8Array): MessageId {
+    const result = call('message_id_from_envelope', envelope_bytes) as {
+      id: ArrayBuffer;
+      timestamp: bigint;
+    };
+    return { id: bytes(result.id), timestamp: result.timestamp };
   },
 };

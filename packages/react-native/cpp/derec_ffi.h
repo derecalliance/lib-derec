@@ -557,6 +557,20 @@ typedef struct ReadTraceIdResult {
   uint64_t trace_id;
 } ReadTraceIdResult;
 
+typedef struct MessageIdResult {
+  struct DeRecError error;
+  /**
+   * SHA-256 of the envelope's encrypted `message` field (32 bytes). Empty
+   * on error.
+   */
+  struct DeRecBuffer id;
+  /**
+   * The envelope's send time, in seconds since the Unix epoch. Zero on
+   * error.
+   */
+  uint64_t timestamp;
+} MessageIdResult;
+
 /**
  * Result of a message JSON codec call. `bytes` is UTF-8 JSON for
  * [`derec_decode_message_json`] and protobuf wire bytes for
@@ -1430,6 +1444,19 @@ struct ReadTraceIdResult read_trace_id_from_envelope(const uint8_t *envelope_ptr
                                                      size_t envelope_len);
 
 /**
+ * Identify an envelope for replay and reflection detection: the same `id`
+ * for every copy of one message, whatever its unauthenticated cleartext
+ * fields say, and a different one for every other message.
+ *
+ * Mirrors [`crate::derec_message::message_id`].
+ *
+ * # Safety
+ *
+ * `envelope_ptr` must point to a readable byte range of length `envelope_len`.
+ */
+struct MessageIdResult message_id_from_envelope(const uint8_t *envelope_ptr, size_t envelope_len);
+
+/**
  * Releases the owned strings carried by a [`DeRecError`]. After
  * returning, `error.message` and `error.peer_memo` are both null —
  * an accidental second call is a safe no-op.
@@ -1805,6 +1832,7 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *     "sharing_round_secs": 60,
  *     "unpair_ack_secs": 60,
  *     "get_share_response_secs": 300,
+ *     "pairing_secs": 30,
  *     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
  *   },
  *   "unsafe_connection": false,

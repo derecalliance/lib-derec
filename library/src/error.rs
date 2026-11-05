@@ -111,10 +111,13 @@ pub enum Error {
         actual: SenderKind,
     },
 
-    /// `start(Pairing)` was called for a `channel_id` that already has
-    /// a `Paired` or `Unpairing` channel record. Re-pairing would silently
-    /// overwrite the stored `SharedKey`; the caller must skip the call, or
-    /// unpair first and wait for [`DeRecEvent::Unpaired`](crate::protocol::DeRecEvent::Unpaired).
+    /// `start(Pairing)` was called for a `channel_id` this device already
+    /// uses: it has a `Paired` or `Unpairing` channel record, a replica
+    /// member is recorded on it, or a key is stored under it. The contact's
+    /// creator chooses its channel identifier, and pairing on one in use
+    /// would overwrite or later remove the key stored there; the caller must
+    /// skip the call, or unpair first and wait for
+    /// [`DeRecEvent::Unpaired`](crate::protocol::DeRecEvent::Unpaired).
     #[error("channel {channel_id:?} is already paired")]
     ChannelAlreadyPaired { channel_id: ChannelId },
 

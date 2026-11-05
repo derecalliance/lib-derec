@@ -350,7 +350,7 @@ Optional setters have defaults:
 | Setter | Default | Purpose |
 |--------|---------|---------|
 | `with_threshold(n)` | `3` | The starting threshold `t`, the minimum subshares required to reconstruct the secret, for a secret with no threshold stored. Each paired Helper contributes one subshare unless `ProtectSecret` gives it more weight; see [Weighted helpers](#weighted-helpers). Once a publish stores a `t`, that `t` applies; see [The threshold is recorded](#the-threshold-is-recorded). |
-| `with_timeouts(timeouts)` | see [Timeouts](#timeouts) | All four waiting periods in one call; unspecified fields keep their default. `inbound_message` 300s is the staleness/replay window, `sharing_round` and `unpair_ack` 60s are liveness budgets, `expired_channels` `Enabled { 300 }` sweeps channels awaiting fingerprint confirmation. |
+| `with_timeouts(timeouts)` | see [Timeouts](#timeouts) | Every waiting period in one call; unspecified fields keep their default. `inbound_message` 300s is the staleness/replay window, `sharing_round` and `unpair_ack` 60s are liveness budgets, `pairing` 30s is how old a contact or pairing request may be (see [Pairing lifetime](#pairing-lifetime)), `expired_channels` `Enabled { 300 }` sweeps channels awaiting fingerprint confirmation. |
 | `with_unsafe_connection(bool)` | `false` | Accept plaintext `http://` and `grpc://` endpoints. **Development only.** Loopback is accepted for your own endpoint regardless; see [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
 | `with_replica_id(id)` | unset | This device's replica identity. Required for any replica-mode pairing; application-assigned and rejected if `0`. |
@@ -416,6 +416,7 @@ SDK, is:
     "sharing_round_secs": 60,
     "unpair_ack_secs": 60,
     "get_share_response_secs": 300,
+    "pairing_secs": 30,
     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
   },
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
@@ -584,9 +585,10 @@ before any target-level events are emitted.
   [Replica fingerprint verification is mandatory](#replica-fingerprint-verification-is-mandatory)),
   `IgnoreReason::Expired` (older than the inbound timeout),
   `IgnoreReason::TimestampMismatch` (the envelope and inner-message
-  timestamps differ, or either or both are absent) or
+  timestamps differ, or either or both are absent),
   `IgnoreReason::StaleResponse` (a verification response to a replaced
-  challenge).
+  challenge) or `IgnoreReason::Superseded` (a share request for a version
+  older than the newest one stored on the channel, and not stored itself).
 - `NoOp` — emitted when an inbound message was processed but had no
   application-visible consequence.
 
@@ -661,6 +663,37 @@ receiver ignores a message whose two timestamps differ, or where either or
 both are absent, as `MessageIgnored` with `IgnoreReason::TimestampMismatch`.
 A peer on 0.0.8 or earlier stamps its replies separately, so they are
 ignored this way.
+
+### Replays and reflections
+
+`process` ignores a message older than `Timeouts::inbound_message`, but
+within that window it processes every copy of a message it is handed. Both
+ends of a channel encrypt under one key, so a message this device sent,
+delivered back to it, decrypts as if the peer had sent it. Detecting both is
+the job of the application's transport layer, keyed on
+`derec_message::message_id(envelope)`:
+
+- `id` is a SHA-256 of the envelope's encrypted `message` field. It is the
+  same for every copy of one message and different for every other message.
+  The cleartext fields around it (`sequence`, `traceId`, the protocol
+  version) are not authenticated and an envelope can be re-encoded, so never
+  key on a hash of the raw bytes.
+- Keep the `id` of every envelope this device sends, and of every envelope
+  `process` accepted (it returned `Ok` without `MessageIgnored`), until
+  `max(received or sent at, timestamp) + inbound_message`. Drop an inbound
+  envelope whose `id` is kept, without calling `process`.
+- Keep the record across restarts, or hold inbound traffic for one window
+  after starting.
+
+A message held back and delivered late is a first delivery, so no record
+catches it. A `StoreShareRequest` for a version older than the newest one a
+helper stores on the channel, and not stored itself, is ignored as
+`MessageIgnored` with `IgnoreReason::Superseded`, so a dropped version never
+comes back. A contact update is the application's to order: the `timestamp`
+of the envelope that raised an `UpdateChannelInfo` `ActionRequired` is when
+the update was sent, and an update older than the last one accepted on the
+channel should be rejected. That needs `AutoAcceptPolicy::update_channel_info`
+off.
 
 ### When `process` fails
 
@@ -1180,6 +1213,44 @@ identity. After pairing completes, propagate a long-term endpoint via
 This flow is covered end to end — happy path and tampered-hash — for every
 SDK. See [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
+### Pairing lifetime
+
+A pairing is possible for `Timeouts::pairing` (default 30 s), measured from
+the contact's `timestamp` for the contact and from the request's `timestamp`
+for a `PairRequest` or `PrePairRequest`. Both sides enforce it, and nothing is
+sent when it runs out:
+
+- **Scanner:** `start(Pairing)` refuses a contact older than the lifetime with
+  `Error::Pairing(PairingError::Expired)` (code `pairing_expired`), and a
+  contact without a timestamp with `PairingError::InvalidContactMessage`.
+- **Creator, on arrival:** a request on a contact older than the lifetime, or
+  a request older than it, is reported as `MessageIgnored` with
+  `IgnoreReason::Expired`, before any `ActionRequired`, and is not answered.
+  The creator measures its contact's age from its own stored copy, so on its
+  own clock.
+- **Creator, on `accept`:** a request accepted after its lifetime, or on a
+  contact that expired while the prompt waited, is refused with
+  `PairingError::Expired`. No channel is recorded.
+
+An expired contact can never pair again, so its stored material is dropped
+when it is next used. A request that expired on a contact still inside its
+lifetime leaves the contact usable, and the scanner can start again.
+
+Pairing involves both parties, and each one checks whether it succeeded, so
+an expiry is a retry: tell the user to scan or share a fresh contact. Without
+this rule a request accepted after its scanner gave up left a channel only the
+creator held.
+
+The scanner keeps its side of a pairing in flight for
+`Timeouts::expired_channels`, so that timeout should be at least
+`Timeouts::pairing` plus the time a response takes to arrive; the defaults,
+300 s and 30 s, leave that margin. Ages are measured across the two devices'
+clocks, so clocks more than the lifetime apart cannot pair. Two starts on
+one contact are still the application's to reconcile: the scanner keeps only
+the last request's keys, so accepting the earlier one leaves a channel the
+scanner cannot open. Confirming a new pairing before relying on it catches
+both.
+
 ---
 
 ## Replica flows
@@ -1584,8 +1655,10 @@ For example, an owner with seven helpers:
 A version whose round is still open when the next one starts is deleted from
 every helper that stores the next one, unless it is the version returned. A
 helper that receives a request older than the latest version it holds on the
-channel ignores that request's `keepVersion`, so a replayed or delayed
-request never deletes a newer share.
+channel never deletes a newer share: a version it still holds is an identical
+re-send whose `keepVersion` is ignored, and one it does not hold is ignored as
+`MessageIgnored` with `IgnoreReason::Superseded`, unanswered, so a version
+already deleted is not stored again.
 
 A replica member publishing as the source cannot tell which versions it
 mirrored had committed on the previous source. Returning the newest version it
@@ -2533,8 +2606,9 @@ Applications using this SDK should ensure:
   keychain-grade — see the trait doc).
 - Proper authentication of helpers.
 - Safe transport channels.
-- Protection against replay attacks beyond the protocol's own timestamp-based
-  staleness check.
+- Detection of replayed and reflected messages within the inbound window,
+  keyed on `derec_message::message_id` (see
+  [Replays and reflections](#replays-and-reflections)).
 
 The DeRec protocol assumes helpers are independent and trusted entities.
 

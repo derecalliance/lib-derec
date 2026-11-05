@@ -281,6 +281,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             sharing_round: Duration::from_secs(secs(timeouts.sharing_round)),
             unpair_ack: Duration::from_secs(secs(timeouts.unpair_ack)),
             get_share_response: Duration::from_secs(secs(timeouts.get_share_response)),
+            pairing: Duration::from_secs(secs(timeouts.pairing)),
             expired_channels: match timeouts.expired_channels {
                 ExpiredChannelCleanup::Enabled { timeout_in_secs } => {
                     ExpiredChannelCleanup::Enabled {
@@ -2336,11 +2337,13 @@ mod tests {
             inbound_message: Duration::ZERO,
             sharing_round: Duration::ZERO,
             unpair_ack: Duration::from_millis(400),
+            pairing: Duration::ZERO,
             ..Default::default()
         });
         assert_eq!(b.timeouts.inbound_message, Duration::from_secs(1));
         assert_eq!(b.timeouts.sharing_round, Duration::from_secs(1));
         assert_eq!(b.timeouts.unpair_ack, Duration::from_secs(1));
+        assert_eq!(b.timeouts.pairing, Duration::from_secs(1));
     }
 
     /// Sub-second precision is truncated, not rounded — 2.5s is 2s.
@@ -2614,6 +2617,7 @@ mod tests {
                 sharing_round_secs: Some(30),
                 unpair_ack_secs: Some(45),
                 get_share_response_secs: Some(900),
+                pairing_secs: Some(240),
                 expired_channels: Some(ExpiredChannelsConfig {
                     enabled: false,
                     timeout_in_secs: 600,
@@ -2677,6 +2681,7 @@ mod tests {
                 sharing_round: Duration::from_secs(30),
                 unpair_ack: Duration::from_secs(45),
                 get_share_response: Duration::from_secs(900),
+                pairing: Duration::from_secs(240),
                 expired_channels: ExpiredChannelCleanup::Disabled,
             })
             .with_parameter_range(ParameterRange {

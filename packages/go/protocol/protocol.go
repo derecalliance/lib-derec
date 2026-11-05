@@ -144,6 +144,15 @@ type Timeouts struct {
 	// recovery settles on the shares it holds. The budget is a human one
 	// when helpers approve share requests by hand. Default: 300.
 	GetShareResponseSecs *uint64 `json:"get_share_response_secs,omitempty"`
+	// PairingSecs bounds how long a pairing stays possible: how old a
+	// contact may be when it is scanned or answered, and how old a pairing
+	// request may be when it is accepted. Both sides enforce it and nothing
+	// is sent on expiry: the scanner refuses an expired contact, and the
+	// creator ignores a request on one and refuses a late accept, with
+	// derec.CodePairingExpired. The remedy is to scan or share a fresh
+	// contact. A scanner's ExpiredChannels timeout should be at least this
+	// plus the time a response takes to arrive. Default: 30.
+	PairingSecs *uint64 `json:"pairing_secs,omitempty"`
 	// ExpiredChannels governs removal of channels still awaiting out-of-band
 	// fingerprint confirmation — every replica pairing, and every NoKeys
 	// pairing. Unlike the others it can be disabled, leaving the sweep to

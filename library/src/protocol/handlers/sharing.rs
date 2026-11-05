@@ -2,7 +2,7 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport, IgnoreReason,
     MissingPolicy, PendingAction, SecretKind, SecretValue, Share, ShareStoreError,
 };
 use super::pairing::own_communication_info;
@@ -453,8 +453,11 @@ pub(in crate::protocol) struct SharingRoundResult {
 /// `keepVersion = 0` keeps no other version.
 ///
 /// A request whose `version` is older than the latest version already
-/// stored on this channel has its `keepVersion` ignored, so a replayed or
-/// delayed request can never delete newer shares.
+/// stored on this channel, and not stored itself, is ignored as
+/// [`IgnoreReason::Superseded`]: a newer request may have dropped that
+/// version, and a delayed or repeated delivery must not bring it back. One
+/// still stored is an identical re-send, acknowledged with its `keepVersion`
+/// ignored, so it can never delete newer shares either.
 ///
 /// "Latest" is scoped to this channel rather than to
 /// [`DeRecShareStore::latest_version`](crate::protocol::DeRecShareStore::latest_version),
@@ -482,6 +485,10 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
 
     // Applying `keepVersion` needs every version stored on the channel.
     let stored_on_channel = stores.shares.load(secret_id, channel_id, &[]).await?;
+
+    if is_superseded(&stored_on_channel, version) {
+        return Ok(superseded(exchange));
+    }
 
     // A version has exactly one writer, so an existing entry at this
     // version is either that writer re-sending the identical envelope —
@@ -692,6 +699,29 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     Ok(())
 }
 
+/// Whether `version` is older than the newest version stored on the channel
+/// and not stored itself: a newer request replaced it and may have dropped
+/// it, so storing it again would bring back a version the Owner discarded.
+fn is_superseded(stored_on_channel: &[Share], version: u32) -> bool {
+    stored_on_channel
+        .iter()
+        .any(|stored| stored.version > version)
+        && stored_on_channel
+            .iter()
+            .all(|stored| stored.version != version)
+}
+
+/// A superseded request is dropped without an answer: a delayed or repeated
+/// delivery is owed nothing, and the Owner's round for that version has
+/// already been replaced.
+fn superseded(exchange: &Exchange<'_>) -> Vec<DeRecEvent> {
+    vec![DeRecEvent::MessageIgnored {
+        channel_id: exchange.channel_id,
+        reason: IgnoreReason::Superseded,
+        trace_id: exchange.trace_id,
+    }]
+}
+
 /// The `StoreShareResponse` that answers `request` with a non-`Ok` `status`.
 pub(in crate::protocol) fn failure_response(
     local: &Local<'_>,
@@ -766,7 +796,9 @@ async fn refuse<S: StoreSet>(
 /// that does not decode (`FORMAT_ERROR`) or verify (`VERIFICATION_FAILED`),
 /// is answered with that status and reported as
 /// [`DeRecEvent::ShareRefused`] instead of `ActionRequired`, so the
-/// application is never asked to store it.
+/// application is never asked to store it. A version older than the newest
+/// one stored on the channel, and not stored itself, is ignored as
+/// [`IgnoreReason::Superseded`] and not answered.
 async fn on_request<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -792,6 +824,14 @@ async fn on_request<S: StoreSet>(
 
     if let Err(fault) = sharing_response::validate_share(&request) {
         return refuse(stores, local, exchange, &request, fault.status, fault.memo).await;
+    }
+
+    let stored_on_channel = stores
+        .shares
+        .load(local.secret_id, exchange.channel_id, &[])
+        .await?;
+    if is_superseded(&stored_on_channel, request.version) {
+        return Ok(superseded(exchange));
     }
 
     Ok(vec![DeRecEvent::ActionRequired {
@@ -1414,7 +1454,8 @@ mod tests {
     };
     use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, Share};
     use crate::protocol::{
-        DeRecEvent, DeRecSecretStore, PendingAction, Refusal, SecretValue, ShareStoreError,
+        DeRecEvent, DeRecSecretStore, IgnoreReason, PendingAction, Refusal, SecretValue,
+        ShareStoreError,
     };
     use crate::types::{ChannelId, SharedKey};
     use derec_proto::{
@@ -1871,14 +1912,102 @@ mod tests {
         });
     }
 
-    /// A request older than the latest stored version must have its
-    /// `keepVersion` ignored, so a replay cannot delete newer shares.
+    async fn accept_events(
+        rig: &mut StoreRig,
+        request: &StoreShareRequestMessage,
+    ) -> Vec<DeRecEvent> {
+        let lf = LocalFixture::new(KEEP_SECRET_ID);
+        super::accept(
+            &mut rig.stores(),
+            &lf.local(),
+            &Exchange {
+                channel_id: KEEP_CHANNEL,
+                shared_key: &KEEP_KEY,
+                trace_id: 1,
+                obligation: None,
+            },
+            request,
+        )
+        .await
+        .expect("accept handles the request")
+    }
+
+    fn is_superseded(events: &[DeRecEvent]) -> bool {
+        matches!(
+            events,
+            [DeRecEvent::MessageIgnored { channel_id, reason: IgnoreReason::Superseded, trace_id: 1 }]
+                if *channel_id == KEEP_CHANNEL
+        )
+    }
+
+    /// A request older than the newest version stored on the channel is
+    /// ignored: nothing is stored, nothing is removed, nothing is sent.
     #[test]
-    fn accept_ignores_the_keep_version_of_an_older_version() {
+    fn accept_ignores_a_version_older_than_the_newest_held() {
         run_async(async {
             let mut rig = keep_rig_with_versions(&[1, 3, 4]).await;
-            accept_version(&mut rig, 2, 0).await;
-            assert_eq!(stored_versions(&rig), vec![1, 2, 3, 4]);
+            let events = accept_events(&mut rig, &store_request(2, 0)).await;
+            assert!(is_superseded(&events), "got {events:?}");
+            assert_eq!(stored_versions(&rig), vec![1, 3, 4]);
+        });
+    }
+
+    /// A version the Helper dropped under a newer request's `keepVersion`
+    /// does not come back when its request is delivered again.
+    #[test]
+    fn a_request_delivered_again_does_not_restore_a_dropped_version() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[]).await;
+            let v2 = store_request(2, 0);
+            accept_request(&mut rig, &v2).await;
+            accept_version(&mut rig, 3, 0).await;
+            assert_eq!(stored_versions(&rig), vec![3]);
+
+            let events = accept_events(&mut rig, &v2).await;
+            assert!(is_superseded(&events), "got {events:?}");
+            assert_eq!(stored_versions(&rig), vec![3]);
+        });
+    }
+
+    /// The application is not asked to store a version older than the
+    /// newest one it holds on the channel.
+    #[test]
+    fn on_request_ignores_a_version_older_than_the_newest_held() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[3]).await;
+            let lf = LocalFixture::new(KEEP_SECRET_ID);
+            let events = super::on_request(
+                &mut rig.stores(),
+                &lf.local(),
+                &Exchange {
+                    channel_id: KEEP_CHANNEL,
+                    shared_key: &KEEP_KEY,
+                    trace_id: 1,
+                    obligation: None,
+                },
+                store_request(2, 0),
+            )
+            .await
+            .expect("on_request handles the request");
+            assert!(is_superseded(&events), "got {events:?}");
+        });
+    }
+
+    /// A version older than the newest held but still stored is the
+    /// identical re-send it always was, acknowledged as stored.
+    #[test]
+    fn accept_acknowledges_a_held_older_version_sent_again() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[]).await;
+            let v2 = store_request(2, 0);
+            accept_request(&mut rig, &v2).await;
+            accept_version(&mut rig, 3, 2).await;
+            let events = accept_events(&mut rig, &v2).await;
+            assert!(
+                matches!(events.as_slice(), [DeRecEvent::ShareStored { .. }]),
+                "got {events:?}"
+            );
+            assert_eq!(stored_versions(&rig), vec![2, 3]);
         });
     }
 

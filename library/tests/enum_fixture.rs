@@ -171,6 +171,7 @@ fn ignore_reason_fixture_is_complete() {
         IgnoreReason::Expired,
         IgnoreReason::TimestampMismatch,
         IgnoreReason::StaleResponse,
+        IgnoreReason::Superseded,
     ];
     let names: Vec<&str> = all
         .iter()
@@ -179,6 +180,7 @@ fn ignore_reason_fixture_is_complete() {
             IgnoreReason::Expired => "Expired",
             IgnoreReason::TimestampMismatch => "TimestampMismatch",
             IgnoreReason::StaleResponse => "StaleResponse",
+            IgnoreReason::Superseded => "Superseded",
         })
         .collect();
     assert_matches_fixture("IgnoreReason", &names);

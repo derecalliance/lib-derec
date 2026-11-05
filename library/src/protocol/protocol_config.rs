@@ -43,6 +43,7 @@ use derec_proto::ParameterRange;
 ///     "sharing_round_secs": 60,
 ///     "unpair_ack_secs": 60,
 ///     "get_share_response_secs": 300,
+///     "pairing_secs": 30,
 ///     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
 ///   },
 ///   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
@@ -127,7 +128,8 @@ pub struct DeRecProtocolConfig {
 /// which clamps every value to at least one second.
 ///
 /// In JSON the fields are `inbound_message_secs`, `sharing_round_secs`,
-/// `unpair_ack_secs`, `get_share_response_secs` (non-negative integers) and
+/// `unpair_ack_secs`, `get_share_response_secs`, `pairing_secs` (non-negative
+/// integers) and
 /// `expired_channels`
 /// (an [`ExpiredChannelsConfig`] object).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -161,6 +163,12 @@ pub struct TimeoutsConfig {
         serde(skip_serializing_if = "Option::is_none")
     )]
     pub get_share_response_secs: Option<u64>,
+    /// [`Timeouts::pairing`], in seconds.
+    #[cfg_attr(
+        any(feature = "serde", target_arch = "wasm32"),
+        serde(skip_serializing_if = "Option::is_none")
+    )]
+    pub pairing_secs: Option<u64>,
     /// [`Timeouts::expired_channels`].
     #[cfg_attr(
         any(feature = "serde", target_arch = "wasm32"),
@@ -203,6 +211,7 @@ impl TimeoutsConfig {
             get_share_response: self
                 .get_share_response_secs
                 .map_or(base.get_share_response, Duration::from_secs),
+            pairing: self.pairing_secs.map_or(base.pairing, Duration::from_secs),
             expired_channels: self.expired_channels.map_or(base.expired_channels, |e| {
                 ExpiredChannelCleanup::new(e.enabled, e.timeout_in_secs)
             }),
@@ -245,6 +254,7 @@ impl DeRecProtocolConfig {
                 sharing_round_secs,
                 unpair_ack_secs,
                 get_share_response_secs,
+                pairing_secs,
                 expired_channels,
             } = t;
             let held = self.timeouts.get_or_insert_with(TimeoutsConfig::default);
@@ -252,6 +262,7 @@ impl DeRecProtocolConfig {
             over(&mut held.sharing_round_secs, sharing_round_secs);
             over(&mut held.unpair_ack_secs, unpair_ack_secs);
             over(&mut held.get_share_response_secs, get_share_response_secs);
+            over(&mut held.pairing_secs, pairing_secs);
             over(&mut held.expired_channels, expired_channels);
         }
         over(&mut self.parameter_range, parameter_range);
@@ -314,6 +325,7 @@ mod layer_tests {
                     sharing_round_secs: Some(30),
                     unpair_ack_secs: None,
                     get_share_response_secs: None,
+                    pairing_secs: None,
                     expired_channels: Some(ExpiredChannelsConfig {
                         enabled: false,
                         timeout_in_secs: 10,
@@ -668,6 +680,7 @@ mod tests {
             "sharing_round_secs": 30,
             "unpair_ack_secs": 45,
             "get_share_response_secs": 900,
+            "pairing_secs": 240,
             "expired_channels": { "enabled": false, "timeout_in_secs": 600 }
         },
         "parameter_range": {
@@ -724,6 +737,7 @@ mod tests {
                 sharing_round_secs: Some(30),
                 unpair_ack_secs: Some(45),
                 get_share_response_secs: Some(900),
+                pairing_secs: Some(240),
                 expired_channels: Some(ExpiredChannelsConfig {
                     enabled: false,
                     timeout_in_secs: 600,

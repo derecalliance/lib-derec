@@ -57,6 +57,7 @@ var layoutMirrors = []layoutMirror{
 	{"PairingFingerprintResult", reflect.TypeOf(pairingFingerprintResult{}), [][2]string{{"Error", "error"}, {"Fingerprint", "fingerprint"}}},
 	{"ProcessGetSecretIdsVersionsResponseMessageResult", reflect.TypeOf(processGetSecretIdsVersionsResponseMessageResult{}), [][2]string{{"Error", "error"}, {"SecretListBytes", "secret_list_bytes"}}},
 	{"ProcessPairResponseMessageResult", reflect.TypeOf(processPairResponseMessageResult{}), [][2]string{{"Error", "error"}, {"SharedKey", "shared_key"}, {"ChannelID", "channel_id"}}},
+	{"MessageIdResult", reflect.TypeOf(messageIdResult{}), [][2]string{{"Error", "error"}, {"ID", "id"}, {"Timestamp", "timestamp"}}},
 	{"ProcessPrePairResponseMessageResult", reflect.TypeOf(processPrePairResponseMessageResult{}), [][2]string{{"Error", "error"}, {"MlkemEncapsulationKey", "mlkem_encapsulation_key"}, {"EciesPublicKey", "ecies_public_key"}, {"Nonce", "nonce"}, {"FingerprintCommitment", "fingerprint_commitment"}}},
 	{"ProcessStoreShareResponseMessageResult", reflect.TypeOf(processStoreShareResponseMessageResult{}), [][2]string{{"Error", "error"}}},
 	{"ProcessUnpairResponseResult", reflect.TypeOf(processUnpairResponseResult{}), [][2]string{{"Error", "error"}}},

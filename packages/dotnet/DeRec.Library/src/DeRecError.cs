@@ -193,6 +193,17 @@ public static class DeRecCode
     /// </summary>
     public const int FingerprintCommitmentMismatch = 48;
 
+    /// <summary>
+    /// The pairing outlived <see cref="Protocol.Timeouts.Pairing"/>: the
+    /// contact, or the pairing request answering it, is older than the
+    /// window. Raised by the scanner on an expired contact and by the
+    /// creator's <c>Accept</c> on a late pairing request. Nothing was sent;
+    /// the remedy is to scan or share a fresh contact.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Pairing"/>.
+    /// </summary>
+    public const int PairingExpired = 49;
+
     public const int EmptyChannels = 60;
     public const int DuplicateChannelId = 61;
     public const int InvalidThreshold = 62;

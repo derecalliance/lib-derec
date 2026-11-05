@@ -17,6 +17,7 @@ use crate::types::{ChannelId, SharedKey};
 use derec_proto::ParameterRange;
 use derec_proto::TransportProtocol;
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// Identity and configuration constant for the lifetime of a protocol
 /// instance.
@@ -128,6 +129,9 @@ pub(crate) struct Round<'a> {
 /// alone; the other flows would carry a field they can never use.
 pub(crate) struct PairingConfig<'a> {
     pub(crate) parameter_range: Option<&'a ParameterRange>,
+    /// How old a contact or a pairing request may be and still pair. See
+    /// [`Timeouts::pairing`](crate::protocol::types::Timeouts::pairing).
+    pub(crate) lifetime: Duration,
 }
 
 /// Borrow a [`DeRecProtocol`]'s identity into a [`Local`].
@@ -158,6 +162,7 @@ macro_rules! pairing_config {
     ($protocol:expr) => {
         $crate::protocol::context::PairingConfig {
             parameter_range: $protocol.parameter_range.as_ref(),
+            lifetime: $protocol.timeouts.pairing,
         }
     };
 }

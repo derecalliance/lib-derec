@@ -134,6 +134,7 @@ var fixtureErrorCodes = map[string]int32{
 	"UnexpectedReplicaId":           derec.CodeUnexpectedReplicaID,
 	"IncompatibleParameterRange":    derec.CodeIncompatibleParameterRange,
 	"FingerprintCommitmentMismatch": derec.CodeFingerprintCommitmentMismatch,
+	"PairingExpired":                derec.CodePairingExpired,
 	"EmptyChannels":                 derec.CodeEmptyChannels,
 	"DuplicateChannelId":            derec.CodeDuplicateChannelID,
 	"InvalidThreshold":              derec.CodeInvalidThreshold,

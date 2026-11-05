@@ -54,7 +54,7 @@ pub(super) async fn start<S: StoreSet>(
     kind: SenderKind,
     trace_id: u64,
 ) -> Result<u64> {
-    super::reject_start_on_paired_channel(stores, local, channel_id).await?;
+    super::reject_start_on_channel_in_use(stores, local, channel_id).await?;
 
     let result = request::produce_pre_pair_request(local.own_transports.to_vec(), &contact)?;
 
@@ -100,10 +100,23 @@ pub(super) async fn start<S: StoreSet>(
 pub(in crate::protocol) async fn accept<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
+    pairing: &PairingConfig<'_>,
     channel_id: ChannelId,
     request: &PrePairRequestMessage,
     trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
+    if let Some(expired) = super::expiry(
+        stores,
+        local,
+        pairing,
+        channel_id,
+        request.timestamp.as_ref(),
+    )
+    .await?
+    {
+        return Err(expired.into());
+    }
+
     let policy = local.policy;
     let secret_id = local.secret_id;
     if let Some(SecretValue::PairingContact(contact)) = stores

@@ -816,6 +816,15 @@ export interface Timeouts {
    *  a **human** one when helpers approve share requests by hand. Library
    *  default: 300. */
   get_share_response_secs?: number;
+  /** How long a pairing stays possible: how old a contact may be when it is
+   *  scanned or answered, and how old a pairing request may be when it is
+   *  accepted. Both sides enforce it and nothing is sent on expiry: the
+   *  scanner refuses an expired contact, and the creator ignores a request on
+   *  one and refuses a late accept, with `pairing_expired`. The remedy is to
+   *  scan or share a fresh contact. A scanner's `expired_channels` timeout
+   *  should be at least this plus the time a response takes to arrive.
+   *  Library default: 30. */
+  pairing_secs?: number;
   /** Removal of channels still awaiting out-of-band fingerprint
    *  confirmation — every replica pairing, and every `NoKeys` pairing.
    *  Unlike the others this can be disabled, leaving the sweep to the
@@ -1456,7 +1465,9 @@ export type DeRecEvent =
    *  non-conforming peer. `"StaleResponse"` means a verification answer to
    *  a challenge that a newer one on the channel replaced; the newer
    *  challenge stays outstanding and its own answer still completes it.
-   *  `trace_id` matches the peer's `*Started` event for the same round
+   *  `"Superseded"` means a `StoreShareRequest` for a version older than
+   *  the newest one this helper stores on the channel, and not stored
+   *  itself; it is not stored and not answered. `trace_id` matches the peer's `*Started` event for the same round
    *  (`"0"` when the sender set none). */
   | {
       type: "MessageIgnored";
@@ -2123,7 +2134,28 @@ export declare const envelope: {
    * protobuf default is indistinguishable from an explicit zero).
    */
   read_trace_id(envelope_bytes: Uint8Array): bigint;
+
+  /**
+   * Identify an envelope for replay and reflection detection. `id` (32
+   * bytes) is the same for every copy of one message, whatever its
+   * unauthenticated cleartext fields (sequence, trace id, protocol version)
+   * say, and different for every other message; never key on a hash of the
+   * raw bytes instead. Detecting a message delivered twice, or delivered
+   * back to its sender, is the application's job: keep the `id` of every
+   * envelope sent and of every envelope `process` accepted, and drop an
+   * inbound envelope whose `id` is kept. Throws when the bytes are not an
+   * envelope or carry no timestamp.
+   */
+  message_id(envelope_bytes: Uint8Array): MessageId;
 };
+
+/** The identity of one delivered message; see `envelope.message_id`. */
+export interface MessageId {
+  /** SHA-256 of the envelope's encrypted `message` field. */
+  id: Uint8Array;
+  /** The envelope's send time, in seconds since the Unix epoch. */
+  timestamp: bigint;
+}
 
 export interface Timestamp {
 
@@ -2199,7 +2231,7 @@ export interface CommunicationInfo {
 
 /** Why a `MessageIgnored` event dropped a message. Matches the Rust
  *  `IgnoreReason` discriminants one-for-one. */
-export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse";
+export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse" | "Superseded";
 
 /** Why a `PeerNotRestored` event left a roster entry without a channel.
  *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */
@@ -2600,6 +2632,7 @@ export type DeRecErrorCode =
   | "unexpected_replica_id"
   | "incompatible_parameter_range"
   | "fingerprint_commitment_mismatch"
+  | "pairing_expired"
   | "empty_channels"
   | "duplicate_channel_id"
   | "invalid_threshold"

@@ -33,6 +33,12 @@ pub enum PairingError {
     )]
     FingerprintCommitmentMismatch,
 
+    /// The pairing outlived `Timeouts::pairing`: the contact, or the request
+    /// answering it, is older than the window. Pairing involves both parties,
+    /// so the remedy is to start again with a fresh contact or request.
+    #[error("pairing expired: {0}")]
+    Expired(&'static str),
+
     #[error(
         "replica-mode pairing (sender_kind={sender_kind:?}) missing the reserved `derec.replica_id` key"
     )]

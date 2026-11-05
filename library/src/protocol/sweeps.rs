@@ -149,6 +149,11 @@ impl<
     /// and no peer remains on its channel — the remainder of a pairing that
     /// never completed; a `Paired` own row is its place in the group and is
     /// never swept.
+    ///
+    /// Removing a record never removes a key by itself: a channel's key and
+    /// pairing material go only once nothing else is recorded on the channel,
+    /// so an expired `Pending` helper record on a replica group's channel
+    /// leaves the group key in place.
     pub async fn remove_expired_channels(
         &mut self,
         older_than_secs: u64,
@@ -177,7 +182,6 @@ impl<
                         },
                     )
                     .await?;
-                self.remove_channel_secrets(channel.channel_id).await;
 
                 #[cfg(feature = "logging")]
                 tracing::info!(
@@ -1074,6 +1078,7 @@ mod expired_channel_sweep_tests {
                 unpair_ack: Duration::from_secs(timeout_in_secs),
                 inbound_message: Duration::from_secs(timeout_in_secs),
                 get_share_response: Duration::from_secs(timeout_in_secs),
+                pairing: Duration::from_secs(timeout_in_secs),
                 expired_channels: policy,
             })
             .build()
@@ -1464,6 +1469,31 @@ mod expired_channel_sweep_tests {
 
             assert!(channels.member_rows.lock().unwrap().is_empty());
             assert!(!has_key(&secrets, 9100));
+        });
+    }
+
+    /// A pending pairing recorded on the group channel expires without taking
+    /// the group key: the channel is still in use by the group.
+    #[test]
+    fn an_expired_pairing_on_the_group_channel_leaves_the_group_key() {
+        run_async(async {
+            let (channels, secrets) = (InMemChannelStore::default(), InMemSecretStore::default());
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed_member_on(&mut c, 9000, 9, ChannelStatus::Paired, 600).await;
+            seed_member_on(&mut c, 9000, 8, ChannelStatus::Paired, 600).await;
+            seed(&mut c, 9000, ChannelStatus::Pending, 600).await;
+            seed_key(&mut s, 9000).await;
+
+            let mut protocol = build_with_secrets(channels.clone(), secrets.clone());
+            protocol.replica_id = Some(9);
+            protocol
+                .remove_expired_channels(60)
+                .await
+                .expect("sweep succeeds");
+
+            assert!(channels.helper_rows.lock().unwrap().is_empty());
+            assert_eq!(channels.member_rows.lock().unwrap().len(), 2);
+            assert!(has_key(&secrets, 9000), "the group key survives the sweep");
         });
     }
 
@@ -2575,6 +2605,7 @@ mod timeout_tests {
         assert_eq!(d.inbound_message, Duration::from_secs(300));
         assert_eq!(d.sharing_round, Duration::from_secs(60));
         assert_eq!(d.unpair_ack, Duration::from_secs(60));
+        assert_eq!(d.pairing, Duration::from_secs(30));
         assert_eq!(
             d.expired_channels,
             ExpiredChannelCleanup::Enabled {

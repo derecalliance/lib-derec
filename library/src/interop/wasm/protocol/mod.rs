@@ -348,6 +348,7 @@ impl DeRecProtocolBuilderWasm {
     ///   sharing_round_secs?:   number,
     ///   unpair_ack_secs?:      number,
     ///   get_share_response_secs?: number, // recovery waits this long for each Helper
+    ///   pairing_secs?:         number,   // how old a contact or pair request may be
     ///   expired_channels?:     { enabled: boolean, timeout_in_secs: number },
     /// }
     /// ```

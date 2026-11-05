@@ -840,6 +840,15 @@ export interface Timeouts {
    *  a **human** one when helpers approve share requests by hand. Library
    *  default: 300. */
   get_share_response_secs?: number;
+  /** How long a pairing stays possible: how old a contact may be when it is
+   *  scanned or answered, and how old a pairing request may be when it is
+   *  accepted. Both sides enforce it and nothing is sent on expiry: the
+   *  scanner refuses an expired contact, and the creator ignores a request on
+   *  one and refuses a late accept, with `pairing_expired`. The remedy is to
+   *  scan or share a fresh contact. A scanner's `expired_channels` timeout
+   *  should be at least this plus the time a response takes to arrive.
+   *  Library default: 30. */
+  pairing_secs?: number;
   /** Removal of channels still awaiting out-of-band fingerprint
    *  confirmation — every replica pairing, and every `NoKeys` pairing.
    *  Unlike the others this can be disabled, leaving the sweep to the
@@ -1478,7 +1487,10 @@ export type DeRecEvent =
    *  and the encrypted inner message's timestamp differ, or either is
    *  absent. `"StaleResponse"` means a `VerifyShareResponse` answered an
    *  earlier challenge that a newer one on the channel has replaced; the
-   *  outstanding challenge is kept. `trace_id` matches the peer's
+   *  outstanding challenge is kept. `"Superseded"` means a
+   *  `StoreShareRequest` for a version older than the newest one this
+   *  helper stores on the channel, and not stored itself; it is not stored
+   *  and not answered. `trace_id` matches the peer's
    *  `*Started` event for the same round (`"0"` when the sender set none). */
   | {
       type: "MessageIgnored";
@@ -1680,7 +1692,7 @@ export interface CommunicationInfo {
 
 /** Why a `MessageIgnored` event dropped a message. Matches the Rust
  *  `IgnoreReason` discriminants one-for-one. */
-export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse";
+export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse" | "Superseded";
 
 /** Why a `PeerNotRestored` event left a roster entry without a channel.
  *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */
@@ -2117,4 +2129,12 @@ export interface UnpairingProcessResult {
 
 export interface DiscoveryProcessResult {
   secret_list: SecretVersionEntry[];
+}
+
+/** The identity of one delivered message; see `envelope.message_id`. */
+export interface MessageId {
+  /** SHA-256 of the envelope's encrypted `message` field. */
+  id: Uint8Array;
+  /** The envelope's send time, in seconds since the Unix epoch. */
+  timestamp: bigint;
 }

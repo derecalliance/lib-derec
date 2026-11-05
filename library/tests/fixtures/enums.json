@@ -94,6 +94,10 @@
         {
           "name": "StaleResponse",
           "wire": "StaleResponse"
+        },
+        {
+          "name": "Superseded",
+          "wire": "Superseded"
         }
       ]
     },
@@ -626,6 +630,7 @@
         { "name": "UnexpectedReplicaId", "wire": 46, "text": "unexpected_replica_id" },
         { "name": "IncompatibleParameterRange", "wire": 47, "text": "incompatible_parameter_range" },
         { "name": "FingerprintCommitmentMismatch", "wire": 48, "text": "fingerprint_commitment_mismatch" },
+        { "name": "PairingExpired", "wire": 49, "text": "pairing_expired" },
         { "name": "EmptyChannels", "wire": 60, "text": "empty_channels" },
         { "name": "DuplicateChannelId", "wire": 61, "text": "duplicate_channel_id" },
         { "name": "InvalidThreshold", "wire": 62, "text": "invalid_threshold" },

@@ -49,6 +49,18 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     kind: SenderKind,
     trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
+    if let Some(expired) = super::expiry(
+        stores,
+        local,
+        pairing,
+        channel_id,
+        request.timestamp.as_ref(),
+    )
+    .await?
+    {
+        return Err(expired.into());
+    }
+
     let secret_id = local.secret_id;
     let replica_id_to_inject = super::require_replica_id_for_kind(kind, local.replica_id)?;
 
@@ -88,8 +100,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
 
     // The contact is still stored at this point — the transient material is
     // dropped further down — so the mode this pairing ran under is readable
-    // here. Only `NoKeys` leaves one on the responder side; the other modes
-    // store a `PairingSecret` instead.
+    // here.
     let contact_mode = match stores
         .secrets
         .load(secret_id, channel_id, SecretKind::PairingContact)
@@ -437,7 +448,7 @@ pub(super) async fn start<S: StoreSet>(
     replica_id_to_inject: Option<u64>,
     trace_id: u64,
 ) -> Result<u64> {
-    super::reject_start_on_paired_channel(stores, local, channel_id).await?;
+    super::reject_start_on_channel_in_use(stores, local, channel_id).await?;
 
     let comm_info = super::build_communication_info(local.communication_info, replica_id_to_inject);
     let result = request::produce(

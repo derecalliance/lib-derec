@@ -15,7 +15,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { channelFilterMatches, ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, StatusEnum, generate_replica_id, primitives, shareStoreRefusal } from "@derec-alliance/nodejs";
+import { channelFilterMatches, ContactMode, DeRecProtocol, DeRecProtocolBuilder, envelope, FlowKind, SenderKind, StatusEnum, generate_replica_id, primitives, shareStoreRefusal } from "@derec-alliance/nodejs";
 import type {
   ChannelStatusName,
   ChannelStore,
@@ -2130,6 +2130,124 @@ async function runInvalidKeepVersionFlow(): Promise<void> {
   console.log("\n✓ Invalid keepVersion flow passed.\n");
 }
 
+/**
+ * The application's replay record: the identity of every envelope a device
+ * sent or accepted, keyed on `envelope.message_id`.
+ */
+class SeenEnvelopes {
+  private readonly ids = new Set<string>();
+
+  private static idOf(bytes: Uint8Array): string {
+    return Array.from(envelope.message_id(bytes).id, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  record(bytes: Uint8Array): void {
+    this.ids.add(SeenEnvelopes.idOf(bytes));
+  }
+
+  contains(bytes: Uint8Array): boolean {
+    return this.ids.has(SeenEnvelopes.idOf(bytes));
+  }
+}
+
+function raisedUpdateChannelInfo(events: DeRecEvent[]): boolean {
+  return events.some((e) => e.type === "ActionRequired" && e.action_kind === "UpdateChannelInfo");
+}
+
+/**
+ * The library processes every copy of a message delivered within the inbound
+ * window, including one delivered back to its own sender. An application that
+ * records the message id of what it sends and accepts drops a replay, a copy
+ * whose unauthenticated trace id was changed, and a reflection.
+ */
+async function runReplayDetectionFlow(): Promise<void> {
+  console.log("=== [Protocol] Replay detection ===\n");
+
+  const helper = makeNode("Helper", "https://helper.example.com");
+  const owner = makeNode("Owner", "https://owner.example.com");
+  const { longTermChannelId } = await doPair(helper, owner, 61n, "ReplayDetection");
+  owner.transport.drain();
+  const ownerSeen = new SeenEnvelopes();
+  const helperSeen = new SeenEnvelopes();
+
+  await owner.protocol.start(FlowKind.UpdateChannelInfo, {
+    target: BigInt(longTermChannelId),
+    communication_info: { name: "owner-renamed" },
+  });
+  const update = drainOne(owner, "Owner");
+  ownerSeen.record(update);
+
+  if (helperSeen.contains(update)) throw new Error("a first delivery is not in the record");
+  let events = await helper.protocol.process(update);
+  if (!raisedUpdateChannelInfo(events)) {
+    throw new Error(`the update must raise ActionRequired; got ${JSON.stringify(events.map((e) => e.type))}`);
+  }
+  helperSeen.record(update);
+
+  const restamped = envelope.apply_trace_id(update, 0x7e57n);
+  if (byteArraysEqual(restamped, update)) throw new Error("the copy travels as different bytes");
+  if (!helperSeen.contains(update) || !helperSeen.contains(restamped)) {
+    throw new Error("the replay and the re-stamped copy must be recognised");
+  }
+  events = await helper.protocol.process(restamped);
+  if (!raisedUpdateChannelInfo(events)) throw new Error("unchecked, the library processes the copy again");
+  console.log("  [Helper] replay and re-stamped copy share the original's message id  ✓");
+
+  if (!ownerSeen.contains(update)) throw new Error("the reflection must be recognised");
+  events = await owner.protocol.process(update);
+  if (!raisedUpdateChannelInfo(events)) throw new Error("unchecked, the library reads its own update as the peer's");
+  console.log("  [Owner]  reflected update matches an outbound message id  ✓");
+
+  console.log("Replay detection flow passed.\n");
+}
+
+/**
+ * A helper that dropped v2 under v3's `keepVersion` does not store v2 again
+ * when v2's request is delivered once more: it is ignored as `Superseded`,
+ * unanswered.
+ */
+async function runSupersededShareRequestFlow(): Promise<void> {
+  console.log("=== [Protocol] Superseded share request ===\n");
+
+  const secretId = 0x6565n;
+  const { owner, helpersByUri } = await pairKeepVersionHelpers(secretId, 63n, 64n);
+  owner.shareStore.keep = 0;
+  await runKeepVersionRound(owner, helpersByUri, 1, ["HelperA", "HelperB"]);
+
+  await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([3]), name: "kept", data: new TextEncoder().encode("round-2") }],
+    description: "round 2",
+  });
+  let v2ForA: Uint8Array | undefined;
+  for (const { endpoint, message } of owner.transport.drain()) {
+    const [helper, label] = helpersByUri.get(endpoint.uri)!;
+    if (label === "HelperA") v2ForA = message;
+    requireEvent(await processAll(helper, message), "ShareStored", label);
+    await owner.protocol.process(drainOne(helper, label));
+  }
+  if (!v2ForA) throw new Error("v2 was sent to HelperA");
+
+  await runKeepVersionRound(owner, helpersByUri, 3, ["HelperA", "HelperB"]);
+  const [helperA, , channelA] = helpersByUri.get("https://helper-a.example.com")!;
+  await assertHeldVersions(helperA, "HelperA", secretId, channelA, [3]);
+
+  const events = await helperA.protocol.process(v2ForA);
+  const [ignored] = events;
+  if (
+    events.length !== 1 ||
+    ignored?.type !== "MessageIgnored" ||
+    ignored.reason !== "Superseded" ||
+    ignored.channel_id !== channelA
+  ) {
+    throw new Error(`v2 delivered again must be MessageIgnored(Superseded); got ${JSON.stringify(events)}`);
+  }
+  await assertHeldVersions(helperA, "HelperA", secretId, channelA, [3]);
+  if (helperA.transport.drain().length !== 0) throw new Error("a superseded request is not answered");
+  console.log("  [HelperA] v2 delivered after v3 → MessageIgnored(Superseded), still holds [3]  ✓");
+
+  console.log("Superseded share request flow passed.\n");
+}
+
 // VSS sharing requires threshold ≥ 2, so this scenario pairs the Owner with
 // TWO helpers and reconstructs the secret from both shares. Mirrors the Rust
 // `smoke-tests/rust/src/protocol.rs::run_discovery_and_recovery_flow`.
@@ -2894,7 +3012,7 @@ async function startReplicaScan(
  * `ProtectSecret` on `owner` must be accepted: a replica pairing that never
  * completed is no group, and must never stop the device from protecting.
  */
-async function assertProtects(owner: Node, name: string): Promise<void> {
+async function assertProtects(owner: Node, name: string, label = "ReplicaA"): Promise<void> {
   try {
     await owner.protocol.start(FlowKind.ProtectSecret, {
       secrets: [{ id: new Uint8Array([11]), name, data: new TextEncoder().encode(name) }],
@@ -2902,7 +3020,7 @@ async function assertProtects(owner: Node, name: string): Promise<void> {
   } catch (e) {
     throw new Error(`ProtectSecret (${name}) must succeed: ${JSON.stringify(e)}`);
   }
-  console.log(`  [ReplicaA] ProtectSecret ${name}  ✓`);
+  console.log(`  [${label}] ProtectSecret ${name}  ✓`);
 }
 
 /**
@@ -2984,6 +3102,164 @@ async function runAbandonedReplicaPairingFlow(): Promise<void> {
   console.log(`  [ReplicaA] own row on the confirmed group channel ${groupChannel}, Paired  ✓`);
 
   console.log("\n✓ Abandoned replica pairing flow passed.\n");
+}
+
+/**
+ * A contact's channel identifier is chosen by whoever created it, and a
+ * replica group's identifier travels in the clear on every envelope of the
+ * group. A contact on the group channel must be refused, and a pending
+ * pairing on that channel must never take the group key when it expires.
+ */
+async function runContactOnTheGroupChannelFlow(): Promise<void> {
+  console.log("=== [Protocol] Contact On The Group Channel Flow ===\n");
+
+  const a: AddressedNode = {
+    node: makeNode("replica-a", "https://replica-a.example.com", {
+      replicaId: 0xA1A1n,
+      timeouts: { expired_channels: { enabled: true, timeout_in_secs: 1 } },
+    }),
+    uri: "https://replica-a.example.com",
+  };
+  const c: AddressedNode = {
+    node: makeNode("replica-c", "https://replica-c.example.com", { replicaId: 0xC3C3n }),
+    uri: "https://replica-c.example.com",
+  };
+  const adversary = makeNode("adversary", "https://adversary.example.com");
+
+  await startReplicaScan(a.node, c.node, 200n, SenderKind.ReplicaSource);
+  const pairingEvents = await pumpAll([a, c]);
+  const completed = pairingEvents.find(
+    (e) => e.type === "PairingCompleted" && e.pairing_channel_id === "200",
+  ) as Extract<DeRecEvent, { type: "PairingCompleted" }> | undefined;
+  if (!completed) {
+    throw new Error(`the pairing with C completes: [${pairingEvents.map((e) => e.type).join(", ")}]`);
+  }
+  const groupChannel = completed.channel_id;
+  await crossConfirmFingerprint(a.node, c.node, BigInt(groupChannel));
+  await pumpAll([a, c]);
+
+  const contact = await adversary.protocol.createContact(BigInt(groupChannel), ContactMode.InlineKeys);
+  await expectCode("a contact on the group channel must be refused", "channel_already_paired", () =>
+    a.node.protocol.start(FlowKind.Pairing, { kind: SenderKind.Owner, contact }),
+  );
+  if (a.node.transport.drain().length !== 0) {
+    throw new Error("nothing is sent for a refused contact");
+  }
+  console.log("  [ReplicaA] contact on the group channel refused with channel_already_paired, nothing sent  ✓");
+
+  await assertProtects(c.node, "group traffic after the refused contact", "ReplicaC");
+  const events: DeRecEvent[] = [];
+  for (const m of c.node.transport.drain()) {
+    events.push(...(await processAll(a.node, m.message)));
+  }
+  if (events.some((e) => e.type === "MessageIgnored")) {
+    throw new Error(`A still processes the group's traffic: ${JSON.stringify(events)}`);
+  }
+  await pumpAll([a, c]);
+  console.log("  [ReplicaA] group traffic still processed  ✓");
+
+  const aSid = String(a.node.protocol.secretId());
+  // The channel id is a u64 beyond what a JS number holds exactly, so the
+  // record is written as text.
+  const pending =
+    `{"Helper":{"channel_id":${groupChannel},"transports":[],"communication_info":{},` +
+    `"status":"Pending","created_at":0,"peer_role":"Helper","weight":1}}`;
+  await a.node.channelStore.save(aSid, groupChannel, "0", new TextEncoder().encode(pending));
+  await a.node.protocol.tick();
+  if (!(await a.node.secretStore.load(aSid, groupChannel, 0))) {
+    throw new Error("an expired pairing on the group channel must not take the group key");
+  }
+  await assertProtects(a.node, "after the expiry sweep");
+  console.log("  [ReplicaA] expired pairing on the group channel leaves the group key  ✓");
+
+  console.log("\n✓ Contact on the group channel flow passed.\n");
+}
+
+/**
+ * A pairing has a lifetime, `timeouts.pairing_secs`, and both sides enforce
+ * it without sending anything: the scanner refuses an expired contact, and
+ * the creator ignores a request on one and refuses a late accept. Pairing
+ * involves both parties, so the remedy is a fresh contact. Mirrors
+ * `run_pairing_expiry_flow` in `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runPairingExpiryFlow(): Promise<void> {
+  console.log("=== [Protocol] Pairing Expiry Flow ===\n");
+
+  const shortWindow = { timeouts: { pairing_secs: 1 } };
+  const creatorA = makeNode("helper-expiry-a", "https://helper-expiry-a.example.com");
+  const scannerA = makeNode("owner-expiry-a", "https://owner-expiry-a.example.com", shortWindow);
+  const creatorB = makeNode("helper-expiry-b", "https://helper-expiry-b.example.com", shortWindow);
+  const scannerB = makeNode("owner-expiry-b", "https://owner-expiry-b.example.com");
+  const creatorC = makeNode("helper-expiry-c", "https://helper-expiry-c.example.com", shortWindow);
+  const scannerC = makeNode("owner-expiry-c", "https://owner-expiry-c.example.com");
+
+  const createContact = (creator: Node, channelId: bigint) =>
+    creator.protocol.createContact(channelId, ContactMode.InlineKeys);
+  const scanAsOwner = (scanner: Node, contact: Awaited<ReturnType<typeof createContact>>) =>
+    scanner.protocol.start(FlowKind.Pairing, { kind: SenderKind.Owner, contact });
+  const codeOf = async (call: () => Promise<unknown>): Promise<string | undefined> => {
+    try {
+      await call();
+    } catch (e) {
+      return (e as { code?: string }).code;
+    }
+    return undefined;
+  };
+
+  const staleContact = await createContact(creatorA, 181n);
+  const expiringContact = await createContact(creatorB, 182n);
+  await scanAsOwner(scannerC, await createContact(creatorC, 183n));
+  const [request] = scannerC.transport.drain();
+  if (!request) throw new Error("scanner-c sends a pair request");
+  const late = (await creatorC.protocol.process(request.message)).find(
+    (e) => e.type === "ActionRequired",
+  ) as Extract<DeRecEvent, { type: "ActionRequired" }> | undefined;
+  if (!late) throw new Error("creator-c is asked to accept the pairing");
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 2100));
+
+  const scanCode = await codeOf(() => scanAsOwner(scannerA, staleContact));
+  if (scanCode !== "pairing_expired") {
+    throw new Error(`the scanner must refuse an expired contact with pairing_expired, got ${scanCode ?? "no error"}`);
+  }
+  if (scannerA.transport.drain().length !== 0) throw new Error("nothing is sent for an expired contact");
+  console.log("  [Owner] scanning a contact older than the window → pairing_expired, nothing sent  ✓");
+
+  await scanAsOwner(scannerB, expiringContact);
+  const [requestB] = scannerB.transport.drain();
+  if (!requestB) throw new Error("scanner-b sends a pair request");
+  const events = await creatorB.protocol.process(requestB.message);
+  const [ignored] = events;
+  if (
+    events.length !== 1 ||
+    ignored?.type !== "MessageIgnored" ||
+    ignored.reason !== "Expired" ||
+    ignored.channel_id !== "182"
+  ) {
+    throw new Error(`a request on an expired contact must be MessageIgnored(Expired); got ${JSON.stringify(events)}`);
+  }
+  if (creatorB.transport.drain().length !== 0) throw new Error("the creator does not answer it");
+  console.log("  [Helper] request on its expired contact → MessageIgnored(Expired), nothing sent  ✓");
+
+  const acceptCode = await codeOf(() => creatorC.protocol.accept(late.action));
+  if (acceptCode !== "pairing_expired") {
+    throw new Error(`a late accept must be refused with pairing_expired, got ${acceptCode ?? "no error"}`);
+  }
+  if (creatorC.transport.drain().length !== 0) throw new Error("a refused accept sends nothing");
+  const sid = String(creatorC.protocol.secretId());
+  const channels = JSON.parse(new TextDecoder().decode(await creatorC.channelStore.listHelpers(sid, ANY_HELPERS)));
+  if (channels.length !== 0) throw new Error(`a refused accept records no channel, got ${JSON.stringify(channels)}`);
+  console.log("  [Helper] accepting after the window → pairing_expired, no channel, nothing sent  ✓");
+
+  await scanAsOwner(scannerC, await createContact(creatorC, 184n));
+  const paired = await pumpAll([
+    { node: scannerC, uri: "https://owner-expiry-c.example.com" },
+    { node: creatorC, uri: "https://helper-expiry-c.example.com" },
+  ]);
+  if (!paired.some((e) => e.type === "PairingCompleted")) throw new Error("a fresh contact pairs");
+  console.log("  [Helper] a fresh contact pairs  ✓");
+
+  console.log("Pairing expiry flow passed.\n");
 }
 
 // Verifies that an Owner-initiated unpair (Required-ack mode, the default)
@@ -4358,12 +4634,16 @@ export async function runProtocolSmoke(): Promise<void> {
   await runHelperKeepVersionFlow();
   await runOwnerKeepVersionMissedRoundFlow();
   await runInvalidKeepVersionFlow();
+  await runSupersededShareRequestFlow();
+  await runReplayDetectionFlow();
   await runDiscoveryAndRecoveryFlow();
   await runSilentHelperRecoveryFlow();
   await runDisputedRecoveryFlow();
   await runConflictingRecoveryFlow();
   await runRestoreKeepsHelperDutiesFlow();
   await runAbandonedReplicaPairingFlow();
+  await runContactOnTheGroupChannelFlow();
+  await runPairingExpiryFlow();
   await runUnpairingFlow();
   await runUpdateChannelInfoFlow();
   await runReplyToFlow();

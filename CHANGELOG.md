@@ -147,6 +147,87 @@ helpers on 0.0.10, and helpers need no upgrade.
   reads the roster in between sees only the peer. A replica pairing in
   progress during the upgrade must be started again.
 
+- **Fixed (security): a contact on a replica group's channel could delete
+  the group key.** *(bug fix; every SDK)*
+
+  The creator of a contact chooses its channel identifier, and a replica
+  group's identifier travels in the clear on every envelope of the group.
+  Scanning a contact that reused it was accepted, since only a non-`Pending`
+  helper record on the channel counted as in use. While that pairing was
+  pending the device ignored the group's messages, and when it expired the
+  sweep deleted every key stored under the channel, the group key with it;
+  every later `ProtectSecret` failed and the group had to be re-created.
+  `start(Pairing)` now refuses, with `ChannelAlreadyPaired`, a channel that
+  holds a key or has a replica member recorded on it, and the expiry sweep
+  removes a channel's key only once nothing else is recorded on the channel.
+
+- **Changed (security): detecting replayed and reflected messages is the
+  application's job, and every SDK gets the tool for it.** *(new API; every
+  SDK)*
+
+  Within the inbound window `process` handles every copy of a message it is
+  given, and both ends of a channel encrypt under one key, so a message
+  delivered back to its sender decrypts there as the peer's. An application
+  could not tell copies apart: `sequence`, `traceId` and the protocol version
+  are not authenticated, and an envelope can be re-encoded, so a copy can
+  arrive as different bytes. `derec_message::message_id(envelope)` returns
+  `{ id, timestamp }`, where `id` is a SHA-256 of the encrypted `message`
+  field: the same for every copy of one message, different for every other.
+  The contract is documented on `process` and in `derecmessage.proto`: keep
+  the `id` of every envelope sent and accepted until
+  `max(received or sent at, timestamp) + inbound_message`, drop an inbound
+  envelope whose `id` is kept, and reject a contact update older than the
+  last one accepted on the channel. The `AutoAcceptPolicy` documentation no
+  longer calls accepting `UpdateChannelInfo` safe because only the peer can
+  send it.
+
+  Exposed as `message_id_from_envelope` (C), `envelope_message_id` (wasm),
+  `envelope.ReadMessageID` (Go), `Envelope.ReadMessageId` (.NET) and
+  `envelope.message_id` (Node, web, React Native), next to the trace-id
+  helpers.
+
+- **Fixed (security): a delivered-again share request brought back a version
+  the helper had dropped.** *(bug fix; every SDK)*
+
+  A helper that had deleted a version under a newer request's `keepVersion`
+  stored it again when the older request arrived a second time within the
+  inbound window, replayed or held back. A `StoreShareRequest` for a version
+  older than the newest one stored on the channel, and not stored itself, is
+  now ignored as `MessageIgnored` with the new reason `Superseded`: it raises
+  no `ActionRequired` and is not answered. An identical re-send of a version
+  still held is acknowledged as before.
+
+  **Migration:** code matching `IgnoreReason` exhaustively must handle
+  `Superseded`.
+
+- **Fixed (security): a late accept left a channel only one side held.**
+  *(bug fix; new setting; every SDK)*
+
+  A pairing request had no deadline at its creator, while the scanner drops
+  its side of a pairing after `expired_channels`. A request accepted after
+  that recorded a paired channel the scanner could not open: an owner then
+  sent a share to it on every `ProtectSecret`, and a helper kept a channel to
+  an owner that no longer knew it. A pairing now has a lifetime,
+  `Timeouts::pairing` (default 30 s), and both sides enforce it without
+  sending anything. The scanner's `start(Pairing)` refuses a contact older
+  than the lifetime with the new `PairingError::Expired` (code
+  `pairing_expired`). The creator reports a request on such a contact, or a
+  request older than the lifetime, as `MessageIgnored` with
+  `IgnoreReason::Expired` before any prompt, and `accept` refuses a request
+  that outlived it with `PairingError::Expired`. The remedy is a fresh
+  contact. The creator now keeps its contact in every mode, so it measures
+  the contact's age on its own clock.
+
+  Exposed as `timeouts.pairing_secs` in the shared config, `Timeouts.Pairing`
+  (.NET), `Timeouts.PairingSecs` (Go) and `timeouts.pairing_secs` (Node, web,
+  React Native), with the code `CodePairingExpired` (Go) and
+  `DeRecCode.PairingExpired` (.NET).
+
+  **Migration:** a scanner's `expired_channels` timeout should be at least
+  `pairing` plus the time a response takes to arrive. A contact without a
+  timestamp is refused, and a contact created before this version cannot be
+  answered: create a new one.
+
 ### 0.0.10
 
 A body naming a group member is accepted only on that member's own channel,

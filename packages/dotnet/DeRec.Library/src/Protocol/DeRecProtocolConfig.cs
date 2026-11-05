@@ -31,8 +31,8 @@ namespace DeRec.Library.Orchestrator;
 /// Keys are snake_case; <see cref="MaxSubshares"/> and <see cref="ReplicaId"/>
 /// are decimal strings; timeouts are whole seconds under
 /// <c>timeouts.inbound_message_secs</c>, <c>sharing_round_secs</c>,
-/// <c>unpair_ack_secs</c>, <c>get_share_response_secs</c> and
-/// <c>expired_channels</c>. An unknown key, at any
+/// <c>unpair_ack_secs</c>, <c>get_share_response_secs</c>,
+/// <c>pairing_secs</c> and <c>expired_channels</c>. An unknown key, at any
 /// level, fails the read with a <see cref="JsonException"/> naming it, so a
 /// misspelled setting is never silently dropped.
 /// </para>
@@ -105,6 +105,7 @@ internal sealed class DeRecProtocolConfigJsonConverter : JsonConverter<DeRecProt
                     SharingRound: FromSecs(w.Timeouts.SharingRoundSecs, "sharing_round_secs"),
                     UnpairAck: FromSecs(w.Timeouts.UnpairAckSecs, "unpair_ack_secs"),
                     GetShareResponse: FromSecs(w.Timeouts.GetShareResponseSecs, "get_share_response_secs"),
+                    Pairing: FromSecs(w.Timeouts.PairingSecs, "pairing_secs"),
                     ExpiredChannels: w.Timeouts.ExpiredChannels is null
                         ? null
                         : new RemoveExpiredChannelsPolicy(
@@ -162,6 +163,7 @@ internal sealed class DeRecProtocolConfigJsonConverter : JsonConverter<DeRecProt
                     SharingRoundSecs = value.Timeouts.SharingRound?.TotalSeconds,
                     UnpairAckSecs = value.Timeouts.UnpairAck?.TotalSeconds,
                     GetShareResponseSecs = value.Timeouts.GetShareResponse?.TotalSeconds,
+                    PairingSecs = value.Timeouts.Pairing?.TotalSeconds,
                     ExpiredChannels = value.Timeouts.ExpiredChannels is null
                         ? null
                         : new ExpiredChannelsWire
@@ -332,6 +334,9 @@ internal sealed class DeRecProtocolConfigJsonConverter : JsonConverter<DeRecProt
 
         [JsonPropertyName("get_share_response_secs"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public double? GetShareResponseSecs { get; init; }
+
+        [JsonPropertyName("pairing_secs"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public double? PairingSecs { get; init; }
 
         [JsonPropertyName("expired_channels"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public ExpiredChannelsWire? ExpiredChannels { get; init; }

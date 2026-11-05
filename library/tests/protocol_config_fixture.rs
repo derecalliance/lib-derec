@@ -59,6 +59,7 @@ fn full_fixture_sets_every_field() {
             sharing_round_secs: Some(30),
             unpair_ack_secs: Some(45),
             get_share_response_secs: Some(900),
+            pairing_secs: Some(240),
             expired_channels: Some(ExpiredChannelsConfig {
                 enabled: true,
                 timeout_in_secs: 600,

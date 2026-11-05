@@ -120,6 +120,12 @@ const (
 	// party that made the commitment — a possible man-in-the-middle. The
 	// pairing does not complete.
 	CodeFingerprintCommitmentMismatch int32 = 48
+	// CodePairingExpired: the pairing outlived Timeouts.PairingSecs — the
+	// contact, or the pairing request answering it, is older than the
+	// window. Raised by the scanner on an expired contact and by the
+	// creator's Accept on a late pairing request. Nothing was sent; the
+	// remedy is to scan or share a fresh contact.
+	CodePairingExpired int32 = 49
 
 	CodeEmptyChannels      int32 = 60
 	CodeDuplicateChannelID int32 = 61

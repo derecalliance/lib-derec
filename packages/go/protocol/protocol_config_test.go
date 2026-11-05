@@ -56,6 +56,7 @@ func TestDeRecProtocolConfig_FullFixtureSetsEveryField(t *testing.T) {
 			SharingRoundSecs:     proto.Uint64(30),
 			UnpairAckSecs:        proto.Uint64(45),
 			GetShareResponseSecs: proto.Uint64(900),
+			PairingSecs:          proto.Uint64(240),
 			ExpiredChannels:      &RemoveExpiredChannelsPolicy{Enabled: true, TimeoutInSecs: 600},
 		},
 		ParameterRange: &ParameterRange{
@@ -153,6 +154,7 @@ func TestDeRecProtocolConfig_LayersLastWriteWins(t *testing.T) {
 		cfg.Timeouts.SharingRoundSecs == nil || *cfg.Timeouts.SharingRoundSecs != 30 ||
 		cfg.Timeouts.InboundMessageSecs == nil || *cfg.Timeouts.InboundMessageSecs != 120 ||
 		cfg.Timeouts.UnpairAckSecs != nil || cfg.Timeouts.GetShareResponseSecs != nil ||
+		cfg.Timeouts.PairingSecs != nil ||
 		cfg.Timeouts.ExpiredChannels != nil {
 		t.Fatalf("timeouts must merge per field, got %+v", cfg.Timeouts)
 	}

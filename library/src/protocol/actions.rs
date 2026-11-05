@@ -727,6 +727,7 @@ impl<
                 handlers::pairing::pre_pair::accept(
                     &mut borrow_stores!(self),
                     &local!(self),
+                    &pairing_config!(self),
                     channel_id,
                     &request,
                     trace_id,
@@ -743,6 +744,7 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::derec_message::current_timestamp;
     use crate::protocol::FailedRequest;
     use crate::protocol::ReplyTarget;
     use crate::protocol::builder::DeRecProtocolBuilder;
@@ -772,6 +774,7 @@ mod tests {
                     channel_id: CHANNEL.0,
                     contact_mode: ContactMode::NoKeys as i32,
                     nonce: NONCE,
+                    timestamp: Some(current_timestamp()),
                     ..Default::default()
                 }),
             )
@@ -788,7 +791,7 @@ mod tests {
                     uri: uri.to_owned(),
                     protocol: protocol as i32,
                 }],
-                timestamp: None,
+                timestamp: Some(current_timestamp()),
             },
             trace_id: 0,
         }
@@ -893,7 +896,7 @@ mod tests {
                                 protocol: Protocol::Https as i32,
                             },
                         ],
-                        timestamp: None,
+                        timestamp: Some(current_timestamp()),
                     },
                     trace_id: 0,
                 })

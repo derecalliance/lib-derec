@@ -1585,6 +1585,16 @@ public sealed record RemoveExpiredChannelsPolicy(bool Enabled, ulong TimeoutInSe
 /// The budget is a <b>human</b> one when helpers approve share requests by
 /// hand. Library default: 300s.
 /// </param>
+/// <param name="Pairing">
+/// How long a pairing stays possible: how old a contact may be when it is
+/// scanned or answered, and how old a pairing request may be when it is
+/// accepted. Both sides enforce it and nothing is sent on expiry: the scanner
+/// refuses an expired contact, and the creator ignores a request on one and
+/// refuses a late accept, with <see cref="DeRecCode.PairingExpired"/>. The
+/// remedy is to scan or share a fresh contact. A scanner's
+/// <see cref="ExpiredChannels"/> timeout should be at least this plus the
+/// time a response takes to arrive. Library default: 30s.
+/// </param>
 /// <param name="ExpiredChannels">
 /// Removal of channels still awaiting out-of-band fingerprint confirmation.
 /// Unlike the others this can be disabled. The budget is a <b>human</b> one —
@@ -1596,6 +1606,7 @@ public sealed record Timeouts(
     TimeSpan? SharingRound = null,
     TimeSpan? UnpairAck = null,
     TimeSpan? GetShareResponse = null,
+    TimeSpan? Pairing = null,
     RemoveExpiredChannelsPolicy? ExpiredChannels = null);
 
 public sealed class AutoAcceptPolicy

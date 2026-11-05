@@ -102,6 +102,42 @@ impl<
     /// event of the message when only the follow-up auto-publish failed.
     /// Those deadlines are already settled and are never reported again.
     ///
+    /// # Security: replay and reflection
+    ///
+    /// An envelope older than
+    /// [`Timeouts::inbound_message`](crate::protocol::types::Timeouts::inbound_message)
+    /// is ignored as `Expired`, but within that window this function keeps
+    /// no record of what it has processed: a copy of a message is processed
+    /// again. Both ends of a channel encrypt under one key, so a message this
+    /// device sent, delivered back to it, decrypts too. Detecting both
+    /// belongs to the **application's transport layer**, keyed on
+    /// [`message_id`](crate::derec_message::message_id):
+    ///
+    /// - Keep the `id` of every envelope this function accepted, and of
+    ///   every envelope this device sends, until
+    ///   `max(received or sent at, timestamp) + inbound_message`. A
+    ///   `timestamp` ahead of this device's clock stays acceptable for
+    ///   longer than the window measured from arrival.
+    /// - Drop an inbound envelope whose `id` is kept, without calling this
+    ///   function.
+    /// - Record an inbound `id` only once this function returned `Ok`
+    ///   without [`DeRecEvent::MessageIgnored`]: a corrupted copy raced
+    ///   ahead of the real message must not get the real one dropped.
+    /// - Keep the record across restarts, or hold inbound traffic for one
+    ///   window after starting.
+    /// - Never key on a hash of the raw envelope: its cleartext fields are
+    ///   not authenticated and a copy can arrive as different bytes.
+    ///
+    /// A message held back and delivered late is a first delivery, so no
+    /// record catches it. Where its order matters to the protocol's own
+    /// state, the library enforces it: a `StoreShareRequest` older than the
+    /// newest version stored on its channel is ignored as `Superseded`.
+    /// Where it matters only to the application, the application enforces
+    /// it: the `timestamp` of the envelope that raised an `UpdateChannelInfo`
+    /// [`ActionRequired`](DeRecEvent::ActionRequired) is when the update was
+    /// sent, and an update older than the last one accepted on the channel
+    /// should be rejected.
+    ///
     /// # Security: bounding inbound message size
     ///
     /// This function does **not** enforce an upper bound on `message.len()`,
@@ -359,6 +395,18 @@ impl<
                     );
                     if !has_pairing_secret && !has_pairing_contact {
                         return Ok(None);
+                    }
+                    if let Some(events) = handlers::pairing::ignored_if_expired(
+                        &mut borrow_stores!(self),
+                        &local!(self),
+                        &pairing_config!(self),
+                        channel_id,
+                        request.timestamp.as_ref(),
+                        message.trace_id,
+                    )
+                    .await?
+                    {
+                        return Ok(Some(events));
                     }
                     let events = handlers::pairing::pre_pair::on_request(
                         channel_id,

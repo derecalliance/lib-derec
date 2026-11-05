@@ -584,6 +584,25 @@
           "offset": 0
         },
         {
+          "name": "id",
+          "offset": 40
+        },
+        {
+          "name": "timestamp",
+          "offset": 56
+        }
+      ],
+      "name": "MessageIdResult",
+      "size": 64
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
           "name": "fingerprint",
           "offset": 40
         }

@@ -23,6 +23,7 @@ import (
 
 	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/derecpb"
+	"github.com/derecalliance/lib-derec/packages/go/primitives/envelope"
 	"github.com/derecalliance/lib-derec/packages/go/protocol"
 
 	"google.golang.org/protobuf/proto"
@@ -1445,6 +1446,231 @@ func runHelperKeepVersionPrunesShareStore() {
 	fmt.Println("Helper keepVersion test passed.")
 }
 
+// seenEnvelopes is the application's replay record: the identity of every
+// envelope a device sent or accepted, keyed on envelope.ReadMessageID.
+type seenEnvelopes map[string]struct{}
+
+func messageIDOf(envelopeBytes []byte) string {
+	id, err := envelope.ReadMessageID(envelopeBytes)
+	must(err, "envelope.ReadMessageID")
+	return string(id.ID)
+}
+
+func (s seenEnvelopes) record(envelopeBytes []byte) { s[messageIDOf(envelopeBytes)] = struct{}{} }
+
+func (s seenEnvelopes) contains(envelopeBytes []byte) bool {
+	_, ok := s[messageIDOf(envelopeBytes)]
+	return ok
+}
+
+func raisedUpdateChannelInfo(events []protocol.Event) bool {
+	return slices.ContainsFunc(events, func(e protocol.Event) bool {
+		return e.Type == protocol.EventTypeActionRequired && e.ActionKind == protocol.ActionKindUpdateChannelInfo
+	})
+}
+
+// runReplayDetection: the library processes every copy of a message
+// delivered within the inbound window, including one delivered back to its
+// own sender. An application that records the message id of what it sends
+// and accepts drops a replay, a copy whose unauthenticated trace id was
+// changed, and a reflection.
+func runReplayDetection() {
+	fmt.Println("=== Replay detection ===")
+
+	owner := newPeer("owner", "https://owner-replay.example.com", 2)
+	helper := newPeer("helper", "https://helper-replay.example.com", 2)
+	defer owner.proto.Close()
+	defer helper.proto.Close()
+	channelID := pairPeers(owner, helper, 61)
+	owner.drain()
+	ownerSeen, helperSeen := seenEnvelopes{}, seenEnvelopes{}
+
+	_, err := owner.proto.Start(protocol.FlowKindUpdateChannelInfo, protocol.UpdateChannelInfoParams{
+		Target:            protocol.TargetOne(channelID),
+		CommunicationInfo: map[string]string{"name": "owner-renamed"},
+	})
+	must(err, "owner Start(UpdateChannelInfo)")
+	sent := owner.drain()
+	assertTrue(len(sent) == 1, "one update for one channel, got %d", len(sent))
+	update := sent[0].message
+	ownerSeen.record(update)
+
+	assertTrue(!helperSeen.contains(update), "a first delivery is not in the record")
+	events, err := helper.proto.Process(update)
+	must(err, "helper Process(update)")
+	assertTrue(raisedUpdateChannelInfo(events), "the update must raise ActionRequired, got %+v", events)
+	helperSeen.record(update)
+
+	restamped, err := envelope.ApplyTraceID(update, 0x7E57)
+	must(err, "envelope.ApplyTraceID")
+	assertTrue(!bytes.Equal(restamped, update), "the copy travels as different bytes")
+	assertTrue(helperSeen.contains(update), "the replay is recognised")
+	assertTrue(helperSeen.contains(restamped), "the re-stamped copy is recognised")
+	events, err = helper.proto.Process(restamped)
+	must(err, "helper Process(copy)")
+	assertTrue(raisedUpdateChannelInfo(events), "unchecked, the library processes the copy again, got %+v", events)
+	fmt.Println("  [helper] replay and re-stamped copy share the original's message id  ✓")
+
+	assertTrue(ownerSeen.contains(update), "the reflection is recognised")
+	events, err = owner.proto.Process(update)
+	must(err, "owner Process(reflected update)")
+	assertTrue(raisedUpdateChannelInfo(events), "unchecked, the library reads its own update as the peer's, got %+v", events)
+	fmt.Println("  [owner]  reflected update matches an outbound message id  ✓")
+	fmt.Println("Replay detection test passed.")
+}
+
+// runSupersededShareRequest: a helper that dropped v2 under v3's keepVersion
+// does not store v2 again when v2's request is delivered once more: it is
+// ignored as Superseded, unanswered.
+func runSupersededShareRequest() {
+	fmt.Println("=== Superseded share request ===")
+
+	const threshold = 2
+	owner := newPeer("owner", "https://owner-superseded.example.com", threshold)
+	helperA := newPeer("helper-a", "https://helper-a-superseded.example.com", threshold)
+	helperB := newPeer("helper-b", "https://helper-b-superseded.example.com", threshold)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+	channelA := pairPeers(owner, helperA, 63)
+	pairPeers(owner, helperB, 64)
+	owner.drain()
+	owner.shareStore.setKeep(proto.Uint32(0))
+	helpers := []*peer{helperA, helperB}
+
+	must(startKeepRound(owner, 0x05, 1), "round 1 Start(ProtectSecret)")
+	deliverKeepRound(owner, helpers, nil)
+
+	must(startKeepRound(owner, 0x05, 2), "round 2 Start(ProtectSecret)")
+	var v2ForA []byte
+	for _, entry := range owner.drain() {
+		target := helperB
+		if entry.uri == helperA.uri {
+			target = helperA
+			v2ForA = entry.message
+		}
+		deliver(target, entry.message)
+		for _, answer := range target.drain() {
+			deliver(owner, answer.message)
+		}
+	}
+	assertTrue(v2ForA != nil, "v2 was sent to helper-a")
+
+	must(startKeepRound(owner, 0x05, 3), "round 3 Start(ProtectSecret)")
+	deliverKeepRound(owner, helpers, nil)
+	versions := helperA.shareStore.storedVersions(protocolSecretID)
+	assertTrue(slices.Equal(versions, []uint32{3}), "helper-a must hold exactly [3], got %v", versions)
+
+	events, err := helperA.proto.Process(v2ForA)
+	must(err, "helper-a Process(v2 again)")
+	assertTrue(len(events) == 1 && events[0].Type == protocol.EventTypeMessageIgnored &&
+		events[0].Reason == protocol.IgnoreReasonSuperseded && events[0].ChannelID == channelA,
+		"v2 delivered again must be MessageIgnored(Superseded), got %+v", events)
+	versions = helperA.shareStore.storedVersions(protocolSecretID)
+	assertTrue(slices.Equal(versions, []uint32{3}), "helper-a must still hold exactly [3], got %v", versions)
+	assertTrue(len(helperA.drain()) == 0, "a superseded request is not answered")
+	fmt.Println("  [helper-a] v2 delivered after v3 → MessageIgnored(Superseded), still holds [3]  ✓")
+	fmt.Println("Superseded share request test passed.")
+}
+
+// runPairingExpiry: a pairing has a lifetime, timeouts.pairing_secs, and
+// both sides enforce it without sending anything. The scanner refuses an
+// expired contact, and the creator ignores a request on one and refuses a
+// late accept. Pairing involves both parties, so the remedy is a fresh
+// contact. Mirrors run_pairing_expiry_flow in smoke-tests/rust/src/protocol.rs.
+func runPairingExpiry() {
+	fmt.Println("=== Pairing expiry ===")
+
+	shortWindow := func(label, uri string) *peer {
+		p, err := newPeerWithConfig(label, uri, protocol.Config{
+			DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+				Threshold: proto.Uint32(2),
+				Timeouts:  &protocol.Timeouts{PairingSecs: proto.Uint64(1)},
+			},
+		})
+		must(err, fmt.Sprintf("protocol.New(%s)", label))
+		return p
+	}
+	scanAsOwner := func(scanner *peer, contact []byte) error {
+		_, err := scanner.proto.Start(protocol.FlowKindPairing, protocol.PairingParams{
+			Kind:    protocol.SenderKindOwner,
+			Contact: contact,
+		})
+		return err
+	}
+	createContact := func(creator *peer, channelID uint64) []byte {
+		contact, err := creator.proto.CreateContact(&channelID, protocol.ContactModeInlineKeys, nil)
+		must(err, fmt.Sprintf("[%s] CreateContact", creator.label))
+		return contact.ContactBytes
+	}
+	isExpired := func(err error) bool {
+		var derecErr *derec.Error
+		return errors.As(err, &derecErr) && derecErr.Code == derec.CodePairingExpired &&
+			derecErr.Category == derec.CategoryPairing
+	}
+
+	creatorA := newPeer("helper-expiry-a", "https://helper-expiry-a.example.com", 2)
+	scannerA := shortWindow("owner-expiry-a", "https://owner-expiry-a.example.com")
+	creatorB := shortWindow("helper-expiry-b", "https://helper-expiry-b.example.com")
+	scannerB := newPeer("owner-expiry-b", "https://owner-expiry-b.example.com", 2)
+	creatorC := shortWindow("helper-expiry-c", "https://helper-expiry-c.example.com")
+	scannerC := newPeer("owner-expiry-c", "https://owner-expiry-c.example.com", 2)
+	for _, p := range []*peer{creatorA, scannerA, creatorB, scannerB, creatorC, scannerC} {
+		defer p.proto.Close()
+	}
+
+	staleContact := createContact(creatorA, 181)
+	expiringContact := createContact(creatorB, 182)
+	must(scanAsOwner(scannerC, createContact(creatorC, 183)), "scanner-c Start(Pairing)")
+	sent := scannerC.drain()
+	assertTrue(len(sent) == 1, "scanner-c sends one pair request, got %d", len(sent))
+	prompt, err := creatorC.proto.Process(sent[0].message)
+	must(err, "creator-c Process(PairRequest)")
+	var late *protocol.Event
+	for i := range prompt {
+		if prompt[i].Type == protocol.EventTypeActionRequired {
+			late = &prompt[i]
+		}
+	}
+	assertTrue(late != nil, "creator-c is asked to accept the pairing, got %+v", prompt)
+
+	time.Sleep(2100 * time.Millisecond)
+
+	err = scanAsOwner(scannerA, staleContact)
+	assertTrue(isExpired(err), "the scanner must refuse an expired contact with CodePairingExpired, got %v", err)
+	assertTrue(len(scannerA.drain()) == 0, "nothing is sent for an expired contact")
+	fmt.Println("  [owner] scanning a contact older than the window → CodePairingExpired, nothing sent  ✓")
+
+	must(scanAsOwner(scannerB, expiringContact), "scanner-b Start(Pairing)")
+	sent = scannerB.drain()
+	assertTrue(len(sent) == 1, "scanner-b sends one pair request, got %d", len(sent))
+	events, err := creatorB.proto.Process(sent[0].message)
+	must(err, "creator-b Process(PairRequest)")
+	assertTrue(len(events) == 1 && events[0].Type == protocol.EventTypeMessageIgnored &&
+		events[0].Reason == protocol.IgnoreReasonExpired && events[0].ChannelID == 182,
+		"a request on an expired contact must be MessageIgnored(Expired), got %+v", events)
+	assertTrue(len(creatorB.drain()) == 0, "the creator does not answer it")
+	fmt.Println("  [helper] request on its expired contact → MessageIgnored(Expired), nothing sent  ✓")
+
+	_, err = creatorC.proto.Accept(late.Action)
+	assertTrue(isExpired(err), "a late accept must be refused with CodePairingExpired, got %v", err)
+	assertTrue(len(creatorC.drain()) == 0, "a refused accept sends nothing")
+	channels, err := creatorC.channelStore.ListHelpers(protocolSecretID, protocol.HelperFilter{})
+	must(err, "creator-c ListHelpers")
+	assertTrue(len(channels) == 0, "a refused accept records no channel, got %+v", channels)
+	fmt.Println("  [helper] accepting after the window → CodePairingExpired, no channel, nothing sent  ✓")
+
+	must(scanAsOwner(scannerC, createContact(creatorC, 184)), "scanner-c Start(Pairing) on the fresh contact")
+	paired := false
+	for _, ev := range pump(scannerC, creatorC) {
+		paired = paired || ev.Type == protocol.EventTypePairingCompleted
+	}
+	assertTrue(paired, "a fresh contact pairs")
+	fmt.Println("  [helper] a fresh contact pairs  ✓")
+
+	fmt.Println("Pairing expiry test passed.")
+}
+
 // runOwnerKeepVersionAcrossMissedRound: the owner asks KeepVersion once per
 // round and sends its answer to every helper. v1 reaches both helpers, v2
 // reaches only helper-a, and v3 keeps v1: helper-a drops v2 and helper-b,
@@ -2263,6 +2489,78 @@ func runAbandonedReplicaPairing() {
 	fmt.Println("  A's own row is on the C channel and Paired  ✓")
 
 	fmt.Println("Protocol abandoned replica pairing test passed.")
+}
+
+// runContactOnTheGroupChannel: a contact naming the replica group's channel
+// is refused before anything is sent, the group's traffic is still
+// processed, and an expired Pending pairing record on that channel does not
+// take the group's key — mirroring `run_contact_on_the_group_channel_flow`
+// in smoke-tests/rust/src/protocol.rs.
+func runContactOnTheGroupChannel() {
+	fmt.Println("=== Protocol contact on the group channel test ===")
+
+	aID, cID := uint64(0xA1A1), uint64(0xC3C3)
+	a, err := newPeerWithConfig("replica-a", "https://replica-a-group-contact.example.com", protocol.Config{
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold: proto.Uint32(2),
+			ReplicaID: &aID,
+			Timeouts: &protocol.Timeouts{
+				ExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{Enabled: true, TimeoutInSecs: 1},
+			},
+		},
+	})
+	must(err, "protocol.New(replica-a)")
+	defer a.proto.Close()
+	c := newPeerWithReplicaID("replica-c", "https://replica-c-group-contact.example.com", 2, &cID)
+	defer c.proto.Close()
+	adversary := newPeer("adversary", "https://adversary-group-contact.example.com", 2)
+	defer adversary.proto.Close()
+
+	startReplicaScan(a, c, 200, protocol.SenderKindReplicaSource)
+	handshake := append(pump(a, c), pump(c, a)...)
+	var groupChannel uint64
+	for _, ev := range handshake {
+		if ev.Type == protocol.EventTypePairingCompleted && ev.PairingChannelID == 200 {
+			groupChannel = ev.ChannelID
+		}
+	}
+	assertTrue(groupChannel != 0, "the pairing with C must complete, got %+v", handshake)
+	crossConfirmFingerprint(a, c, groupChannel)
+	pumpMany([]*peer{a, c})
+
+	contact, err := adversary.proto.CreateContact(&groupChannel, protocol.ContactModeInlineKeys, nil)
+	must(err, "[adversary] CreateContact")
+	_, err = a.proto.Start(protocol.FlowKindPairing, protocol.PairingParams{
+		Kind:    protocol.SenderKindOwner,
+		Contact: contact.ContactBytes,
+	})
+	var pairErr *derec.Error
+	assertTrue(errors.As(err, &pairErr) && pairErr.Code == derec.CodeChannelAlreadyPaired,
+		"a contact on the group channel %d must be refused with CodeChannelAlreadyPaired, got %v", groupChannel, err)
+	sent := a.drain()
+	assertTrue(len(sent) == 0, "nothing is sent for a refused contact, got %d messages", len(sent))
+	fmt.Println("  contact on the group channel refused  ✓")
+
+	assertProtects(c, "group traffic after the refused contact")
+	for _, ev := range pump(c, a) {
+		assertTrue(ev.Type != protocol.EventTypeMessageIgnored,
+			"A must still process the group's traffic, got %+v", ev)
+	}
+	pumpMany([]*peer{a, c})
+	fmt.Println("  group traffic still processed  ✓")
+
+	must(a.channelStore.Save(a.proto.SecretID(), protocol.ChannelRecord{Helper: &protocol.HelperChannel{
+		ChannelID: groupChannel, Transports: []protocol.TransportEndpoint{}, CommunicationInfo: map[string]string{},
+		PeerRole: protocol.SenderKindHelper, Status: protocol.ChannelStatusPending, CreatedAt: 0, Weight: 1,
+	}}), "record a pending pairing on the group channel")
+	_, err = a.proto.Tick()
+	must(err, "replica-a.Tick()")
+	assertTrue(hasSharedKey(a, groupChannel),
+		"an expired pairing on the group channel %d must not take the group key", groupChannel)
+	assertProtects(a, "after the expiry sweep")
+	fmt.Println("  expired pairing on the group channel leaves the group key  ✓")
+
+	fmt.Println("Protocol contact on the group channel test passed.")
 }
 
 // runRecoverRestoreRepublish protects a weighted secret, loses the owner,

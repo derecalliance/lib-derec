@@ -76,6 +76,7 @@ export const DEREC_ERROR_CODES = [
   "unexpected_replica_id",
   "incompatible_parameter_range",
   "fingerprint_commitment_mismatch",
+  "pairing_expired",
   "empty_channels",
   "duplicate_channel_id",
   "invalid_threshold",

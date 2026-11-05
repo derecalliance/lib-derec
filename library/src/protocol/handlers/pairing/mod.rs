@@ -45,7 +45,10 @@
 //! Absent `CommunicationInfo` implies no reserved entries; replica
 //! pairings are refused up-front by the missing-id check.
 
-use super::super::{DeRecChannelStore, DeRecEvent, now_secs};
+use super::super::{
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, IgnoreReason, SecretKind, SecretValue,
+    now_secs,
+};
 use crate::error_codes::classify;
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::channel_store::ChannelStoreExt as _;
@@ -67,7 +70,9 @@ use derec_proto::{
     CommunicationInfo, CommunicationInfoKeyValue, ContactMessage, MessageBody, PairRequestMessage,
     SenderKind, StatusEnum, TransportProtocol,
 };
+use prost_types::Timestamp;
 use std::collections::HashMap;
+use std::time::Duration;
 
 pub(in crate::protocol) mod pair;
 pub(in crate::protocol) mod pre_pair;
@@ -89,6 +94,18 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 ) -> Result<Vec<DeRecEvent>> {
     match message {
         MessageBody::PairRequest(request) => {
+            if let Some(events) = ignored_if_expired(
+                stores,
+                local,
+                pairing,
+                channel_id,
+                request.timestamp.as_ref(),
+                inbound_trace_id,
+            )
+            .await?
+            {
+                return Ok(events);
+            }
             if let Err(err) = check_parameter_range(request, pairing.parameter_range) {
                 let memo = parameter_range_memo(&err);
                 return refuse(
@@ -134,12 +151,105 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
             pair::on_response(stores, local, pairing, channel_id, response, pairing_secret).await
         }
         MessageBody::PrePairRequest(request) => {
+            if let Some(events) = ignored_if_expired(
+                stores,
+                local,
+                pairing,
+                channel_id,
+                request.timestamp.as_ref(),
+                inbound_trace_id,
+            )
+            .await?
+            {
+                return Ok(events);
+            }
             pre_pair::on_request(channel_id, request, inbound_trace_id)
         }
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in pairing message",
         )),
     }
+}
+
+/// Why a pairing on `channel_id` can no longer go on, or `None` while it can.
+///
+/// The contact is judged by the timestamp this device wrote into it, read
+/// from its own stored copy, so its age is measured on this device's clock
+/// alone. The request is judged by its own timestamp. A missing timestamp,
+/// or no stored contact, cannot show the pairing is fresh and counts as
+/// expired.
+///
+/// An expired contact can never pair again, so its material is dropped here.
+/// An expired request leaves the contact in place: the scanner may start
+/// again on it.
+pub(in crate::protocol) async fn expiry<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    pairing: &PairingConfig<'_>,
+    channel_id: ChannelId,
+    request_timestamp: Option<&Timestamp>,
+) -> Result<Option<PairingError>> {
+    let contact_timestamp = match stores
+        .secrets
+        .load(local.secret_id, channel_id, SecretKind::PairingContact)
+        .await?
+    {
+        Some(SecretValue::PairingContact(contact)) => contact.timestamp,
+        _ => None,
+    };
+    if outlived(contact_timestamp.as_ref(), pairing.lifetime) {
+        stores
+            .secrets
+            .remove(local.secret_id, channel_id, SecretKind::PairingSecret)
+            .await?;
+        stores
+            .secrets
+            .remove(local.secret_id, channel_id, SecretKind::PairingContact)
+            .await?;
+        return Ok(Some(PairingError::Expired(
+            "the contact is older than the pairing lifetime",
+        )));
+    }
+    if outlived(request_timestamp, pairing.lifetime) {
+        return Ok(Some(PairingError::Expired(
+            "the pairing request is older than the pairing lifetime",
+        )));
+    }
+    Ok(None)
+}
+
+/// [`expiry`] for a request that just arrived: an expired one is reported as
+/// ignored, before the application is asked anything, and is not answered.
+pub(in crate::protocol) async fn ignored_if_expired<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    pairing: &PairingConfig<'_>,
+    channel_id: ChannelId,
+    request_timestamp: Option<&Timestamp>,
+    trace_id: u64,
+) -> Result<Option<Vec<DeRecEvent>>> {
+    let Some(_reason) = expiry(stores, local, pairing, channel_id, request_timestamp).await? else {
+        return Ok(None);
+    };
+    #[cfg(feature = "logging")]
+    tracing::warn!(
+        channel_id = channel_id.0,
+        reason = %_reason,
+        "pairing request ignored"
+    );
+    Ok(Some(vec![DeRecEvent::MessageIgnored {
+        channel_id,
+        reason: IgnoreReason::Expired,
+        trace_id,
+    }]))
+}
+
+/// Whether `timestamp` is missing or more than `lifetime` in the past.
+fn outlived(timestamp: Option<&Timestamp>, lifetime: Duration) -> bool {
+    timestamp.is_none_or(|ts| {
+        let created = u64::try_from(ts.seconds).unwrap_or(0);
+        now_secs().saturating_sub(created) > lifetime.as_secs()
+    })
 }
 
 /// The memo sent with an `INCOMPATIBLE_PARAMETER_RANGE` refusal.
@@ -220,6 +330,13 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     trace_id: u64,
 ) -> Result<u64> {
     let replica_id_to_inject = require_replica_id_for_kind(kind, local.replica_id)?;
+
+    if contact.timestamp.is_none() {
+        return Err(PairingError::InvalidContactMessage("contact carries no timestamp").into());
+    }
+    if outlived(contact.timestamp.as_ref(), pairing.lifetime) {
+        return Err(PairingError::Expired("the contact is older than the pairing lifetime").into());
+    }
 
     let channel_id = ChannelId(contact.channel_id);
 
@@ -443,17 +560,37 @@ pub(in crate::protocol) async fn claim_own_member<S: StoreSet>(
     Ok(())
 }
 
-async fn reject_start_on_paired_channel<S: StoreSet>(
+/// Refuse to start a pairing on a channel this device already uses.
+///
+/// The channel identifier is chosen by whoever created the contact, and a
+/// replica group's identifier travels in the clear on every envelope of the
+/// group. A channel is in use while it holds a key, while any replica member
+/// is recorded on it, or while a helper record on it is past `Pending`. A
+/// `Pending` helper record alone is an unfinished pairing on the same
+/// contact, which a new start replaces.
+async fn reject_start_on_channel_in_use<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     channel_id: ChannelId,
 ) -> Result<()> {
-    if let Some(record) = stores
+    let helper_in_use = stores
         .channels
         .load(local.secret_id, ChannelQuery::Helper { channel_id })
         .await?
-        && record.status() != ChannelStatus::Pending
-    {
+        .is_some_and(|record| record.status() != ChannelStatus::Pending);
+    let replica_in_use = stores
+        .channels
+        .replicas_matching(local.secret_id, ReplicaFilter::default())
+        .await?
+        .iter()
+        .any(|member| member.channel_id == channel_id);
+    let key_in_use = stores
+        .secrets
+        .load(local.secret_id, channel_id, SecretKind::SharedKey)
+        .await?
+        .is_some();
+
+    if helper_in_use || replica_in_use || key_in_use {
         return Err(Error::ChannelAlreadyPaired { channel_id });
     }
     Ok(())

@@ -240,6 +240,7 @@ fn unpair_ack_out_of_range(value: Option<&Value>) -> Option<DeRecError> {
 ///     "sharing_round_secs": 60,
 ///     "unpair_ack_secs": 60,
 ///     "get_share_response_secs": 300,
+///     "pairing_secs": 30,
 ///     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
 ///   },
 ///   "unsafe_connection": false,
@@ -788,6 +789,7 @@ mod tests {
                     "sharing_round_secs": 60,
                     "unpair_ack_secs": 60,
                     "get_share_response_secs": 300,
+                    "pairing_secs": 30,
                     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
                 },
                 "unsafe_connection": false,

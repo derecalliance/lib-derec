@@ -237,6 +237,29 @@ pub struct Timeouts {
     ///
     /// Default: **300 seconds**.
     pub get_share_response: Duration,
+    /// How long a pairing stays possible: how old a contact may be when it is
+    /// scanned or answered, and how old a pairing request may be when it is
+    /// accepted.
+    ///
+    /// Both sides enforce it. The scanner refuses to start with a contact
+    /// older than this. The creator ignores a request on such a contact, and
+    /// neither prompts for nor accepts a request older than this, so a
+    /// request accepted after its scanner gave up cannot leave a channel only
+    /// one side holds. Nothing is sent on expiry: pairing involves both
+    /// parties, and the remedy is to scan or share a fresh contact.
+    ///
+    /// A scanner keeps its side of a pairing in flight for
+    /// [`expired_channels`](Self::expired_channels), which should therefore
+    /// be at least this plus the time a response takes to arrive.
+    ///
+    /// The request's age is measured against the creator's clock and the
+    /// contact's age against the scanner's, so two devices whose clocks
+    /// differ by more than this cannot pair. The budget is also a **human**
+    /// one: the contact must be scanned, and a manual accept given, within
+    /// it.
+    ///
+    /// Default: **30 seconds**.
+    pub pairing: Duration,
     /// When to remove a channel still awaiting out-of-band fingerprint
     /// confirmation — every replica pairing, and every
     /// [`derec_proto::ContactMode::NoKeys`] pairing.
@@ -257,6 +280,7 @@ impl Default for Timeouts {
             sharing_round: Duration::from_secs(60),
             unpair_ack: Duration::from_secs(60),
             get_share_response: Duration::from_secs(300),
+            pairing: Duration::from_secs(30),
             expired_channels: ExpiredChannelCleanup::default(),
         }
     }

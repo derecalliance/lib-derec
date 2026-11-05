@@ -11,7 +11,9 @@ use std::thread;
 use std::time::Duration;
 
 use derec_library::Error;
-use derec_library::derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message};
+use derec_library::derec_message::{
+    DeRecMessageBuilder, apply_trace_id, current_timestamp, extract_inner_message, message_id,
+};
 use derec_library::primitives::pairing::PairingError;
 use derec_library::primitives::sharing::SharingError;
 use derec_library::protocol::types::{
@@ -31,9 +33,9 @@ use derec_library::protocol::{
 use derec_library::transport::TransportValidationError;
 use derec_library::types::{ChannelId, ReplicaId};
 use derec_proto::{
-    CommittedDeRecShare, ContactMode, DeRecMessage, DeRecShare, GetSecretIdsVersionsRequestMessage,
-    MessageBody, ParameterRange, Protocol, SenderKind, StatusEnum, StoreShareRequestMessage,
-    TransportProtocol,
+    CommittedDeRecShare, ContactMessage, ContactMode, DeRecMessage, DeRecShare,
+    GetSecretIdsVersionsRequestMessage, MessageBody, ParameterRange, Protocol, SenderKind,
+    StatusEnum, StoreShareRequestMessage, TransportProtocol,
 };
 use prost::Message as _;
 
@@ -72,8 +74,11 @@ pub async fn run_all() {
     run_conflicting_recovery_flow().await;
     run_restore_keeps_helper_duties_flow().await;
     run_abandoned_replica_pairing_flow().await;
+    run_contact_on_the_group_channel_flow().await;
     run_unpairing_flow().await;
     run_update_channel_info_flow().await;
+    run_replay_detection_flow().await;
+    run_superseded_share_request_flow().await;
     run_reply_to_flow().await;
     run_auto_publish_on_pair_flow().await;
     run_replica_sync_version_progression_flow().await;
@@ -82,6 +87,7 @@ pub async fn run_all() {
     run_auto_accept_flow().await;
     run_start_pairing_rejects_already_paired_channel().await;
     run_pairing_rejects_incompatible_parameter_range().await;
+    run_pairing_expiry_flow().await;
     run_expired_channel_cleanup_flow().await;
     run_expired_pending_pairing_loses_its_key_flow().await;
     run_own_transport_set_rules().await;
@@ -4856,6 +4862,98 @@ async fn run_abandoned_replica_pairing_flow() {
     println!("Protocol abandoned replica pairing flow test passed.");
 }
 
+/// A contact's channel identifier is chosen by whoever created it, and a
+/// replica group's identifier travels in the clear on every envelope of the
+/// group. A contact on the group channel must be refused, and a pending
+/// pairing on that channel must never take the group key when it expires.
+async fn run_contact_on_the_group_channel_flow() {
+    println!("=== Protocol contact on the group channel flow test ===");
+
+    let mut a = Peer::with_expired_channel_cleanup(
+        "replica-a",
+        "https://replica-a.example.com",
+        0xA1A1,
+        ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 },
+    );
+    let mut c = Peer::with_secret_id_and_replica_id(
+        "replica-c",
+        "https://replica-c.example.com",
+        DEFAULT_TEST_SECRET_ID,
+        0xC3C3,
+    );
+    let mut adversary = Peer::new("adversary", "https://adversary.example.com");
+
+    start_replica_scan(&mut a, &mut c, ChannelId(200), SenderKind::ReplicaSource).await;
+    let round_1 = pump(&mut a, &mut c).await;
+    let round_2 = pump(&mut c, &mut a).await;
+    let group_channel =
+        extract_paired_channel_id(round_1.iter().chain(round_2.iter()), ChannelId(200))
+            .expect("the pairing with C completes");
+    cross_confirm_fingerprint(&mut a, &mut c, group_channel).await;
+    pump_many(&mut [&mut a, &mut c]).await;
+
+    let contact = adversary
+        .protocol
+        .create_contact(Some(group_channel), ContactMode::InlineKeys, None)
+        .await
+        .expect("create_contact failed");
+    let scan = a
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Owner,
+            contact,
+            peer_communication_info: HashMap::new(),
+        })
+        .await;
+    assert!(
+        matches!(scan, Err(Error::ChannelAlreadyPaired { channel_id }) if channel_id == group_channel),
+        "a contact on the group channel must be refused, got {scan:?}"
+    );
+    assert!(
+        a.drain().is_empty(),
+        "nothing is sent for a refused contact"
+    );
+    println!("  contact on the group channel refused  ✓");
+
+    assert_protects(&mut c, "group traffic after the refused contact").await;
+    let events = pump(&mut c, &mut a).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::MessageIgnored { .. })),
+        "A still processes the group's traffic: {events:?}"
+    );
+    pump_many(&mut [&mut a, &mut c]).await;
+    println!("  group traffic still processed  ✓");
+
+    let a_sid = a.protocol.secret_id();
+    a.protocol
+        .channel_store
+        .save(
+            a_sid,
+            ChannelRecord::Helper(HelperChannel {
+                channel_id: group_channel,
+                transports: Vec::new(),
+                communication_info: HashMap::new(),
+                status: ChannelStatus::Pending,
+                created_at: 0,
+                peer_role: SenderKind::Helper,
+                weight: 1,
+            }),
+        )
+        .await
+        .expect("record a pending pairing on the group channel");
+    a.protocol.tick().await;
+    assert!(
+        has_channel_key(&a, group_channel.0).await,
+        "an expired pairing on the group channel must not take the group key"
+    );
+    assert_protects(&mut a, "after the expiry sweep").await;
+    println!("  expired pairing on the group channel leaves the group key  ✓");
+
+    println!("Protocol contact on the group channel flow test passed.");
+}
+
 /// Protect a one-entry secret from `owner` across every helper in
 /// `helpers`, deliver the round, and return the version it published.
 async fn protect_across(owner: &mut Peer, helpers: &mut [&mut Peer], name: &str) -> u32 {
@@ -5287,6 +5385,174 @@ async fn run_update_channel_info_flow() {
     );
 
     println!("Protocol UpdateChannelInfo flow test passed.");
+}
+
+/// The application's replay record: the identity of every envelope a device
+/// sent or accepted, keyed on `message_id`.
+#[derive(Default)]
+struct SeenEnvelopes(HashSet<[u8; 32]>);
+
+impl SeenEnvelopes {
+    fn record(&mut self, envelope: &[u8]) {
+        self.0.insert(
+            message_id(envelope)
+                .expect("message_id of a valid envelope")
+                .id,
+        );
+    }
+
+    fn contains(&self, envelope: &[u8]) -> bool {
+        self.0.contains(
+            &message_id(envelope)
+                .expect("message_id of a valid envelope")
+                .id,
+        )
+    }
+}
+
+fn raised_update_channel_info(events: &[DeRecEvent]) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e,
+            DeRecEvent::ActionRequired {
+                action: PendingAction::UpdateChannelInfo { .. },
+                ..
+            }
+        )
+    })
+}
+
+/// The library processes every copy of a message delivered within the
+/// inbound window, including one delivered back to its own sender. An
+/// application that records the `message_id` of what it sends and accepts
+/// drops a replay, a copy whose unauthenticated `traceId` was changed, and a
+/// reflection.
+async fn run_replay_detection_flow() {
+    println!("=== Protocol replay detection flow ===");
+
+    let mut owner = Peer::new("owner", "https://owner.example.com");
+    let mut helper = Peer::new("helper", "https://helper.example.com");
+    let channel_id = pair(&mut owner, &mut helper, ChannelId(61)).await;
+    let mut owner_seen = SeenEnvelopes::default();
+    let mut helper_seen = SeenEnvelopes::default();
+
+    owner
+        .protocol
+        .start(DeRecFlow::UpdateChannelInfo {
+            target: Target::Single(channel_id),
+            communication_info: Some(HashMap::from([(
+                "name".to_owned(),
+                "owner-renamed".to_owned(),
+            )])),
+            own_transports: Vec::new(),
+        })
+        .await
+        .expect("owner start(UpdateChannelInfo) failed");
+    let sent = owner.drain();
+    assert_eq!(sent.len(), 1, "one update for one channel");
+    let update = sent[0].1.clone();
+    owner_seen.record(&update);
+
+    assert!(!helper_seen.contains(&update));
+    let events = helper
+        .protocol
+        .process(&update)
+        .await
+        .expect("helper process(update) failed");
+    assert!(raised_update_channel_info(&events), "got {events:?}");
+    helper_seen.record(&update);
+
+    let copy = apply_trace_id(&update, 0x7E57).expect("re-stamp the copy");
+    assert_ne!(copy, update, "the copy travels as different bytes");
+    assert!(helper_seen.contains(&update), "the replay is recognised");
+    assert!(
+        helper_seen.contains(&copy),
+        "the re-stamped copy is recognised"
+    );
+    let events = helper
+        .protocol
+        .process(&copy)
+        .await
+        .expect("helper process(copy) failed");
+    assert!(
+        raised_update_channel_info(&events),
+        "unchecked, the library processes the copy again: {events:?}"
+    );
+    println!("  [helper] replay and re-stamped copy share the original's message_id  ✓");
+
+    assert!(owner_seen.contains(&update), "the reflection is recognised");
+    let events = owner
+        .protocol
+        .process(&update)
+        .await
+        .expect("owner process(reflected update) failed");
+    assert!(
+        raised_update_channel_info(&events),
+        "unchecked, the library reads its own update as the peer's: {events:?}"
+    );
+    println!("  [owner]  reflected update matches an outbound message_id  ✓");
+
+    println!("Protocol replay detection flow test passed.");
+}
+
+/// A Helper that dropped v2 under v3's `keepVersion` does not store v2 again
+/// when v2's request is delivered once more: it is ignored as `Superseded`,
+/// unanswered.
+async fn run_superseded_share_request_flow() {
+    println!("=== Protocol superseded share request flow ===");
+
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 44);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(63)).await;
+    pair(&mut owner, &mut helper_b, ChannelId(64)).await;
+    owner.protocol.share_store.keep = Some(0);
+
+    assert_eq!(start_protect_round(&mut owner, 1).await, 1);
+    pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+
+    assert_eq!(start_protect_round(&mut owner, 2).await, 2);
+    let mut v2_for_a = None;
+    for (endpoint, bytes) in owner.drain() {
+        let helper = if endpoint.uri == helper_a.uri {
+            v2_for_a = Some(bytes.clone());
+            &mut helper_a
+        } else {
+            &mut helper_b
+        };
+        deliver(helper, &bytes).await;
+        for (_, reply) in helper.drain() {
+            deliver(&mut owner, &reply).await;
+        }
+    }
+    let v2_for_a = v2_for_a.expect("v2 was sent to helper-a");
+    pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+
+    assert_eq!(start_protect_round(&mut owner, 3).await, 3);
+    pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+    assert_eq!(held_versions(&helper_a, channel_a).await, vec![3]);
+
+    let events = helper_a
+        .protocol
+        .process(&v2_for_a)
+        .await
+        .expect("helper-a process(v2 again) failed");
+    assert!(
+        matches!(
+            events.as_slice(),
+            [DeRecEvent::MessageIgnored { channel_id, reason: IgnoreReason::Superseded, .. }]
+                if *channel_id == channel_a
+        ),
+        "v2 delivered again must be MessageIgnored(Superseded), got {events:?}"
+    );
+    assert_eq!(held_versions(&helper_a, channel_a).await, vec![3]);
+    assert!(
+        helper_a.drain().is_empty(),
+        "a superseded request is not answered"
+    );
+    println!("  [helper-a] v2 delivered after v3 → MessageIgnored(Superseded), still holds [3]  ✓");
+
+    println!("Protocol superseded share request flow test passed.");
 }
 
 /// Asserts the two halves of the `replyTo` contract:
@@ -6901,6 +7167,167 @@ async fn run_expired_pending_pairing_loses_its_key_flow() {
     println!("  expired pending helper and replica pairings swept with their keys  ✓");
     println!("  paired channel of the same age kept  ✓");
     println!("Protocol expired pending pairing loses its key flow test passed.");
+}
+
+/// A pairing has a lifetime, `Timeouts::pairing`, and both sides enforce it
+/// without sending anything: the scanner refuses an expired contact, and the
+/// creator ignores a request on one and refuses a late accept. Pairing
+/// involves both parties, so the remedy is a fresh contact.
+async fn run_pairing_expiry_flow() {
+    println!("=== Protocol pairing expiry flow ===");
+    let short = Timeouts {
+        pairing: Duration::from_secs(1),
+        ..Default::default()
+    };
+
+    let mut creator_a = Peer::new("helper-expiry-a", "https://helper-expiry-a.example.com");
+    let mut scanner_a = Peer::with_timeouts(
+        "owner-expiry-a",
+        "https://owner-expiry-a.example.com",
+        short,
+    );
+    let stale_contact = creator_a
+        .protocol
+        .create_contact(Some(ChannelId(181)), ContactMode::InlineKeys, None)
+        .await
+        .expect("creator-a create_contact failed");
+
+    let mut creator_b = Peer::with_timeouts(
+        "helper-expiry-b",
+        "https://helper-expiry-b.example.com",
+        short,
+    );
+    let mut scanner_b = Peer::new("owner-expiry-b", "https://owner-expiry-b.example.com");
+    let expiring_contact = creator_b
+        .protocol
+        .create_contact(Some(ChannelId(182)), ContactMode::InlineKeys, None)
+        .await
+        .expect("creator-b create_contact failed");
+
+    let mut creator_c = Peer::with_timeouts(
+        "helper-expiry-c",
+        "https://helper-expiry-c.example.com",
+        short,
+    );
+    let mut scanner_c = Peer::new("owner-expiry-c", "https://owner-expiry-c.example.com");
+    let contact_c = creator_c
+        .protocol
+        .create_contact(Some(ChannelId(183)), ContactMode::InlineKeys, None)
+        .await
+        .expect("creator-c create_contact failed");
+    scan_as_owner(&mut scanner_c, contact_c)
+        .await
+        .expect("scanner-c start(Pairing) failed");
+    let (_, request) = scanner_c
+        .drain()
+        .pop()
+        .expect("scanner-c sent a pair request");
+    let prompt = creator_c
+        .protocol
+        .process(&request)
+        .await
+        .expect("creator-c process(PairRequest) failed");
+    let late = prompt
+        .into_iter()
+        .find_map(|event| match event {
+            DeRecEvent::ActionRequired { action, .. } => Some(action),
+            _ => None,
+        })
+        .expect("creator-c is asked to accept the pairing");
+
+    thread::sleep(Duration::from_millis(2100));
+
+    let refused = scan_as_owner(&mut scanner_a, stale_contact).await;
+    assert!(
+        matches!(refused, Err(Error::Pairing(PairingError::Expired(_)))),
+        "the scanner must refuse an expired contact, got {refused:?}"
+    );
+    assert!(
+        scanner_a.drain().is_empty(),
+        "nothing is sent for an expired contact"
+    );
+    println!(
+        "  [owner] scanning a contact older than the window → Pairing(Expired), nothing sent  ✓"
+    );
+
+    scan_as_owner(&mut scanner_b, expiring_contact)
+        .await
+        .expect("scanner-b start(Pairing) failed");
+    let (_, request) = scanner_b
+        .drain()
+        .pop()
+        .expect("scanner-b sent a pair request");
+    let events = creator_b
+        .protocol
+        .process(&request)
+        .await
+        .expect("creator-b process(PairRequest) failed");
+    assert!(
+        matches!(
+            events.as_slice(),
+            [DeRecEvent::MessageIgnored { channel_id, reason: IgnoreReason::Expired, .. }]
+                if *channel_id == ChannelId(182)
+        ),
+        "a request on an expired contact must be MessageIgnored(Expired), got {events:?}"
+    );
+    assert!(
+        creator_b.drain().is_empty(),
+        "the creator does not answer it"
+    );
+    println!(
+        "  [helper] request on its expired contact → MessageIgnored(Expired), nothing sent  ✓"
+    );
+
+    let refused = creator_c.protocol.accept(late).await;
+    assert!(
+        matches!(refused, Err(Error::Pairing(PairingError::Expired(_)))),
+        "a late accept must be refused, got {refused:?}"
+    );
+    assert!(
+        creator_c.drain().is_empty(),
+        "a refused accept sends nothing"
+    );
+    assert!(
+        creator_c.protocol.channel_store.helper_rows.is_empty(),
+        "a refused accept records no channel"
+    );
+    println!(
+        "  [helper] accepting after the window → Pairing(Expired), no channel, nothing sent  ✓"
+    );
+
+    let fresh = creator_c
+        .protocol
+        .create_contact(Some(ChannelId(184)), ContactMode::InlineKeys, None)
+        .await
+        .expect("creator-c create_contact (fresh) failed");
+    scan_as_owner(&mut scanner_c, fresh)
+        .await
+        .expect("scanner-c start(Pairing) on the fresh contact failed");
+    let events = pump(&mut scanner_c, &mut creator_c).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::PairingCompleted { .. })),
+        "a fresh contact pairs, got {events:?}"
+    );
+    println!("  [helper] a fresh contact pairs  ✓");
+
+    println!("Protocol pairing expiry flow test passed.");
+}
+
+/// `start(Pairing)` as an Owner scanning `contact`.
+async fn scan_as_owner(
+    scanner: &mut Peer,
+    contact: ContactMessage,
+) -> Result<Vec<DeRecEvent>, Error> {
+    scanner
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Owner,
+            contact,
+            peer_communication_info: HashMap::new(),
+        })
+        .await
 }
 
 async fn run_expired_channel_cleanup_flow() {

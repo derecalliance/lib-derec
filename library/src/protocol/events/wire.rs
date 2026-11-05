@@ -347,7 +347,7 @@ pub(crate) enum Event {
     MessageIgnored {
         channel_id: String,
         /// [`ignore_reason_label`] — `"PendingVerification"`, `"Expired"`,
-        /// `"TimestampMismatch"` or `"StaleResponse"`.
+        /// `"TimestampMismatch"`, `"StaleResponse"` or `"Superseded"`.
         reason: String,
         trace_id: String,
     },
@@ -1183,6 +1183,7 @@ pub(crate) fn ignore_reason_label(reason: IgnoreReason) -> &'static str {
         IgnoreReason::Expired => "Expired",
         IgnoreReason::TimestampMismatch => "TimestampMismatch",
         IgnoreReason::StaleResponse => "StaleResponse",
+        IgnoreReason::Superseded => "Superseded",
     }
 }
 

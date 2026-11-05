@@ -1167,6 +1167,13 @@ public static class IgnoreReason
     public const string Expired = "Expired";
     public const string TimestampMismatch = "TimestampMismatch";
     public const string StaleResponse = "StaleResponse";
+
+    /// <summary>
+    /// A <c>StoreShareRequest</c> for a version older than the newest one this
+    /// helper stores on the channel, and not stored itself. It is not stored
+    /// and not answered.
+    /// </summary>
+    public const string Superseded = "Superseded";
 }
 
 /// <summary>

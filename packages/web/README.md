@@ -694,6 +694,32 @@ envelope and the inner message. A message whose two timestamps differ, or
 where either or both are absent, is ignored as `MessageIgnored` with
 `reason: "TimestampMismatch"`; this includes replies from 0.0.8 peers.
 
+Within the inbound window `process` handles every copy of a message it is
+given, including one of this device's own messages delivered back to it.
+Detecting both is the app's transport's job: `envelope.message_id(bytes)`
+returns an `id` that is the same for every copy of one message, whatever its
+unauthenticated fields (sequence, trace id, protocol version) say, and a
+`timestamp`. Keep the `id` of every envelope you send and of every envelope
+`process` accepted (no throw and no `MessageIgnored`) until
+`max(received or sent at, timestamp) + inbound_message_secs`, drop an inbound
+envelope whose `id` you kept, and keep the record across restarts. Never key
+on a hash of the raw bytes. A helper ignores a `StoreShareRequest` for a
+version older than the newest it stores on the channel, and not stored
+itself, as `MessageIgnored` with `reason: "Superseded"`, unanswered. Reject a
+contact update older than the last one you accepted on the channel, using the
+`timestamp` of the envelope that raised it; that needs auto-accept off for
+`UpdateChannelInfo`.
+
+A pairing has a lifetime, `timeouts.pairing_secs` (default 30). Both sides
+enforce it and nothing is sent on expiry: `start(FlowKind.Pairing, …)` refuses
+a contact older than it with code `pairing_expired`; the contact's creator
+reports a request on such a contact, or a request older than the lifetime, as
+`MessageIgnored` with reason `"Expired"` before any `ActionRequired`, and
+`accept` refuses a request that outlived it with `pairing_expired`. Pairing
+involves both parties, so treat an expiry as a retry and ask the user to scan
+or share a fresh contact. Keep the scanner's `expired_channels` timeout at
+least `pairing_secs` plus the time a response takes to arrive.
+
 ---
 
 ## Usage with Bundlers
@@ -856,6 +882,7 @@ The canonical JSON, shared by every SDK, is:
     "sharing_round_secs": 60,
     "unpair_ack_secs": 60,
     "get_share_response_secs": 300,
+    "pairing_secs": 30,
     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
   },
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },

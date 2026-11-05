@@ -821,6 +821,33 @@ envelope and the inner message. A message whose two timestamps differ, or
 where either or both are absent, is ignored as `MessageIgnoredEvent` with
 `IgnoreReason.TimestampMismatch`; this includes replies from 0.0.8 peers.
 
+Within the inbound window `ProcessAsync` handles every copy of a message it is
+given, including one of this device's own messages delivered back to it.
+Detecting both is the app's transport's job: `Envelope.ReadMessageId(bytes)`
+returns an `Id` that is the same for every copy of one message, whatever its
+unauthenticated fields (sequence, trace id, protocol version) say, and a
+`Timestamp`. Keep the `Id` of every envelope you send and of every envelope
+`ProcessAsync` accepted (no exception and no `MessageIgnoredEvent`) until
+`max(received or sent at, Timestamp) + InboundMessage`, drop an inbound
+envelope whose `Id` you kept, and keep the record across restarts. Never key
+on a hash of the raw bytes. A helper ignores a `StoreShareRequest` for a
+version older than the newest it stores on the channel, and not stored
+itself, as `MessageIgnoredEvent` with `IgnoreReason.Superseded`, unanswered.
+Reject a contact update older than the last one you accepted on the channel,
+using the `Timestamp` of the envelope that raised it; that needs auto-accept
+off for `UpdateChannelInfo`.
+
+A pairing has a lifetime, `Timeouts.Pairing` (default 30 s). Both sides
+enforce it and nothing is sent on expiry: `StartAsync(FlowKind.Pairing, …)`
+refuses a contact older than it with `DeRecCode.PairingExpired`; the contact's
+creator reports a request on such a contact, or a request older than the
+lifetime, as `MessageIgnoredEvent` with `IgnoreReason.Expired` before any
+`ActionRequiredEvent`, and `AcceptAsync` refuses a request that outlived it
+with `DeRecCode.PairingExpired`. Pairing involves both parties, so treat an
+expiry as a retry and ask the user to scan or share a fresh contact. Keep the
+scanner's `ExpiredChannels` timeout at least `Pairing` plus the time a response
+takes to arrive.
+
 #### Filtered listings
 
 `ListHelpers` and `ListReplicas` take a filter — `ids`, `status`, `role` and
@@ -917,6 +944,7 @@ The record reads and writes the canonical JSON shared by every SDK
     "sharing_round_secs": 60,
     "unpair_ack_secs": 60,
     "get_share_response_secs": 300,
+    "pairing_secs": 30,
     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
   },
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },

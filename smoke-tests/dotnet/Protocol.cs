@@ -80,6 +80,8 @@ internal static class Protocol
         RunHelperKeepVersionPrunesShareStoreTest();
         RunOwnerKeepVersionAcrossMissedRoundTest();
         RunInvalidKeepVersionFailsRoundTest();
+        RunSupersededShareRequestTest();
+        RunReplayDetectionTest();
         RunShareStoreRefusalTest();
         RunRequestFailedTokenTest();
         RunAutoRespondOnFailureTest();
@@ -98,6 +100,8 @@ internal static class Protocol
         RunOrchestratorConflictingRecoveryTest();
         RunRestoreKeepsHelperDutiesTest();
         RunAbandonedReplicaPairingTest();
+        RunContactOnTheGroupChannelTest();
+        RunPairingExpiryTest();
         RunOrchestratorUnpairingFlowTest();
         RunOrchestratorUpdateChannelInfoFlowTest();
         RunOrchestratorReplyToFlowTest();
@@ -1406,6 +1410,132 @@ internal static class Protocol
         Console.WriteLine("Invalid keepVersion test passed.\n");
     }
 
+    /// <summary>
+    /// A helper that dropped v2 under v3's <c>keepVersion</c> does not store
+    /// v2 again when v2's request is delivered once more: it is ignored as
+    /// <see cref="IgnoreReason.Superseded"/>, unanswered.
+    /// </summary>
+    private static void RunSupersededShareRequestTest()
+    {
+        Console.WriteLine("=== Superseded share request ===");
+
+        const ulong secretId = 0x6565UL;
+        using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions(SecretId: secretId));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com", new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com", new NodeOptions(SecretId: secretId));
+        ulong channelA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 63UL);
+        DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 64UL);
+        owner.ShareStore.Keep = 0;
+
+        var helpersByUri = new Dictionary<string, Node>
+        {
+            ["https://helper-a.example.com"] = helperA,
+            ["https://helper-b.example.com"] = helperB,
+        };
+        byte[]? v2ForA = null;
+        for (var round = 1; round <= 3; round++)
+        {
+            StartKeepRound(owner, 0x06, round);
+            foreach (var (uri, _, bytes) in owner.Transport.DrainAll())
+            {
+                if (round == 2 && uri == "https://helper-a.example.com") v2ForA = bytes;
+                var h = helpersByUri[uri];
+                h.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+                owner.Protocol.ProcessAndAcceptAllAsync(h.Transport.DrainOne()).GetAwaiter().GetResult();
+            }
+        }
+        if (v2ForA is null)
+            throw new InvalidOperationException("v2 was sent to helper-a");
+        if (!helperA.ShareStore.StoredVersions(secretId).SequenceEqual(new uint[] { 3 }))
+            throw new InvalidOperationException(
+                $"helper-a must hold exactly [3]; got [{string.Join(", ", helperA.ShareStore.StoredVersions(secretId))}]");
+
+        var events = helperA.Protocol.ProcessAsync(v2ForA).GetAwaiter().GetResult();
+        if (events.Count != 1
+            || events[0] is not MessageIgnoredEvent ignored
+            || ignored.Reason != IgnoreReason.Superseded
+            || ignored.ChannelId != channelA)
+            throw new InvalidOperationException(
+                $"v2 delivered again must be MessageIgnored(Superseded); got [{string.Join(", ", events)}]");
+        if (!helperA.ShareStore.StoredVersions(secretId).SequenceEqual(new uint[] { 3 }))
+            throw new InvalidOperationException("helper-a must still hold exactly [3]");
+        if (helperA.Transport.DrainAll().Count != 0)
+            throw new InvalidOperationException("a superseded request is not answered");
+        Console.WriteLine("  [HelperA] v2 delivered after v3 → MessageIgnored(Superseded), still holds [3]  ✓");
+
+        Console.WriteLine("Superseded share request test passed.\n");
+    }
+
+    /// <summary>
+    /// The application's replay record: the identity of every envelope a
+    /// device sent or accepted, keyed on <see cref="Envelope.ReadMessageId(byte[])"/>.
+    /// </summary>
+    private sealed class SeenEnvelopes
+    {
+        private readonly HashSet<string> _ids = new();
+
+        private static string IdOf(byte[] envelope) => Convert.ToHexString(Envelope.ReadMessageId(envelope).Id);
+
+        public void Record(byte[] envelope) => _ids.Add(IdOf(envelope));
+
+        public bool Contains(byte[] envelope) => _ids.Contains(IdOf(envelope));
+    }
+
+    private static bool RaisedUpdateChannelInfo(IReadOnlyList<DeRecEvent> events) =>
+        events.OfType<ActionRequiredEvent>().Any(e => e.ActionKind == PendingActionKind.UpdateChannelInfo);
+
+    /// <summary>
+    /// The library processes every copy of a message delivered within the
+    /// inbound window, including one delivered back to its own sender. An
+    /// application that records the message id of what it sends and accepts
+    /// drops a replay, a copy whose unauthenticated trace id was changed, and
+    /// a reflection.
+    /// </summary>
+    private static void RunReplayDetectionTest()
+    {
+        Console.WriteLine("=== Replay detection ===");
+
+        using var owner = MakeNode("Owner", "https://owner.example.com");
+        using var helper = MakeNode("Helper", "https://helper.example.com");
+        ulong channelId = DoOrchestratorPair(helper, helper.Transport, owner, owner.Transport, 61UL);
+        var ownerSeen = new SeenEnvelopes();
+        var helperSeen = new SeenEnvelopes();
+
+        owner.Protocol.StartAsync(FlowKind.UpdateChannelInfo, new UpdateChannelInfoParams
+        {
+            Target = Target.One(channelId),
+            CommunicationInfo = new Dictionary<string, string> { { "name", "owner-renamed" } },
+        }).GetAwaiter().GetResult();
+        byte[] update = owner.Transport.DrainOne();
+        ownerSeen.Record(update);
+
+        if (helperSeen.Contains(update))
+            throw new InvalidOperationException("a first delivery is not in the record");
+        var events = helper.Protocol.ProcessAsync(update).GetAwaiter().GetResult();
+        if (!RaisedUpdateChannelInfo(events))
+            throw new InvalidOperationException($"the update must raise ActionRequired; got [{string.Join(", ", events)}]");
+        helperSeen.Record(update);
+
+        byte[] restamped = Envelope.ApplyTraceId(update, 0x7E57UL);
+        if (restamped.AsSpan().SequenceEqual(update))
+            throw new InvalidOperationException("the copy travels as different bytes");
+        if (!helperSeen.Contains(update) || !helperSeen.Contains(restamped))
+            throw new InvalidOperationException("the replay and the re-stamped copy must be recognised");
+        events = helper.Protocol.ProcessAsync(restamped).GetAwaiter().GetResult();
+        if (!RaisedUpdateChannelInfo(events))
+            throw new InvalidOperationException("unchecked, the library processes the copy again");
+        Console.WriteLine("  [Helper] replay and re-stamped copy share the original's message id  ✓");
+
+        if (!ownerSeen.Contains(update))
+            throw new InvalidOperationException("the reflection must be recognised");
+        events = owner.Protocol.ProcessAsync(update).GetAwaiter().GetResult();
+        if (!RaisedUpdateChannelInfo(events))
+            throw new InvalidOperationException("unchecked, the library reads its own update as the peer's");
+        Console.WriteLine("  [Owner]  reflected update matches an outbound message id  ✓");
+
+        Console.WriteLine("Replay detection test passed.\n");
+    }
+
     private static void StartKeepRound(Node owner, byte secretTag, int round) =>
         owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
         {
@@ -2630,6 +2760,167 @@ internal static class Protocol
         Console.WriteLine("  A's own row is Paired on the confirmed group channel  ✓");
 
         Console.WriteLine("Orchestrator abandoned replica pairing test passed.\n");
+    }
+
+    /// <summary>
+    /// A contact's channel identifier is chosen by whoever created it, and a
+    /// replica group's identifier travels in the clear on every envelope of
+    /// the group. A contact on the group channel must be refused, and a
+    /// pending pairing on that channel must never take the group key when it
+    /// expires.
+    /// </summary>
+    private static void RunContactOnTheGroupChannelTest()
+    {
+        Console.WriteLine("=== Orchestrator contact on the group channel test ===");
+
+        const string aUri = "https://replica-a.example.com";
+        const string cUri = "https://replica-c.example.com";
+        using var a = MakeNode("replica-a", aUri, new NodeOptions(
+            ReplicaId: 0xA1A1UL,
+            Timeouts: new Timeouts(ExpiredChannels: new RemoveExpiredChannelsPolicy(Enabled: true, TimeoutInSecs: 1))));
+        using var c = MakeNode("replica-c", cUri, new NodeOptions(ReplicaId: 0xC3C3UL));
+        using var adversary = MakeNode("adversary", "https://adversary.example.com");
+        var scope = new[] { (a, aUri), (c, cUri) };
+
+        StartReplicaScan(a, c, 200UL, Pairing.SenderKind.ReplicaSource);
+        var pairing = PumpAll(scope).OfType<PairingCompletedEvent>().ToList();
+        if (pairing.Count != 2 || pairing[0].ChannelId != pairing[1].ChannelId)
+            throw new InvalidOperationException(
+                $"the pairing with C must complete on both sides; got [{string.Join(", ", pairing.Select(p => p.ChannelId))}]");
+        ulong groupChannel = pairing[0].ChannelId;
+        CrossConfirmFingerprint(a, c, groupChannel);
+        PumpAll(scope);
+
+        byte[] contact = adversary.Protocol.CreateContactAsync(groupChannel, ContactMode.InlineKeys)
+            .GetAwaiter().GetResult();
+        try
+        {
+            a.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
+            {
+                Kind = Pairing.SenderKind.Owner,
+                Contact = contact,
+            }).GetAwaiter().GetResult();
+            throw new InvalidOperationException("a contact on the group channel must be refused");
+        }
+        catch (DeRecException e) when (e.Code == DeRecCode.ChannelAlreadyPaired)
+        {
+        }
+        if (a.Transport.DrainAll().Count != 0)
+            throw new InvalidOperationException("nothing is sent for a refused contact");
+        Console.WriteLine("  contact on the group channel refused  ✓");
+
+        AssertProtects(c, "group traffic after the refused contact");
+        var ignored = PumpAll(c.Transport, a).OfType<MessageIgnoredEvent>().ToList();
+        if (ignored.Count != 0)
+            throw new InvalidOperationException(
+                $"A must still process the group's traffic; got {ignored.Count} MessageIgnored");
+        PumpAll(scope);
+        Console.WriteLine("  group traffic still processed  ✓");
+
+        a.ChannelStore.Save(a.Protocol.SecretId, ChannelRecord.Of(new HelperChannel(
+            ChannelId: groupChannel,
+            Transports: Array.Empty<TransportProtocol>(),
+            CommunicationInfo: new Dictionary<string, string>(),
+            Status: ChannelStatus.Pending,
+            CreatedAt: 0UL,
+            PeerRole: Pairing.SenderKind.Helper,
+            Weight: 1)));
+        a.Protocol.TickAsync().GetAwaiter().GetResult();
+        if (a.SecretStore.Load(a.Protocol.SecretId, groupChannel, SecretKind.SharedKey) is null)
+            throw new InvalidOperationException(
+                "an expired pairing on the group channel must not take the group key");
+        AssertProtects(a, "after the expiry sweep");
+        Console.WriteLine("  expired pairing on the group channel leaves the group key  ✓");
+
+        Console.WriteLine("Orchestrator contact on the group channel test passed.\n");
+    }
+
+    /// <summary>
+    /// A pairing has a lifetime, <see cref="Timeouts.Pairing"/>, and both
+    /// sides enforce it without sending anything: the scanner refuses an
+    /// expired contact, and the creator ignores a request on one and refuses
+    /// a late accept. Pairing involves both parties, so the remedy is a fresh
+    /// contact. Mirrors <c>run_pairing_expiry_flow</c> in
+    /// <c>smoke-tests/rust/src/protocol.rs</c>.
+    /// </summary>
+    private static void RunPairingExpiryTest()
+    {
+        Console.WriteLine("=== Orchestrator pairing expiry test ===");
+
+        var shortWindow = new NodeOptions(Timeouts: new Timeouts(Pairing: TimeSpan.FromSeconds(1)));
+        using var creatorA = MakeNode("HelperExpiryA", "https://helper-expiry-a.example.com");
+        using var scannerA = MakeNode("OwnerExpiryA", "https://owner-expiry-a.example.com", shortWindow);
+        using var creatorB = MakeNode("HelperExpiryB", "https://helper-expiry-b.example.com", shortWindow);
+        using var scannerB = MakeNode("OwnerExpiryB", "https://owner-expiry-b.example.com");
+        using var creatorC = MakeNode("HelperExpiryC", "https://helper-expiry-c.example.com", shortWindow);
+        using var scannerC = MakeNode("OwnerExpiryC", "https://owner-expiry-c.example.com");
+
+        static byte[] CreateContact(Node creator, ulong channelId) =>
+            creator.Protocol.CreateContactAsync(channelId, ContactMode.InlineKeys).GetAwaiter().GetResult();
+        static void ScanAsOwner(Node scanner, byte[] contact) =>
+            scanner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
+            {
+                Kind = Pairing.SenderKind.Owner,
+                Contact = contact,
+            }).GetAwaiter().GetResult();
+        static bool IsExpired(DeRecException e) =>
+            e.Code == DeRecCode.PairingExpired && e.Category == DeRecCategory.Pairing;
+
+        byte[] staleContact = CreateContact(creatorA, 181UL);
+        byte[] expiringContact = CreateContact(creatorB, 182UL);
+        ScanAsOwner(scannerC, CreateContact(creatorC, 183UL));
+        byte[] request = scannerC.Transport.DrainOne();
+        var late = creatorC.Protocol.ProcessAsync(request).GetAwaiter().GetResult()
+            .OfType<ActionRequiredEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException("creator-c is asked to accept the pairing");
+
+        Thread.Sleep(TimeSpan.FromMilliseconds(2100));
+
+        try
+        {
+            ScanAsOwner(scannerA, staleContact);
+            throw new InvalidOperationException("the scanner must refuse an expired contact");
+        }
+        catch (DeRecException e) when (IsExpired(e))
+        {
+        }
+        if (scannerA.Transport.DrainAll().Count != 0)
+            throw new InvalidOperationException("nothing is sent for an expired contact");
+        Console.WriteLine("  [Owner] scanning a contact older than the window → PairingExpired, nothing sent  ✓");
+
+        ScanAsOwner(scannerB, expiringContact);
+        var events = creatorB.Protocol.ProcessAsync(scannerB.Transport.DrainOne()).GetAwaiter().GetResult();
+        if (events.Count != 1
+            || events[0] is not MessageIgnoredEvent ignored
+            || ignored.Reason != IgnoreReason.Expired
+            || ignored.ChannelId != 182UL)
+            throw new InvalidOperationException(
+                $"a request on an expired contact must be MessageIgnored(Expired); got [{string.Join(", ", events)}]");
+        if (creatorB.Transport.DrainAll().Count != 0)
+            throw new InvalidOperationException("the creator does not answer it");
+        Console.WriteLine("  [Helper] request on its expired contact → MessageIgnored(Expired), nothing sent  ✓");
+
+        try
+        {
+            creatorC.Protocol.AcceptAsync(late.Action).GetAwaiter().GetResult();
+            throw new InvalidOperationException("a late accept must be refused");
+        }
+        catch (DeRecException e) when (IsExpired(e))
+        {
+        }
+        if (creatorC.Transport.DrainAll().Count != 0)
+            throw new InvalidOperationException("a refused accept sends nothing");
+        if (creatorC.ChannelStore.ListHelpers(creatorC.Protocol.SecretId, HelperFilter.Any).Any())
+            throw new InvalidOperationException("a refused accept records no channel");
+        Console.WriteLine("  [Helper] accepting after the window → PairingExpired, no channel, nothing sent  ✓");
+
+        ScanAsOwner(scannerC, CreateContact(creatorC, 184UL));
+        if (!PumpAll(new[] { (scannerC, "https://owner-expiry-c.example.com"), (creatorC, "https://helper-expiry-c.example.com") })
+                .OfType<PairingCompletedEvent>().Any())
+            throw new InvalidOperationException("a fresh contact pairs");
+        Console.WriteLine("  [Helper] a fresh contact pairs  ✓");
+
+        Console.WriteLine("Orchestrator pairing expiry test passed.\n");
     }
 
     /// <summary>
@@ -5184,6 +5475,7 @@ internal static class Protocol
             || full.Timeouts?.SharingRound != TimeSpan.FromSeconds(30)
             || full.Timeouts?.UnpairAck != TimeSpan.FromSeconds(45)
             || full.Timeouts?.GetShareResponse != TimeSpan.FromSeconds(900)
+            || full.Timeouts?.Pairing != TimeSpan.FromSeconds(240)
             || full.Timeouts?.ExpiredChannels != new RemoveExpiredChannelsPolicy(true, 600)
             || full.ParameterRange?.MaxUnresponsiveDeletionTimeout != 9007199254740993L
             || full.AutoAccept is not { Pairing: true, PrePair: false, StoreShare: true, Unpair: true }

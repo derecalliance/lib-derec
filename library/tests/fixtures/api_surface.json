@@ -1121,6 +1121,14 @@
       "dotnet": "Envelope.ReadTraceId",
       "go": "envelope.ReadTraceID",
       "ts": "envelope.read_trace_id"
+    },
+    {
+      "rust": "derec_message::message_id",
+      "ffi": "message_id_from_envelope",
+      "wasm": "envelope_message_id",
+      "dotnet": "Envelope.ReadMessageId",
+      "go": "envelope.ReadMessageID",
+      "ts": "envelope.message_id"
     }
   ],
   "records": [

@@ -419,6 +419,10 @@ const (
 	IgnoreReasonExpired             = "Expired"
 	IgnoreReasonTimestampMismatch   = "TimestampMismatch"
 	IgnoreReasonStaleResponse       = "StaleResponse"
+	// IgnoreReasonSuperseded: a StoreShareRequest for a version older than
+	// the newest one this helper stores on the channel, and not stored
+	// itself. It is not stored and not answered.
+	IgnoreReasonSuperseded = "Superseded"
 )
 
 // The label vocabulary for Event.Reason on a PeerNotRestored event. Matches

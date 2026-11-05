@@ -13,7 +13,7 @@
 //! identifiers cross as decimal strings, never as JS numbers, so values above
 //! `Number.MAX_SAFE_INTEGER` survive the boundary intact.
 
-mod helpers;
+pub(crate) mod helpers;
 pub mod types;
 
 pub mod discovery;

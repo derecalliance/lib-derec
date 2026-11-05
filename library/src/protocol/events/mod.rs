@@ -81,6 +81,13 @@ pub enum IgnoreReason {
     /// earlier challenge that a newer one has replaced. The outstanding
     /// challenge is kept, so its own answer still completes it.
     StaleResponse,
+    /// A `StoreShareRequest` for a version older than the newest one this
+    /// Helper stores on the channel, and not stored itself: a delayed or
+    /// repeated delivery of a request a newer one has replaced. Storing it
+    /// would bring back a version the Owner already dropped, so it is not
+    /// stored, not raised as [`DeRecEvent::ActionRequired`], and not
+    /// answered.
+    Superseded,
 }
 
 /// Why [`DeRecEvent::VerifySharesFailed`] reached no verdict for a channel.
@@ -223,10 +230,18 @@ pub enum PendingActionKind {
 ///   sure?" gate should keep this off.
 /// - [`Self::update_channel_info`] silently overwrites the stored
 ///   channel record with the peer's new transport / communication
-///   info. Cryptographically safe (only the paired peer can send it),
-///   but a compromised peer key gets weaponised faster — outbound
-///   traffic on the channel re-routes to whatever endpoint the peer
-///   announced.
+///   info, and outbound traffic on the channel re-routes to whatever
+///   endpoint the update announced. Holding the channel key is not
+///   proof that the peer sent it: both ends encrypt under one key and
+///   the envelope does not say which end sent it, so an update this
+///   device sent, delivered back to it, decrypts like one from the peer.
+///   An older update delivered again, or held back and delivered after
+///   a newer one, decrypts too. Catching both is the application's
+///   replay detection (see
+///   [`message_id`](crate::derec_message::message_id)), and rejecting a
+///   contact update older than the last one accepted on the channel
+///   needs the application to see each update, which this flag
+///   removes. Keep it `false` unless the transport rules both out.
 ///
 /// All other fields wrap routine request/response flows and have no
 /// caveats beyond "the caller decided not to gate them." Note that this

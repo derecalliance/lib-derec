@@ -5,8 +5,17 @@
 //! `DeRecMessage` bytes. Mirrors the FFI shape in `crate::interop::ffi::envelope`.
 
 use crate::derec_message;
-use crate::interop::wasm::ts_bindings_utils::js_error;
+use crate::interop::wasm::primitives::helpers::to_js;
+use crate::interop::wasm::ts_bindings_utils::{js_error, js_error_from_lib};
+use serde::Serialize;
 use wasm_bindgen::prelude::*;
+
+#[derive(Serialize)]
+struct MessageId {
+    #[serde(with = "serde_bytes")]
+    id: Vec<u8>,
+    timestamp: u64,
+}
 
 /// Overwrite `trace_id` on a primitive-produced envelope and return the
 /// re-encoded bytes. The outer envelope is plaintext, so this does no
@@ -28,4 +37,17 @@ pub fn apply_trace_id(envelope_bytes: &[u8], trace_id: u64) -> Result<Vec<u8>, J
 pub fn read_trace_id(envelope_bytes: &[u8]) -> Result<u64, JsValue> {
     derec_message::read_trace_id(envelope_bytes)
         .map_err(|e| js_error("envelope_decode_error", e.to_string()))
+}
+
+/// Identify an envelope for replay and reflection detection: `{ id, timestamp }`,
+/// where `id` (32 bytes) is the same for every copy of one message, whatever
+/// its unauthenticated cleartext fields say, and different for every other
+/// message. Mirrors [`derec_message::message_id`].
+#[wasm_bindgen(js_name = "envelope_message_id")]
+pub fn message_id(envelope_bytes: &[u8]) -> Result<JsValue, JsValue> {
+    let identity = derec_message::message_id(envelope_bytes).map_err(js_error_from_lib)?;
+    to_js(&MessageId {
+        id: identity.id.to_vec(),
+        timestamp: identity.timestamp,
+    })
 }

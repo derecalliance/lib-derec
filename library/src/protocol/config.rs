@@ -148,17 +148,17 @@ impl<
     ///
     /// # What is persisted
     ///
-    /// Each mode leaves behind what its inbound handler will need to look the
-    /// contact back up:
+    /// Every mode stores the contact itself as
+    /// [`SecretKind::PairingContact`](crate::protocol::SecretKind::PairingContact).
+    /// Its timestamp is what the inbound handlers measure the contact's age
+    /// against (see [`Timeouts::pairing`](crate::protocol::types::Timeouts::pairing)),
+    /// and for `NoKeys` its `nonce` is what authenticates the caller.
     ///
-    /// - `InlineKeys` and `HashedKeys` store the generated secret key as
-    ///   [`SecretKind::PairingSecret`](crate::protocol::SecretKind::PairingSecret). The handler decrypts the encrypted
-    ///   `PairRequest` with it, and republishes the keys on the `PrePair` leg
-    ///   for `HashedKeys`.
-    /// - `NoKeys` has no key material yet, so the contact itself is stored as
-    ///   [`SecretKind::PairingContact`](crate::protocol::SecretKind::PairingContact). The inbound `PrePairRequest` handler
-    ///   authenticates the caller by matching its `nonce` against it, then
-    ///   generates fresh key material for the response.
+    /// `InlineKeys` and `HashedKeys` also store the generated secret key as
+    /// [`SecretKind::PairingSecret`](crate::protocol::SecretKind::PairingSecret).
+    /// The handler decrypts the encrypted `PairRequest` with it, and
+    /// republishes the keys on the `PrePair` leg for `HashedKeys`. `NoKeys`
+    /// has no key material yet; its `PrePairRequest` handler generates it.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
     pub async fn create_contact(
         &mut self,
@@ -178,26 +178,22 @@ impl<
         let result =
             create_contact_message(channel_id, contact_mode, self.own_transports.clone(), nonce)?;
 
-        match result.secret_key {
-            Some(secret_key) => {
-                self.secret_store
-                    .save(
-                        self.secret_id,
-                        channel_id,
-                        SecretValue::PairingSecret(PairingKeyMaterial::from_secret(&secret_key)),
-                    )
-                    .await?;
-            }
-            None => {
-                self.secret_store
-                    .save(
-                        self.secret_id,
-                        channel_id,
-                        SecretValue::PairingContact(result.contact_message.clone()),
-                    )
-                    .await?;
-            }
+        if let Some(secret_key) = result.secret_key {
+            self.secret_store
+                .save(
+                    self.secret_id,
+                    channel_id,
+                    SecretValue::PairingSecret(PairingKeyMaterial::from_secret(&secret_key)),
+                )
+                .await?;
         }
+        self.secret_store
+            .save(
+                self.secret_id,
+                channel_id,
+                SecretValue::PairingContact(result.contact_message.clone()),
+            )
+            .await?;
 
         #[cfg(feature = "logging")]
         tracing::info!(channel_id = channel_id.0, "contact message created");

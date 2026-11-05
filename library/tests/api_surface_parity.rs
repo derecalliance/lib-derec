@@ -198,6 +198,12 @@ const RECORD_FIELDS: &[Allow] = &[
         "getshareresponsesecs=getshareresponse",
         "a TimeSpan carries its unit, so the name drops `Secs`; the wire DTO converts to seconds",
     ),
+    (
+        "dotnet",
+        "Timeouts",
+        "pairingsecs=pairing",
+        "a TimeSpan carries its unit, so the name drops `Secs`; the wire DTO converts to seconds",
+    ),
 ];
 
 /// Records an SDK does not declare as a named type.
