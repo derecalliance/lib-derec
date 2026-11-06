@@ -18,13 +18,14 @@
 //! discriminant now travels with the endpoint, so nothing infers it.
 
 use std::collections::HashMap;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 
 use derec_proto::TransportProtocol;
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use flate2::{Compression, write::GzEncoder};
 use serde::de;
 use serde::{Deserialize, Serialize};
 
+use super::decode_gzip_json;
 use crate::protocol::types::secret::SecretError;
 use crate::protocol::types::{HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret};
 
@@ -278,8 +279,7 @@ pub fn encode(secret: &Secret) -> Vec<u8> {
 
 /// Decode a v3 payload (no version prefix) back into a [`Secret`].
 pub fn decode(payload: &[u8]) -> Result<Secret, SecretError> {
-    let json = gunzip(payload)?;
-    let dto: SecretJson = serde_json::from_slice(&json)?;
+    let dto: SecretJson = decode_gzip_json(payload)?;
     Ok(Secret::from(dto))
 }
 
@@ -288,14 +288,6 @@ fn gzip(data: &[u8]) -> Vec<u8> {
     enc.write_all(data)
         .expect("gzip write into Vec is infallible");
     enc.finish().expect("gzip finish into Vec is infallible")
-}
-
-fn gunzip(data: &[u8]) -> Result<Vec<u8>, SecretError> {
-    let mut out = Vec::new();
-    GzDecoder::new(data)
-        .read_to_end(&mut out)
-        .map_err(|_| SecretError::Decompression)?;
-    Ok(out)
 }
 
 /// A present `weight` must be at least `1`: a Helper that received no
@@ -360,7 +352,7 @@ mod weight_tests {
     }
 
     fn json_of(secret: &Secret) -> serde_json::Value {
-        serde_json::from_slice(&gunzip(&encode(secret)).unwrap()).unwrap()
+        decode_gzip_json(&encode(secret)).unwrap()
     }
 
     fn decode_json(json: &str) -> Result<Secret, SecretError> {
@@ -413,7 +405,7 @@ mod threshold_tests {
     }
 
     fn json_of(secret: &Secret) -> serde_json::Value {
-        serde_json::from_slice(&gunzip(&encode(secret)).unwrap()).unwrap()
+        decode_gzip_json(&encode(secret)).unwrap()
     }
 
     fn decode_json(json: &str) -> Result<Secret, SecretError> {

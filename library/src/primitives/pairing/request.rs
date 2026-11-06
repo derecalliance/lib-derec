@@ -173,13 +173,15 @@ pub fn create_contact(
     let (contact_message, secret_key) = match contact_mode {
         ContactMode::InlineKeys => {
             let (pk, sk) = generate_pairing_keys()?;
-            let commitment = sk.fingerprint_commitment();
+            let commitment = sk
+                .fingerprint_commitment()
+                .map_err(|source| PairingError::ContactMessageKeygen { source })?;
             let msg = ContactMessage::inline_keys(channel_id, nonce, own, pk, commitment);
             (msg, Some(PairingSecretKeyMaterial::Initiator(sk)))
         }
         ContactMode::HashedKeys => {
             let (pk, sk) = generate_pairing_keys()?;
-            let msg = ContactMessage::hashed_keys(channel_id, nonce, own, &pk);
+            let msg = ContactMessage::hashed_keys(channel_id, nonce, own, &pk)?;
             (msg, Some(PairingSecretKeyMaterial::Initiator(sk)))
         }
         ContactMode::NoKeys => {

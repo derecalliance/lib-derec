@@ -251,6 +251,12 @@ type ReplicaDiscoveryParams struct{}
 // no event when told to leave: when a roster excluding it arrives it drops its
 // whole secret_id partition and emits EventTypeSelfRemovedFromGroup. The
 // secret survives on the remaining members and the helpers.
+//
+// Removal does not replace the group key, so it relies on the removed device's
+// library deleting its copy. That covers a lost or stolen device whose storage
+// was not read. Whoever read a device's storage keeps the group key and can
+// decrypt every later publication it obtains, the one completing the removal
+// included.
 type UnpairReplicaParams struct {
 	ReplicaID uint64
 	Memo      *string

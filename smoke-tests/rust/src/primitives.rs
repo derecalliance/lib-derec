@@ -253,6 +253,24 @@ fn run_pairing_flow_hashed_keys_test() {
     );
     assert_eq!(processed_prepair.nonce, alice_contact.nonce);
 
+    // Moving the last byte of the ML-KEM key to the front of the ECIES key
+    // leaves the concatenated keys, and so the binding hash input, unchanged;
+    // the scanner refuses the split anyway.
+    let mut split = extracted_prepair_resp.response.clone();
+    let mut mlkem = split.mlkem_encapsulation_key.take().unwrap();
+    let mut ecies = vec![mlkem.pop().unwrap()];
+    ecies.extend(split.ecies_public_key.take().unwrap());
+    split.mlkem_encapsulation_key = Some(mlkem);
+    split.ecies_public_key = Some(ecies);
+    assert!(
+        matches!(
+            pair_response::process_pre_pair(&alice_contact, &split),
+            Err(Error::Pairing(PairingError::PrePairHashMismatch))
+        ),
+        "keys split at another point must be refused"
+    );
+    println!("  keys split at another point refused (PrePairHashMismatch)  ✓");
+
     let mut filled_in_contact = alice_contact.clone();
     filled_in_contact.mlkem_encapsulation_key =
         Some(processed_prepair.mlkem_encapsulation_key.clone());

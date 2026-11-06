@@ -10,10 +10,10 @@ use derec_proto::{
 /// A peer-supplied message that advertises where its sender can be reached.
 ///
 /// Implemented for every message type carrying `supportedTransports`:
-/// [`ContactMessage`](derec_proto::ContactMessage),
-/// [`PairRequestMessage`](derec_proto::PairRequestMessage),
-/// [`PrePairRequestMessage`](derec_proto::PrePairRequestMessage) and
-/// [`UpdateChannelInfoRequestMessage`](derec_proto::UpdateChannelInfoRequestMessage).
+/// [`ContactMessage`],
+/// [`PairRequestMessage`],
+/// [`PrePairRequestMessage`] and
+/// [`UpdateChannelInfoRequestMessage`].
 pub trait AdvertisedEndpoints {
     /// The endpoints this message advertises, in the peer's own order.
     ///

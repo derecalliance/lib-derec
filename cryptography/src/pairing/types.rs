@@ -7,6 +7,8 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError
 use std::io::{Read, Write};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use super::DerecPairingError;
+
 #[derive(CanonicalSerialize, CanonicalDeserialize, Clone)]
 pub struct PairingContactMessageMaterial {
     pub mlkem_encapsulation_key: Vec<u8>,
@@ -48,7 +50,12 @@ pub struct InitiatorSecretKeyMaterial {
 impl InitiatorSecretKeyMaterial {
     /// The commitment to [`Self::fingerprint_nonce`] over this initiator's
     /// public keys, published with those keys.
-    pub fn fingerprint_commitment(&self) -> FingerprintCommitment {
+    ///
+    /// # Errors
+    ///
+    /// [`DerecPairingError::InvalidSize`]
+    /// if either public key does not have the size the protocol fixes.
+    pub fn fingerprint_commitment(&self) -> Result<FingerprintCommitment, DerecPairingError> {
         super::fingerprint_commitment(
             &self.mlkem_encapsulation_key,
             &self.ecies_public_key,

@@ -848,7 +848,13 @@ export type ReplicaDiscoveryParams = Record<string, never>;
  *  member is not asked and gets no event when told to leave: when a roster
  *  excluding it arrives it drops its whole `secret_id` partition and emits
  *  `SelfRemovedFromGroup`. The secret survives on the remaining members and
- *  the helpers. */
+ *  the helpers.
+ *
+ *  Removal does not replace the group key, so it relies on the removed
+ *  device's library deleting its copy. That covers a lost or stolen device
+ *  whose storage was not read. Whoever read a device's storage keeps the
+ *  group key and can decrypt every later publication it obtains, the one
+ *  completing the removal included. */
 export interface UnpairReplicaParams {
   /** The member to remove, as a **decimal** `u64` string — the same form
    *  `ReplicaPaired.peer_replica_id` hands back. A value naming no current

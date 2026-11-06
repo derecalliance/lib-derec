@@ -243,6 +243,67 @@ helpers on 0.0.10, and helpers need no upgrade.
   (default 300 s) has elapsed, `tick` or the next `process` concludes it on
   the versions already reported, with `ReplicaDiscoveryComplete`.
 
+- **Fixed: the pairing hashes bound the two public keys only through a
+  size check made elsewhere.** *(hardening; Rust)*
+
+  `contact_binding_hash` (the `HashedKeys` commitment) and
+  `fingerprint_commitment` concatenate the ML-KEM and ECIES public keys
+  without their lengths, so moving bytes from the end of one key to the
+  start of the other left the hash unchanged. Only ML-KEM's own size check,
+  in a later step, refused such a split. Both functions now refuse keys of
+  any size but the protocol's (1568 and 65 bytes) with
+  `DerecPairingError::InvalidSize`, and return a `Result`; a `PrePair`
+  response whose keys have the wrong sizes is refused with
+  `PrePairHashMismatch`. The hashed bytes are unchanged, so pairing with
+  0.0.10 devices still works. `InitiatorSecretKeyMaterial::fingerprint_commitment`
+  and `ContactMessageExt::hashed_keys` return a `Result` too.
+
+- **Docs: seeds passed to the cryptography primitives must be secret,
+  random and fresh.** *(docs; Rust)*
+
+  `vss::share`, `pairing::contact_message` and
+  `pairing::pairing_request_message` are deterministic in their `entropy`
+  argument, and their examples passed all zeros. With a guessable seed,
+  anyone holding one share can test a guess of the secret, and anyone who
+  knows a pairing seed holds the pairing keys. The docs now state that the
+  seed must be secret, uniformly random and fresh for every call, and every
+  example draws it from the operating system's generator. The library's own
+  flows always did.
+
+- **Docs: removing a replica member does not protect against a compromised
+  device.** *(docs; every SDK)*
+
+  The group key does not change when a member is removed, so removal relies
+  on the removed device's library deleting its copy. A device whose storage
+  was read keeps the key and can decrypt every later publication it
+  obtains, including the one that completes its removal. `UnpairReplica`
+  and `ReplicaRemoved` now say so in every SDK.
+
+- **Fixed (hardening): decoding a recovered vault inflated all of it before
+  checking it.** *(hardening; every SDK)*
+
+  The vault decoder inflated the whole gzip stream into memory and only then
+  parsed the JSON. In recovery the vault comes from shares that nothing
+  authenticates, so a forged payload of about 1 MB could make a device
+  allocate a gigabyte before being refused, or several gigabytes if it was
+  valid JSON. The decoder now parses the JSON while the stream is being
+  inflated: a payload that is not JSON is refused after its first bytes, and
+  padding around the JSON is not buffered. Errors are unchanged. The format
+  is unchanged, and v2 and v3 vaults decode as before.
+
+- **Docs: the vault's compressed length and its decoding cost.** *(docs;
+  every SDK)*
+
+  The vault is one gzip stream that mixes the user's secrets and channel
+  keys with contact details a helper chooses, and every helper learns its
+  compressed length, so a corrupted helper could learn secrets slowly
+  through that length. Decoding sets no memory limit: a valid-JSON vault
+  receives the memory its largest value claims, up to about 1030 times its
+  size, and running out kills a native process. The secret module docs, the
+  library README and every SDK README now describe both, with the
+  mitigations: keep auto-accept of `UpdateChannelInfo` off, and set
+  `parameter_range.max_share_size` to bound decoding.
+
 ### 0.0.10
 
 A body naming a group member is accepted only on that member's own channel,

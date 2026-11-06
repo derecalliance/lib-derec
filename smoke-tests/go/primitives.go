@@ -35,6 +35,7 @@ func runPrimitives() {
 	runFingerprintCommitmentHandshake()
 	runFingerprintNonceTampered()
 	runPrePairWithoutCommitment()
+	runPrePairKeysSplitAtAnotherPoint()
 	runNoKeysRelayCopiesCommitment()
 	runSharingFlow()
 	runWeightedSplit()
@@ -642,6 +643,26 @@ func runPrePairWithoutCommitment() {
 		}
 	}
 	fmt.Println("Fingerprint commitment test (PrePair without commitment) passed.")
+}
+
+// runPrePairKeysSplitAtAnotherPoint: moving the last byte of the ML-KEM key
+// to the front of the ECIES key leaves the concatenated keys, and so the
+// binding hash input, unchanged; the scanner refuses the split anyway.
+func runPrePairKeysSplitAtAnotherPoint() {
+	fmt.Println("=== Binding hash test (keys split at another point) ===")
+	contact, _, responseProto := prePairLeg(pairing.ContactModeHashedKeys)
+	var resp derecpb.PrePairResponseMessage
+	must(proto.Unmarshal(responseProto, &resp), "decode PrePairResponseMessage")
+	mlkem := resp.GetMlkemEncapsulationKey()
+	moved := mlkem[len(mlkem)-1]
+	resp.MlkemEncapsulationKey = mlkem[:len(mlkem)-1]
+	resp.EciesPublicKey = append([]byte{moved}, resp.GetEciesPublicKey()...)
+	split, err := proto.Marshal(&resp)
+	must(err, "encode split PrePairResponseMessage")
+
+	_, err = pairing.Response.ProcessPrePair(contact, split)
+	assertPairingCode(err, derec.CodePrepairHashMismatch, "pairing.Response.ProcessPrePair (keys split at another point)")
+	fmt.Println("Binding hash test (keys split at another point) passed.")
 }
 
 // runNoKeysRelayCopiesCommitment: a relay answers a NO_KEYS PrePair with its

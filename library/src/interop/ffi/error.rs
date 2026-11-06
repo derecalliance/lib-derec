@@ -159,6 +159,11 @@ pub const DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE: i32 = 47;
 /// commitment, so applications can treat it as a possible
 /// man-in-the-middle.
 pub const DEREC_CODE_FINGERPRINT_COMMITMENT_MISMATCH: i32 = 48;
+/// The pairing outlived `Timeouts::pairing`: the scanner refuses a contact
+/// older than it, and the contact's creator refuses to accept a request
+/// that arrives after it. Surfaced as [`DEREC_CATEGORY_PAIRING`]; nothing is
+/// sent to the peer, and a fresh contact starts a new pairing.
+pub const DEREC_CODE_PAIRING_EXPIRED: i32 = 49;
 
 pub const DEREC_CODE_EMPTY_CHANNELS: i32 = 60;
 pub const DEREC_CODE_DUPLICATE_CHANNEL_ID: i32 = 61;

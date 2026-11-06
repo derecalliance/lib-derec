@@ -1196,6 +1196,33 @@ before the destination's user has confirmed. Confirming does not replay it:
 once the destination's `verifyFingerprint` resolves `true`, call
 `start(FlowKind.ReplicaDiscovery)` to pull the copy from the source.
 
+### Every helper sees the vault's compressed length
+
+The vault (the user's secrets, every helper's channel key and
+`communication_info`, and the replica group key) is compressed as one gzip stream
+before it is encrypted and split. Encryption keeps the length, so every
+helper learns the compressed length of every version. A helper also chooses
+part of what is compressed: its own `communication_info`, which it changes with
+`UpdateChannelInfo`. When that text repeats part of a secret elsewhere in
+the vault, the vault compresses better, so over many versions a corrupted
+helper could learn another helper's channel key, the group key or the
+user's secrets a few characters at a time (the side channel behind CRIME
+and BREACH). Each guess costs a new version, which only the owner creates,
+after a contact change the owner's application has to accept. Keep the `updateChannelInfo` auto-accept flag
+off, and treat a helper that keeps changing its contact details as suspect.
+
+### Decoding a recovered vault has no memory limit
+
+In recovery the vault is decrypted from shares that nothing authenticates,
+so a forged recovery group can deliver any payload, including one built to
+exhaust memory. The decoder parses the vault while it inflates it: a
+payload that is not JSON is refused after its first bytes, and padding is
+not buffered. A payload that is valid JSON still receives the memory its
+largest value claims, and gzip lets a payload claim up to about 1030 times
+its own size. The library sets no limit. When memory runs out, the call fails with a WebAssembly trap (a `RuntimeError`), after which the protocol instance must not be used. To bound it, configure
+`parameter_range.max_share_size`: a recovery share larger than that is refused before anything is
+decoded, so a vault can claim at most about 1030 times that size.
+
 ### The `derec.*` namespace in `communicationInfo` is library-owned
 
 `communicationInfo` is otherwise an opaque app-defined map, but every

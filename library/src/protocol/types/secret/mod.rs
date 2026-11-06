@@ -98,6 +98,49 @@
 //! carries a v1 roster: the last published version predates the roster
 //! entirely, so nothing in the wild needs migrating.
 //!
+//! # Security of the encoding
+//!
+//! ## Every helper sees the compressed length
+//!
+//! The whole payload is one gzip stream: the user's secrets, every helper's
+//! channel key and `communication_info`, and the replica group key. AES-GCM
+//! keeps the length, and every share carries the full ciphertext, so every
+//! helper learns the compressed length of every version. A helper also
+//! chooses part of what is compressed, its own `communication_info`, which it
+//! can change with `UpdateChannelInfo`. When that text repeats part of a
+//! secret elsewhere in the stream, the stream compresses better. Over many
+//! versions, a corrupted helper could therefore learn another helper's
+//! channel key, the group key or the user's secrets a few characters at a
+//! time: the side channel behind the CRIME and BREACH attacks. Each guess
+//! costs a new version, which only the owner creates, after a contact change
+//! the owner's application has to accept. The format does not close this
+//! channel. Applications should keep
+//! [`AutoAcceptPolicy::update_channel_info`](crate::protocol::AutoAcceptPolicy::update_channel_info)
+//! off and treat a helper that keeps changing its contact details as
+//! suspect.
+//!
+//! ## Decoding has no memory limit
+//!
+//! In recovery the payload is decrypted from shares that nothing
+//! authenticates, so a forged recovery group can deliver any payload,
+//! including one built to exhaust memory, and the version byte that selects
+//! the decoder is part of it. The decoder parses the JSON while the stream is
+//! being inflated. A payload that is not JSON is refused after its first
+//! bytes, and whitespace around the JSON passes through without being
+//! buffered; a corrupt or truncated stream is
+//! [`SecretError::Decompression`], anything else malformed is
+//! [`SecretError::Json`].
+//!
+//! A payload that is valid JSON still receives the memory its largest value
+//! claims, and gzip lets a payload claim up to about 1030 times its own size.
+//! The library sets no limit. When memory runs out, a native process is
+//! killed by the operating system or aborts, with no error and no event;
+//! under WebAssembly the call fails with a trap, after which the instance
+//! must not be used. An application bounds this with
+//! `parameter_range.max_share_size`: a recovery share larger than it is
+//! refused before anything is decoded, so a payload can claim at most about
+//! 1030 times that size.
+//!
 //! # Conformance
 //!
 //! Golden vectors (a canonical [`Secret`] paired with its exact v3 JSON, plus v2

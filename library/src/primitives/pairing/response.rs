@@ -374,6 +374,9 @@ pub fn produce_pre_pair(
         }
     };
 
+    let commitment = initiator_material
+        .fingerprint_commitment()
+        .map_err(|source| PairingError::ContactMessageKeygen { source })?;
     let timestamp = current_timestamp();
     let response = PrePairResponseMessage {
         result: Some(DeRecResult::ok()),
@@ -381,7 +384,7 @@ pub fn produce_pre_pair(
         ecies_public_key: Some(initiator_material.ecies_public_key.clone()),
         nonce: request.nonce,
         timestamp: Some(timestamp),
-        fingerprint_commitment: Some(initiator_material.fingerprint_commitment().to_vec()),
+        fingerprint_commitment: Some(commitment.to_vec()),
     };
 
     let protocol_version = ProtocolVersion::current();
@@ -462,6 +465,9 @@ pub fn produce_pre_pair_no_keys(
     let (pk, secret_key) = cryptography_pairing::contact_message(*seed)
         .map_err(|e| PairingError::ContactMessageKeygen { source: e })?;
 
+    let commitment = secret_key
+        .fingerprint_commitment()
+        .map_err(|source| PairingError::ContactMessageKeygen { source })?;
     let timestamp = current_timestamp();
     let response = PrePairResponseMessage {
         result: Some(DeRecResult::ok()),
@@ -469,7 +475,7 @@ pub fn produce_pre_pair_no_keys(
         ecies_public_key: Some(pk.ecies_public_key.clone()),
         nonce: request.nonce,
         timestamp: Some(timestamp),
-        fingerprint_commitment: Some(secret_key.fingerprint_commitment().to_vec()),
+        fingerprint_commitment: Some(commitment.to_vec()),
     };
 
     let protocol_version = ProtocolVersion::current();
@@ -899,7 +905,8 @@ pub fn process(
 /// 1. confirm `result.status == OK`;
 /// 2. recompute `SHA-384(mlkemEncapsulationKey || eciesPublicKey
 ///    || u64_be(nonce) || u64_be(channelId))` and verify it matches the
-///    original [`ContactMessage::contact_binding_hash`];
+///    original [`ContactMessage::contact_binding_hash`], counting keys of
+///    any size but the protocol's as a mismatch;
 /// 3. only on match, proceed to construct a normal [`PairRequestMessage`].
 ///
 /// This function performs all three checks. The recomputation uses the
@@ -1251,7 +1258,12 @@ fn validate_contact_binding_hash(
         &ecies_public_key,
         contact_message.nonce,
         contact_message.channel_id,
-    );
+    )
+    .map_err(|_e| {
+        #[cfg(feature = "logging")]
+        tracing::warn!(error = %_e, "published keys do not have the committed sizes");
+        Error::from(PairingError::PrePairHashMismatch)
+    })?;
 
     let matched: bool = recomputed.as_slice().ct_eq(expected_hash.as_slice()).into();
     if !matched {

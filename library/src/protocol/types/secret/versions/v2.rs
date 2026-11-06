@@ -6,16 +6,15 @@
 //! optional keys are omitted when absent/empty.
 
 use std::collections::HashMap;
-use std::io::Read as _;
 #[cfg(test)]
 use std::io::Write as _;
 
 use derec_proto::TransportProtocol;
-use flate2::read::GzDecoder;
 #[cfg(test)]
 use flate2::{Compression, write::GzEncoder};
 use serde::{Deserialize, Serialize};
 
+use super::decode_gzip_json;
 use crate::protocol::types::secret::SecretError;
 use crate::protocol::types::{HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret};
 use crate::transport;
@@ -28,14 +27,6 @@ fn gzip(data: &[u8]) -> Vec<u8> {
     enc.write_all(data)
         .expect("gzip write into Vec is infallible");
     enc.finish().expect("gzip finish into Vec is infallible")
-}
-
-fn gunzip(data: &[u8]) -> Result<Vec<u8>, SecretError> {
-    let mut out = Vec::new();
-    GzDecoder::new(data)
-        .read_to_end(&mut out)
-        .map_err(|_| SecretError::Decompression)?;
-    Ok(out)
 }
 
 mod base64_bytes {
@@ -189,8 +180,7 @@ impl From<ReplicaInfoJson> for ReplicaInfo {
 
 /// Decode a v2 payload (no version prefix) back into a [`Secret`].
 pub fn decode(payload: &[u8]) -> Result<Secret, SecretError> {
-    let json = gunzip(payload)?;
-    let dto: SecretJson = serde_json::from_slice(&json)?;
+    let dto: SecretJson = decode_gzip_json(payload)?;
     Ok(Secret::from(dto))
 }
 

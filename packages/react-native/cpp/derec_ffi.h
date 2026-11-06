@@ -246,6 +246,14 @@
  */
 #define DEREC_CODE_FINGERPRINT_COMMITMENT_MISMATCH 48
 
+/**
+ * The pairing outlived `Timeouts::pairing`: the scanner refuses a contact
+ * older than it, and the contact's creator refuses to accept a request
+ * that arrives after it. Surfaced as [`DEREC_CATEGORY_PAIRING`]; nothing is
+ * sent to the peer, and a fresh contact starts a new pairing.
+ */
+#define DEREC_CODE_PAIRING_EXPIRED 49
+
 #define DEREC_CODE_EMPTY_CHANNELS 60
 
 #define DEREC_CODE_DUPLICATE_CHANNEL_ID 61

@@ -434,6 +434,31 @@ internal static class Primitives
                 $"tampered binding hash must throw DeRecCode.PrePairHashMismatch ({DeRecCode.PrePairHashMismatch}), got category={caught.Category} code={caught.Code} message={caught.Message}");
         Console.WriteLine($"  ProcessPrePair threw category={caught.Category} code={caught.Code} ✓");
 
+        // Moving the last byte of the ML-KEM key to the front of the ECIES
+        // key leaves the concatenated keys, and so the binding hash input,
+        // unchanged; the scanner refuses the split anyway.
+        var split = Proto.PrePairResponseMessage.Parser.ParseFrom(extractedPrePairResp.ResponseProtoBytes);
+        var mlkem = split.MlkemEncapsulationKey.ToByteArray();
+        split.MlkemEncapsulationKey = Google.Protobuf.ByteString.CopyFrom(mlkem, 0, mlkem.Length - 1);
+        split.EciesPublicKey = Google.Protobuf.ByteString.CopyFrom(
+            new[] { mlkem[^1] }.Concat(split.EciesPublicKey.ToByteArray()).ToArray());
+        DeRecException? splitCaught = null;
+        try
+        {
+            Pairing.Response.ProcessPrePair(
+                aliceContact.ContactMessage,
+                Google.Protobuf.MessageExtensions.ToByteArray(split)
+            );
+        }
+        catch (DeRecException e)
+        {
+            splitCaught = e;
+        }
+        if (splitCaught?.Code != DeRecCode.PrePairHashMismatch)
+            throw new InvalidOperationException(
+                $"keys split at another point must throw DeRecCode.PrePairHashMismatch, got code={splitCaught?.Code}");
+        Console.WriteLine("  keys split at another point refused (PrePairHashMismatch) ✓");
+
         Console.WriteLine("Pairing flow test (HASHED_KEYS + PrePair) passed.");
     }
 

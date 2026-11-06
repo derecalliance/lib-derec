@@ -13,6 +13,10 @@ use zeroize::Zeroizing;
 use super::DerecPairingError;
 use crate::random;
 
+/// Size of a public key as [`generate_key`] encodes it: an uncompressed
+/// secp256k1 point.
+pub const PUBLIC_KEY_SIZE_IN_BYTES: usize = 65;
+
 /// Generates a new secp256k1 keypair for use with ECIES.
 ///
 /// # Arguments

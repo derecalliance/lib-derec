@@ -222,7 +222,7 @@ impl<
     /// [`DeRecProtocolBuilder::with_own_transports`](crate::protocol::DeRecProtocolBuilder::with_own_transports).
     /// A device serves at most one endpoint per protocol, so the list is a
     /// preference order over distinct protocols; see the
-    /// [`transport`](crate::transport) module docs.
+    /// [`transport`] module docs.
     ///
     /// Only mutates local state — to propagate the change to paired peers,
     /// follow up with [`DeRecFlow::UpdateChannelInfo`](crate::protocol::DeRecFlow::UpdateChannelInfo).

@@ -111,12 +111,17 @@ pub(crate) trait ContactMessageExt {
     /// `own` is outside the binding hash.
     ///
     /// Timestamp is stamped with the current wall-clock.
+    ///
+    /// # Errors
+    ///
+    /// [`PairingError::ContactMessageKeygen`] if either public key in `pk`
+    /// does not have the size the protocol fixes.
     fn hashed_keys(
         channel_id: ChannelId,
         nonce: u64,
         own: Vec<TransportProtocol>,
         pk: &PairingContactMessageMaterial,
-    ) -> ContactMessage;
+    ) -> Result<ContactMessage, Error>;
 
     /// Build a [`ContactMode::NoKeys`] [`ContactMessage`]: no key
     /// material and no commitment — only `channel_id`, `nonce`, and
@@ -238,15 +243,16 @@ impl ContactMessageExt for ContactMessage {
         nonce: u64,
         own: Vec<TransportProtocol>,
         pk: &PairingContactMessageMaterial,
-    ) -> ContactMessage {
+    ) -> Result<ContactMessage, Error> {
         let binding_hash = contact_binding_hash(
             &pk.mlkem_encapsulation_key,
             &pk.ecies_public_key,
             nonce,
             channel_id.into(),
-        );
+        )
+        .map_err(|source| PairingError::ContactMessageKeygen { source })?;
 
-        ContactMessage {
+        Ok(ContactMessage {
             channel_id: channel_id.into(),
             contact_mode: ContactMode::HashedKeys as i32,
             mlkem_encapsulation_key: None,
@@ -256,7 +262,7 @@ impl ContactMessageExt for ContactMessage {
             timestamp: Some(current_timestamp()),
             supported_transports: own,
             fingerprint_commitment: None,
-        }
+        })
     }
 
     fn no_keys(channel_id: ChannelId, nonce: u64, own: Vec<TransportProtocol>) -> ContactMessage {

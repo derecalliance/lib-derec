@@ -41,7 +41,7 @@ impl TransportPolicy {
     ///
     /// # Errors
     ///
-    /// [`Error::NoUsableEndpoint`](crate::Error::NoUsableEndpoint) when
+    /// [`Error::NoUsableEndpoint`] when
     /// nothing survives — including when the peer advertised nothing at all.
     /// Every caller treats an empty survivor set as fatal (there is nowhere
     /// to send the reply), which is why this returns `Result` rather than an

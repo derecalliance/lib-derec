@@ -299,6 +299,13 @@ public sealed record ReplicaDiscoveryParams;
 /// <see cref="SelfRemovedFromGroupEvent"/>. The secret survives on the
 /// remaining members and the helpers.
 /// </para>
+/// <para>
+/// Removal does not replace the group key, so it relies on the removed
+/// device's library deleting its copy. That covers a lost or stolen device
+/// whose storage was not read. Whoever read a device's storage keeps the group
+/// key and can decrypt every later publication it obtains, the one completing
+/// the removal included.
+/// </para>
 /// </remarks>
 public sealed record UnpairReplicaParams
 {

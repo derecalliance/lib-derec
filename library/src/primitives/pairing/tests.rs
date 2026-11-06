@@ -1766,6 +1766,26 @@ fn test_process_pre_pair_rejects_tampered_ecies_key() {
     ));
 }
 
+/// Moving the last byte of the ML-KEM key to the front of the ECIES key
+/// leaves the concatenation, and so the binding hash input, unchanged.
+#[test]
+fn test_process_pre_pair_rejects_keys_split_at_another_point() {
+    let (contact, mut response) = run_pre_pair_leg(ChannelId(42));
+
+    let mut mlkem = response.mlkem_encapsulation_key.take().unwrap();
+    let moved = mlkem.pop().unwrap();
+    let mut ecies = vec![moved];
+    ecies.extend(response.ecies_public_key.take().unwrap());
+    response.mlkem_encapsulation_key = Some(mlkem);
+    response.ecies_public_key = Some(ecies);
+
+    let result = process_pre_pair(&contact, &response);
+    assert!(matches!(
+        result,
+        Err(Error::Pairing(PairingError::PrePairHashMismatch))
+    ));
+}
+
 #[test]
 fn test_process_pre_pair_rejects_non_ok_status() {
     let (contact, mut response) = run_pre_pair_leg(ChannelId(42));
@@ -2895,7 +2915,8 @@ fn the_pair_response_reveals_the_nonce_the_contact_committed_to() {
         contact.mlkem_encapsulation_key.as_deref().unwrap(),
         contact.ecies_public_key.as_deref().unwrap(),
         &nonce,
-    );
+    )
+    .unwrap();
     assert_eq!(contact.fingerprint_commitment, Some(opened.to_vec()));
 }
 

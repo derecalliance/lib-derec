@@ -485,6 +485,35 @@ export function runPrimitivesSmoke(): void {
   );
   console.log(`  PrePair validated (mlkem=${validated.mlkem_encapsulation_key.length}B, ecies=${validated.ecies_public_key.length}B, nonce echoed)  ✓`);
 
+  // Moving the last byte of the ML-KEM key to the front of the ECIES key
+  // leaves the concatenated keys, and so the binding hash input, unchanged;
+  // the scanner refuses the split anyway.
+  {
+    const mlkem = prePairResp.mlkem_encapsulation_key!;
+    const ecies = prePairResp.ecies_public_key!;
+    const longer = new Uint8Array(ecies.length + 1);
+    longer[0] = mlkem[mlkem.length - 1]!;
+    longer.set(ecies, 1);
+    let splitRefused = false;
+    try {
+      primitives.pairing.response.process_pre_pair(hkContact.contact_message, {
+        ...prePairResp,
+        mlkem_encapsulation_key: mlkem.slice(0, mlkem.length - 1),
+        ecies_public_key: longer,
+      });
+    } catch (e) {
+      const code = String((e as { code: unknown }).code);
+      if (code !== "prepair_hash_mismatch") {
+        throw new Error(`process_pre_pair(keys split at another point): expected prepair_hash_mismatch, got ${code}`);
+      }
+      splitRefused = true;
+    }
+    if (!splitRefused) {
+      throw new Error("process_pre_pair must refuse keys split at another point");
+    }
+    console.log("  keys split at another point refused (prepair_hash_mismatch)  ✓");
+  }
+
 
   // Bob synthesizes a "filled-in" contact by copying the validated keys
   // into a clone of the HASHED_KEYS contact, then flips contact_mode to

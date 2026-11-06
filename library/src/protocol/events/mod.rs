@@ -241,7 +241,10 @@ pub enum PendingActionKind {
 ///   [`message_id`](crate::derec_message::message_id)), and rejecting a
 ///   contact update older than the last one accepted on the channel
 ///   needs the application to see each update, which this flag
-///   removes. Keep it `false` unless the transport rules both out.
+///   removes. Keep it `false` unless the transport rules both out. It
+///   also removes the owner's chance to refuse the repeated contact
+///   changes that let a helper read the vault through its compressed
+///   length; see the [`secret`](crate::protocol::types::secret) module.
 ///
 /// All other fields wrap routine request/response flows and have no
 /// caveats beyond "the caller decided not to gate them." Note that this
@@ -871,6 +874,20 @@ pub enum DeRecFlow {
     /// roster excluding it arrives, it drops its whole `secret_id` partition
     /// automatically and emits [`DeRecEvent::SelfRemovedFromGroup`]. The
     /// secret survives on the remaining members and the helpers.
+    ///
+    /// # Removal does not protect against a compromised device
+    ///
+    /// Every member holds the same group key, and removal does not replace
+    /// it. The remaining members keep publishing under it, and the roster that
+    /// completes the removal is itself sent to the removed member under it.
+    /// Removal therefore relies on the removed device's own library deleting
+    /// its copy. That covers a lost or stolen device whose storage was not
+    /// read. It does not cover a device whose storage was read: whoever read
+    /// it keeps the group key and can decrypt every later publication it
+    /// obtains, the one completing the removal included. Shared-key rotation
+    /// does not help either, since each key is derived from the one before.
+    /// Nothing recovers what such a device already copied, the secret
+    /// included.
     UnpairReplica {
         replica_id: u64,
         memo: Option<String>,
@@ -1278,6 +1295,10 @@ pub enum DeRecEvent {
     ///
     /// Fires on the members that remain. The departing device instead reports
     /// [`Self::SelfRemovedFromGroup`].
+    ///
+    /// The group key is unchanged, so a removed device whose storage was read
+    /// can still decrypt later publications; see
+    /// [`DeRecFlow::UnpairReplica`].
     ReplicaRemoved {
         /// The member that left or was evicted.
         replica_id: u64,
