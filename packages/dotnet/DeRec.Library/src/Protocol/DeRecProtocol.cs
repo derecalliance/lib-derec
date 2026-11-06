@@ -1583,7 +1583,9 @@ public sealed record RemoveExpiredChannelsPolicy(bool Enabled, ulong TimeoutInSe
 /// elapsed since the requests went out; on expiry each silent helper is
 /// reported as <c>RecoverSecretFailedEvent</c> with error <c>"timeout"</c>.
 /// The budget is a <b>human</b> one when helpers approve share requests by
-/// hand. Library default: 300s.
+/// hand. The same budget bounds a replica version check
+/// (<c>FlowKind.ReplicaDiscovery</c>): once it elapses, the check concludes on
+/// the versions already reported. Library default: 300s.
 /// </param>
 /// <param name="Pairing">
 /// How long a pairing stays possible: how old a contact may be when it is

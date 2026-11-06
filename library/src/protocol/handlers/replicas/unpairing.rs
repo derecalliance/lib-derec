@@ -17,7 +17,7 @@
 //! arrives that both omits it and post-dates the flag. [`reconcile`] and
 //! [`tear_down`] are the second half, driven from the sharing flow as each new
 //! roster lands.
-use super::flag_unpairing;
+use super::{flag_unpairing, load_member_keys};
 use crate::derec_message::apply_trace_id;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::primitives::unpairing::request;
@@ -25,7 +25,7 @@ use crate::protocol::context::Local;
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{
     ChannelQuery, ChannelRecord, ChannelStatus, HelperFilter, ReplicaFilter, ReplicaMember,
-    ReplicaRole, SecretValue,
+    ReplicaRole,
 };
 use crate::protocol::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
@@ -96,27 +96,20 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         None
     };
 
-    let group_channel = member.channel_id;
-    let key = match stores
-        .secrets
-        .load(secret_id, group_channel, SecretKind::SharedKey)
-        .await?
-    {
-        Some(SecretValue::SharedKey(k)) => k,
-        _ => {
-            return Err(Error::InvalidInput(
-                "channel has no shared key — not yet paired",
-            ));
-        }
-    };
-
     // Every member is told, the departing one included. The remaining members
     // need the flag to satisfy the safety rule when the new roster arrives;
     // without it they would be acting on absence alone.
+    let peers: Vec<ReplicaMember> = roster
+        .iter()
+        .filter(|m| m.replica_id.0 != own)
+        .cloned()
+        .collect();
+    let keys = load_member_keys(stores, local, &peers).await?;
     let memo = memo.unwrap_or_default();
     let mut notified = Vec::new();
-    for peer in roster.iter().filter(|m| m.replica_id.0 != own) {
-        let request = request::produce(peer.channel_id, &memo, &key, &[], Some(target.0))?;
+    for peer in &peers {
+        let key = &keys[&peer.channel_id];
+        let request = request::produce(peer.channel_id, &memo, key, &[], Some(target.0))?;
         let envelope = apply_trace_id(&request.envelope, trace_id)?;
         if stores
             .transport
@@ -345,13 +338,16 @@ async fn on_request<S: StoreSet>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::derec_message::extract_inner_message;
     use crate::protocol::tests::{InMemChannelStore, InMemSecretStore, StoreRig, run_async};
     use crate::protocol::tests::{LocalFixture, NoopTransport};
     use crate::protocol::types::{
         HelperChannel, HelperFilter, ReplicaFilter, SecretValue, UserSecrets,
     };
     use crate::protocol::{DeRecSecretStore, DeRecUserSecretStore};
-    use derec_proto::{Protocol, SenderKind, TransportProtocol};
+    use crate::types::SharedKey;
+    use derec_proto::{DeRecMessage, Protocol, SenderKind, TransportProtocol};
+    use prost::Message as _;
     use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0xDE9A27;
@@ -830,5 +826,86 @@ mod tests {
             );
             assert_eq!(role_of(&rig.channels, 1001).await, ReplicaRole::Source);
         });
+    }
+
+    /// A member that has just joined still talks on its pairing channel,
+    /// under that channel's key, until it is handed the group channel. Each
+    /// notice is sealed under the key of the channel it travels on, whichever
+    /// member is leaving, so every remaining member can read its own.
+    #[test]
+    fn each_notice_is_sealed_under_its_own_channel_key() {
+        const PAIRING: ChannelId = ChannelId(5002);
+        const GROUP_KEY: SharedKey = [7u8; 32];
+        const PAIRING_KEY: SharedKey = [0x22; 32];
+
+        for leaving in [1002, 1003] {
+            run_async(async {
+                let lf = LocalFixture::with_replica(SECRET_ID, 1001);
+                let mut rig = StoreRig::new();
+                seed_group_key(&mut rig.secrets).await;
+                rig.secrets
+                    .save(SECRET_ID, PAIRING, SecretValue::SharedKey(PAIRING_KEY))
+                    .await
+                    .expect("seed pairing key");
+                seed_member(
+                    &mut rig.channels,
+                    1001,
+                    ReplicaRole::Source,
+                    ChannelStatus::Paired,
+                )
+                .await;
+                seed_member(
+                    &mut rig.channels,
+                    1002,
+                    ReplicaRole::Destination,
+                    ChannelStatus::Paired,
+                )
+                .await;
+                rig.channels
+                    .save(
+                        SECRET_ID,
+                        ChannelRecord::Replica(ReplicaMember {
+                            channel_id: PAIRING,
+                            replica_id: ReplicaId(1003),
+                            transports: vec![endpoint("https://joiner.example")],
+                            communication_info: HashMap::new(),
+                            role: ReplicaRole::Destination,
+                            status: ChannelStatus::Paired,
+                            created_at: 0,
+                        }),
+                    )
+                    .await
+                    .expect("seed joiner");
+
+                super::start(&mut rig.stores(), &lf.local(), leaving, None, TRACE_ID)
+                    .await
+                    .expect("start");
+
+                let mut noticed = Vec::new();
+                for bytes in rig.transport.sent_envelopes() {
+                    let envelope =
+                        DeRecMessage::decode(bytes.as_slice()).expect("envelope decodes");
+                    let key = if envelope.channel_id == PAIRING.0 {
+                        PAIRING_KEY
+                    } else {
+                        GROUP_KEY
+                    };
+                    match extract_inner_message(&envelope.message, &key) {
+                        Ok(MessageBody::UnpairRequest(_)) => noticed.push(envelope.channel_id),
+                        Ok(_) => {}
+                        Err(e) => panic!(
+                            "removing {leaving}: the message on channel {} must open under that channel's key: {e}",
+                            envelope.channel_id
+                        ),
+                    }
+                }
+                noticed.sort_unstable();
+                assert_eq!(
+                    noticed,
+                    vec![GROUP.0, PAIRING.0],
+                    "removing {leaving}: both other members are told"
+                );
+            });
+        }
     }
 }

@@ -228,6 +228,21 @@ helpers on 0.0.10, and helpers need no upgrade.
   timestamp is refused, and a contact created before this version cannot be
   answered: create a new one.
 
+- **Fixed (security): a replica version check could hang, and a member could
+  miss a removal.** *(bug fix; every SDK)*
+
+  Until its fingerprint is confirmed and the group channel is handed over, a
+  member that has just joined talks on its own pairing channel, under that
+  channel's key, so for that window the group spans two channels and two
+  keys. `start(ReplicaDiscovery)` sealed every question under the key of the
+  first member in the roster, and `start(UnpairReplica)` sealed every notice
+  under the key of the member being removed, so a member on the other
+  channel could not read its message. Each message is now sealed under the
+  key of the channel it travels on. A version check also no longer waits
+  forever on a member that never answers: once `Timeouts::get_share_response`
+  (default 300 s) has elapsed, `tick` or the next `process` concludes it on
+  the versions already reported, with `ReplicaDiscoveryComplete`.
+
 ### 0.0.10
 
 A body naming a group member is accepted only on that member's own channel,

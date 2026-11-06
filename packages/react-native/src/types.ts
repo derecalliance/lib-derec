@@ -837,8 +837,10 @@ export interface Timeouts {
    *  recovery decides only once every helper it asked has answered or this
    *  has elapsed since the requests went out; each silent helper is then
    *  reported as `RecoverSecretFailed` with error `"timeout"`. The budget is
-   *  a **human** one when helpers approve share requests by hand. Library
-   *  default: 300. */
+   *  a **human** one when helpers approve share requests by hand. The same
+   *  budget bounds a replica version check (`FlowKind.ReplicaDiscovery`):
+   *  once it elapses, the check concludes on the versions already reported.
+   *  Library default: 300. */
   get_share_response_secs?: number;
   /** How long a pairing stays possible: how old a contact may be when it is
    *  scanned or answered, and how old a pairing request may be when it is

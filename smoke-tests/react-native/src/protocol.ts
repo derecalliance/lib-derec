@@ -3068,6 +3068,85 @@ async function runContactOnTheGroupChannelFlow(): Promise<void> {
 }
 
 /**
+ * A version check reaches each member under the key of the channel that
+ * member is recorded on, and concludes once its budget elapses even when a
+ * member never answers. A joiner whose fingerprint is not yet confirmed sits
+ * on its own pairing channel, so the group spans two channels and two keys.
+ * Mirrors `run_discovery_across_two_channels_flow` in
+ * `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runDiscoveryAcrossTwoChannelsFlow(): Promise<void> {
+  console.log("=== [Protocol] Replica Discovery Across Two Channels Flow ===\n");
+
+  const source: AddressedNode = {
+    node: makeNode("source", "https://source-two-channels.example.com", {
+      replicaId: 0x5050n,
+      timeouts: { get_share_response_secs: 1 },
+    }),
+    uri: "https://source-two-channels.example.com",
+  };
+  const dest: AddressedNode = {
+    node: makeNode("dest", "https://dest-two-channels.example.com", { replicaId: 0xd1d1n }),
+    uri: "https://dest-two-channels.example.com",
+  };
+  const joiner: AddressedNode = {
+    node: makeNode("joiner", "https://joiner-two-channels.example.com", { replicaId: 0xd3d3n }),
+    uri: "https://joiner-two-channels.example.com",
+  };
+  const completedOn = (events: DeRecEvent[], transient: string): string => {
+    const completed = events.find(
+      (e) => e.type === "PairingCompleted" && e.pairing_channel_id === transient,
+    ) as Extract<DeRecEvent, { type: "PairingCompleted" }> | undefined;
+    if (!completed) {
+      throw new Error(`the pairing on ${transient} completes: [${events.map((e) => e.type).join(", ")}]`);
+    }
+    return completed.channel_id;
+  };
+
+  await startReplicaScan(dest.node, source.node, 191n, SenderKind.ReplicaDestination);
+  const group = completedOn(await pumpAll([source, dest]), "191");
+  await crossConfirmFingerprint(source.node, dest.node, BigInt(group));
+  await pumpAll([source, dest]);
+  await assertProtects(source.node, "two channels", "Source");
+  await pumpAll([source, dest]);
+
+  await startReplicaScan(joiner.node, source.node, 192n, SenderKind.ReplicaDestination);
+  const joining = completedOn(await pumpAll([source, dest, joiner]), "192");
+  if (joining === group) {
+    throw new Error("the joiner must still be on its own pairing channel");
+  }
+  console.log("  group spans two channels: the destination on one, the joiner on another  ✓");
+
+  await source.node.protocol.start(FlowKind.ReplicaDiscovery);
+  const events = await pumpAll([source, dest, joiner]);
+  if (events.some((e) => e.type === "ReplicaDiscoveryComplete")) {
+    throw new Error(`the joiner's answer is still due: ${JSON.stringify(events)}`);
+  }
+  if ((await source.node.protocol.tick()).length !== 0) {
+    throw new Error("the check waits out its window");
+  }
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 2100));
+  const concluded = await source.node.protocol.tick();
+  const done = concluded[0];
+  if (concluded.length !== 1 || done?.type !== "ReplicaDiscoveryComplete") {
+    throw new Error(`expected ReplicaDiscoveryComplete: ${JSON.stringify(concluded)}`);
+  }
+  if (done.group_version === 0) {
+    throw new Error("the destination's answer must have been read");
+  }
+  if (done.local_version !== done.group_version || (done.fetched_from ?? null) !== null) {
+    throw new Error(`the group is level and nothing is fetched: ${JSON.stringify(done)}`);
+  }
+  if ((await source.node.protocol.tick()).length !== 0) {
+    throw new Error("the check is closed once concluded");
+  }
+  console.log("  the destination answered under its own key; the timeout closed the check  ✓");
+
+  console.log("\n✓ Replica discovery across two channels flow passed.\n");
+}
+
+/**
  * A pairing has a lifetime, `timeouts.pairing_secs`, and both sides enforce
  * it without sending anything: the scanner refuses an expired contact, and
  * the creator ignores a request on one and refuses a late accept. Pairing
@@ -4526,6 +4605,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runAbandonedReplicaPairingFlow();
   await runContactOnTheGroupChannelFlow();
   await runPairingExpiryFlow();
+  await runDiscoveryAcrossTwoChannelsFlow();
   await runUnpairingFlow();
   await runUpdateChannelInfoFlow();
   await runReplyToFlow();

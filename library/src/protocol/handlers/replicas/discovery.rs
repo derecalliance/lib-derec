@@ -9,7 +9,7 @@
 //! of catch-up. The owner↔helper side lives in
 //! [`handlers::discovery`](super::super::discovery), which routes here when
 //! the payload names an author.
-use super::load_channel_key;
+use super::{load_channel_key, load_member_keys};
 use crate::derec_message::{DeRecMessageBuilder, apply_trace_id, current_timestamp};
 use crate::extensions::advertised_endpoints::reply_to_owned;
 use crate::extensions::channel_store::{ChannelStoreExt as _, filter_reply_to};
@@ -36,6 +36,7 @@ use derec_proto::{
 use prost::Message as _;
 use std::collections::{HashMap, HashSet};
 use std::slice;
+use std::time::Duration;
 
 /// Handle a discovery message a group member authored.
 ///
@@ -114,8 +115,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         .map(|s| s.version)
         .unwrap_or(0);
 
-    let group_channel = peers[0].channel_id;
-    let key = load_channel_key(stores, local, group_channel).await?;
+    let keys = load_member_keys(stores, local, &peers).await?;
 
     let mut asked: HashSet<ReplicaId> = HashSet::new();
     for peer in &peers {
@@ -133,7 +133,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
             .timestamp(timestamp)
             .message_body(MessageBody::GetSecretIdsVersionsRequest(request))
             .trace_id(trace_id)
-            .encrypt(&key)?
+            .encrypt(&keys[&peer.channel_id])?
             .build()?
             .encode_to_vec();
 
@@ -300,6 +300,42 @@ async fn on_response<S: StoreSet>(
     finish(stores, local, local_version, &reported).await
 }
 
+/// Conclude a version check that has waited longer than `timeout`, on the
+/// versions already reported.
+///
+/// A member that never answers would otherwise hold the check open forever.
+/// A silent member contributes nothing to the outcome. The row is removed
+/// before the check concludes, so a store failure leaves it open for the next
+/// sweep rather than concluding it twice.
+pub(in crate::protocol) async fn conclude_if_expired<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    timeout: Duration,
+) -> Result<Vec<DeRecEvent>> {
+    let secret_id = local.secret_id;
+    let Some(StateItem::PendingReplicaDiscovery {
+        local_version,
+        reported,
+        started_at,
+        ..
+    }) = stores
+        .state
+        .load(secret_id, StateKey::PendingReplicaDiscovery)
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    if now_secs().saturating_sub(started_at) <= timeout.as_secs() {
+        return Ok(Vec::new());
+    }
+
+    stores
+        .state
+        .remove(secret_id, StateKey::PendingReplicaDiscovery)
+        .await?;
+    finish(stores, local, local_version, &reported).await
+}
+
 /// Choose the member holding the newest state and ask it, or report that this
 /// device is already current.
 async fn finish<S: StoreSet>(
@@ -400,6 +436,7 @@ async fn finish<S: StoreSet>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::derec_message::extract_inner_message;
     use crate::protocol::DeRecSecretStore;
     use crate::protocol::tests::LocalFixture;
     use crate::protocol::tests::{
@@ -422,14 +459,24 @@ mod tests {
     }
 
     use crate::protocol::DeRecChannelStore as _;
-    use derec_proto::{Protocol, TransportProtocol};
+    use derec_proto::{DeRecMessage, Protocol, TransportProtocol};
 
     async fn seed(channels: &mut InMemChannelStore, id: u64, role: ReplicaRole, uri: &str) {
+        seed_on(channels, GROUP, id, role, uri).await;
+    }
+
+    async fn seed_on(
+        channels: &mut InMemChannelStore,
+        channel_id: ChannelId,
+        id: u64,
+        role: ReplicaRole,
+        uri: &str,
+    ) {
         channels
             .save(
                 SECRET_ID,
                 ChannelRecord::Replica(ReplicaMember {
-                    channel_id: GROUP,
+                    channel_id,
                     replica_id: ReplicaId(id),
                     transports: vec![endpoint(uri)],
                     communication_info: HashMap::new(),
@@ -750,6 +797,72 @@ mod tests {
                 !sent.iter().any(|u| u == "https://alice-2"),
                 "the asker must not query itself, got {sent:?}"
             );
+        });
+    }
+
+    /// A member that has just joined still talks on its pairing channel,
+    /// under that channel's key, until it is handed the group channel. Each
+    /// question is sealed under the key of the channel it travels on, so the
+    /// joiner can read its own.
+    #[test]
+    fn each_question_is_sealed_under_its_own_channel_key() {
+        run_async(async {
+            const PAIRING: ChannelId = ChannelId(5002);
+            const GROUP_KEY: SharedKey = [0x11; 32];
+            const PAIRING_KEY: SharedKey = [0x22; 32];
+
+            let lf = LocalFixture::with_replica(SECRET_ID, 1001);
+            let mut rig = StoreRig::new();
+            seed(
+                &mut rig.channels,
+                1001,
+                ReplicaRole::Source,
+                "https://alice",
+            )
+            .await;
+            seed(
+                &mut rig.channels,
+                1002,
+                ReplicaRole::Destination,
+                "https://alice-2",
+            )
+            .await;
+            seed_on(
+                &mut rig.channels,
+                PAIRING,
+                1003,
+                ReplicaRole::Destination,
+                "https://alice-3",
+            )
+            .await;
+            seed_key(&mut rig.secrets).await;
+            rig.secrets
+                .save(SECRET_ID, PAIRING, SecretValue::SharedKey(PAIRING_KEY))
+                .await
+                .expect("seed pairing key");
+            seed_version(&mut rig.user_secrets, 5).await;
+
+            super::start(&mut rig.stores(), &lf.local(), TRACE_ID)
+                .await
+                .expect("start succeeds");
+
+            let sent = rig.transport.sent_envelopes();
+            assert_eq!(sent.len(), 2, "both other members are asked");
+            for bytes in sent {
+                let envelope = DeRecMessage::decode(bytes.as_slice()).expect("envelope decodes");
+                let key = if envelope.channel_id == PAIRING.0 {
+                    PAIRING_KEY
+                } else {
+                    GROUP_KEY
+                };
+                match extract_inner_message(&envelope.message, &key) {
+                    Ok(MessageBody::GetSecretIdsVersionsRequest(_)) => {}
+                    other => panic!(
+                        "the question on channel {} must open under that channel's key, got {other:?}",
+                        envelope.channel_id
+                    ),
+                }
+            }
         });
     }
 }

@@ -1573,6 +1573,83 @@ func runSupersededShareRequest() {
 	fmt.Println("Superseded share request test passed.")
 }
 
+// runDiscoveryAcrossTwoChannels: a version check reaches each member under
+// the key of the channel that member is recorded on, and concludes once its
+// budget elapses even when a member never answers. A joiner whose
+// fingerprint is not yet confirmed sits on its own pairing channel, so the
+// group spans two channels and two keys — mirroring
+// `run_discovery_across_two_channels_flow` in smoke-tests/rust/src/protocol.rs.
+func runDiscoveryAcrossTwoChannels() {
+	fmt.Println("=== Protocol replica discovery across two channels test ===")
+
+	sourceID, destID, joinerID := uint64(0x5050), uint64(0xD1D1), uint64(0xD3D3)
+	source, err := newPeerWithConfig("source", "https://source-two-channels.example.com", protocol.Config{
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold: proto.Uint32(2),
+			ReplicaID: &sourceID,
+			Timeouts:  &protocol.Timeouts{GetShareResponseSecs: proto.Uint64(1)},
+		},
+	})
+	must(err, "protocol.New(source)")
+	defer source.proto.Close()
+	dest := newPeerWithReplicaID("dest", "https://dest-two-channels.example.com", 2, &destID)
+	joiner := newPeerWithReplicaID("joiner", "https://joiner-two-channels.example.com", 2, &joinerID)
+	defer dest.proto.Close()
+	defer joiner.proto.Close()
+
+	pairingCompleted := func(events []protocol.Event, transient uint64) uint64 {
+		for _, ev := range events {
+			if ev.Type == protocol.EventTypePairingCompleted && ev.PairingChannelID == transient {
+				return ev.ChannelID
+			}
+		}
+		fail("the pairing on %d must complete, got %+v", transient, events)
+		return 0
+	}
+
+	startReplicaScan(dest, source, 191, protocol.SenderKindReplicaDestination)
+	group := pairingCompleted(append(pump(dest, source), pump(source, dest)...), 191)
+	crossConfirmFingerprint(source, dest, group)
+	pumpMany([]*peer{source, dest})
+	assertProtects(source, "two channels")
+	pumpMany([]*peer{source, dest})
+
+	startReplicaScan(joiner, source, 192, protocol.SenderKindReplicaDestination)
+	joining := pairingCompleted(append(pump(joiner, source), pump(source, joiner)...), 192)
+	pumpMany([]*peer{source, dest, joiner})
+	assertTrue(joining != group, "the joiner must still be on its own pairing channel")
+	fmt.Println("  group spans two channels: the destination on one, the joiner on another  ✓")
+
+	_, err = source.proto.Start(protocol.FlowKindReplicaDiscovery, nil)
+	must(err, "source.Start(ReplicaDiscovery)")
+	for _, ev := range pumpMany([]*peer{source, dest, joiner}) {
+		assertTrue(ev.Type != protocol.EventTypeReplicaDiscoveryComplete,
+			"the joiner's answer is still due, got %+v", ev)
+	}
+	early, err := source.proto.Tick()
+	must(err, "source.Tick()")
+	assertTrue(len(early) == 0, "the check waits out its window, got %+v", early)
+
+	time.Sleep(2100 * time.Millisecond)
+	concluded, err := source.proto.Tick()
+	must(err, "source.Tick()")
+	assertTrue(len(concluded) == 1 && concluded[0].Type == protocol.EventTypeReplicaDiscoveryComplete,
+		"expected ReplicaDiscoveryComplete, got %+v", concluded)
+	done := concluded[0]
+	assertTrue(done.GroupVersion != nil && *done.GroupVersion > 0,
+		"the destination's answer must have been read, got %+v", done)
+	assertTrue(done.LocalVersion != nil && *done.LocalVersion == *done.GroupVersion,
+		"the group is level, got %+v", done)
+	assertTrue(done.FetchedFrom == nil, "nothing is fetched, got %+v", done)
+	after, err := source.proto.Tick()
+	must(err, "source.Tick()")
+	assertTrue(len(after) == 0, "the check is closed once concluded, got %+v", after)
+	fmt.Println("  the destination answered under its own key; the timeout closed the check  ✓")
+
+	fmt.Println("Protocol replica discovery across two channels test passed.")
+	fmt.Println()
+}
+
 // runPairingExpiry: a pairing has a lifetime, timeouts.pairing_secs, and
 // both sides enforce it without sending anything. The scanner refuses an
 // expired contact, and the creator ignores a request on one and refuses a

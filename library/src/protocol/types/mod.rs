@@ -235,6 +235,10 @@ pub struct Timeouts {
     /// on the shares it holds. The budget is a **human** one when Helpers
     /// approve share requests by hand.
     ///
+    /// The same budget bounds a replica version check
+    /// ([`DeRecFlow::ReplicaDiscovery`](crate::protocol::DeRecFlow::ReplicaDiscovery)):
+    /// once it elapses, the check concludes on the versions already reported.
+    ///
     /// Default: **300 seconds**.
     pub get_share_response: Duration,
     /// How long a pairing stays possible: how old a contact may be when it is

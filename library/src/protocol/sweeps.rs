@@ -12,6 +12,7 @@
 use super::DeRecProtocol;
 use super::context::local;
 use super::events::DeRecEvent;
+use super::handlers::replicas::discovery;
 use super::handlers::{recovery, unpairing};
 use super::stores::borrow_stores;
 use super::traits::{
@@ -85,7 +86,9 @@ impl<
     ///    [`Timeouts::get_share_response`](crate::protocol::types::Timeouts::get_share_response)
     ///    reports each silent helper as [`DeRecEvent::RecoverSecretFailed`]
     ///    and decides on the shares it holds.
-    /// 5. The round tally, which is what turns a fully-drained round into
+    /// 5. Replica version-check timeouts — a check still waiting on a member
+    ///    past the same budget concludes on the versions already reported.
+    /// 6. The round tally, which is what turns a fully-drained round into
     ///    [`DeRecEvent::SharingComplete`] and clears its state row. Step 2
     ///    only marks the participants; without this the round would report
     ///    failures and still never close.
@@ -351,7 +354,26 @@ impl<
         let mut events = self.check_sharing_round_timeouts().await;
         events.append(&mut self.check_unpair_timeouts().await);
         events.append(&mut self.check_recovery_timeouts().await);
+        events.append(&mut self.check_replica_discovery_timeout().await);
         events
+    }
+
+    /// Conclude a replica version check whose members have stayed silent
+    /// longer than
+    /// [`Timeouts::get_share_response`](crate::protocol::types::Timeouts::get_share_response),
+    /// on the versions already reported.
+    async fn check_replica_discovery_timeout(&mut self) -> Vec<DeRecEvent> {
+        let timeout = self.timeouts.get_share_response;
+        let concluded =
+            discovery::conclude_if_expired(&mut borrow_stores!(self), &local!(self), timeout).await;
+        #[cfg(feature = "logging")]
+        if let Err(error) = &concluded {
+            tracing::warn!(
+                error = %error,
+                "replica discovery: concluding the timed-out check failed"
+            );
+        }
+        concluded.unwrap_or_default()
     }
 
     /// Close every recovery whose share requests have waited longer than
@@ -2079,6 +2101,90 @@ mod sharing_round_outcome_tests {
                     .expect("load")
                     .is_some(),
                 "a Helper's answer is still due"
+            );
+        });
+    }
+
+    /// A version check whose members go quiet still concludes. Past
+    /// `get_share_response`, `tick` closes it on the versions already
+    /// reported; a member that never answered contributes nothing.
+    #[test]
+    fn tick_concludes_a_discovery_whose_members_went_silent() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeouts.get_share_response = Duration::from_secs(60);
+
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingReplicaDiscovery {
+                        local_version: 3,
+                        pending: HashSet::from([ReplicaId(1003)]),
+                        reported: HashMap::from([(ReplicaId(1002), 2)]),
+                        started_at: now_secs().saturating_sub(600),
+                    },
+                )
+                .await
+                .expect("seed pending discovery");
+
+            let events = protocol.tick().await;
+
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [DeRecEvent::ReplicaDiscoveryComplete {
+                        local_version: 3,
+                        group_version: 2,
+                        fetched_from: None,
+                    }]
+                ),
+                "got {events:?}"
+            );
+            assert!(
+                protocol
+                    .state_store
+                    .load(SECRET_ID, StateKey::PendingReplicaDiscovery)
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "the check is closed"
+            );
+        });
+    }
+
+    /// A version check still inside its window survives a `tick`.
+    #[test]
+    fn tick_leaves_a_recent_discovery_open() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeouts.get_share_response = Duration::from_secs(600);
+
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingReplicaDiscovery {
+                        local_version: 3,
+                        pending: HashSet::from([ReplicaId(1003)]),
+                        reported: HashMap::new(),
+                        started_at: now_secs(),
+                    },
+                )
+                .await
+                .expect("seed pending discovery");
+
+            let events = protocol.tick().await;
+
+            assert!(events.is_empty(), "got {events:?}");
+            assert!(
+                protocol
+                    .state_store
+                    .load(SECRET_ID, StateKey::PendingReplicaDiscovery)
+                    .await
+                    .expect("load")
+                    .is_some(),
+                "a member's answer is still due"
             );
         });
     }

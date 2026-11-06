@@ -813,6 +813,12 @@ pub enum DeRecFlow {
     /// mechanism and the application chooses when to run it (a user action, a
     /// timer, app start). Concludes with [`DeRecEvent::ReplicaDiscoveryComplete`],
     /// plus the usual hydration event when a fetch actually happened.
+    ///
+    /// The check concludes once every member asked has answered, or once
+    /// [`Timeouts::get_share_response`](crate::protocol::types::Timeouts::get_share_response)
+    /// has elapsed, on whatever was reported by then: a member that never
+    /// answers contributes nothing. Only [`DeRecProtocol::tick`](crate::protocol::DeRecProtocol::tick)
+    /// or a later `process` notices the elapsed budget.
     ReplicaDiscovery,
     /// Remove a member from the replica group.
     ///

@@ -102,6 +102,7 @@ internal static class Protocol
         RunAbandonedReplicaPairingTest();
         RunContactOnTheGroupChannelTest();
         RunPairingExpiryTest();
+        RunDiscoveryAcrossTwoChannelsTest();
         RunOrchestratorUnpairingFlowTest();
         RunOrchestratorUpdateChannelInfoFlowTest();
         RunOrchestratorReplyToFlowTest();
@@ -2833,6 +2834,67 @@ internal static class Protocol
         Console.WriteLine("  expired pairing on the group channel leaves the group key  ✓");
 
         Console.WriteLine("Orchestrator contact on the group channel test passed.\n");
+    }
+
+    /// <summary>
+    /// A version check reaches each member under the key of the channel that
+    /// member is recorded on, and concludes once its budget elapses even when
+    /// a member never answers. A joiner whose fingerprint is not yet
+    /// confirmed sits on its own pairing channel, so the group spans two
+    /// channels and two keys. Mirrors
+    /// <c>run_discovery_across_two_channels_flow</c> in
+    /// <c>smoke-tests/rust/src/protocol.rs</c>.
+    /// </summary>
+    private static void RunDiscoveryAcrossTwoChannelsTest()
+    {
+        Console.WriteLine("=== Orchestrator replica discovery across two channels test ===");
+
+        const string sourceUri = "https://source-two-channels.example.com";
+        const string destUri = "https://dest-two-channels.example.com";
+        const string joinerUri = "https://joiner-two-channels.example.com";
+        using var source = MakeNode("source", sourceUri, new NodeOptions(
+            ReplicaId: 0x5050UL,
+            Timeouts: new Timeouts(GetShareResponse: TimeSpan.FromSeconds(1))));
+        using var dest = MakeNode("dest", destUri, new NodeOptions(ReplicaId: 0xD1D1UL));
+        using var joiner = MakeNode("joiner", joinerUri, new NodeOptions(ReplicaId: 0xD3D3UL));
+        var pair = new[] { (source, sourceUri), (dest, destUri) };
+        var all = new[] { (source, sourceUri), (dest, destUri), (joiner, joinerUri) };
+
+        StartReplicaScan(dest, source, 191UL, Pairing.SenderKind.ReplicaDestination);
+        ulong group = PumpAll(pair).OfType<PairingCompletedEvent>().First().ChannelId;
+        CrossConfirmFingerprint(source, dest, group);
+        PumpAll(pair);
+        AssertProtects(source, "two channels");
+        PumpAll(pair);
+
+        StartReplicaScan(joiner, source, 192UL, Pairing.SenderKind.ReplicaDestination);
+        ulong joining = PumpAll(all).OfType<PairingCompletedEvent>().First().ChannelId;
+        if (joining == group)
+            throw new InvalidOperationException("the joiner must still be on its own pairing channel");
+        Console.WriteLine("  group spans two channels: the destination on one, the joiner on another  ✓");
+
+        source.Protocol.StartAsync(FlowKind.ReplicaDiscovery, new ReplicaDiscoveryParams())
+            .GetAwaiter().GetResult();
+        if (PumpAll(all).OfType<ReplicaDiscoveryCompleteEvent>().Any())
+            throw new InvalidOperationException("the joiner's answer is still due");
+        if (source.Protocol.TickAsync().GetAwaiter().GetResult().Count != 0)
+            throw new InvalidOperationException("the check waits out its window");
+
+        Thread.Sleep(TimeSpan.FromMilliseconds(2100));
+        var concluded = source.Protocol.TickAsync().GetAwaiter().GetResult();
+        if (concluded.Count != 1 || concluded[0] is not ReplicaDiscoveryCompleteEvent done)
+            throw new InvalidOperationException(
+                $"expected ReplicaDiscoveryComplete; got [{string.Join(", ", concluded.Select(e => e.EventType))}]");
+        if (done.GroupVersion == 0)
+            throw new InvalidOperationException("the destination's answer must have been read");
+        if (done.LocalVersion != done.GroupVersion || done.FetchedFrom is not null)
+            throw new InvalidOperationException(
+                $"the group is level and nothing is fetched; got local {done.LocalVersion}, group {done.GroupVersion}, from {done.FetchedFrom}");
+        if (source.Protocol.TickAsync().GetAwaiter().GetResult().Count != 0)
+            throw new InvalidOperationException("the check is closed once concluded");
+        Console.WriteLine("  the destination answered under its own key; the timeout closed the check  ✓");
+
+        Console.WriteLine("Orchestrator replica discovery across two channels test passed.\n");
     }
 
     /// <summary>

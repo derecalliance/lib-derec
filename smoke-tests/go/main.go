@@ -47,6 +47,7 @@ func main() {
 	runAbandonedReplicaPairing()
 	runContactOnTheGroupChannel()
 	runPairingExpiry()
+	runDiscoveryAcrossTwoChannels()
 	runFingerprintMismatch()
 	runNoKeysFingerprintMismatch()
 	runExpiredPendingPairingLosesItsKey()

@@ -27,9 +27,12 @@ pub(in crate::protocol) mod unpairing;
 use crate::protocol::context::Local;
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{ChannelRecord, ChannelStatus, ReplicaMember};
-use crate::protocol::{DeRecChannelStore, DeRecSecretStore, SecretKind, SecretValue};
+use crate::protocol::{
+    DeRecChannelStore, DeRecSecretStore, MissingPolicy, SecretKind, SecretValue,
+};
 use crate::types::{ChannelId, SharedKey};
 use crate::{Error, Result};
+use std::collections::HashMap;
 
 /// The group key a member encrypts with on `channel_id`.
 async fn load_channel_key<S: StoreSet>(
@@ -47,6 +50,40 @@ async fn load_channel_key<S: StoreSet>(
             "channel has no shared key — not yet paired",
         )),
     }
+}
+
+/// The key of every channel `members` are recorded on.
+///
+/// Members of a group converge on one channel and one key, but a member that
+/// has just joined still talks on its pairing channel until it is handed the
+/// group channel, so a message to each member is sealed under the key of that
+/// member's own channel.
+async fn load_member_keys<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    members: &[ReplicaMember],
+) -> Result<HashMap<ChannelId, SharedKey>> {
+    let mut channel_ids: Vec<ChannelId> = Vec::new();
+    for member in members {
+        if !channel_ids.contains(&member.channel_id) {
+            channel_ids.push(member.channel_id);
+        }
+    }
+    Ok(stores
+        .secrets
+        .load_many(
+            local.secret_id,
+            &channel_ids,
+            SecretKind::SharedKey,
+            MissingPolicy::Fail,
+        )
+        .await?
+        .into_iter()
+        .filter_map(|(channel_id, value)| match value {
+            SecretValue::SharedKey(key) => Some((channel_id, key)),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Mark a member as told-to-leave, preserving everything else about the row.

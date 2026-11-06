@@ -142,7 +142,9 @@ type Timeouts struct {
 	// asked has answered or this has elapsed since the requests went out; on
 	// expiry each silent helper is reported as RecoverSecretFailed and the
 	// recovery settles on the shares it holds. The budget is a human one
-	// when helpers approve share requests by hand. Default: 300.
+	// when helpers approve share requests by hand. The same budget bounds a
+	// replica version check (FlowKindReplicaDiscovery): once it elapses, the
+	// check concludes on the versions already reported. Default: 300.
 	GetShareResponseSecs *uint64 `json:"get_share_response_secs,omitempty"`
 	// PairingSecs bounds how long a pairing stays possible: how old a
 	// contact may be when it is scanned or answered, and how old a pairing

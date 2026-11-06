@@ -88,6 +88,7 @@ pub async fn run_all() {
     run_start_pairing_rejects_already_paired_channel().await;
     run_pairing_rejects_incompatible_parameter_range().await;
     run_pairing_expiry_flow().await;
+    run_discovery_across_two_channels_flow().await;
     run_expired_channel_cleanup_flow().await;
     run_expired_pending_pairing_loses_its_key_flow().await;
     run_own_transport_set_rules().await;
@@ -742,6 +743,36 @@ impl Peer {
             .with_state_store(InMemoryStateStore::default())
             .with_own_transports([uri])
             .with_threshold(2)
+            .with_timeouts(timeouts)
+            .build()
+            .expect("test fixture: builder.build() should succeed");
+        Self {
+            label,
+            uri: uri.to_owned(),
+            protocol,
+            transport,
+        }
+    }
+
+    /// Build a replica-capable peer with `timeouts` in place of the defaults.
+    fn with_replica_and_timeouts(
+        label: &'static str,
+        uri: &str,
+        secret_id: u64,
+        replica_id: u64,
+        timeouts: Timeouts,
+    ) -> Self {
+        let transport = InProcessTransport::new();
+        let protocol = DeRecProtocolBuilder::new(secret_id)
+            .with_channel_store(InMemoryChannelStore::default())
+            .with_share_store(InMemoryShareStore::default())
+            .with_secret_store(InMemorySecretStore::default())
+            .with_user_secret_store(InMemoryUserSecretStore::default())
+            .with_transport(transport.clone())
+            .with_state_store(InMemoryStateStore::default())
+            .with_own_transports([uri])
+            .with_threshold(2)
+            .with_replica_id(replica_id)
             .with_timeouts(timeouts)
             .build()
             .expect("test fixture: builder.build() should succeed");
@@ -7328,6 +7359,117 @@ async fn scan_as_owner(
             peer_communication_info: HashMap::new(),
         })
         .await
+}
+
+/// A version check reaches each member under the key of the channel that
+/// member is recorded on, and concludes once its budget elapses even when a
+/// member never answers.
+///
+/// A joiner whose fingerprint is not yet confirmed sits on its own pairing
+/// channel, so for that window the group spans two channels and two keys.
+/// The destination on the group channel must read its question and report
+/// its version; the joiner never answers, so the check concludes on the
+/// timeout, carrying the version the destination reported.
+async fn run_discovery_across_two_channels_flow() {
+    println!("=== Protocol replica discovery across two channels flow ===");
+
+    let sid = 0xD15Cu64;
+    let mut source = Peer::with_replica_and_timeouts(
+        "source",
+        "https://source.example.com",
+        sid,
+        0x5050_5050_5050_5050,
+        Timeouts {
+            get_share_response: Duration::from_secs(1),
+            ..Default::default()
+        },
+    );
+    let mut dest = Peer::with_options(
+        "dest",
+        "https://dest.example.com",
+        2,
+        false,
+        Some(0xD1D1_D1D1_D1D1_D1D1),
+        sid,
+    );
+    let mut joiner = Peer::with_options(
+        "joiner",
+        "https://joiner.example.com",
+        2,
+        false,
+        Some(0xD3D3_D3D3_D3D3_D3D3),
+        sid,
+    );
+
+    let group = pair_replica_handshake(&mut source, &mut dest, ChannelId(191)).await;
+    cross_confirm_fingerprint(&mut source, &mut dest, group).await;
+    pump_many(&mut [&mut source, &mut dest]).await;
+    source
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![0x19],
+                name: "two channels".to_owned(),
+                data: b"one group, two keys".to_vec(),
+            }],
+            description: None,
+            weights: HashMap::new(),
+            threshold: None,
+        })
+        .await
+        .expect("source start(ProtectSecret) failed");
+    pump_many(&mut [&mut source, &mut dest]).await;
+
+    let joining = pair_replica_handshake(&mut source, &mut joiner, ChannelId(192)).await;
+    pump_many(&mut [&mut source, &mut dest, &mut joiner]).await;
+    assert_ne!(
+        joining, group,
+        "the joiner must still be on its own pairing channel"
+    );
+    println!("  group spans two channels: the destination on one, the joiner on another  ✓");
+
+    source
+        .protocol
+        .start(DeRecFlow::ReplicaDiscovery)
+        .await
+        .expect("source start(ReplicaDiscovery) failed");
+    let events = pump_many(&mut [&mut source, &mut dest, &mut joiner]).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::ReplicaDiscoveryComplete { .. })),
+        "the joiner's answer is still due: {events:?}"
+    );
+    assert!(
+        source.protocol.tick().await.is_empty(),
+        "the check waits out its window"
+    );
+
+    thread::sleep(Duration::from_millis(2100));
+    let concluded = source.protocol.tick().await;
+    match concluded.as_slice() {
+        [
+            DeRecEvent::ReplicaDiscoveryComplete {
+                local_version,
+                group_version,
+                fetched_from: None,
+            },
+        ] => {
+            assert!(
+                *group_version > 0,
+                "the destination's answer must have been read"
+            );
+            assert_eq!(group_version, local_version, "the group is level");
+        }
+        other => panic!("expected ReplicaDiscoveryComplete, got {other:?}"),
+    }
+    assert!(
+        source.protocol.tick().await.is_empty(),
+        "the check is closed once concluded"
+    );
+    println!("  the destination answered under its own key; the timeout closed the check  ✓");
+
+    println!("Protocol replica discovery across two channels flow test passed.");
 }
 
 async fn run_expired_channel_cleanup_flow() {
