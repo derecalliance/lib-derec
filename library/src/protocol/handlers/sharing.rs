@@ -1081,10 +1081,13 @@ fn build_replicas(
 
     let members: Vec<ReplicaInfo> = roster
         .iter()
-        // A member told to leave is already out of the group as far as the
-        // published roster is concerned. Its absence here is what completes
-        // the removal on every recipient.
-        .filter(|member| member.status != ChannelStatus::Unpairing)
+        // Only confirmed members are published. Every recipient installs
+        // what it is sent as `Paired`, so listing a member whose pairing this
+        // device has not confirmed would admit it on their behalf. A member
+        // told to leave is already out of the group as far as the roster is
+        // concerned: its absence here is what completes the removal on every
+        // recipient.
+        .filter(|member| member.status == ChannelStatus::Paired)
         .map(|member| ReplicaInfo {
             replica_id: member.replica_id.0,
             transports: member.transports.clone(),
@@ -3817,6 +3820,99 @@ mod group_conformance_tests {
                 ],
             );
         });
+    }
+
+    /// A member whose pairing this device has not confirmed is not part of
+    /// the group yet. A roster that listed it would have every recipient
+    /// install it as `Paired`.
+    #[test]
+    fn a_catch_up_roster_leaves_out_an_unconfirmed_member() {
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, 1002);
+            let mut rig = StoreRig::new();
+            seed_member(&mut rig.channels, 1002, ReplicaRole::Source, "https://self").await;
+            seed_member(
+                &mut rig.channels,
+                1003,
+                ReplicaRole::Destination,
+                "https://alice-3",
+            )
+            .await;
+            seed_unconfirmed_joiner(&mut rig.channels, 1004).await;
+            seed_group_key(&mut rig.secrets).await;
+            seed_helper_and_snapshot(&mut rig, 4, None).await;
+
+            let payload = super::build_catch_up_payload(&mut rig.stores(), &lf.local())
+                .await
+                .expect("catch-up payload")
+                .expect("a device holding a snapshot must serve one");
+
+            let mut listed: Vec<u64> = payload
+                .secret
+                .and_then(|s| s.replicas)
+                .expect("roster is present")
+                .members
+                .iter()
+                .map(|m| m.replica_id)
+                .collect();
+            listed.sort();
+            assert_eq!(listed, vec![1002, 1003]);
+        });
+    }
+
+    /// The vault a publish round splits is built the same way, so it leaves
+    /// out an unconfirmed member too.
+    #[test]
+    fn a_published_roster_leaves_out_an_unconfirmed_member() {
+        run_async(async {
+            let mut rig = StoreRig::new();
+            seed_member(&mut rig.channels, 1002, ReplicaRole::Source, "https://self").await;
+            seed_unconfirmed_joiner(&mut rig.channels, 1004).await;
+            let roster = rig
+                .channels
+                .replicas(SECRET_ID, ReplicaFilter::default())
+                .await
+                .expect("roster");
+
+            let secret = super::build_secret(
+                &[],
+                &roster,
+                Vec::new(),
+                Some(GROUP_CHANNEL),
+                Some([0x42; 32]),
+                None,
+            )
+            .expect("secret builds");
+
+            let listed: Vec<u64> = secret
+                .replicas
+                .expect("roster is present")
+                .members
+                .iter()
+                .map(|m| m.replica_id)
+                .collect();
+            assert_eq!(listed, vec![1002]);
+        });
+    }
+
+    /// A joiner whose handshake finished but whose fingerprint this device
+    /// has not confirmed: still `Pending`, on its own pairing channel.
+    async fn seed_unconfirmed_joiner(channels: &mut InMemChannelStore, replica_id: u64) {
+        channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Replica(ReplicaMember {
+                    channel_id: ChannelId(5002),
+                    replica_id: ReplicaId(replica_id),
+                    transports: vec![endpoint("https://joiner")],
+                    communication_info: HashMap::new(),
+                    role: ReplicaRole::Destination,
+                    status: ChannelStatus::Pending,
+                    created_at: 0,
+                }),
+            )
+            .await
+            .expect("seed joiner");
     }
 
     /// A member with no tracking rows serves a map-less answer rather than

@@ -1187,7 +1187,7 @@ impl DeRecTransport for JsTransport {
                 .map_err(|_| Error::InvalidInput("transport.send call failed"))?;
             resolve_promise(promise_val)
                 .await
-                .map_err(|_| Error::InvalidInput("transport.send promise rejected"))?;
+                .map_err(|_| Error::TransportSendFailed)?;
             Ok(())
         })
     }

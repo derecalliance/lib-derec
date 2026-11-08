@@ -683,7 +683,7 @@ Reference: the repository's end-to-end tests drive a complete Owner + two Helper
 
 ## Package Layout
 
-- [`derec`](derec/) — the shared error vocabulary: `derec.Error` (`Category`, `Code`, `Message`, `PeerStatus`, `PeerMemo`, `Expected`, `Got`, plus `CategoryName()`/`CodeName()` returning the library's stable names) and the `Category*`/`Code*` constants every fallible call can return; and `derec.CurrentProtocolVersion()`, the core's protocol version for audit logs.
+- [`derec`](derec/) — the shared error vocabulary: `derec.Error` (`Category`, `Code`, `Message`, `PeerStatus`, `PeerMemo`, `Expected`, `Got`, `ConflictingChannelIDs`, `ChannelID` — the channel the error is about, set for `CodeChannelAlreadyPaired`, `CodeFingerprintMismatch` and `CodeRoleMismatch` and on a failed `Process` — plus `CategoryName()`/`CodeName()` returning the library's stable names) and the `Category*`/`Code*` constants every fallible call can return; and `derec.CurrentProtocolVersion()`, the core's protocol version for audit logs.
 - [`derecpb`](derecpb/) — generated protobuf Go types for the DeRec wire messages (`TransportProtocol`, `CommunicationInfo`, `ContactMessage`, …).
 - [`primitives`](primitives/) — one package per flow (`pairing`, `sharing`, `verification`, `recovery`, `discovery`, `unpairing`, `envelope`), each exposing stateless `Request`/`Response` produce/extract/process functions operating on raw bytes.
 - [`protocol`](protocol/) — the stateful `DeRecProtocol` orchestrator, its six store interfaces, `Config`, `FlowKind`/`ContactMode` constants, and the `Event` type.
@@ -714,32 +714,15 @@ Replica channels are created `Pending` and remain there until both sides call `V
 
 Until a device confirms, it ignores everything the peer sends on that channel: `Process` changes no store, sends nothing back, and returns an event with `Type == EventTypeMessageIgnored` and `Reason == IgnoreReasonPendingVerification`, plus `ChannelID` and `TraceID`. This matters most for a replica destination. The source's own confirmation publishes the vault immediately, so that copy usually arrives before the destination's user has confirmed. Confirming does not replay it: once the destination's `VerifyFingerprint` returns `true`, call `Start(FlowKindReplicaDiscovery, nil)` to pull the copy from the source.
 
+Until a device confirms a member, that member is not part of the group as far as the device is concerned. It is left out of every roster the device publishes (each new version, catch-up answers and the vault itself), it is not asked in a replica version check, and it cannot succeed a removed source. Every recipient installs a roster's members as paired, so listing an unconfirmed one would admit it on their behalf.
+
 ### Every helper sees the vault's compressed length
 
-The vault (the user's secrets, every helper's channel key and
-`CommunicationInfo`, and the replica group key) is compressed as one gzip stream
-before it is encrypted and split. Encryption keeps the length, so every
-helper learns the compressed length of every version. A helper also chooses
-part of what is compressed: its own `CommunicationInfo`, which it changes with
-`UpdateChannelInfo`. When that text repeats part of a secret elsewhere in
-the vault, the vault compresses better, so over many versions a corrupted
-helper could learn another helper's channel key, the group key or the
-user's secrets a few characters at a time (the side channel behind CRIME
-and BREACH). Each guess costs a new version, which only the owner creates,
-after a contact change the owner's application has to accept. Keep `AutoAcceptPolicy.UpdateChannelInfo`
-off, and treat a helper that keeps changing its contact details as suspect.
+The vault (the user's secrets, every helper's channel key and `CommunicationInfo`, and the replica group key) is compressed as one gzip stream before it is encrypted and split. Encryption keeps the length, so every helper learns the compressed length of every version. A helper also chooses part of what is compressed: its own `CommunicationInfo`, which it changes with `UpdateChannelInfo`. When that text repeats part of a secret elsewhere in the vault, the vault compresses better, so over many versions a corrupted helper could learn another helper's channel key, the group key or the user's secrets a few characters at a time (the side channel behind CRIME and BREACH). Each guess costs a new version, which only the owner creates, after a contact change the owner's application has to accept. Keep `AutoAcceptPolicy.UpdateChannelInfo` off, and treat a helper that keeps changing its contact details as suspect.
 
 ### Decoding a recovered vault has no memory limit
 
-In recovery the vault is decrypted from shares that nothing authenticates,
-so a forged recovery group can deliver any payload, including one built to
-exhaust memory. The decoder parses the vault while it inflates it: a
-payload that is not JSON is refused after its first bytes, and padding is
-not buffered. A payload that is valid JSON still receives the memory its
-largest value claims, and gzip lets a payload claim up to about 1030 times
-its own size. The library sets no limit. When memory runs out, the process is killed by the operating system or aborts inside the native library, with no error and no event. To bound it, configure
-`ParameterRange.MaxShareSize`: a recovery share larger than that is refused before anything is
-decoded, so a vault can claim at most about 1030 times that size.
+In recovery the vault is decrypted from shares that nothing authenticates, so a forged recovery group can deliver any payload, including one built to exhaust memory. The decoder parses the vault while it inflates it: a payload that is not JSON is refused after its first bytes, and padding is not buffered. A payload that is valid JSON still receives the memory its largest value claims, and gzip lets a payload claim up to about 1030 times its own size. The library sets no limit. When memory runs out, the process is killed by the operating system or aborts inside the native library, with no error and no event. To bound it, configure `ParameterRange.MaxShareSize`: a recovery share larger than that is refused before anything is decoded, so a vault can claim at most about 1030 times that size.
 
 ### The `derec.*` `communicationInfo` namespace is library-owned
 

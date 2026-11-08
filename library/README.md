@@ -2677,6 +2677,13 @@ confirmed. Confirming does not replay it: once the destination's
 `verify_fingerprint` succeeds, call `start(DeRecFlow::ReplicaDiscovery)` to
 pull the copy from the source.
 
+Until a device confirms a member, that member is not part of the group as
+far as the device is concerned. It is left out of every roster the device
+publishes (each new version, catch-up answers and the vault itself), it is
+not asked in a replica version check, and it cannot succeed a removed source.
+Every recipient installs a roster's members as paired, so listing an
+unconfirmed one would admit it on their behalf.
+
 ### Every helper sees the vault's compressed length
 
 The vault (the user's secrets, every helper's channel key and

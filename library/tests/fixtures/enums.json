@@ -592,7 +592,8 @@
         { "name": "InvalidInput", "wire": 12, "text": "input" },
         { "name": "Protobuf", "wire": 13, "text": "protobuf" },
         { "name": "Invariant", "wire": 14, "text": "invariant" },
-        { "name": "StateStore", "wire": 15, "text": "state_store" }
+        { "name": "StateStore", "wire": 15, "text": "state_store" },
+        { "name": "Transport", "wire": 16, "text": "transport" }
       ]
     },
     "DeRecErrorCode": {
@@ -654,7 +655,8 @@
         { "name": "FfiBadSharedKey", "wire": 105, "text": "ffi_bad_shared_key" },
         { "name": "FfiNulInString", "wire": 106, "text": "ffi_nul_in_string" },
         { "name": "TransportInvalid", "wire": 120, "text": "transport_invalid" },
-        { "name": "NoUsableEndpoint", "wire": 121, "text": "no_usable_endpoint" }
+        { "name": "NoUsableEndpoint", "wire": 121, "text": "no_usable_endpoint" },
+        { "name": "TransportSendFailed", "wire": 123, "text": "transport_send_failed" }
       ]
     },
     "MessageKind": {

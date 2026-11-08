@@ -21,6 +21,10 @@ import "github.com/derecalliance/lib-derec/packages/go/internal/native"
 //   - ConflictingChannelIDs is set by protocol Restore when
 //     Code == CodeRestoreConflict: the existing channel ids that collide
 //     with the recovered Secret. Empty otherwise.
+//   - ChannelID is the channel the error is about: set for
+//     CodeChannelAlreadyPaired, CodeFingerprintMismatch and CodeRoleMismatch,
+//     and on a failed protocol Process to the channel the failing message
+//     arrived on. Nil otherwise.
 //
 // Message is human-readable only — branch on Code, never parse Message.
 // CategoryName and CodeName return the library's stable names for Category
@@ -69,6 +73,7 @@ const (
 	CategoryProtobuf     int32 = 13
 	CategoryInvariant    int32 = 14
 	CategoryStateStore   int32 = 15
+	CategoryTransport    int32 = 16
 )
 
 // Codes give the specific reason an [Error] occurred. Codes are global — the
@@ -170,4 +175,8 @@ const (
 	// unreachable peer also cannot be told.
 	CodeNoUsableEndpoint int32 = 121
 	// 122 is retired; never reassign it.
+
+	// CodeTransportSendFailed: the application's transport delivered a
+	// message to none of the peer's endpoints. Category is CategoryTransport.
+	CodeTransportSendFailed int32 = 123
 )

@@ -166,6 +166,17 @@ pub enum Error {
     #[error("fingerprint does not match channel {channel_id:?}: possible man-in-the-middle")]
     FingerprintMismatch { channel_id: ChannelId },
 
+    /// A [`DeRecTransport`](crate::protocol::DeRecTransport) reported that
+    /// a message reached none of the peer's endpoints.
+    ///
+    /// The variant a transport returns when delivery failed, and the one the
+    /// FFI and WASM bindings report when the application's transport
+    /// callback fails, so the same failure reads the same in every SDK. The
+    /// protocol state a failed send leaves is the same as for a message lost
+    /// in transit: the request is retried, or times out.
+    #[error("transport send failed: the message reached none of the peer's endpoints")]
+    TransportSendFailed,
+
     /// A peer advertised no endpoint this library will record.
     ///
     /// Every endpoint it offered failed [`TransportPolicy`] — typically all
@@ -191,6 +202,19 @@ pub enum Error {
 }
 
 impl Error {
+    /// The channel this error is about, for the variants that name one:
+    /// [`Error::ChannelAlreadyPaired`], [`Error::FingerprintMismatch`] and
+    /// [`Error::RoleMismatch`]. Every SDK reports it as the error's
+    /// `channel_id`.
+    pub fn channel_id(&self) -> Option<ChannelId> {
+        match self {
+            Error::ChannelAlreadyPaired { channel_id }
+            | Error::FingerprintMismatch { channel_id }
+            | Error::RoleMismatch { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        }
+    }
+
     pub fn as_non_ok_status(&self) -> Option<(i32, &str)> {
         match self {
             Error::Pairing(PairingError::NonOkStatus { status, memo }) => Some((*status, memo)),

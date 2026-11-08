@@ -9,13 +9,20 @@ all of them unless it names a specific binding.
 
 ### 0.0.11
 
-Recovery no longer accepts whichever group of shares reconstructs first. It
-waits for an answer from every helper it asked, tries every group, and when
-the answers disagree it reports the disagreement to the application instead
-of choosing a side. Fewer than the threshold of helpers can no longer have
-the owner silently recover a forged secret, and with it a forged helper
-list. No wire message changes: an owner on this version recovers from
-helpers on 0.0.10, and helpers need no upgrade.
+A security release. Recovery no longer accepts whichever group of shares
+reconstructs first. It waits for an answer from every helper it asked, tries
+every group, and when the answers disagree it reports the disagreement to
+the application instead of choosing a side. Fewer than the threshold of
+helpers can no longer have the owner silently recover a forged secret, and
+with it a forged helper list. Pairing gains a lifetime, replica rosters list
+only confirmed members, restore keeps the channels on which this device is
+a helper, and every SDK gets `message_id` to detect replayed and reflected
+messages.
+
+No wire message changes: an owner on this version recovers from helpers on
+0.0.10, and helpers need no upgrade. Two things in progress during the
+upgrade must be redone: a contact created before it, and a replica pairing
+not yet confirmed.
 
 - **Fixed (security): one helper could forge the recovered secret.**
   *(bug fix; every SDK)*
@@ -303,6 +310,78 @@ helpers on 0.0.10, and helpers need no upgrade.
   library README and every SDK README now describe both, with the
   mitigations: keep auto-accept of `UpdateChannelInfo` off, and set
   `parameter_range.max_share_size` to bound decoding.
+
+- **Fixed (security): an unconfirmed replica joiner was published as a
+  member.** *(bug fix; every SDK)*
+
+  A joiner whose fingerprint the publishing device had not confirmed was
+  still listed in the roster it published, in each new version, in catch-up
+  answers and in the vault. Every recipient installs a roster's members as
+  `Paired`, so one member's unconfirmed pairing became an accepted
+  membership on every other device, and could come back to the publisher
+  through a later roster from another member. A roster now lists only
+  confirmed members. For the same reason, an unconfirmed member can no
+  longer be chosen to succeed a removed source, and a replica version check
+  no longer asks it: it drops the question at its pending gate, so the check
+  used to wait out `get_share_response` for nothing.
+
+- **Changed: a failed transport send reports the same error in every SDK.**
+  *(breaking for code matching the old text; every SDK)*
+
+  When the application's transport delivered a message to none of a peer's
+  endpoints, the C ABI bindings (Go, .NET, React Native) reported it as
+  `invariant` / `invariant` with "internal invariant violated: transport send
+  failed", and Node and web as `input` / `invalid_input` with "invalid input:
+  transport.send promise rejected". Neither category was true, and the same
+  failure read differently per SDK, including in `ProtectSecretFailed.error`.
+  Every binding now reports the new `Error::TransportSendFailed`: category
+  `transport` (16) and code `transport_send_failed` (123), with the text
+  "transport send failed: the message reached none of the peer's endpoints".
+  A Rust `DeRecTransport` should return the same variant when delivery fails.
+  Code 122 stays retired. The constants are `DEREC_CATEGORY_TRANSPORT` /
+  `DEREC_CODE_TRANSPORT_SEND_FAILED` (C), `CategoryTransport` /
+  `CodeTransportSendFailed` (Go), `DeRecCategory.Transport` /
+  `DeRecCode.TransportSendFailed` (.NET), and the `"transport"` /
+  `"transport_send_failed"` names (TypeScript).
+
+- **Added: SDK errors name the channel they are about.** *(every SDK —
+  breaking for the C ABI: `DeRecError` gains two fields)*
+
+  `ChannelAlreadyPaired`, `FingerprintMismatch` and `RoleMismatch` name a
+  channel in Rust, and the SDKs dropped it: an app that re-scanned a contact
+  for a channel it already holds learned only that some channel was paired,
+  since the contact's creator chooses the id. Rust's `Error` gains a
+  `channel_id()` method, and every SDK now carries the id on its error: `has_channel_id` /
+  `channel_id` on the C `DeRecError`, `ChannelID *uint64` on Go's
+  `derec.Error`, `DeRecException.ChannelId` (.NET) and `channel_id` (Node, web,
+  React Native). The .NET and TypeScript fields already named the failing
+  channel of a `process()` call and keep doing so; Go's `ProcessError.ChannelID`
+  is unchanged and its inner `derec.Error` now carries the same id. Every
+  result struct that embeds `DeRecError` grows by 16 bytes on 64-bit targets;
+  `ffi_layout.json` and the React Native header are regenerated. Every smoke
+  suite asserts the id on the re-scan, fingerprint-mismatch and helper-unpair
+  refusals.
+
+- **Tests: every SDK smoke suite covers what the Rust suite covers.**
+  *(tests; every SDK)*
+
+  The Go, .NET, Node, web and React Native smoke suites now exercise the
+  behaviours they were missing against the Rust reference: a replica
+  destination verifying the source's helpers, recovery past a corrupted share
+  and past a helper without the version, one target failing while a round's
+  fan-out continues, the group key handover and a lost handover
+  acknowledgement, the roster describing every member, a responder answering
+  at an inbound `replyTo`, the NoKeys wrong-nonce and HashedKeys tampered-hash
+  refusals, a re-scan of a paired channel, and expired-channel cleanup with a
+  pending pairing. Go also gained the auto-accept, unpair,
+  `UpdateChannelInfo`, Discovery, replica sync and replica-id flows it lacked.
+  The Rust suite in turn now covers what only the SDKs tested: `RequestFailed`
+  answered through its token or by `auto_respond_on_failure`, an oversized
+  share, `InvalidWeight`, verification verdicts, `ReplicaSecretRefused`, an
+  undecodable request, and a republish after restore with the stored weights.
+  The per-target failure flow asserts the exact transport error in every
+  suite, and the expired-channel cleanup flow no longer depends on pairing
+  and sweeping within the same clock second.
 
 ### 0.0.10
 

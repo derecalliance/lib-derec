@@ -19,8 +19,10 @@ namespace DeRec.Library;
 /// <see cref="Code"/> equals <see cref="DeRecCode.VersionMismatch"/>.</item>
 /// <item><see cref="ConflictingChannelIds"/> is populated when
 /// <see cref="Code"/> equals <see cref="DeRecCode.RestoreConflict"/>.</item>
-/// <item><see cref="ChannelId"/> / <see cref="Events"/> are populated by a
-/// failed <c>DeRecProtocol.ProcessAsync</c>.</item>
+/// <item><see cref="ChannelId"/> is populated when the error is about one
+/// channel, and by a failed <c>DeRecProtocol.ProcessAsync</c>.</item>
+/// <item><see cref="Events"/> is populated by a failed
+/// <c>DeRecProtocol.ProcessAsync</c>.</item>
 /// </list>
 /// </summary>
 public sealed class DeRecException : Exception
@@ -41,9 +43,13 @@ public sealed class DeRecException : Exception
     public IReadOnlyList<ulong> ConflictingChannelIds { get; }
 
     /// <summary>
-    /// The channel the failing inbound message arrived on, when
-    /// <c>DeRecProtocol.ProcessAsync</c> could tell. <c>null</c> when the bytes
-    /// were not a decodable envelope, and for every other call.
+    /// The channel the error is about: the one named by
+    /// <see cref="DeRecCode.ChannelAlreadyPaired"/>,
+    /// <see cref="DeRecCode.FingerprintMismatch"/> and
+    /// <see cref="DeRecCode.RoleMismatch"/>, or, on a failed
+    /// <c>DeRecProtocol.ProcessAsync</c>, the channel the failing inbound
+    /// message arrived on. <c>null</c> otherwise, including when the bytes
+    /// were not a decodable envelope.
     /// </summary>
     public ulong? ChannelId { get; }
 
@@ -156,7 +162,7 @@ internal static class Utils
             expected: error.Expected,
             got: error.Got,
             conflictingChannelIds: conflictingChannelIds,
-            channelId: channelId,
+            channelId: channelId ?? (error.HasChannelId ? error.ChannelId : null),
             events: events
         );
 

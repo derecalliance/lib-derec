@@ -90,7 +90,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     let successor = if member.role == ReplicaRole::Source {
         roster
             .iter()
-            .find(|m| m.replica_id != target && m.status != ChannelStatus::Unpairing)
+            .find(|m| m.replica_id != target && m.status == ChannelStatus::Paired)
             .cloned()
     } else {
         None
@@ -744,6 +744,45 @@ mod tests {
                 1002,
                 ReplicaRole::Destination,
                 ChannelStatus::Unpairing,
+            )
+            .await;
+            seed_member(
+                &mut rig.channels,
+                1003,
+                ReplicaRole::Destination,
+                ChannelStatus::Paired,
+            )
+            .await;
+
+            super::start(&mut rig.stores(), &lf.local(), 1001, None, TRACE_ID)
+                .await
+                .expect("start");
+
+            assert_eq!(role_of(&rig.channels, 1003).await, ReplicaRole::Source);
+            assert_eq!(role_of(&rig.channels, 1002).await, ReplicaRole::Destination);
+        });
+    }
+
+    /// R1 — a member whose pairing is unconfirmed is not in the published
+    /// roster, so it cannot be the source that roster names.
+    #[test]
+    fn an_unconfirmed_member_is_not_eligible_to_succeed() {
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, 1003);
+            let mut rig = StoreRig::with_transport(NoopTransport);
+            seed_group_key(&mut rig.secrets).await;
+            seed_member(
+                &mut rig.channels,
+                1001,
+                ReplicaRole::Source,
+                ChannelStatus::Paired,
+            )
+            .await;
+            seed_member(
+                &mut rig.channels,
+                1002,
+                ReplicaRole::Destination,
+                ChannelStatus::Pending,
             )
             .await;
             seed_member(

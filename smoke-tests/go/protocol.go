@@ -23,6 +23,7 @@ import (
 
 	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/derecpb"
+	"github.com/derecalliance/lib-derec/packages/go/primitives/discovery"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/envelope"
 	"github.com/derecalliance/lib-derec/packages/go/protocol"
 
@@ -525,10 +526,20 @@ type outboxEntry struct {
 type memTransport struct {
 	mu     sync.Mutex
 	outbox []outboxEntry
+	// failing holds the URIs every send to fails, the way a broken link to
+	// one peer would while the others stay healthy.
+	failing map[string]bool
 }
 
 func newMemTransport() *memTransport {
-	return &memTransport{}
+	return &memTransport{failing: make(map[string]bool)}
+}
+
+// failURI makes every later send to uri fail.
+func (t *memTransport) failURI(uri string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.failing[uri] = true
 }
 
 func (t *memTransport) Send(endpoints []protocol.Endpoint, message []byte) error {
@@ -537,6 +548,9 @@ func (t *memTransport) Send(endpoints []protocol.Endpoint, message []byte) error
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.failing[endpoints[0].URI] {
+		return errors.New("transport: simulated failure")
+	}
 	t.outbox = append(t.outbox, outboxEntry{uri: endpoints[0].URI, message: append([]byte(nil), message...)})
 	return nil
 }
@@ -789,7 +803,10 @@ func pairPeersWithMode(owner, helper *peer, pairingChannelID uint64, mode protoc
 // runEveryContactModePairs proves this SDK can pair over all three contact
 // modes. It only ever exercised InlineKeys, so the two modes with a PrePair
 // leg — the ones where the wire choreography actually differs — were never
-// driven from Go at all.
+// driven from Go at all. It then refuses a HashedKeys contact whose binding
+// hash was tampered with and a NoKeys PrePair naming another nonce. Mirrors
+// run_hashed_keys_pairing_flow and run_no_keys_pairing_flow in
+// smoke-tests/rust/src/protocol.rs.
 func runEveryContactModePairs() {
 	fmt.Println("=== Protocol contact-mode pairing test ===")
 
@@ -875,6 +892,68 @@ func runEveryContactModePairs() {
 		fmt.Printf("  %s paired → channel_id=%d, shared_key=%dB, no transient state left  ✓\n",
 			m.name, channelID, len(ownerKey.Bytes))
 	}
+
+	// A HashedKeys contact commits to the creator's keys; keys that do not
+	// open the commitment are refused by the scanner.
+	owner := newPeer("owner", "https://owner-hash-tampered.example.com", threshold)
+	helper := newPeer("helper", "https://helper-hash-tampered.example.com", threshold)
+	defer owner.proto.Close()
+	defer helper.proto.Close()
+	hashedChannel := uint64(910)
+	hashed, err := owner.proto.CreateContact(&hashedChannel, protocol.ContactModeHashedKeys, nil)
+	must(err, "owner CreateContact(HashedKeys)")
+	var hashedContact derecpb.ContactMessage
+	must(proto.Unmarshal(hashed.ContactBytes, &hashedContact), "decode the HashedKeys contact")
+	assertTrue(len(hashedContact.ContactBindingHash) != 0, "a HashedKeys contact must carry a binding hash")
+	assertTrue(hashedContact.MlkemEncapsulationKey == nil && hashedContact.EciesPublicKey == nil,
+		"a HashedKeys contact must not carry inline public keys")
+	hashedContact.ContactBindingHash[0] ^= 0xFF
+	tampered, err := proto.Marshal(&hashedContact)
+	must(err, "encode the tampered contact")
+	_, err = helper.proto.Start(protocol.FlowKindPairing, protocol.PairingParams{Kind: protocol.SenderKindHelper, Contact: tampered})
+	must(err, "helper Start(Pairing, tampered HashedKeys)")
+	prePairRequest := helper.drain()
+	assertTrue(len(prePairRequest) == 1, "the helper must send exactly one PrePairRequest, got %d", len(prePairRequest))
+	deliver(owner, prePairRequest[0].message)
+	prePairResponse := owner.drain()
+	assertTrue(len(prePairResponse) == 1, "the owner must send exactly one PrePairResponse, got %d", len(prePairResponse))
+	_, err = helper.proto.Process(prePairResponse[0].message)
+	var hashErr *derec.Error
+	assertTrue(errors.As(err, &hashErr) && hashErr.Code == derec.CodePrepairHashMismatch,
+		"a tampered binding hash must fail Process with CodePrepairHashMismatch, got %v", err)
+	fmt.Println("  HashedKeys with a tampered binding hash → Process fails with CodePrepairHashMismatch  ✓")
+
+	// A NoKeys contact is authenticated by its nonce: a PrePairRequest naming
+	// another nonce is refused when the creator accepts it.
+	creator := newPeer("owner", "https://owner-nonce.example.com", threshold)
+	scanner := newPeer("helper", "https://helper-nonce.example.com", threshold)
+	defer creator.proto.Close()
+	defer scanner.proto.Close()
+	noKeysChannel, realNonce := uint64(9999), uint64(8888)
+	noKeys, err := creator.proto.CreateContact(&noKeysChannel, protocol.ContactModeNoKeys, &realNonce)
+	must(err, "owner CreateContact(NoKeys)")
+	var noKeysContact derecpb.ContactMessage
+	must(proto.Unmarshal(noKeys.ContactBytes, &noKeysContact), "decode the NoKeys contact")
+	noKeysContact.Nonce = 7777
+	wrongNonce, err := proto.Marshal(&noKeysContact)
+	must(err, "encode the contact with another nonce")
+	_, err = scanner.proto.Start(protocol.FlowKindPairing, protocol.PairingParams{Kind: protocol.SenderKindHelper, Contact: wrongNonce})
+	must(err, "helper Start(Pairing, NoKeys with another nonce)")
+	prePair := scanner.drain()
+	assertTrue(len(prePair) == 1, "the helper must send exactly one PrePairRequest, got %d", len(prePair))
+	prompt, err := creator.proto.Process(prePair[0].message)
+	must(err, "owner Process(PrePairRequest)")
+	var action []byte
+	for _, ev := range prompt {
+		if ev.Type == protocol.EventTypeActionRequired {
+			action = ev.Action
+		}
+	}
+	assertTrue(action != nil, "the owner must raise ActionRequired for the PrePair, got %+v", prompt)
+	_, err = creator.proto.Accept(action)
+	assertTrue(err != nil && strings.Contains(err.Error(), "NoKeys PrePair nonce mismatch"),
+		"accepting a PrePair with another nonce must fail with the NoKeys nonce mismatch, got %v", err)
+	fmt.Println("  NoKeys PrePair with another nonce → Accept fails with the nonce mismatch  ✓")
 
 	fmt.Println("Protocol contact-mode pairing test passed.")
 }
@@ -1573,17 +1652,16 @@ func runSupersededShareRequest() {
 	fmt.Println("Superseded share request test passed.")
 }
 
-// runDiscoveryAcrossTwoChannels: a version check reaches each member under
-// the key of the channel that member is recorded on, and concludes once its
-// budget elapses even when a member never answers. A joiner whose
-// fingerprint is not yet confirmed sits on its own pairing channel, so the
-// group spans two channels and two keys — mirroring
-// `run_discovery_across_two_channels_flow` in smoke-tests/rust/src/protocol.rs.
-func runDiscoveryAcrossTwoChannels() {
-	fmt.Println("=== Protocol replica discovery across two channels test ===")
+// runUnconfirmedJoiner: a joiner whose fingerprint is not yet confirmed is
+// not a member. The source neither lists it in the roster it publishes nor
+// asks it in a version check, and a check whose only member stays silent
+// concludes once its budget elapses — mirroring `run_unconfirmed_joiner_flow`
+// in smoke-tests/rust/src/protocol.rs.
+func runUnconfirmedJoiner() {
+	fmt.Println("=== Protocol replica unconfirmed joiner test ===")
 
 	sourceID, destID, joinerID := uint64(0x5050), uint64(0xD1D1), uint64(0xD3D3)
-	source, err := newPeerWithConfig("source", "https://source-two-channels.example.com", protocol.Config{
+	source, err := newPeerWithConfig("source", "https://source-unconfirmed.example.com", protocol.Config{
 		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
 			Threshold: proto.Uint32(2),
 			ReplicaID: &sourceID,
@@ -1592,8 +1670,8 @@ func runDiscoveryAcrossTwoChannels() {
 	})
 	must(err, "protocol.New(source)")
 	defer source.proto.Close()
-	dest := newPeerWithReplicaID("dest", "https://dest-two-channels.example.com", 2, &destID)
-	joiner := newPeerWithReplicaID("joiner", "https://joiner-two-channels.example.com", 2, &joinerID)
+	dest := newPeerWithReplicaID("dest", "https://dest-unconfirmed.example.com", 2, &destID)
+	joiner := newPeerWithReplicaID("joiner", "https://joiner-unconfirmed.example.com", 2, &joinerID)
 	defer dest.proto.Close()
 	defer joiner.proto.Close()
 
@@ -1611,42 +1689,62 @@ func runDiscoveryAcrossTwoChannels() {
 	group := pairingCompleted(append(pump(dest, source), pump(source, dest)...), 191)
 	crossConfirmFingerprint(source, dest, group)
 	pumpMany([]*peer{source, dest})
-	assertProtects(source, "two channels")
+	assertProtects(source, "unconfirmed joiner")
 	pumpMany([]*peer{source, dest})
 
 	startReplicaScan(joiner, source, 192, protocol.SenderKindReplicaDestination)
-	joining := pairingCompleted(append(pump(joiner, source), pump(source, joiner)...), 192)
+	pairingCompleted(append(pump(joiner, source), pump(source, joiner)...), 192)
 	pumpMany([]*peer{source, dest, joiner})
-	assertTrue(joining != group, "the joiner must still be on its own pairing channel")
-	fmt.Println("  group spans two channels: the destination on one, the joiner on another  ✓")
+
+	assertProtects(source, "unconfirmed joiner")
+	var listed []uint64
+	received := false
+	for _, ev := range pumpMany([]*peer{source, dest, joiner}) {
+		if (ev.Type == protocol.EventTypeReplicaSecretReceived || ev.Type == protocol.EventTypeReplicaSecretInstalled) &&
+			ev.Secret != nil && ev.Secret.Replicas != nil {
+			received = true
+			for _, m := range ev.Secret.Replicas.Members {
+				listed = append(listed, m.ReplicaID)
+			}
+		}
+	}
+	assertTrue(received, "the destination must receive the new version")
+	assertTrue(len(listed) == 2, "source and destination only, got %v", listed)
+	for _, id := range listed {
+		assertTrue(id != joinerID, "an unconfirmed joiner must not be published, got %v", listed)
+	}
+	fmt.Println("  the published roster leaves out the unconfirmed joiner  ✓")
 
 	_, err = source.proto.Start(protocol.FlowKindReplicaDiscovery, nil)
 	must(err, "source.Start(ReplicaDiscovery)")
+	concludedAtOnce := false
 	for _, ev := range pumpMany([]*peer{source, dest, joiner}) {
-		assertTrue(ev.Type != protocol.EventTypeReplicaDiscoveryComplete,
-			"the joiner's answer is still due, got %+v", ev)
+		assertTrue(ev.Type != protocol.EventTypeMessageIgnored, "the joiner must not be asked, got %+v", ev)
+		if ev.Type == protocol.EventTypeReplicaDiscoveryComplete {
+			concludedAtOnce = true
+		}
 	}
+	assertTrue(concludedAtOnce, "the check concludes on the destination's answer")
+	fmt.Println("  the version check skips the joiner and concludes at once  ✓")
+
+	_, err = source.proto.Start(protocol.FlowKindReplicaDiscovery, nil)
+	must(err, "source.Start(ReplicaDiscovery)")
+	source.drain()
 	early, err := source.proto.Tick()
 	must(err, "source.Tick()")
 	assertTrue(len(early) == 0, "the check waits out its window, got %+v", early)
-
 	time.Sleep(2100 * time.Millisecond)
 	concluded, err := source.proto.Tick()
 	must(err, "source.Tick()")
-	assertTrue(len(concluded) == 1 && concluded[0].Type == protocol.EventTypeReplicaDiscoveryComplete,
+	assertTrue(len(concluded) == 1 && concluded[0].Type == protocol.EventTypeReplicaDiscoveryComplete &&
+		concluded[0].FetchedFrom == nil,
 		"expected ReplicaDiscoveryComplete, got %+v", concluded)
-	done := concluded[0]
-	assertTrue(done.GroupVersion != nil && *done.GroupVersion > 0,
-		"the destination's answer must have been read, got %+v", done)
-	assertTrue(done.LocalVersion != nil && *done.LocalVersion == *done.GroupVersion,
-		"the group is level, got %+v", done)
-	assertTrue(done.FetchedFrom == nil, "nothing is fetched, got %+v", done)
 	after, err := source.proto.Tick()
 	must(err, "source.Tick()")
 	assertTrue(len(after) == 0, "the check is closed once concluded, got %+v", after)
-	fmt.Println("  the destination answered under its own key; the timeout closed the check  ✓")
+	fmt.Println("  a silent member's check concludes on the timeout  ✓")
 
-	fmt.Println("Protocol replica discovery across two channels test passed.")
+	fmt.Println("Protocol replica unconfirmed joiner test passed.")
 	fmt.Println()
 }
 
@@ -1991,8 +2089,10 @@ func runRequestFailedToken() {
 	fmt.Println("Protocol failed request answered through its token test passed.")
 }
 
-// runExpiredChannelCleanup exercises the expired-channel cleanup surface
-// through the Go SDK.
+// runExpiredChannelCleanup: with the automatic sweep disabled, a Pending
+// replica pairing survives a manual sweep, stays usable afterwards, and once
+// Paired is never swept. Mirrors run_expired_channel_cleanup_flow in
+// smoke-tests/rust/src/protocol.rs.
 //
 // The contradictory pair — Enabled false alongside a non-zero timeout — is
 // the point: the wrapper must forward both values verbatim and let the
@@ -2003,38 +2103,45 @@ func runRequestFailedToken() {
 func runExpiredChannelCleanup() {
 	fmt.Println("=== Protocol expired-channel cleanup test ===")
 
-	channelStore := newMemChannelStore()
-	shareStore := newMemShareStore()
-	secretStore := newMemSecretStore()
-	userSecretStore := newMemUserSecretStore()
-	stateStore := newMemStateStore()
-	transport := newMemTransport()
-
-	cfg := protocol.Config{
-		SecretID: protocolSecretID,
-		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
-			OwnTransports: []protocol.TransportProtocolParam{{URI: "https://cleanup.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
-			Threshold:     proto.Uint32(2),
-			Timeouts: &protocol.Timeouts{
-				ExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{
-					Enabled:       false,
-					TimeoutInSecs: 900,
+	disabled := func(label, uri string, replicaID uint64) *peer {
+		p, err := newPeerWithConfig(label, uri, protocol.Config{
+			DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+				Threshold: proto.Uint32(2),
+				ReplicaID: &replicaID,
+				Timeouts: &protocol.Timeouts{
+					ExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{
+						Enabled:       false,
+						TimeoutInSecs: 900,
+					},
 				},
 			},
-		},
+		})
+		must(err, fmt.Sprintf("protocol.New(%s)", label))
+		return p
 	}
-	p, err := protocol.New(protocol.Stores{Channel: channelStore, Share: shareStore, Secret: secretStore, UserSecret: userSecretStore, State: stateStore}, transport, cfg)
-	must(err, "protocol.New(cleanup)")
-	defer p.Close()
+	owner := disabled("owner", "https://owner-cleanup.example.com", 11)
+	replica := disabled("replica", "https://replica-cleanup.example.com", 12)
+	defer owner.proto.Close()
+	defer replica.proto.Close()
 
-	// The caller-driven sweep works regardless of the disabled policy —
-	// that is what Disabled means. No Pending channels exist yet, so the
-	// result is an empty (non-nil error) list.
-	removed, err := p.RemoveExpiredChannels(0)
-	must(err, "RemoveExpiredChannels(0)")
-	assertTrue(len(removed) == 0, "expected no removed channels on a fresh protocol, got %d", len(removed))
+	channelID := pairReplicaHandshake(owner, replica, 0xEC0001)
 
-	fmt.Println("  cleanup: disabled policy forwarded with its timeout; manual sweep callable ✓")
+	// Both ends are Pending until the fingerprints are compared, and with
+	// the policy disabled nothing sweeps them.
+	removed, err := owner.proto.RemoveExpiredChannels(3600)
+	must(err, "owner RemoveExpiredChannels(3600)")
+	assertTrue(len(removed) == 0, "a Pending channel younger than the threshold survives the sweep, got %v", removed)
+	fmt.Println("  Pending replica pairing survives RemoveExpiredChannels(3600) under a disabled policy  ✓")
+
+	// Still usable: the fingerprint round-trip completes, which it could not
+	// had the sweep dropped the channel or its key.
+	crossConfirmFingerprint(owner, replica, channelID)
+	fmt.Println("  the swept-over pairing still completes its fingerprint round-trip  ✓")
+
+	removed, err = owner.proto.RemoveExpiredChannels(0)
+	must(err, "owner RemoveExpiredChannels(0) after verification")
+	assertTrue(len(removed) == 0, "Paired channels are out of scope for the sweep, got %v", removed)
+	fmt.Println("  Paired channel is never swept  ✓")
 	fmt.Println("Protocol expired-channel cleanup test passed.")
 }
 
@@ -2065,11 +2172,19 @@ func hasChannelRecord(p *peer, channelID, replicaID uint64) bool {
 }
 
 // assertFingerprintMismatch checks that err is the Pairing-category
-// FingerprintMismatch a rejected VerifyFingerprint returns.
-func assertFingerprintMismatch(err error, label string) {
+// FingerprintMismatch a rejected VerifyFingerprint returns, naming the
+// channel it was about.
+func assertFingerprintMismatch(err error, channelID uint64, label string) {
 	var fpErr *derec.Error
 	assertTrue(errors.As(err, &fpErr) && fpErr.Code == derec.CodeFingerprintMismatch && fpErr.Category == derec.CategoryPairing,
 		"%s must fail with Pairing/CodeFingerprintMismatch (17), got %v", label, err)
+	assertChannelID(fpErr, channelID, label)
+}
+
+// assertChannelID checks that err names channelID as the channel it is about.
+func assertChannelID(err *derec.Error, channelID uint64, label string) {
+	assertTrue(err.ChannelID != nil && *err.ChannelID == channelID,
+		"%s must name channel %d, got %v", label, channelID, err.ChannelID)
 }
 
 // runFingerprintMismatch: VerifyFingerprint(wrong) on a still-Pending channel
@@ -2099,7 +2214,7 @@ func runFingerprintMismatch() {
 	must(node.secretStore.Save(protocolSecretID, channelID, protocol.SecretValue{Kind: protocol.SecretKindSharedKey, Bytes: testSharedKey()}),
 		"seed shared key")
 
-	assertFingerprintMismatch(node.proto.VerifyFingerprint(channelID, "0000-0000-0000-0000"), "VerifyFingerprint(wrong)")
+	assertFingerprintMismatch(node.proto.VerifyFingerprint(channelID, "0000-0000-0000-0000"), channelID, "VerifyFingerprint(wrong)")
 	fmt.Println("  verifyFingerprint(wrong) fails with FingerprintMismatch  ✓")
 
 	assertTrue(!hasChannelRecord(node, channelID, replicaID), "VerifyFingerprint(wrong) must remove the member record")
@@ -2123,7 +2238,7 @@ func runNoKeysFingerprintMismatch() {
 
 	channelID := pairPeersWithMode(owner, helper, 920, protocol.ContactModeNoKeys)
 
-	assertFingerprintMismatch(owner.proto.VerifyFingerprint(channelID, "0000-0000-0000-0000"), "owner VerifyFingerprint(wrong)")
+	assertFingerprintMismatch(owner.proto.VerifyFingerprint(channelID, "0000-0000-0000-0000"), channelID, "owner VerifyFingerprint(wrong)")
 	fmt.Println("  owner verifyFingerprint(wrong) fails with FingerprintMismatch  ✓")
 
 	assertTrue(!hasChannelRecord(owner, channelID, 0), "owner must drop the rejected helper channel")
@@ -2393,6 +2508,10 @@ func runConfigSurface() {
 		"CodeFingerprintCommitmentMismatch must be 48, got %d", derec.CodeFingerprintCommitmentMismatch)
 	assertTrue(derec.CategoryStateStore == 15,
 		"CategoryStateStore must be 15, got %d", derec.CategoryStateStore)
+	assertTrue(derec.CodeTransportSendFailed == 123,
+		"CodeTransportSendFailed must be 123, got %d", derec.CodeTransportSendFailed)
+	assertTrue(derec.CategoryTransport == 16,
+		"CategoryTransport must be 16, got %d", derec.CategoryTransport)
 	fmt.Println("  error code/category values match the FFI  ✓")
 
 	fmt.Println("Protocol config surface test passed.")
@@ -2614,6 +2733,7 @@ func runContactOnTheGroupChannel() {
 	var pairErr *derec.Error
 	assertTrue(errors.As(err, &pairErr) && pairErr.Code == derec.CodeChannelAlreadyPaired,
 		"a contact on the group channel %d must be refused with CodeChannelAlreadyPaired, got %v", groupChannel, err)
+	assertChannelID(pairErr, groupChannel, "the refused group-channel contact")
 	sent := a.drain()
 	assertTrue(len(sent) == 0, "nothing is sent for a refused contact, got %d messages", len(sent))
 	fmt.Println("  contact on the group channel refused  ✓")
@@ -3488,4 +3608,1511 @@ func runVerificationResponseVerdicts() {
 	fmt.Println("  envelope timestamp ≠ inner timestamp → MessageIgnored(TimestampMismatch), nothing sent  ✓")
 
 	fmt.Println("Protocol verification response verdicts test passed.")
+}
+
+// pairedChannelID returns the long-term channel the pairing on transient
+// rotated to, failing when no PairingCompleted names it — mirroring
+// `extract_paired_channel_id` in smoke-tests/rust/src/protocol.rs.
+func pairedChannelID(events []protocol.Event, transient uint64) uint64 {
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypePairingCompleted && ev.PairingChannelID == transient {
+			return ev.ChannelID
+		}
+	}
+	fail("the pairing on %d must complete, got %+v", transient, events)
+	return 0
+}
+
+// pairReplicaHandshake drives only the cryptographic handshake of replica
+// joining source's group as a Destination; both ends stay Pending until the
+// fingerprints are confirmed — mirroring `pair_replica_handshake` in
+// smoke-tests/rust/src/protocol.rs.
+func pairReplicaHandshake(source, replica *peer, transient uint64) uint64 {
+	startReplicaScan(replica, source, transient, protocol.SenderKindReplicaDestination)
+	return pairedChannelID(append(pump(replica, source), pump(source, replica)...), transient)
+}
+
+// helperStartPair has helper start a Helper pairing on a fresh contact from
+// owner; nothing is delivered — mirroring `helper_start_pair` in
+// smoke-tests/rust/src/protocol.rs.
+func helperStartPair(owner, helper *peer, transient uint64) {
+	contact, err := owner.proto.CreateContact(&transient, protocol.ContactModeInlineKeys, nil)
+	must(err, fmt.Sprintf("[%s] CreateContact", owner.label))
+	_, err = helper.proto.Start(protocol.FlowKindPairing, protocol.PairingParams{
+		Kind:    protocol.SenderKindHelper,
+		Contact: contact.ContactBytes,
+	})
+	must(err, fmt.Sprintf("[%s] Start(Pairing)", helper.label))
+}
+
+// newReplicaPeer builds a replica-capable peer of secretID at threshold,
+// addressed by an HTTPS own transport at uri.
+func newReplicaPeer(label, uri string, secretID, replicaID uint64, threshold uint32) *peer {
+	p, err := newPeerFromConfig(label, protocol.Config{
+		SecretID: secretID,
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold:     proto.Uint32(threshold),
+			ReplicaID:     &replicaID,
+			OwnTransports: []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
+		},
+	})
+	must(err, fmt.Sprintf("protocol.New(%s)", label))
+	return p
+}
+
+// channelKey returns the SharedKey p stores for channelID under secretID, or
+// nil when it holds none.
+func channelKey(p *peer, secretID, channelID uint64) []byte {
+	v, ok, err := p.secretStore.Load(secretID, channelID, protocol.SecretKindSharedKey)
+	must(err, fmt.Sprintf("[%s] secretStore.Load(%d)", p.label, channelID))
+	if !ok {
+		return nil
+	}
+	return v.Bytes
+}
+
+// loadChannelKey is channelKey for a key that must be present.
+func loadChannelKey(p *peer, secretID, channelID uint64) []byte {
+	key := channelKey(p, secretID, channelID)
+	assertTrue(key != nil, "[%s] must hold a key for channel %d", p.label, channelID)
+	return key
+}
+
+// startedVersion is the version the ProtectSecretStarted events of a round
+// report, or 0 when there are none.
+func startedVersion(events []protocol.Event) uint32 {
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeProtectSecretStarted && ev.Version != nil {
+			return *ev.Version
+		}
+	}
+	return 0
+}
+
+// verifiedChannels collects the channels a ShareVerified names.
+func verifiedChannels(events []protocol.Event) map[uint64]bool {
+	out := map[uint64]bool{}
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeShareVerified {
+			out[ev.ChannelID] = true
+		}
+	}
+	return out
+}
+
+// replicaArrival returns the first ReplicaSecretInstalled or
+// ReplicaSecretReceived on channelID, and whether it was an install, or nil
+// when none arrived — mirroring `find_replica_event` in
+// smoke-tests/rust/src/protocol.rs.
+func replicaArrival(events []protocol.Event, channelID uint64) (*protocol.Event, bool) {
+	for i := range events {
+		ev := events[i]
+		if ev.ChannelID != channelID || ev.Secret == nil || ev.Version == nil {
+			continue
+		}
+		switch ev.Type {
+		case protocol.EventTypeReplicaSecretInstalled:
+			return &ev, true
+		case protocol.EventTypeReplicaSecretReceived:
+			return &ev, false
+		}
+	}
+	return nil, false
+}
+
+// anyReplicaArrival is replicaArrival on whichever channel the copy came in.
+func anyReplicaArrival(events []protocol.Event) *protocol.Event {
+	for i := range events {
+		ev := events[i]
+		if (ev.Type == protocol.EventTypeReplicaSecretInstalled || ev.Type == protocol.EventTypeReplicaSecretReceived) &&
+			ev.Secret != nil && ev.Version != nil {
+			return &ev
+		}
+	}
+	return nil
+}
+
+// rosterSize is the number of members a received secret's roster names.
+func rosterSize(secret *protocol.Secret) int {
+	if secret.Replicas == nil {
+		return 0
+	}
+	return len(secret.Replicas.Members)
+}
+
+// assertHydrated checks that a replica's own stores hold what the source
+// published: the snapshot version and secrets, every helper channel, and a
+// roster naming exactly one source — mirroring `assert_hydrated` in
+// smoke-tests/rust/src/protocol.rs.
+func assertHydrated(p *peer, label string, version uint32, helpers, secrets, members int) {
+	sid := p.proto.SecretID()
+	snapshot, ok, err := p.userSecrets.LoadLatest(sid)
+	must(err, fmt.Sprintf("[%s] userSecrets.LoadLatest", label))
+	assertTrue(ok, "replica %s must hold a snapshot", label)
+	assertTrue(snapshot.Version == version, "replica %s must hold v=%d, got v=%d", label, version, snapshot.Version)
+	assertTrue(len(snapshot.Secrets) == secrets, "replica %s secret count: want %d, got %d", label, secrets, len(snapshot.Secrets))
+	stored, err := p.channelStore.ListHelpers(sid, protocol.HelperFilter{})
+	must(err, fmt.Sprintf("[%s] ListHelpers", label))
+	assertTrue(len(stored) == helpers, "replica %s must have materialised %d helper channels, got %d", label, helpers, len(stored))
+	roster, err := p.channelStore.ListReplicas(sid, protocol.ReplicaFilter{})
+	must(err, fmt.Sprintf("[%s] ListReplicas", label))
+	assertTrue(len(roster) == members, "replica %s roster size (includes itself): want %d, got %d", label, members, len(roster))
+	sources := 0
+	for _, m := range roster {
+		if m.Role == protocol.ReplicaRoleSource {
+			sources++
+		}
+	}
+	assertTrue(sources == 1, "replica %s roster must name exactly one source, got %d", label, sources)
+}
+
+// runProtectSecretPerTargetFailure fans a ProtectSecret out to two helpers
+// while the owner's transport fails every send to helper-b: the round reports
+// ProtectSecretStarted for helper-a and ProtectSecretFailed for helper-b, and
+// Start itself succeeds. Mirrors run_protect_secret_per_target_failure_flow in
+// smoke-tests/rust/src/protocol.rs.
+func runProtectSecretPerTargetFailure() {
+	fmt.Println("=== Protocol ProtectSecret per-target failure test ===")
+
+	owner := newPeerWithSecretID("owner", "https://owner-per-target.example.com", 42, 2)
+	helperA := newPeer("helper-a", "https://helper-a-per-target.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-per-target.example.com", 2)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+
+	channelA := pairPeers(owner, helperA, 1)
+	channelB := pairPeers(owner, helperB, 2)
+
+	owner.transport.failURI(helperB.uri)
+	events, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{1, 2, 3}, Name: "per-target-failure", Data: []byte("payload")}},
+	})
+	must(err, "Start(ProtectSecret) must not fail on a per-target failure")
+
+	var started, failed []protocol.Event
+	for _, ev := range events {
+		switch ev.Type {
+		case protocol.EventTypeProtectSecretStarted:
+			started = append(started, ev)
+		case protocol.EventTypeProtectSecretFailed:
+			failed = append(failed, ev)
+		}
+	}
+	assertTrue(len(started) == 1 && started[0].ChannelID == channelA,
+		"expected exactly one ProtectSecretStarted, for helper-a; got %+v", started)
+	assertTrue(len(failed) == 1 && failed[0].ChannelID == channelB && failed[0].Error == "transport send failed: the message reached none of the peer's endpoints",
+		"expected exactly one ProtectSecretFailed with the transport failure, for helper-b; got %+v", failed)
+	fmt.Printf("  helper-a: ProtectSecretStarted ✓   helper-b: ProtectSecretFailed(%q)  ✓\n", failed[0].Error)
+
+	fmt.Println("Protocol ProtectSecret per-target failure test passed.")
+}
+
+// runReplicaMirrorThenVerify: a Destination that received the Source's copy
+// verifies the Source's helpers itself, both for a version pushed to it and
+// for one it pulled with ReplicaDiscovery after missing the push. Mirrors
+// run_replica_mirror_then_verify_flow in smoke-tests/rust/src/protocol.rs.
+func runReplicaMirrorThenVerify() {
+	fmt.Println("=== Protocol replica mirror-then-verify test ===")
+
+	source := newReplicaPeer("source", "https://source-mirror.example.com", 0xC0FFEE, 0xAAAAAAAAAAAAAAAA, 2)
+	helperA := newPeer("helper-a", "https://helper-a-mirror.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-mirror.example.com", 2)
+	destination := newReplicaPeer("destination", "https://destination-mirror.example.com", protocolSecretID, 0xBBBBBBBBBBBBBBBB, 2)
+	all := []*peer{source, helperA, helperB, destination}
+	for _, p := range all {
+		defer p.proto.Close()
+	}
+
+	channelA := pairPeers(source, helperA, 1)
+	channelB := pairPeers(source, helperB, 2)
+	replicaChannel := pairReplicaHandshake(source, destination, 3)
+	crossConfirmFingerprint(source, destination, replicaChannel)
+	pumpMany(all)
+
+	_, err := source.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{1}, Name: "mirrored secret", Data: []byte("vault-contents")}},
+	})
+	must(err, "source.Start(ProtectSecret)")
+	mirrored := anyReplicaArrival(pumpMany(all))
+	assertTrue(mirrored != nil, "the destination must report the mirrored vault")
+	assertTrue(len(mirrored.Shares) == 2, "the mirrored payload must carry one share per helper, got %d", len(mirrored.Shares))
+	mirroredVersion := *mirrored.Version
+
+	destinationSID := destination.proto.SecretID()
+	for _, ch := range []uint64{channelA, channelB} {
+		tracked, err := destination.shareStore.Load(destinationSID, ch, []uint32{mirroredVersion})
+		must(err, "destination shareStore.Load")
+		assertTrue(len(tracked) == 1 && len(tracked[0].Bytes) != 0,
+			"the destination must hold a tracking share for helper channel %d at v%d, got %d", ch, mirroredVersion, len(tracked))
+	}
+
+	_, err = destination.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+		SecretID: destinationSID,
+		Version:  mirroredVersion,
+		Target:   protocol.TargetAll(),
+	})
+	must(err, "destination.Start(VerifyShares)")
+	verified := verifiedChannels(pumpMany(all))
+	assertTrue(verified[channelA] && verified[channelB],
+		"a destination holding a mirrored vault must verify the helpers that hold its shares; verified %v", verified)
+	fmt.Printf("  destination verifies both helpers for pushed v%d  ✓\n", mirroredVersion)
+
+	events, err := source.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{1}, Name: "mirrored secret", Data: []byte("vault-contents-v2")}},
+	})
+	must(err, "source.Start(ProtectSecret) of the missed round")
+	missedVersion := startedVersion(events)
+	assertTrue(missedVersion > mirroredVersion, "the missed round must be newer, got v%d after v%d", missedVersion, mirroredVersion)
+	// The destination's copy of this round is dropped, leaving it behind.
+	for _, entry := range source.drain() {
+		switch entry.uri {
+		case helperA.uri:
+			deliver(helperA, entry.message)
+		case helperB.uri:
+			deliver(helperB, entry.message)
+		}
+	}
+	pumpMany([]*peer{source, helperA, helperB})
+
+	_, err = destination.proto.Start(protocol.FlowKindReplicaDiscovery, nil)
+	must(err, "destination.Start(ReplicaDiscovery)")
+	caughtUp := false
+	for _, ev := range pumpMany(all) {
+		if ev.Type == protocol.EventTypeReplicaSecretReceived && ev.Version != nil && *ev.Version == missedVersion {
+			caughtUp = true
+		}
+	}
+	assertTrue(caughtUp, "the catch-up must hydrate the missed v%d", missedVersion)
+
+	_, err = destination.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+		SecretID: destinationSID,
+		Version:  missedVersion,
+		Target:   protocol.TargetAll(),
+	})
+	must(err, "destination.Start(VerifyShares) after the catch-up")
+	verified = verifiedChannels(pumpMany(all))
+	assertTrue(verified[channelA] && verified[channelB],
+		"a version obtained by catch-up must be as verifiable as one received by push; verified %v", verified)
+	fmt.Printf("  destination verifies both helpers for pulled v%d  ✓\n", missedVersion)
+
+	fmt.Println("Protocol replica mirror-then-verify test passed.")
+}
+
+// runReplicaRosterDescribesEveryMember: a published roster describes every
+// member the same way, the publisher included — every endpoint in preference
+// order and its communication_info — and the destination stores each member
+// so. Mirrors run_replica_roster_describes_every_member_flow in
+// smoke-tests/rust/src/protocol.rs.
+func runReplicaRosterDescribesEveryMember() {
+	fmt.Println("=== Protocol replica roster describes every member test ===")
+
+	sourceID, destinationID := uint64(0xCCCCCCCCCCCCCCCC), uint64(0xDDDDDDDDDDDDDDDD)
+	identity := func(label, name string, replicaID uint64) (*peer, []string) {
+		endpoints := []string{"https://" + label + ".example.com", "grpcs://" + label + ".example.com:443"}
+		p, err := newPeerFromConfig(label, protocol.Config{
+			SecretID: protocolSecretID,
+			DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+				Threshold: proto.Uint32(2),
+				ReplicaID: &replicaID,
+				OwnTransports: []protocol.TransportProtocolParam{
+					{URI: endpoints[0], Protocol: int32(derecpb.Protocol_HTTPS)},
+					{URI: endpoints[1], Protocol: int32(derecpb.Protocol_GRPC)},
+				},
+				CommunicationInfo: map[string]string{"name": name},
+			},
+		})
+		must(err, fmt.Sprintf("protocol.New(%s)", label))
+		return p, endpoints
+	}
+	source, sourceEndpoints := identity("roster-source", "Alice-1", sourceID)
+	destination, destinationEndpoints := identity("roster-destination", "Alice-2", destinationID)
+	defer source.proto.Close()
+	defer destination.proto.Close()
+
+	groupChannel := pairReplicaHandshake(source, destination, 0x0570)
+	crossConfirmFingerprint(source, destination, groupChannel)
+	pumpMany([]*peer{source, destination})
+
+	_, err := source.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{1}, Name: "roster secret", Data: []byte("roster-contents")}},
+	})
+	must(err, "source.Start(ProtectSecret)")
+	events := pumpMany([]*peer{source, destination})
+	var secret *protocol.Secret
+	for i := len(events) - 1; i >= 0 && secret == nil; i-- {
+		ev := events[i]
+		if (ev.Type == protocol.EventTypeReplicaSecretReceived || ev.Type == protocol.EventTypeReplicaSecretInstalled) && ev.Secret != nil {
+			secret = ev.Secret
+		}
+	}
+	assertTrue(secret != nil && secret.Replicas != nil, "the destination must receive the published secret with its roster")
+
+	want := []struct {
+		replicaID uint64
+		endpoints []string
+		name      string
+	}{{sourceID, sourceEndpoints, "Alice-1"}, {destinationID, destinationEndpoints, "Alice-2"}}
+
+	members := secret.Replicas.Members
+	assertTrue(len(members) == 2, "both members are published, got %+v", members)
+	for _, w := range want {
+		idx := slices.IndexFunc(members, func(m protocol.Replica) bool { return m.ReplicaID == w.replicaID })
+		assertTrue(idx >= 0, "member %#x missing from %+v", w.replicaID, members)
+		var uris []string
+		for _, t := range members[idx].Transports {
+			uris = append(uris, t.URI)
+		}
+		assertTrue(slices.Equal(uris, w.endpoints) && members[idx].CommunicationInfo["name"] == w.name,
+			"published row for %s: want (%v, %s), got (%v, %v)", w.name, w.endpoints, w.name, uris, members[idx].CommunicationInfo)
+	}
+	fmt.Println("  published roster names and reaches the writer as well as its peer  ✓")
+
+	stored, err := destination.channelStore.ListReplicas(destination.proto.SecretID(), protocol.ReplicaFilter{})
+	must(err, "destination ListReplicas")
+	for _, w := range want {
+		idx := slices.IndexFunc(stored, func(m protocol.ReplicaMember) bool { return m.ReplicaID == w.replicaID })
+		assertTrue(idx >= 0, "destination holds no row for %#x", w.replicaID)
+		var uris []string
+		for _, t := range stored[idx].Transports {
+			uris = append(uris, t.URI)
+		}
+		assertTrue(slices.Equal(uris, w.endpoints) && stored[idx].CommunicationInfo["name"] == w.name,
+			"destination's stored row for %s: want (%v, %s), got (%v, %v)", w.name, w.endpoints, w.name, uris, stored[idx].CommunicationInfo)
+	}
+	fmt.Println("  destination stores every member, itself included, the same way  ✓")
+
+	fmt.Println("Protocol replica roster describes every member test passed.")
+}
+
+// runReplicaVerifiesOnlySyncedVersions: a Destination paired after v1 is
+// synced v2 only. Restore on it is refused as already provisioned, both
+// devices verify v2, and only the source verifies v1: the Destination fails
+// each channel with NoProof and sends nothing. Mirrors
+// run_replica_verifies_only_synced_versions_flow in
+// smoke-tests/rust/src/protocol.rs.
+func runReplicaVerifiesOnlySyncedVersions() {
+	fmt.Println("=== Protocol replica verifies only synced versions test ===")
+
+	alice := newReplicaPeer("alice", "https://alice-synced.example.com", 0xC0FFEE, 0xA11CE, 2)
+	h1 := newPeer("helper-1", "https://helper-1-synced.example.com", 2)
+	h2 := newPeer("helper-2", "https://helper-2-synced.example.com", 2)
+	h3 := newPeer("helper-3", "https://helper-3-synced.example.com", 2)
+	bob := newReplicaPeer("bob", "https://bob-synced.example.com", protocolSecretID, 0xB0B, 2)
+	all := []*peer{alice, h1, h2, h3, bob}
+	for _, p := range all {
+		defer p.proto.Close()
+	}
+
+	helperChannels := []uint64{pairPeers(alice, h1, 1), pairPeers(alice, h2, 2), pairPeers(alice, h3, 3)}
+	events, err := alice.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{1}, Name: "wallet", Data: []byte("alice-secret-v1")}},
+	})
+	must(err, "alice.Start(ProtectSecret) v1")
+	v1 := startedVersion(events)
+	assertTrue(v1 != 0, "v1 must report a version, got %+v", events)
+	pumpMany([]*peer{alice, h1, h2, h3})
+
+	replicaChannel := pairReplicaHandshake(alice, bob, 4)
+	crossConfirmFingerprint(alice, bob, replicaChannel)
+	synced := anyReplicaArrival(pumpMany(all))
+	assertTrue(synced != nil, "bob must be synced when he joins the roster")
+	v2 := *synced.Version
+	assertTrue(v2 > v1, "joining must publish a newer version (v1=%d, v2=%d)", v1, v2)
+
+	_, err = bob.proto.Restore(*synced.Secret, v2)
+	var restoreErr *derec.Error
+	assertTrue(errors.As(err, &restoreErr) && restoreErr.Code == derec.CodeAlreadyRestored,
+		"a synced destination is already provisioned; Restore must refuse it with CodeAlreadyRestored, got %v", err)
+	fmt.Println("  Restore on a synced destination → CodeAlreadyRestored  ✓")
+
+	aliceSID, bobSID := alice.proto.SecretID(), bob.proto.SecretID()
+	for _, ch := range helperChannels {
+		for _, c := range []struct {
+			label    string
+			p        *peer
+			sid      uint64
+			version  uint32
+			expected int
+		}{
+			{"alice", alice, aliceSID, v1, 1},
+			{"alice", alice, aliceSID, v2, 1},
+			{"bob", bob, bobSID, v1, 0},
+			{"bob", bob, bobSID, v2, 1},
+		} {
+			rows, err := c.p.shareStore.Load(c.sid, ch, []uint32{c.version})
+			must(err, c.label+" shareStore.Load")
+			assertTrue(len(rows) == c.expected, "%s must hold %d tracking share(s) for helper %d at v%d, got %d",
+				c.label, c.expected, ch, c.version, len(rows))
+		}
+	}
+
+	verify := func(p *peer, sid uint64, version uint32) map[uint64]bool {
+		_, err := p.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+			SecretID: sid,
+			Version:  version,
+			Target:   protocol.TargetAll(),
+		})
+		must(err, fmt.Sprintf("%s.Start(VerifyShares v%d)", p.label, version))
+		return verifiedChannels(pumpMany(all))
+	}
+	for _, c := range []struct {
+		p       *peer
+		sid     uint64
+		version uint32
+	}{{alice, aliceSID, v2}, {bob, bobSID, v2}, {alice, aliceSID, v1}} {
+		verified := verify(c.p, c.sid, c.version)
+		for _, ch := range helperChannels {
+			assertTrue(verified[ch], "%s must verify v%d against all three helpers; verified %v", c.p.label, c.version, verified)
+		}
+	}
+
+	events, err = bob.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+		SecretID: bobSID,
+		Version:  v1,
+		Target:   protocol.TargetAll(),
+	})
+	must(err, "a missing proof fails its channel, not the round")
+	noProof := map[uint64]bool{}
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeVerifySharesFailed && ev.Reason == protocol.VerifyFailureReasonNoProof {
+			noProof[ev.ChannelID] = true
+		}
+	}
+	for _, ch := range helperChannels {
+		assertTrue(noProof[ch], "bob holds no v1 bytes, so every helper channel fails with NoProof; got %+v", events)
+	}
+	assertTrue(len(bob.drain()) == 0, "no v1 challenge is sent without a proof to check the answer against")
+	fmt.Printf("  alice: v%d ✓ v%d ✓   bob: v%d NoProof (never synced) v%d ✓  ✓\n", v1, v2, v1, v2)
+
+	fmt.Println("Protocol replica verifies only synced versions test passed.")
+}
+
+// runDiscoveryAndRecovery: an owner that lost its snapshot and its channels
+// re-pairs with each helper, discovers the secret and its versions through
+// Discovery, recovers it, and restores it on a fresh device. Mirrors
+// run_discovery_and_recovery_flow in smoke-tests/rust/src/protocol.rs.
+func runDiscoveryAndRecovery() {
+	fmt.Println("=== Protocol discovery & recovery test ===")
+
+	const protectedSecretID uint64 = 7777
+	secretIDBytes := []byte{9, 9, 9}
+	secretData := []byte("correct horse battery staple")
+	owner := newPeerWithSecretID("owner", "https://owner-discovery.example.com", protectedSecretID, 2)
+	helperA := newPeerWithSecretID("helper-a", "https://helper-a-discovery.example.com", protectedSecretID, 2)
+	helperB := newPeerWithSecretID("helper-b", "https://helper-b-discovery.example.com", protectedSecretID, 2)
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+
+	channelA := pairPeers(owner, helperA, 1)
+	channelB := pairPeers(owner, helperB, 2)
+	description := "wallet seed phrase"
+	_, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets:     []protocol.UserSecret{{ID: secretIDBytes, Name: "wallet seed", Data: secretData}},
+		Description: &description,
+	})
+	must(err, "owner.Start(ProtectSecret)")
+	stored := map[uint64]bool{}
+	confirmed := 0
+	for _, ev := range pumpMany([]*peer{owner, helperA, helperB}) {
+		switch ev.Type {
+		case protocol.EventTypeShareStored:
+			stored[ev.ChannelID] = true
+		case protocol.EventTypeShareConfirmed:
+			confirmed++
+		}
+	}
+	assertTrue(stored[channelA] && stored[channelB] && confirmed == 2,
+		"both helpers must store and confirm, got stored=%v confirmed=%d", stored, confirmed)
+
+	must(owner.userSecrets.Remove(protectedSecretID), "owner userSecrets.Remove")
+
+	var rekeyed []uint64
+	for i, helper := range []*peer{helperA, helperB} {
+		fresh := uint64(100 + i)
+		contact, err := owner.proto.CreateContact(&fresh, protocol.ContactModeInlineKeys, nil)
+		must(err, "owner.CreateContact(recovery)")
+		_, err = helper.proto.Start(protocol.FlowKindPairing, protocol.PairingParams{
+			Kind:                  protocol.SenderKindHelper,
+			Contact:               contact.ContactBytes,
+			PeerCommunicationInfo: map[string]string{"name": "recovering-owner"},
+		})
+		must(err, fmt.Sprintf("%s Start(Pairing recovery)", helper.label))
+		rekeyed = append(rekeyed, pairedChannelID(pumpMany([]*peer{owner, helper}), fresh))
+	}
+	recoveryA, recoveryB := rekeyed[0], rekeyed[1]
+	must(helperA.channelStore.LinkChannel(protectedSecretID, channelA, recoveryA), "helper-a LinkChannel")
+	must(helperB.channelStore.LinkChannel(protectedSecretID, channelB, recoveryB), "helper-b LinkChannel")
+	_, err = owner.channelStore.Remove(protectedSecretID, channelA, 0)
+	must(err, "owner remove(channelA)")
+	_, err = owner.channelStore.Remove(protectedSecretID, channelB, 0)
+	must(err, "owner remove(channelB)")
+
+	_, err = owner.proto.Start(protocol.FlowKindDiscovery, protocol.DiscoveryParams{Target: protocol.TargetMany(recoveryA, recoveryB)})
+	must(err, "owner.Start(Discovery)")
+	discoveredOn := 0
+	var recoverVersion uint32
+	foundSecret, describedVersion := false, false
+	for _, ev := range pumpMany([]*peer{owner, helperA, helperB}) {
+		if ev.Type != protocol.EventTypeSecretsDiscovered {
+			continue
+		}
+		discoveredOn++
+		for _, s := range ev.Secrets {
+			if s.SecretID != protectedSecretID {
+				continue
+			}
+			foundSecret = true
+			for _, v := range s.Versions {
+				describedVersion = describedVersion || v.Description == description
+				recoverVersion = max(recoverVersion, v.Version)
+			}
+		}
+	}
+	assertTrue(discoveredOn > 0, "expected at least one SecretsDiscovered event on the owner")
+	assertTrue(foundSecret && recoverVersion != 0, "the discovered list must contain secret %d with a version", protectedSecretID)
+	assertTrue(describedVersion, "the version description must be preserved through discovery")
+	fmt.Printf("  Discovery → SecretsDiscovered from %d helper(s): secret_id=%d v%d %q  ✓\n",
+		discoveredOn, protectedSecretID, recoverVersion, description)
+
+	_, err = owner.proto.Start(protocol.FlowKindRecoverSecret, protocol.RecoverSecretParams{
+		SecretID: protectedSecretID,
+		Version:  recoverVersion,
+	})
+	must(err, "owner.Start(RecoverSecret)")
+	var recovered *protocol.Secret
+	for _, ev := range pumpMany([]*peer{owner, helperA, helperB}) {
+		if ev.Type == protocol.EventTypeSecretRecovered && ev.Secret != nil {
+			recovered = ev.Secret
+		}
+	}
+	assertTrue(recovered != nil, "expected SecretRecovered on the owner")
+	idx := slices.IndexFunc(recovered.Secrets, func(s protocol.UserSecret) bool { return bytes.Equal(s.ID, secretIDBytes) })
+	assertTrue(idx >= 0 && bytes.Equal(recovered.Secrets[idx].Data, secretData) && recovered.Secrets[idx].Name == "wallet seed",
+		"the recovered secret must carry the protected user secret, got %+v", recovered.Secrets)
+	fmt.Printf("  RecoverSecret → UserSecret %q (%dB)  ✓\n", recovered.Secrets[idx].Name, len(recovered.Secrets[idx].Data))
+
+	restored := newPeerWithSecretID("restored-owner", "https://restored-discovery.example.com", protectedSecretID, 2)
+	defer restored.proto.Close()
+	_, err = restored.proto.Restore(*recovered, recoverVersion)
+	must(err, "Restore on a fresh peer")
+	snapshot, ok, err := restored.userSecrets.LoadLatest(protectedSecretID)
+	must(err, "restored userSecrets.LoadLatest")
+	assertTrue(ok && snapshot.Version == recoverVersion, "the restored snapshot must be v%d, got ok=%v v%d", recoverVersion, ok, snapshot.Version)
+	assertTrue(slices.ContainsFunc(snapshot.Secrets, func(s protocol.UserSecret) bool {
+		return bytes.Equal(s.ID, secretIDBytes) && bytes.Equal(s.Data, secretData)
+	}), "the restored snapshot must carry the protected user secret")
+	for _, h := range recovered.Helpers {
+		record, ok, err := restored.channelStore.Load(protectedSecretID, h.ChannelID, 0)
+		must(err, "restored channelStore.Load")
+		assertTrue(ok && record.Helper != nil && record.Helper.PeerRole == protocol.SenderKindHelper,
+			"restored helper channel %d must exist as a Helper, got ok=%v %+v", h.ChannelID, ok, record)
+	}
+	fmt.Println("  Restore on a fresh peer writes the snapshot and every helper channel  ✓")
+
+	fmt.Println("Protocol discovery & recovery test passed.")
+}
+
+// recoverAfter protects one secret across three helpers, lets damage alter
+// helper-a's stored share, and recovers. It returns helper-a's channel, the
+// version and the recovery's events.
+func recoverAfter(tag string, secretID uint64, secret protocol.UserSecret, damage func(helperA *peer, channelA uint64, version uint32)) (uint64, uint32, []protocol.Event, []protocol.Event) {
+	owner := newPeerWithSecretID("owner", "https://owner-"+tag+".example.com", secretID, 2)
+	helperA := newPeer("helper-a", "https://helper-a-"+tag+".example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-"+tag+".example.com", 2)
+	helperC := newPeer("helper-c", "https://helper-c-"+tag+".example.com", 2)
+	all := []*peer{owner, helperA, helperB, helperC}
+	for _, p := range all {
+		defer p.proto.Close()
+	}
+	channelA := pairPeers(owner, helperA, 1)
+	pairPeers(owner, helperB, 2)
+	pairPeers(owner, helperC, 3)
+
+	events, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{secret},
+	})
+	must(err, "owner.Start(ProtectSecret)")
+	version := startedVersion(events)
+	assertTrue(version != 0, "the round must report the version it published, got %+v", events)
+	pumpMany(all)
+
+	damage(helperA, channelA, version)
+
+	_, err = owner.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+		SecretID: secretID,
+		Version:  version,
+		Target:   protocol.TargetAll(),
+	})
+	must(err, "owner.Start(VerifyShares)")
+	verifyEvents := pumpMany(all)
+
+	started, err := owner.proto.Start(protocol.FlowKindRecoverSecret, protocol.RecoverSecretParams{
+		SecretID: secretID,
+		Version:  version,
+	})
+	must(err, "owner.Start(RecoverSecret)")
+	asked := 0
+	for _, ev := range started {
+		if ev.Type == protocol.EventTypeRecoverSecretStarted {
+			asked++
+		}
+	}
+	assertTrue(asked == 3, "every helper is asked for its share, got %d", asked)
+	return channelA, version, verifyEvents, pumpMany(all)
+}
+
+// assertRecoveredDespite fails unless the recovery decided SecretRecovered
+// carrying secret, never RecoveryIncomplete or RecoveryConflict.
+func assertRecoveredDespite(events []protocol.Event, secret protocol.UserSecret, what string) {
+	var recovered *protocol.Secret
+	for _, ev := range events {
+		assertTrue(ev.Type != protocol.EventTypeRecoveryIncomplete && ev.Type != protocol.EventTypeRecoveryConflict,
+			"%s must not leave the recovery undecided: %+v", what, events)
+		if ev.Type == protocol.EventTypeSecretRecovered && ev.Secret != nil {
+			recovered = ev.Secret
+		}
+	}
+	assertTrue(recovered != nil, "the two remaining helpers must complete the recovery, got %+v", events)
+	assertTrue(slices.ContainsFunc(recovered.Secrets, func(s protocol.UserSecret) bool {
+		return bytes.Equal(s.ID, secret.ID) && bytes.Equal(s.Data, secret.Data)
+	}), "the recovered secret must carry the protected bytes, got %+v", recovered.Secrets)
+}
+
+// runHelperWithoutTheVersion: one of three helpers no longer holds the
+// version. It answers the challenge and the recovery request with
+// UNKNOWN_SHARE_VERSION; the owner reports ShareVerifyRejected and
+// RecoveryShareRefused and recovers from the other two. Mirrors
+// run_helper_without_the_version_flow in smoke-tests/rust/src/protocol.rs.
+func runHelperWithoutTheVersion() {
+	fmt.Println("=== Protocol helper without the version test ===")
+
+	secret := protocol.UserSecret{ID: []byte{7}, Name: "forgetful-helper secret", Data: []byte("three helpers, one forgetful")}
+	channelA, version, verifyEvents, recoveryEvents := recoverAfter("forgetful", 42, secret, func(helperA *peer, channelA uint64, version uint32) {
+		must(helperA.shareStore.RemoveVersions(helperA.proto.SecretID(), channelA, []uint32{version}), "helper-a drops its share")
+	})
+
+	var rejected []protocol.Event
+	verified := 0
+	for _, ev := range verifyEvents {
+		switch ev.Type {
+		case protocol.EventTypeShareVerifyRejected:
+			rejected = append(rejected, ev)
+		case protocol.EventTypeShareVerified:
+			verified++
+		}
+	}
+	assertTrue(len(rejected) == 1 && rejected[0].ChannelID == channelA && rejected[0].Status == derecpb.StatusEnum_UNKNOWN_SHARE_VERSION,
+		"helper-a must refuse the challenge with UNKNOWN_SHARE_VERSION, got %+v", rejected)
+	assertTrue(verified == 2, "helper-b and helper-c still prove possession, got %d", verified)
+	fmt.Println("  VerifyShares → ShareVerifyRejected(helper-a, UNKNOWN_SHARE_VERSION), two ShareVerified  ✓")
+
+	var refused []protocol.Event
+	for _, ev := range recoveryEvents {
+		if ev.Type == protocol.EventTypeRecoveryShareRefused {
+			refused = append(refused, ev)
+		}
+	}
+	assertTrue(len(refused) == 1 && refused[0].ChannelID == channelA && refused[0].Version != nil && *refused[0].Version == version &&
+		refused[0].Status == derecpb.StatusEnum_UNKNOWN_SHARE_VERSION,
+		"the app sees exactly one refusal, from helper-a, got %+v", refused)
+	assertRecoveredDespite(recoveryEvents, secret, "a refusal")
+	fmt.Println("  RecoverSecret → RecoveryShareRefused(helper-a, UNKNOWN_SHARE_VERSION), SecretRecovered from the rest  ✓")
+
+	fmt.Println("Protocol helper without the version test passed.")
+}
+
+// runCorruptedShare: one of three helpers holds a share with one byte of a y
+// coordinate flipped in storage, so it still answers OK. The owner reports
+// RecoveryShareCorrupted(InvalidProof) against it and recovers from the other
+// two. Mirrors run_corrupted_share_flow in smoke-tests/rust/src/protocol.rs.
+func runCorruptedShare() {
+	fmt.Println("=== Protocol corrupted share test ===")
+
+	secret := protocol.UserSecret{ID: []byte{8}, Name: "tampered-helper secret", Data: []byte("three helpers, one tampered")}
+	channelA, version, _, recoveryEvents := recoverAfter("corrupted", 43, secret, func(helperA *peer, channelA uint64, version uint32) {
+		stored := heldShare(helperA, channelA, version)
+		var request derecpb.StoreShareRequestMessage
+		must(proto.Unmarshal(stored.Bytes, &request), "decode the stored StoreShareRequestMessage")
+		var committed derecpb.CommittedDeRecShare
+		must(proto.Unmarshal(request.Share, &committed), "decode the CommittedDeRecShare")
+		var share derecpb.DeRecShare
+		must(proto.Unmarshal(committed.DeRecShare, &share), "decode the DeRecShare")
+		share.Subshares[0].Y[0] ^= 0x01
+		var err error
+		committed.DeRecShare, err = proto.Marshal(&share)
+		must(err, "encode the DeRecShare")
+		request.Share, err = proto.Marshal(&committed)
+		must(err, "encode the CommittedDeRecShare")
+		stored.Bytes, err = proto.Marshal(&request)
+		must(err, "encode the StoreShareRequestMessage")
+		must(helperA.shareStore.Save(helperA.proto.SecretID(), channelA, stored), "helper-a stores the tampered share")
+	})
+
+	var corrupted []protocol.Event
+	for _, ev := range recoveryEvents {
+		if ev.Type == protocol.EventTypeRecoveryShareCorrupted {
+			corrupted = append(corrupted, ev)
+		}
+	}
+	assertTrue(len(corrupted) == 1 && corrupted[0].ChannelID == channelA && corrupted[0].Version != nil &&
+		*corrupted[0].Version == version && corrupted[0].Reason == protocol.CorruptionReasonInvalidProof,
+		"the app sees exactly one corrupted share, from helper-a (InvalidProof), got %+v", corrupted)
+	assertRecoveredDespite(recoveryEvents, secret, "a corrupted share")
+	fmt.Println("  RecoverSecret → RecoveryShareCorrupted(helper-a, InvalidProof), SecretRecovered from the rest  ✓")
+
+	fmt.Println("Protocol corrupted share test passed.")
+}
+
+// runUnpairing: the owner starts an unpair, the helper accepts it, both sides
+// report Unpaired and drop the channel record. A helper starting an unpair is
+// refused with CodeRoleMismatch. Mirrors run_unpairing_flow in
+// smoke-tests/rust/src/protocol.rs.
+func runUnpairing() {
+	fmt.Println("=== Protocol unpairing test ===")
+
+	owner := newPeer("owner", "https://owner-unpair.example.com", 2)
+	helper := newPeer("helper", "https://helper-unpair.example.com", 2)
+	defer owner.proto.Close()
+	defer helper.proto.Close()
+	channelID := pairPeers(owner, helper, 7)
+
+	memo := "decommissioning"
+	_, err := owner.proto.Start(protocol.FlowKindUnpair, protocol.UnpairParams{ChannelID: channelID, Memo: &memo})
+	must(err, "owner.Start(Unpair)")
+	unpaired := 0
+	for _, ev := range pump(owner, helper) {
+		assertTrue(ev.Type != protocol.EventTypeUnpairRejected, "an accepted unpair must not be rejected, got %+v", ev)
+		if ev.Type == protocol.EventTypeUnpaired && ev.ChannelID == channelID {
+			unpaired++
+		}
+	}
+	assertTrue(unpaired >= 2, "expected Unpaired on both sides, got %d", unpaired)
+	assertTrue(!hasChannelRecord(owner, channelID, 0), "the owner's channel record must be removed after unpair")
+	assertTrue(!hasChannelRecord(helper, channelID, 0), "the helper's channel record must be removed after unpair")
+	fmt.Println("  Start(Unpair) → Unpaired on both sides, channel record gone on both  ✓")
+
+	owner2 := newPeer("owner", "https://owner-unpair-2.example.com", 2)
+	helper2 := newPeer("helper", "https://helper-unpair-2.example.com", 2)
+	defer owner2.proto.Close()
+	defer helper2.proto.Close()
+	helperChannel := pairPeers(owner2, helper2, 8)
+	helperMemo := "helper trying to unpair"
+	_, err = helper2.proto.Start(protocol.FlowKindUnpair, protocol.UnpairParams{ChannelID: helperChannel, Memo: &helperMemo})
+	var roleErr *derec.Error
+	assertTrue(errors.As(err, &roleErr) && roleErr.Code == derec.CodeRoleMismatch,
+		"a helper-started unpair must be refused with CodeRoleMismatch, got %v", err)
+	assertChannelID(roleErr, helperChannel, "the refused helper unpair")
+	fmt.Println("  helper Start(Unpair) → CodeRoleMismatch  ✓")
+
+	fmt.Println("Protocol unpairing test passed.")
+}
+
+// runUpdateChannelInfo: the owner changes its communication info and
+// endpoint and announces both; both sides report ChannelInfoUpdated and the
+// helper's stored record reflects the update. An update naming neither is
+// refused with CodeInvalidInput. Mirrors run_update_channel_info_flow in
+// smoke-tests/rust/src/protocol.rs.
+func runUpdateChannelInfo() {
+	fmt.Println("=== Protocol UpdateChannelInfo test ===")
+
+	owner := newPeer("owner", "https://owner-update.example.com", 2)
+	helper := newPeer("helper", "https://helper-update.example.com", 2)
+	defer owner.proto.Close()
+	defer helper.proto.Close()
+	channelID := pairPeers(owner, helper, 42)
+
+	newURI := "https://owner-update.NEW.example.com"
+	newInfo := map[string]string{"name": "Owner-renamed", "email": "owner.new@example.com"}
+	newTransports := []protocol.TransportProtocolParam{{URI: newURI, Protocol: int32(derecpb.Protocol_HTTPS)}}
+	must(owner.proto.SetCommunicationInfo(newInfo), "owner SetCommunicationInfo")
+	must(owner.proto.SetOwnTransports(newTransports), "owner SetOwnTransports")
+	owner.uri = newURI
+
+	_, err := owner.proto.Start(protocol.FlowKindUpdateChannelInfo, protocol.UpdateChannelInfoParams{
+		Target:            protocol.TargetOne(channelID),
+		CommunicationInfo: newInfo,
+		OwnTransports:     newTransports,
+	})
+	must(err, "owner.Start(UpdateChannelInfo)")
+	updated := 0
+	for _, ev := range pump(owner, helper) {
+		if ev.Type == protocol.EventTypeChannelInfoUpdated && ev.ChannelID == channelID {
+			updated++
+		}
+	}
+	assertTrue(updated >= 2, "expected ChannelInfoUpdated on both sides, got %d", updated)
+	fmt.Println("  Start(UpdateChannelInfo) → ChannelInfoUpdated on both sides  ✓")
+
+	record, ok, err := helper.channelStore.Load(protocolSecretID, channelID, 0)
+	must(err, "helper channelStore.Load")
+	assertTrue(ok && record.Helper != nil, "the helper channel must still exist after UpdateChannelInfo")
+	assertTrue(len(record.Helper.Transports) > 0 && record.Helper.Transports[0].URI == newURI,
+		"the helper's stored transport must be %s, got %+v", newURI, record.Helper.Transports)
+	assertTrue(len(record.Helper.CommunicationInfo) == len(newInfo) &&
+		record.Helper.CommunicationInfo["name"] == newInfo["name"] && record.Helper.CommunicationInfo["email"] == newInfo["email"],
+		"the helper's stored communication_info must mirror the announced map, got %v", record.Helper.CommunicationInfo)
+	fmt.Println("  the helper's stored record reflects the new endpoint and communication info  ✓")
+
+	_, err = owner.proto.Start(protocol.FlowKindUpdateChannelInfo, protocol.UpdateChannelInfoParams{
+		Target: protocol.TargetOne(channelID),
+	})
+	var inputErr *derec.Error
+	assertTrue(errors.As(err, &inputErr) && inputErr.Code == derec.CodeInvalidInput,
+		"an update naming neither field must fail with CodeInvalidInput, got %v", err)
+	fmt.Println("  an update naming neither field → CodeInvalidInput  ✓")
+
+	fmt.Println("Protocol UpdateChannelInfo test passed.")
+}
+
+// runReplyTo: with AutoReplyTo on, an outbound request still goes to the
+// peer's stored endpoint but carries this device's endpoints as replyTo; and
+// a responder routes its reply to an inbound request's replyTo instead of the
+// stored endpoint. Mirrors run_reply_to_flow in
+// smoke-tests/rust/src/protocol.rs.
+func runReplyTo() {
+	fmt.Println("=== Protocol replyTo test ===")
+
+	owner, err := newPeerWithConfig("owner-reply", "https://owner-reply.example.com", protocol.Config{
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold:   proto.Uint32(2),
+			AutoReplyTo: proto.Bool(true),
+		},
+	})
+	must(err, "protocol.New(owner-reply)")
+	helper := newPeer("helper-reply", "https://helper-reply.example.com", 2)
+	defer owner.proto.Close()
+	defer helper.proto.Close()
+	channelID := pairPeers(owner, helper, 7)
+
+	_, err = owner.proto.Start(protocol.FlowKindDiscovery, protocol.DiscoveryParams{Target: protocol.TargetOne(channelID)})
+	must(err, "owner.Start(Discovery)")
+	outbound := owner.drain()
+	assertTrue(len(outbound) == 1, "expected exactly one outbound Discovery request, got %d", len(outbound))
+	assertTrue(outbound[0].uri == helper.uri, "the request must still route to the helper's stored endpoint, got %s", outbound[0].uri)
+
+	sharedKey := loadChannelKey(owner, protocolSecretID, channelID)
+	extracted, err := discovery.Request.Extract(outbound[0].message, sharedKey)
+	must(err, "discovery.Request.Extract")
+	var request derecpb.GetSecretIdsVersionsRequestMessage
+	must(proto.Unmarshal(extracted.RequestProto, &request), "decode GetSecretIdsVersionsRequestMessage")
+	replyTo := request.GetReplyToTransports()
+	assertTrue(len(replyTo) > 0 && replyTo[0].GetUri() == owner.uri,
+		"AutoReplyTo must stamp replyToTransports leading with %s, got %v", owner.uri, replyTo)
+	fmt.Println("  AutoReplyTo stamps the outbound request with this device's endpoint  ✓")
+
+	const phantomURI = "https://phantom-replica.example.com"
+	crafted, err := discovery.Request.Produce(channelID, sharedKey,
+		[]discovery.Endpoint{{URI: phantomURI, Protocol: int32(derecpb.Protocol_HTTPS)}})
+	must(err, "discovery.Request.Produce with replyTo")
+	helper.drain()
+	deliver(helper, crafted)
+	answers := helper.drain()
+	assertTrue(len(answers) == 1, "expected exactly one Discovery response, got %d", len(answers))
+	assertTrue(answers[0].uri == phantomURI,
+		"the responder must route to the request's replyTo, not the stored endpoint; got %s", answers[0].uri)
+	fmt.Println("  the responder routes its reply to the inbound replyTo  ✓")
+
+	fmt.Println("Protocol replyTo test passed.")
+}
+
+// runAutoAccept: helpers whose AutoAccept policy opts into StoreShare store
+// each share without ActionRequired, reporting AutoAccepted instead, and the
+// owner sees both ShareConfirmed. Mirrors run_auto_accept_flow in
+// smoke-tests/rust/src/protocol.rs.
+func runAutoAccept() {
+	fmt.Println("=== Protocol auto-accept test ===")
+
+	autoAccepting := func(label, uri string) *peer {
+		p, err := newPeerWithConfig(label, uri, protocol.Config{
+			DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+				Threshold:  proto.Uint32(2),
+				AutoAccept: &protocol.AutoAcceptPolicy{StoreShare: true},
+			},
+		})
+		must(err, fmt.Sprintf("protocol.New(%s)", label))
+		return p
+	}
+	owner := newPeerWithSecretID("owner", "https://owner-auto-accept.example.com", 99, 2)
+	helperA := autoAccepting("helper-a", "https://helper-a-auto-accept.example.com")
+	helperB := autoAccepting("helper-b", "https://helper-b-auto-accept.example.com")
+	defer owner.proto.Close()
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+	channelA := pairPeers(owner, helperA, 1)
+	channelB := pairPeers(owner, helperB, 2)
+
+	description := "auto-accept smoke"
+	_, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets:     []protocol.UserSecret{{ID: []byte{1, 2, 3}, Name: "auto-accept smoke secret", Data: []byte("auto-accepted-value")}},
+		Description: &description,
+	})
+	must(err, "owner.Start(ProtectSecret)")
+	autoAccepted, confirmed := 0, 0
+	stored := map[uint64]bool{}
+	for _, ev := range pumpMany([]*peer{owner, helperA, helperB}) {
+		switch ev.Type {
+		case protocol.EventTypeAutoAccepted:
+			if ev.ActionKind == protocol.ActionKindStoreShare {
+				autoAccepted++
+			}
+		case protocol.EventTypeActionRequired:
+			assertTrue(ev.ActionKind != protocol.ActionKindStoreShare, "auto-accept must suppress ActionRequired(StoreShare), got %+v", ev)
+		case protocol.EventTypeShareStored:
+			stored[ev.ChannelID] = true
+		case protocol.EventTypeShareConfirmed:
+			confirmed++
+		}
+	}
+	assertTrue(autoAccepted == 2, "expected AutoAccepted(StoreShare) on both helpers, got %d", autoAccepted)
+	assertTrue(stored[channelA] && stored[channelB], "expected ShareStored on both helpers, got %v", stored)
+	assertTrue(confirmed == 2, "expected ShareConfirmed from both helpers, got %d", confirmed)
+	fmt.Println("  helpers auto-accept StoreShare: AutoAccepted + ShareStored, no ActionRequired; owner ShareConfirmed ×2  ✓")
+
+	fmt.Println("Protocol auto-accept test passed.")
+}
+
+// runStartPairingRejectsAlreadyPaired: scanning a fresh contact on a channel
+// that already finished pairing is refused with CodeChannelAlreadyPaired; the
+// channel stays Paired with its SharedKey, no pairing secret or contact is
+// stored, and nothing is sent. Mirrors
+// run_start_pairing_rejects_already_paired_channel in
+// smoke-tests/rust/src/protocol.rs.
+func runStartPairingRejectsAlreadyPaired() {
+	fmt.Println("=== Protocol start(Pairing) rejects already-Paired channel test ===")
+
+	everyFlow := &protocol.AutoAcceptPolicy{
+		Pairing: true, PrePair: true, StoreShare: true, VerifyShare: true,
+		Discovery: true, GetShare: true, Unpair: true, UpdateChannelInfo: true,
+	}
+	autoAccepting := func(label, uri string) *peer {
+		p, err := newPeerWithConfig(label, uri, protocol.Config{
+			DeRecProtocolConfig: protocol.DeRecProtocolConfig{Threshold: proto.Uint32(2), AutoAccept: everyFlow},
+		})
+		must(err, fmt.Sprintf("protocol.New(%s)", label))
+		return p
+	}
+	owner := autoAccepting("owner", "https://owner-already-paired.example.com")
+	helper := autoAccepting("helper", "https://helper-already-paired.example.com")
+	defer owner.proto.Close()
+	defer helper.proto.Close()
+	channelID := pairPeers(owner, helper, 1000)
+
+	status := func() protocol.ChannelStatus {
+		record, ok, err := helper.channelStore.Load(protocolSecretID, channelID, 0)
+		must(err, "helper channelStore.Load")
+		assertTrue(ok && record.Helper != nil, "the helper channel must exist")
+		return record.Helper.Status
+	}
+	assertTrue(status() == protocol.ChannelStatusPaired, "the channel must be Paired after pairing")
+
+	fresh, err := owner.proto.CreateContact(&channelID, protocol.ContactModeInlineKeys, nil)
+	must(err, "owner.CreateContact (round 2)")
+	_, err = helper.proto.Start(protocol.FlowKindPairing, protocol.PairingParams{Kind: protocol.SenderKindHelper, Contact: fresh.ContactBytes})
+	var pairErr *derec.Error
+	assertTrue(errors.As(err, &pairErr) && pairErr.Code == derec.CodeChannelAlreadyPaired,
+		"Start(Pairing) on an already-Paired channel must fail with CodeChannelAlreadyPaired, got %v", err)
+	assertChannelID(pairErr, channelID, "the refused re-scan")
+
+	assertTrue(status() == protocol.ChannelStatusPaired, "the channel must remain Paired after the refused start")
+	assertTrue(hasSharedKey(helper, channelID), "the SharedKey must remain after the refused start")
+	for _, kind := range []protocol.SecretKind{protocol.SecretKindPairingSecret, protocol.SecretKindPairingContact} {
+		_, ok, err := helper.secretStore.Load(protocolSecretID, channelID, kind)
+		must(err, "helper secretStore.Load")
+		assertTrue(!ok, "secret kind %v must remain absent after the refused start", kind)
+	}
+	queued := helper.drain()
+	assertTrue(len(queued) == 0, "a refused start must send nothing, got %d message(s)", len(queued))
+	fmt.Println("  helper Start(Pairing) on an already-Paired channel → CodeChannelAlreadyPaired, no state change  ✓")
+
+	fmt.Println("Protocol start(Pairing) rejects already-Paired channel test passed.")
+}
+
+// runReplicaIDWiring: two replica-configured peers pair in replica mode, both
+// report ReplicaPaired naming the other, neither records its own row before
+// confirming, and afterwards both hold the same absolute roster. A replica
+// pairing is refused with CodeReplicaIDNotConfigured by an initiator, and by
+// a responder, built without a replica id. Mirrors run_replica_id_wiring_flow
+// in smoke-tests/rust/src/protocol.rs.
+func runReplicaIDWiring() {
+	fmt.Println("=== Protocol replica_id wiring test ===")
+
+	ownerID, helperID := uint64(0x1111222233334444), uint64(0xAAAABBBBCCCCDDDD)
+	owner := newPeerWithReplicaID("owner", "https://owner-wiring.example.com", 2, &ownerID)
+	helper := newPeerWithReplicaID("helper", "https://helper-wiring.example.com", 2, &helperID)
+	defer owner.proto.Close()
+	defer helper.proto.Close()
+
+	startReplicaScan(helper, owner, 1, protocol.SenderKindReplicaDestination)
+	helperToOwner := pump(helper, owner)
+	all := append(helperToOwner, pump(owner, helper)...)
+	assertTrue(slices.ContainsFunc(helperToOwner, func(ev protocol.Event) bool { return ev.Type == protocol.EventTypePairingCompleted }),
+		"expected PairingCompleted for the replica pairing")
+	channelID := pairedChannelID(all, 1)
+	replicaPaired := func(peerID uint64) bool {
+		return slices.ContainsFunc(all, func(ev protocol.Event) bool {
+			return ev.Type == protocol.EventTypeReplicaPaired && ev.ChannelID == channelID && ev.PeerReplicaID == peerID
+		})
+	}
+	assertTrue(replicaPaired(helperID), "the owner-side ReplicaPaired must carry the helper's id")
+	assertTrue(replicaPaired(ownerID), "the helper-side ReplicaPaired must carry the owner's id")
+
+	for _, side := range []struct {
+		p     *peer
+		ownID uint64
+	}{{owner, ownerID}, {helper, helperID}} {
+		roster, err := side.p.channelStore.ListReplicas(protocolSecretID, protocol.ReplicaFilter{})
+		must(err, side.p.label+" ListReplicas")
+		for _, m := range roster {
+			assertTrue(m.ReplicaID != side.ownID, "%s holds no own row before confirming, got %+v", side.p.label, roster)
+		}
+	}
+	crossConfirmFingerprint(owner, helper, channelID)
+	pumpMany([]*peer{owner, helper})
+
+	for _, p := range []*peer{owner, helper} {
+		roster, err := p.channelStore.ListReplicas(protocolSecretID, protocol.ReplicaFilter{})
+		must(err, p.label+" ListReplicas")
+		member := func(id uint64) protocol.ReplicaMember {
+			idx := slices.IndexFunc(roster, func(m protocol.ReplicaMember) bool { return m.ReplicaID == id })
+			assertTrue(idx >= 0, "%s's roster must contain a row for replica %#x, got %+v", p.label, id, roster)
+			return roster[idx]
+		}
+		assertTrue(member(ownerID).Role == protocol.ReplicaRoleSource && member(helperID).Role == protocol.ReplicaRoleDestination,
+			"%s: the owner must be the Source and the helper the Destination", p.label)
+		assertTrue(member(ownerID).ChannelID == channelID && member(helperID).ChannelID == channelID,
+			"%s must record every member against the group channel %d", p.label, channelID)
+		for _, id := range []uint64{ownerID, helperID} {
+			_, reserved := member(id).CommunicationInfo["derec.replica_id"]
+			assertTrue(!reserved, "%s: communication_info must not contain the reserved key", p.label)
+		}
+	}
+	fmt.Println("  happy path: both sides hold the same absolute roster  ✓")
+
+	owner2 := newPeerWithReplicaID("owner", "https://owner-wiring-2.example.com", 2, &ownerID)
+	unconfigured := newPeer("helper", "https://helper-wiring-2.example.com", 2)
+	defer owner2.proto.Close()
+	defer unconfigured.proto.Close()
+	transient := uint64(2)
+	contact, err := owner2.proto.CreateContact(&transient, protocol.ContactModeInlineKeys, nil)
+	must(err, "owner.CreateContact")
+	_, err = unconfigured.proto.Start(protocol.FlowKindPairing, protocol.PairingParams{
+		Kind:    protocol.SenderKindReplicaDestination,
+		Contact: contact.ContactBytes,
+	})
+	var initiatorErr *derec.Error
+	assertTrue(errors.As(err, &initiatorErr) && initiatorErr.Code == derec.CodeReplicaIDNotConfigured,
+		"an initiator without a replica id must refuse a replica pairing with CodeReplicaIDNotConfigured, got %v", err)
+	assertTrue(len(unconfigured.drain()) == 0, "no outbound traffic may be generated")
+	fmt.Println("  initiator without replica_id → CodeReplicaIDNotConfigured, nothing sent  ✓")
+
+	unconfiguredOwner := newPeer("owner", "https://owner-wiring-3.example.com", 2)
+	helper3 := newPeerWithReplicaID("helper", "https://helper-wiring-3.example.com", 2, &helperID)
+	defer unconfiguredOwner.proto.Close()
+	defer helper3.proto.Close()
+	startReplicaScan(helper3, unconfiguredOwner, 3, protocol.SenderKindReplicaDestination)
+	request := helper3.drain()
+	assertTrue(len(request) == 1, "the helper must send exactly one PairRequest, got %d", len(request))
+	_, err = unconfiguredOwner.proto.Process(request[0].message)
+	var responderErr *derec.Error
+	assertTrue(errors.As(err, &responderErr) && responderErr.Code == derec.CodeReplicaIDNotConfigured,
+		"a responder without a replica id must refuse a replica PairRequest with CodeReplicaIDNotConfigured, got %v", err)
+	fmt.Println("  responder without replica_id → CodeReplicaIDNotConfigured  ✓")
+
+	fmt.Println("Protocol replica_id wiring test passed.")
+}
+
+// runProtectSecretWithReplicaTargets: a ProtectSecret over two helpers and a
+// paired Destination reports ProtectSecretStarted per helper channel only and
+// sends three requests. The Destination installs the full secret, the helper
+// share map and the roster, and acknowledges; the owner reports
+// ReplicaSecretAcked. Mirrors run_protect_secret_with_replica_targets_flow in
+// smoke-tests/rust/src/protocol.rs, except the decryption of the requests'
+// share_algorithm, which needs the Rust message internals.
+func runProtectSecretWithReplicaTargets() {
+	fmt.Println("=== Protocol ProtectSecret(replica targets) test ===")
+
+	ownerID, replicaID := uint64(0xAAAAAAAAAAAAAAAA), uint64(0xBBBBBBBBBBBBBBBB)
+	owner := newReplicaPeer("owner", "https://owner-replica-targets.example.com", 0xC0FFEE, ownerID, 2)
+	helperA := newPeer("helper-a", "https://helper-a-replica-targets.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-replica-targets.example.com", 2)
+	replica := newPeerWithReplicaID("replica", "https://replica-replica-targets.example.com", 2, &replicaID)
+	for _, p := range []*peer{owner, helperA, helperB, replica} {
+		defer p.proto.Close()
+	}
+
+	channelA := pairPeers(owner, helperA, 1)
+	channelB := pairPeers(owner, helperB, 2)
+	replicaChannel := pairReplicaHandshake(owner, replica, 3)
+
+	record, ok, err := owner.channelStore.Load(0xC0FFEE, replicaChannel, replicaID)
+	must(err, "owner channelStore.Load(replica)")
+	assertTrue(ok && record.Replica != nil && record.Replica.Role == protocol.ReplicaRoleDestination,
+		"the owner must hold a Destination member row for the replica, got ok=%v %+v", ok, record)
+
+	crossConfirmFingerprint(owner, replica, replicaChannel)
+	autoPublish := owner.drain()
+	assertTrue(len(autoPublish) == 3, "the confirmation's publish must fan out to 2 helpers + 1 replica, got %d", len(autoPublish))
+
+	secretData := []byte("secret-payload-for-replica-and-helper")
+	description := "replica + helper distribution"
+	events, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets:     []protocol.UserSecret{{ID: []byte{0x01}, Name: "shared-secret", Data: secretData}},
+		Description: &description,
+	})
+	must(err, "owner.Start(ProtectSecret) with a replica target")
+	started := map[uint64]uint32{}
+	for _, ev := range events {
+		assertTrue(ev.Type != protocol.EventTypeProtectSecretFailed, "ProtectSecret emitted ProtectSecretFailed: %+v", ev)
+		if ev.Type == protocol.EventTypeProtectSecretStarted && ev.Version != nil {
+			started[ev.ChannelID] = *ev.Version
+		}
+	}
+	assertTrue(len(started) == 2 && started[channelA] != 0 && started[channelA] == started[channelB],
+		"ProtectSecretStarted must name each helper channel once, at one version; got %v", started)
+	_, onGroup := started[replicaChannel]
+	assertTrue(!onGroup, "the group channel must not appear in the helper-keyed started events")
+
+	outbound := owner.drain()
+	assertTrue(len(outbound) == 3, "expected three outbound requests (two helpers + one replica), got %d", len(outbound))
+	idx := slices.IndexFunc(outbound, func(e outboxEntry) bool { return e.uri == replica.uri })
+	assertTrue(idx >= 0 && slices.ContainsFunc(outbound, func(e outboxEntry) bool { return e.uri == helperA.uri }),
+		"one request must route to helper-a and one to the replica")
+	fmt.Println("  ProtectSecretStarted per helper channel only; three requests sent  ✓")
+
+	replicaEvents, err := replica.proto.Process(outbound[idx].message)
+	must(err, "replica.Process(StoreShareRequest)")
+	installed, isInstall := replicaArrival(replicaEvents, replicaChannel)
+	assertTrue(installed != nil && isInstall, "the first sync must be ReplicaSecretInstalled, got %+v", replicaEvents)
+	assertTrue(installed.FromReplicaID == ownerID, "FromReplicaID must be the owner's id, got %#x", installed.FromReplicaID)
+	assertTrue(installed.AuthorReplicaID != nil && *installed.AuthorReplicaID == ownerID, "the publisher is recorded as the author")
+	assertTrue(installed.SecretID == 0xC0FFEE, "SecretID must be the owner's secret, got %#x", installed.SecretID)
+	secret := installed.Secret
+	assertTrue(len(secret.Secrets) == 1 && bytes.Equal(secret.Secrets[0].Data, secretData),
+		"the secret must carry the one user secret, got %+v", secret.Secrets)
+	shareChannels := map[uint64]bool{}
+	for _, s := range installed.Shares {
+		assertTrue(len(s.CommittedShare) != 0, "ChannelShare.CommittedShare must be non-empty")
+		shareChannels[s.ChannelID] = true
+	}
+	assertTrue(len(installed.Shares) == 2 && shareChannels[channelA] && shareChannels[channelB],
+		"the share map must be keyed by the two helper channels, got %+v", installed.Shares)
+	helperChannels := map[uint64]bool{}
+	for _, h := range secret.Helpers {
+		assertTrue(len(h.SharedKey) == 32, "Helper.SharedKey must be a 32-byte key, got %d", len(h.SharedKey))
+		helperChannels[h.ChannelID] = true
+	}
+	assertTrue(len(secret.Helpers) == 2 && helperChannels[channelA] && helperChannels[channelB],
+		"secret.Helpers must name both helper channels, got %+v", secret.Helpers)
+	assertTrue(secret.Replicas != nil && secret.Replicas.ChannelID == replicaChannel && len(secret.Replicas.Members) == 2,
+		"the roster must carry the group channel and both members, got %+v", secret.Replicas)
+	for _, m := range secret.Replicas.Members {
+		switch m.ReplicaID {
+		case ownerID:
+			assertTrue(m.Role == protocol.ReplicaRoleSource, "the writer's own entry carries role Source")
+		case replicaID:
+			assertTrue(m.Role == protocol.ReplicaRoleDestination, "the replica's entry carries role Destination")
+			assertTrue(len(m.Transports) > 0 && m.Transports[0].URI == replica.uri,
+				"the Destination's entry must lead with its URI, got %+v", m.Transports)
+		default:
+			fail("unexpected roster member %#x", m.ReplicaID)
+		}
+	}
+	fmt.Printf("  replica installed: from=%x, secret_id=%x, %d secret / %d helpers / %d replicas, %d helper shares  ✓\n",
+		installed.FromReplicaID, installed.SecretID, len(secret.Secrets), len(secret.Helpers), len(secret.Replicas.Members), len(installed.Shares))
+
+	ack := replica.drain()
+	assertTrue(len(ack) == 1, "the replica must acknowledge with exactly one response, got %d", len(ack))
+	ownerEvents, err := owner.proto.Process(ack[0].message)
+	must(err, "owner.Process(replica acknowledgement)")
+	idx = slices.IndexFunc(ownerEvents, func(ev protocol.Event) bool {
+		return ev.Type == protocol.EventTypeReplicaSecretAcked && ev.ChannelID == replicaChannel
+	})
+	assertTrue(idx >= 0, "the owner must report ReplicaSecretAcked, got %+v", ownerEvents)
+	acked := ownerEvents[idx]
+	assertTrue(acked.FromReplicaID == replicaID && acked.Status == derecpb.StatusEnum_OK,
+		"ReplicaSecretAcked must come from the replica with status OK, got %+v", acked)
+	fmt.Printf("  owner received ReplicaSecretAcked: from=%x, status=%s  ✓\n", acked.FromReplicaID, acked.Status)
+
+	fmt.Println("Protocol ProtectSecret(replica targets) test passed.")
+}
+
+// runReplicaSyncVersionProgression walks the version progression of a group
+// that gains replicas, user secrets and helpers one at a time: every change
+// bumps the version, every confirmed Destination is hydrated with it, and the
+// helpers receive shares only once the threshold is met. Mirrors
+// run_replica_sync_version_progression_flow in
+// smoke-tests/rust/src/protocol.rs.
+func runReplicaSyncVersionProgression() {
+	fmt.Println("=== Protocol replica sync — version progression v0→v8 ===")
+
+	const sid uint64 = 0xABBA
+	const threshold = 3
+	owner := newReplicaPeer("owner", "https://owner-progression.example.com", sid, 0x0001, threshold)
+	replicaA := newReplicaPeer("replica-a", "https://replica-a-progression.example.com", sid, 0x000A, threshold)
+	replicaB := newReplicaPeer("replica-b", "https://replica-b-progression.example.com", sid, 0x000B, threshold)
+	replicaC := newReplicaPeer("replica-c", "https://replica-c-progression.example.com", sid, 0x000C, threshold)
+	helper1 := newPeerWithSecretID("helper-1", "https://helper-1-progression.example.com", sid, threshold)
+	helper2 := newPeerWithSecretID("helper-2", "https://helper-2-progression.example.com", sid, threshold)
+	helper3 := newPeerWithSecretID("helper-3", "https://helper-3-progression.example.com", sid, threshold)
+	replicas := []*peer{owner, replicaA, replicaB, replicaC}
+	everyone := append(slices.Clone(replicas), helper1, helper2, helper3)
+	for _, p := range everyone {
+		defer p.proto.Close()
+	}
+
+	_, ok, err := owner.userSecrets.LoadLatest(sid)
+	must(err, "owner userSecrets.LoadLatest")
+	assertTrue(!ok, "step 0: a brand-new instance has no published snapshot")
+	fmt.Println("  step 0: user_secret_store latest = None  ✓")
+
+	arrival := func(events []protocol.Event, channel uint64, step string) (*protocol.Event, bool) {
+		ev, installed := replicaArrival(events, channel)
+		assertTrue(ev != nil, "%s: no replica arrival on channel %d, got %+v", step, channel, events)
+		return ev, installed
+	}
+	shape := func(ev *protocol.Event, step string, version uint32, helpers, secrets, members, shares int) {
+		assertTrue(*ev.Version == version && len(ev.Secret.Helpers) == helpers && len(ev.Secret.Secrets) == secrets &&
+			rosterSize(ev.Secret) == members && len(ev.Shares) == shares,
+			"%s: want v=%d h=%d s=%d r=%d shares=%d, got v=%d h=%d s=%d r=%d shares=%d", step,
+			version, helpers, secrets, members, shares,
+			*ev.Version, len(ev.Secret.Helpers), len(ev.Secret.Secrets), rosterSize(ev.Secret), len(ev.Shares))
+	}
+	storedAt := func(events []protocol.Event, channel uint64, version uint32) bool {
+		return slices.ContainsFunc(events, func(ev protocol.Event) bool {
+			return ev.Type == protocol.EventTypeShareStored && ev.ChannelID == channel && ev.Version != nil && *ev.Version == version
+		})
+	}
+	anyStored := func(events []protocol.Event) bool {
+		return slices.ContainsFunc(events, func(ev protocol.Event) bool { return ev.Type == protocol.EventTypeShareStored })
+	}
+
+	cidA := pairReplicaHandshake(owner, replicaA, 1)
+	crossConfirmFingerprint(owner, replicaA, cidA)
+	events := pumpMany(replicas)
+	received, installed := arrival(events, cidA, "step 1")
+	assertTrue(installed, "step 1: A had no snapshot, so its first sync installs the secret")
+	shape(received, "step 1", 1, 0, 0, 2, 0)
+	snapshot, ok, err := owner.userSecrets.LoadLatest(sid)
+	must(err, "owner userSecrets.LoadLatest")
+	assertTrue(ok && snapshot.Version == 1, "step 1: the owner's snapshot must be v=1")
+	fmt.Println("  step 1: pair replica A → v=1, secret(h=0,s=0,r=2,shares=0)  ✓")
+
+	s1 := protocol.UserSecret{ID: []byte{0x01}, Name: "secret-one", Data: []byte("first-user-secret")}
+	d2 := "v=2 explicit publish"
+	_, err = owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{Secrets: []protocol.UserSecret{s1}, Description: &d2})
+	must(err, "ProtectSecret([s1])")
+	received, _ = arrival(pumpMany(replicas), cidA, "step 2")
+	shape(received, "step 2", 2, 0, 1, 2, 0)
+	assertTrue(bytes.Equal(received.Secret.Secrets[0].Data, s1.Data), "step 2: A must receive s1")
+	fmt.Println("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=2,shares=0)  ✓")
+
+	cidB := pairReplicaHandshake(owner, replicaB, 3)
+	crossConfirmFingerprint(owner, replicaB, cidB)
+	events = pumpMany(replicas)
+	receivedA, installedA := arrival(events, cidA, "step 3 (A)")
+	receivedB, installedB := arrival(events, cidB, "step 3 (B)")
+	assertTrue(!installedA, "step 3: A already held the secret, so this is an update")
+	assertTrue(installedB, "step 3: B is new to the secret, so this is an install")
+	for _, r := range []*protocol.Event{receivedA, receivedB} {
+		shape(r, "step 3", 3, 0, 1, 3, 0)
+		assertTrue(bytes.Equal(r.Secret.Secrets[0].Data, s1.Data), "step 3: s1 must reach both")
+	}
+	fmt.Println("  step 3: pair replica B → v=3, secret(h=0,s=1,r=3,shares=0) on A+B  ✓")
+
+	helperStartPair(owner, helper1, 11)
+	events = pumpMany(everyone)
+	cidH1 := pairedChannelID(events, 11)
+	assertTrue(!slices.ContainsFunc(events, func(ev protocol.Event) bool {
+		return ev.Type == protocol.EventTypeShareStored && ev.ChannelID == cidH1
+	}), "step 4: helper-1 must not store a share (1 < threshold 3)")
+	assertHydrated(replicaA, "A", 4, 1, 1, 3)
+	assertHydrated(replicaB, "B", 4, 1, 1, 3)
+	fmt.Println("  step 4: pair helper #1 → v=4, secret(h=1,s=1,r=3,shares=0)  ✓")
+
+	helperStartPair(owner, helper2, 12)
+	events = pumpMany(everyone)
+	cidH2 := pairedChannelID(events, 12)
+	assertTrue(!anyStored(events), "step 5: still below threshold, no helper stores a share")
+	assertHydrated(replicaA, "A", 5, 2, 1, 3)
+	assertHydrated(replicaB, "B", 5, 2, 1, 3)
+	fmt.Println("  step 5: pair helper #2 → v=5, secret(h=2,s=1,r=3,shares=0)  ✓")
+
+	s2 := protocol.UserSecret{ID: []byte{0x02}, Name: "secret-two", Data: []byte("second-user-secret")}
+	d6 := "v=6 explicit publish"
+	_, err = owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{Secrets: []protocol.UserSecret{s1, s2}, Description: &d6})
+	must(err, "ProtectSecret([s1, s2])")
+	assertTrue(!anyStored(pumpMany(everyone)), "step 6: still below threshold, no helper stores a share")
+	assertHydrated(replicaA, "A", 6, 2, 2, 3)
+	assertHydrated(replicaB, "B", 6, 2, 2, 3)
+	snapshotA, ok, err := replicaA.userSecrets.LoadLatest(sid)
+	must(err, "replica-a userSecrets.LoadLatest")
+	assertTrue(ok, "A holds a snapshot")
+	for _, s := range []protocol.UserSecret{s1, s2} {
+		assertTrue(slices.ContainsFunc(snapshotA.Secrets, func(us protocol.UserSecret) bool { return bytes.Equal(us.Data, s.Data) }),
+			"step 6: A's snapshot must carry %q", s.Name)
+	}
+	fmt.Println("  step 6: ProtectSecret([s1, s2]) → v=6, secret(h=2,s=2,r=3,shares=0)  ✓")
+
+	helperStartPair(owner, helper3, 13)
+	events = pumpMany(everyone)
+	cidH3 := pairedChannelID(events, 13)
+	helperChannels := []uint64{cidH1, cidH2, cidH3}
+	for i, c := range helperChannels {
+		assertTrue(storedAt(events, c, 7), "step 7: helper-%d must emit ShareStored at v=7", i+1)
+	}
+	assertHydrated(replicaA, "A", 7, 3, 2, 3)
+	assertHydrated(replicaB, "B", 7, 3, 2, 3)
+	fmt.Println("  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=3,shares=3); all 3 helpers ShareStored  ✓")
+
+	cidC := pairReplicaHandshake(owner, replicaC, 8)
+	crossConfirmFingerprint(owner, replicaC, cidC)
+	events = pumpMany(everyone)
+	for i, c := range helperChannels {
+		assertTrue(storedAt(events, c, 8), "step 8: helper-%d must emit ShareStored at v=8 (fresh VSS round)", i+1)
+	}
+	receivedC, _ := arrival(events, cidC, "step 8")
+	shape(receivedC, "step 8", 8, 3, 2, 4, 3)
+	assertHydrated(replicaA, "A", 8, 3, 2, 4)
+	assertHydrated(replicaB, "B", 8, 3, 2, 4)
+	assertHydrated(replicaC, "C", 8, 3, 2, 4)
+
+	groupChannels := map[uint64]bool{}
+	for _, p := range replicas {
+		roster, err := p.channelStore.ListReplicas(sid, protocol.ReplicaFilter{})
+		must(err, p.label+" ListReplicas")
+		ids := map[uint64]bool{}
+		for _, m := range roster {
+			ids[m.ChannelID] = true
+			groupChannels[m.ChannelID] = true
+		}
+		assertTrue(len(ids) == 1, "%s must place every member on one channel, got %v", p.label, ids)
+	}
+	assertTrue(len(groupChannels) == 1, "all devices must agree on the group channel, got %v", groupChannels)
+	fmt.Println("  step 8: pair replica C → v=8, secret(h=3,s=2,r=4,shares=3) on A+B+C; all helpers refreshed  ✓")
+
+	fmt.Println("Protocol replica sync version progression test passed.")
+}
+
+// runReplicaGroupKeyHandover: the first replica pairing fixes the group key;
+// a second Destination is moved onto the group channel and key, its
+// ephemeral pairing channel dropped on both sides, every member is recorded
+// on the group channel, and a follow-up round is decrypted by the newcomer.
+// Mirrors run_replica_group_key_handover_flow in
+// smoke-tests/rust/src/protocol.rs.
+func runReplicaGroupKeyHandover() {
+	fmt.Println("=== Protocol replica group-key handover test ===")
+
+	const sid uint64 = 0xBEEF
+	source := newReplicaPeer("source", "https://source-handover.example.com", sid, 0xC0DEC0DEC0DEC0DE, 2)
+	dest1 := newReplicaPeer("dest1", "https://dest1-handover.example.com", sid, 0xD1D1D1D1D1D1D1D1, 2)
+	dest2 := newReplicaPeer("dest2", "https://dest2-handover.example.com", sid, 0xD2D2D2D2D2D2D2D2, 2)
+	all := []*peer{source, dest1, dest2}
+	for _, p := range all {
+		defer p.proto.Close()
+	}
+
+	groupChannel := pairReplicaHandshake(source, dest1, 1)
+	crossConfirmFingerprint(source, dest1, groupChannel)
+	pumpMany(all)
+	kGroup := loadChannelKey(source, sid, groupChannel)
+	assertTrue(bytes.Equal(kGroup, loadChannelKey(dest1, sid, groupChannel)),
+		"after pair 1: Source and Dest1 must hold the same channel key")
+	fmt.Println("  step 1: pair Source↔Dest1 — K_group emerged, both sides agree  ✓")
+
+	ephemeral := pairReplicaHandshake(source, dest2, 2)
+	kEphemeral := loadChannelKey(source, sid, ephemeral)
+	assertTrue(bytes.Equal(kEphemeral, loadChannelKey(dest2, sid, ephemeral)),
+		"before the handover: Source and Dest2 must share the ephemeral key")
+	assertTrue(!bytes.Equal(kEphemeral, kGroup), "before the handover: Dest2's ephemeral key must not be K_group")
+
+	crossConfirmFingerprint(source, dest2, ephemeral)
+	pumpMany(all)
+	kSource := loadChannelKey(source, sid, groupChannel)
+	assertTrue(bytes.Equal(loadChannelKey(dest1, sid, groupChannel), kSource), "Dest1 must hold K_group")
+	assertTrue(bytes.Equal(loadChannelKey(dest2, sid, groupChannel), kSource), "Dest2 must have adopted K_group on the group channel")
+	assertTrue(bytes.Equal(kSource, kGroup), "K_group is fixed at the first replica pairing and never re-derived")
+	for _, p := range []*peer{source, dest2} {
+		assertTrue(channelKey(p, sid, ephemeral) == nil, "%s must drop the ephemeral pairing channel's key after the handover", p.label)
+	}
+	for _, p := range all {
+		roster, err := p.channelStore.ListReplicas(sid, protocol.ReplicaFilter{})
+		must(err, p.label+" ListReplicas")
+		assertTrue(len(roster) == 3, "%s's roster must hold all three members, got %d", p.label, len(roster))
+		for _, m := range roster {
+			assertTrue(m.ChannelID == groupChannel, "%s must place every member on the group channel, got %+v", p.label, m)
+		}
+	}
+	fmt.Println("  step 2: pair Source↔Dest2 — group converged on one channel and K_group  ✓")
+
+	description := "post-handover round"
+	_, err := source.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets:     []protocol.UserSecret{{ID: []byte{0x42}, Name: "post-handover", Data: []byte("k_group payload")}},
+		Description: &description,
+	})
+	must(err, "source.Start(ProtectSecret)")
+	post := pumpMany(all)
+	assertTrue(slices.ContainsFunc(post, func(ev protocol.Event) bool {
+		return ev.Type == protocol.EventTypeReplicaSecretReceived && ev.ChannelID == groupChannel
+	}), "the post-handover round must arrive on the group channel")
+	snapshot, ok, err := dest2.userSecrets.LoadLatest(sid)
+	must(err, "dest2 userSecrets.LoadLatest")
+	assertTrue(ok && slices.ContainsFunc(snapshot.Secrets, func(us protocol.UserSecret) bool { return string(us.Data) == "k_group payload" }),
+		"Dest2 must decrypt the post-handover payload with K_group")
+	assertTrue(bytes.Equal(loadChannelKey(source, sid, groupChannel), kGroup), "K_group must remain stable across follow-up rounds")
+	fmt.Println("  step 3: follow-up ProtectSecret round encrypted with K_group; Dest2 decrypted cleanly  ✓")
+
+	fmt.Println("Protocol replica group-key handover test passed.")
+}
+
+// runReplicaPublishBeforeHandoverAck: the joiner's handover acknowledgement
+// is lost, and the publishes after it still reach the joiner on the group
+// channel. Mirrors run_replica_publish_before_handover_ack_flow in
+// smoke-tests/rust/src/protocol.rs.
+func runReplicaPublishBeforeHandoverAck() {
+	fmt.Println("=== Protocol replica publish before handover ack test ===")
+
+	const sid uint64 = 0xBEEF
+	source := newReplicaPeer("source", "https://source-lost-ack.example.com", sid, 0xC0DEC0DEC0DEC0DE, 2)
+	dest1 := newReplicaPeer("dest1", "https://dest1-lost-ack.example.com", sid, 0xD1D1D1D1D1D1D1D1, 2)
+	dest2 := newReplicaPeer("dest2", "https://dest2-lost-ack.example.com", sid, 0xD2D2D2D2D2D2D2D2, 2)
+	all := []*peer{source, dest1, dest2}
+	for _, p := range all {
+		defer p.proto.Close()
+	}
+
+	groupChannel := pairReplicaHandshake(source, dest1, 1)
+	crossConfirmFingerprint(source, dest1, groupChannel)
+	pumpMany(all)
+
+	ephemeral := pairReplicaHandshake(source, dest2, 2)
+	crossConfirmFingerprint(source, dest2, ephemeral)
+	for _, entry := range source.drain() {
+		switch entry.uri {
+		case dest1.uri:
+			deliver(dest1, entry.message)
+		case dest2.uri:
+			deliver(dest2, entry.message)
+		}
+	}
+	lost := dest2.drain()
+	assertTrue(len(lost) > 0, "Dest2 must have acknowledged the handover before it is dropped")
+	pumpMany(all)
+	fmt.Println("  step 1: handover delivered, Dest2's acknowledgement lost  ✓")
+
+	for _, payload := range []string{"before the ack", "after the ack"} {
+		_, err := source.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+			Secrets: []protocol.UserSecret{{ID: []byte{0x42}, Name: "handover", Data: []byte(payload)}},
+		})
+		must(err, "source.Start(ProtectSecret)")
+		pumpMany(all)
+		snapshot, ok, err := dest2.userSecrets.LoadLatest(sid)
+		must(err, "dest2 userSecrets.LoadLatest")
+		assertTrue(ok && slices.ContainsFunc(snapshot.Secrets, func(us protocol.UserSecret) bool { return string(us.Data) == payload }),
+			"Dest2 must receive the publish carrying %q", payload)
+	}
+	fmt.Println("  step 2: both publishes reached Dest2 on the group channel  ✓")
+
+	fmt.Println("Protocol replica publish before handover ack test passed.")
 }

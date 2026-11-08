@@ -557,7 +557,9 @@ Errors surface as a `DeRecError` with a `category` and `code` —
 `invalid_recovered_secret` (a malformed `secret`), or `store_error` (a store call failed; `category`
 names the store). `code` is typed `DeRecErrorCode`, the full union of every
 code the library can report plus the WASM-marshalling codes this binding
-raises itself (e.g. `decode_error`, `invalid_timeouts`).
+raises itself (e.g. `decode_error`, `invalid_timeouts`). An error about one
+channel names it in `channel_id`: `channel_already_paired`,
+`fingerprint_mismatch`, `role_mismatch`, and a failed `process()`.
 
 > **Secret format:** the recoverable secret (the bytes helpers store and
 > recovery reconstructs) is `[version byte] · payload` — v1's payload is
@@ -1195,6 +1197,13 @@ confirmation publishes the vault immediately, so that copy usually arrives
 before the destination's user has confirmed. Confirming does not replay it:
 once the destination's `verifyFingerprint` resolves `true`, call
 `start(FlowKind.ReplicaDiscovery)` to pull the copy from the source.
+
+Until a device confirms a member, that member is not part of the group as
+far as the device is concerned. It is left out of every roster the device
+publishes (each new version, catch-up answers and the vault itself), it is
+not asked in a replica version check, and it cannot succeed a removed source.
+Every recipient installs a roster's members as paired, so listing an
+unconfirmed one would admit it on their behalf.
 
 ### Every helper sees the vault's compressed length
 

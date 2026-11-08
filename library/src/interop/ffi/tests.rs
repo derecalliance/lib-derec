@@ -137,7 +137,9 @@ fn generated() -> serde_json::Value {
             peer_status,
             peer_memo,
             expected,
-            got
+            got,
+            has_channel_id,
+            channel_id
         },
         DeRecMessageJsonResult { error, bytes },
         CreateContactMessageResult {

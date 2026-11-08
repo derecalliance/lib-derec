@@ -804,8 +804,11 @@ pub enum DeRecFlow {
     /// it is.
     ///
     /// **Replica-only.** Requires a configured `replica_id` and at least one
-    /// other group member. Every member is asked which version it holds; the
-    /// one holding the newest state is then asked for it, and the reply is
+    /// other group member. Every member is asked which version it holds,
+    /// except one whose pairing this device has not confirmed (its record is
+    /// still `Pending`): it drops every message at its pending gate, so it
+    /// is not a member yet. The one holding the newest state is then asked
+    /// for it, and the reply is
     /// hydrated exactly as an inbound sync would be. Ties resolve to the
     /// group's `Source`.
     ///

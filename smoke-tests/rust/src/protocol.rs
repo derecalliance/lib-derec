@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use derec_cryptography::channel::{decrypt_message, encrypt_message};
 use derec_library::Error;
 use derec_library::derec_message::{
     DeRecMessageBuilder, apply_trace_id, current_timestamp, extract_inner_message, message_id,
@@ -68,6 +69,16 @@ pub async fn run_all() {
     run_sticky_threshold_flow().await;
     run_max_subshares_flow().await;
     run_share_store_refusal_flow().await;
+    run_share_size_refusal_flow().await;
+    run_request_failed_token_flow().await;
+    run_auto_respond_on_failure_flow().await;
+    run_undecodable_request_flow().await;
+    run_verify_no_proof_flow().await;
+    run_verification_verdicts_flow().await;
+    run_invalid_weight_flow().await;
+    run_sticky_weights_flow().await;
+    run_recover_restore_republish_flow().await;
+    run_replica_secret_refused_flow().await;
     run_corrupted_share_flow().await;
     run_silent_helper_recovery_flow().await;
     run_disputed_recovery_flow().await;
@@ -88,7 +99,7 @@ pub async fn run_all() {
     run_start_pairing_rejects_already_paired_channel().await;
     run_pairing_rejects_incompatible_parameter_range().await;
     run_pairing_expiry_flow().await;
-    run_discovery_across_two_channels_flow().await;
+    run_unconfirmed_joiner_flow().await;
     run_expired_channel_cleanup_flow().await;
     run_expired_pending_pairing_loses_its_key_flow().await;
     run_own_transport_set_rules().await;
@@ -312,6 +323,7 @@ fn clone_secret_value(v: &SecretValue) -> SecretValue {
 ///
 /// `refuse_saves` / `refuse_verifications` make the store refuse with
 /// [`Refusal::TooFrequent`], the way an application's rate limit would.
+/// `fail_saves` makes `save` fail with a backend error instead.
 ///
 /// `keep_version` answers `keep` when set and otherwise the version
 /// distributed before, recording every version it is asked about in
@@ -321,6 +333,7 @@ struct InMemoryShareStore {
     data: HashMap<(u64, u64, u32), Share>,
     refuse_saves: bool,
     refuse_verifications: bool,
+    fail_saves: bool,
     keep: Option<u32>,
     keep_version_calls: Mutex<Vec<u32>>,
     removed: Vec<Vec<u32>>,
@@ -411,6 +424,11 @@ impl DeRecShareStore for InMemoryShareStore {
         if self.refuse_saves {
             return Box::pin(future::ready(Err(ShareStoreError::Refused(
                 Refusal::TooFrequent,
+            ))));
+        }
+        if self.fail_saves {
+            return Box::pin(future::ready(Err(ShareStoreError::Backend(
+                "simulated backend failure".into(),
             ))));
         }
         // Keyed by the partition, which is what every read here filters by.
@@ -533,7 +551,7 @@ impl DeRecTransport for InProcessTransport {
                 .expect("transport failing_uris mutex poisoned")
                 .contains(&entry.0.uri);
             if should_fail {
-                return Err(Error::Invariant("simulated transport failure"));
+                return Err(Error::TransportSendFailed);
             }
             outbox
                 .lock()
@@ -610,6 +628,31 @@ impl Peer {
     /// builder so every outbound request stamps `replyTo = own_transport`.
     fn with_auto_reply_to(label: &'static str, uri: &str) -> Self {
         Self::with_options(label, uri, 2, true, None, DEFAULT_TEST_SECRET_ID)
+    }
+
+    /// Same as [`Peer::with_secret_id`] but flips
+    /// `with_auto_respond_on_failure(true)`, so a request whose handling
+    /// fails is answered by the library rather than through a token.
+    fn with_auto_respond_on_failure(label: &'static str, uri: &str, secret_id: u64) -> Self {
+        let transport = InProcessTransport::new();
+        let protocol = DeRecProtocolBuilder::new(secret_id)
+            .with_channel_store(InMemoryChannelStore::default())
+            .with_share_store(InMemoryShareStore::default())
+            .with_secret_store(InMemorySecretStore::default())
+            .with_user_secret_store(InMemoryUserSecretStore::default())
+            .with_transport(transport.clone())
+            .with_state_store(InMemoryStateStore::default())
+            .with_own_transports([uri])
+            .with_threshold(2)
+            .with_auto_respond_on_failure(true)
+            .build()
+            .expect("test fixture: builder.build() should succeed");
+        Self {
+            label,
+            uri: uri.to_owned(),
+            protocol,
+            transport,
+        }
     }
 
     /// Configure a per-flow auto-accept policy on the builder. The
@@ -2305,9 +2348,10 @@ async fn run_protect_secret_per_target_failure_flow() {
                 *channel_id, channel_b,
                 "the failed event must be for helper-b"
             );
-            assert!(
-                !error.is_empty(),
-                "ProtectSecretFailed.error must carry a non-empty message"
+            assert_eq!(
+                error,
+                &Error::TransportSendFailed.to_string(),
+                "ProtectSecretFailed.error must carry the transport failure"
             );
         }
         _ => unreachable!(),
@@ -4368,6 +4412,1165 @@ async fn run_share_store_refusal_flow() {
     println!("Protocol share store refusal flow test passed.");
 }
 
+/// The version a `start(ProtectSecret)` round reports distributing.
+fn protect_started_version(events: &[DeRecEvent]) -> u32 {
+    events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ProtectSecretStarted { version, .. } => Some(*version),
+            _ => None,
+        })
+        .expect("the round must report the version it published")
+}
+
+/// Every `ShareRejected` in `events` as `(channel, version, status, memo)`.
+fn share_rejections(events: &[DeRecEvent]) -> Vec<(ChannelId, u32, i32, String)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ShareRejected {
+                channel_id,
+                version,
+                status,
+                memo,
+            } => Some((*channel_id, *version, *status, memo.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The helper's own size bound refuses a share before the application is
+/// asked: the helper reports `ShareRefused` and the owner, answered with the
+/// same status and memo, `ShareRejected(SIZE_LIMIT_EXCEEDED)`.
+async fn run_share_size_refusal_flow() {
+    println!("=== Protocol share size refusal flow test ===");
+
+    let size_limit_exceeded = StatusEnum::SizeLimitExceeded as i32;
+    let memo = "share size is outside the helper's accepted range";
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 47);
+    let mut helper_a = Peer::with_parameter_range(
+        "helper-a",
+        "https://helper-a.example.com",
+        ParameterRange {
+            max_share_size: 16,
+            ..Default::default()
+        },
+    );
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(71)).await;
+    pair(&mut owner, &mut helper_b, ChannelId(72)).await;
+
+    let version = start_protect_round(&mut owner, 1).await;
+    let mut owner_events = Vec::new();
+    for (endpoint, bytes) in owner.drain() {
+        let helper = if endpoint.uri == helper_a.uri {
+            let events = helper_a
+                .protocol
+                .process(&bytes)
+                .await
+                .expect("helper-a process(StoreShareRequest) failed");
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::ActionRequired { .. })),
+                "helper-a must refuse the share without asking the application: {events:?}"
+            );
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [DeRecEvent::ShareRefused { channel_id, version: v, status, memo: m }]
+                        if *channel_id == channel_a
+                            && *v == version
+                            && *status == size_limit_exceeded
+                            && m == memo
+                ),
+                "helper-a must report ShareRefused(SIZE_LIMIT_EXCEEDED), got {events:?}"
+            );
+            println!(
+                "  [helper-a] share over max_share_size → ShareRefused(SIZE_LIMIT_EXCEEDED), no ActionRequired  ✓"
+            );
+            &mut helper_a
+        } else {
+            deliver(&mut helper_b, &bytes).await;
+            &mut helper_b
+        };
+        let replies = helper.drain();
+        assert_eq!(replies.len(), 1, "[{}] answers once", helper.label);
+        owner_events.extend(deliver(&mut owner, &replies[0].1).await);
+    }
+
+    assert_eq!(
+        share_rejections(&owner_events),
+        vec![(channel_a, version, size_limit_exceeded, memo.to_owned())],
+        "the owner must see helper-a's refusal with its memo"
+    );
+    println!("  [owner]    ShareRejected(SIZE_LIMIT_EXCEEDED) with the helper's memo  ✓");
+
+    println!("Protocol share size refusal flow test passed.");
+}
+
+/// With `auto_respond_on_failure` off (the default), a request whose handling
+/// fails is not answered by the library. It is reported as `RequestFailed`
+/// carrying a token, and `reject` on that token sends the one response the
+/// peer is owed. The failure is a share store backend error on an accepted
+/// StoreShare; the owner observes exactly one `ShareRejected` carrying the
+/// status and memo passed to `reject`.
+async fn run_request_failed_token_flow() {
+    println!("=== Protocol failed request answered through its token ===");
+
+    let fail = StatusEnum::Fail as i32;
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 46);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(61)).await;
+    pair(&mut owner, &mut helper_b, ChannelId(62)).await;
+
+    helper_a.protocol.share_store.fail_saves = true;
+    let version = start_protect_round(&mut owner, 1).await;
+
+    let mut owner_events = Vec::new();
+    let mut failed = Vec::new();
+    for (endpoint, bytes) in owner.drain() {
+        if endpoint.uri == helper_a.uri {
+            failed.extend(
+                deliver(&mut helper_a, &bytes)
+                    .await
+                    .into_iter()
+                    .filter(|e| matches!(e, DeRecEvent::RequestFailed { .. })),
+            );
+        } else {
+            deliver(&mut helper_b, &bytes).await;
+            for (_, reply) in helper_b.drain() {
+                owner_events.extend(deliver(&mut owner, &reply).await);
+            }
+        }
+    }
+
+    let [
+        DeRecEvent::RequestFailed {
+            channel_id,
+            action_kind,
+            responded,
+            status,
+            memo,
+            error_code,
+            action: Some(action),
+            ..
+        },
+    ] = failed.as_slice()
+    else {
+        panic!("helper-a must report one unanswered RequestFailed with a token, got {failed:?}");
+    };
+    assert_eq!(*channel_id, channel_a);
+    assert_eq!(*action_kind, PendingActionKind::StoreShare);
+    assert!(
+        !responded,
+        "with auto_respond_on_failure off, nothing is sent"
+    );
+    assert_eq!(*status, fail);
+    assert_eq!(memo, "request could not be processed");
+    assert_eq!(error_code, "store_error");
+    assert!(
+        helper_a.drain().is_empty(),
+        "with auto_respond_on_failure off, helper-a must not answer by itself"
+    );
+    println!(
+        "  [helper-a] save fails → RequestFailed(action_kind={action_kind:?}, responded=false, status=FAIL, memo=\"{memo}\", error_code={error_code}) with a token, nothing sent  ✓"
+    );
+
+    let memo = memo.clone();
+    helper_a
+        .protocol
+        .reject(
+            action.clone(),
+            StatusEnum::try_from(*status).expect("RequestFailed.status is a StatusEnum"),
+            &memo,
+        )
+        .await
+        .expect("helper-a reject(token) failed");
+    let replies = helper_a.drain();
+    assert_eq!(
+        replies.len(),
+        1,
+        "reject(token) must send exactly one response"
+    );
+    owner_events.extend(deliver(&mut owner, &replies[0].1).await);
+
+    assert_eq!(
+        share_rejections(&owner_events),
+        vec![(channel_a, version, fail, memo)],
+        "the owner must see one ShareRejected(FAIL) with the event's memo"
+    );
+    println!(
+        "  [helper-a] reject(token, event.status, event.memo) → one response; [owner] ShareRejected(status=FAIL, same memo)  ✓"
+    );
+
+    println!("Protocol failed request token flow test passed.");
+}
+
+/// With `auto_respond_on_failure` on, the library answers a failed request
+/// itself: `RequestFailed` reports `responded: true` and carries no token, and
+/// the owner observes `ShareRejected(FAIL)` with the generic memo.
+async fn run_auto_respond_on_failure_flow() {
+    println!("=== Protocol failed request answered by the library ===");
+
+    let fail = StatusEnum::Fail as i32;
+    let memo = "request could not be processed";
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 48);
+    let mut helper_a = Peer::with_auto_respond_on_failure(
+        "helper-a",
+        "https://helper-a.example.com",
+        DEFAULT_TEST_SECRET_ID,
+    );
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(73)).await;
+    pair(&mut owner, &mut helper_b, ChannelId(74)).await;
+
+    helper_a.protocol.share_store.fail_saves = true;
+    let version = start_protect_round(&mut owner, 1).await;
+
+    let mut owner_events = Vec::new();
+    for (endpoint, bytes) in owner.drain() {
+        let is_a = endpoint.uri == helper_a.uri;
+        let helper = if is_a { &mut helper_a } else { &mut helper_b };
+        let events = deliver(helper, &bytes).await;
+        if is_a {
+            let failed: Vec<_> = events
+                .iter()
+                .filter(|e| matches!(e, DeRecEvent::RequestFailed { .. }))
+                .collect();
+            assert!(
+                matches!(
+                    failed.as_slice(),
+                    [DeRecEvent::RequestFailed {
+                        channel_id,
+                        action_kind: PendingActionKind::StoreShare,
+                        responded: true,
+                        status,
+                        memo: m,
+                        action: None,
+                        ..
+                    }] if *channel_id == channel_a && *status == fail && m == memo
+                ),
+                "helper-a must answer the failure itself, got {failed:?}"
+            );
+            println!("  [helper-a] save fails → RequestFailed(responded=true), no action token  ✓");
+        }
+        let replies = helper.drain();
+        assert_eq!(
+            replies.len(),
+            1,
+            "[{}] must send exactly one response",
+            helper.label
+        );
+        owner_events.extend(deliver(&mut owner, &replies[0].1).await);
+    }
+
+    assert_eq!(
+        share_rejections(&owner_events),
+        vec![(channel_a, version, fail, memo.to_owned())],
+        "the owner must see one ShareRejected(FAIL) from helper-a"
+    );
+    println!("  [owner]    ShareRejected(status=FAIL, memo=\"{memo}\")  ✓");
+
+    println!("Protocol auto-respond-on-failure flow test passed.");
+}
+
+/// A request whose body decrypts under the channel key but does not decode is
+/// still owed an answer. With `auto_respond_on_failure` off it is reported as
+/// `RequestFailed(action_kind: Failed, FORMAT_ERROR)` with a token that
+/// `accept` refuses and `reject` answers with an `ErrorResponseMessage`, which
+/// the sender reports as `ErrorResponseReceived`.
+async fn run_undecodable_request_flow() {
+    println!("=== Protocol undecodable request flow test ===");
+
+    let format_error = StatusEnum::FormatError as i32;
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 49);
+    let mut helper = Peer::new("helper", "https://helper.example.com");
+    let channel_id = pair(&mut owner, &mut helper, ChannelId(75)).await;
+
+    owner
+        .protocol
+        .start(DeRecFlow::Discovery {
+            target: Target::Single(channel_id),
+        })
+        .await
+        .expect("owner start(Discovery) failed");
+    let mut sent = owner.drain();
+    assert_eq!(sent.len(), 1, "one Discovery request for one channel");
+    let shared_key = load_channel_key(&owner, owner.protocol.secret_id(), channel_id).await;
+    // The body is resealed under the channel key with the same nonce and
+    // length, its plaintext replaced by bytes that decode as no message.
+    let mut envelope = DeRecMessage::decode(sent.remove(0).1.as_slice()).expect("request decodes");
+    let plaintext = decrypt_message(&envelope.message, &shared_key).expect("the body decrypts");
+    let mut nonce = [0u8; 32];
+    nonce[..12].copy_from_slice(&envelope.message[..12]);
+    envelope.message = encrypt_message(&vec![0xff; plaintext.len()], &shared_key, &nonce)
+        .expect("reseal the body");
+
+    let events = helper
+        .protocol
+        .process(&envelope.encode_to_vec())
+        .await
+        .expect("helper process(undecodable) failed");
+    let [
+        DeRecEvent::RequestFailed {
+            channel_id: failed_channel,
+            action_kind: PendingActionKind::Failed,
+            responded: false,
+            status,
+            memo,
+            action: Some(action),
+            ..
+        },
+    ] = events.as_slice()
+    else {
+        panic!(
+            "helper must report an unanswered RequestFailed(Failed, FORMAT_ERROR) with a token, got {events:?}"
+        );
+    };
+    assert_eq!(*failed_channel, channel_id);
+    assert_eq!(*status, format_error);
+    assert!(
+        helper.drain().is_empty(),
+        "with auto_respond_on_failure off, the helper must not answer by itself"
+    );
+    println!(
+        "  [helper] undecodable body → RequestFailed(action_kind=Failed, status=FORMAT_ERROR, memo=\"{memo}\") with a token  ✓"
+    );
+
+    let (action, memo) = (action.clone(), memo.clone());
+    let err = helper
+        .protocol
+        .accept(action.clone())
+        .await
+        .expect_err("accept(Failed token) must be refused");
+    assert!(
+        matches!(err, Error::InvalidInput(_)),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        helper.drain().is_empty(),
+        "a refused accept must send nothing"
+    );
+    println!("  [helper] accept(Failed token) refused (InvalidInput), nothing sent  ✓");
+
+    helper
+        .protocol
+        .reject(action, StatusEnum::FormatError, &memo)
+        .await
+        .expect("helper reject(token) failed");
+    let replies = helper.drain();
+    assert_eq!(
+        replies.len(),
+        1,
+        "reject(token) must send exactly one response"
+    );
+    let owner_events = owner
+        .protocol
+        .process(&replies[0].1)
+        .await
+        .expect("owner process(ErrorResponse) failed");
+    assert!(
+        matches!(
+            owner_events.as_slice(),
+            [DeRecEvent::ErrorResponseReceived { channel_id: c, status, memo: m }]
+                if *c == channel_id && *status == format_error && *m == memo
+        ),
+        "owner must report the helper's ErrorResponse, got {owner_events:?}"
+    );
+    assert!(
+        owner.drain().is_empty(),
+        "an ErrorResponseReceived is never answered"
+    );
+    println!(
+        "  [helper] reject(token) → ErrorResponseMessage; [owner] ErrorResponseReceived(FORMAT_ERROR, same memo), not answered  ✓"
+    );
+
+    println!("Protocol undecodable request flow test passed.");
+}
+
+/// A channel whose share for the version was never confirmed has no proof on
+/// the owner: `start(VerifyShares)` fails it locally with `NoProof` and sends
+/// it no challenge, while a confirmed channel is challenged as usual.
+async fn run_verify_no_proof_flow() {
+    println!("=== Protocol VerifyShares without a proof flow test ===");
+
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 50);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(76)).await;
+    let channel_b = pair(&mut owner, &mut helper_b, ChannelId(77)).await;
+
+    helper_a.protocol.share_store.refuse_saves = true;
+    let version = start_protect_round(&mut owner, 1).await;
+    pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+
+    let owner_sid = owner.protocol.secret_id();
+    let events = owner
+        .protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id: owner_sid,
+            version,
+            target: Target::All,
+        })
+        .await
+        .expect("owner start(VerifyShares) failed");
+    let failed: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::VerifySharesFailed {
+                channel_id,
+                version,
+                reason,
+                ..
+            } => Some((*channel_id, *version, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        failed,
+        vec![(channel_a, version, VerifyFailureReason::NoProof)],
+        "helper-a, which never confirmed, must fail with NoProof: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DeRecEvent::VerifySharesStarted { channel_id, .. } if *channel_id == channel_b
+        )),
+        "helper-b, which confirmed, must still be challenged: {events:?}"
+    );
+    let sent = owner.drain();
+    assert!(
+        sent.len() == 1 && sent[0].0.uri == helper_b.uri,
+        "only helper-b may be challenged, sent to {:?}",
+        sent.iter().map(|(tp, _)| &tp.uri).collect::<Vec<_>>()
+    );
+    println!(
+        "  [owner] v{version}: helper-a VerifySharesFailed(reason=NoProof), no challenge; helper-b challenged  ✓"
+    );
+
+    println!("Protocol VerifyShares NoProof flow test passed.");
+}
+
+/// Verdicts on verification answers that do not prove the share: the answer
+/// to a challenge a newer one replaced is ignored as `StaleResponse`, a proof
+/// over bytes that differ from the owner's is `ShareVerifyInvalid`, and a
+/// message whose plaintext envelope timestamp differs from the encrypted one
+/// is ignored as `TimestampMismatch`.
+async fn run_verification_verdicts_flow() {
+    println!("=== Protocol verification verdicts flow test ===");
+
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 51);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(78)).await;
+    pair(&mut owner, &mut helper_b, ChannelId(79)).await;
+
+    let version = start_protect_round(&mut owner, 1).await;
+    pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+
+    async fn challenge(owner: &mut Peer, version: u32, channel_id: ChannelId) -> (u64, Vec<u8>) {
+        let owner_sid = owner.protocol.secret_id();
+        let events = owner
+            .protocol
+            .start(DeRecFlow::VerifyShares {
+                secret_id: owner_sid,
+                version,
+                target: Target::Single(channel_id),
+            })
+            .await
+            .expect("owner start(VerifyShares) failed");
+        let trace_id = events
+            .iter()
+            .find_map(|e| match e {
+                DeRecEvent::VerifySharesStarted { trace_id, .. } => Some(*trace_id),
+                _ => None,
+            })
+            .expect("start(VerifyShares) must emit VerifySharesStarted");
+        let mut sent = owner.drain();
+        assert_eq!(sent.len(), 1, "one challenge for one channel");
+        (trace_id, sent.remove(0).1)
+    }
+    async fn answer(helper: &mut Peer, challenge: &[u8]) -> Vec<u8> {
+        deliver(helper, challenge).await;
+        let mut replies = helper.drain();
+        assert_eq!(replies.len(), 1, "[{}] answers once", helper.label);
+        replies.remove(0).1
+    }
+
+    let (first_trace, first) = challenge(&mut owner, version, channel_a).await;
+    let (_, second) = challenge(&mut owner, version, channel_a).await;
+    let first_answer = answer(&mut helper_a, &first).await;
+    let second_answer = answer(&mut helper_a, &second).await;
+    let stale = owner
+        .protocol
+        .process(&first_answer)
+        .await
+        .expect("owner process(first answer) failed");
+    assert!(
+        matches!(
+            stale.as_slice(),
+            [DeRecEvent::MessageIgnored { channel_id, reason: IgnoreReason::StaleResponse, trace_id }]
+                if *channel_id == channel_a && *trace_id == first_trace
+        ),
+        "the replaced challenge's answer must be MessageIgnored(StaleResponse), got {stale:?}"
+    );
+    let current = owner
+        .protocol
+        .process(&second_answer)
+        .await
+        .expect("owner process(second answer) failed");
+    assert!(
+        current.iter().any(|e| matches!(
+            e,
+            DeRecEvent::ShareVerified { channel_id, version: v, .. }
+                if *channel_id == channel_a && *v == version
+        )),
+        "the current challenge's answer must still verify, got {current:?}"
+    );
+    println!(
+        "  [owner]    answer to a replaced challenge → MessageIgnored(StaleResponse); current answer → ShareVerified  ✓"
+    );
+
+    // helper-a's stored share no longer matches the bytes the owner holds a
+    // proof of, as after storage corruption.
+    let helper_sid = helper_a.protocol.secret_id();
+    let mut stored = helper_a
+        .protocol
+        .share_store
+        .load(helper_sid, channel_a, &[version])
+        .await
+        .expect("helper-a loads its share")
+        .pop()
+        .expect("helper-a holds a share for the version");
+    let mut request = StoreShareRequestMessage::decode(stored.bytes.as_slice())
+        .expect("stored share request decodes");
+    let middle = request.share.len() / 2;
+    request.share[middle] ^= 0xff;
+    stored.bytes = request.encode_to_vec();
+    helper_a
+        .protocol
+        .share_store
+        .save(helper_sid, channel_a, stored)
+        .await
+        .expect("helper-a stores the corrupted share");
+    let (_, corrupted) = challenge(&mut owner, version, channel_a).await;
+    let corrupted_answer = answer(&mut helper_a, &corrupted).await;
+    let invalid = owner
+        .protocol
+        .process(&corrupted_answer)
+        .await
+        .expect("owner process(corrupted answer) failed");
+    assert!(
+        matches!(
+            invalid.as_slice(),
+            [DeRecEvent::ShareVerifyInvalid { channel_id, version: v }]
+                if *channel_id == channel_a && *v == version
+        ),
+        "a proof over corrupted bytes must be ShareVerifyInvalid, got {invalid:?}"
+    );
+    println!("  [owner]    proof over helper-a's corrupted share → ShareVerifyInvalid  ✓");
+
+    // The plaintext envelope timestamp is moved one second off the encrypted
+    // inner one.
+    let (_, message) = challenge(&mut owner, version, channel_a).await;
+    let mut envelope = DeRecMessage::decode(message.as_slice()).expect("challenge decodes");
+    envelope
+        .timestamp
+        .as_mut()
+        .expect("the envelope carries a timestamp")
+        .seconds ^= 1;
+    let mismatched = helper_a
+        .protocol
+        .process(&envelope.encode_to_vec())
+        .await
+        .expect("helper-a process(shifted challenge) failed");
+    assert!(
+        matches!(
+            mismatched.as_slice(),
+            [DeRecEvent::MessageIgnored { channel_id, reason: IgnoreReason::TimestampMismatch, .. }]
+                if *channel_id == channel_a
+        ),
+        "a mismatched envelope timestamp must be MessageIgnored(TimestampMismatch), got {mismatched:?}"
+    );
+    assert!(
+        helper_a.drain().is_empty(),
+        "a message ignored for its timestamp must not be answered"
+    );
+    println!(
+        "  [helper-a] envelope timestamp ≠ inner timestamp → MessageIgnored(TimestampMismatch), nothing sent  ✓"
+    );
+
+    println!("Protocol verification verdicts flow test passed.");
+}
+
+/// `start` refuses a weight assignment the round cannot honour — a weight
+/// that alone meets the threshold, or a weight for a channel that is not a
+/// paired helper — with `InvalidWeight`, before anything is sent.
+async fn run_invalid_weight_flow() {
+    println!("=== Protocol InvalidWeight from start flow test ===");
+
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 52);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(80)).await;
+    pair(&mut owner, &mut helper_b, ChannelId(81)).await;
+
+    for (what, channel_id, weight) in [
+        ("a weight equal to the threshold", channel_a, 2),
+        ("a weight for an unpaired channel", ChannelId(0xBAD), 1),
+    ] {
+        let err = owner
+            .protocol
+            .start(DeRecFlow::ProtectSecret {
+                secrets: vec![UserSecret {
+                    id: vec![15],
+                    name: "weighted".to_owned(),
+                    data: vec![1],
+                }],
+                description: None,
+                weights: HashMap::from([(channel_id, weight)]),
+                threshold: None,
+            })
+            .await
+            .expect_err("an invalid weight must fail the round");
+        assert!(
+            matches!(
+                err,
+                Error::Sharing(SharingError::InvalidWeight { channel_id: c, weight: w })
+                    if c == channel_id.0 && w == weight
+            ),
+            "{what}: unexpected error {err:?}"
+        );
+        assert!(owner.drain().is_empty(), "{what}: nothing may be sent");
+        println!("  {what} → InvalidWeight, nothing sent  ✓");
+    }
+
+    println!("Protocol InvalidWeight flow test passed.");
+}
+
+/// The weight on a stored helper record is sticky: the publish the library
+/// starts after a pairing carries no weights map, so it gives every helper
+/// the weight its record holds and the newly paired helper `1`.
+async fn run_sticky_weights_flow() {
+    println!("=== Protocol sticky weights flow test ===");
+
+    let mut owner = Peer::with_threshold("owner", "https://owner.example.com", 3);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let mut helper_c = Peer::new("helper-c", "https://helper-c.example.com");
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(1)).await;
+    let channel_b = pair(&mut owner, &mut helper_b, ChannelId(2)).await;
+
+    let started_weights = |events: &[DeRecEvent]| {
+        let mut weights: Vec<(ChannelId, u32)> = events
+            .iter()
+            .filter_map(|e| match e {
+                DeRecEvent::ProtectSecretStarted {
+                    channel_id, weight, ..
+                } => Some((*channel_id, *weight)),
+                _ => None,
+            })
+            .collect();
+        weights.sort_unstable();
+        weights
+    };
+
+    let events = owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![5],
+                name: "sticky weights".to_owned(),
+                data: b"sticky-weights-secret".to_vec(),
+            }],
+            description: Some("weighted round".to_owned()),
+            weights: HashMap::from([(channel_a, 2)]),
+            threshold: None,
+        })
+        .await
+        .expect("owner start(ProtectSecret) with weights failed");
+    assert_eq!(
+        started_weights(&events),
+        sorted_weights(vec![(channel_a, 2), (channel_b, 1)]),
+        "the round must send A=2, B=1 subshares"
+    );
+    println!("  [owner] start(ProtectSecret, weights={{A: 2}}) → weight(A)=2, weight(B)=1  ✓");
+
+    let share_events = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+    assert!(
+        share_events.iter().any(|e| matches!(
+            e,
+            DeRecEvent::SharingComplete {
+                threshold_met: true,
+                ..
+            }
+        )),
+        "A (2 subshares) and B (1 subshare) must meet threshold 3"
+    );
+    println!("  [owner] SharingComplete(threshold_met=true) — 2+1 subshares ≥ 3  ✓");
+
+    async fn stored_weight(owner: &Peer, channel_id: ChannelId) -> u32 {
+        owner
+            .protocol
+            .channel_store
+            .load(
+                owner.protocol.secret_id(),
+                ChannelQuery::Helper { channel_id },
+            )
+            .await
+            .expect("owner channel load failed")
+            .and_then(|record| record.as_helper().cloned())
+            .expect("the owner holds a helper record")
+            .weight
+    }
+    assert_eq!(stored_weight(&owner, channel_a).await, 2);
+    println!("  [owner] the stored helper record for A carries weight 2  ✓");
+
+    let contact = owner
+        .protocol
+        .create_contact(Some(ChannelId(3)), ContactMode::InlineKeys, None)
+        .await
+        .expect("owner.create_contact(helper-c) failed");
+    helper_c
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Helper,
+            contact,
+            peer_communication_info: HashMap::new(),
+        })
+        .await
+        .expect("helper-c start(Pairing) failed");
+    let auto = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b, &mut helper_c]).await;
+    let channel_c = extract_paired_channel_id(auto.iter(), ChannelId(3))
+        .expect("helper-c PairingCompleted must fire");
+    assert_eq!(
+        started_weights(&auto),
+        sorted_weights(vec![(channel_a, 2), (channel_b, 1), (channel_c, 1)]),
+        "the pairing publish must reuse the stored weights"
+    );
+    println!("  [owner] pairing C → auto-publish with weight(A)=2, weight(B)=1, weight(C)=1  ✓");
+
+    assert_eq!(stored_weight(&owner, channel_a).await, 2);
+    println!("  [owner] the stored helper record for A still carries weight 2  ✓");
+
+    println!("Protocol sticky weights flow test passed.");
+}
+
+fn sorted_weights(mut weights: Vec<(ChannelId, u32)>) -> Vec<(ChannelId, u32)> {
+    weights.sort_unstable();
+    weights
+}
+
+/// A weighted secret is recovered on a new device at the same endpoint,
+/// restored there and republished with the stored weights. `restore` writes
+/// the roster's threshold and weights back, so the republish splits at the
+/// original threshold with the original weights. The restored device holds
+/// no proof of the recovered version, so verifying it fails with `NoProof`
+/// and sends nothing.
+async fn run_recover_restore_republish_flow() {
+    println!("=== Protocol recover → restore → republish flow test ===");
+
+    const OWNER_URI: &str = "https://owner-restore.example.com";
+    const SECRET_ID: u64 = 0x2E5;
+    let secret_data = b"restore-me".to_vec();
+    let mut owner = Peer::with_secret_id("owner", OWNER_URI, SECRET_ID);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a-restore.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b-restore.example.com");
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(1)).await;
+    let channel_b = pair(&mut owner, &mut helper_b, ChannelId(2)).await;
+
+    let v1 = protect_started_version(
+        &owner
+            .protocol
+            .start(DeRecFlow::ProtectSecret {
+                secrets: vec![UserSecret {
+                    id: vec![11],
+                    name: "restored secret".to_owned(),
+                    data: secret_data.clone(),
+                }],
+                description: None,
+                weights: HashMap::from([(channel_a, 2)]),
+                threshold: Some(3),
+            })
+            .await
+            .expect("owner start(ProtectSecret) failed"),
+    );
+    pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+    drop(owner);
+
+    // The new device pairs with each helper afresh; each helper links its
+    // original channel to the new one so the recovery request finds the share
+    // stored under the original.
+    let mut device = Peer::with_secret_id("device", OWNER_URI, SECRET_ID);
+    let recovery_a = pair(&mut device, &mut helper_a, ChannelId(100)).await;
+    let recovery_b = pair(&mut device, &mut helper_b, ChannelId(101)).await;
+    for (helper, original, recovery) in [
+        (&mut helper_a, channel_a, recovery_a),
+        (&mut helper_b, channel_b, recovery_b),
+    ] {
+        let helper_sid = helper.protocol.secret_id();
+        helper
+            .protocol
+            .channel_store
+            .link_channel(helper_sid, original, recovery)
+            .await
+            .expect("link the recovery channel to the original");
+    }
+
+    device
+        .protocol
+        .start(DeRecFlow::RecoverSecret {
+            secret_id: SECRET_ID,
+            version: v1,
+        })
+        .await
+        .expect("device start(RecoverSecret) failed");
+    let recovered = pump_many(&mut [&mut device, &mut helper_a, &mut helper_b])
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            DeRecEvent::SecretRecovered { secret } => Some(secret),
+            _ => None,
+        })
+        .expect("RecoverSecret must surface SecretRecovered");
+    assert!(
+        recovered.secrets.len() == 1 && recovered.secrets[0].data == secret_data,
+        "the recovered secret must carry the protected data, got {:?}",
+        recovered.secrets
+    );
+    assert_eq!(recovered.threshold, Some(3), "the roster carries t = 3");
+    let mut recovered_weights: Vec<(u64, u32)> = recovered
+        .helpers
+        .iter()
+        .map(|h| (h.channel_id, h.weight))
+        .collect();
+    recovered_weights.sort_unstable();
+    let mut expected_weights = vec![(channel_a.0, 2), (channel_b.0, 1)];
+    expected_weights.sort_unstable();
+    assert_eq!(
+        recovered_weights, expected_weights,
+        "the roster carries weights A=2, B=1"
+    );
+    println!("  SecretRecovered carries t=3 and weights A=2, B=1  ✓");
+
+    let restore_events = device
+        .protocol
+        .restore(&recovered, v1)
+        .await
+        .expect("restore succeeds");
+    assert!(
+        !restore_events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::Unpaired { .. })),
+        "restore must wait for the recovery helpers' answers, got {restore_events:?}"
+    );
+    let unpair_started: HashSet<ChannelId> = restore_events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::UnpairStarted { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        unpair_started,
+        HashSet::from([recovery_a, recovery_b]),
+        "restore must start unpairing both recovery channels"
+    );
+    for channel_id in [recovery_a, recovery_b] {
+        let status = device
+            .protocol
+            .channel_store
+            .load(SECRET_ID, ChannelQuery::Helper { channel_id })
+            .await
+            .expect("device channel load failed")
+            .and_then(|record| record.as_helper().cloned())
+            .map(|h| h.status);
+        assert_eq!(
+            status,
+            Some(ChannelStatus::Unpairing),
+            "recovery channel {channel_id:?} must be Unpairing until its helper answers"
+        );
+    }
+    let unpaired: HashSet<ChannelId> = pump_many(&mut [&mut device, &mut helper_a, &mut helper_b])
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            DeRecEvent::Unpaired { channel_id } => Some(channel_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        unpaired.contains(&recovery_a) && unpaired.contains(&recovery_b),
+        "the recovery helpers' answers must unpair both recovery channels, got {unpaired:?}"
+    );
+    println!("  restore unpairs the recovery channels once their helpers answer  ✓");
+
+    let snapshot = device
+        .protocol
+        .user_secret_store
+        .load_latest(SECRET_ID)
+        .await
+        .expect("load_latest after restore failed")
+        .expect("restore commits a snapshot");
+    assert_eq!(snapshot.version, v1, "restore stores the recovered version");
+    assert_eq!(snapshot.threshold, Some(3), "restore keeps t = 3");
+    let mut stored_weights = HashMap::new();
+    for channel_id in [channel_a, channel_b] {
+        let helper = device
+            .protocol
+            .channel_store
+            .load(SECRET_ID, ChannelQuery::Helper { channel_id })
+            .await
+            .expect("device channel load failed")
+            .and_then(|record| record.as_helper().cloned())
+            .unwrap_or_else(|| panic!("restore must write helper channel {channel_id:?}"));
+        stored_weights.insert(channel_id, helper.weight);
+    }
+    assert_eq!(
+        stored_weights,
+        HashMap::from([(channel_a, 2), (channel_b, 1)]),
+        "restore must store weights A=2, B=1"
+    );
+    println!("  restore stores t=3 and HelperChannel.weight A=2, B=1  ✓");
+
+    let events = device
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: snapshot.secrets.clone(),
+            description: None,
+            weights: stored_weights,
+            threshold: None,
+        })
+        .await
+        .expect("device start(ProtectSecret) after restore failed");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::ProtectSecretFailed { .. })),
+        "the republish must not fail: {events:?}"
+    );
+    let v2 = protect_started_version(&events);
+    let republished: HashMap<ChannelId, u32> = events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ProtectSecretStarted {
+                channel_id, weight, ..
+            } => Some((*channel_id, *weight)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        v2 > v1 && republished == HashMap::from([(channel_a, 2), (channel_b, 1)]),
+        "the republish must be a newer version with weights A=2, B=1; got v{v2} {republished:?}"
+    );
+    let confirmed = pump_many(&mut [&mut device, &mut helper_a, &mut helper_b])
+        .await
+        .iter()
+        .filter(|e| matches!(e, DeRecEvent::ShareConfirmed { .. }))
+        .count();
+    assert_eq!(confirmed, 2, "both helpers must confirm the republish");
+    for (channel_id, subshares) in [(channel_a, 2), (channel_b, 1)] {
+        let rows = device
+            .protocol
+            .share_store
+            .load(SECRET_ID, channel_id, &[v2])
+            .await
+            .expect("device share load failed");
+        assert_eq!(rows.len(), 1, "the device tracks each republished share");
+        assert_eq!(
+            rows[0].threshold,
+            Some(3),
+            "the republish must split at the restored t = 3"
+        );
+        assert_eq!(
+            rows[0].subshares,
+            Some(subshares),
+            "the republish must give {channel_id:?} {subshares} subshares"
+        );
+    }
+    println!(
+        "  republish v{v2} with the stored weights splits at t=3 with A=2, B=1, both helpers confirm  ✓"
+    );
+
+    let events = device
+        .protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id: SECRET_ID,
+            version: v1,
+            target: Target::All,
+        })
+        .await
+        .expect("device start(VerifyShares) of the recovered version failed");
+    let no_proof: HashSet<ChannelId> = events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::VerifySharesFailed {
+                channel_id,
+                reason: VerifyFailureReason::NoProof,
+                ..
+            } => Some(*channel_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        no_proof.contains(&channel_a) && no_proof.contains(&channel_b),
+        "restore writes no proof, so verifying v{v1} must fail with NoProof on both helpers; got {events:?}"
+    );
+    assert!(
+        device.drain().is_empty(),
+        "no challenge may be sent without a proof to check the answer against"
+    );
+    println!(
+        "  verifying the recovered v{v1} → VerifySharesFailed(NoProof) on both helpers, nothing sent  ✓"
+    );
+
+    println!("Protocol recover → restore → republish flow test passed.");
+}
+
+/// A replica destination's library refuses a copy whose share map does not
+/// verify: it reports `ReplicaSecretRefused` and writes nothing. The copy here
+/// is a catch-up served from the source's stores, one of whose tracked shares
+/// was corrupted, so it is not answered.
+async fn run_replica_secret_refused_flow() {
+    println!("=== Protocol replica copy refused flow test ===");
+
+    const SECRET_ID: u64 = 0x5EC7;
+    const SOURCE_REPLICA_ID: u64 = 0x7171;
+    let mut source = Peer::with_secret_id_and_replica_id(
+        "source",
+        "https://refusing-source.example.com",
+        SECRET_ID,
+        SOURCE_REPLICA_ID,
+    );
+    let mut helper_a = Peer::new("helper-a", "https://refusing-helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://refusing-helper-b.example.com");
+    let mut destination = Peer::with_secret_id_and_replica_id(
+        "destination",
+        "https://refusing-destination.example.com",
+        SECRET_ID,
+        0x7272,
+    );
+    let channel_a = pair(&mut source, &mut helper_a, ChannelId(82)).await;
+    pair(&mut source, &mut helper_b, ChannelId(83)).await;
+
+    let replica_channel =
+        pair_replica_handshake(&mut source, &mut destination, ChannelId(84)).await;
+    // The source confirms first, so its publish reaches the destination while
+    // the destination still shows the code and is ignored there.
+    let destination_fp = destination
+        .protocol
+        .get_fingerprint(replica_channel)
+        .await
+        .expect("destination fingerprint");
+    source
+        .protocol
+        .verify_fingerprint(replica_channel, &destination_fp)
+        .await
+        .expect("the source must accept the matching fingerprint");
+    pump_many(&mut [&mut source, &mut helper_a, &mut helper_b, &mut destination]).await;
+
+    let version = source
+        .protocol
+        .user_secret_store
+        .load_latest(SECRET_ID)
+        .await
+        .expect("source load_latest failed")
+        .expect("the source must hold a snapshot")
+        .version;
+    let mut tracked = source
+        .protocol
+        .share_store
+        .load(SECRET_ID, channel_a, &[version])
+        .await
+        .expect("source share load failed")
+        .pop()
+        .unwrap_or_else(|| panic!("the source must track helper-a's v{version} share"));
+    // One byte of the committed share's Merkle commitment: the share still
+    // decodes, and its proof no longer opens to the commitment.
+    let mut committed = CommittedDeRecShare::decode(tracked.bytes.as_slice())
+        .expect("the tracked share is a CommittedDeRecShare");
+    committed.commitment[0] ^= 0xff;
+    tracked.bytes = committed.encode_to_vec();
+    source
+        .protocol
+        .share_store
+        .save(SECRET_ID, channel_a, tracked)
+        .await
+        .expect("source stores the corrupted share");
+
+    let source_fp = source
+        .protocol
+        .get_fingerprint(replica_channel)
+        .await
+        .expect("source fingerprint");
+    destination
+        .protocol
+        .verify_fingerprint(replica_channel, &source_fp)
+        .await
+        .expect("the destination must accept the matching fingerprint");
+    destination
+        .protocol
+        .start(DeRecFlow::ReplicaDiscovery)
+        .await
+        .expect("destination start(ReplicaDiscovery) failed");
+    let events = pump(&mut destination, &mut source).await;
+    let refused: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ReplicaSecretRefused {
+                from_replica_id,
+                secret_id,
+                version,
+                status,
+                memo,
+                ..
+            } => Some((
+                *from_replica_id,
+                *secret_id,
+                *version,
+                *status,
+                memo.as_str(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        refused,
+        vec![(
+            SOURCE_REPLICA_ID,
+            SECRET_ID,
+            version,
+            StatusEnum::VerificationFailed as i32,
+            "CommittedDeRecShare Merkle proof verification failed",
+        )],
+        "the destination must refuse the copy, got {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            DeRecEvent::ReplicaSecretInstalled { .. } | DeRecEvent::ReplicaSecretReceived { .. }
+        )),
+        "a refused copy must not be installed: {events:?}"
+    );
+    assert!(
+        destination
+            .protocol
+            .user_secret_store
+            .load_latest(SECRET_ID)
+            .await
+            .expect("destination load_latest failed")
+            .is_none(),
+        "a refused copy must write nothing"
+    );
+    println!(
+        "  [destination] catch-up with a corrupted share → ReplicaSecretRefused(status=VERIFICATION_FAILED), nothing written  ✓"
+    );
+
+    println!("Protocol replica copy refused flow test passed.");
+}
+
 /// One of three helpers holds a tampered share: one byte of its `y`
 /// coordinate flipped in storage, so it still answers OK.
 ///
@@ -5314,6 +6517,11 @@ async fn run_unpairing_flow() {
         matches!(result, Err(Error::RoleMismatch { .. })),
         "Helper-initiated Unpair must be refused with RoleMismatch, got {result:?}"
     );
+    assert_eq!(
+        result.err().and_then(|err| err.channel_id()),
+        Some(helper_init_channel),
+        "the refusal names the channel it is about"
+    );
 
     println!("Protocol unpairing flow test passed.");
 }
@@ -6101,7 +7309,7 @@ async fn run_replica_sync_version_progression_flow() {
     assert_hydrated(&replica_a, "A", 7, 3, 2, 3).await;
     assert_hydrated(&replica_b, "B", 7, 3, 2, 3).await;
     println!(
-        "  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=4,shares=3); all 3 helpers ShareStored  ✓"
+        "  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=3,shares=3); all 3 helpers ShareStored  ✓"
     );
 
     let cid_c = pair_replica_handshake(&mut owner, &mut replica_c, cid_c).await;
@@ -7101,6 +8309,11 @@ async fn run_fingerprint_mismatch_flow() {
         matches!(err, Error::FingerprintMismatch { .. }),
         "expected FingerprintMismatch, got {err:?}"
     );
+    assert_eq!(
+        err.channel_id(),
+        Some(ChannelId(5151)),
+        "the mismatch names the channel it is about"
+    );
     println!("  verify_fingerprint(wrong) fails with FingerprintMismatch  ✓");
 
     let member = node
@@ -7361,19 +8574,15 @@ async fn scan_as_owner(
         .await
 }
 
-/// A version check reaches each member under the key of the channel that
-/// member is recorded on, and concludes once its budget elapses even when a
-/// member never answers.
-///
-/// A joiner whose fingerprint is not yet confirmed sits on its own pairing
-/// channel, so for that window the group spans two channels and two keys.
-/// The destination on the group channel must read its question and report
-/// its version; the joiner never answers, so the check concludes on the
-/// timeout, carrying the version the destination reported.
-async fn run_discovery_across_two_channels_flow() {
-    println!("=== Protocol replica discovery across two channels flow ===");
+/// A joiner whose fingerprint is not yet confirmed is not a member: the
+/// source neither lists it in the roster it publishes nor asks it in a
+/// version check. A check whose only member stays silent concludes once its
+/// budget elapses.
+async fn run_unconfirmed_joiner_flow() {
+    println!("=== Protocol replica unconfirmed joiner flow ===");
 
     let sid = 0xD15Cu64;
+    let joiner_id = 0xD3D3_D3D3_D3D3_D3D3u64;
     let mut source = Peer::with_replica_and_timeouts(
         "source",
         "https://source.example.com",
@@ -7397,36 +8606,56 @@ async fn run_discovery_across_two_channels_flow() {
         "https://joiner.example.com",
         2,
         false,
-        Some(0xD3D3_D3D3_D3D3_D3D3),
+        Some(joiner_id),
         sid,
     );
 
     let group = pair_replica_handshake(&mut source, &mut dest, ChannelId(191)).await;
     cross_confirm_fingerprint(&mut source, &mut dest, group).await;
     pump_many(&mut [&mut source, &mut dest]).await;
+    let protect = || DeRecFlow::ProtectSecret {
+        secrets: vec![UserSecret {
+            id: vec![0x19],
+            name: "unconfirmed joiner".to_owned(),
+            data: b"members only".to_vec(),
+        }],
+        description: None,
+        weights: HashMap::new(),
+        threshold: None,
+    };
     source
         .protocol
-        .start(DeRecFlow::ProtectSecret {
-            secrets: vec![UserSecret {
-                id: vec![0x19],
-                name: "two channels".to_owned(),
-                data: b"one group, two keys".to_vec(),
-            }],
-            description: None,
-            weights: HashMap::new(),
-            threshold: None,
-        })
+        .start(protect())
         .await
         .expect("source start(ProtectSecret) failed");
     pump_many(&mut [&mut source, &mut dest]).await;
 
-    let joining = pair_replica_handshake(&mut source, &mut joiner, ChannelId(192)).await;
+    pair_replica_handshake(&mut source, &mut joiner, ChannelId(192)).await;
     pump_many(&mut [&mut source, &mut dest, &mut joiner]).await;
-    assert_ne!(
-        joining, group,
-        "the joiner must still be on its own pairing channel"
+
+    source
+        .protocol
+        .start(protect())
+        .await
+        .expect("source start(ProtectSecret) with a joiner pending failed");
+    let events = pump_many(&mut [&mut source, &mut dest, &mut joiner]).await;
+    let listed: Vec<u64> = events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ReplicaSecretReceived { secret, .. }
+            | DeRecEvent::ReplicaSecretInstalled { secret, .. } => secret
+                .replicas
+                .as_ref()
+                .map(|r| r.members.iter().map(|m| m.replica_id).collect()),
+            _ => None,
+        })
+        .expect("the destination must receive the new version");
+    assert_eq!(listed.len(), 2, "source and destination only: {listed:?}");
+    assert!(
+        !listed.contains(&joiner_id),
+        "an unconfirmed joiner must not be published: {listed:?}"
     );
-    println!("  group spans two channels: the destination on one, the joiner on another  ✓");
+    println!("  the published roster leaves out the unconfirmed joiner  ✓");
 
     source
         .protocol
@@ -7435,41 +8664,48 @@ async fn run_discovery_across_two_channels_flow() {
         .expect("source start(ReplicaDiscovery) failed");
     let events = pump_many(&mut [&mut source, &mut dest, &mut joiner]).await;
     assert!(
-        !events
+        events
             .iter()
             .any(|e| matches!(e, DeRecEvent::ReplicaDiscoveryComplete { .. })),
-        "the joiner's answer is still due: {events:?}"
+        "the check concludes on the destination's answer: {events:?}"
     );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::MessageIgnored { .. })),
+        "the joiner must not be asked: {events:?}"
+    );
+    println!("  the version check skips the joiner and concludes at once  ✓");
+
+    source
+        .protocol
+        .start(DeRecFlow::ReplicaDiscovery)
+        .await
+        .expect("source start(ReplicaDiscovery) failed");
+    source.drain();
     assert!(
         source.protocol.tick().await.is_empty(),
         "the check waits out its window"
     );
-
     thread::sleep(Duration::from_millis(2100));
     let concluded = source.protocol.tick().await;
-    match concluded.as_slice() {
-        [
-            DeRecEvent::ReplicaDiscoveryComplete {
-                local_version,
-                group_version,
+    assert!(
+        matches!(
+            concluded.as_slice(),
+            [DeRecEvent::ReplicaDiscoveryComplete {
                 fetched_from: None,
-            },
-        ] => {
-            assert!(
-                *group_version > 0,
-                "the destination's answer must have been read"
-            );
-            assert_eq!(group_version, local_version, "the group is level");
-        }
-        other => panic!("expected ReplicaDiscoveryComplete, got {other:?}"),
-    }
+                ..
+            }]
+        ),
+        "expected ReplicaDiscoveryComplete, got {concluded:?}"
+    );
     assert!(
         source.protocol.tick().await.is_empty(),
         "the check is closed once concluded"
     );
-    println!("  the destination answered under its own key; the timeout closed the check  ✓");
+    println!("  a silent member's check concludes on the timeout  ✓");
 
-    println!("Protocol replica discovery across two channels flow test passed.");
+    println!("Protocol replica unconfirmed joiner flow test passed.");
 }
 
 async fn run_expired_channel_cleanup_flow() {
@@ -7492,12 +8728,12 @@ async fn run_expired_channel_cleanup_flow() {
     // policy disabled nothing sweeps them, however much traffic arrives.
     let owner_removed = owner
         .protocol
-        .remove_expired_channels(0)
+        .remove_expired_channels(3600)
         .await
         .expect("owner remove_expired_channels");
     assert!(
         owner_removed.is_empty(),
-        "a channel created in the current second survives the strict `>` boundary"
+        "a Pending channel younger than the threshold survives the sweep"
     );
 
     // Still usable afterwards: the fingerprint round-trip completes, which

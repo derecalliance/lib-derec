@@ -411,6 +411,9 @@ func (p *DeRecProtocol) Process(message []byte) ([]Event, error) {
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
+		if channelID != nil {
+			derecErr.ChannelID = channelID
+		}
 		return nil, &ProcessError{ChannelID: channelID, Events: events, Err: derecErr}
 	}
 	return events, decodeErr

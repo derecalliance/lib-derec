@@ -9,6 +9,7 @@
 
 import {
   ContactMode,
+  envelope,
   primitives,
   SenderKind,
   type ContactMessage,
@@ -261,6 +262,29 @@ export function runPrimitivesSmoke(): void {
   console.log(`  [response.process] ${discResult.secret_list.length} secret(s) discovered`);
 
   console.log("✓ Discovery flow passed.\n");
+
+
+  // Mirrors `run_envelope_trace_id_test` in `smoke-tests/rust/src/primitives.rs`.
+  console.log("=== [Primitives] Envelope trace_id helpers ===");
+
+  const traceKey = sharedKey(9);
+  const traced = primitives.discovery.request.produce(42n, traceKey);
+  const traceBefore = envelope.read_trace_id(traced.envelope);
+  if (traceBefore !== 0n) {
+    throw new Error(`a primitive envelope's default trace_id must be 0, got ${traceBefore}`);
+  }
+  const stamped = envelope.apply_trace_id(traced.envelope, 0xDEAD_BEEF_F00D_CAFEn);
+  const traceAfter = envelope.read_trace_id(stamped);
+  if (traceAfter !== 0xDEAD_BEEF_F00D_CAFEn) {
+    throw new Error(`trace_id must round-trip through apply + read, got ${traceAfter}`);
+  }
+  const { request: restamped } = primitives.discovery.request.extract(stamped, traceKey);
+  if (!restamped.timestamp) {
+    throw new Error("extract must still decode a re-stamped envelope");
+  }
+  console.log(`  default=0, apply/read round-trip 0x${traceAfter.toString(16)}, extract after re-stamp  ✓`);
+
+  console.log("✓ Envelope trace_id helpers passed.\n");
 
 
   console.log("=== [Primitives] Recovery Flow ===");

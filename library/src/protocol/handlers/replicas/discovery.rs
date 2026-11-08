@@ -19,7 +19,7 @@ use crate::interop::wasm::now_secs;
 use crate::protocol::context::{Exchange, Local};
 use crate::protocol::obligation::{Obligation, deliver};
 use crate::protocol::stores::{StoreSet, Stores};
-use crate::protocol::types::{ReplicaFilter, ReplicaMember, ReplicaRole};
+use crate::protocol::types::{ChannelStatus, ReplicaFilter, ReplicaMember, ReplicaRole};
 use crate::protocol::{
     DeRecEvent, DeRecStateStore, DeRecTransport, DeRecUserSecretStore, StateItem, StateKey,
 };
@@ -93,11 +93,14 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     let secret_id = local.secret_id;
     let own = local.replica_id.ok_or(Error::ReplicaIdNotConfigured)?;
 
+    // A member whose pairing is unconfirmed drops every message at its
+    // pending gate, so it is not asked.
     let peers: Vec<ReplicaMember> = stores
         .channels
         .replicas_matching(
             secret_id,
             ReplicaFilter {
+                status: vec![ChannelStatus::Paired, ChannelStatus::Unpairing],
                 exclude: local.exclude_self(),
                 ..Default::default()
             },
@@ -442,9 +445,7 @@ mod tests {
     use crate::protocol::tests::{
         InMemChannelStore, InMemSecretStore, InMemUserSecretStore, StoreRig, run_async,
     };
-    use crate::protocol::types::{
-        ChannelRecord, ChannelStatus, ReplicaRole, SecretValue, UserSecrets,
-    };
+    use crate::protocol::types::{ChannelRecord, ReplicaRole, SecretValue, UserSecrets};
     use crate::types::ChannelId;
     use std::collections::HashSet;
 
@@ -864,5 +865,92 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// A member whose pairing is unconfirmed drops every message at its
+    /// pending gate, so asking it would only hold the check until it times
+    /// out.
+    #[test]
+    fn an_unconfirmed_member_is_not_asked() {
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, 1001);
+            let mut rig = StoreRig::new();
+            seed(
+                &mut rig.channels,
+                1001,
+                ReplicaRole::Source,
+                "https://alice",
+            )
+            .await;
+            seed(
+                &mut rig.channels,
+                1002,
+                ReplicaRole::Destination,
+                "https://alice-2",
+            )
+            .await;
+            seed_unconfirmed_joiner(&mut rig).await;
+            seed_key(&mut rig.secrets).await;
+            seed_version(&mut rig.user_secrets, 5).await;
+
+            super::start(&mut rig.stores(), &lf.local(), TRACE_ID)
+                .await
+                .expect("start succeeds");
+
+            assert_eq!(
+                rig.transport.sent_uris(),
+                vec!["https://alice-2".to_owned()]
+            );
+        });
+    }
+
+    #[test]
+    fn a_group_of_unconfirmed_members_asks_nobody() {
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, 1001);
+            let mut rig = StoreRig::new();
+            seed(
+                &mut rig.channels,
+                1001,
+                ReplicaRole::Source,
+                "https://alice",
+            )
+            .await;
+            seed_unconfirmed_joiner(&mut rig).await;
+            seed_key(&mut rig.secrets).await;
+            seed_version(&mut rig.user_secrets, 5).await;
+
+            let events = super::start(&mut rig.stores(), &lf.local(), TRACE_ID)
+                .await
+                .expect("start succeeds");
+
+            assert!(events.is_empty(), "{events:?}");
+            assert!(rig.transport.sent_uris().is_empty());
+        });
+    }
+
+    /// A joiner whose handshake finished but whose fingerprint this device
+    /// has not confirmed: still `Pending`, on its own pairing channel.
+    async fn seed_unconfirmed_joiner(rig: &mut StoreRig) {
+        const PAIRING: ChannelId = ChannelId(5002);
+        rig.channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Replica(ReplicaMember {
+                    channel_id: PAIRING,
+                    replica_id: ReplicaId(1003),
+                    transports: vec![endpoint("https://joiner")],
+                    communication_info: HashMap::new(),
+                    role: ReplicaRole::Destination,
+                    status: ChannelStatus::Pending,
+                    created_at: 0,
+                }),
+            )
+            .await
+            .expect("seed joiner");
+        rig.secrets
+            .save(SECRET_ID, PAIRING, SecretValue::SharedKey([0x22; 32]))
+            .await
+            .expect("seed pairing key");
     }
 }

@@ -794,7 +794,9 @@ pub trait DeRecTransport {
     /// are healthy, cheap, or currently reachable.
     ///
     /// Delivery to **any one** endpoint is success. Return an error only
-    /// when the message reached none of them.
+    /// when the message reached none of them:
+    /// [`Error::TransportSendFailed`](crate::Error::TransportSendFailed),
+    /// which is what every SDK reports for a failed send.
     ///
     /// `endpoints` is never empty: the library refuses to record a peer it
     /// filtered every endpoint away from, so a channel that exists has at

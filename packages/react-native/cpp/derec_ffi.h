@@ -106,6 +106,8 @@
 
 #define DEREC_CATEGORY_STATE_STORE 15
 
+#define DEREC_CATEGORY_TRANSPORT 16
+
 #define DEREC_CODE_OK 0
 
 #define DEREC_CODE_NON_OK_STATUS 1
@@ -321,6 +323,13 @@
 #define DEREC_CODE_NO_USABLE_ENDPOINT 121
 
 /**
+ * The application's transport delivered a message to none of the peer's
+ * endpoints: the `send` callback returned non-zero.
+ * `DEREC_CATEGORY_TRANSPORT`.
+ */
+#define DEREC_CODE_TRANSPORT_SEND_FAILED 123
+
+/**
  * Return codes for [`crate::interop::ffi::protocol::stores::ShareStoreCallbacks::save`]
  * and `ShareStoreCallbacks::record_verification`: `0` is success, each of
  * these three refuses the write/verification with the matching
@@ -502,6 +511,14 @@ typedef struct DeRecError {
    * Valid when `code == DEREC_CODE_VERSION_MISMATCH`.
    */
   uint32_t got;
+  /**
+   * Whether `channel_id` is set: the error names the channel it is about.
+   */
+  bool has_channel_id;
+  /**
+   * The channel the error is about. Valid when `has_channel_id`.
+   */
+  uint64_t channel_id;
 } DeRecError;
 
 typedef struct DeRecBuffer {

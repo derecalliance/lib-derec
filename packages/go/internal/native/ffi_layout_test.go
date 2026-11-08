@@ -29,7 +29,7 @@ var layoutMirrors = []layoutMirror{
 	{"ChannelStoreCallbacks", reflect.TypeOf(ChannelStoreCallbacks{}), [][2]string{{"UserData", "user_data"}, {"Load", "load"}, {"Save", "save"}, {"Remove", "remove"}, {"ListHelpers", "list_helpers"}, {"ListReplicas", "list_replicas"}, {"LinkChannel", "link_channel"}, {"LinkedChannels", "linked_channels"}, {"FreeBuffer", "free_buffer"}}},
 	{"CreateContactMessageResult", reflect.TypeOf(createContactMessageResult{}), [][2]string{{"Error", "error"}, {"ContactWireBytes", "contact_wire_bytes"}, {"SecretKeyMaterial", "secret_key_material"}}},
 	{"DeRecBuffer", reflect.TypeOf(DeRecBuffer{}), [][2]string{{"Ptr", "ptr"}, {"Len", "len"}}},
-	{"DeRecError", reflect.TypeOf(DeRecError{}), [][2]string{{"Category", "category"}, {"Code", "code"}, {"Message", "message"}, {"PeerStatus", "peer_status"}, {"PeerMemo", "peer_memo"}, {"Expected", "expected"}, {"Got", "got"}}},
+	{"DeRecError", reflect.TypeOf(DeRecError{}), [][2]string{{"Category", "category"}, {"Code", "code"}, {"Message", "message"}, {"PeerStatus", "peer_status"}, {"PeerMemo", "peer_memo"}, {"Expected", "expected"}, {"Got", "got"}, {"HasChannelID", "has_channel_id"}, {"ChannelID", "channel_id"}}},
 	{"DeRecProtocolCreateContactResult", reflect.TypeOf(DeRecProtocolCreateContactResult{}), [][2]string{{"Error", "error"}, {"ContactWireBytes", "contact_wire_bytes"}}},
 	{"DeRecProtocolEventsResult", reflect.TypeOf(DeRecProtocolEventsResult{}), [][2]string{{"Error", "error"}, {"EventsJSON", "events_json"}}},
 	{"DeRecProtocolFingerprintResult", reflect.TypeOf(DeRecProtocolFingerprintResult{}), [][2]string{{"Error", "error"}, {"Fingerprint", "fingerprint"}}},

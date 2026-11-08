@@ -2596,6 +2596,7 @@ export type DeRecErrorCategory =
   | "channel_store"
   | "share_store"
   | "state_store"
+  | "transport"
   | "input"
   | "protobuf"
   | "invariant"
@@ -2665,6 +2666,7 @@ export type DeRecErrorCode =
   | "ffi_nul_in_string"
   | "transport_invalid"
   | "no_usable_endpoint"
+  | "transport_send_failed"
   | "builder_missing"
   | "decode_error"
   | "envelope_decode_error"
@@ -2704,7 +2706,12 @@ export interface DeRecError {
   memo?: string;
   expected?: number;
   got?: number;
-  /** The channel the failing inbound message arrived on, when `process()` could tell. */
+  /**
+   * The channel the error is about: the one named by
+   * `"channel_already_paired"`, `"fingerprint_mismatch"` and
+   * `"role_mismatch"`, or, on a failed `process()`, the channel the failing
+   * inbound message arrived on.
+   */
   channel_id?: string;
   /**
    * On a failed `process()`: the events it produced before failing, such as

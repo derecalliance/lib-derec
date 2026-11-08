@@ -38,6 +38,8 @@ void throwDeRecError(jsi::Runtime& rt,
   int32_t peerStatus = error.peer_status;
   uint32_t expected = error.expected;
   uint32_t got = error.got;
+  bool hasChannelId = process.hasChannelId || error.has_channel_id;
+  uint64_t channelId = process.hasChannelId ? process.channelId : error.channel_id;
 
   // Release both owned strings in one call, matching the ABI contract.
   DeRecError owned = error;
@@ -62,9 +64,9 @@ void throwDeRecError(jsi::Runtime& rt,
                         jsi::Value::createFromJsonUtf8(rt, conflictingChannelIdsJson.data(),
                                                        conflictingChannelIdsJson.size()));
   }
-  if (process.hasChannelId) {
+  if (hasChannelId) {
     payload.setProperty(rt, "channel_id",
-                        jsi::String::createFromUtf8(rt, std::to_string(process.channelId)));
+                        jsi::String::createFromUtf8(rt, std::to_string(channelId)));
   }
   if (!process.eventsJson.empty()) {
     payload.setProperty(rt, "events",

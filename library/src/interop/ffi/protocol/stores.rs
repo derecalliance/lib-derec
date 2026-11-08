@@ -1489,10 +1489,10 @@ impl DeRecTransport for DotnetTransport {
         );
         Box::pin(async move {
             if rc != 0 {
-                // crate::Error's variants take &'static str, so we lose
-                // the dynamic rc in the surface error — callers can log
-                // it through the transport callback's own side channel.
-                Err(Error::Invariant("transport send failed"))
+                // The dynamic rc is not carried in the surface error —
+                // callers can log it through the transport callback's own
+                // side channel.
+                Err(Error::TransportSendFailed)
             } else {
                 Ok(())
             }

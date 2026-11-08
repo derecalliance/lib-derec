@@ -628,6 +628,7 @@ dependencies = [
 name = "derec-rust-binding-smoke-test"
 version = "0.1.0"
 dependencies = [
+ "derec-cryptography",
  "derec-library",
  "derec-proto",
  "prost",

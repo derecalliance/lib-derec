@@ -86,6 +86,7 @@ vocabulary! {
         Protobuf = 13 => "protobuf",
         Invariant = 14 => "invariant",
         StateStore = 15 => "state_store",
+        Transport = 16 => "transport",
     }
 }
 
@@ -149,6 +150,7 @@ vocabulary! {
         FfiNulInString = 106 => "ffi_nul_in_string",
         TransportInvalid = 120 => "transport_invalid",
         NoUsableEndpoint = 121 => "no_usable_endpoint",
+        TransportSendFailed = 123 => "transport_send_failed",
     }
 }
 
@@ -179,6 +181,7 @@ pub(crate) fn classify(err: &Error) -> (Category, Code) {
         E::StateStore(_) => (Category::StateStore, Code::StoreError),
         E::Transport(_) => (Category::InvalidInput, Code::TransportInvalid),
         E::NoUsableEndpoint { .. } => (Category::InvalidInput, Code::NoUsableEndpoint),
+        E::TransportSendFailed => (Category::Transport, Code::TransportSendFailed),
         E::InvalidInput(_) => (Category::InvalidInput, Code::InvalidInput),
         E::ProtobufDecode(_) => (Category::Protobuf, Code::ProtobufDecode),
         E::ProtobufEncode(_) => (Category::Protobuf, Code::ProtobufEncode),
@@ -318,5 +321,36 @@ mod tests {
             classify(&Error::Restore(RestoreError::Conflict(Vec::new()))),
             (Category::InvalidInput, Code::RestoreConflict)
         );
+    }
+
+    /// The variants that name a channel report it, so every SDK can carry
+    /// it on its error; the rest report none.
+    #[test]
+    fn errors_naming_a_channel_report_it() {
+        use crate::types::ChannelId;
+        use derec_proto::SenderKind;
+        let channel = ChannelId(0xC0FFEE);
+        for error in [
+            Error::ChannelAlreadyPaired {
+                channel_id: channel,
+            },
+            Error::FingerprintMismatch {
+                channel_id: channel,
+            },
+            Error::RoleMismatch {
+                channel_id: channel,
+                expected: SenderKind::Owner,
+                actual: SenderKind::Helper,
+            },
+        ] {
+            assert_eq!(error.channel_id(), Some(channel), "{error:?}");
+        }
+        for error in [
+            Error::TransportSendFailed,
+            Error::ReplicaIdNotConfigured,
+            Error::NoUsableEndpoint { offered: 1 },
+        ] {
+            assert_eq!(error.channel_id(), None, "{error:?}");
+        }
     }
 }

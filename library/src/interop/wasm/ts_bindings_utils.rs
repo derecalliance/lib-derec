@@ -24,6 +24,8 @@ struct TsError {
     #[serde(skip_serializing_if = "Option::is_none")]
     got: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    channel_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     channel_ids: Option<Vec<String>>,
 }
 
@@ -36,6 +38,7 @@ pub(crate) fn js_error(code: &'static str, message: impl Into<String>) -> JsValu
         memo: None,
         expected: None,
         got: None,
+        channel_id: None,
         channel_ids: None,
     };
     serde_wasm_bindgen::to_value(&payload)
@@ -62,6 +65,7 @@ pub(crate) fn js_error_from_lib(err: Error) -> JsValue {
         }
         _ => None,
     };
+    let channel_id = err.channel_id().map(|id| id.0.to_string());
     let payload = TsError {
         category,
         code,
@@ -70,6 +74,7 @@ pub(crate) fn js_error_from_lib(err: Error) -> JsValue {
         memo,
         expected,
         got,
+        channel_id,
         channel_ids,
     };
     serde_wasm_bindgen::to_value(&payload)

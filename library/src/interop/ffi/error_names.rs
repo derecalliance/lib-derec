@@ -122,6 +122,7 @@ mod tests {
             (DEREC_CATEGORY_PROTOBUF, Category::Protobuf),
             (DEREC_CATEGORY_INVARIANT, Category::Invariant),
             (DEREC_CATEGORY_STATE_STORE, Category::StateStore),
+            (DEREC_CATEGORY_TRANSPORT, Category::Transport),
         ];
         for (value, category) in declared {
             assert_eq!(value, category as i32, "{category:?}");

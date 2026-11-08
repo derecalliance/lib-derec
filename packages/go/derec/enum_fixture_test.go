@@ -100,6 +100,7 @@ var fixtureErrorCategories = map[string]int32{
 	"Protobuf":     derec.CategoryProtobuf,
 	"Invariant":    derec.CategoryInvariant,
 	"StateStore":   derec.CategoryStateStore,
+	"Transport":    derec.CategoryTransport,
 }
 
 var fixtureErrorCodes = map[string]int32{
@@ -159,6 +160,7 @@ var fixtureErrorCodes = map[string]int32{
 	"FfiNulInString":                derec.CodeFFINulInString,
 	"TransportInvalid":              derec.CodeTransportInvalid,
 	"NoUsableEndpoint":              derec.CodeNoUsableEndpoint,
+	"TransportSendFailed":           derec.CodeTransportSendFailed,
 }
 
 func checkNumberToNameEnum(t *testing.T, enumName, prefix string, goValues map[string]int32, name func(int32) string) {

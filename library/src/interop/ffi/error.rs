@@ -45,6 +45,10 @@ pub struct DeRecError {
     pub expected: u32,
     /// Valid when `code == DEREC_CODE_VERSION_MISMATCH`.
     pub got: u32,
+    /// Whether `channel_id` is set: the error names the channel it is about.
+    pub has_channel_id: bool,
+    /// The channel the error is about. Valid when `has_channel_id`.
+    pub channel_id: u64,
 }
 
 pub const DEREC_CATEGORY_OK: i32 = 0;
@@ -63,6 +67,7 @@ pub const DEREC_CATEGORY_INVALID_INPUT: i32 = 12;
 pub const DEREC_CATEGORY_PROTOBUF: i32 = 13;
 pub const DEREC_CATEGORY_INVARIANT: i32 = 14;
 pub const DEREC_CATEGORY_STATE_STORE: i32 = 15;
+pub const DEREC_CATEGORY_TRANSPORT: i32 = 16;
 
 pub const DEREC_CODE_OK: i32 = 0;
 pub const DEREC_CODE_NON_OK_STATUS: i32 = 1;
@@ -209,6 +214,11 @@ pub const DEREC_CODE_NO_USABLE_ENDPOINT: i32 = 121;
 
 // 122 is retired (formerly the conflicting plaintext opt-in); never reassign it.
 
+/// The application's transport delivered a message to none of the peer's
+/// endpoints: the `send` callback returned non-zero.
+/// `DEREC_CATEGORY_TRANSPORT`.
+pub const DEREC_CODE_TRANSPORT_SEND_FAILED: i32 = 123;
+
 /// Return codes for [`crate::interop::ffi::protocol::stores::ShareStoreCallbacks::save`]
 /// and `ShareStoreCallbacks::record_verification`: `0` is success, each of
 /// these three refuses the write/verification with the matching
@@ -228,6 +238,8 @@ pub(crate) fn success() -> DeRecError {
         peer_memo: ptr::null_mut(),
         expected: 0,
         got: 0,
+        has_channel_id: false,
+        channel_id: 0,
     }
 }
 
@@ -240,6 +252,8 @@ pub(crate) fn ffi_error(code: i32, msg: impl AsRef<str>) -> DeRecError {
         peer_memo: ptr::null_mut(),
         expected: 0,
         got: 0,
+        has_channel_id: false,
+        channel_id: 0,
     }
 }
 
@@ -266,6 +280,8 @@ pub(crate) fn from_lib_error(err: Error) -> DeRecError {
         _ => (0, 0),
     };
 
+    let channel_id = err.channel_id();
+
     DeRecError {
         category,
         code,
@@ -274,6 +290,8 @@ pub(crate) fn from_lib_error(err: Error) -> DeRecError {
         peer_memo,
         expected,
         got,
+        has_channel_id: channel_id.is_some(),
+        channel_id: channel_id.map_or(0, |id| id.0),
     }
 }
 
@@ -296,6 +314,8 @@ pub(crate) fn from_restore_error(err: RestoreError) -> DeRecError {
         peer_memo: ptr::null_mut(),
         expected: 0,
         got: 0,
+        has_channel_id: false,
+        channel_id: 0,
     }
 }
 
