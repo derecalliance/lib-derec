@@ -521,6 +521,7 @@ mod golden {
                 disputed_by: vec![recovery_helper("1052", "heidi")],
             },
             Event::RecoveryIncomplete {
+                secret_id: "1079".into(),
                 version: 27,
                 shares_received: 3,
             },

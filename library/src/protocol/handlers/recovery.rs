@@ -671,6 +671,7 @@ pub(in crate::protocol) fn settle(
             "recovery closed without reconstructing a secret"
         );
         events.push(DeRecEvent::RecoveryIncomplete {
+            secret_id,
             version,
             shares_received: shares.len() - faults.len(),
         });
@@ -1440,6 +1441,7 @@ mod recovery_ids_tests {
                 matches!(
                     events.as_slice(),
                     [DeRecEvent::RecoveryIncomplete {
+                        secret_id: TARGET,
                         version: VERSION,
                         shares_received: 0,
                     }]
@@ -3392,6 +3394,7 @@ mod share_judging_tests {
             matches!(
                 events.as_slice(),
                 [DeRecEvent::RecoveryIncomplete {
+                    secret_id: SECRET_ID,
                     version: VERSION,
                     shares_received: 2,
                 }]
@@ -3405,6 +3408,7 @@ mod share_judging_tests {
         assert!(matches!(
             settle(SECRET_ID, VERSION, &[], &HashMap::new()).as_slice(),
             [DeRecEvent::RecoveryIncomplete {
+                secret_id: SECRET_ID,
                 version: VERSION,
                 shares_received: 0,
             }]

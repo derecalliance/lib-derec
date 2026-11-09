@@ -900,8 +900,10 @@ export const envelope = {
    * Identify an envelope for replay and reflection detection. `id` is the
    * same for every copy of one message, whatever its unauthenticated
    * cleartext fields say, and different for every other message. Keep the
-   * `id` of every envelope sent and of every envelope `process` accepted,
-   * and drop an inbound envelope whose `id` is kept.
+   * `id` of every envelope sent and of every envelope `process` accepted
+   * until `max(received or sent at, timestamp) + inbound_message_secs`, keep
+   * the record across restarts, and drop an inbound envelope whose `id` is
+   * kept. The README has the full contract.
    */
   message_id(envelope_bytes: Uint8Array): MessageId {
     const result = call('message_id_from_envelope', envelope_bytes) as {

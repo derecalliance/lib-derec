@@ -80,7 +80,7 @@ not yet confirmed.
   - `RecoveryConflict { version, candidates, disputed_by }` — two or more
     different secrets reconstruct; each candidate carries its `secret` and
     `supported_by`;
-  - `RecoveryIncomplete { version, shares_received }` — nothing
+  - `RecoveryIncomplete { secret_id, version, shares_received }` — nothing
     reconstructs. The recovery is closed.
 
   `supported_by` and `disputed_by` name helpers as `RecoveryHelper
@@ -182,9 +182,10 @@ not yet confirmed.
   field: the same for every copy of one message, different for every other.
   The contract is documented on `process` and in `derecmessage.proto`: keep
   the `id` of every envelope sent and accepted until
-  `max(received or sent at, timestamp) + inbound_message`, drop an inbound
-  envelope whose `id` is kept, and reject a contact update older than the
-  last one accepted on the channel. The `AutoAcceptPolicy` documentation no
+  `max(received or sent at, timestamp) + inbound_message`, keep that record
+  across restarts (or hold inbound traffic for one window after starting),
+  drop an inbound envelope whose `id` is kept, and reject a contact update
+  older than the last one accepted on the channel. The `AutoAcceptPolicy` documentation no
   longer calls accepting `UpdateChannelInfo` safe because only the peer can
   send it.
 
@@ -233,7 +234,11 @@ not yet confirmed.
   **Migration:** a scanner's `expired_channels` timeout should be at least
   `pairing` plus the time a response takes to arrive. A contact without a
   timestamp is refused, and a contact created before this version cannot be
-  answered: create a new one.
+  answered: create a new one. An application that carries contacts in its
+  own format (a QR payload, a DTO) and rebuilds the `ContactMessage` from it
+  must now carry the contact's `timestamp` too: until this version it was
+  optional and unused, and a contact rebuilt without it is refused with
+  `invalid_contact_message` ("contact carries no timestamp").
 
 - **Fixed (security): a replica version check could hang, and a member could
   miss a removal.** *(bug fix; every SDK)*

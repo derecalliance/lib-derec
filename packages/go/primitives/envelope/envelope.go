@@ -35,7 +35,9 @@ type MessageID struct {
 // ReadMessageID reads the identity of an envelope. Detecting a message
 // delivered twice, or delivered back to its sender, is the application's
 // job: keep the ID of every envelope sent and every envelope Process
-// accepted, and drop an inbound envelope whose ID is kept.
+// accepted until max(received or sent at, Timestamp) +
+// Timeouts.InboundMessageSecs, keep the record across restarts, and drop an
+// inbound envelope whose ID is kept. The README has the full contract.
 func ReadMessageID(envelopeBytes []byte) (MessageID, error) {
 	id, timestamp, err := native.MessageIDFromEnvelope(envelopeBytes)
 	if err != nil {

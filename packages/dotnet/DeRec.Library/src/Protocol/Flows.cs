@@ -484,6 +484,14 @@ public sealed record ShareConfirmedEvent : DeRecEvent
     public required uint Version { get; init; }
 }
 
+/// <summary>
+/// A helper rejected or failed to store our share. <see cref="Status"/> and
+/// <see cref="Memo"/> come from the helper's response, except for a helper
+/// that did not answer within <c>Timeouts.SharingRound</c>:
+/// <c>TickAsync</c> then reports it with status <c>Fail</c> and memo
+/// <c>"timeout"</c>. The memo of a helper's own answer is free text and can
+/// read the same.
+/// </summary>
 public sealed record ShareRejectedEvent : DeRecEvent
 {
     public override string EventType => "ShareRejected";
@@ -759,15 +767,18 @@ public sealed record RecoveryDisputedEvent : DeRecEvent
 }
 
 /// <summary>
-/// A recovery for <see cref="Version"/> closed without reconstructing a
-/// secret: every helper asked has answered, or the rest timed out, and no
-/// collected shares reconstruct. <see cref="SharesReceived"/> is the number of
+/// A recovery of <see cref="SecretId"/> at <see cref="Version"/> closed
+/// without reconstructing a secret: every helper asked has answered, or the
+/// rest timed out, and no collected shares reconstruct. <see cref="SecretId"/>
+/// and <see cref="Version"/> name the recovery that closed, since recoveries
+/// of several secrets can be open at once. <see cref="SharesReceived"/> is the number of
 /// helpers whose shares were collected. Start the recovery again to retry,
 /// for example once more helpers are reachable.
 /// </summary>
 public sealed record RecoveryIncompleteEvent : DeRecEvent
 {
     public override string EventType => "RecoveryIncomplete";
+    public required ulong SecretId { get; init; }
     public required uint Version { get; init; }
     public required uint SharesReceived { get; init; }
 }
@@ -1086,8 +1097,12 @@ public sealed record ReplicaSyncRejectedEvent : DeRecEvent
 }
 
 /// <summary>
-/// A secret sync could not be delivered to a member at all — distinct from
+/// A secret sync could not be delivered to a member, or the member did not
+/// acknowledge it within <c>Timeouts.SharingRound</c> — distinct from
 /// <see cref="ReplicaSyncRejectedEvent"/>, which is the member answering "no".
+/// <see cref="Reason"/> is <c>"timeout"</c> when the member did not
+/// acknowledge in time (reported by <c>TickAsync</c>); otherwise it is the
+/// transport or encoding failure, rendered for display.
 /// </summary>
 public sealed record ReplicaSyncFailedEvent : DeRecEvent
 {
@@ -1580,6 +1595,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             },
             "RecoveryIncomplete" => new RecoveryIncompleteEvent
             {
+                SecretId = ReadId(root.GetProperty("secret_id")),
                 Version = root.GetProperty("version").GetUInt32(),
                 SharesReceived = root.GetProperty("shares_received").GetUInt32(),
             },

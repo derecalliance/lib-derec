@@ -5563,6 +5563,20 @@ internal static class Protocol
             throw new InvalidOperationException("the recovered secret must carry the protected bytes");
         Console.WriteLine("  HelperA: RecoveryShareRefused(UNKNOWN_SHARE_VERSION); recovered from HelperB + HelperC  ✓");
 
+        uint missing = version + 100;
+        owner.Protocol.StartAsync(FlowKind.RecoverSecret, new RecoverSecretParams
+        {
+            SecretId = ownerSid,
+            Version = missing,
+        }).GetAwaiter().GetResult();
+        var missingEvents = PumpAll(scope);
+        var incomplete = missingEvents.OfType<RecoveryIncompleteEvent>().ToList();
+        if (incomplete.Count != 1 || incomplete[0].SecretId != ownerSid || incomplete[0].Version != missing
+            || incomplete[0].SharesReceived != 0)
+            throw new InvalidOperationException(
+                $"a version no helper holds closes as RecoveryIncomplete naming its secret; got [{string.Join(", ", missingEvents)}]");
+        Console.WriteLine("  RecoverSecret for a version no helper holds → RecoveryIncomplete naming the secret, 0 shares  ✓");
+
         Console.WriteLine("Orchestrator helper without the version test passed.\n");
     }
 

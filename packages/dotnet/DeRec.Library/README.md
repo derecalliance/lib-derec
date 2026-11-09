@@ -505,7 +505,7 @@ each silent helper is then reported as `RecoverSecretFailedEvent` with
   different secrets reconstruct. Each `RecoveryCandidate` carries the
   `Secret` and `SupportedBy`. The library never picks: involve the owner, and
   pass the candidate they confirm to `RestoreAsync`;
-- `RecoveryIncompleteEvent { Version, SharesReceived }` — nothing
+- `RecoveryIncompleteEvent { SecretId, Version, SharesReceived }` — nothing
   reconstructs. The recovery is closed; start it again to retry.
 
 `SupportedBy` / `DisputedBy` name helpers as `RecoveryHelper(ChannelId,

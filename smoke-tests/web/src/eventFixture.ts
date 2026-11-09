@@ -72,7 +72,7 @@ const DECLARED: EventFieldTable = {
   SecretRecovered: { secret: R },
   RecoveryConflict: { version: R, candidates: R, disputed_by: R },
   RecoveryDisputed: { version: R, secret: R, supported_by: R, disputed_by: R },
-  RecoveryIncomplete: { version: R, shares_received: R },
+  RecoveryIncomplete: { secret_id: R, version: R, shares_received: R },
   Unpaired: { channel_id: R },
   UnpairRejected: { channel_id: R, status: R, memo: R },
   PrePairRejected: { channel_id: R, status: R, memo: R },

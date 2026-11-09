@@ -665,7 +665,7 @@ During recovery, each collected share is reported as `EventTypeRecoveryShareRece
 - `EventTypeSecretRecovered` (`Secret`) — one secret reconstructs and every collected share is part of it.
 - `EventTypeRecoveryDisputed` (`Version`, `Secret`, `SupportedBy`, `DisputedBy`) — one secret reconstructs, but other helpers hold valid shares of a different split that does not. Either side can be the owner's: colluding helpers can forge a complete split, and the honest ones may be too few to reconstruct theirs. Show the owner what `Secret` holds and who stands on each side, and pass it to `Restore` only once they confirm it.
 - `EventTypeRecoveryConflict` (`Version`, `Candidates`, `DisputedBy`) — two or more different secrets reconstruct. Each `protocol.RecoveryCandidate` carries the `Secret` and `SupportedBy`. The library never picks: involve the owner, and pass the candidate they confirm to `Restore`.
-- `EventTypeRecoveryIncomplete` (`Version`, `SharesReceived`) — nothing reconstructs. The recovery is closed; start it again to retry.
+- `EventTypeRecoveryIncomplete` (`SecretID`, `Version`, `SharesReceived`) — nothing reconstructs. The recovery is closed; start it again to retry.
 
 `SupportedBy` / `DisputedBy` name helpers as `protocol.RecoveryHelper` (`ChannelID`, `CommunicationInfo`), the `CommunicationInfo` being what the helper advertised when it paired, so the app can tell the owner who is on each side. That is the helper's own configured communication info, not the peer communication info it passed when starting the pairing: a helper that configures none is named by its channel alone.
 

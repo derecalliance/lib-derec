@@ -484,8 +484,8 @@ func TestRecoveryHelper_EmptyCommunicationInfoOmitted(t *testing.T) {
 }
 
 func TestDecodeEvents_RecoveryIncomplete(t *testing.T) {
-	ev := decodeOne(t, `{"type": "RecoveryIncomplete", "version": 4, "shares_received": 1}`)
-	if ev.Type != EventTypeRecoveryIncomplete || ev.Version == nil || *ev.Version != 4 || ev.SharesReceived != 1 {
+	ev := decodeOne(t, `{"type": "RecoveryIncomplete", "secret_id": "9", "version": 4, "shares_received": 1}`)
+	if ev.Type != EventTypeRecoveryIncomplete || ev.SecretID != 9 || ev.Version == nil || *ev.Version != 4 || ev.SharesReceived != 1 {
 		t.Fatalf("got %+v", ev)
 	}
 }

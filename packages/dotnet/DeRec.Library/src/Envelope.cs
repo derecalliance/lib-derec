@@ -22,8 +22,10 @@ public static class Envelope
     /// <remarks>
     /// Detecting a message delivered twice, or delivered back to its sender,
     /// is the application's job: keep the <see cref="MessageId.Id"/> of every
-    /// envelope sent and of every envelope <c>ProcessAsync</c> accepted, and
-    /// drop an inbound envelope whose id is kept. The id is the same for every
+    /// envelope sent and of every envelope <c>ProcessAsync</c> accepted until
+    /// <c>max(received or sent at, Timestamp) + InboundMessage</c>, keep the
+    /// record across restarts, and drop an inbound envelope whose id is kept.
+    /// The README has the full contract. The id is the same for every
     /// copy of one message, whatever its unauthenticated cleartext fields
     /// (sequence, trace id, protocol version) say, and different for every
     /// other message, so never key on a hash of the raw bytes instead.

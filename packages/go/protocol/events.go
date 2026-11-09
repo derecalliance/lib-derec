@@ -125,7 +125,8 @@ type Event struct {
 
 	// ReplicaPaired, ReplicaSecretReceived, ReplicaSecretInstalled,
 	// ReplicaVersionConflict, ReplicaSecretRefused, ReplicaSecretAcked.
-	// FromReplicaID is the member the copy came from: the publisher on a
+	// SecretID is also set on RecoveryIncomplete: the secret whose recovery
+	// closed. FromReplicaID is the member the copy came from: the publisher on a
 	// push, the responder on a catch-up.
 	PeerReplicaID uint64         `json:"peer_replica_id,string"`
 	FromReplicaID uint64         `json:"from_replica_id,string"`
@@ -215,6 +216,11 @@ type Event struct {
 	// Memo, which it observes as ShareRejected. A refusal from the
 	// application's own share store does not raise it.
 	//
+	// ShareRejected carries the helper's own Status and Memo, except for a
+	// helper that did not answer within Timeouts.SharingRoundSecs: Tick then
+	// reports it with StatusEnum_FAIL and Memo "timeout". The memo of a
+	// helper's own answer is free text and can read the same.
+	//
 	// RequestFailed carries the status and memo this device sent, or would
 	// have sent; see Responded below.
 	Status derecpb.StatusEnum `json:"status"`
@@ -230,8 +236,10 @@ type Event struct {
 	// whose channel ChannelID names.
 	ReplicaID *uint64 `json:"replica_id,string"`
 
-	// ReplicaSyncFailed — the transport or encoding failure, rendered for
-	// display. Distinct from Error, which the flow-level *Failed events use.
+	// ReplicaSyncFailed — "timeout" when the member did not acknowledge
+	// within Timeouts.SharingRoundSecs (reported by Tick); otherwise the
+	// transport or encoding failure, rendered for display. Distinct from
+	// Error, which the flow-level *Failed events use.
 	//
 	// MessageIgnored — why the message was dropped, one of the IgnoreReason*
 	// constants. The message changed no store and drew no reply.
@@ -308,7 +316,7 @@ type Event struct {
 	// shares of a different split that does not), RecoveryConflict (two or
 	// more different secrets reconstruct) or RecoveryIncomplete (nothing
 	// reconstructs; the recovery is closed, start it again to retry). Version
-	// is set on the last three.
+	// is set on the last three, and SecretID on RecoveryIncomplete.
 	SharesReceived uint32 `json:"shares_received"`
 
 	// RecoveryConflict — every secret that reconstructs, each with the

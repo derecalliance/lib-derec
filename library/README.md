@@ -532,7 +532,7 @@ before any target-level events are emitted.
     different secrets reconstruct. Each candidate carries the `secret` and
     `supported_by`. The library never picks: involve the owner, and pass
     the candidate they confirm to `restore`;
-  - `RecoveryIncomplete { version, shares_received }` — nothing
+  - `RecoveryIncomplete { secret_id, version, shares_received }` — nothing
     reconstructs. The recovery is closed; start it again to retry.
 
   `supported_by` / `disputed_by` name helpers as `RecoveryHelper

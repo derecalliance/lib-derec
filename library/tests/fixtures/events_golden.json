@@ -690,6 +690,7 @@
       "version": 28
     },
     {
+      "secret_id": "1079",
       "shares_received": 3,
       "type": "RecoveryIncomplete",
       "version": 27

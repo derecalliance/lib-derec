@@ -961,6 +961,11 @@ export type DeRecEvent =
    *  from the application's own share store does not raise it. */
   | { type: "ShareRefused"; channel_id: string; version: number; status: StatusEnum; memo: string }
   | { type: "ShareConfirmed"; channel_id: string; version: number }
+  /** A helper rejected or failed to store our share. `status` and `memo`
+   *  come from the helper's response, except for a helper that did not
+   *  answer within `timeouts.sharing_round_secs`: `tick()` then reports it
+   *  with status `FAIL` and memo `"timeout"`. The memo of a helper's own
+   *  answer is free text and can read the same. */
   | { type: "ShareRejected"; channel_id: string; version: number; status: StatusEnum; memo: string }
   /** A publishing round finished — every targeted helper confirmed,
    *  rejected, or timed out.
@@ -992,8 +997,12 @@ export type DeRecEvent =
       status: StatusEnum;
       memo: string;
     }
-  /** A secret sync could not be delivered to a member at all — distinct from
-   *  `ReplicaSyncRejected`, which is the member answering "no". */
+  /** A secret sync could not be delivered to a member, or the member did not
+   *  acknowledge it within `timeouts.sharing_round_secs` — distinct from
+   *  `ReplicaSyncRejected`, which is the member answering "no". `reason` is
+   *  `"timeout"` when the member did not acknowledge in time (reported by
+   *  `tick()`); otherwise the transport or encoding failure, rendered for
+   *  display. */
   | { type: "ReplicaSyncFailed"; replica_id: string; version: number; reason: string }
   /** A member left the group and its roster row was dropped. Fires on the
    *  members that remain. */
@@ -1162,11 +1171,13 @@ export type DeRecEvent =
       supported_by: RecoveryHelper[];
       disputed_by: RecoveryHelper[];
     }
-  /** A recovery for `version` closed without reconstructing a secret: every
-   *  helper asked has answered, or the rest timed out, and no collected
-   *  shares reconstruct. `shares_received` is the number of helpers whose
-   *  shares were collected. Start `RecoverSecret` again to retry. */
-  | { type: "RecoveryIncomplete"; version: number; shares_received: number }
+  /** A recovery of `(secret_id, version)` closed without reconstructing a
+   *  secret: every helper asked has answered, or the rest timed out, and no
+   *  collected shares reconstruct. `secret_id` and `version` name the
+   *  recovery that closed, since recoveries of several secrets can be open at
+   *  once. `shares_received` is the number of helpers whose shares were
+   *  collected. Start `RecoverSecret` again to retry. */
+  | { type: "RecoveryIncomplete"; secret_id: string; version: number; shares_received: number }
 
   | { type: "Unpaired"; channel_id: string }
 

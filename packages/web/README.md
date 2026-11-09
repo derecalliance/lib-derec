@@ -507,7 +507,7 @@ each silent helper is then reported as `RecoverSecretFailed` with
   different secrets reconstruct. Each candidate carries the `secret` and
   `supported_by`. The library never picks: involve the owner, and pass the
   candidate they confirm to `restore`;
-- `RecoveryIncomplete { version, shares_received }` — nothing reconstructs.
+- `RecoveryIncomplete { secret_id, version, shares_received }` — nothing reconstructs.
   The recovery is closed; start it again to retry.
 
 `supported_by` / `disputed_by` name helpers as `RecoveryHelper { channel_id,

@@ -133,8 +133,10 @@ pub struct MessageId {
 /// Identify an envelope for replay and reflection detection.
 ///
 /// Detecting a message delivered twice is the application's job, since it
-/// owns the transport. `id` is the same for every copy of one message and
-/// different for every other message:
+/// owns the transport. What to keep, for how long, and that the record must
+/// survive a restart is set out on
+/// [`process`](crate::protocol::DeRecProtocol::process). `id` is the same for
+/// every copy of one message and different for every other message:
 ///
 /// - It covers only the encrypted `message` field. The cleartext fields
 ///   around it (`sequence`, `traceId`, the protocol version) are not

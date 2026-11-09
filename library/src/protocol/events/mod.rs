@@ -1279,18 +1279,22 @@ pub enum DeRecEvent {
         memo: String,
     },
 
-    /// A secret sync could not be delivered to a member at all.
+    /// A secret sync could not be delivered to a member, or the member did
+    /// not acknowledge it in time.
     ///
     /// Distinct from [`Self::ReplicaSyncRejected`], which is the member
-    /// answering "no": here nothing was sent, so no acknowledgement can ever
-    /// arrive. The member is reported once, at dispatch, and appears in
-    /// [`Self::ReplicaSyncComplete::behind`].
+    /// answering "no". The member is reported once, either at dispatch, when
+    /// nothing could be sent, or by [`super::DeRecProtocol::tick`] when no
+    /// acknowledgement arrived within
+    /// [`Timeouts::sharing_round`](crate::protocol::types::Timeouts::sharing_round),
+    /// and appears in [`Self::ReplicaSyncComplete::behind`].
     ReplicaSyncFailed {
         /// The member that could not be reached.
         replica_id: u64,
         /// The version this round was publishing.
         version: u32,
-        /// The transport or encoding failure, rendered for display.
+        /// `"timeout"` when the member did not acknowledge in time; otherwise
+        /// the transport or encoding failure, rendered for display.
         reason: String,
     },
 
@@ -1396,7 +1400,12 @@ pub enum DeRecEvent {
     ///
     /// The protocol absorbs sharing failures and converts them to events
     /// so the application can display per-participant progress. `status` and
-    /// `memo` come from the Helper's response (or are synthetic for timeouts).
+    /// `memo` come from the Helper's response, except for a Helper that did
+    /// not answer within
+    /// [`Timeouts::sharing_round`](crate::protocol::types::Timeouts::sharing_round):
+    /// [`super::DeRecProtocol::tick`] then reports it with status `FAIL` and
+    /// memo `"timeout"`. The memo of a Helper's own answer is free text and
+    /// can read the same.
     ///
     /// Reported as the response arrives, without matching it to a request
     /// this device sent: pairing it with what was asked is the application's
@@ -1658,15 +1667,18 @@ pub enum DeRecEvent {
         disputed_by: Vec<RecoveryHelper>,
     },
 
-    /// A recovery for `version` closed without reconstructing a secret (Owner
-    /// side): every Helper asked has answered, or the rest timed out, and no
-    /// collected shares reconstruct.
+    /// A recovery of `(secret_id, version)` closed without reconstructing a
+    /// secret (Owner side): every Helper asked has answered, or the rest
+    /// timed out, and no collected shares reconstruct.
     ///
-    /// `shares_received` is the number of Helpers whose shares were
-    /// collected. The recovery is closed; run
+    /// `secret_id` and `version` name the recovery that closed, as passed to
+    /// [`DeRecFlow::RecoverSecret`]; recoveries of several secrets can be
+    /// open at once. `shares_received` is the number of Helpers whose shares
+    /// were collected. The recovery is closed; run
     /// [`DeRecFlow::RecoverSecret`] again to retry, for example once more
     /// Helpers are reachable.
     RecoveryIncomplete {
+        secret_id: u64,
         version: u32,
         shares_received: usize,
     },
@@ -2040,8 +2052,11 @@ pub enum DeRecEvent {
 
     /// A recovery share request could not be dispatched to `channel_id`
     /// for `version`, or the Helper did not answer it within
-    /// [`Timeouts::get_share_response`](crate::protocol::types::Timeouts::get_share_response)
-    /// (error `"timeout"`).
+    /// [`Timeouts::get_share_response`](crate::protocol::types::Timeouts::get_share_response).
+    ///
+    /// `error` is exactly `"timeout"` for a Helper that did not answer in
+    /// time, reported by [`super::DeRecProtocol::tick`]; otherwise it is the
+    /// dispatch failure, rendered for display.
     RecoverSecretFailed {
         channel_id: ChannelId,
         version: u32,

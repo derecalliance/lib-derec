@@ -3798,6 +3798,36 @@ async fn run_helper_without_the_version_flow() {
         "recovered secret must carry the protected bytes"
     );
 
+    // A version no helper holds: every helper refuses, and the recovery closes
+    // naming the secret and version it was for.
+    let missing = version + 100;
+    owner
+        .protocol
+        .start(DeRecFlow::RecoverSecret {
+            secret_id: owner_sid,
+            version: missing,
+        })
+        .await
+        .expect("owner start(RecoverSecret) for a missing version failed");
+    let missing_events =
+        pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b, &mut helper_c]).await;
+    let incomplete: Vec<_> = missing_events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::RecoveryIncomplete {
+                secret_id,
+                version,
+                shares_received,
+            } => Some((*secret_id, *version, *shares_received)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        incomplete,
+        vec![(owner_sid, missing, 0)],
+        "a version no helper holds closes as RecoveryIncomplete naming its secret: {missing_events:?}"
+    );
+
     println!("Protocol helper without the version flow test passed.");
 }
 

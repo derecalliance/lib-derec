@@ -5151,6 +5151,17 @@ async function runHelperWithoutTheVersionFlow(): Promise<void> {
   }
   console.log("  [Owner] RecoverSecret → RecoveryShareRefused(UNKNOWN_SHARE_VERSION) from HelperA, SecretRecovered from the rest  ✓");
 
+  const missing = version + 100;
+  await owner.protocol.start(FlowKind.RecoverSecret, { secretId: ownerSid, version: missing });
+  const missingEvents = await pumpAll(all);
+  const incomplete = missingEvents.flatMap((e) =>
+    e.type === "RecoveryIncomplete" ? [[e.secret_id, e.version, e.shares_received]] : [],
+  );
+  if (JSON.stringify(incomplete) !== JSON.stringify([[String(ownerSid), missing, 0]])) {
+    throw new Error(`a version no helper holds closes as RecoveryIncomplete naming its secret, got ${JSON.stringify(missingEvents)}`);
+  }
+  console.log("  [Owner] RecoverSecret for a version no helper holds → RecoveryIncomplete naming the secret, 0 shares  ✓");
+
   console.log("\n✓ Helper without the version flow passed.\n");
 }
 

@@ -234,6 +234,7 @@ pub(crate) enum Event {
         disputed_by: Vec<RecoveryHelperWire>,
     },
     RecoveryIncomplete {
+        secret_id: String,
         version: u32,
         shares_received: u32,
     },
@@ -911,9 +912,11 @@ impl Event {
                 disputed_by: helpers_wire(disputed_by),
             },
             DeRecEvent::RecoveryIncomplete {
+                secret_id,
                 version,
                 shares_received,
             } => Self::RecoveryIncomplete {
+                secret_id: secret_id.to_string(),
                 version,
                 shares_received: shares_received as u32,
             },

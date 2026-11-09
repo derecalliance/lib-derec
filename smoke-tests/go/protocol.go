@@ -4215,9 +4215,11 @@ func runDiscoveryAndRecovery() {
 }
 
 // recoverAfter protects one secret across three helpers, lets damage alter
-// helper-a's stored share, and recovers. It returns helper-a's channel, the
-// version and the recovery's events.
-func recoverAfter(tag string, secretID uint64, secret protocol.UserSecret, damage func(helperA *peer, channelA uint64, version uint32)) (uint64, uint32, []protocol.Event, []protocol.Event) {
+// helper-a's stored share, and recovers. It then recovers a version no helper
+// holds. It returns helper-a's channel, the version, and the events of the
+// verification, the recovery and the recovery of the missing version
+// (version + 100).
+func recoverAfter(tag string, secretID uint64, secret protocol.UserSecret, damage func(helperA *peer, channelA uint64, version uint32)) (uint64, uint32, []protocol.Event, []protocol.Event, []protocol.Event) {
 	owner := newPeerWithSecretID("owner", "https://owner-"+tag+".example.com", secretID, 2)
 	helperA := newPeer("helper-a", "https://helper-a-"+tag+".example.com", 2)
 	helperB := newPeer("helper-b", "https://helper-b-"+tag+".example.com", 2)
@@ -4260,7 +4262,14 @@ func recoverAfter(tag string, secretID uint64, secret protocol.UserSecret, damag
 		}
 	}
 	assertTrue(asked == 3, "every helper is asked for its share, got %d", asked)
-	return channelA, version, verifyEvents, pumpMany(all)
+	recoveryEvents := pumpMany(all)
+
+	_, err = owner.proto.Start(protocol.FlowKindRecoverSecret, protocol.RecoverSecretParams{
+		SecretID: secretID,
+		Version:  version + 100,
+	})
+	must(err, "owner.Start(RecoverSecret) for a missing version")
+	return channelA, version, verifyEvents, recoveryEvents, pumpMany(all)
 }
 
 // assertRecoveredDespite fails unless the recovery decided SecretRecovered
@@ -4289,7 +4298,7 @@ func runHelperWithoutTheVersion() {
 	fmt.Println("=== Protocol helper without the version test ===")
 
 	secret := protocol.UserSecret{ID: []byte{7}, Name: "forgetful-helper secret", Data: []byte("three helpers, one forgetful")}
-	channelA, version, verifyEvents, recoveryEvents := recoverAfter("forgetful", 42, secret, func(helperA *peer, channelA uint64, version uint32) {
+	channelA, version, verifyEvents, recoveryEvents, missingEvents := recoverAfter("forgetful", 42, secret, func(helperA *peer, channelA uint64, version uint32) {
 		must(helperA.shareStore.RemoveVersions(helperA.proto.SecretID(), channelA, []uint32{version}), "helper-a drops its share")
 	})
 
@@ -4320,6 +4329,17 @@ func runHelperWithoutTheVersion() {
 	assertRecoveredDespite(recoveryEvents, secret, "a refusal")
 	fmt.Println("  RecoverSecret → RecoveryShareRefused(helper-a, UNKNOWN_SHARE_VERSION), SecretRecovered from the rest  ✓")
 
+	var incomplete []protocol.Event
+	for _, ev := range missingEvents {
+		if ev.Type == protocol.EventTypeRecoveryIncomplete {
+			incomplete = append(incomplete, ev)
+		}
+	}
+	assertTrue(len(incomplete) == 1 && incomplete[0].SecretID == 42 && incomplete[0].Version != nil &&
+		*incomplete[0].Version == version+100 && incomplete[0].SharesReceived == 0,
+		"a version no helper holds closes as RecoveryIncomplete naming its secret, got %+v", missingEvents)
+	fmt.Println("  RecoverSecret for a version no helper holds → RecoveryIncomplete(secret 42, 0 shares)  ✓")
+
 	fmt.Println("Protocol helper without the version test passed.")
 }
 
@@ -4331,7 +4351,7 @@ func runCorruptedShare() {
 	fmt.Println("=== Protocol corrupted share test ===")
 
 	secret := protocol.UserSecret{ID: []byte{8}, Name: "tampered-helper secret", Data: []byte("three helpers, one tampered")}
-	channelA, version, _, recoveryEvents := recoverAfter("corrupted", 43, secret, func(helperA *peer, channelA uint64, version uint32) {
+	channelA, version, _, recoveryEvents, _ := recoverAfter("corrupted", 43, secret, func(helperA *peer, channelA uint64, version uint32) {
 		stored := heldShare(helperA, channelA, version)
 		var request derecpb.StoreShareRequestMessage
 		must(proto.Unmarshal(stored.Bytes, &request), "decode the stored StoreShareRequestMessage")

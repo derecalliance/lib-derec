@@ -211,7 +211,7 @@ const EVENTS = {
     },
     nested: { secret: SECRET, supported_by: RECOVERY_HELPER, disputed_by: RECOVERY_HELPER },
   },
-  RecoveryIncomplete: { fields: { type: 'required', version: 'required', shares_received: 'required' } },
+  RecoveryIncomplete: { fields: { type: 'required', secret_id: 'required', version: 'required', shares_received: 'required' } },
   Unpaired: { fields: { type: 'required', channel_id: 'required' } },
   UnpairRejected: { fields: { type: 'required', channel_id: 'required', ...STATUS_MEMO } },
   PrePairRejected: { fields: { type: 'required', channel_id: 'required', ...STATUS_MEMO } },
