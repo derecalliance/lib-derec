@@ -11,12 +11,14 @@ pub extern "C" fn derec_generate_replica_id() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::ReplicaId;
+
     #[test]
     fn a_generated_id_is_a_valid_replica_id() {
         for _ in 0..64 {
             let id = super::derec_generate_replica_id();
             assert!(
-                crate::types::ReplicaId::try_from(id).is_ok(),
+                ReplicaId::try_from(id).is_ok(),
                 "{id} is not a valid replica id"
             );
         }

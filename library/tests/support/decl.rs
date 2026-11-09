@@ -17,6 +17,8 @@
 
 #![allow(dead_code)]
 
+use std::ops::Range;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lang {
     Rust,
@@ -152,8 +154,8 @@ pub fn word_positions(masked: &str, word: &str) -> Vec<usize> {
 #[derive(Clone, Debug)]
 pub struct Block {
     pub header: String,
-    pub body: std::ops::Range<usize>,
-    pub params: Option<std::ops::Range<usize>>,
+    pub body: Range<usize>,
+    pub params: Option<Range<usize>>,
 }
 
 /// Find the declaration `<keyword> <name>` and its body.
@@ -170,7 +172,7 @@ pub fn find_block(masked: &str, keywords: &[&str], name: &str) -> Option<Block> 
 /// the members of one enclosing block.
 pub fn find_block_in(
     masked: &str,
-    within: std::ops::Range<usize>,
+    within: Range<usize>,
     keywords: &[&str],
     name: &str,
 ) -> Option<Block> {
@@ -234,15 +236,15 @@ pub fn find_block_in(
 /// a `{...}` block it opened closes.
 pub fn statements(
     masked: &str,
-    range: std::ops::Range<usize>,
+    range: Range<usize>,
     commas: bool,
     newlines: bool,
-) -> Vec<std::ops::Range<usize>> {
+) -> Vec<Range<usize>> {
     let b = masked.as_bytes();
     let mut out = Vec::new();
     let mut start = range.start;
     let mut i = range.start;
-    let push = |s: usize, e: usize, out: &mut Vec<std::ops::Range<usize>>| {
+    let push = |s: usize, e: usize, out: &mut Vec<Range<usize>>| {
         if !masked[s..e].trim().is_empty() {
             out.push(s..e);
         }
@@ -311,7 +313,7 @@ pub struct Member {
 }
 
 /// Split a parameter list on depth-zero commas.
-pub fn split_params(masked: &str, range: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>> {
+pub fn split_params(masked: &str, range: Range<usize>) -> Vec<Range<usize>> {
     let b = masked.as_bytes();
     let mut out = Vec::new();
     let mut start = range.start;
@@ -377,7 +379,7 @@ fn strip_attributes(masked: &str, mut s: usize, e: usize) -> usize {
 }
 
 /// Parameter names of a parameter list, per the language's declaration form.
-pub fn param_names(masked: &str, range: std::ops::Range<usize>, lang: Lang) -> Vec<String> {
+pub fn param_names(masked: &str, range: Range<usize>, lang: Lang) -> Vec<String> {
     let pieces = split_params(masked, range);
     let mut names: Vec<String> = Vec::new();
     for p in pieces {
@@ -425,7 +427,7 @@ const CS_TYPE_KEYWORDS: &[&str] = &["class", "record", "struct", "interface", "e
 pub fn parse_member(
     masked: &str,
     src: &str,
-    stmt: std::ops::Range<usize>,
+    stmt: Range<usize>,
     lang: Lang,
     owner: &str,
     implicit_public: bool,
@@ -736,7 +738,7 @@ fn parse_rust(masked: &str, s: usize, e: usize, text: String) -> Option<Member> 
 pub fn members(
     src: &str,
     masked: &str,
-    body: std::ops::Range<usize>,
+    body: Range<usize>,
     lang: Lang,
     owner: &str,
     implicit_public: bool,

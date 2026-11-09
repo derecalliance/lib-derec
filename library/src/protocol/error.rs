@@ -2,7 +2,11 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::SecretKind;
+use crate::Error;
+use crate::protocol::events::DeRecEvent;
 use crate::types::ChannelId;
+use derec_proto::StatusEnum;
+use std::error;
 
 /// Error returned by [`DeRecProtocol::process`](super::DeRecProtocol::process).
 ///
@@ -23,9 +27,9 @@ pub struct ProcessError {
     pub channel_id: Option<ChannelId>,
     /// The underlying error.
     #[source]
-    pub source: crate::Error,
+    pub source: Error,
     /// Events produced before the failure.
-    pub events: Vec<super::events::DeRecEvent>,
+    pub events: Vec<DeRecEvent>,
 }
 
 impl ProcessError {
@@ -54,7 +58,7 @@ pub enum SecretStoreError {
     /// The original error is preserved as the `source` so that callers can
     /// inspect the full error chain via [`std::error::Error::source`].
     #[error("secret store backend error")]
-    Backend(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    Backend(#[source] Box<dyn error::Error + Send + Sync + 'static>),
 
     /// Returned by [`super::DeRecSecretStore::load_many`] when one or more
     /// requested channels have no stored secret of the requested
@@ -85,7 +89,7 @@ pub enum ChannelStoreError {
 
     /// An I/O or serialization error in the underlying storage backend.
     #[error("channel store backend error")]
-    Backend(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    Backend(#[source] Box<dyn error::Error + Send + Sync + 'static>),
 }
 
 /// Errors produced by [`DeRecStateStore`](super::DeRecStateStore) implementations.
@@ -102,7 +106,7 @@ pub enum StateStoreError {
     /// The original error is preserved as the `source` so that callers can
     /// inspect the full error chain via [`std::error::Error::source`].
     #[error("state store backend error")]
-    Backend(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    Backend(#[source] Box<dyn error::Error + Send + Sync + 'static>),
 }
 
 /// Reason an application's share store gives for refusing a write on a
@@ -123,11 +127,11 @@ pub enum Refusal {
 
 impl Refusal {
     /// The [`derec_proto::StatusEnum`] the helper answers the owner with.
-    pub(crate) fn status(self) -> derec_proto::StatusEnum {
+    pub(crate) fn status(self) -> StatusEnum {
         match self {
-            Self::TooFrequent => derec_proto::StatusEnum::TooFrequent,
-            Self::SizeLimitExceeded => derec_proto::StatusEnum::SizeLimitExceeded,
-            Self::Rejected => derec_proto::StatusEnum::Rejected,
+            Self::TooFrequent => StatusEnum::TooFrequent,
+            Self::SizeLimitExceeded => StatusEnum::SizeLimitExceeded,
+            Self::Rejected => StatusEnum::Rejected,
         }
     }
 
@@ -166,7 +170,7 @@ pub enum ShareStoreError {
     /// The original error is preserved as the `source` so that callers can
     /// inspect the full error chain via [`std::error::Error::source`].
     #[error("share store backend error")]
-    Backend(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    Backend(#[source] Box<dyn error::Error + Send + Sync + 'static>),
 
     /// The app's store refused the write on a helper channel.
     ///
@@ -186,10 +190,7 @@ mod tests {
 
     #[test]
     fn refusal_maps_to_status_and_memo() {
-        assert_eq!(
-            Refusal::TooFrequent.status(),
-            derec_proto::StatusEnum::TooFrequent
-        );
+        assert_eq!(Refusal::TooFrequent.status(), StatusEnum::TooFrequent);
         assert_eq!(
             Refusal::TooFrequent.memo(),
             "refused by the helper: too frequent"
@@ -197,17 +198,14 @@ mod tests {
 
         assert_eq!(
             Refusal::SizeLimitExceeded.status(),
-            derec_proto::StatusEnum::SizeLimitExceeded
+            StatusEnum::SizeLimitExceeded
         );
         assert_eq!(
             Refusal::SizeLimitExceeded.memo(),
             "refused by the helper: size limit exceeded"
         );
 
-        assert_eq!(
-            Refusal::Rejected.status(),
-            derec_proto::StatusEnum::Rejected
-        );
+        assert_eq!(Refusal::Rejected.status(), StatusEnum::Rejected);
         assert_eq!(Refusal::Rejected.memo(), "refused by the helper");
     }
 }

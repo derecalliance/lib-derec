@@ -299,6 +299,13 @@ public sealed record ReplicaDiscoveryParams;
 /// <see cref="SelfRemovedFromGroupEvent"/>. The secret survives on the
 /// remaining members and the helpers.
 /// </para>
+/// <para>
+/// Removal does not replace the group key, so it relies on the removed
+/// device's library deleting its copy. That covers a lost or stolen device
+/// whose storage was not read. Whoever read a device's storage keeps the group
+/// key and can decrypt every later publication it obtains, the one completing
+/// the removal included.
+/// </para>
 /// </remarks>
 public sealed record UnpairReplicaParams
 {
@@ -477,6 +484,14 @@ public sealed record ShareConfirmedEvent : DeRecEvent
     public required uint Version { get; init; }
 }
 
+/// <summary>
+/// A helper rejected or failed to store our share. <see cref="Status"/> and
+/// <see cref="Memo"/> come from the helper's response, except for a helper
+/// that did not answer within <c>Timeouts.SharingRound</c>:
+/// <c>TickAsync</c> then reports it with status <c>Fail</c> and memo
+/// <c>"timeout"</c>. The memo of a helper's own answer is free text and can
+/// read the same.
+/// </summary>
 public sealed record ShareRejectedEvent : DeRecEvent
 {
     public override string EventType => "ShareRejected";
@@ -583,6 +598,13 @@ public sealed record SecretsDiscoveredEvent : DeRecEvent
     public required IReadOnlyList<DiscoveredSecret> Secrets { get; init; }
 }
 
+/// <summary>
+/// A helper's share was collected for a recovery. Nothing is reconstructed
+/// until every helper asked has answered or the recovery times out; the
+/// recovery then decides exactly once, as <see cref="SecretRecoveredEvent"/>,
+/// <see cref="RecoveryDisputedEvent"/>, <see cref="RecoveryConflictEvent"/> or
+/// <see cref="RecoveryIncompleteEvent"/>.
+/// </summary>
 public sealed record RecoveryShareReceivedEvent : DeRecEvent
 {
     public override string EventType => "RecoveryShareReceived";
@@ -590,21 +612,13 @@ public sealed record RecoveryShareReceivedEvent : DeRecEvent
     public required uint SharesReceived { get; init; }
 }
 
-public sealed record RecoveryShareErrorEvent : DeRecEvent
-{
-    public override string EventType => "RecoveryShareError";
-    public required ulong ChannelId { get; init; }
-    public required uint SharesReceived { get; init; }
-    public required string Error { get; init; }
-}
-
 /// <summary>
 /// A helper refused a recovery share request: its response carried a non-OK
 /// <c>Status</c> (e.g. <c>UnknownShareVersion</c>) instead of a share. The
-/// refusal is not collected — it does not count towards
-/// <c>SharesReceived</c> and the recovery stays open for the other helpers'
-/// shares — but it does answer that helper's
-/// <see cref="RecoverSecretStartedEvent"/>.
+/// refusal is not collected and does not count towards
+/// <c>SharesReceived</c>, but it is that helper's answer: it answers the
+/// helper's <see cref="RecoverSecretStartedEvent"/>, and when it is the last
+/// answer due the recovery decides on the shares it holds.
 /// </summary>
 public sealed record RecoveryShareRefusedEvent : DeRecEvent
 {
@@ -625,11 +639,16 @@ public sealed record RecoveryShareRefusedEvent : DeRecEvent
 /// and never blocks the recovery — the other helpers' shares still complete
 /// it. <see cref="CorruptionReason.Malformed"/> and
 /// <see cref="CorruptionReason.InvalidProof"/> are reported as the share
-/// arrives; <see cref="CorruptionReason.Inconsistent"/> alongside
-/// <see cref="SecretRecoveredEvent"/>, once per helper. An honest helper never
-/// sends a corrupted share, so the application may treat this as a sign of a
-/// damaged or compromised helper — for example by offering to unpair it. It
-/// also answers that helper's <see cref="RecoverSecretStartedEvent"/>.
+/// arrives, and count as that helper's answer;
+/// <see cref="CorruptionReason.Forged"/> with the recovery's decision, once
+/// per helper. An honest helper never sends a corrupted share, so the
+/// application may treat this as a sign of a damaged or compromised helper —
+/// for example by offering to unpair it. It also answers that helper's
+/// <see cref="RecoverSecretStartedEvent"/>. A share that only disagrees with
+/// the others is never reported here: it is a dispute, named in
+/// <see cref="RecoveryDisputedEvent.DisputedBy"/> or
+/// <see cref="RecoveryConflictEvent.DisputedBy"/>, not evidence against its
+/// helper.
 /// </remarks>
 public sealed record RecoveryShareCorruptedEvent : DeRecEvent
 {
@@ -650,15 +669,19 @@ public static class CorruptionReason
     /// <summary>The share fails its own Merkle proof, e.g. a value altered after it was split.</summary>
     public const string InvalidProof = "InvalidProof";
     /// <summary>
-    /// The share is valid on its own, but its commitment root or ciphertext
-    /// disagrees with the shares the secret was rebuilt from.
+    /// The share belongs to a group of shares that reconstructs under one
+    /// key, but what it reconstructs is not a secret: it does not decode, or
+    /// it does not fit the threshold it declares; or a single share
+    /// reconstructs alone. An honest split never produces that, so every
+    /// helper in the group is reported, with the recovery's decision.
     /// </summary>
-    public const string Inconsistent = "Inconsistent";
+    public const string Forged = "Forged";
 }
 
 /// <summary>
-/// Recovery completed — the reconstructed <see cref="Secret"/> is
-/// returned exactly once. Mirrors
+/// Recovery completed — one secret reconstructed and every collected share is
+/// part of it; the reconstructed <see cref="Secret"/> is returned exactly
+/// once. Mirrors
 /// <see cref="ReplicaSecretReceivedEvent.Secret"/>: the nested
 /// <see cref="Secret"/> carries the typed
 /// <c>secrets: IReadOnlyList&lt;UserSecret&gt;</c> the owner originally
@@ -671,6 +694,93 @@ public sealed record SecretRecoveredEvent : DeRecEvent
 {
     public override string EventType => "SecretRecovered";
     public required Secret Secret { get; init; }
+}
+
+/// <summary>
+/// A helper as the recovering owner knows it, named in
+/// <see cref="RecoveryConflictEvent"/> and <see cref="RecoveryDisputedEvent"/>
+/// so the application can tell the owner who is on which side.
+/// <see cref="ChannelId"/> is the channel the helper answered on;
+/// <see cref="CommunicationInfo"/> is what the helper advertised about itself
+/// when it paired, as stored on its channel — empty when the channel is no
+/// longer stored.
+/// </summary>
+public sealed record RecoveryHelper(ulong ChannelId, Dictionary<string, string> CommunicationInfo);
+
+/// <summary>
+/// One secret a recovery reconstructed, reported in
+/// <see cref="RecoveryConflictEvent"/>. <see cref="Secret"/> has the shape of
+/// <see cref="SecretRecoveredEvent.Secret"/>, so a chosen candidate is passed
+/// to <see cref="DeRecProtocol.RestoreAsync"/> the same way;
+/// <see cref="SupportedBy"/> are the helpers whose shares reconstruct it, in
+/// the order their shares were collected.
+/// </summary>
+public sealed record RecoveryCandidate(Secret Secret, IReadOnlyList<RecoveryHelper> SupportedBy);
+
+/// <summary>
+/// A recovery reconstructed two or more different secrets for
+/// <see cref="Version"/>, so it cannot tell which is the owner's.
+/// </summary>
+/// <remarks>
+/// Each candidate is a complete, self-consistent secret, rebuilt from the
+/// shares of the helpers it names. Fewer than the threshold of colluding
+/// helpers can forge one, so the library never picks: involve the owner —
+/// for example by showing what each candidate holds and who backs it — and
+/// pass the one the owner confirms to <see cref="DeRecProtocol.RestoreAsync"/>,
+/// exactly as the <see cref="SecretRecoveredEvent.Secret"/> would be. The
+/// helpers backing a rejected candidate are suspect.
+/// <see cref="DisputedBy"/> names the helpers holding valid shares of yet
+/// another split that does not reconstruct, so no helper's answer goes
+/// unshown. The recovery is closed when this is emitted.
+/// </remarks>
+public sealed record RecoveryConflictEvent : DeRecEvent
+{
+    public override string EventType => "RecoveryConflict";
+    public required uint Version { get; init; }
+    public required IReadOnlyList<RecoveryCandidate> Candidates { get; init; }
+    public required IReadOnlyList<RecoveryHelper> DisputedBy { get; init; }
+}
+
+/// <summary>
+/// A recovery reconstructed one secret for <see cref="Version"/>, but other
+/// helpers hold valid shares of a different split that does not reconstruct.
+/// </summary>
+/// <remarks>
+/// <see cref="Secret"/> is complete and self-consistent, rebuilt from the
+/// shares of <see cref="SupportedBy"/>. The shares of <see cref="DisputedBy"/>
+/// each pass their own proof but belong to another split at the same
+/// version, which an honest sharing never produces. Either side can be the
+/// owner's: colluding helpers can forge a complete split, and the honest
+/// helpers may be too few to reconstruct theirs. The library never picks:
+/// involve the owner — for example by showing what <see cref="Secret"/>
+/// holds and who stands on each side — and pass <see cref="Secret"/> to
+/// <see cref="DeRecProtocol.RestoreAsync"/> only once the owner confirms it.
+/// The recovery is closed when this is emitted.
+/// </remarks>
+public sealed record RecoveryDisputedEvent : DeRecEvent
+{
+    public override string EventType => "RecoveryDisputed";
+    public required uint Version { get; init; }
+    public required Secret Secret { get; init; }
+    public required IReadOnlyList<RecoveryHelper> SupportedBy { get; init; }
+    public required IReadOnlyList<RecoveryHelper> DisputedBy { get; init; }
+}
+
+/// <summary>
+/// A recovery of <see cref="SecretId"/> at <see cref="Version"/> closed
+/// without reconstructing a secret: every helper asked has answered, or the
+/// rest timed out, and no collected shares reconstruct. <see cref="SecretId"/>
+/// and <see cref="Version"/> name the recovery that closed, since recoveries
+/// of several secrets can be open at once. <see cref="SharesReceived"/> is the number of
+/// helpers whose shares were collected. Start the recovery again to retry,
+/// for example once more helpers are reachable.
+/// </summary>
+public sealed record RecoveryIncompleteEvent : DeRecEvent
+{
+    public override string EventType => "RecoveryIncomplete";
+    public required ulong SecretId { get; init; }
+    public required uint Version { get; init; }
+    public required uint SharesReceived { get; init; }
 }
 
 public sealed record UnpairedEvent : DeRecEvent
@@ -987,8 +1097,12 @@ public sealed record ReplicaSyncRejectedEvent : DeRecEvent
 }
 
 /// <summary>
-/// A secret sync could not be delivered to a member at all — distinct from
+/// A secret sync could not be delivered to a member, or the member did not
+/// acknowledge it within <c>Timeouts.SharingRound</c> — distinct from
 /// <see cref="ReplicaSyncRejectedEvent"/>, which is the member answering "no".
+/// <see cref="Reason"/> is <c>"timeout"</c> when the member did not
+/// acknowledge in time (reported by <c>TickAsync</c>); otherwise it is the
+/// transport or encoding failure, rendered for display.
 /// </summary>
 public sealed record ReplicaSyncFailedEvent : DeRecEvent
 {
@@ -1075,6 +1189,13 @@ public static class IgnoreReason
     public const string Expired = "Expired";
     public const string TimestampMismatch = "TimestampMismatch";
     public const string StaleResponse = "StaleResponse";
+
+    /// <summary>
+    /// A <c>StoreShareRequest</c> for a version older than the newest one this
+    /// helper stores on the channel, and not stored itself. It is not stored
+    /// and not answered.
+    /// </summary>
+    public const string Superseded = "Superseded";
 }
 
 /// <summary>
@@ -1218,6 +1339,12 @@ public sealed record RecoverSecretStartedEvent : DeRecEvent
     public required ulong TraceId { get; init; }
 }
 
+/// <summary>
+/// A recovery share request could not be dispatched to
+/// <see cref="ChannelId"/>, or the helper did not answer it within
+/// <see cref="Timeouts.GetShareResponse"/> (<see cref="Error"/> is
+/// <c>"timeout"</c>).
+/// </summary>
 public sealed record RecoverSecretFailedEvent : DeRecEvent
 {
     public override string EventType => "RecoverSecretFailed";
@@ -1432,12 +1559,6 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 SharesReceived = root.GetProperty("shares_received").GetUInt32(),
             },
-            "RecoveryShareError" => new RecoveryShareErrorEvent
-            {
-                ChannelId = ReadId(root.GetProperty("channel_id")),
-                SharesReceived = root.GetProperty("shares_received").GetUInt32(),
-                Error = root.GetProperty("error").GetString() ?? string.Empty,
-            },
             "RecoveryShareRefused" => new RecoveryShareRefusedEvent
             {
                 ChannelId = ReadId(root.GetProperty("channel_id")),
@@ -1454,6 +1575,29 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             "SecretRecovered" => new SecretRecoveredEvent
             {
                 Secret = ParseSecretObject(root.GetProperty("secret")),
+            },
+            "RecoveryConflict" => new RecoveryConflictEvent
+            {
+                Version = root.GetProperty("version").GetUInt32(),
+                Candidates = root.GetProperty("candidates").EnumerateArray()
+                    .Select(c => new RecoveryCandidate(
+                        ParseSecretObject(c.GetProperty("secret")),
+                        ReadRecoveryHelpers(c.GetProperty("supported_by"))))
+                    .ToList(),
+                DisputedBy = ReadRecoveryHelpers(root.GetProperty("disputed_by")),
+            },
+            "RecoveryDisputed" => new RecoveryDisputedEvent
+            {
+                Version = root.GetProperty("version").GetUInt32(),
+                Secret = ParseSecretObject(root.GetProperty("secret")),
+                SupportedBy = ReadRecoveryHelpers(root.GetProperty("supported_by")),
+                DisputedBy = ReadRecoveryHelpers(root.GetProperty("disputed_by")),
+            },
+            "RecoveryIncomplete" => new RecoveryIncompleteEvent
+            {
+                SecretId = ReadId(root.GetProperty("secret_id")),
+                Version = root.GetProperty("version").GetUInt32(),
+                SharesReceived = root.GetProperty("shares_received").GetUInt32(),
             },
             "Unpaired" => new UnpairedEvent
             {
@@ -1699,6 +1843,16 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
     {
         var out_ = new List<ulong>(el.GetArrayLength());
         foreach (var item in el.EnumerateArray()) out_.Add(ReadId(item));
+        return out_;
+    }
+
+    private static List<RecoveryHelper> ReadRecoveryHelpers(System.Text.Json.JsonElement el)
+    {
+        var out_ = new List<RecoveryHelper>(el.GetArrayLength());
+        foreach (var h in el.EnumerateArray())
+            out_.Add(new RecoveryHelper(
+                ReadId(h.GetProperty("channel_id")),
+                h.TryGetProperty("communication_info", out var ci) ? ReadStringMap(ci) : new()));
         return out_;
     }
 

@@ -94,6 +94,10 @@
         {
           "name": "StaleResponse",
           "wire": "StaleResponse"
+        },
+        {
+          "name": "Superseded",
+          "wire": "Superseded"
         }
       ]
     },
@@ -138,8 +142,8 @@
           "wire": "InvalidProof"
         },
         {
-          "name": "Inconsistent",
-          "wire": "Inconsistent"
+          "name": "Forged",
+          "wire": "Forged"
         }
       ]
     },
@@ -224,8 +228,16 @@
           "wire": "RecoveryShareCorrupted"
         },
         {
-          "name": "RecoveryShareError",
-          "wire": "RecoveryShareError"
+          "name": "RecoveryConflict",
+          "wire": "RecoveryConflict"
+        },
+        {
+          "name": "RecoveryIncomplete",
+          "wire": "RecoveryIncomplete"
+        },
+        {
+          "name": "RecoveryDisputed",
+          "wire": "RecoveryDisputed"
         },
         {
           "name": "RecoveryShareReceived",
@@ -580,7 +592,8 @@
         { "name": "InvalidInput", "wire": 12, "text": "input" },
         { "name": "Protobuf", "wire": 13, "text": "protobuf" },
         { "name": "Invariant", "wire": 14, "text": "invariant" },
-        { "name": "StateStore", "wire": 15, "text": "state_store" }
+        { "name": "StateStore", "wire": 15, "text": "state_store" },
+        { "name": "Transport", "wire": 16, "text": "transport" }
       ]
     },
     "DeRecErrorCode": {
@@ -618,6 +631,7 @@
         { "name": "UnexpectedReplicaId", "wire": 46, "text": "unexpected_replica_id" },
         { "name": "IncompatibleParameterRange", "wire": 47, "text": "incompatible_parameter_range" },
         { "name": "FingerprintCommitmentMismatch", "wire": 48, "text": "fingerprint_commitment_mismatch" },
+        { "name": "PairingExpired", "wire": 49, "text": "pairing_expired" },
         { "name": "EmptyChannels", "wire": 60, "text": "empty_channels" },
         { "name": "DuplicateChannelId", "wire": 61, "text": "duplicate_channel_id" },
         { "name": "InvalidThreshold", "wire": 62, "text": "invalid_threshold" },
@@ -641,7 +655,8 @@
         { "name": "FfiBadSharedKey", "wire": 105, "text": "ffi_bad_shared_key" },
         { "name": "FfiNulInString", "wire": 106, "text": "ffi_nul_in_string" },
         { "name": "TransportInvalid", "wire": 120, "text": "transport_invalid" },
-        { "name": "NoUsableEndpoint", "wire": 121, "text": "no_usable_endpoint" }
+        { "name": "NoUsableEndpoint", "wire": 121, "text": "no_usable_endpoint" },
+        { "name": "TransportSendFailed", "wire": 123, "text": "transport_send_failed" }
       ]
     },
     "MessageKind": {

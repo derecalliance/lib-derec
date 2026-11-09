@@ -27,8 +27,11 @@
 //! natural unit of work for one function invocation. A `start()` initiated by
 //! the user is its own invocation.
 
+use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
+use derec_library::protocol::types::Timeouts;
 use derec_library::protocol::{AutoAcceptPolicy, DeRecEvent, DeRecProtocolBuilder, PendingAction};
 use derec_proto::TransportProtocol;
 
@@ -138,9 +141,9 @@ impl StatelessPeer {
             // staleness window every message is judged against and stays at the
             // default — narrowing it here would start discarding the scenario's
             // own traffic rather than closing rounds faster.
-            builder = builder.with_timeouts(derec_library::protocol::types::Timeouts {
-                sharing_round: std::time::Duration::from_secs(secs),
-                unpair_ack: std::time::Duration::from_secs(secs),
+            builder = builder.with_timeouts(Timeouts {
+                sharing_round: Duration::from_secs(secs),
+                unpair_ack: Duration::from_secs(secs),
                 ..Default::default()
             });
         }
@@ -178,14 +181,14 @@ async fn try_deliver(peer: &StatelessPeer, bytes: &[u8]) -> Result<Vec<DeRecEven
 
     let mut i = 0;
     while i < collected.len() {
-        let action: Option<PendingAction> =
-            match std::mem::replace(&mut collected[i], DeRecEvent::NoOp) {
-                DeRecEvent::ActionRequired { action, .. } => Some(action),
-                other => {
-                    collected[i] = other;
-                    None
-                }
-            };
+        let action: Option<PendingAction> = match mem::replace(&mut collected[i], DeRecEvent::NoOp)
+        {
+            DeRecEvent::ActionRequired { action, .. } => Some(action),
+            other => {
+                collected[i] = other;
+                None
+            }
+        };
         if let Some(action) = action {
             let mut accept_events = protocol
                 .accept(action)

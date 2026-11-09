@@ -19,12 +19,21 @@ type readTraceIdResult struct {
 	TraceID uint64
 }
 
+type messageIdResult struct {
+	Error     DeRecError
+	ID        DeRecBuffer
+	Timestamp uint64
+}
+
 var (
 	applyTraceIDOnce sync.Once
 	applyTraceIDFn   func(envelope *byte, envelopeLen uintptr, traceID uint64) applyTraceIdResult
 
 	readTraceIDOnce sync.Once
 	readTraceIDFn   func(envelope *byte, envelopeLen uintptr) readTraceIdResult
+
+	messageIDOnce sync.Once
+	messageIDFn   func(envelope *byte, envelopeLen uintptr) messageIdResult
 )
 
 func ApplyTraceIDToEnvelope(envelope []byte, traceID uint64) ([]byte, error) {
@@ -47,4 +56,15 @@ func ReadTraceIDFromEnvelope(envelope []byte) (uint64, error) {
 		return 0, err
 	}
 	return res.TraceID, nil
+}
+
+func MessageIDFromEnvelope(envelope []byte) ([]byte, uint64, error) {
+	messageIDOnce.Do(func() {
+		purego.RegisterFunc(&messageIDFn, symbol("message_id_from_envelope"))
+	})
+	res := messageIDFn(bytePtr(envelope), uintptr(len(envelope)))
+	if err := errorFrom(res.Error); err != nil {
+		return nil, 0, err
+	}
+	return bytesFromBuffer(res.ID), res.Timestamp, nil
 }

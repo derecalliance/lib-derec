@@ -2,19 +2,28 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport, IgnoreReason,
     MissingPolicy, PendingAction, SecretKind, SecretValue, Share, ShareStoreError,
 };
+use super::pairing::own_communication_info;
 use super::replicas::sharing as replica;
-use crate::derec_message::DeRecMessageBuilder;
-use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::derec_message::{DeRecMessageBuilder, apply_trace_id};
+use crate::extensions::advertised_endpoints::reply_to_owned;
+use crate::extensions::channel_store::{ChannelStoreExt as _, send_channel_message};
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
-use crate::primitives::sharing::request::SHARE_ALGORITHM_REPLICA_SECRET;
+use crate::primitives::sharing::SharingError;
+use crate::primitives::sharing::request::{
+    SHARE_ALGORITHM_REPLICA_SECRET, SplitResult, validate_keep_version,
+};
 use crate::protocol::DeRecUserSecretStore;
 use crate::protocol::context::{Exchange, Local, Round};
 use crate::protocol::obligation::{deliver, refused, reported};
 use crate::protocol::stores::{StoreSet, Stores};
-use crate::protocol::types::ChannelQuery;
+use crate::protocol::types::{
+    ChannelQuery, ChannelRecord, ChannelShare, ChannelStatus, HelperChannel, HelperFilter,
+    ReplicaFilter, ReplicaInfo, ReplicaMember, ReplicaSecretPayload, Replicas, UserSecrets,
+};
+use crate::types::ReplicaId;
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -28,10 +37,11 @@ use crate::{
     types::{ChannelId, SharedKey, WeightedChannel},
 };
 use derec_proto::{
-    DeRecResult, DeRecSecret, MessageBody, SenderKind, StatusEnum, StoreShareRequestMessage,
-    StoreShareResponseMessage,
+    CommittedDeRecShare, DeRecResult, DeRecSecret, DeRecShare, MessageBody, SenderKind, StatusEnum,
+    StoreShareRequestMessage, StoreShareResponseMessage, TransportProtocol,
 };
 use prost::Message;
+use std::collections::HashMap;
 
 #[cfg_attr(
     feature = "logging",
@@ -137,7 +147,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     local: &Local<'_>,
     secrets: Vec<UserSecret>,
     description: Option<String>,
-    weights: Option<&std::collections::HashMap<ChannelId, u32>>,
+    weights: Option<&HashMap<ChannelId, u32>>,
     threshold: Option<u32>,
     default_threshold: usize,
     max_subshares: Option<u64>,
@@ -156,9 +166,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     if let Some(max) = max_subshares
         && subshares > max
     {
-        return Err(
-            crate::primitives::sharing::SharingError::TooManySubshares { subshares, max }.into(),
-        );
+        return Err(SharingError::TooManySubshares { subshares, max }.into());
     }
     let threshold = round_threshold;
     let recorded_threshold = u32::try_from(threshold).ok();
@@ -172,10 +180,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
             channel.weight = weight;
             stores
                 .channels
-                .save(
-                    secret_id,
-                    crate::protocol::types::ChannelRecord::Helper(channel.clone()),
-                )
+                .save(secret_id, ChannelRecord::Helper(channel.clone()))
                 .await?;
         }
     }
@@ -188,7 +193,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     // The dispatch list above is the same set minus self.
     let mut roster = stores
         .channels
-        .replicas_matching(secret_id, crate::protocol::types::ReplicaFilter::default())
+        .replicas_matching(secret_id, ReplicaFilter::default())
         .await?;
     stamp_own_row(local, &mut roster);
     let group_channel = group_channel_of(local, &roster)?;
@@ -222,7 +227,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     // whoever paired — which for a member that joined later is the wrong
     // device entirely. Decided here, where the roster is known, rather than
     // left to the application's `auto_reply_to` setting.
-    let helper_reply_to: Vec<derec_proto::TransportProtocol> = if roster.is_empty() {
+    let helper_reply_to: Vec<TransportProtocol> = if roster.is_empty() {
         round.reply_to.to_vec()
     } else {
         vec![local.primary().clone()]
@@ -245,7 +250,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     };
 
     let mut outcomes: Vec<(ChannelId, Result<()>)> = Vec::new();
-    let mut replica_outcomes: Vec<(crate::types::ReplicaId, Result<()>)> = Vec::new();
+    let mut replica_outcomes: Vec<(ReplicaId, Result<()>)> = Vec::new();
     let mut keep_version = None;
 
     if let Some(ref result) = split_result {
@@ -290,7 +295,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         .user_secrets
         .save_latest(
             secret_id,
-            crate::protocol::types::UserSecrets {
+            UserSecrets {
                 version,
                 secrets: snapshot_secrets,
                 description: snapshot_description,
@@ -316,12 +321,12 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 /// [`crate::primitives::sharing::SharingError::InvalidThreshold`]. A threshold
 /// above the `max_subshares` cap could never be met by a round that splits.
 fn validate_threshold(
-    helpers: &[(crate::protocol::types::HelperChannel, SharedKey)],
+    helpers: &[(HelperChannel, SharedKey)],
     threshold: usize,
     max_subshares: Option<u64>,
 ) -> Result<()> {
     if threshold < 2 || u32::try_from(threshold).is_err() {
-        return Err(crate::primitives::sharing::SharingError::InvalidThreshold {
+        return Err(SharingError::InvalidThreshold {
             threshold,
             channels: helpers.len(),
             subshares: helpers.iter().map(|(c, _)| u64::from(c.weight)).sum(),
@@ -352,8 +357,8 @@ fn validate_threshold(
 /// [`crate::primitives::sharing::SharingError::InvalidWeight`] does not depend
 /// on the map's iteration order.
 fn resolve_weights(
-    helpers: &[(crate::protocol::types::HelperChannel, SharedKey)],
-    weights: Option<&std::collections::HashMap<ChannelId, u32>>,
+    helpers: &[(HelperChannel, SharedKey)],
+    weights: Option<&HashMap<ChannelId, u32>>,
     threshold: usize,
 ) -> Result<Vec<WeightedChannel>> {
     if let Some(weights) = weights {
@@ -361,7 +366,7 @@ fn resolve_weights(
         entries.sort_by_key(|&(channel_id, _)| channel_id);
         for (channel_id, weight) in entries {
             if !helpers.iter().any(|(ch, _)| ch.channel_id == channel_id) {
-                return Err(crate::primitives::sharing::SharingError::InvalidWeight {
+                return Err(SharingError::InvalidWeight {
                     channel_id: channel_id.into(),
                     weight,
                 }
@@ -401,7 +406,7 @@ pub(in crate::protocol) struct SharingRoundResult {
     /// The threshold this round split at.
     pub(in crate::protocol) threshold: Option<u32>,
     /// The weight this round gave every paired Helper, by channel.
-    pub(in crate::protocol) weights: std::collections::HashMap<ChannelId, u32>,
+    pub(in crate::protocol) weights: HashMap<ChannelId, u32>,
     /// One entry per helper written to, keyed by its channel.
     pub(in crate::protocol) outcomes: Vec<(ChannelId, Result<()>)>,
     /// One entry per group member written to, keyed by its `ReplicaId`.
@@ -409,7 +414,7 @@ pub(in crate::protocol) struct SharingRoundResult {
     /// Separate from `outcomes` because members share one channel: keying
     /// them by `ChannelId` would collapse the whole group into a single
     /// entry, and the first answer would settle the round for all of them.
-    pub(in crate::protocol) replica_outcomes: Vec<(crate::types::ReplicaId, Result<()>)>,
+    pub(in crate::protocol) replica_outcomes: Vec<(ReplicaId, Result<()>)>,
     /// The `keepVersion` every Helper in `outcomes` was sent; `None` when no
     /// share was sent.
     pub(in crate::protocol) keep_version: Option<u32>,
@@ -448,8 +453,11 @@ pub(in crate::protocol) struct SharingRoundResult {
 /// `keepVersion = 0` keeps no other version.
 ///
 /// A request whose `version` is older than the latest version already
-/// stored on this channel has its `keepVersion` ignored, so a replayed or
-/// delayed request can never delete newer shares.
+/// stored on this channel, and not stored itself, is ignored as
+/// [`IgnoreReason::Superseded`]: a newer request may have dropped that
+/// version, and a delayed or repeated delivery must not bring it back. One
+/// still stored is an identical re-send, acknowledged with its `keepVersion`
+/// ignored, so it can never delete newer shares either.
 ///
 /// "Latest" is scoped to this channel rather than to
 /// [`DeRecShareStore::latest_version`](crate::protocol::DeRecShareStore::latest_version),
@@ -477,6 +485,10 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
 
     // Applying `keepVersion` needs every version stored on the channel.
     let stored_on_channel = stores.shares.load(secret_id, channel_id, &[]).await?;
+
+    if is_superseded(&stored_on_channel, version) {
+        return Ok(superseded(exchange));
+    }
 
     // A version has exactly one writer, so an existing entry at this
     // version is either that writer re-sending the identical envelope —
@@ -600,14 +612,14 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     }
 
     let resp = sharing_response::produce(channel_id, request, exchange.shared_key)?;
-    let envelope = crate::derec_message::apply_trace_id(&resp.envelope, exchange.trace_id)?;
+    let envelope = apply_trace_id(&resp.envelope, exchange.trace_id)?;
     let endpoint = stores
         .channels
         .resolve_response_endpoints(
             secret_id,
             channel_id,
             local.policy,
-            &crate::extensions::advertised_endpoints::reply_to_owned(request),
+            &reply_to_owned(request),
         )
         .await?;
     let sent = deliver(
@@ -659,7 +671,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
 ) -> Result<()> {
     let channel_id = exchange.channel_id;
     let secret_id = local.secret_id;
-    crate::extensions::channel_store::send_channel_message(
+    send_channel_message(
         stores.channels,
         stores.transport,
         secret_id,
@@ -668,7 +680,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         exchange.shared_key,
         exchange.trace_id,
         local.policy,
-        &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        &reply_to_owned(request),
         exchange.obligation,
         status,
         memo,
@@ -685,6 +697,29 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     );
 
     Ok(())
+}
+
+/// Whether `version` is older than the newest version stored on the channel
+/// and not stored itself: a newer request replaced it and may have dropped
+/// it, so storing it again would bring back a version the Owner discarded.
+fn is_superseded(stored_on_channel: &[Share], version: u32) -> bool {
+    stored_on_channel
+        .iter()
+        .any(|stored| stored.version > version)
+        && stored_on_channel
+            .iter()
+            .all(|stored| stored.version != version)
+}
+
+/// A superseded request is dropped without an answer: a delayed or repeated
+/// delivery is owed nothing, and the Owner's round for that version has
+/// already been replaced.
+fn superseded(exchange: &Exchange<'_>) -> Vec<DeRecEvent> {
+    vec![DeRecEvent::MessageIgnored {
+        channel_id: exchange.channel_id,
+        reason: IgnoreReason::Superseded,
+        trace_id: exchange.trace_id,
+    }]
 }
 
 /// The `StoreShareResponse` that answers `request` with a non-`Ok` `status`.
@@ -761,7 +796,9 @@ async fn refuse<S: StoreSet>(
 /// that does not decode (`FORMAT_ERROR`) or verify (`VERIFICATION_FAILED`),
 /// is answered with that status and reported as
 /// [`DeRecEvent::ShareRefused`] instead of `ActionRequired`, so the
-/// application is never asked to store it.
+/// application is never asked to store it. A version older than the newest
+/// one stored on the channel, and not stored itself, is ignored as
+/// [`IgnoreReason::Superseded`] and not answered.
 async fn on_request<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -787,6 +824,14 @@ async fn on_request<S: StoreSet>(
 
     if let Err(fault) = sharing_response::validate_share(&request) {
         return refuse(stores, local, exchange, &request, fault.status, fault.memo).await;
+    }
+
+    let stored_on_channel = stores
+        .shares
+        .load(local.secret_id, exchange.channel_id, &[])
+        .await?;
+    if is_superseded(&stored_on_channel, request.version) {
+        return Ok(superseded(exchange));
     }
 
     Ok(vec![DeRecEvent::ActionRequired {
@@ -860,17 +905,16 @@ async fn load_all_paired_targets<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
 ) -> Result<(
-    Vec<(crate::protocol::types::HelperChannel, SharedKey)>,
-    Vec<(crate::protocol::types::ReplicaMember, SharedKey)>,
+    Vec<(HelperChannel, SharedKey)>,
+    Vec<(ReplicaMember, SharedKey)>,
 )> {
     let secret_id = local.secret_id;
-    use crate::protocol::types::ChannelStatus;
 
     let helper_rows: Vec<_> = stores
         .channels
         .helpers_matching(
             secret_id,
-            crate::protocol::types::HelperFilter {
+            HelperFilter {
                 status: vec![ChannelStatus::Paired],
                 role: Some(SenderKind::Helper),
                 ..Default::default()
@@ -889,7 +933,7 @@ async fn load_all_paired_targets<S: StoreSet>(
         .channels
         .replicas_matching(
             secret_id,
-            crate::protocol::types::ReplicaFilter {
+            ReplicaFilter {
                 status: vec![ChannelStatus::Paired, ChannelStatus::Unpairing],
                 exclude: local.exclude_self(),
                 ..Default::default()
@@ -911,7 +955,7 @@ async fn load_all_paired_targets<S: StoreSet>(
         }
     }
 
-    let keys: std::collections::HashMap<ChannelId, SharedKey> = stores
+    let keys: HashMap<ChannelId, SharedKey> = stores
         .secrets
         .load_many(
             secret_id,
@@ -927,7 +971,7 @@ async fn load_all_paired_targets<S: StoreSet>(
         })
         .collect();
 
-    let helpers: Vec<(crate::protocol::types::HelperChannel, SharedKey)> = helper_rows
+    let helpers: Vec<(HelperChannel, SharedKey)> = helper_rows
         .into_iter()
         .map(|c| {
             let key = *keys
@@ -937,7 +981,7 @@ async fn load_all_paired_targets<S: StoreSet>(
         })
         .collect();
 
-    let replicas: Vec<(crate::protocol::types::ReplicaMember, SharedKey)> = member_rows
+    let replicas: Vec<(ReplicaMember, SharedKey)> = member_rows
         .into_iter()
         .map(|m| {
             let key = *keys
@@ -957,8 +1001,8 @@ async fn load_all_paired_targets<S: StoreSet>(
 /// differs by channel, since a joiner sits on its ephemeral pairing channel
 /// until its first copy is sent.
 pub(in crate::protocol) fn build_secret(
-    paired_helpers: &[(crate::protocol::types::HelperChannel, SharedKey)],
-    roster: &[crate::protocol::types::ReplicaMember],
+    paired_helpers: &[(HelperChannel, SharedKey)],
+    roster: &[ReplicaMember],
     secrets: Vec<UserSecret>,
     group_channel: Option<ChannelId>,
     group_key: Option<SharedKey>,
@@ -988,25 +1032,25 @@ pub(in crate::protocol) fn build_secret(
 /// A joiner admitted since the last round is still on its ephemeral pairing
 /// channel, so the group's id cannot be read off an arbitrary row — and
 /// publishing an ephemeral id as the group's would strand every other member.
-/// This device's own row always names the group: it is written once, at the
-/// first replica pairing, and never moved.
+/// This device's own row always names the group: it is written when the first
+/// replica pairing is confirmed, and never moved.
 ///
-/// `Ok(None)` when there is no group at all.
-fn group_channel_of(
-    local: &Local<'_>,
-    roster: &[crate::protocol::types::ReplicaMember],
-) -> Result<Option<ChannelId>> {
+/// `Ok(None)` when there is no group at all — including while every replica
+/// peer is still an unconfirmed pairing, which no own row exists for yet.
+fn group_channel_of(local: &Local<'_>, roster: &[ReplicaMember]) -> Result<Option<ChannelId>> {
     if roster.is_empty() {
         return Ok(None);
     }
     let own = local.replica_id.ok_or(Error::ReplicaIdNotConfigured)?;
-    roster
-        .iter()
-        .find(|m| m.replica_id.0 == own)
-        .map(|m| Some(m.channel_id))
-        .ok_or(Error::Invariant(
-            "replica group has members but this device holds no row of its own",
-        ))
+    if let Some(member) = roster.iter().find(|m| m.replica_id.0 == own) {
+        return Ok(Some(member.channel_id));
+    }
+    if roster.iter().all(|m| m.status == ChannelStatus::Pending) {
+        return Ok(None);
+    }
+    Err(Error::Invariant(
+        "replica group has members but this device holds no row of its own",
+    ))
 }
 
 /// Publish this device's own row under what it advertises now.
@@ -1015,33 +1059,36 @@ fn group_channel_of(
 /// advertised, but the stored own row only records what was current when it
 /// was written. Stamping it here is what lets a roster name, and reach, the
 /// device that published it.
-fn stamp_own_row(local: &Local<'_>, roster: &mut [crate::protocol::types::ReplicaMember]) {
+fn stamp_own_row(local: &Local<'_>, roster: &mut [ReplicaMember]) {
     let Some(own) = local.replica_id else {
         return;
     };
     if let Some(member) = roster.iter_mut().find(|m| m.replica_id.0 == own) {
         member.transports = local.own_transports.to_vec();
-        member.communication_info = super::pairing::own_communication_info(local);
+        member.communication_info = own_communication_info(local);
     }
 }
 
 /// Project the group onto the wire roster.
 fn build_replicas(
-    roster: &[crate::protocol::types::ReplicaMember],
+    roster: &[ReplicaMember],
     group_channel: Option<ChannelId>,
     group_key: Option<SharedKey>,
-) -> Result<Option<crate::protocol::types::Replicas>> {
+) -> Result<Option<Replicas>> {
     let (Some(group_channel), Some(group_key)) = (group_channel, group_key) else {
         return Ok(None);
     };
 
-    let members: Vec<crate::protocol::types::ReplicaInfo> = roster
+    let members: Vec<ReplicaInfo> = roster
         .iter()
-        // A member told to leave is already out of the group as far as the
-        // published roster is concerned. Its absence here is what completes
-        // the removal on every recipient.
-        .filter(|member| member.status != crate::protocol::types::ChannelStatus::Unpairing)
-        .map(|member| crate::protocol::types::ReplicaInfo {
+        // Only confirmed members are published. Every recipient installs
+        // what it is sent as `Paired`, so listing a member whose pairing this
+        // device has not confirmed would admit it on their behalf. A member
+        // told to leave is already out of the group as far as the roster is
+        // concerned: its absence here is what completes the removal on every
+        // recipient.
+        .filter(|member| member.status == ChannelStatus::Paired)
+        .map(|member| ReplicaInfo {
             replica_id: member.replica_id.0,
             transports: member.transports.clone(),
             role: member.role as i32,
@@ -1049,7 +1096,7 @@ fn build_replicas(
         })
         .collect();
 
-    Ok(Some(crate::protocol::types::Replicas {
+    Ok(Some(Replicas {
         channel_id: group_channel.0,
         members,
         shared_key: group_key.to_vec(),
@@ -1058,15 +1105,15 @@ fn build_replicas(
 
 fn build_replica_composite(
     secret: &Secret,
-    split_result: Option<&crate::primitives::sharing::request::SplitResult>,
+    split_result: Option<&SplitResult>,
     version: u32,
     author_replica_id: Option<u64>,
-) -> crate::protocol::types::ReplicaSecretPayload {
-    let shares: Vec<crate::protocol::types::ChannelShare> = split_result
+) -> ReplicaSecretPayload {
+    let shares: Vec<ChannelShare> = split_result
         .map(|r| {
             r.shares
                 .iter()
-                .map(|(ch_id, committed)| crate::protocol::types::ChannelShare {
+                .map(|(ch_id, committed)| ChannelShare {
                     channel_id: ch_id.0,
                     committed_share: committed.encode_to_vec(),
                 })
@@ -1074,7 +1121,7 @@ fn build_replica_composite(
         })
         .unwrap_or_default();
 
-    crate::protocol::types::ReplicaSecretPayload {
+    ReplicaSecretPayload {
         secret: Some(secret.clone()),
         shares,
         shared_key: Vec::new(),
@@ -1105,8 +1152,7 @@ async fn resolve_keep_version<S: StoreSet>(
     version: u32,
 ) -> Result<u32> {
     let keep_version = stores.shares.keep_version(secret_id, version).await?;
-    crate::primitives::sharing::request::validate_keep_version(keep_version, version)
-        .map_err(crate::Error::from)?;
+    validate_keep_version(keep_version, version).map_err(Error::from)?;
     Ok(keep_version)
 }
 
@@ -1115,8 +1161,8 @@ async fn resolve_keep_version<S: StoreSet>(
 async fn distribute_shares<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-    paired_helpers: &[(crate::protocol::types::HelperChannel, SharedKey)],
-    split_result: &crate::primitives::sharing::request::SplitResult,
+    paired_helpers: &[(HelperChannel, SharedKey)],
+    split_result: &SplitResult,
     keep_version: u32,
     version: u32,
     threshold: Option<u32>,
@@ -1176,10 +1222,8 @@ async fn distribute_shares<S: StoreSet>(
 /// `DeRecShare` it wraps, or `None` when that share does not decode or
 /// carries none — the proto requires at least one, so an empty list is a
 /// malformed share, not a real count of zero.
-pub(in crate::protocol) fn subshare_count(
-    committed: &derec_proto::CommittedDeRecShare,
-) -> Option<u32> {
-    derec_proto::DeRecShare::decode(committed.de_rec_share.as_slice())
+pub(in crate::protocol) fn subshare_count(committed: &CommittedDeRecShare) -> Option<u32> {
+    DeRecShare::decode(committed.de_rec_share.as_slice())
         .ok()
         .and_then(|share| u32::try_from(share.subshares.len()).ok())
         .filter(|&n| n > 0)
@@ -1219,9 +1263,9 @@ pub(in crate::protocol) fn subshare_count(
 async fn dispatch_share_to_helper<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-    channel: &crate::protocol::types::HelperChannel,
+    channel: &HelperChannel,
     shared_key: &SharedKey,
-    committed_share: &derec_proto::CommittedDeRecShare,
+    committed_share: &CommittedDeRecShare,
     keep_version: u32,
     version: u32,
     threshold: Option<u32>,
@@ -1239,7 +1283,7 @@ async fn dispatch_share_to_helper<S: StoreSet>(
         shared_key,
         round.reply_to,
     )?;
-    let envelope = crate::derec_message::apply_trace_id(&msg.envelope, round.trace_id)?;
+    let envelope = apply_trace_id(&msg.envelope, round.trace_id)?;
     stores.transport.send(&channel.transports, envelope).await?;
 
     stores
@@ -1264,15 +1308,14 @@ async fn dispatch_share_to_helper<S: StoreSet>(
 async fn distribute_composite_to_destinations<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-    replicas: &[(crate::protocol::types::ReplicaMember, SharedKey)],
-    composite: &crate::protocol::types::ReplicaSecretPayload,
+    replicas: &[(ReplicaMember, SharedKey)],
+    composite: &ReplicaSecretPayload,
     group: Option<(ChannelId, SharedKey)>,
     version: u32,
     description: &str,
     round: &Round<'_>,
-) -> Vec<(crate::types::ReplicaId, Result<()>)> {
-    let mut results: Vec<(crate::types::ReplicaId, Result<()>)> =
-        Vec::with_capacity(replicas.len());
+) -> Vec<(ReplicaId, Result<()>)> {
+    let mut results: Vec<(ReplicaId, Result<()>)> = Vec::with_capacity(replicas.len());
     for (channel, channel_key) in replicas {
         let outcome = dispatch_composite_to_destination(
             stores,
@@ -1333,9 +1376,9 @@ async fn distribute_composite_to_destinations<S: StoreSet>(
 async fn dispatch_composite_to_destination<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-    channel: &crate::protocol::types::ReplicaMember,
+    channel: &ReplicaMember,
     channel_key: &SharedKey,
-    composite: &crate::protocol::types::ReplicaSecretPayload,
+    composite: &ReplicaSecretPayload,
     group: Option<&(ChannelId, SharedKey)>,
     version: u32,
     description: &str,
@@ -1370,7 +1413,7 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
         .encrypt(channel_key)?
         .build()?
         .encode_to_vec();
-    let envelope = crate::derec_message::apply_trace_id(&envelope_bytes, round.trace_id)?;
+    let envelope = apply_trace_id(&envelope_bytes, round.trace_id)?;
     stores.transport.send(&channel.transports, envelope).await?;
 
     if let Some((group_channel, _)) = handover {
@@ -1378,12 +1421,10 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
             .channels
             .save(
                 local.secret_id,
-                crate::protocol::types::ChannelRecord::Replica(
-                    crate::protocol::types::ReplicaMember {
-                        channel_id: *group_channel,
-                        ..channel.clone()
-                    },
-                ),
+                ChannelRecord::Replica(ReplicaMember {
+                    channel_id: *group_channel,
+                    ..channel.clone()
+                }),
             )
             .await?;
         let _ = stores
@@ -1404,17 +1445,30 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
 
 #[cfg(test)]
 mod tests {
+    use crate::Error;
+    use crate::derec_message::extract_inner_message;
     use crate::primitives::sharing::request;
     use crate::protocol::context::Exchange;
+    use crate::protocol::obligation::respond_to_failure;
     use crate::protocol::tests::LocalFixture;
     use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemUserSecretStore,
         NoopTransport, RecordingTransport, RefusingShareStore, StoreRig, run_async,
     };
-    use crate::protocol::{Refusal, ShareStoreError};
+    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, Share};
+    use crate::protocol::{
+        DeRecEvent, DeRecSecretStore, IgnoreReason, PendingAction, Refusal, SecretValue,
+        ShareStoreError,
+    };
     use crate::types::{ChannelId, SharedKey};
-    use derec_proto::{ParameterRange, Protocol, StatusEnum, TransportProtocol};
+    use derec_proto::{
+        CommittedDeRecShare, DeRecMessage, DeRecShare, MessageBody, ParameterRange, Protocol,
+        SenderKind, StatusEnum, StoreShareRequestMessage, StoreShareResponseMessage,
+        TransportProtocol,
+    };
     use prost::Message as _;
+    use std::collections::HashMap;
+    use std::slice;
 
     /// A Helper stores each incoming share partitioned under *its own*
     /// `secret_id`, but the persisted `Share` record must carry the
@@ -1452,7 +1506,7 @@ mod tests {
                 0,
                 "",
                 &shared_key,
-                std::slice::from_ref(&TransportProtocol {
+                slice::from_ref(&TransportProtocol {
                     uri: "https://owner.example".to_owned(),
                     protocol: Protocol::Https as i32,
                 }),
@@ -1545,10 +1599,7 @@ mod tests {
                 .await
                 .expect("identical re-send is accepted");
                 assert!(
-                    matches!(
-                        events.as_slice(),
-                        [crate::protocol::DeRecEvent::ShareStored { .. }]
-                    ),
+                    matches!(events.as_slice(), [DeRecEvent::ShareStored { .. }]),
                     "an idempotent retry is still acknowledged as stored"
                 );
             }
@@ -1641,7 +1692,7 @@ mod tests {
             assert!(
                 matches!(
                     events.as_slice(),
-                    [crate::protocol::DeRecEvent::ShareRefused { version: 1, status, .. }]
+                    [DeRecEvent::ShareRefused { version: 1, status, .. }]
                         if *status == StatusEnum::VersionConflict as i32
                 ),
                 "a refused write stores nothing and reports ShareRefused, got {events:?}"
@@ -1667,7 +1718,7 @@ mod tests {
     const KEEP_CHANNEL: ChannelId = ChannelId(11);
     const KEEP_KEY: SharedKey = [42u8; 32];
 
-    fn store_request(version: u32, keep_version: u32) -> derec_proto::StoreShareRequestMessage {
+    fn store_request(version: u32, keep_version: u32) -> StoreShareRequestMessage {
         let split = request::split(
             &[(KEEP_CHANNEL, 1), (ChannelId(12), 1)],
             KEEP_SECRET_ID,
@@ -1697,7 +1748,7 @@ mod tests {
         accept_request(rig, &store_request(version, keep_version)).await;
     }
 
-    async fn accept_request(rig: &mut StoreRig, request: &derec_proto::StoreShareRequestMessage) {
+    async fn accept_request(rig: &mut StoreRig, request: &StoreShareRequestMessage) {
         let lf = LocalFixture::new(KEEP_SECRET_ID);
         let events = super::accept(
             &mut rig.stores(),
@@ -1713,10 +1764,7 @@ mod tests {
         .await
         .expect("accept stores share");
         assert!(
-            matches!(
-                events.as_slice(),
-                [crate::protocol::DeRecEvent::ShareStored { .. }]
-            ),
+            matches!(events.as_slice(), [DeRecEvent::ShareStored { .. }]),
             "every request in these scenarios is acknowledged as stored"
         );
     }
@@ -1732,7 +1780,7 @@ mod tests {
                 .save(
                     KEEP_SECRET_ID,
                     KEEP_CHANNEL,
-                    crate::protocol::types::Share {
+                    Share {
                         secret_id: KEEP_SECRET_ID,
                         version: *v,
                         bytes: store_request(*v, 0).encode_to_vec(),
@@ -1808,11 +1856,11 @@ mod tests {
     /// helper holds zero of them.
     #[test]
     fn subshare_count_of_an_empty_subshare_list_is_none() {
-        let malformed = derec_proto::DeRecShare {
+        let malformed = DeRecShare {
             subshares: Vec::new(),
             ..Default::default()
         };
-        let committed = derec_proto::CommittedDeRecShare {
+        let committed = CommittedDeRecShare {
             de_rec_share: malformed.encode_to_vec(),
             commitment: Vec::new(),
             merkle_path: Vec::new(),
@@ -1867,14 +1915,102 @@ mod tests {
         });
     }
 
-    /// A request older than the latest stored version must have its
-    /// `keepVersion` ignored, so a replay cannot delete newer shares.
+    async fn accept_events(
+        rig: &mut StoreRig,
+        request: &StoreShareRequestMessage,
+    ) -> Vec<DeRecEvent> {
+        let lf = LocalFixture::new(KEEP_SECRET_ID);
+        super::accept(
+            &mut rig.stores(),
+            &lf.local(),
+            &Exchange {
+                channel_id: KEEP_CHANNEL,
+                shared_key: &KEEP_KEY,
+                trace_id: 1,
+                obligation: None,
+            },
+            request,
+        )
+        .await
+        .expect("accept handles the request")
+    }
+
+    fn is_superseded(events: &[DeRecEvent]) -> bool {
+        matches!(
+            events,
+            [DeRecEvent::MessageIgnored { channel_id, reason: IgnoreReason::Superseded, trace_id: 1 }]
+                if *channel_id == KEEP_CHANNEL
+        )
+    }
+
+    /// A request older than the newest version stored on the channel is
+    /// ignored: nothing is stored, nothing is removed, nothing is sent.
     #[test]
-    fn accept_ignores_the_keep_version_of_an_older_version() {
+    fn accept_ignores_a_version_older_than_the_newest_held() {
         run_async(async {
             let mut rig = keep_rig_with_versions(&[1, 3, 4]).await;
-            accept_version(&mut rig, 2, 0).await;
-            assert_eq!(stored_versions(&rig), vec![1, 2, 3, 4]);
+            let events = accept_events(&mut rig, &store_request(2, 0)).await;
+            assert!(is_superseded(&events), "got {events:?}");
+            assert_eq!(stored_versions(&rig), vec![1, 3, 4]);
+        });
+    }
+
+    /// A version the Helper dropped under a newer request's `keepVersion`
+    /// does not come back when its request is delivered again.
+    #[test]
+    fn a_request_delivered_again_does_not_restore_a_dropped_version() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[]).await;
+            let v2 = store_request(2, 0);
+            accept_request(&mut rig, &v2).await;
+            accept_version(&mut rig, 3, 0).await;
+            assert_eq!(stored_versions(&rig), vec![3]);
+
+            let events = accept_events(&mut rig, &v2).await;
+            assert!(is_superseded(&events), "got {events:?}");
+            assert_eq!(stored_versions(&rig), vec![3]);
+        });
+    }
+
+    /// The application is not asked to store a version older than the
+    /// newest one it holds on the channel.
+    #[test]
+    fn on_request_ignores_a_version_older_than_the_newest_held() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[3]).await;
+            let lf = LocalFixture::new(KEEP_SECRET_ID);
+            let events = super::on_request(
+                &mut rig.stores(),
+                &lf.local(),
+                &Exchange {
+                    channel_id: KEEP_CHANNEL,
+                    shared_key: &KEEP_KEY,
+                    trace_id: 1,
+                    obligation: None,
+                },
+                store_request(2, 0),
+            )
+            .await
+            .expect("on_request handles the request");
+            assert!(is_superseded(&events), "got {events:?}");
+        });
+    }
+
+    /// A version older than the newest held but still stored is the
+    /// identical re-send it always was, acknowledged as stored.
+    #[test]
+    fn accept_acknowledges_a_held_older_version_sent_again() {
+        run_async(async {
+            let mut rig = keep_rig_with_versions(&[]).await;
+            let v2 = store_request(2, 0);
+            accept_request(&mut rig, &v2).await;
+            accept_version(&mut rig, 3, 2).await;
+            let events = accept_events(&mut rig, &v2).await;
+            assert!(
+                matches!(events.as_slice(), [DeRecEvent::ShareStored { .. }]),
+                "got {events:?}"
+            );
+            assert_eq!(stored_versions(&rig), vec![2, 3]);
         });
     }
 
@@ -1898,7 +2034,7 @@ mod tests {
         run_async(async {
             use crate::protocol::DeRecShareStore;
             let mut rig = keep_rig_with_versions(&[1, 2]).await;
-            let other = crate::protocol::types::Share {
+            let other = Share {
                 secret_id: KEEP_SECRET_ID,
                 version: 1,
                 bytes: vec![1, 2, 3],
@@ -1933,20 +2069,18 @@ mod tests {
         channels
             .save(
                 secret_id,
-                crate::protocol::types::ChannelRecord::Helper(
-                    crate::protocol::types::HelperChannel {
-                        channel_id,
-                        transports: vec![TransportProtocol {
-                            uri: "https://owner.example".to_owned(),
-                            protocol: Protocol::Https as i32,
-                        }],
-                        communication_info: std::collections::HashMap::new(),
-                        status: crate::protocol::types::ChannelStatus::Paired,
-                        created_at: 0,
-                        peer_role: derec_proto::SenderKind::Owner,
-                        weight: 1,
-                    },
-                ),
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id,
+                    transports: vec![TransportProtocol {
+                        uri: "https://owner.example".to_owned(),
+                        protocol: Protocol::Https as i32,
+                    }],
+                    communication_info: HashMap::new(),
+                    status: ChannelStatus::Paired,
+                    created_at: 0,
+                    peer_role: SenderKind::Owner,
+                    weight: 1,
+                }),
             )
             .await
             .expect("seed channel");
@@ -1967,7 +2101,7 @@ mod tests {
     /// committed-share encoding of `payload`, carrying an explicit
     /// `reply_to` so these tests need no seeded channel record to resolve
     /// a response endpoint.
-    fn param_request(payload: &[u8]) -> derec_proto::StoreShareRequestMessage {
+    fn param_request(payload: &[u8]) -> StoreShareRequestMessage {
         let split = request::split(
             &[(PARAM_CHANNEL, 1), (ChannelId(42), 1)],
             PARAM_SECRET_ID,
@@ -1985,7 +2119,7 @@ mod tests {
             0,
             "",
             &PARAM_KEY,
-            std::slice::from_ref(&param_reply_to()),
+            slice::from_ref(&param_reply_to()),
         )
         .expect("produce request");
         request::extract(&produced.envelope, &PARAM_KEY)
@@ -2000,13 +2134,10 @@ mod tests {
     fn decode_store_share_response(
         envelope_bytes: &[u8],
         shared_key: &SharedKey,
-    ) -> derec_proto::StoreShareResponseMessage {
-        let envelope =
-            derec_proto::DeRecMessage::decode(envelope_bytes).expect("decode response envelope");
-        match crate::derec_message::extract_inner_message(&envelope.message, shared_key)
-            .expect("decrypt response")
-        {
-            derec_proto::MessageBody::StoreShareResponse(resp) => resp,
+    ) -> StoreShareResponseMessage {
+        let envelope = DeRecMessage::decode(envelope_bytes).expect("decode response envelope");
+        match extract_inner_message(&envelope.message, shared_key).expect("decrypt response") {
+            MessageBody::StoreShareResponse(resp) => resp,
             other => panic!("expected a StoreShareResponse, got {other:?}"),
         }
     }
@@ -2042,7 +2173,7 @@ mod tests {
             assert!(
                 matches!(
                     events.as_slice(),
-                    [crate::protocol::DeRecEvent::ShareRefused { channel_id, version: 1, status, .. }]
+                    [DeRecEvent::ShareRefused { channel_id, version: 1, status, .. }]
                         if *channel_id == PARAM_CHANNEL
                             && *status == StatusEnum::SizeLimitExceeded as i32
                 ),
@@ -2061,7 +2192,7 @@ mod tests {
             assert!(
                 matches!(
                     owner_events.as_slice(),
-                    [crate::protocol::DeRecEvent::ShareRejected { status, .. }]
+                    [DeRecEvent::ShareRejected { status, .. }]
                         if *status == StatusEnum::SizeLimitExceeded as i32
                 ),
                 "the owner sees the mapped SIZE_LIMIT_EXCEEDED status"
@@ -2099,7 +2230,7 @@ mod tests {
             assert!(
                 matches!(
                     events.as_slice(),
-                    [crate::protocol::DeRecEvent::ShareRefused { channel_id, version: 1, status, .. }]
+                    [DeRecEvent::ShareRefused { channel_id, version: 1, status, .. }]
                         if *channel_id == PARAM_CHANNEL
                             && *status == StatusEnum::SizeLimitExceeded as i32
                 ),
@@ -2118,7 +2249,7 @@ mod tests {
             assert!(
                 matches!(
                     owner_events.as_slice(),
-                    [crate::protocol::DeRecEvent::ShareRejected { status, .. }]
+                    [DeRecEvent::ShareRejected { status, .. }]
                         if *status == StatusEnum::SizeLimitExceeded as i32
                 ),
                 "the owner sees the mapped SIZE_LIMIT_EXCEEDED status"
@@ -2157,8 +2288,8 @@ mod tests {
             assert!(
                 matches!(
                     events.as_slice(),
-                    [crate::protocol::DeRecEvent::ActionRequired {
-                        action: crate::protocol::PendingAction::StoreShare { .. },
+                    [DeRecEvent::ActionRequired {
+                        action: PendingAction::StoreShare { .. },
                         ..
                     }]
                 ),
@@ -2180,7 +2311,7 @@ mod tests {
             .expect("accept stores the in-bounds share");
             assert!(matches!(
                 accept_events.as_slice(),
-                [crate::protocol::DeRecEvent::ShareStored { .. }]
+                [DeRecEvent::ShareStored { .. }]
             ));
 
             let sent = rig.transport.sent_envelopes();
@@ -2190,7 +2321,7 @@ mod tests {
                 super::on_response(PARAM_CHANNEL, &response).expect("owner processes the ack");
             assert!(matches!(
                 owner_events.as_slice(),
-                [crate::protocol::DeRecEvent::ShareConfirmed { .. }]
+                [DeRecEvent::ShareConfirmed { .. }]
             ));
         });
     }
@@ -2220,7 +2351,7 @@ mod tests {
 
             assert!(matches!(
                 events.as_slice(),
-                [crate::protocol::DeRecEvent::ActionRequired { .. }]
+                [DeRecEvent::ActionRequired { .. }]
             ));
         });
     }
@@ -2270,7 +2401,7 @@ mod tests {
             .expect("a store refusal is answered, not raised as an error");
 
             assert!(
-                matches!(events.as_slice(), [crate::protocol::DeRecEvent::NoOp]),
+                matches!(events.as_slice(), [DeRecEvent::NoOp]),
                 "the refusal is reported to the peer, not surfaced as a local ShareStored"
             );
 
@@ -2282,7 +2413,7 @@ mod tests {
             assert!(
                 matches!(
                     owner_events.as_slice(),
-                    [crate::protocol::DeRecEvent::ShareRejected { status, memo, .. }]
+                    [DeRecEvent::ShareRejected { status, memo, .. }]
                         if *status == StatusEnum::TooFrequent as i32
                             && memo == "refused by the helper: too frequent"
                 ),
@@ -2315,10 +2446,7 @@ mod tests {
             )
             .await
             .expect("the first write stores the share");
-            assert!(matches!(
-                first.as_slice(),
-                [crate::protocol::DeRecEvent::ShareStored { .. }]
-            ));
+            assert!(matches!(first.as_slice(), [DeRecEvent::ShareStored { .. }]));
 
             rig.shares.set_refusal(Some(Refusal::TooFrequent));
 
@@ -2336,10 +2464,7 @@ mod tests {
             .await
             .expect("an identical resend never reaches save, so it cannot be refused");
             assert!(
-                matches!(
-                    second.as_slice(),
-                    [crate::protocol::DeRecEvent::ShareStored { .. }]
-                ),
+                matches!(second.as_slice(), [DeRecEvent::ShareStored { .. }]),
                 "the idempotent resend is still acknowledged as stored"
             );
         });
@@ -2359,7 +2484,7 @@ mod tests {
                 let lf = LocalFixture::new(PARAM_SECRET_ID);
                 let mut rig = param_rig();
                 rig.shares.set_backend_error(true);
-                let action = crate::protocol::PendingAction::StoreShare {
+                let action = PendingAction::StoreShare {
                     channel_id: PARAM_CHANNEL,
                     request: request.clone(),
                     shared_key: PARAM_KEY,
@@ -2381,21 +2506,18 @@ mod tests {
                 )
                 .await;
                 assert!(
-                    matches!(
-                        outcome,
-                        Err(crate::Error::ShareStore(ShareStoreError::Backend(_)))
-                    ),
+                    matches!(outcome, Err(Error::ShareStore(ShareStoreError::Backend(_)))),
                     "the flow itself leaves the failure to the router"
                 );
                 assert!(rig.transport.sent_envelopes().is_empty());
 
                 // The paired channel's key is in the secret store. The token
                 // carries none: `reject` reads it from there.
-                crate::protocol::DeRecSecretStore::save(
+                DeRecSecretStore::save(
                     &mut rig.secrets,
                     PARAM_SECRET_ID,
                     PARAM_CHANNEL,
-                    crate::protocol::SecretValue::SharedKey(PARAM_KEY),
+                    SecretValue::SharedKey(PARAM_KEY),
                 )
                 .await
                 .expect("seed the channel key");
@@ -2409,7 +2531,7 @@ mod tests {
                 .await;
                 let token = match events.as_slice() {
                     [
-                        crate::protocol::DeRecEvent::RequestFailed {
+                        DeRecEvent::RequestFailed {
                             responded, action, ..
                         },
                     ] => {
@@ -2420,7 +2542,7 @@ mod tests {
                 };
                 if let Some(token) = token {
                     assert!(rig.transport.sent_envelopes().is_empty());
-                    let crate::protocol::PendingAction::RespondToFailure {
+                    let PendingAction::RespondToFailure {
                         channel_id,
                         trace_id,
                         reply,
@@ -2436,7 +2558,7 @@ mod tests {
                         request,
                         lf.local().policy,
                     );
-                    crate::protocol::obligation::respond_to_failure(
+                    respond_to_failure(
                         &mut rig.stores(),
                         &lf.local(),
                         &answer,
@@ -2463,7 +2585,7 @@ mod tests {
 /// `auto_respond_on_failure` says.
 #[cfg(test)]
 mod invalid_share_tests {
-    use crate::derec_message::DeRecMessageBuilder;
+    use crate::derec_message::{DeRecMessageBuilder, extract_inner_message};
     use crate::primitives::sharing::request;
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::context::Exchange;
@@ -2477,11 +2599,14 @@ mod invalid_share_tests {
         DeRecShareStore,
     };
     use crate::types::{ChannelId, SharedKey};
+    use crate::utils::now_secs;
     use derec_proto::{
-        CommittedDeRecShare, MessageBody, Protocol, SenderKind, StatusEnum,
+        CommittedDeRecShare, DeRecMessage, MessageBody, Protocol, SenderKind, StatusEnum,
         StoreShareRequestMessage, TransportProtocol,
     };
     use prost::Message as _;
+    use std::collections::HashMap;
+    use std::slice;
 
     const HELPER_SECRET_ID: u64 = 0x4E;
     const OWNER_SECRET_ID: u64 = 0xA11CE;
@@ -2528,7 +2653,7 @@ mod invalid_share_tests {
             keep_version,
             "",
             &KEY,
-            std::slice::from_ref(&owner_endpoint()),
+            slice::from_ref(&owner_endpoint()),
         )
         .expect("produce request");
         request::extract(&produced.envelope, &KEY)
@@ -2580,9 +2705,9 @@ mod invalid_share_tests {
                 ChannelRecord::Helper(HelperChannel {
                     channel_id: CHANNEL,
                     transports: vec![owner_endpoint()],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     status: ChannelStatus::Paired,
-                    created_at: crate::utils::now_secs(),
+                    created_at: now_secs(),
                     peer_role: SenderKind::Owner,
                     weight: 1,
                 }),
@@ -2694,9 +2819,9 @@ mod invalid_share_tests {
 
         let sent = transport.sent_envelopes();
         assert_eq!(sent.len(), 1, "exactly one response is sent to the owner");
-        let envelope = derec_proto::DeRecMessage::decode(sent[0].as_slice()).expect("envelope");
+        let envelope = DeRecMessage::decode(sent[0].as_slice()).expect("envelope");
         let MessageBody::StoreShareResponse(response) =
-            crate::derec_message::extract_inner_message(&envelope.message, &KEY).expect("decrypt")
+            extract_inner_message(&envelope.message, &KEY).expect("decrypt")
         else {
             panic!("expected a StoreShareResponse");
         };
@@ -2893,7 +3018,8 @@ mod refused_reply_to_tests {
 /// keep, and the end-to-end effect once they apply it.
 #[cfg(test)]
 mod owner_keep_version_tests {
-    use crate::primitives::sharing::request;
+    use super::SharingRoundResult;
+    use crate::primitives::sharing::{SharingError, request};
     use crate::protocol::context::{Exchange, Round};
     use crate::protocol::tests::{LocalFixture, StoreRig, run_async};
     use crate::protocol::types::{
@@ -2901,7 +3027,9 @@ mod owner_keep_version_tests {
     };
     use crate::protocol::{DeRecChannelStore, DeRecSecretStore, DeRecUserSecretStore};
     use crate::types::{ChannelId, SharedKey};
-    use derec_proto::{Protocol, SenderKind, TransportProtocol};
+    use crate::{Error, Result};
+    use derec_proto::{Protocol, SenderKind, StoreShareRequestMessage, TransportProtocol};
+    use std::collections::HashMap;
 
     const OWNER_SECRET_ID: u64 = 0x0E;
     const HELPER_SECRET_ID: u64 = 0x4E;
@@ -2935,7 +3063,7 @@ mod owner_keep_version_tests {
                     ChannelRecord::Helper(HelperChannel {
                         channel_id: ChannelId(channel),
                         transports: vec![endpoint(channel)],
-                        communication_info: std::collections::HashMap::new(),
+                        communication_info: HashMap::new(),
                         status: ChannelStatus::Paired,
                         created_at: 0,
                         peer_role: SenderKind::Helper,
@@ -2980,7 +3108,7 @@ mod owner_keep_version_tests {
             .version
     }
 
-    async fn try_publish(rig: &mut StoreRig) -> crate::Result<Option<super::SharingRoundResult>> {
+    async fn try_publish(rig: &mut StoreRig) -> Result<Option<SharingRoundResult>> {
         let lf = LocalFixture::new(OWNER_SECRET_ID);
         rig.transport.sent.lock().unwrap().clear();
         super::start(
@@ -2992,7 +3120,7 @@ mod owner_keep_version_tests {
                 data: b"data".to_vec(),
             }],
             None,
-            Some(&std::collections::HashMap::new()),
+            Some(&HashMap::new()),
             None,
             THRESHOLD,
             None,
@@ -3004,7 +3132,7 @@ mod owner_keep_version_tests {
         .await
     }
 
-    fn sent_requests(rig: &StoreRig) -> Vec<(u64, derec_proto::StoreShareRequestMessage)> {
+    fn sent_requests(rig: &StoreRig) -> Vec<(u64, StoreShareRequestMessage)> {
         rig.transport
             .sent
             .lock()
@@ -3078,8 +3206,8 @@ mod owner_keep_version_tests {
                 assert!(
                     matches!(
                         err,
-                        crate::Error::Sharing(
-                            crate::primitives::sharing::SharingError::InvalidKeepVersion {
+                        Error::Sharing(
+                            SharingError::InvalidKeepVersion {
                                 keep_version: k,
                                 version: 5,
                             }
@@ -3110,7 +3238,7 @@ mod owner_keep_version_tests {
                         uri: "https://owner.example".to_owned(),
                         protocol: Protocol::Https as i32,
                     }],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     status: ChannelStatus::Paired,
                     created_at: 0,
                     peer_role: SenderKind::Owner,
@@ -3236,15 +3364,19 @@ mod owner_keep_version_tests {
 /// non-source member is allowed to do.
 #[cfg(test)]
 mod group_conformance_tests {
-    use crate::protocol::DeRecChannelStore;
+    use crate::primitives::sharing::request;
     use crate::protocol::tests::LocalFixture;
     use crate::protocol::tests::StoreRig;
     use crate::protocol::tests::{InMemChannelStore, InMemSecretStore, run_async};
     use crate::protocol::types::{
-        ChannelRecord, ChannelStatus, ReplicaMember, ReplicaRole, SecretValue,
+        ChannelRecord, ChannelShare, ChannelStatus, HelperInfo, ReplicaFilter, ReplicaInfo,
+        ReplicaMember, ReplicaRole, ReplicaSecretPayload, Replicas, Secret, SecretValue,
     };
+    use crate::protocol::{DeRecChannelStore, DeRecEvent};
     use crate::types::{ChannelId, ReplicaId};
-    use derec_proto::{Protocol, TransportProtocol};
+    use derec_proto::{Protocol, SenderKind, TransportProtocol};
+    use prost::Message;
+    use std::collections::{HashMap, HashSet};
 
     const SECRET_ID: u64 = 0xC0FFEE;
     const GROUP_CHANNEL: ChannelId = ChannelId(5001);
@@ -3269,7 +3401,7 @@ mod group_conformance_tests {
                     channel_id: GROUP_CHANNEL,
                     replica_id: ReplicaId(replica_id),
                     transports: vec![endpoint(uri)],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     role,
                     status: ChannelStatus::Paired,
                     created_at: 0,
@@ -3363,7 +3495,7 @@ mod group_conformance_tests {
                 .expect("targets load");
 
             assert_eq!(targets.len(), 3, "one target per member, not per channel");
-            let channels_used: std::collections::HashSet<ChannelId> =
+            let channels_used: HashSet<ChannelId> =
                 targets.iter().map(|(m, _)| m.channel_id).collect();
             assert_eq!(
                 channels_used.len(),
@@ -3402,7 +3534,7 @@ mod group_conformance_tests {
             // Publishing as the destination, not the source.
             let roster = rig
                 .channels
-                .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
+                .replicas(SECRET_ID, ReplicaFilter::default())
                 .await
                 .expect("roster");
             let group_channel =
@@ -3467,7 +3599,7 @@ mod group_conformance_tests {
                         channel_id: ChannelId(7001),
                         replica_id: ReplicaId(1003),
                         transports: vec![endpoint("https://alice-3")],
-                        communication_info: std::collections::HashMap::new(),
+                        communication_info: HashMap::new(),
                         role: ReplicaRole::Destination,
                         status: ChannelStatus::Paired,
                         created_at: 0,
@@ -3478,7 +3610,7 @@ mod group_conformance_tests {
 
             let roster = rig
                 .channels
-                .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
+                .replicas(SECRET_ID, ReplicaFilter::default())
                 .await
                 .expect("roster");
             let group_channel = super::group_channel_of(&lf.local(), &roster)
@@ -3509,10 +3641,10 @@ mod group_conformance_tests {
                 ChannelRecord::Helper(HelperChannel {
                     channel_id: HELPER_CHANNEL,
                     transports: vec![endpoint("https://helper")],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     status: ChannelStatus::Paired,
                     created_at: 0,
-                    peer_role: derec_proto::SenderKind::Helper,
+                    peer_role: SenderKind::Helper,
                     weight: 1,
                 }),
             )
@@ -3560,14 +3692,14 @@ mod group_conformance_tests {
     /// The roster a catch-up payload carries. A payload always comes from a
     /// group member, so one is always present — and `hydrate` commits the
     /// snapshot only for a payload that names a group.
-    fn payload_roster() -> crate::protocol::types::Replicas {
-        crate::protocol::types::Replicas {
+    fn payload_roster() -> Replicas {
+        Replicas {
             channel_id: GROUP_CHANNEL.0,
-            members: vec![crate::protocol::types::ReplicaInfo {
+            members: vec![ReplicaInfo {
                 replica_id: 1002,
                 transports: vec![endpoint("https://self")],
                 role: ReplicaRole::Destination as i32,
-                communication_info: std::collections::HashMap::new(),
+                communication_info: HashMap::new(),
             }],
             shared_key: vec![0x42; 32],
         }
@@ -3617,7 +3749,7 @@ mod group_conformance_tests {
     #[test]
     fn a_published_roster_describes_every_member_including_the_writer() {
         run_async(async {
-            let lf = crate::protocol::tests::LocalFixture {
+            let lf = LocalFixture {
                 own_transports: vec![
                     endpoint("https://self"),
                     TransportProtocol {
@@ -3625,10 +3757,7 @@ mod group_conformance_tests {
                         protocol: Protocol::Grpc as i32,
                     },
                 ],
-                communication_info: std::collections::HashMap::from([(
-                    "name".to_owned(),
-                    "Alice-2".to_owned(),
-                )]),
+                communication_info: HashMap::from([("name".to_owned(), "Alice-2".to_owned())]),
                 ..LocalFixture::with_replica(SECRET_ID, 1002)
             };
             let mut rig = StoreRig::new();
@@ -3640,7 +3769,7 @@ mod group_conformance_tests {
                         channel_id: GROUP_CHANNEL,
                         replica_id: ReplicaId(1003),
                         transports: vec![endpoint("https://alice-3")],
-                        communication_info: std::collections::HashMap::from([(
+                        communication_info: HashMap::from([(
                             "name".to_owned(),
                             "Alice-3".to_owned(),
                         )]),
@@ -3693,6 +3822,99 @@ mod group_conformance_tests {
         });
     }
 
+    /// A member whose pairing this device has not confirmed is not part of
+    /// the group yet. A roster that listed it would have every recipient
+    /// install it as `Paired`.
+    #[test]
+    fn a_catch_up_roster_leaves_out_an_unconfirmed_member() {
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, 1002);
+            let mut rig = StoreRig::new();
+            seed_member(&mut rig.channels, 1002, ReplicaRole::Source, "https://self").await;
+            seed_member(
+                &mut rig.channels,
+                1003,
+                ReplicaRole::Destination,
+                "https://alice-3",
+            )
+            .await;
+            seed_unconfirmed_joiner(&mut rig.channels, 1004).await;
+            seed_group_key(&mut rig.secrets).await;
+            seed_helper_and_snapshot(&mut rig, 4, None).await;
+
+            let payload = super::build_catch_up_payload(&mut rig.stores(), &lf.local())
+                .await
+                .expect("catch-up payload")
+                .expect("a device holding a snapshot must serve one");
+
+            let mut listed: Vec<u64> = payload
+                .secret
+                .and_then(|s| s.replicas)
+                .expect("roster is present")
+                .members
+                .iter()
+                .map(|m| m.replica_id)
+                .collect();
+            listed.sort();
+            assert_eq!(listed, vec![1002, 1003]);
+        });
+    }
+
+    /// The vault a publish round splits is built the same way, so it leaves
+    /// out an unconfirmed member too.
+    #[test]
+    fn a_published_roster_leaves_out_an_unconfirmed_member() {
+        run_async(async {
+            let mut rig = StoreRig::new();
+            seed_member(&mut rig.channels, 1002, ReplicaRole::Source, "https://self").await;
+            seed_unconfirmed_joiner(&mut rig.channels, 1004).await;
+            let roster = rig
+                .channels
+                .replicas(SECRET_ID, ReplicaFilter::default())
+                .await
+                .expect("roster");
+
+            let secret = super::build_secret(
+                &[],
+                &roster,
+                Vec::new(),
+                Some(GROUP_CHANNEL),
+                Some([0x42; 32]),
+                None,
+            )
+            .expect("secret builds");
+
+            let listed: Vec<u64> = secret
+                .replicas
+                .expect("roster is present")
+                .members
+                .iter()
+                .map(|m| m.replica_id)
+                .collect();
+            assert_eq!(listed, vec![1002]);
+        });
+    }
+
+    /// A joiner whose handshake finished but whose fingerprint this device
+    /// has not confirmed: still `Pending`, on its own pairing channel.
+    async fn seed_unconfirmed_joiner(channels: &mut InMemChannelStore, replica_id: u64) {
+        channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Replica(ReplicaMember {
+                    channel_id: ChannelId(5002),
+                    replica_id: ReplicaId(replica_id),
+                    transports: vec![endpoint("https://joiner")],
+                    communication_info: HashMap::new(),
+                    role: ReplicaRole::Destination,
+                    status: ChannelStatus::Pending,
+                    created_at: 0,
+                }),
+            )
+            .await
+            .expect("seed joiner");
+    }
+
     /// A member with no tracking rows serves a map-less answer rather than
     /// failing. Below-threshold rounds and recovered devices both land here.
     #[test]
@@ -3729,23 +3951,23 @@ mod group_conformance_tests {
             let lf = LocalFixture::with_replica(SECRET_ID, 1002);
             let mut rig = StoreRig::new();
 
-            let payload = crate::protocol::types::ReplicaSecretPayload {
-                secret: Some(crate::protocol::types::Secret {
-                    helpers: vec![crate::protocol::types::HelperInfo {
+            let payload = ReplicaSecretPayload {
+                secret: Some(Secret {
+                    helpers: vec![HelperInfo {
                         channel_id: HELPER_CHANNEL.0,
                         transports: vec![endpoint("https://helper")],
                         shared_key: vec![0xAA; 32],
-                        communication_info: std::collections::HashMap::new(),
+                        communication_info: HashMap::new(),
                         weight: 1,
                     }],
                     secrets: Vec::new(),
                     replicas: Some(payload_roster()),
                     threshold: None,
                 }),
-                shares: vec![crate::protocol::types::ChannelShare {
+                shares: vec![ChannelShare {
                     channel_id: HELPER_CHANNEL.0,
-                    committed_share: prost::Message::encode_to_vec(
-                        crate::primitives::sharing::request::split(
+                    committed_share: Message::encode_to_vec(
+                        request::split(
                             &[(HELPER_CHANNEL, 1), (ChannelId(HELPER_CHANNEL.0 + 1), 1)],
                             SECRET_ID,
                             4,
@@ -3767,11 +3989,11 @@ mod group_conformance_tests {
             super::hydrate_catch_up(
                 &mut rig.stores(),
                 &lf.local(),
-                crate::types::ChannelId(5001),
+                ChannelId(5001),
                 1001,
                 SECRET_ID,
                 9,
-                &prost::Message::encode_to_vec(&payload),
+                &Message::encode_to_vec(&payload),
             )
             .await
             .expect("catch-up must hydrate");
@@ -3808,8 +4030,8 @@ mod group_conformance_tests {
             let lf = LocalFixture::with_replica(SECRET_ID, 1002);
             let mut rig = StoreRig::new();
 
-            let payload = crate::protocol::types::ReplicaSecretPayload {
-                secret: Some(crate::protocol::types::Secret {
+            let payload = ReplicaSecretPayload {
+                secret: Some(Secret {
                     helpers: Vec::new(),
                     secrets: Vec::new(),
                     replicas: Some(payload_roster()),
@@ -3824,11 +4046,11 @@ mod group_conformance_tests {
             super::hydrate_catch_up(
                 &mut rig.stores(),
                 &lf.local(),
-                crate::types::ChannelId(5001),
+                ChannelId(5001),
                 1001,
                 SECRET_ID,
                 9,
-                &prost::Message::encode_to_vec(&payload),
+                &Message::encode_to_vec(&payload),
             )
             .await
             .expect("catch-up must hydrate");
@@ -3854,8 +4076,8 @@ mod group_conformance_tests {
             const SENDER_SECRET_ID: u64 = 0x5E_4DE4;
             let lf = LocalFixture::with_replica(SECRET_ID, 1002);
             let mut rig = StoreRig::new();
-            let payload = crate::protocol::types::ReplicaSecretPayload {
-                secret: Some(crate::protocol::types::Secret {
+            let payload = ReplicaSecretPayload {
+                secret: Some(Secret {
                     helpers: Vec::new(),
                     secrets: Vec::new(),
                     replicas: Some(payload_roster()),
@@ -3870,11 +4092,11 @@ mod group_conformance_tests {
             let events = super::hydrate_catch_up(
                 &mut rig.stores(),
                 &lf.local(),
-                crate::types::ChannelId(5001),
+                ChannelId(5001),
                 1001,
                 SENDER_SECRET_ID,
                 3,
-                &prost::Message::encode_to_vec(&payload),
+                &Message::encode_to_vec(&payload),
             )
             .await
             .expect("catch-up must hydrate");
@@ -3882,7 +4104,7 @@ mod group_conformance_tests {
             assert!(
                 matches!(
                     events.as_slice(),
-                    [crate::protocol::DeRecEvent::ReplicaSecretInstalled { secret_id, .. }] if *secret_id == SENDER_SECRET_ID
+                    [DeRecEvent::ReplicaSecretInstalled { secret_id, .. }] if *secret_id == SENDER_SECRET_ID
                 ),
                 "a pull must report the sender's secret id, as a push does: {events:?}"
             );
@@ -3930,7 +4152,7 @@ mod group_conformance_tests {
 pub(in crate::protocol) async fn build_catch_up_payload<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-) -> Result<Option<crate::protocol::types::ReplicaSecretPayload>> {
+) -> Result<Option<ReplicaSecretPayload>> {
     let secret_id = local.secret_id;
     let Some(snapshot) = stores.user_secrets.load_latest(secret_id).await? else {
         return Ok(None);
@@ -3939,7 +4161,7 @@ pub(in crate::protocol) async fn build_catch_up_payload<S: StoreSet>(
     let (helpers, _) = load_all_paired_targets(stores, local).await?;
     let mut roster = stores
         .channels
-        .replicas_matching(secret_id, crate::protocol::types::ReplicaFilter::default())
+        .replicas_matching(secret_id, ReplicaFilter::default())
         .await?;
     stamp_own_row(local, &mut roster);
     let group_channel = group_channel_of(local, &roster)?;
@@ -3964,7 +4186,7 @@ pub(in crate::protocol) async fn build_catch_up_payload<S: StoreSet>(
         snapshot.threshold,
     )?;
 
-    let mut shares: Vec<crate::protocol::types::ChannelShare> = Vec::new();
+    let mut shares: Vec<ChannelShare> = Vec::new();
     for (helper, _) in &helpers {
         if let Some(tracked) = stores
             .shares
@@ -3973,14 +4195,14 @@ pub(in crate::protocol) async fn build_catch_up_payload<S: StoreSet>(
             .into_iter()
             .next()
         {
-            shares.push(crate::protocol::types::ChannelShare {
+            shares.push(ChannelShare {
                 channel_id: helper.channel_id.0,
                 committed_share: tracked.bytes,
             });
         }
     }
 
-    Ok(Some(crate::protocol::types::ReplicaSecretPayload {
+    Ok(Some(ReplicaSecretPayload {
         secret: Some(secret),
         shares,
         shared_key: Vec::new(),
@@ -4040,7 +4262,7 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
         }])
     };
 
-    let Ok(composite) = crate::protocol::types::ReplicaSecretPayload::decode(payload) else {
+    let Ok(composite) = ReplicaSecretPayload::decode(payload) else {
         return refused(
             response_version,
             replica::PayloadFault::format("catch-up payload is not a valid ReplicaSecretPayload"),
@@ -4133,19 +4355,23 @@ mod weighted_round_tests {
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::context::Round;
     use crate::protocol::tests::{
-        InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
-        InMemUserSecretStore, LocalFixture, RecordingTransport, StoreRig, run_async,
+        FailingTransport, InMemChannelStore, InMemPersistedStateStore, InMemSecretStore,
+        InMemShareStore, InMemUserSecretStore, LocalFixture, RecordingTransport, StoreRig,
+        run_async,
     };
     use crate::protocol::types::{
-        ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole, SecretValue,
-        UserSecret, UserSecrets,
+        ChannelQuery, ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole,
+        Secret, SecretValue, StateItem, StateKey, Target, UserSecret, UserSecrets,
     };
     use crate::protocol::{
-        DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol, DeRecSecretStore,
-        DeRecUserSecretStore,
+        AutoAcceptPolicy, DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol,
+        DeRecSecretStore, DeRecUserSecretStore,
     };
     use crate::types::{ChannelId, ReplicaId};
-    use derec_proto::{Protocol, SenderKind, TransportProtocol};
+    use crate::{Error, Result};
+    use derec_proto::{
+        CommittedDeRecShare, ContactMode, DeRecShare, Protocol, SenderKind, TransportProtocol,
+    };
     use prost::Message as _;
     use std::collections::HashMap;
 
@@ -4249,7 +4475,7 @@ mod weighted_round_tests {
             assert!(
                 matches!(
                     result,
-                    Err(crate::Error::Sharing(SharingError::InvalidWeight {
+                    Err(Error::Sharing(SharingError::InvalidWeight {
                         channel_id: 999,
                         weight: 2
                     }))
@@ -4320,7 +4546,7 @@ mod weighted_round_tests {
             assert!(
                 matches!(
                     result,
-                    Err(crate::Error::Sharing(SharingError::InvalidWeight {
+                    Err(Error::Sharing(SharingError::InvalidWeight {
                         channel_id: GROUP_CHANNEL,
                         ..
                     }))
@@ -4363,7 +4589,7 @@ mod weighted_round_tests {
             assert!(
                 matches!(
                     result,
-                    Err(crate::Error::Sharing(SharingError::InvalidWeight {
+                    Err(Error::Sharing(SharingError::InvalidWeight {
                         channel_id: 41,
                         weight: 0
                     }))
@@ -4457,7 +4683,7 @@ mod weighted_round_tests {
         channels
             .load(
                 SECRET_ID,
-                crate::protocol::types::ChannelQuery::Helper {
+                ChannelQuery::Helper {
                     channel_id: ChannelId(channel),
                 },
             )
@@ -4513,9 +4739,8 @@ mod weighted_round_tests {
             .expect("the owner keeps a tracking share per dispatched helper")
             .bytes
             .clone();
-        let committed =
-            derec_proto::CommittedDeRecShare::decode(bytes.as_slice()).expect("committed share");
-        derec_proto::DeRecShare::decode(committed.de_rec_share.as_slice())
+        let committed = CommittedDeRecShare::decode(bytes.as_slice()).expect("committed share");
+        DeRecShare::decode(committed.de_rec_share.as_slice())
             .expect("derec share")
             .subshares
             .len()
@@ -4596,7 +4821,7 @@ mod weighted_round_tests {
                     .start(DeRecFlow::VerifyShares {
                         secret_id: SECRET_ID,
                         version: 1,
-                        target: crate::protocol::types::Target::Single(ChannelId(channel)),
+                        target: Target::Single(ChannelId(channel)),
                     })
                     .await
                     .expect("verification starts");
@@ -4699,7 +4924,7 @@ mod weighted_round_tests {
                 .with_share_store(InMemShareStore::default())
                 .with_secret_store(secrets_store)
                 .with_user_secret_store(InMemUserSecretStore::default())
-                .with_transport(crate::protocol::tests::FailingTransport)
+                .with_transport(FailingTransport)
                 .with_state_store(InMemPersistedStateStore::default())
                 .with_own_transports(["https://owner.example.com"])
                 .with_threshold(3)
@@ -4778,11 +5003,11 @@ mod weighted_round_tests {
         });
     }
 
-    fn assert_invalid_weight(result: crate::Result<Vec<DeRecEvent>>, channel_id: u64, weight: u32) {
+    fn assert_invalid_weight(result: Result<Vec<DeRecEvent>>, channel_id: u64, weight: u32) {
         assert!(
             matches!(
                 result,
-                Err(crate::Error::Sharing(SharingError::InvalidWeight { channel_id: c, weight: w }))
+                Err(Error::Sharing(SharingError::InvalidWeight { channel_id: c, weight: w }))
                     if c == channel_id && w == weight
             ),
             "expected InvalidWeight {{ {channel_id}, {weight} }}; got {:?}",
@@ -4904,7 +5129,7 @@ mod weighted_round_tests {
             assert!(
                 matches!(
                     result,
-                    Err(crate::Error::Sharing(SharingError::InvalidWeight {
+                    Err(Error::Sharing(SharingError::InvalidWeight {
                         channel_id: 51,
                         weight: 2
                     }))
@@ -4925,7 +5150,7 @@ mod weighted_round_tests {
                 .channels
                 .load(
                     SECRET_ID,
-                    crate::protocol::types::ChannelQuery::Helper {
+                    ChannelQuery::Helper {
                         channel_id: ChannelId(53),
                     },
                 )
@@ -4973,18 +5198,14 @@ mod weighted_round_tests {
                 .with_state_store(InMemPersistedStateStore::default())
                 .with_own_transports(["https://helper-53.example"])
                 .with_threshold(2)
-                .with_auto_accept(crate::protocol::AutoAcceptPolicy {
+                .with_auto_accept(AutoAcceptPolicy {
                     pairing: true,
                     ..Default::default()
                 })
                 .build()
                 .expect("helper builds");
             let contact = helper
-                .create_contact(
-                    Some(ChannelId(9393)),
-                    derec_proto::ContactMode::InlineKeys,
-                    None,
-                )
+                .create_contact(Some(ChannelId(9393)), ContactMode::InlineKeys, None)
                 .await
                 .expect("contact");
             rig.protocol
@@ -5017,7 +5238,7 @@ mod weighted_round_tests {
             assert!(
                 matches!(
                     err.source,
-                    crate::Error::Sharing(SharingError::InvalidWeight {
+                    Error::Sharing(SharingError::InvalidWeight {
                         channel_id: 51,
                         weight: 2
                     })
@@ -5211,8 +5432,7 @@ mod weighted_round_tests {
 
             // Restore reads the roster through its recoverable encoding, as a
             // recovered secret arrives.
-            let mut recovered = crate::protocol::types::Secret::decode(&roster.encode())
-                .expect("the roster decodes");
+            let mut recovered = Secret::decode(&roster.encode()).expect("the roster decodes");
             recovered.replicas = None;
             let mut restored = device(None, "https://restored").await;
             restored
@@ -5272,7 +5492,7 @@ mod weighted_round_tests {
             assert!(
                 matches!(
                     result,
-                    Err(crate::Error::Sharing(SharingError::TooManySubshares {
+                    Err(Error::Sharing(SharingError::TooManySubshares {
                         subshares: 4,
                         max: 3
                     }))
@@ -5362,7 +5582,7 @@ mod weighted_round_tests {
             assert!(
                 matches!(
                     result,
-                    Err(crate::Error::Sharing(SharingError::TooManySubshares {
+                    Err(Error::Sharing(SharingError::TooManySubshares {
                         subshares: 4,
                         max: 3
                     }))
@@ -5426,7 +5646,7 @@ mod weighted_round_tests {
             assert!(
                 matches!(
                     result,
-                    Err(crate::Error::Sharing(SharingError::TooManySubshares {
+                    Err(Error::Sharing(SharingError::TooManySubshares {
                         subshares: 3,
                         max: 2
                     }))
@@ -5476,14 +5696,11 @@ mod weighted_round_tests {
         match rig
             .protocol
             .state_store
-            .load(
-                SECRET_ID,
-                crate::protocol::types::StateKey::SharingRound { version },
-            )
+            .load(SECRET_ID, StateKey::SharingRound { version })
             .await
             .unwrap()
         {
-            Some(crate::protocol::types::StateItem::SharingRound(round)) => round.threshold,
+            Some(StateItem::SharingRound(round)) => round.threshold,
             other => panic!("no open round at v{version}: {other:?}"),
         }
     }
@@ -5492,7 +5709,7 @@ mod weighted_round_tests {
         rig: &mut ProtocolRig,
         weights: &[(u64, u32)],
         threshold: Option<u32>,
-    ) -> crate::Result<Vec<DeRecEvent>> {
+    ) -> Result<Vec<DeRecEvent>> {
         rig.protocol
             .start(DeRecFlow::ProtectSecret {
                 secrets: secrets(),
@@ -5633,7 +5850,7 @@ mod weighted_round_tests {
             let result = protect_at(&mut rig, &[], Some(4)).await;
 
             assert!(
-                matches!(result, Err(crate::Error::InvalidInput(_))),
+                matches!(result, Err(Error::InvalidInput(_))),
                 "got {:?}",
                 result.as_ref().map(|_| ())
             );
@@ -5660,7 +5877,7 @@ mod weighted_round_tests {
                 assert!(
                     matches!(
                         result,
-                        Err(crate::Error::Sharing(SharingError::InvalidThreshold { threshold, .. }))
+                        Err(Error::Sharing(SharingError::InvalidThreshold { threshold, .. }))
                             if threshold == t as usize
                     ),
                     "t = {t}: got {:?}",
@@ -5716,7 +5933,7 @@ mod weighted_round_tests {
                 .start(DeRecFlow::VerifyShares {
                     secret_id: SECRET_ID,
                     version: 1,
-                    target: crate::protocol::types::Target::Single(ChannelId(51)),
+                    target: Target::Single(ChannelId(51)),
                 })
                 .await
                 .expect("verification starts");

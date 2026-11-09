@@ -14,6 +14,7 @@
 
 import {
   ContactMode,
+  envelope,
   generate_replica_id,
   primitives,
   protocol_version,
@@ -290,6 +291,28 @@ export function runPrimitivesSmoke(): void {
 
   console.log("✓ Discovery flow passed.\n");
 
+  // Mirrors `run_envelope_trace_id_test` in `smoke-tests/rust/src/primitives.rs`.
+  console.log("=== [Primitives] Envelope trace_id helpers ===");
+
+  const traceKey = sharedKey(9);
+  const traced = primitives.discovery.request.produce(42n, traceKey);
+  const traceBefore = envelope.read_trace_id(traced.envelope);
+  if (traceBefore !== 0n) {
+    throw new Error(`a primitive envelope's default trace_id must be 0, got ${traceBefore}`);
+  }
+  const stamped = envelope.apply_trace_id(traced.envelope, 0xDEAD_BEEF_F00D_CAFEn);
+  const traceAfter = envelope.read_trace_id(stamped);
+  if (traceAfter !== 0xDEAD_BEEF_F00D_CAFEn) {
+    throw new Error(`trace_id must round-trip through apply + read, got ${traceAfter}`);
+  }
+  const { request: restamped } = primitives.discovery.request.extract(stamped, traceKey);
+  if (!restamped.timestamp) {
+    throw new Error("extract must still decode a re-stamped envelope");
+  }
+  console.log(`  default=0, apply/read round-trip 0x${traceAfter.toString(16)}, extract after re-stamp  ✓`);
+
+  console.log("✓ Envelope trace_id helpers passed.\n");
+
 
   console.log("=== [Primitives] Recovery Flow ===");
 
@@ -436,6 +459,35 @@ export function runPrimitivesSmoke(): void {
     hkContact.contact_message, prePairResp,
   );
   console.log(`  PrePair validated (mlkem=${validated.mlkem_encapsulation_key.length}B, ecies=${validated.ecies_public_key.length}B, nonce echoed)  ✓`);
+
+  // Moving the last byte of the ML-KEM key to the front of the ECIES key
+  // leaves the concatenated keys, and so the binding hash input, unchanged;
+  // the scanner refuses the split anyway.
+  {
+    const mlkem = prePairResp.mlkem_encapsulation_key!;
+    const ecies = prePairResp.ecies_public_key!;
+    const longer = new Uint8Array(ecies.length + 1);
+    longer[0] = mlkem[mlkem.length - 1]!;
+    longer.set(ecies, 1);
+    let splitRefused = false;
+    try {
+      primitives.pairing.response.process_pre_pair(hkContact.contact_message, {
+        ...prePairResp,
+        mlkem_encapsulation_key: mlkem.slice(0, mlkem.length - 1),
+        ecies_public_key: longer,
+      });
+    } catch (e) {
+      const code = String((e as { code: unknown }).code);
+      if (code !== "prepair_hash_mismatch") {
+        throw new Error(`process_pre_pair(keys split at another point): expected prepair_hash_mismatch, got ${code}`);
+      }
+      splitRefused = true;
+    }
+    if (!splitRefused) {
+      throw new Error("process_pre_pair must refuse keys split at another point");
+    }
+    console.log("  keys split at another point refused (prepair_hash_mismatch)  ✓");
+  }
 
 
   // Bob synthesizes a "filled-in" contact by copying the validated keys

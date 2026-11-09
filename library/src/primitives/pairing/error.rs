@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_cryptography::pairing::{DerecEncryptionError, DerecPairingError};
+use derec_proto::SenderKind;
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PairingError {
@@ -30,19 +33,21 @@ pub enum PairingError {
     )]
     FingerprintCommitmentMismatch,
 
+    /// The pairing outlived `Timeouts::pairing`: the contact, or the request
+    /// answering it, is older than the window. Pairing involves both parties,
+    /// so the remedy is to start again with a fresh contact or request.
+    #[error("pairing expired: {0}")]
+    Expired(&'static str),
+
     #[error(
         "replica-mode pairing (sender_kind={sender_kind:?}) missing the reserved `derec.replica_id` key"
     )]
-    MissingReplicaId {
-        sender_kind: derec_proto::SenderKind,
-    },
+    MissingReplicaId { sender_kind: SenderKind },
 
     #[error(
         "non-replica pairing (sender_kind={sender_kind:?}) carries the reserved `derec.replica_id` key"
     )]
-    UnexpectedReplicaId {
-        sender_kind: derec_proto::SenderKind,
-    },
+    UnexpectedReplicaId { sender_kind: SenderKind },
     #[error(
         "incompatible parameter range on `{field}`: local=[{local_min}, {local_max}], peer=[{peer_min}, {peer_max}]"
     )]
@@ -59,27 +64,27 @@ pub enum PairingError {
     #[error("failed to generate contact message key material")]
     ContactMessageKeygen {
         #[source]
-        source: derec_cryptography::pairing::DerecPairingError,
+        source: DerecPairingError,
     },
 
     #[error("failed to generate pairing request key material")]
     PairRequestKeygen {
         #[source]
-        source: derec_cryptography::pairing::DerecPairingError,
+        source: DerecPairingError,
     },
 
     #[error("failed to finalize pairing (initiator side)")]
     FinishPairingInitiator {
         #[source]
-        source: derec_cryptography::pairing::DerecPairingError,
+        source: DerecPairingError,
     },
 
     #[error("failed to finalize pairing (responder side)")]
     FinishPairingResponder {
         #[source]
-        source: derec_cryptography::pairing::DerecPairingError,
+        source: DerecPairingError,
     },
 
     #[error(transparent)]
-    PairingEncryption(#[from] derec_cryptography::pairing::DerecEncryptionError),
+    PairingEncryption(#[from] DerecEncryptionError),
 }

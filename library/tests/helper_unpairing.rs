@@ -15,6 +15,7 @@
 mod protocol_doubles;
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use derec_library::derec_message::{DeRecMessageBuilder, current_timestamp};
 use derec_library::protocol::types::{
@@ -27,7 +28,8 @@ use derec_library::protocol::{
 };
 use derec_library::types::{ChannelId, SharedKey};
 use derec_proto::{
-    DeRecResult, MessageBody, SenderKind, StatusEnum, TransportProtocol, UnpairResponseMessage,
+    DeRecResult, MessageBody, Protocol, SenderKind, StatusEnum, TransportProtocol,
+    UnpairResponseMessage,
 };
 use prost::Message as _;
 use protocol_doubles::{
@@ -57,7 +59,7 @@ fn key(channel_id: ChannelId) -> SharedKey {
 fn endpoint(channel_id: ChannelId) -> TransportProtocol {
     TransportProtocol {
         uri: format!("https://helper-{}.example.com/derec", channel_id.0),
-        protocol: derec_proto::Protocol::Https as i32,
+        protocol: Protocol::Https as i32,
     }
 }
 
@@ -124,8 +126,8 @@ impl Rig {
 }
 
 fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .expect("clock after the epoch")
         .as_secs()
 }

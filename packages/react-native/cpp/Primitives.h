@@ -34,9 +34,11 @@ struct ProcessFailureDetails {
   uint64_t channelId = 0;
 };
 
-/// As above, additionally attaching `channel_id` (a decimal string) when
-/// `process.hasChannelId` is set, and `events` (the JSON array verbatim)
-/// when `process.eventsJson` is non-empty. Only `process` produces these.
+/// As above, additionally attaching `events` (the JSON array verbatim) when
+/// `process.eventsJson` is non-empty, which only `process` produces.
+/// `channel_id` (a decimal string) is `process.channelId` when
+/// `process.hasChannelId` is set, else the error's own channel when it
+/// names one.
 [[noreturn]] void throwDeRecError(facebook::jsi::Runtime& rt,
                                   const DeRecError& error,
                                   const std::vector<uint8_t>& conflictingChannelIdsJson,

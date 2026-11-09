@@ -18,6 +18,7 @@
 //! compatible.
 
 use super::error::PairingError;
+use crate::Error;
 use derec_proto::ParameterRange;
 
 /// One `ParameterRange` field: its protocol name, a `(min, max)` accessor,
@@ -99,10 +100,10 @@ const FIELDS: &[Field] = &[
 /// A value of `0` means "no bound". For every field, `min` and `max` must be
 /// `>= 0`, and when `max != 0`, `min <= max`. Returns the first offending
 /// field as a [`crate::Error::InvalidInput`] naming it.
-pub(crate) fn validate(range: &ParameterRange) -> Result<(), crate::Error> {
+pub(crate) fn validate(range: &ParameterRange) -> Result<(), Error> {
     for field in FIELDS {
         if let Some(message) = field.malformed(range) {
-            return Err(crate::Error::InvalidInput(message));
+            return Err(Error::InvalidInput(message));
         }
     }
     Ok(())
@@ -258,7 +259,7 @@ mod tests {
 
     fn invalid_input_message(range: &ParameterRange) -> &'static str {
         match validate(range) {
-            Err(crate::Error::InvalidInput(msg)) => msg,
+            Err(Error::InvalidInput(msg)) => msg,
             other => panic!("expected InvalidInput, got {other:?}"),
         }
     }

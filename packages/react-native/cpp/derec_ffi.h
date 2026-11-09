@@ -106,6 +106,8 @@
 
 #define DEREC_CATEGORY_STATE_STORE 15
 
+#define DEREC_CATEGORY_TRANSPORT 16
+
 #define DEREC_CODE_OK 0
 
 #define DEREC_CODE_NON_OK_STATUS 1
@@ -246,6 +248,14 @@
  */
 #define DEREC_CODE_FINGERPRINT_COMMITMENT_MISMATCH 48
 
+/**
+ * The pairing outlived `Timeouts::pairing`: the scanner refuses a contact
+ * older than it, and the contact's creator refuses to accept a request
+ * that arrives after it. Surfaced as [`DEREC_CATEGORY_PAIRING`]; nothing is
+ * sent to the peer, and a fresh contact starts a new pairing.
+ */
+#define DEREC_CODE_PAIRING_EXPIRED 49
+
 #define DEREC_CODE_EMPTY_CHANNELS 60
 
 #define DEREC_CODE_DUPLICATE_CHANNEL_ID 61
@@ -311,6 +321,13 @@
  * cannot be told. `DEREC_CATEGORY_INVALID_INPUT`.
  */
 #define DEREC_CODE_NO_USABLE_ENDPOINT 121
+
+/**
+ * The application's transport delivered a message to none of the peer's
+ * endpoints: the `send` callback returned non-zero.
+ * `DEREC_CATEGORY_TRANSPORT`.
+ */
+#define DEREC_CODE_TRANSPORT_SEND_FAILED 123
 
 /**
  * Return codes for [`crate::interop::ffi::protocol::stores::ShareStoreCallbacks::save`]
@@ -494,6 +511,14 @@ typedef struct DeRecError {
    * Valid when `code == DEREC_CODE_VERSION_MISMATCH`.
    */
   uint32_t got;
+  /**
+   * Whether `channel_id` is set: the error names the channel it is about.
+   */
+  bool has_channel_id;
+  /**
+   * The channel the error is about. Valid when `has_channel_id`.
+   */
+  uint64_t channel_id;
 } DeRecError;
 
 typedef struct DeRecBuffer {
@@ -556,6 +581,20 @@ typedef struct ReadTraceIdResult {
    */
   uint64_t trace_id;
 } ReadTraceIdResult;
+
+typedef struct MessageIdResult {
+  struct DeRecError error;
+  /**
+   * SHA-256 of the envelope's encrypted `message` field (32 bytes). Empty
+   * on error.
+   */
+  struct DeRecBuffer id;
+  /**
+   * The envelope's send time, in seconds since the Unix epoch. Zero on
+   * error.
+   */
+  uint64_t timestamp;
+} MessageIdResult;
 
 /**
  * Result of a message JSON codec call. `bytes` is UTF-8 JSON for
@@ -1430,6 +1469,19 @@ struct ReadTraceIdResult read_trace_id_from_envelope(const uint8_t *envelope_ptr
                                                      size_t envelope_len);
 
 /**
+ * Identify an envelope for replay and reflection detection: the same `id`
+ * for every copy of one message, whatever its unauthenticated cleartext
+ * fields say, and a different one for every other message.
+ *
+ * Mirrors [`crate::derec_message::message_id`].
+ *
+ * # Safety
+ *
+ * `envelope_ptr` must point to a readable byte range of length `envelope_len`.
+ */
+struct MessageIdResult message_id_from_envelope(const uint8_t *envelope_ptr, size_t envelope_len);
+
+/**
  * Releases the owned strings carried by a [`DeRecError`]. After
  * returning, `error.message` and `error.peer_memo` are both null —
  * an accidental second call is a safe no-op.
@@ -1804,6 +1856,8 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *     "inbound_message_secs": 300,
  *     "sharing_round_secs": 60,
  *     "unpair_ack_secs": 60,
+ *     "get_share_response_secs": 300,
+ *     "pairing_secs": 30,
  *     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
  *   },
  *   "unsafe_connection": false,

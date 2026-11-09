@@ -421,14 +421,71 @@ func TestDecodeEvents_RecoveryShareReceived(t *testing.T) {
 	}
 }
 
-func TestDecodeEvents_RecoveryShareError(t *testing.T) {
+func TestDecodeEvents_RecoveryConflict(t *testing.T) {
 	ev := decodeOne(t, `{
-		"type": "RecoveryShareError",
-		"channel_id": "11",
-		"shares_received": 2,
-		"error": "corrupted share"
+		"type": "RecoveryConflict",
+		"version": 4,
+		"candidates": [
+			{"secret": {"helpers": [], "secrets": [{"id": [1], "name": "a", "data": [2]}]},
+			 "supported_by": [{"channel_id": "11", "communication_info": {"name": "alice"}}, {"channel_id": "18446744073709551615"}]},
+			{"secret": {"helpers": [], "secrets": []}, "supported_by": [{"channel_id": "12"}]}
+		],
+		"disputed_by": [{"channel_id": "13", "communication_info": {"name": "erin"}}]
 	}`)
-	if ev.Type != EventTypeRecoveryShareError || ev.SharesReceived != 2 || ev.Error != "corrupted share" {
+	if ev.Type != EventTypeRecoveryConflict || ev.Version == nil || *ev.Version != 4 || len(ev.Candidates) != 2 {
+		t.Fatalf("got %+v", ev)
+	}
+	first := ev.Candidates[0]
+	if len(first.SupportedBy) != 2 || first.SupportedBy[0].ChannelID != 11 ||
+		first.SupportedBy[0].CommunicationInfo["name"] != "alice" ||
+		first.SupportedBy[1].ChannelID != 18446744073709551615 || first.SupportedBy[1].CommunicationInfo != nil ||
+		len(first.Secret.Secrets) != 1 || first.Secret.Secrets[0].Name != "a" {
+		t.Fatalf("candidate 0: got %+v", first)
+	}
+	if len(ev.Candidates[1].SupportedBy) != 1 || ev.Candidates[1].SupportedBy[0].ChannelID != 12 {
+		t.Fatalf("candidate 1: got %+v", ev.Candidates[1])
+	}
+	if len(ev.DisputedBy) != 1 || ev.DisputedBy[0].ChannelID != 13 || ev.DisputedBy[0].CommunicationInfo["name"] != "erin" {
+		t.Fatalf("disputed_by: got %+v", ev.DisputedBy)
+	}
+}
+
+func TestDecodeEvents_RecoveryDisputed(t *testing.T) {
+	ev := decodeOne(t, `{
+		"type": "RecoveryDisputed",
+		"version": 5,
+		"secret": {"helpers": [], "secrets": [{"id": [1], "name": "a", "data": [2]}]},
+		"supported_by": [{"channel_id": "11"}, {"channel_id": "12"}],
+		"disputed_by": [{"channel_id": "18446744073709551615", "communication_info": {"name": "heidi"}}]
+	}`)
+	if ev.Type != EventTypeRecoveryDisputed || ev.Version == nil || *ev.Version != 5 ||
+		ev.Secret == nil || len(ev.Secret.Secrets) != 1 || ev.Secret.Secrets[0].Name != "a" {
+		t.Fatalf("got %+v", ev)
+	}
+	if len(ev.SupportedBy) != 2 || ev.SupportedBy[0].ChannelID != 11 || ev.SupportedBy[1].ChannelID != 12 {
+		t.Fatalf("supported_by: got %+v", ev.SupportedBy)
+	}
+	if len(ev.DisputedBy) != 1 || ev.DisputedBy[0].ChannelID != 18446744073709551615 ||
+		ev.DisputedBy[0].CommunicationInfo["name"] != "heidi" {
+		t.Fatalf("disputed_by: got %+v", ev.DisputedBy)
+	}
+}
+
+// A helper that advertised no communication info is written without the
+// key, as RecoveryHelperWire skips an empty map.
+func TestRecoveryHelper_EmptyCommunicationInfoOmitted(t *testing.T) {
+	out, err := json.Marshal(RecoveryHelper{ChannelID: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != `{"channel_id":"7"}` {
+		t.Fatalf("got %s", out)
+	}
+}
+
+func TestDecodeEvents_RecoveryIncomplete(t *testing.T) {
+	ev := decodeOne(t, `{"type": "RecoveryIncomplete", "secret_id": "9", "version": 4, "shares_received": 1}`)
+	if ev.Type != EventTypeRecoveryIncomplete || ev.SecretID != 9 || ev.Version == nil || *ev.Version != 4 || ev.SharesReceived != 1 {
 		t.Fatalf("got %+v", ev)
 	}
 }
@@ -448,7 +505,7 @@ func TestDecodeEvents_RecoveryShareRefused(t *testing.T) {
 }
 
 func TestDecodeEvents_RecoveryShareCorrupted(t *testing.T) {
-	for _, reason := range []string{CorruptionReasonMalformed, CorruptionReasonInvalidProof, CorruptionReasonInconsistent} {
+	for _, reason := range []string{CorruptionReasonMalformed, CorruptionReasonInvalidProof, CorruptionReasonForged} {
 		ev := decodeOne(t, `{
 			"type": "RecoveryShareCorrupted",
 			"channel_id": "18446744073709551615",

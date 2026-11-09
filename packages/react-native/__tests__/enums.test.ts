@@ -66,13 +66,14 @@ const NAME_UNIONS: Record<string, Record<string, true>> = {
     Expired: true,
     TimestampMismatch: true,
     StaleResponse: true,
+    Superseded: true,
   } satisfies Record<IgnoreReason, true>,
   NotRestoredReason: { NoTransports: true } satisfies Record<NotRestoredReason, true>,
   VerifyFailureReason: { NoSharedKey: true, NoProof: true, DispatchFailed: true } satisfies Record<
     VerifyFailureReason,
     true
   >,
-  CorruptionReason: { Malformed: true, InvalidProof: true, Inconsistent: true } satisfies Record<
+  CorruptionReason: { Malformed: true, InvalidProof: true, Forged: true } satisfies Record<
     CorruptionReason,
     true
   >,
@@ -101,10 +102,12 @@ const NAME_UNIONS: Record<string, Record<string, true>> = {
     ShareVerifyRejected: true,
     SecretsDiscovered: true,
     RecoveryShareReceived: true,
-    RecoveryShareError: true,
     RecoveryShareRefused: true,
     RecoveryShareCorrupted: true,
     SecretRecovered: true,
+    RecoveryDisputed: true,
+    RecoveryConflict: true,
+    RecoveryIncomplete: true,
     Unpaired: true,
     UnpairRejected: true,
     PrePairRejected: true,

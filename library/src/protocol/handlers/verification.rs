@@ -7,12 +7,15 @@ use super::super::{
     VerifyFailureReason,
 };
 use super::NO_SHARE_FOR_VERSION;
-use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::derec_message::apply_trace_id;
+use crate::extensions::advertised_endpoints::reply_to_owned;
+use crate::extensions::channel_store::{ChannelStoreExt as _, send_channel_message};
 use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::extensions::verify_share_response::VerifyShareResponseExt as _;
 use crate::protocol::context::{Exchange, Local, Round};
 use crate::protocol::obligation::{deliver, refused, reported};
 use crate::protocol::stores::{StoreSet, Stores};
+use crate::protocol::types::ReplicaFilter;
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -24,8 +27,8 @@ use crate::{
     types::{ChannelId, SharedKey},
 };
 use derec_proto::{
-    DeRecResult, MessageBody, StatusEnum, StoreShareRequestMessage, VerifyShareRequestMessage,
-    VerifyShareResponseMessage,
+    DeRecResult, MessageBody, StatusEnum, StoreShareRequestMessage, TransportProtocol,
+    VerifyShareRequestMessage, VerifyShareResponseMessage,
 };
 use prost::Message;
 
@@ -137,9 +140,9 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 
     let roster = stores
         .channels
-        .replicas_matching(secret_id, crate::protocol::types::ReplicaFilter::default())
+        .replicas_matching(secret_id, ReplicaFilter::default())
         .await?;
-    let reply_to: Vec<derec_proto::TransportProtocol> = if roster.is_empty() {
+    let reply_to: Vec<TransportProtocol> = if roster.is_empty() {
         round.reply_to.to_vec()
     } else {
         vec![local.primary().clone()]
@@ -267,14 +270,14 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     let resp =
         verification_response::produce(channel_id, request, exchange.shared_key, &stored.share)?;
 
-    let envelope = crate::derec_message::apply_trace_id(&resp.envelope, exchange.trace_id)?;
+    let envelope = apply_trace_id(&resp.envelope, exchange.trace_id)?;
     let endpoint = stores
         .channels
         .resolve_response_endpoints(
             secret_id,
             channel_id,
             local.policy,
-            &crate::extensions::advertised_endpoints::reply_to_owned(request),
+            &reply_to_owned(request),
         )
         .await?;
     let sent = deliver(
@@ -318,7 +321,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     memo: &str,
 ) -> Result<()> {
     let (secret_id, channel_id) = (local.secret_id, exchange.channel_id);
-    crate::extensions::channel_store::send_channel_message(
+    send_channel_message(
         stores.channels,
         stores.transport,
         secret_id,
@@ -327,7 +330,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         exchange.shared_key,
         exchange.trace_id,
         local.policy,
-        &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        &reply_to_owned(request),
         exchange.obligation,
         status,
         memo,
@@ -502,7 +505,7 @@ async fn dispatch_all<S: StoreSet>(
     secret_id: u64,
     version: u32,
     keys: Vec<(ChannelId, SecretValue)>,
-    reply_to: &[derec_proto::TransportProtocol],
+    reply_to: &[TransportProtocol],
     round: &Round<'_>,
 ) -> Vec<DeRecEvent> {
     let mut events = Vec::with_capacity(keys.len());
@@ -604,7 +607,7 @@ async fn dispatch_one<S: StoreSet>(
     version: u32,
     channel_id: ChannelId,
     shared_key: &SharedKey,
-    reply_to: &[derec_proto::TransportProtocol],
+    reply_to: &[TransportProtocol],
     round: &Round<'_>,
 ) -> Result<()> {
     let endpoint = stores
@@ -622,7 +625,7 @@ async fn dispatch_one<S: StoreSet>(
             secret_id,
             StateItem::PendingVerification {
                 channel_id,
-                request: derec_proto::VerifyShareRequestMessage {
+                request: VerifyShareRequestMessage {
                     secret_id,
                     version,
                     nonce: msg.nonce,
@@ -633,7 +636,7 @@ async fn dispatch_one<S: StoreSet>(
         )
         .await?;
 
-    let envelope = crate::derec_message::apply_trace_id(&msg.envelope, round.trace_id)?;
+    let envelope = apply_trace_id(&msg.envelope, round.trace_id)?;
     stores.transport.send(&endpoint, envelope).await?;
     Ok(())
 }
@@ -641,7 +644,7 @@ async fn dispatch_one<S: StoreSet>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::tests::{StoreRig, run_async};
+    use crate::protocol::tests::{LocalFixture, StoreRig, run_async};
     use crate::protocol::types::Share;
 
     const SECRET_ID: u64 = 0x5E1F;
@@ -697,7 +700,7 @@ mod tests {
                 hash: Vec::new(),
                 timestamp: Some(current_timestamp()),
             };
-            let local = crate::protocol::tests::LocalFixture::new(SECRET_ID);
+            let local = LocalFixture::new(SECRET_ID);
             let events = handle(
                 &mut rig.stores(),
                 &local.local(),
@@ -744,15 +747,18 @@ mod tests {
     /// and the owner reads that answer as [`DeRecEvent::ShareVerifyRejected`].
     mod helper_without_the_share {
         use super::*;
+        use crate::derec_message::extract_inner_message;
         use crate::protocol::tests::{
             InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
-            InMemUserSecretStore, RecordingTransport,
+            InMemUserSecretStore, LocalFixture, RecordingTransport,
         };
         use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel};
-        use crate::protocol::{AutoAcceptPolicy, DeRecChannelStore, DeRecProtocolBuilder};
-        use derec_proto::{DeRecMessage, SenderKind, TransportProtocol};
+        use crate::protocol::{
+            AutoAcceptPolicy, DeRecChannelStore, DeRecProtocol, DeRecProtocolBuilder,
+        };
+        use derec_proto::{DeRecMessage, Protocol, SenderKind, TransportProtocol};
 
-        type TestProto = crate::protocol::DeRecProtocol<
+        type TestProto = DeRecProtocol<
             InMemChannelStore,
             InMemShareStore,
             InMemSecretStore,
@@ -773,7 +779,7 @@ mod tests {
                         channel_id: CHANNEL,
                         transports: vec![TransportProtocol {
                             uri: "https://owner.example".to_owned(),
-                            protocol: derec_proto::Protocol::Https as i32,
+                            protocol: Protocol::Https as i32,
                         }],
                         communication_info: Default::default(),
                         status: ChannelStatus::Paired,
@@ -806,9 +812,7 @@ mod tests {
             let envelopes = transport.sent_envelopes();
             assert_eq!(envelopes.len(), 1, "exactly one answer must be sent");
             let msg = DeRecMessage::decode(envelopes[0].as_slice()).expect("envelope decodes");
-            match crate::derec_message::extract_inner_message(&msg.message, &KEY)
-                .expect("inner message decrypts")
-            {
+            match extract_inner_message(&msg.message, &KEY).expect("inner message decrypts") {
                 MessageBody::VerifyShareResponse(r) => r,
                 other => panic!("expected VerifyShareResponse, got {other:?}"),
             }
@@ -848,7 +852,7 @@ mod tests {
                 )
                 .await
                 .expect("seed committed share");
-            let local = crate::protocol::tests::LocalFixture::new(SECRET_ID);
+            let local = LocalFixture::new(SECRET_ID);
             handle(
                 &mut rig.stores(),
                 &local.local(),
@@ -960,11 +964,14 @@ mod tests {
     /// error.
     mod record_verification_tests {
         use super::*;
-        use crate::protocol::Refusal;
+        use crate::Error;
+        use crate::derec_message::extract_inner_message;
+        use crate::protocol::obligation::respond_to_failure;
         use crate::protocol::tests::{
             InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemUserSecretStore,
             LocalFixture, RecordingTransport, RefusingShareStore, StoreRig,
         };
+        use crate::protocol::{DeRecSecretStore, Refusal, SecretValue, ShareStoreError};
         use derec_proto::{DeRecMessage, Protocol, TransportProtocol};
 
         const REC_SECRET_ID: u64 = 0xBEE5;
@@ -1046,9 +1053,7 @@ mod tests {
             shared_key: &SharedKey,
         ) -> VerifyShareResponseMessage {
             let envelope = DeRecMessage::decode(envelope_bytes).expect("decode response envelope");
-            match crate::derec_message::extract_inner_message(&envelope.message, shared_key)
-                .expect("decrypt response")
-            {
+            match extract_inner_message(&envelope.message, shared_key).expect("decrypt response") {
                 MessageBody::VerifyShareResponse(r) => r,
                 other => panic!("expected a VerifyShareResponse, got {other:?}"),
             }
@@ -1262,23 +1267,18 @@ mod tests {
                     )
                     .await;
                     assert!(
-                        matches!(
-                            outcome,
-                            Err(crate::Error::ShareStore(
-                                crate::protocol::ShareStoreError::Backend(_)
-                            ))
-                        ),
+                        matches!(outcome, Err(Error::ShareStore(ShareStoreError::Backend(_)))),
                         "the flow itself leaves the failure to the router; got {outcome:?}"
                     );
                     assert!(rig.transport.sent_envelopes().is_empty());
 
                     // The paired channel's key is in the secret store. The token
                     // carries none: `reject` reads it from there.
-                    crate::protocol::DeRecSecretStore::save(
+                    DeRecSecretStore::save(
                         &mut rig.secrets,
                         REC_SECRET_ID,
                         REC_CHANNEL,
-                        crate::protocol::SecretValue::SharedKey(REC_KEY),
+                        SecretValue::SharedKey(REC_KEY),
                     )
                     .await
                     .expect("seed the channel key");
@@ -1316,7 +1316,7 @@ mod tests {
                             request,
                             local.local().policy,
                         );
-                        crate::protocol::obligation::respond_to_failure(
+                        respond_to_failure(
                             &mut rig.stores(),
                             &local.local(),
                             &answer,
@@ -1343,9 +1343,10 @@ mod tests {
     /// wrong or missing proof is reported rather than raised as an error.
     mod verdicts {
         use super::*;
+        use crate::protocol::tests::LocalFixture;
         use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel};
         use crate::protocol::{DeRecChannelStore, IgnoreReason, VerifyFailureReason};
-        use derec_proto::{ContactMessage, SenderKind, TransportProtocol};
+        use derec_proto::{ContactMessage, Protocol, SenderKind, TransportProtocol};
 
         const OTHER: ChannelId = ChannelId(22);
         const KEY: SharedKey = [0x3C; 32];
@@ -1354,7 +1355,7 @@ mod tests {
         fn endpoint(uri: &str) -> TransportProtocol {
             TransportProtocol {
                 uri: uri.to_owned(),
-                protocol: derec_proto::Protocol::Https as i32,
+                protocol: Protocol::Https as i32,
             }
         }
 
@@ -1482,7 +1483,7 @@ mod tests {
             rig: &mut StoreRig,
             response: VerifyShareResponseMessage,
         ) -> Result<Vec<DeRecEvent>> {
-            let local = crate::protocol::tests::LocalFixture::new(SECRET_ID);
+            let local = LocalFixture::new(SECRET_ID);
             handle(
                 &mut rig.stores(),
                 &local.local(),
@@ -1731,7 +1732,7 @@ mod tests {
                 seed_helper(&mut rig, CHANNEL, "https://no-proof.example").await;
                 seed_helper(&mut rig, OTHER, "https://with-proof.example").await;
                 seed_proof(&mut rig, OTHER).await;
-                let local = crate::protocol::tests::LocalFixture::new(SECRET_ID);
+                let local = LocalFixture::new(SECRET_ID);
 
                 let events = start(
                     &mut rig.stores(),

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_proto::PairRequestMessage;
+
+use crate::Error;
 use crate::primitives::pairing::PairingError;
 
 /// Structural validation for a decoded [`PairRequestMessage`], attached as a
@@ -27,11 +30,11 @@ pub(crate) trait PairRequestMessageExt {
     /// Says nothing about whether those endpoints are *acceptable* — that is
     /// [`TransportPolicy`](crate::transport::TransportPolicy)'s decision, made
     /// later against configuration this validator cannot see.
-    fn validate(&self) -> Result<(), crate::Error>;
+    fn validate(&self) -> Result<(), Error>;
 }
 
-impl PairRequestMessageExt for derec_proto::PairRequestMessage {
-    fn validate(&self) -> Result<(), crate::Error> {
+impl PairRequestMessageExt for PairRequestMessage {
+    fn validate(&self) -> Result<(), Error> {
         if self.mlkem_ciphertext.is_empty() {
             #[cfg(feature = "logging")]
             tracing::warn!("pair request missing mlkem_ciphertext");

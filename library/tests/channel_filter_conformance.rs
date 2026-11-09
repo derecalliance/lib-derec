@@ -17,6 +17,9 @@
 //! own helper to the same table. When they disagree, the fixture says which is
 //! wrong.
 
+use std::fmt::Debug;
+use std::fs;
+
 use derec_library::protocol::types::{ChannelFilter, ChannelStatus, ReplicaRole};
 use derec_library::types::{ChannelId, ReplicaId};
 use derec_proto::SenderKind;
@@ -26,7 +29,7 @@ fn fixture() -> serde_json::Value {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/channel_filter.json"
     );
-    let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+    let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parsing {path}: {e}"))
 }
 
@@ -74,7 +77,7 @@ fn run_section<Role, Id>(
     parse_role: impl Fn(&str) -> Role,
 ) where
     Role: PartialEq,
-    Id: PartialEq + std::fmt::Debug,
+    Id: PartialEq + Debug,
 {
     let doc = fixture();
     let records = doc[section]["records"]

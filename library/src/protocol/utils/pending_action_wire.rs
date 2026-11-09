@@ -43,6 +43,7 @@ use derec_proto::{
     UnpairRequestMessage, UpdateChannelInfoRequestMessage, VerifyShareRequestMessage,
 };
 use prost::Message;
+use std::collections::HashMap;
 
 const TAG_PAIRING: u8 = 0;
 const TAG_STORE_SHARE: u8 = 1;
@@ -239,7 +240,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
                 channel_id,
                 request,
                 kind,
-                peer_communication_info: std::collections::HashMap::new(),
+                peer_communication_info: HashMap::new(),
                 trace_id,
             })
         }

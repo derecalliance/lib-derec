@@ -13,6 +13,8 @@ use crate::{
     },
     primitives::pairing::request,
 };
+use derec_proto::ContactMode;
+use js_sys::BigInt;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -47,7 +49,7 @@ pub fn create_contact(
     transport_protocols: JsValue,
     nonce: JsValue,
 ) -> Result<JsValue, JsValue> {
-    let contact_mode = derec_proto::ContactMode::try_from(contact_mode as i32).map_err(|_| {
+    let contact_mode = ContactMode::try_from(contact_mode as i32).map_err(|_| {
         js_error(
             "invalid_contact_mode",
             format!("invalid contact_mode value: {contact_mode}"),
@@ -60,7 +62,7 @@ pub fn create_contact(
         None
     } else if nonce.is_bigint() {
         Some(
-            u64::try_from(js_sys::BigInt::from(nonce))
+            u64::try_from(BigInt::from(nonce))
                 .map_err(|e| js_error("invalid_nonce", format!("nonce out of u64 range: {e:?}")))?,
         )
     } else {

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use std::env;
 use std::sync::Arc;
 use tokio_postgres::{Client, NoTls};
+use uuid::Uuid;
 
 /// Migrations bundled into the binary at compile time. Adding a
 /// migration is two lines: drop a new `.sql` file under `migrations/`
@@ -50,7 +52,7 @@ impl Database {
     /// new schema, pin `search_path` to it for this connection, and
     /// apply every pending migration against it.
     pub async fn open_isolated() -> Self {
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_owned());
+        let url = env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_owned());
         let (client, connection) = tokio_postgres::connect(&url, NoTls)
             .await
             .unwrap_or_else(|e| {
@@ -65,7 +67,7 @@ impl Database {
             }
         });
 
-        let schema = format!("{SCHEMA_PREFIX}{}", uuid::Uuid::new_v4().simple());
+        let schema = format!("{SCHEMA_PREFIX}{}", Uuid::new_v4().simple());
         client
             .batch_execute(&format!(r#"CREATE SCHEMA "{schema}""#))
             .await
@@ -137,7 +139,7 @@ async fn apply_migrations(client: &Client) {
 /// invocations don't bloat the database. Errors are surfaced as
 /// panics — this is a smoke-test harness, not production code.
 pub async fn cleanup_stale_schemas() {
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_owned());
+    let url = env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_owned());
     let (client, connection) = tokio_postgres::connect(&url, NoTls)
         .await
         .unwrap_or_else(|e| {

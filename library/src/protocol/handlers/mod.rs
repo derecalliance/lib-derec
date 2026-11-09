@@ -37,9 +37,12 @@ pub(super) mod unpairing;
 pub(super) mod update_channel_info;
 pub(super) mod verification;
 
-use super::DeRecEvent;
+use super::{DeRecEvent, IgnoreReason};
+use crate::derec_message::{decrypt_inner_message, extract_inner_pairing_message};
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
+use crate::protocol::obligation;
+use crate::utils::verify_timestamps;
 use crate::{
     Error, Result,
     protocol::{
@@ -97,7 +100,7 @@ pub(super) async fn handle<S: StoreSet>(
     shared_key: &SharedKey,
     auto_respond_on_failure: bool,
 ) -> Result<Vec<DeRecEvent>> {
-    let plaintext = crate::derec_message::decrypt_inner_message(&message.message, shared_key)?;
+    let plaintext = decrypt_inner_message(&message.message, shared_key)?;
     // The sender holds the channel key, so a body that does not decode is
     // still a request owed an answer, though no request type can be named.
     let inner_message = match MessageBody::decode_from_vec(&plaintext) {
@@ -105,7 +108,7 @@ pub(super) async fn handle<S: StoreSet>(
         Err(error) => {
             let obligation =
                 Obligation::undecodable(channel_id, shared_key, message.trace_id, local.policy);
-            return Ok(crate::protocol::obligation::settle(
+            return Ok(obligation::settle(
                 stores,
                 local,
                 &obligation,
@@ -119,12 +122,10 @@ pub(super) async fn handle<S: StoreSet>(
     // The sender stamps the envelope and the inner message with one value.
     // A mismatch is dropped before any handler runs, so nothing is stored
     // and nothing, not even a failure response, is sent.
-    if crate::utils::verify_timestamps(message.timestamp, inner_message.timestamp().copied())
-        .is_err()
-    {
+    if verify_timestamps(message.timestamp, inner_message.timestamp().copied()).is_err() {
         return Ok(vec![DeRecEvent::MessageIgnored {
             channel_id,
-            reason: super::IgnoreReason::TimestampMismatch,
+            reason: IgnoreReason::TimestampMismatch,
             trace_id: message.trace_id,
         }]);
     }
@@ -224,14 +225,12 @@ pub(super) async fn handle<S: StoreSet>(
     };
 
     match &obligation {
-        Some(obligation) => Ok(crate::protocol::obligation::settle(
-            stores,
-            local,
-            obligation,
-            auto_respond_on_failure,
-            outcome,
-        )
-        .await),
+        Some(obligation) => {
+            Ok(
+                obligation::settle(stores, local, obligation, auto_respond_on_failure, outcome)
+                    .await,
+            )
+        }
         None => outcome,
     }
 }
@@ -248,8 +247,7 @@ pub(in crate::protocol) async fn handle_pairing<S: StoreSet>(
     channel_id: ChannelId,
     pairing_secret: &PairingSecretKeyMaterial,
 ) -> Result<Vec<DeRecEvent>> {
-    let inner =
-        crate::derec_message::extract_inner_pairing_message(&message.message, pairing_secret)?;
+    let inner = extract_inner_pairing_message(&message.message, pairing_secret)?;
 
     // Same single gate as the channel path: the endpoint a peer offers at
     // pairing is the one every later message to it is addressed to.
@@ -278,6 +276,8 @@ mod replica_id_discrimination_tests {
     use crate::protocol::tests::{StoreRig, run_async};
     use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel};
     use crate::types::ChannelId;
+    use derec_proto::{Protocol, SenderKind, TransportProtocol};
+    use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0xD15C;
 
@@ -295,12 +295,12 @@ mod replica_id_discrimination_tests {
                     SECRET_ID,
                     ChannelRecord::Helper(HelperChannel {
                         channel_id: ChannelId(9001),
-                        transports: vec![derec_proto::TransportProtocol {
+                        transports: vec![TransportProtocol {
                             uri: "https://helper.example".to_owned(),
-                            protocol: derec_proto::Protocol::Https as i32,
+                            protocol: Protocol::Https as i32,
                         }],
-                        communication_info: std::collections::HashMap::new(),
-                        peer_role: derec_proto::SenderKind::Helper,
+                        communication_info: HashMap::new(),
+                        peer_role: SenderKind::Helper,
                         status: ChannelStatus::Paired,
                         created_at: 0,
                         weight: 1,
@@ -344,6 +344,7 @@ mod replica_id_discrimination_tests {
 /// A channel message whose two copies disagree is dropped before dispatch.
 #[cfg(test)]
 mod timestamp_binding_tests {
+    use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::tests::{
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
@@ -354,20 +355,25 @@ mod timestamp_binding_tests {
         AutoAcceptPolicy, DeRecChannelStore as _, DeRecEvent, DeRecProtocol, DeRecSecretStore as _,
         IgnoreReason,
     };
-    use crate::types::ChannelId;
+    use crate::types::{ChannelId, SharedKey};
+    use crate::utils::now_secs;
+    use derec_proto::{
+        MessageBody, Protocol, SenderKind, TransportProtocol, UpdateChannelInfoRequestMessage,
+    };
     use prost::Message as _;
+    use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0x7153;
     const CHANNEL: ChannelId = ChannelId(4242);
-    const SHARED_KEY: crate::types::SharedKey = [5u8; 32];
+    const SHARED_KEY: SharedKey = [5u8; 32];
     const TRACE: u64 = 99;
     const ORIGINAL_URI: &str = "https://peer.example.com/derec";
     const MOVED_URI: &str = "https://moved.example.com/derec";
 
-    fn endpoint(uri: &str) -> derec_proto::TransportProtocol {
-        derec_proto::TransportProtocol {
+    fn endpoint(uri: &str) -> TransportProtocol {
+        TransportProtocol {
             uri: uri.to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         }
     }
 
@@ -378,10 +384,10 @@ mod timestamp_binding_tests {
                 ChannelRecord::Helper(HelperChannel {
                     channel_id: CHANNEL,
                     transports: vec![endpoint(ORIGINAL_URI)],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     status: ChannelStatus::Paired,
-                    created_at: crate::utils::now_secs(),
-                    peer_role: derec_proto::SenderKind::Helper,
+                    created_at: now_secs(),
+                    peer_role: SenderKind::Helper,
                     weight: 1,
                 }),
             )
@@ -426,12 +432,12 @@ mod timestamp_binding_tests {
         envelope_ts: prost_types::Timestamp,
         inner_ts: prost_types::Timestamp,
     ) -> Vec<u8> {
-        crate::derec_message::DeRecMessageBuilder::channel()
+        DeRecMessageBuilder::channel()
             .channel_id(CHANNEL)
             .timestamp(envelope_ts)
             .trace_id(TRACE)
-            .message_body(derec_proto::MessageBody::UpdateChannelInfoRequest(
-                derec_proto::UpdateChannelInfoRequestMessage {
+            .message_body(MessageBody::UpdateChannelInfoRequest(
+                UpdateChannelInfoRequestMessage {
                     communication_info: None,
                     supported_transports: vec![endpoint(MOVED_URI)],
                     timestamp: Some(inner_ts),
@@ -467,7 +473,7 @@ mod timestamp_binding_tests {
             seed(&mut c, &mut s).await;
             let secrets_before = secrets.data.lock().unwrap().len();
 
-            let envelope_ts = crate::derec_message::current_timestamp();
+            let envelope_ts = current_timestamp();
             let inner_ts = prost_types::Timestamp {
                 seconds: envelope_ts.seconds - 1,
                 nanos: envelope_ts.nanos,
@@ -504,7 +510,7 @@ mod timestamp_binding_tests {
             let (mut c, mut s) = (channels.clone(), secrets.clone());
             seed(&mut c, &mut s).await;
 
-            let ts = crate::derec_message::current_timestamp();
+            let ts = current_timestamp();
             let mut protocol = build(channels.clone(), secrets, transport.clone());
             let events = protocol
                 .process(&update_request(ts, ts))
@@ -534,6 +540,7 @@ mod timestamp_binding_tests {
 /// `replica_id` it writes into a body must not open the replica path there.
 #[cfg(test)]
 mod replica_channel_binding_tests {
+    use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
     use crate::primitives::sharing::request::SHARE_ALGORITHM_REPLICA_SECRET;
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::tests::{
@@ -549,8 +556,14 @@ mod replica_channel_binding_tests {
         DeRecUserSecretStore as _,
     };
     use crate::types::{ChannelId, ReplicaId, SharedKey};
-    use derec_proto::{DeRecResult, MessageBody, StatusEnum};
+    use crate::utils::now_secs;
+    use derec_proto::{
+        DeRecResult, GetSecretIdsVersionsResponseMessage, GetShareResponseMessage, MessageBody,
+        Protocol, SenderKind, StatusEnum, StoreShareRequestMessage, TransportProtocol,
+        UnpairRequestMessage,
+    };
     use prost::Message as _;
+    use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0xB1D0;
     const OWN_ID: u64 = 1;
@@ -561,10 +574,10 @@ mod replica_channel_binding_tests {
     const MEMBER: u64 = 7;
     const FORGED_HELPER: u64 = 777;
 
-    fn endpoint(uri: &str) -> derec_proto::TransportProtocol {
-        derec_proto::TransportProtocol {
+    fn endpoint(uri: &str) -> TransportProtocol {
+        TransportProtocol {
             uri: uri.to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         }
     }
 
@@ -593,10 +606,10 @@ mod replica_channel_binding_tests {
                 ChannelRecord::Helper(HelperChannel {
                     channel_id: HELPER_CHANNEL,
                     transports: vec![endpoint("https://helper.example")],
-                    communication_info: std::collections::HashMap::new(),
-                    peer_role: derec_proto::SenderKind::Helper,
+                    communication_info: HashMap::new(),
+                    peer_role: SenderKind::Helper,
                     status: ChannelStatus::Paired,
-                    created_at: crate::utils::now_secs(),
+                    created_at: now_secs(),
                     weight: 1,
                 }),
             )
@@ -617,10 +630,10 @@ mod replica_channel_binding_tests {
                     channel_id: GROUP_CHANNEL,
                     replica_id: ReplicaId(MEMBER),
                     transports: vec![endpoint("https://member.example")],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     role: ReplicaRole::Source,
                     status: ChannelStatus::Paired,
-                    created_at: crate::utils::now_secs(),
+                    created_at: now_secs(),
                 }),
             )
             .await
@@ -673,7 +686,7 @@ mod replica_channel_binding_tests {
                     channel_id: FORGED_HELPER,
                     transports: vec![endpoint("https://attacker.example")],
                     shared_key: vec![0xEE; 32],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     weight: 1,
                 }],
                 secrets: Vec::new(),
@@ -689,7 +702,7 @@ mod replica_channel_binding_tests {
     }
 
     fn catch_up_response(replica_id: u64, ts: prost_types::Timestamp) -> MessageBody {
-        MessageBody::GetShareResponse(derec_proto::GetShareResponseMessage {
+        MessageBody::GetShareResponse(GetShareResponseMessage {
             result: Some(DeRecResult {
                 status: StatusEnum::Ok as i32,
                 memo: String::new(),
@@ -708,8 +721,8 @@ mod replica_channel_binding_tests {
         key: &SharedKey,
         build: impl FnOnce(prost_types::Timestamp) -> MessageBody,
     ) -> Vec<u8> {
-        let ts = crate::derec_message::current_timestamp();
-        crate::derec_message::DeRecMessageBuilder::channel()
+        let ts = current_timestamp();
+        DeRecMessageBuilder::channel()
             .channel_id(channel_id)
             .timestamp(ts)
             .message_body(build(ts))
@@ -780,7 +793,7 @@ mod replica_channel_binding_tests {
         run_async(async {
             let mut rig = rig().await;
             let message = envelope(HELPER_CHANNEL, &HELPER_KEY, |ts| {
-                MessageBody::StoreShareRequest(derec_proto::StoreShareRequestMessage {
+                MessageBody::StoreShareRequest(StoreShareRequestMessage {
                     secret_id: SECRET_ID,
                     share: forged_payload(),
                     version: 2,
@@ -810,7 +823,7 @@ mod replica_channel_binding_tests {
         run_async(async {
             let mut rig = rig().await;
             let message = envelope(HELPER_CHANNEL, &HELPER_KEY, |ts| {
-                MessageBody::UnpairRequest(derec_proto::UnpairRequestMessage {
+                MessageBody::UnpairRequest(UnpairRequestMessage {
                     memo: String::new(),
                     timestamp: Some(ts),
                     reply_to_transports: Vec::new(),
@@ -827,17 +840,15 @@ mod replica_channel_binding_tests {
         run_async(async {
             let mut rig = rig().await;
             let message = envelope(HELPER_CHANNEL, &HELPER_KEY, |ts| {
-                MessageBody::GetSecretIdsVersionsResponse(
-                    derec_proto::GetSecretIdsVersionsResponseMessage {
-                        result: Some(DeRecResult {
-                            status: StatusEnum::Ok as i32,
-                            memo: String::new(),
-                        }),
-                        secret_list: Vec::new(),
-                        timestamp: Some(ts),
-                        replica_id: Some(MEMBER),
-                    },
-                )
+                MessageBody::GetSecretIdsVersionsResponse(GetSecretIdsVersionsResponseMessage {
+                    result: Some(DeRecResult {
+                        status: StatusEnum::Ok as i32,
+                        memo: String::new(),
+                    }),
+                    secret_list: Vec::new(),
+                    timestamp: Some(ts),
+                    replica_id: Some(MEMBER),
+                })
             });
             let result = rig.protocol.process(&message).await;
             assert!(result.is_err(), "expected a refusal, got {result:?}");

@@ -9,14 +9,23 @@
 //! string and acting on the comparison are the two halves here.
 
 use super::DeRecProtocol;
-use super::context::Round;
+use super::context::{Round, local};
+use super::stores::borrow_stores;
 use super::traits::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport,
     DeRecUserSecretStore,
 };
 use super::types::{SecretKind, SecretValue};
+use crate::derec_message;
 use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::primitives::pairing;
+use crate::protocol::handlers::pairing::claim_own_member;
+use crate::protocol::types::{
+    ChannelQuery, ChannelRecord, ChannelStatus, ReplicaFilter, ReplicaRole,
+};
+use crate::transport::TransportPolicy;
 use crate::{Error, Result, types::ChannelId};
+use derec_proto::TransportProtocol;
 
 impl<
     Ch: DeRecChannelStore,
@@ -50,7 +59,7 @@ impl<
             }
         };
 
-        Ok(crate::primitives::pairing::fingerprint(&shared_key))
+        Ok(pairing::fingerprint(&shared_key))
     }
 
     /// Verify that a fingerprint matches the one derived from a channel's shared key.
@@ -81,9 +90,12 @@ impl<
     /// removed with its key by expired-channel cleanup.
     ///
     /// A match promotes every row on the channel, not just the peer that was
-    /// confirmed: on a group channel that is every member and this device's
-    /// own row, so the whole group becomes usable at once and the roster stays
-    /// reconstructible from the stores.
+    /// confirmed: on a group channel that is every member, so the whole group
+    /// becomes usable at once and the roster stays reconstructible from the
+    /// stores. Confirming a replica pairing also writes this device's own
+    /// member row on the channel when it holds no `Paired` one yet: the first
+    /// confirmed replica pairing fixes the group's channel, and a device
+    /// already in a group keeps its own.
     ///
     /// On a promotion the current snapshot is published to the newly usable
     /// peer, because it was not an eligible target while `Pending` and the
@@ -117,32 +129,27 @@ impl<
         let mut transitioned_helper = false;
         if let Some(record) = self
             .channel_store
-            .load(
-                self.secret_id,
-                crate::protocol::types::ChannelQuery::Helper { channel_id },
-            )
+            .load(self.secret_id, ChannelQuery::Helper { channel_id })
             .await?
             && let Some(helper) = record.as_helper()
-            && helper.status == crate::protocol::types::ChannelStatus::Pending
+            && helper.status == ChannelStatus::Pending
         {
             let mut helper = helper.clone();
-            helper.status = crate::protocol::types::ChannelStatus::Paired;
+            helper.status = ChannelStatus::Paired;
             self.channel_store
-                .save(
-                    self.secret_id,
-                    crate::protocol::types::ChannelRecord::Helper(helper),
-                )
+                .save(self.secret_id, ChannelRecord::Helper(helper))
                 .await?;
             transitioned_helper = true;
         }
 
         let mut transitioned_replica = false;
+        let mut confirmed_peer_role = None;
         let members = self
             .channel_store
             .replicas_matching(
                 self.secret_id,
-                crate::protocol::types::ReplicaFilter {
-                    status: vec![crate::protocol::types::ChannelStatus::Pending],
+                ReplicaFilter {
+                    status: vec![ChannelStatus::Pending],
                     ..Default::default()
                 },
             )
@@ -151,18 +158,27 @@ impl<
             if member.channel_id != channel_id {
                 continue;
             }
-            if member.role == crate::protocol::types::ReplicaRole::Destination
-                && Some(member.replica_id.0) != self.replica_id
-            {
-                transitioned_replica = true;
+            if Some(member.replica_id.0) != self.replica_id {
+                confirmed_peer_role = Some(member.role);
+                if member.role == ReplicaRole::Destination {
+                    transitioned_replica = true;
+                }
             }
-            member.status = crate::protocol::types::ChannelStatus::Paired;
+            member.status = ChannelStatus::Paired;
             self.channel_store
-                .save(
-                    self.secret_id,
-                    crate::protocol::types::ChannelRecord::Replica(member),
-                )
+                .save(self.secret_id, ChannelRecord::Replica(member))
                 .await?;
+        }
+
+        // The first confirmed replica pairing fixes the group's channel.
+        if let Some(peer_role) = confirmed_peer_role {
+            claim_own_member(
+                &mut borrow_stores!(self),
+                &local!(self),
+                channel_id,
+                peer_role.counterparty(),
+            )
+            .await?;
         }
 
         if transitioned_replica || transitioned_helper {
@@ -175,7 +191,7 @@ impl<
                 None => None,
             };
             if let Some((secrets, description)) = payload {
-                let reply_to: Vec<derec_proto::TransportProtocol> = if self.auto_reply_to {
+                let reply_to: Vec<TransportProtocol> = if self.auto_reply_to {
                     self.own_transports.clone()
                 } else {
                     Vec::new()
@@ -187,7 +203,7 @@ impl<
                     None,
                     &Round {
                         reply_to: &reply_to,
-                        trace_id: crate::derec_message::fresh_trace_id(),
+                        trace_id: derec_message::fresh_trace_id(),
                     },
                 )
                 .await?;
@@ -202,8 +218,6 @@ impl<
     /// device's own `Pending` row, the channel key and the pairing material.
     /// `Paired` records are left in place.
     async fn revoke_pending_pairing(&mut self, channel_id: ChannelId) -> Result<()> {
-        use crate::protocol::types::{ChannelQuery, ChannelStatus, ReplicaFilter};
-
         if self
             .channel_store
             .load(self.secret_id, ChannelQuery::Helper { channel_id })
@@ -247,29 +261,35 @@ impl<
     /// that reaches it. Built from
     /// [`DeRecProtocolBuilder::with_unsafe_connection`](crate::protocol::DeRecProtocolBuilder::with_unsafe_connection); see
     /// [`TransportPolicy`](crate::transport::TransportPolicy).
-    pub(crate) fn transport_policy(&self) -> crate::transport::TransportPolicy {
-        crate::transport::TransportPolicy::new(self.unsafe_connection)
+    pub(crate) fn transport_policy(&self) -> TransportPolicy {
+        TransportPolicy::new(self.unsafe_connection)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::sharing::request;
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::tests::{
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
+    use crate::protocol::types::UserSecrets;
     use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, SecretValue};
+    use crate::types::ReplicaId;
     use crate::utils::now_secs;
+    use derec_proto::Protocol;
+    use derec_proto::SenderKind;
+    use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0xF1;
     const CHANNEL: ChannelId = ChannelId(77);
 
-    fn endpoint() -> derec_proto::TransportProtocol {
-        derec_proto::TransportProtocol {
+    fn endpoint() -> TransportProtocol {
+        TransportProtocol {
             uri: "https://helper.example.com".to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         }
     }
 
@@ -286,10 +306,10 @@ mod tests {
                 ChannelRecord::Helper(HelperChannel {
                     channel_id: CHANNEL,
                     transports: vec![endpoint()],
-                    communication_info: std::collections::HashMap::new(),
+                    communication_info: HashMap::new(),
                     status,
                     created_at: now_secs(),
-                    peer_role: derec_proto::SenderKind::Helper,
+                    peer_role: SenderKind::Helper,
                     weight: 1,
                 }),
             )
@@ -329,7 +349,7 @@ mod tests {
         channels
             .load(
                 SECRET_ID,
-                crate::protocol::types::ChannelQuery::Helper {
+                ChannelQuery::Helper {
                     channel_id: CHANNEL,
                 },
             )
@@ -419,9 +439,9 @@ mod tests {
                         SECRET_ID,
                         ChannelRecord::Replica(ReplicaMember {
                             channel_id: CHANNEL,
-                            replica_id: crate::types::ReplicaId(id),
+                            replica_id: ReplicaId(id),
                             transports: vec![endpoint()],
-                            communication_info: std::collections::HashMap::new(),
+                            communication_info: HashMap::new(),
                             role,
                             status: ChannelStatus::Pending,
                             created_at: now_secs(),
@@ -514,10 +534,10 @@ mod tests {
                     ChannelRecord::Helper(HelperChannel {
                         channel_id: OTHER,
                         transports: vec![endpoint()],
-                        communication_info: std::collections::HashMap::new(),
+                        communication_info: HashMap::new(),
                         status: ChannelStatus::Paired,
                         created_at: now_secs(),
-                        peer_role: derec_proto::SenderKind::Helper,
+                        peer_role: SenderKind::Helper,
                         weight: 1,
                     }),
                 )
@@ -531,7 +551,7 @@ mod tests {
             user_secrets
                 .save_latest(
                     SECRET_ID,
-                    crate::protocol::types::UserSecrets {
+                    UserSecrets {
                         version: 4,
                         secrets: Vec::new(),
                         description: None,
@@ -573,7 +593,7 @@ mod tests {
                 .sent_envelopes()
                 .iter()
                 .map(|envelope| {
-                    crate::primitives::sharing::request::extract(envelope, &[7u8; 32])
+                    request::extract(envelope, &[7u8; 32])
                         .expect("extract store-share request")
                         .request
                         .keep_version

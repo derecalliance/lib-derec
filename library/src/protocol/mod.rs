@@ -96,6 +96,7 @@ pub(crate) mod sweeps;
 pub(crate) mod tests;
 
 pub use builder::{DEFAULT_THRESHOLD, DeRecProtocolBuilder, DeRecStores};
+use derec_proto::ParameterRange;
 use derec_proto::TransportProtocol;
 pub use error::{
     ChannelStoreError, ProcessError, Refusal, SecretStoreError, ShareStoreError, StateStoreError,
@@ -117,13 +118,14 @@ pub use types::{
 
 pub use events::{
     AutoAcceptPolicy, CorruptionReason, DeRecEvent, DeRecFlow, FailedRequest, IgnoreReason,
-    NotRestoredReason, PendingAction, PendingActionKind, ReplyTarget, UnpairAck,
-    VerifyFailureReason,
+    NotRestoredReason, PendingAction, PendingActionKind, RecoveryCandidate, RecoveryHelper,
+    ReplyTarget, UnpairAck, VerifyFailureReason,
 };
 pub use handlers::restore::RestoreError;
 
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
+use crate::protocol::types::Timeouts;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
 
@@ -204,7 +206,7 @@ pub struct DeRecProtocol<
     threshold: usize,
     /// Configured via [`Timeouts`](crate::protocol::types::Timeouts).
     /// Configured via [`DeRecProtocolBuilder::with_timeouts`](crate::protocol::DeRecProtocolBuilder::with_timeouts).
-    pub(crate) timeouts: crate::protocol::types::Timeouts,
+    pub(crate) timeouts: Timeouts,
     /// Configured via [`DeRecProtocolBuilder::with_unsafe_connection`](crate::protocol::DeRecProtocolBuilder::with_unsafe_connection).
     pub(crate) unsafe_connection: bool,
     /// Configured via [`DeRecProtocolBuilder::with_communication_info`](crate::protocol::DeRecProtocolBuilder::with_communication_info).
@@ -244,7 +246,7 @@ pub struct DeRecProtocol<
     /// the peer's advertised range on inbound ones. `None` declares no
     /// constraints — every peer range is accepted and outbound
     /// envelopes omit the field.
-    pub(crate) parameter_range: Option<derec_proto::ParameterRange>,
+    pub(crate) parameter_range: Option<ParameterRange>,
     /// Configured via [`DeRecProtocolBuilder::with_max_subshares`](crate::protocol::DeRecProtocolBuilder::with_max_subshares).
     ///
     /// `Some(max)` bounds the total subshares of every sharing round;

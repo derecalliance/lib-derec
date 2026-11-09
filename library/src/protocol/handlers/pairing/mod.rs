@@ -45,23 +45,34 @@
 //! Absent `CommunicationInfo` implies no reserved entries; replica
 //! pairings are refused up-front by the missing-id check.
 
-use super::super::{DeRecChannelStore, DeRecEvent, now_secs};
+use super::super::{
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, IgnoreReason, SecretKind, SecretValue,
+    now_secs,
+};
+use crate::error_codes::classify;
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::contact_message::ContactMessageExt as _;
 use crate::extensions::sender_kind::SenderKindExt as _;
+use crate::primitives::pairing::request::check_parameter_range;
 use crate::protocol::context::{Local, PairingConfig};
 use crate::protocol::stores::{StoreSet, Stores};
+use crate::protocol::types::{ChannelQuery, ChannelStatus, ReplicaFilter, ReplicaRole};
+use crate::protocol::{PendingActionKind, obligation};
+use crate::types::ReplicaId;
 use crate::{
     Error, Result, primitives::pairing::PairingError, protocol::utils::reserved_keys,
     types::ChannelId,
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
+use derec_proto::communication_info_key_value::Value;
 use derec_proto::{
-    CommunicationInfo, ContactMessage, MessageBody, PairRequestMessage, SenderKind, StatusEnum,
-    TransportProtocol,
+    CommunicationInfo, CommunicationInfoKeyValue, ContactMessage, MessageBody, PairRequestMessage,
+    SenderKind, StatusEnum, TransportProtocol,
 };
+use prost_types::Timestamp;
 use std::collections::HashMap;
+use std::time::Duration;
 
 pub(in crate::protocol) mod pair;
 pub(in crate::protocol) mod pre_pair;
@@ -83,10 +94,19 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 ) -> Result<Vec<DeRecEvent>> {
     match message {
         MessageBody::PairRequest(request) => {
-            if let Err(err) = crate::primitives::pairing::request::check_parameter_range(
-                request,
-                pairing.parameter_range,
-            ) {
+            if let Some(events) = ignored_if_expired(
+                stores,
+                local,
+                pairing,
+                channel_id,
+                request.timestamp.as_ref(),
+                inbound_trace_id,
+            )
+            .await?
+            {
+                return Ok(events);
+            }
+            if let Err(err) = check_parameter_range(request, pairing.parameter_range) {
                 let memo = parameter_range_memo(&err);
                 return refuse(
                     stores,
@@ -131,12 +151,105 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
             pair::on_response(stores, local, pairing, channel_id, response, pairing_secret).await
         }
         MessageBody::PrePairRequest(request) => {
+            if let Some(events) = ignored_if_expired(
+                stores,
+                local,
+                pairing,
+                channel_id,
+                request.timestamp.as_ref(),
+                inbound_trace_id,
+            )
+            .await?
+            {
+                return Ok(events);
+            }
             pre_pair::on_request(channel_id, request, inbound_trace_id)
         }
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in pairing message",
         )),
     }
+}
+
+/// Why a pairing on `channel_id` can no longer go on, or `None` while it can.
+///
+/// The contact is judged by the timestamp this device wrote into it, read
+/// from its own stored copy, so its age is measured on this device's clock
+/// alone. The request is judged by its own timestamp. A missing timestamp,
+/// or no stored contact, cannot show the pairing is fresh and counts as
+/// expired.
+///
+/// An expired contact can never pair again, so its material is dropped here.
+/// An expired request leaves the contact in place: the scanner may start
+/// again on it.
+pub(in crate::protocol) async fn expiry<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    pairing: &PairingConfig<'_>,
+    channel_id: ChannelId,
+    request_timestamp: Option<&Timestamp>,
+) -> Result<Option<PairingError>> {
+    let contact_timestamp = match stores
+        .secrets
+        .load(local.secret_id, channel_id, SecretKind::PairingContact)
+        .await?
+    {
+        Some(SecretValue::PairingContact(contact)) => contact.timestamp,
+        _ => None,
+    };
+    if outlived(contact_timestamp.as_ref(), pairing.lifetime) {
+        stores
+            .secrets
+            .remove(local.secret_id, channel_id, SecretKind::PairingSecret)
+            .await?;
+        stores
+            .secrets
+            .remove(local.secret_id, channel_id, SecretKind::PairingContact)
+            .await?;
+        return Ok(Some(PairingError::Expired(
+            "the contact is older than the pairing lifetime",
+        )));
+    }
+    if outlived(request_timestamp, pairing.lifetime) {
+        return Ok(Some(PairingError::Expired(
+            "the pairing request is older than the pairing lifetime",
+        )));
+    }
+    Ok(None)
+}
+
+/// [`expiry`] for a request that just arrived: an expired one is reported as
+/// ignored, before the application is asked anything, and is not answered.
+pub(in crate::protocol) async fn ignored_if_expired<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    pairing: &PairingConfig<'_>,
+    channel_id: ChannelId,
+    request_timestamp: Option<&Timestamp>,
+    trace_id: u64,
+) -> Result<Option<Vec<DeRecEvent>>> {
+    let Some(_reason) = expiry(stores, local, pairing, channel_id, request_timestamp).await? else {
+        return Ok(None);
+    };
+    #[cfg(feature = "logging")]
+    tracing::warn!(
+        channel_id = channel_id.0,
+        reason = %_reason,
+        "pairing request ignored"
+    );
+    Ok(Some(vec![DeRecEvent::MessageIgnored {
+        channel_id,
+        reason: IgnoreReason::Expired,
+        trace_id,
+    }]))
+}
+
+/// Whether `timestamp` is missing or more than `lifetime` in the past.
+fn outlived(timestamp: Option<&Timestamp>, lifetime: Duration) -> bool {
+    timestamp.is_none_or(|ts| {
+        let created = u64::try_from(ts.seconds).unwrap_or(0);
+        now_secs().saturating_sub(created) > lifetime.as_secs()
+    })
 }
 
 /// The memo sent with an `INCOMPATIBLE_PARAMETER_RANGE` refusal.
@@ -186,13 +299,13 @@ async fn refuse<S: StoreSet>(
         channel_id,
         status: status as i32,
         memo: memo.to_owned(),
-        error_code: crate::error_codes::classify(error).1.name().to_owned(),
+        error_code: classify(error).1.name().to_owned(),
         message: error.to_string(),
     }];
     if let Some(error) = after {
-        events.push(crate::protocol::obligation::request_failed(
+        events.push(obligation::request_failed(
             channel_id,
-            crate::protocol::PendingActionKind::Pairing,
+            PendingActionKind::Pairing,
             true,
             status as i32,
             memo,
@@ -217,6 +330,13 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     trace_id: u64,
 ) -> Result<u64> {
     let replica_id_to_inject = require_replica_id_for_kind(kind, local.replica_id)?;
+
+    if contact.timestamp.is_none() {
+        return Err(PairingError::InvalidContactMessage("contact carries no timestamp").into());
+    }
+    if outlived(contact.timestamp.as_ref(), pairing.lifetime) {
+        return Err(PairingError::Expired("the contact is older than the pairing lifetime").into());
+    }
 
     let channel_id = ChannelId(contact.channel_id);
 
@@ -261,22 +381,16 @@ fn build_communication_info(
         .iter()
         .filter(|(k, _)| !is_reserved_key(k))
         .filter(|(_, v)| !v.trim().is_empty())
-        .map(|(k, v)| derec_proto::CommunicationInfoKeyValue {
+        .map(|(k, v)| CommunicationInfoKeyValue {
             key: k.to_owned(),
-            value: Some(
-                derec_proto::communication_info_key_value::Value::StringValue(v.to_owned()),
-            ),
+            value: Some(Value::StringValue(v.to_owned())),
         })
         .collect();
 
     if let Some(id) = replica_id_to_inject {
-        entries.push(derec_proto::CommunicationInfoKeyValue {
+        entries.push(CommunicationInfoKeyValue {
             key: reserved_keys::DEREC_REPLICA_ID_KEY.to_owned(),
-            value: Some(
-                derec_proto::communication_info_key_value::Value::StringValue(
-                    reserved_keys::encode_replica_id(id),
-                ),
-            ),
+            value: Some(Value::StringValue(reserved_keys::encode_replica_id(id))),
         });
     }
 
@@ -307,8 +421,7 @@ fn extract_communication_info(
     let mut peer_replica_id: Option<u64> = None;
 
     for e in &info.communication_info_entries {
-        let Some(derec_proto::communication_info_key_value::Value::StringValue(s)) = &e.value
-        else {
+        let Some(Value::StringValue(s)) = &e.value else {
             continue;
         };
         let trimmed = s.trim();
@@ -356,12 +469,16 @@ pub(in crate::protocol) fn own_communication_info(local: &Local<'_>) -> HashMap<
         .collect()
 }
 
-/// Write this device's own member row when it *initiates* a replica pairing.
+/// Record a pairing this device *initiates*, until its response arrives.
 ///
-/// The initiator knows its identity and role at `start`, and the peer's role is
-/// simply the counterpart — which is what lets the handshake proceed without
-/// recording anything about a peer whose `replica_id` has not arrived yet.
-/// Helper pairings write a [`HelperChannel`] placeholder instead, unchanged.
+/// Every kind writes the same `Pending` [`HelperChannel`] placeholder at the
+/// contact's channel, carrying the peer's role, the endpoints and the
+/// `communication_info` to record for it. That is all the response handler
+/// needs: the local kind is the counterpart of the peer's, and a replica
+/// peer's `replica_id`, unknown until the response, goes on the row written
+/// then. Nothing is put in the replica roster: a pairing in flight is not
+/// group membership, and this device's own row is written only when a
+/// replica pairing is confirmed (see [`claim_own_member`]).
 async fn persist_start_record<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -369,20 +486,8 @@ async fn persist_start_record<S: StoreSet>(
     peer_endpoints: Vec<TransportProtocol>,
     peer_communication_info: HashMap<String, String>,
     own_kind: SenderKind,
-    own_replica_id: Option<u64>,
 ) -> Result<()> {
-    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel};
-    if own_kind.is_replica() {
-        return persist_own_member(
-            stores,
-            local,
-            channel_id,
-            own_kind,
-            own_replica_id,
-            ChannelStatus::Pending,
-        )
-        .await;
-    }
+    use crate::protocol::types::{ChannelRecord, HelperChannel};
     stores
         .channels
         .save(
@@ -401,46 +506,39 @@ async fn persist_start_record<S: StoreSet>(
     Ok(())
 }
 
-/// Write this device's own row into the replica roster.
+/// Write this device's own row into the replica roster, on the group channel
+/// `channel_id`, as `role`.
 ///
-/// Both ends of a replica handshake do this — the initiator at `start`, the
-/// responder when it accepts — because the roster is absolute, not a view from
-/// one side. A group whose members cannot name themselves cannot be published.
-///
-/// Never called for helper pairings: a helper channel has exactly two ends and
-/// one record, so there is no self-row to write.
-async fn persist_own_member<S: StoreSet>(
+/// Called when a replica pairing is confirmed: the first confirmed pairing
+/// fixes the group's channel. A device that already holds a `Paired` own row
+/// is in a group, and keeps that row — a later pairing admits a joiner on an
+/// ephemeral channel, and moving this row onto it would redefine the group's
+/// channel, and with it the group key, on every admission. Any other own row
+/// is replaced.
+pub(in crate::protocol) async fn claim_own_member<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     channel_id: ChannelId,
-    own_kind: SenderKind,
-    own_replica_id: Option<u64>,
-    status: crate::protocol::types::ChannelStatus,
+    role: ReplicaRole,
 ) -> Result<()> {
-    use crate::protocol::types::{ChannelQuery, ChannelRecord, ReplicaMember, ReplicaRole};
-    let role = ReplicaRole::from_sender_kind(own_kind).ok_or(Error::Invariant(
-        "own member row requested for a non-replica pairing",
-    ))?;
-    let replica_id = own_replica_id
-        .ok_or(Error::ReplicaIdNotConfigured)
-        .and_then(crate::types::ReplicaId::try_from)?;
+    use crate::protocol::types::{ChannelRecord, ReplicaMember};
+    let replica_id = ReplicaId::try_from(local.replica_id.ok_or(Error::ReplicaIdNotConfigured)?)?;
 
-    // A device already in a group keeps the row it has. Its `channel_id` is
-    // the group's, and a later pairing mints an ephemeral channel for the
-    // *joiner* only — moving this row onto it would redefine the group's
-    // channel, and with it the group key, on every admission.
-    if stores
+    let holds_a_group = stores
         .channels
-        .load(
+        .replicas_matching(
             local.secret_id,
-            ChannelQuery::Replica {
-                channel_id,
-                replica_id,
+            ReplicaFilter {
+                ids: vec![replica_id],
+                status: vec![ChannelStatus::Paired],
+                ..Default::default()
             },
         )
         .await?
-        .is_some()
-    {
+        .into_iter()
+        .next()
+        .is_some();
+    if holds_a_group {
         return Ok(());
     }
 
@@ -454,7 +552,7 @@ async fn persist_own_member<S: StoreSet>(
                 transports: local.own_transports.to_vec(),
                 communication_info: own_communication_info(local),
                 role,
-                status,
+                status: ChannelStatus::Paired,
                 created_at: now_secs(),
             }),
         )
@@ -462,20 +560,37 @@ async fn persist_own_member<S: StoreSet>(
     Ok(())
 }
 
-async fn reject_start_on_paired_channel<S: StoreSet>(
+/// Refuse to start a pairing on a channel this device already uses.
+///
+/// The channel identifier is chosen by whoever created the contact, and a
+/// replica group's identifier travels in the clear on every envelope of the
+/// group. A channel is in use while it holds a key, while any replica member
+/// is recorded on it, or while a helper record on it is past `Pending`. A
+/// `Pending` helper record alone is an unfinished pairing on the same
+/// contact, which a new start replaces.
+async fn reject_start_on_channel_in_use<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     channel_id: ChannelId,
 ) -> Result<()> {
-    if let Some(record) = stores
+    let helper_in_use = stores
         .channels
-        .load(
-            local.secret_id,
-            crate::protocol::types::ChannelQuery::Helper { channel_id },
-        )
+        .load(local.secret_id, ChannelQuery::Helper { channel_id })
         .await?
-        && record.status() != crate::protocol::types::ChannelStatus::Pending
-    {
+        .is_some_and(|record| record.status() != ChannelStatus::Pending);
+    let replica_in_use = stores
+        .channels
+        .replicas_matching(local.secret_id, ReplicaFilter::default())
+        .await?
+        .iter()
+        .any(|member| member.channel_id == channel_id);
+    let key_in_use = stores
+        .secrets
+        .load(local.secret_id, channel_id, SecretKind::SharedKey)
+        .await?
+        .is_some();
+
+    if helper_in_use || replica_in_use || key_in_use {
         return Err(Error::ChannelAlreadyPaired { channel_id });
     }
     Ok(())
@@ -507,8 +622,8 @@ async fn replica_id_is_taken<S: StoreSet>(
         .channels
         .replicas_matching(
             local.secret_id,
-            crate::protocol::types::ReplicaFilter {
-                ids: vec![crate::types::ReplicaId(candidate)],
+            ReplicaFilter {
+                ids: vec![ReplicaId(candidate)],
                 ..Default::default()
             },
         )

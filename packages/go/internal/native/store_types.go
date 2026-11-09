@@ -370,7 +370,8 @@ type StateKey struct {
 //   - PendingRecovery: SecretID (the secret being recovered), Version,
 //     Shares (each entry a prost-encoded GetShareResponseMessage),
 //     ShareChannels (the channel each share arrived on, index-aligned with
-//     Shares).
+//     Shares), Pending (the helpers asked that have not answered yet),
+//     StartedAt (unix seconds at which the share requests went out).
 //   - PendingUnpair: ChannelID, StartedAt (unix seconds).
 //   - SharingRound: Version, Pending/Confirmed/Failed (channel-id sets),
 //     PendingReplicas/SyncedReplicas/BehindReplicas (replica-id sets),

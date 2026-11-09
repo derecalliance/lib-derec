@@ -25,6 +25,10 @@
 //! is recursive: `GetSecretIdsVersionsResponseMessage` nests `secret_id`
 //! inside `secret_list`, so a top-level-only pass would miss it.
 
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use std::slice;
+
 use crate::interop::dto;
 use crate::interop::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
 use crate::interop::ffi::error::{
@@ -94,25 +98,25 @@ const I64_RANGE_FIELDS: [&str; 10] = [
 ];
 
 /// Recursively rewrites the wide numeric fields to decimal strings.
-pub(crate) fn wide_numbers_to_strings(value: &mut serde_json::Value) {
+pub(crate) fn wide_numbers_to_strings(value: &mut Value) {
     match value {
-        serde_json::Value::Array(items) => {
+        Value::Array(items) => {
             for item in items {
                 wide_numbers_to_strings(item);
             }
         }
-        serde_json::Value::Object(object) => {
+        Value::Object(object) => {
             for (key, field) in object.iter_mut() {
                 if U64_ID_FIELDS.contains(&key.as_str())
                     && let Some(n) = field.as_u64()
                 {
-                    *field = serde_json::Value::String(n.to_string());
+                    *field = Value::String(n.to_string());
                     continue;
                 }
                 if I64_RANGE_FIELDS.contains(&key.as_str())
                     && let Some(n) = field.as_i64()
                 {
-                    *field = serde_json::Value::String(n.to_string());
+                    *field = Value::String(n.to_string());
                     continue;
                 }
                 wide_numbers_to_strings(field);
@@ -124,30 +128,30 @@ pub(crate) fn wide_numbers_to_strings(value: &mut serde_json::Value) {
 
 /// Reverse of [`wide_numbers_to_strings`]. A field already holding a JSON
 /// number is left untouched, so a host that never widened them still works.
-pub(crate) fn wide_numbers_to_numbers(value: &mut serde_json::Value) -> Result<(), String> {
+pub(crate) fn wide_numbers_to_numbers(value: &mut Value) -> Result<(), String> {
     match value {
-        serde_json::Value::Array(items) => {
+        Value::Array(items) => {
             for item in items {
                 wide_numbers_to_numbers(item)?;
             }
         }
-        serde_json::Value::Object(object) => {
+        Value::Object(object) => {
             for (key, field) in object.iter_mut() {
                 let is_u64 = U64_ID_FIELDS.contains(&key.as_str());
                 let is_i64 = I64_RANGE_FIELDS.contains(&key.as_str());
-                if let serde_json::Value::String(raw) = field {
+                if let Value::String(raw) = field {
                     if is_u64 {
                         let parsed: u64 = raw.parse().map_err(|e| {
                             format!("{key} must be a decimal u64 string, got {raw:?}: {e}")
                         })?;
-                        *field = serde_json::Value::Number(parsed.into());
+                        *field = Value::Number(parsed.into());
                         continue;
                     }
                     if is_i64 {
                         let parsed: i64 = raw.parse().map_err(|e| {
                             format!("{key} must be a decimal i64 string, got {raw:?}: {e}")
                         })?;
-                        *field = serde_json::Value::Number(parsed.into());
+                        *field = Value::Number(parsed.into());
                         continue;
                     }
                 }
@@ -313,7 +317,7 @@ fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], 
     if len == 0 {
         Ok(&[])
     } else {
-        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+        Ok(unsafe { slice::from_raw_parts(ptr, len) })
     }
 }
 
@@ -355,9 +359,9 @@ where
 fn encode_as<Proto, Dto>(json: &[u8], name: &str) -> DeRecMessageJsonResult
 where
     Proto: prost::Message + From<Dto>,
-    Dto: serde::de::DeserializeOwned,
+    Dto: DeserializeOwned,
 {
-    let mut value: serde_json::Value = match serde_json::from_slice(json) {
+    let mut value: Value = match serde_json::from_slice(json) {
         Ok(v) => v,
         Err(e) => return bad_proto(format!("{name} JSON is not valid JSON: {e}")),
     };
@@ -379,7 +383,12 @@ where
 mod tests {
     use super::*;
     use crate::interop::ffi::common::derec_free_buffer;
+    use derec_proto::{
+        GetSecretIdsVersionsResponseMessage, PairRequestMessage, ParameterRange,
+        UnpairRequestMessage, VerifyShareRequestMessage,
+    };
     use prost::Message as _;
+    use std::{fs, ptr};
 
     /// Every kind this FFI accepts, paired with the name
     /// `library/tests/fixtures/enums.json` records for it. The round-trip test
@@ -432,9 +441,8 @@ mod tests {
     #[test]
     fn fixture_matches_the_dispatch_table() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/enums.json");
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).expect("read fixture"))
-                .expect("parse fixture");
+        let doc: Value = serde_json::from_str(&fs::read_to_string(path).expect("read fixture"))
+            .expect("parse fixture");
         let variants = doc["enums"]["MessageKind"]["variants"]
             .as_array()
             .expect("fixture has MessageKind variants");
@@ -462,18 +470,17 @@ mod tests {
 
     fn take(result: DeRecMessageJsonResult) -> Vec<u8> {
         assert_eq!(result.error.code, 0, "unexpected FFI error");
-        let bytes =
-            unsafe { std::slice::from_raw_parts(result.bytes.ptr, result.bytes.len) }.to_vec();
+        let bytes = unsafe { slice::from_raw_parts(result.bytes.ptr, result.bytes.len) }.to_vec();
         derec_free_buffer(result.bytes.ptr, result.bytes.len);
         bytes
     }
 
-    fn decode(kind: i32, proto: &[u8]) -> serde_json::Value {
+    fn decode(kind: i32, proto: &[u8]) -> Value {
         let json = take(derec_decode_message_json(kind, proto.as_ptr(), proto.len()));
         serde_json::from_slice(&json).expect("decoded output is JSON")
     }
 
-    fn encode(kind: i32, json: &serde_json::Value) -> Vec<u8> {
+    fn encode(kind: i32, json: &Value) -> Vec<u8> {
         let bytes = serde_json::to_vec(json).unwrap();
         take(derec_encode_message_json(kind, bytes.as_ptr(), bytes.len()))
     }
@@ -497,7 +504,7 @@ mod tests {
     fn every_kind_is_listed() {
         // A kind outside the dispatch table must be rejected, which is what
         // makes ALL_KINDS a complete list rather than an arbitrary sample.
-        let result = derec_decode_message_json(ALL_KINDS.len() as i32, std::ptr::null(), 0);
+        let result = derec_decode_message_json(ALL_KINDS.len() as i32, ptr::null(), 0);
         assert_ne!(result.error.code, 0, "an unknown kind must be rejected");
         derec_free_buffer(result.bytes.ptr, result.bytes.len);
     }
@@ -506,7 +513,7 @@ mod tests {
     /// above 2^53 and must come back bit-for-bit.
     #[test]
     fn wide_ids_survive_as_decimal_strings() {
-        let message = derec_proto::VerifyShareRequestMessage {
+        let message = VerifyShareRequestMessage {
             secret_id: u64::MAX,
             version: 7,
             nonce: 9_007_199_254_740_993,
@@ -523,7 +530,7 @@ mod tests {
         assert_eq!(json["version"], serde_json::json!(7));
 
         let reencoded = encode(DEREC_MESSAGE_KIND_VERIFY_SHARE_REQUEST, &json);
-        let decoded = derec_proto::VerifyShareRequestMessage::decode(&reencoded[..]).unwrap();
+        let decoded = VerifyShareRequestMessage::decode(&reencoded[..]).unwrap();
         assert_eq!(decoded.secret_id, u64::MAX);
         assert_eq!(decoded.nonce, 9_007_199_254_740_993);
     }
@@ -534,7 +541,7 @@ mod tests {
     fn nested_secret_ids_are_widened() {
         use derec_proto::get_secret_ids_versions_response_message::{VersionList, version_list};
 
-        let message = derec_proto::GetSecretIdsVersionsResponseMessage {
+        let message = GetSecretIdsVersionsResponseMessage {
             result: None,
             secret_list: vec![VersionList {
                 secret_id: u64::MAX,
@@ -557,8 +564,7 @@ mod tests {
         );
 
         let reencoded = encode(DEREC_MESSAGE_KIND_GET_SECRET_IDS_VERSIONS_RESPONSE, &json);
-        let decoded =
-            derec_proto::GetSecretIdsVersionsResponseMessage::decode(&reencoded[..]).unwrap();
+        let decoded = GetSecretIdsVersionsResponseMessage::decode(&reencoded[..]).unwrap();
         assert_eq!(decoded.secret_list[0].secret_id, u64::MAX);
     }
 
@@ -566,13 +572,13 @@ mod tests {
     /// the WASM SDKs, so they cross this seam as strings too.
     #[test]
     fn parameter_range_bounds_are_widened() {
-        let message = derec_proto::PairRequestMessage {
+        let message = PairRequestMessage {
             sender_kind: 0,
             mlkem_ciphertext: vec![1, 2, 3],
             ecies_public_key: vec![4, 5, 6],
             nonce: 42,
             communication_info: None,
-            parameter_range: Some(derec_proto::ParameterRange {
+            parameter_range: Some(ParameterRange {
                 min_share_size: 1,
                 max_share_size: i64::MAX,
                 ..Default::default()
@@ -588,7 +594,7 @@ mod tests {
         );
 
         let reencoded = encode(DEREC_MESSAGE_KIND_PAIR_REQUEST, &json);
-        let decoded = derec_proto::PairRequestMessage::decode(&reencoded[..]).unwrap();
+        let decoded = PairRequestMessage::decode(&reencoded[..]).unwrap();
         assert_eq!(
             decoded.parameter_range.unwrap().max_share_size,
             i64::MAX,
@@ -607,7 +613,7 @@ mod tests {
             "timestamp": null,
         });
         let bytes = encode(DEREC_MESSAGE_KIND_VERIFY_SHARE_REQUEST, &json);
-        let decoded = derec_proto::VerifyShareRequestMessage::decode(&bytes[..]).unwrap();
+        let decoded = VerifyShareRequestMessage::decode(&bytes[..]).unwrap();
         assert_eq!(decoded.secret_id, 12);
         assert_eq!(decoded.nonce, 34);
     }
@@ -647,7 +653,7 @@ mod tests {
     /// convert a replica departure into an owner-originated unpair.
     #[test]
     fn unpair_replica_id_survives_the_round_trip() {
-        let message = derec_proto::UnpairRequestMessage {
+        let message = UnpairRequestMessage {
             memo: "leaving".to_owned(),
             timestamp: None,
             reply_to_transports: Vec::new(),
@@ -660,7 +666,7 @@ mod tests {
         );
 
         let reencoded = encode(DEREC_MESSAGE_KIND_UNPAIR_REQUEST, &json);
-        let decoded = derec_proto::UnpairRequestMessage::decode(&reencoded[..]).unwrap();
+        let decoded = UnpairRequestMessage::decode(&reencoded[..]).unwrap();
         assert_eq!(decoded.replica_id, Some(u64::MAX));
     }
 }

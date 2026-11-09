@@ -137,6 +137,24 @@ type Timeouts struct {
 	// UnpairAckSecs bounds the wait for an unpair acknowledgement before
 	// local channel state is dropped anyway. Default: 60.
 	UnpairAckSecs *uint64 `json:"unpair_ack_secs,omitempty"`
+	// GetShareResponseSecs bounds how long a recovery waits for a helper to
+	// answer its share request. A recovery decides only once every helper it
+	// asked has answered or this has elapsed since the requests went out; on
+	// expiry each silent helper is reported as RecoverSecretFailed and the
+	// recovery settles on the shares it holds. The budget is a human one
+	// when helpers approve share requests by hand. The same budget bounds a
+	// replica version check (FlowKindReplicaDiscovery): once it elapses, the
+	// check concludes on the versions already reported. Default: 300.
+	GetShareResponseSecs *uint64 `json:"get_share_response_secs,omitempty"`
+	// PairingSecs bounds how long a pairing stays possible: how old a
+	// contact may be when it is scanned or answered, and how old a pairing
+	// request may be when it is accepted. Both sides enforce it and nothing
+	// is sent on expiry: the scanner refuses an expired contact, and the
+	// creator ignores a request on one and refuses a late accept, with
+	// derec.CodePairingExpired. The remedy is to scan or share a fresh
+	// contact. A scanner's ExpiredChannels timeout should be at least this
+	// plus the time a response takes to arrive. Default: 30.
+	PairingSecs *uint64 `json:"pairing_secs,omitempty"`
 	// ExpiredChannels governs removal of channels still awaiting out-of-band
 	// fingerprint confirmation — every replica pairing, and every NoKeys
 	// pairing. Unlike the others it can be disabled, leaving the sweep to
@@ -393,6 +411,9 @@ func (p *DeRecProtocol) Process(message []byte) ([]Event, error) {
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
+		if channelID != nil {
+			derecErr.ChannelID = channelID
+		}
 		return nil, &ProcessError{ChannelID: channelID, Events: events, Err: derecErr}
 	}
 	return events, decodeErr
@@ -427,7 +448,9 @@ func (e *ProcessError) Unwrap() error {
 //
 // Timeouts are otherwise only evaluated by Process, so a publish whose
 // helpers all go quiet has nothing left to close it: the round stays open
-// and no SharingComplete is ever emitted. Call this from a scheduler — a
+// and no SharingComplete is ever emitted. A recovery waiting on a silent
+// helper is likewise decided only here once its timeout has passed. Call
+// this from a scheduler — a
 // time.Ticker, a cron job, a queue heartbeat — at an interval shorter than
 // the configured timeout.
 //

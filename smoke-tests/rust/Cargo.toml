@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
+derec-cryptography = { path = "../../cryptography" }
 derec-library = { path = "../../library" }
 derec-proto = { path = "../../protobufs" }
 prost = "0.14.4"

@@ -9,26 +9,34 @@
 //! `start` / `process` / `accept` / `reject` event-loop surface.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard};
+use std::{fmt, ptr, slice};
 
+use derec_proto::CommunicationInfo;
 use prost::Message as _;
+use serde_json::Value;
+use tokio::runtime::{Builder, Runtime};
 
+use crate::Error;
 use crate::extensions::communication_info::CommunicationInfoExt as _;
 use crate::interop::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_INVALID_ENUM, DEREC_CODE_FFI_NULL_PTR, DeRecError,
-    ffi_error, success,
+    ffi_error, from_lib_error, success,
 };
 use crate::interop::ffi::protocol::stores::{
     ChannelStoreCallbacks, DotnetChannelStore, DotnetSecretStore, DotnetShareStore,
     DotnetStateStore, DotnetTransport, DotnetUserSecretStore, SecretStoreCallbacks,
     ShareStoreCallbacks, StateStoreCallbacks, TransportCallbacks, UserSecretStoreCallbacks,
 };
-use crate::protocol::{DeRecProtocolBuilder, DeRecProtocolConfig};
+use crate::interop::protocol_names::unpair_ack_from_name;
+use crate::protocol::{DeRecProtocol, DeRecProtocolBuilder, DeRecProtocolConfig};
+use crate::transport::TransportProtocol;
 
 pub(in crate::interop::ffi) mod config;
 pub(in crate::interop::ffi) mod flow;
 pub(in crate::interop::ffi) mod pairing;
 
-pub(super) type Protocol = crate::protocol::DeRecProtocol<
+pub(super) type Protocol = DeRecProtocol<
     DotnetChannelStore,
     DotnetShareStore,
     DotnetSecretStore,
@@ -52,8 +60,8 @@ pub(super) type Protocol = crate::protocol::DeRecProtocol<
 /// holding the protocol lock across `block_on` also serializes runtime
 /// invocations on the current-thread executor.
 pub struct DeRecProtocolHandle {
-    pub(super) runtime: tokio::runtime::Runtime,
-    pub(super) inner: std::sync::Mutex<Protocol>,
+    pub(super) runtime: Runtime,
+    pub(super) inner: Mutex<Protocol>,
 }
 
 impl DeRecProtocolHandle {
@@ -62,7 +70,7 @@ impl DeRecProtocolHandle {
     /// the inner state — panicking across the FFI boundary is itself
     /// undefined behavior, so the poison-tolerant pattern is the right
     /// default here.
-    pub(super) fn lock_inner(&self) -> std::sync::MutexGuard<'_, Protocol> {
+    pub(super) fn lock_inner(&self) -> MutexGuard<'_, Protocol> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -78,15 +86,14 @@ impl DeRecProtocolHandle {
 pub(super) fn validate_transport(
     uri: &str,
     protocol: i32,
-) -> Result<crate::transport::TransportProtocol, DeRecError> {
+) -> Result<TransportProtocol, DeRecError> {
     let proto = derec_proto::TransportProtocol {
         uri: uri.to_owned(),
         protocol,
     };
     // `TryFrom` runs both the enum-discriminant check and the URI
     // structural validation; a single `?` covers both.
-    crate::transport::TransportProtocol::try_from(&proto)
-        .map_err(|e| crate::interop::ffi::error::from_lib_error(crate::Error::Transport(e)))
+    TransportProtocol::try_from(&proto).map_err(|e| from_lib_error(Error::Transport(e)))
 }
 
 /// Result type for [`derec_protocol_new`].
@@ -101,7 +108,7 @@ impl From<DeRecError> for DeRecProtocolNewResult {
     fn from(error: DeRecError) -> Self {
         Self {
             error,
-            handle: std::ptr::null_mut(),
+            handle: ptr::null_mut(),
         }
     }
 }
@@ -117,9 +124,7 @@ impl From<DeRecError> for DeRecProtocolNewResult {
 /// `DEREC_CODE_TRANSPORT_INVALID`. Every other malformed value is
 /// `DEREC_CODE_FFI_BAD_PROTO`.
 fn parse_config(json: &[u8]) -> Result<(u64, DeRecProtocolConfig), DeRecError> {
-    use serde_json::Value;
-
-    let not_valid = |e: &dyn std::fmt::Display| {
+    let not_valid = |e: &dyn fmt::Display| {
         ffi_error(
             DEREC_CODE_FFI_BAD_PROTO,
             format!("config_json is not valid: {e}"),
@@ -169,17 +174,17 @@ fn parse_config(json: &[u8]) -> Result<(u64, DeRecProtocolConfig), DeRecError> {
 /// code or a name but not one of [`crate::protocol::UnpairAck`]'s: `0` /
 /// `"required"` or `1` / `"not_required"`. `None` for a valid value, an
 /// absent one, or one of another JSON type, which fails to parse instead.
-fn unpair_ack_out_of_range(value: Option<&serde_json::Value>) -> Option<DeRecError> {
+fn unpair_ack_out_of_range(value: Option<&Value>) -> Option<DeRecError> {
     let shown = match value? {
-        serde_json::Value::Number(n) => {
+        Value::Number(n) => {
             let code = n.as_i64().and_then(|c| i32::try_from(c).ok())?;
             if code == 0 || code == 1 {
                 return None;
             }
             code.to_string()
         }
-        serde_json::Value::String(name) => {
-            if crate::interop::protocol_names::unpair_ack_from_name(name).is_some() {
+        Value::String(name) => {
+            if unpair_ack_from_name(name).is_some() {
                 return None;
             }
             format!("{name:?}")
@@ -234,6 +239,8 @@ fn unpair_ack_out_of_range(value: Option<&serde_json::Value>) -> Option<DeRecErr
 ///     "inbound_message_secs": 300,
 ///     "sharing_round_secs": 60,
 ///     "unpair_ack_secs": 60,
+///     "get_share_response_secs": 300,
+///     "pairing_secs": 30,
 ///     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
 ///   },
 ///   "unsafe_connection": false,
@@ -320,7 +327,7 @@ pub unsafe extern "C" fn derec_protocol_new(
     if config_json_ptr.is_null() {
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "config_json_ptr is null").into();
     }
-    let json_bytes = unsafe { std::slice::from_raw_parts(config_json_ptr, config_json_len) };
+    let json_bytes = unsafe { slice::from_raw_parts(config_json_ptr, config_json_len) };
     let (secret_id, mut config) = match parse_config(json_bytes) {
         Ok(parsed) => parsed,
         Err(e) => return e.into(),
@@ -425,8 +432,8 @@ unsafe fn decode_communication_info(
             "communication_info_ptr is null but length is non-zero",
         ));
     }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    match derec_proto::CommunicationInfo::decode(bytes) {
+    let bytes = unsafe { slice::from_raw_parts(ptr, len) };
+    match CommunicationInfo::decode(bytes) {
         Ok(c) => Ok(c.to_map()),
         Err(_) => Err(ffi_error(
             DEREC_CODE_FFI_BAD_PROTO,
@@ -473,22 +480,22 @@ unsafe fn construct_protocol(
     }
 
     let channel_store = DotnetChannelStore {
-        cb: unsafe { std::ptr::read(channel_store_cb) },
+        cb: unsafe { ptr::read(channel_store_cb) },
     };
     let secret_store = DotnetSecretStore {
-        cb: unsafe { std::ptr::read(secret_store_cb) },
+        cb: unsafe { ptr::read(secret_store_cb) },
     };
     let share_store = DotnetShareStore {
-        cb: unsafe { std::ptr::read(share_store_cb) },
+        cb: unsafe { ptr::read(share_store_cb) },
     };
     let user_secret_store = DotnetUserSecretStore {
-        cb: unsafe { std::ptr::read(user_secret_store_cb) },
+        cb: unsafe { ptr::read(user_secret_store_cb) },
     };
     let state_store = DotnetStateStore {
-        cb: unsafe { std::ptr::read(state_store_cb) },
+        cb: unsafe { ptr::read(state_store_cb) },
     };
     let transport = DotnetTransport {
-        cb: unsafe { std::ptr::read(transport_cb) },
+        cb: unsafe { ptr::read(transport_cb) },
     };
 
     let builder = DeRecProtocolBuilder::new(secret_id)
@@ -502,10 +509,10 @@ unsafe fn construct_protocol(
 
     let inner = match builder.build() {
         Ok(p) => p,
-        Err(e) => return crate::interop::ffi::error::from_lib_error(e).into(),
+        Err(e) => return from_lib_error(e).into(),
     };
 
-    let runtime = match tokio::runtime::Builder::new_current_thread().build() {
+    let runtime = match Builder::new_current_thread().build() {
         Ok(rt) => rt,
         Err(e) => {
             return ffi_error(
@@ -518,7 +525,7 @@ unsafe fn construct_protocol(
 
     let handle = Box::new(DeRecProtocolHandle {
         runtime,
-        inner: std::sync::Mutex::new(inner),
+        inner: Mutex::new(inner),
     });
     DeRecProtocolNewResult {
         error: success(),
@@ -529,20 +536,25 @@ unsafe fn construct_protocol(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interop::ffi::error::DEREC_CODE_TRANSPORT_INVALID;
+    use crate::interop::ffi::error::{DEREC_CODE_TRANSPORT_INVALID, derec_free_error};
     use crate::protocol::UnpairAck;
+    use crate::protocol::tests::{
+        InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+        InMemUserSecretStore, NoopTransport,
+    };
+    use std::ffi::CStr;
 
     /// The error's code and message, with the error released.
     fn take(mut err: DeRecError) -> (i32, String) {
         let message = if err.message.is_null() {
             String::new()
         } else {
-            unsafe { std::ffi::CStr::from_ptr(err.message) }
+            unsafe { CStr::from_ptr(err.message) }
                 .to_string_lossy()
                 .into_owned()
         };
         let code = err.code;
-        unsafe { crate::interop::ffi::error::derec_free_error(&mut err) };
+        unsafe { derec_free_error(&mut err) };
         (code, message)
     }
 
@@ -709,18 +721,18 @@ mod tests {
     fn communication_info_comes_from_exactly_one_source() {
         let config = parsed(r#"{"secret_id": "1", "communication_info": {"name": "alice"}}"#);
         let from_json =
-            unsafe { resolve_communication_info(config.communication_info, std::ptr::null(), 0) }
+            unsafe { resolve_communication_info(config.communication_info, ptr::null(), 0) }
                 .unwrap_or_else(|e| panic!("json map refused: {}", e.code));
         assert_eq!(from_json.get("name").map(String::as_str), Some("alice"));
 
         let mut map = HashMap::new();
         map.insert("name".to_owned(), "bob".to_owned());
-        let proto = derec_proto::CommunicationInfo::from_map(&map).encode_to_vec();
+        let proto = CommunicationInfo::from_map(&map).encode_to_vec();
         let from_proto = unsafe { resolve_communication_info(None, proto.as_ptr(), proto.len()) }
             .unwrap_or_else(|e| panic!("proto buffer refused: {}", e.code));
         assert_eq!(from_proto, map);
 
-        let neither = unsafe { resolve_communication_info(None, std::ptr::null(), 0) }
+        let neither = unsafe { resolve_communication_info(None, ptr::null(), 0) }
             .unwrap_or_else(|e| panic!("absent refused: {}", e.code));
         assert!(neither.is_empty());
 
@@ -731,22 +743,18 @@ mod tests {
         assert_eq!(code, DEREC_CODE_FFI_BAD_PROTO);
     }
 
-    type InMemProtocol = crate::protocol::DeRecProtocol<
-        crate::protocol::tests::InMemChannelStore,
-        crate::protocol::tests::InMemShareStore,
-        crate::protocol::tests::InMemSecretStore,
-        crate::protocol::tests::InMemUserSecretStore,
-        crate::protocol::tests::InMemStateStore,
-        crate::protocol::tests::NoopTransport,
+    type InMemProtocol = DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemStateStore,
+        NoopTransport,
     >;
 
     /// Builds through the same path as [`derec_protocol_new`], with the
     /// in-memory store doubles in place of the host's callback tables.
     fn build_from(json: &str) -> crate::Result<InMemProtocol> {
-        use crate::protocol::tests::{
-            InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
-            InMemUserSecretStore, NoopTransport,
-        };
         let (secret_id, config) = parse(json).unwrap_or_else(|(c, m)| panic!("{c}: {m}"));
         DeRecProtocolBuilder::new(secret_id)
             .with_channel_store(InMemChannelStore::default())
@@ -780,6 +788,8 @@ mod tests {
                     "inbound_message_secs": 300,
                     "sharing_round_secs": 60,
                     "unpair_ack_secs": 60,
+                    "get_share_response_secs": 300,
+                    "pairing_secs": 30,
                     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
                 },
                 "unsafe_connection": false,
@@ -810,7 +820,7 @@ mod tests {
     #[test]
     fn a_config_without_own_transports_does_not_build() {
         match build_from(r#"{"secret_id": "1"}"#) {
-            Err(crate::Error::InvalidInput(message)) => {
+            Err(Error::InvalidInput(message)) => {
                 assert!(message.contains("own transports"), "{message}")
             }
             Err(other) => panic!("expected InvalidInput, got {other:?}"),
@@ -828,7 +838,7 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("an invalid URI must not build"),
         };
-        let (code, _) = take(crate::interop::ffi::error::from_lib_error(err));
+        let (code, _) = take(from_lib_error(err));
         assert_eq!(code, DEREC_CODE_TRANSPORT_INVALID);
     }
 
@@ -836,7 +846,7 @@ mod tests {
     /// FFI path once a `secret_id` is added.
     #[test]
     fn the_shared_fixture_configs_build() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        let fixture: Value = serde_json::from_str(include_str!(
             "../../../../../tests/fixtures/protocol_config.json"
         ))
         .expect("fixture is JSON");

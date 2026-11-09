@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_proto::{DeRecResult, StatusEnum};
+
 /// The `status`/`memo` check every response carries, attached as a method
 /// the same way [`ContactMessageExt`] attaches structural validation to
 /// [`ContactMessage`].
@@ -35,16 +37,16 @@ pub(crate) trait DeRecResultExt {
         Self: Sized;
 }
 
-impl DeRecResultExt for derec_proto::DeRecResult {
+impl DeRecResultExt for DeRecResult {
     fn ok() -> Self {
         Self {
-            status: derec_proto::StatusEnum::Ok as i32,
+            status: StatusEnum::Ok as i32,
             memo: String::new(),
         }
     }
 
     fn validate<E>(&self, non_ok: impl FnOnce(i32, String) -> E) -> Result<(), E> {
-        if self.status == derec_proto::StatusEnum::Ok as i32 {
+        if self.status == StatusEnum::Ok as i32 {
             return Ok(());
         }
         #[cfg(feature = "logging")]
@@ -64,8 +66,8 @@ mod ok_tests {
     /// `ok()` is the answer `validate` accepts: Ok status, no memo.
     #[test]
     fn ok_is_an_ok_status_with_no_memo() {
-        let result = derec_proto::DeRecResult::ok();
-        assert_eq!(result.status, derec_proto::StatusEnum::Ok as i32);
+        let result = DeRecResult::ok();
+        assert_eq!(result.status, StatusEnum::Ok as i32);
         assert!(result.memo.is_empty());
         assert!(result.validate(|_, _| ()).is_ok());
     }
@@ -82,6 +84,7 @@ mod ok_tests {
 #[cfg(all(test, feature = "logging"))]
 mod trace_id_span_tests {
     use super::*;
+    use crate::primitives::discovery::DiscoveryError;
     use std::io;
     use std::sync::{Arc, Mutex};
 
@@ -122,13 +125,12 @@ mod trace_id_span_tests {
             let span = tracing::info_span!("handle", trace_id = TRACE_ID);
             let _entered = span.enter();
 
-            let result = derec_proto::DeRecResult {
-                status: derec_proto::StatusEnum::Fail as i32,
+            let result = DeRecResult {
+                status: StatusEnum::Fail as i32,
                 memo: "helper refused".to_owned(),
             };
-            let outcome = result.validate(|status, memo| {
-                crate::primitives::discovery::DiscoveryError::NonOkStatus { status, memo }
-            });
+            let outcome =
+                result.validate(|status, memo| DiscoveryError::NonOkStatus { status, memo });
             assert!(outcome.is_err(), "a non-Ok status must be rejected");
         });
 

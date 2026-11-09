@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::Error;
 use rand::Rng as _;
 use rand::rand_core::UnwrapErr;
 use rand::rngs::SysRng;
@@ -60,7 +61,7 @@ pub(crate) fn now_secs() -> u64 {
 pub(crate) fn verify_timestamps(
     envelope_timestamp: Option<prost_types::Timestamp>,
     timestamp: Option<prost_types::Timestamp>,
-) -> Result<(), crate::Error> {
+) -> Result<(), Error> {
     match (envelope_timestamp, timestamp) {
         (Some(envelope_ts), Some(inner_ts)) if envelope_ts == inner_ts => Ok(()),
         (None, None) => {
@@ -69,7 +70,7 @@ pub(crate) fn verify_timestamps(
                 "timestamp invariant violated: both envelope and inner timestamp absent"
             );
 
-            Err(crate::Error::Invariant(
+            Err(Error::Invariant(
                 "Envelope and request/response timestamps are both absent; absence cannot be used to satisfy the binding check",
             ))
         }
@@ -77,7 +78,7 @@ pub(crate) fn verify_timestamps(
             #[cfg(feature = "logging")]
             tracing::warn!("timestamp invariant violated");
 
-            Err(crate::Error::Invariant(
+            Err(Error::Invariant(
                 "Envelope timestamp does not match request/response timestamp",
             ))
         }
@@ -102,7 +103,7 @@ mod tests {
     fn rejects_mismatched_some_timestamps() {
         let res = verify_timestamps(Some(ts(1_700_000_000)), Some(ts(1_700_000_001)));
         match res {
-            Err(crate::Error::Invariant(msg)) => {
+            Err(Error::Invariant(msg)) => {
                 assert!(msg.contains("does not match"), "msg: {msg}")
             }
             other => panic!("expected Invariant mismatch, got {other:?}"),
@@ -113,7 +114,7 @@ mod tests {
     fn rejects_both_none() {
         let res = verify_timestamps(None, None);
         match res {
-            Err(crate::Error::Invariant(msg)) => {
+            Err(Error::Invariant(msg)) => {
                 assert!(
                     msg.contains("absent"),
                     "expected absence-specific message, got: {msg}"
@@ -126,12 +127,12 @@ mod tests {
     #[test]
     fn rejects_envelope_none() {
         let res = verify_timestamps(None, Some(ts(1_700_000_000)));
-        assert!(matches!(res, Err(crate::Error::Invariant(_))));
+        assert!(matches!(res, Err(Error::Invariant(_))));
     }
 
     #[test]
     fn rejects_inner_none() {
         let res = verify_timestamps(Some(ts(1_700_000_000)), None);
-        assert!(matches!(res, Err(crate::Error::Invariant(_))));
+        assert!(matches!(res, Err(Error::Invariant(_))));
     }
 }

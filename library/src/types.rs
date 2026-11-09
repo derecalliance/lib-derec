@@ -17,6 +17,10 @@
 //! contact data, the resulting identifier is **symmetric** — both the Owner and
 //! the Helper obtain the same value without additional coordination.
 
+use std::fmt;
+
+use crate::Error;
+
 /// Identifier of the secure communication channel between an Owner and a Helper.
 ///
 /// A `ChannelId` is established during the pairing flow and uniquely identifies
@@ -83,11 +87,11 @@ pub type WeightedChannel = (ChannelId, u32);
 pub struct ReplicaId(pub u64);
 
 impl TryFrom<u64> for ReplicaId {
-    type Error = crate::Error;
+    type Error = Error;
 
     fn try_from(value: u64) -> Result<Self, Self::Error> {
         if value == 0 {
-            return Err(crate::Error::InvalidInput(
+            return Err(Error::InvalidInput(
                 "replica_id 0 is reserved as the absent-value sentinel",
             ));
         }
@@ -107,8 +111,8 @@ impl PartialEq<u64> for ReplicaId {
     }
 }
 
-impl std::fmt::Display for ReplicaId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ReplicaId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }

@@ -13,6 +13,7 @@
 
 #![allow(dead_code)]
 
+use derec_library::Error;
 use derec_library::protocol::types::{
     ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
     ReplicaMember, SecretKind, SecretValue, Share, UserSecrets,
@@ -26,7 +27,9 @@ use derec_library::protocol::{
 use derec_library::types::ChannelId;
 use derec_proto::TransportProtocol;
 use std::collections::HashMap;
+use std::future::{self, Future};
 use std::sync::{Arc, Mutex};
+use tokio::runtime::Builder;
 
 /// Two maps, mirroring the two primary keys the trait defines, plus the
 /// channel-link graph recovery walks.
@@ -57,7 +60,7 @@ impl DeRecChannelStore for InMemChannelStore {
                 .cloned()
                 .map(ChannelRecord::Replica),
         };
-        Box::pin(std::future::ready(Ok(found)))
+        Box::pin(future::ready(Ok(found)))
     }
 
     fn save(&mut self, sid: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
@@ -75,7 +78,7 @@ impl DeRecChannelStore for InMemChannelStore {
                     .insert((sid, r.replica_id.0), r);
             }
         }
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 
     fn remove(&mut self, sid: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
@@ -93,7 +96,7 @@ impl DeRecChannelStore for InMemChannelStore {
                 .remove(&(sid, replica_id.0))
                 .is_some(),
         };
-        Box::pin(std::future::ready(Ok(removed)))
+        Box::pin(future::ready(Ok(removed)))
     }
 
     fn helpers(
@@ -110,7 +113,7 @@ impl DeRecChannelStore for InMemChannelStore {
             .map(|(_, c)| c.clone())
             .filter(|c| filter.matches(&c.channel_id, c.status, &c.peer_role))
             .collect();
-        Box::pin(std::future::ready(Ok(v)))
+        Box::pin(future::ready(Ok(v)))
     }
 
     fn replicas(
@@ -127,7 +130,7 @@ impl DeRecChannelStore for InMemChannelStore {
             .map(|(_, m)| m.clone())
             .filter(|m| filter.matches(&m.replica_id, m.status, &m.role))
             .collect();
-        Box::pin(std::future::ready(Ok(v)))
+        Box::pin(future::ready(Ok(v)))
     }
 
     fn link_channel(&mut self, sid: u64, a: ChannelId, b: ChannelId) -> ChannelStoreFuture<'_, ()> {
@@ -139,7 +142,7 @@ impl DeRecChannelStore for InMemChannelStore {
             }
         }
         drop(links);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 
     /// Transitive closure including the start node — the same walk a SQL
@@ -157,10 +160,7 @@ impl DeRecChannelStore for InMemChannelStore {
             }
         }
         drop(links);
-        Box::pin(std::future::ready(Ok(seen
-            .into_iter()
-            .map(ChannelId)
-            .collect())))
+        Box::pin(future::ready(Ok(seen.into_iter().map(ChannelId).collect())))
     }
 }
 
@@ -197,7 +197,7 @@ impl FlakyChannelStore {
 }
 
 fn channel_backend_error<T: Send + 'static>() -> ChannelStoreFuture<'static, T> {
-    Box::pin(std::future::ready(Err(ChannelStoreError::Backend(
+    Box::pin(future::ready(Err(ChannelStoreError::Backend(
         "channel store unavailable".into(),
     ))))
 }
@@ -282,7 +282,7 @@ impl DeRecSecretStore for InMemSecretStore {
             .unwrap()
             .get(&(sid, cid.0, kind as u8))
             .cloned();
-        Box::pin(std::future::ready(Ok(v)))
+        Box::pin(future::ready(Ok(v)))
     }
     fn load_many(
         &self,
@@ -302,12 +302,12 @@ impl DeRecSecretStore for InMemSecretStore {
         }
         drop(data);
         if missing_policy == MissingPolicy::Fail && !missing.is_empty() {
-            return Box::pin(std::future::ready(Err(SecretStoreError::MissingEntries {
+            return Box::pin(future::ready(Err(SecretStoreError::MissingEntries {
                 kind,
                 channel_ids: missing,
             })));
         }
-        Box::pin(std::future::ready(Ok(out)))
+        Box::pin(future::ready(Ok(out)))
     }
     fn save(&mut self, sid: u64, cid: ChannelId, value: SecretValue) -> SecretStoreFuture<'_, ()> {
         let k = match &value {
@@ -316,16 +316,16 @@ impl DeRecSecretStore for InMemSecretStore {
             SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
         };
         self.data.lock().unwrap().insert((sid, cid.0, k), value);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn remove(&mut self, sid: u64, cid: ChannelId, kind: SecretKind) -> SecretStoreFuture<'_, ()> {
         if *self.fail_remove.lock().unwrap() == Some(kind) {
-            return Box::pin(std::future::ready(Err(SecretStoreError::Backend(
+            return Box::pin(future::ready(Err(SecretStoreError::Backend(
                 "secret store unavailable".into(),
             ))));
         }
         self.data.lock().unwrap().remove(&(sid, cid.0, kind as u8));
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 }
 
@@ -348,7 +348,7 @@ impl DeRecShareStore for InMemShareStore {
             })
             .map(|(_, s)| s.clone())
             .collect();
-        Box::pin(std::future::ready(Ok(out)))
+        Box::pin(future::ready(Ok(out)))
     }
     /// Ordered by `(version, channel_id)`, so a caller that depends on which
     /// row arrives first fails reproducibly rather than intermittently.
@@ -368,7 +368,7 @@ impl DeRecShareStore for InMemShareStore {
             .map(|((_, c, _), share)| (*c, share.clone()))
             .collect();
         out.sort_by_key(|(c, share)| (share.version, *c));
-        Box::pin(std::future::ready(Ok(out
+        Box::pin(future::ready(Ok(out
             .into_iter()
             .map(|(_, share)| share)
             .collect())))
@@ -377,15 +377,15 @@ impl DeRecShareStore for InMemShareStore {
         self.load_many(sid, cids, &[])
     }
     fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
-        Box::pin(std::future::ready(Ok(None)))
+        Box::pin(future::ready(Ok(None)))
     }
     fn save(&mut self, sid: u64, cid: ChannelId, share: Share) -> ShareStoreFuture<'_, ()> {
         let v = share.version;
         self.data.lock().unwrap().insert((sid, cid.0, v), share);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn remove_versions(
         &mut self,
@@ -397,7 +397,7 @@ impl DeRecShareStore for InMemShareStore {
             .lock()
             .unwrap()
             .retain(|(s, c, v), _| !(*s == sid && *c == cid.0 && versions.contains(v)));
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn keep_version(&self, _: u64, version: u32) -> ShareStoreFuture<'_, u32> {
         let keep = self
@@ -405,7 +405,7 @@ impl DeRecShareStore for InMemShareStore {
             .lock()
             .unwrap()
             .unwrap_or(version.saturating_sub(1));
-        Box::pin(std::future::ready(Ok(keep)))
+        Box::pin(future::ready(Ok(keep)))
     }
 }
 
@@ -442,7 +442,7 @@ impl RefusingShareStore {
     }
 
     fn backend_error<T: Send + 'static>() -> ShareStoreFuture<'static, T> {
-        Box::pin(std::future::ready(Err(ShareStoreError::Backend(
+        Box::pin(future::ready(Err(ShareStoreError::Backend(
             "share store backend unavailable".to_owned().into(),
         ))))
     }
@@ -520,7 +520,7 @@ impl DeRecShareStore for RefusingShareStore {
         if *self.verification_backend_error.lock().unwrap() {
             return Self::backend_error();
         }
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 }
 
@@ -532,15 +532,15 @@ pub struct InMemUserSecretStore {
 impl DeRecUserSecretStore for InMemUserSecretStore {
     fn load_latest(&self, sid: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
         let v = self.data.lock().unwrap().get(&sid).cloned();
-        Box::pin(std::future::ready(Ok(v)))
+        Box::pin(future::ready(Ok(v)))
     }
     fn save_latest(&mut self, sid: u64, value: UserSecrets) -> ShareStoreFuture<'_, ()> {
         self.data.lock().unwrap().insert(sid, value);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn remove(&mut self, sid: u64) -> ShareStoreFuture<'_, ()> {
         self.data.lock().unwrap().remove(&sid);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 }
 
@@ -563,7 +563,7 @@ impl FlakyUserSecretStore {
 }
 
 fn user_secret_backend_error<T: Send + 'static>() -> ShareStoreFuture<'static, T> {
-    Box::pin(std::future::ready(Err(ShareStoreError::Backend(
+    Box::pin(future::ready(Err(ShareStoreError::Backend(
         "user secret store unavailable".into(),
     ))))
 }
@@ -591,16 +591,16 @@ impl DeRecUserSecretStore for FlakyUserSecretStore {
 pub struct InMemStateStore;
 impl DeRecStateStore for InMemStateStore {
     fn save(&mut self, _: u64, _: StateItem) -> StateStoreFuture<'_, ()> {
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn load(&self, _: u64, _: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
-        Box::pin(std::future::ready(Ok(None)))
+        Box::pin(future::ready(Ok(None)))
     }
     fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
-        Box::pin(std::future::ready(Ok(false)))
+        Box::pin(future::ready(Ok(false)))
     }
     fn load_all(&self, _: u64, _: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
-        Box::pin(std::future::ready(Ok(Vec::new())))
+        Box::pin(future::ready(Ok(Vec::new())))
     }
 }
 
@@ -616,15 +616,15 @@ pub struct InMemPersistedStateStore {
 impl DeRecStateStore for InMemPersistedStateStore {
     fn save(&mut self, sid: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
         self.data.lock().unwrap().insert((sid, item.key()), item);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
     fn load(&self, sid: u64, key: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
         let v = self.data.lock().unwrap().get(&(sid, key)).cloned();
-        Box::pin(std::future::ready(Ok(v)))
+        Box::pin(future::ready(Ok(v)))
     }
     fn remove(&mut self, sid: u64, key: StateKey) -> StateStoreFuture<'_, bool> {
         let removed = self.data.lock().unwrap().remove(&(sid, key)).is_some();
-        Box::pin(std::future::ready(Ok(removed)))
+        Box::pin(future::ready(Ok(removed)))
     }
     fn load_all(&self, sid: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
         let v: Vec<StateItem> = self
@@ -635,7 +635,7 @@ impl DeRecStateStore for InMemPersistedStateStore {
             .filter(|((s, k), _)| *s == sid && k.kind() == kind)
             .map(|(_, i)| i.clone())
             .collect();
-        Box::pin(std::future::ready(Ok(v)))
+        Box::pin(future::ready(Ok(v)))
     }
 }
 
@@ -685,17 +685,17 @@ impl DeRecTransport for RecordingTransport {
         );
         self.sent.lock().unwrap().push((endpoints.to_vec(), bytes));
         if *self.fail_after_record.lock().unwrap() {
-            return Box::pin(std::future::ready(Err(derec_library::Error::InvalidInput(
+            return Box::pin(future::ready(Err(Error::InvalidInput(
                 "transport could not confirm delivery",
             ))));
         }
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 }
 
 /// Drive an async test body to completion on a fresh current-thread runtime.
-pub fn run_async<F: std::future::Future<Output = ()>>(f: F) {
-    tokio::runtime::Builder::new_current_thread()
+pub fn run_async<F: Future<Output = ()>>(f: F) {
+    Builder::new_current_thread()
         .build()
         .expect("test runtime")
         .block_on(f)

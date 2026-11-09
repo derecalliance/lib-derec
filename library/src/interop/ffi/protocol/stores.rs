@@ -18,16 +18,26 @@
 //! deserializer covers both.
 
 use std::os::raw::c_void;
+use std::{error, fmt, ptr, slice};
 
+use derec_proto::ContactMessage;
 use prost::Message as _;
+use prost::encoding::{decode_varint, encode_varint};
+use serde::de::DeserializeOwned;
+
+use crate::Error;
+use crate::interop::ffi::message_json::DeRecMessageJsonResult;
+use crate::interop::protocol_names::protocol_discriminant_to_name;
+use crate::interop::secret_batch;
 
 use crate::protocol::types::state_record::{StateItemRecord, StateKeyRecord};
 use crate::protocol::types::{UserSecret, UserSecrets};
 use crate::protocol::{
     ChannelStoreError, ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore,
-    DeRecStateStore, DeRecTransport, DeRecUserSecretStore, MissingPolicy, Refusal, SecretKind,
-    SecretStoreError, SecretStoreFuture, SecretValue, Share, ShareStoreError, ShareStoreFuture,
-    StateItem, StateKey, StateKind, StateStoreError, StateStoreFuture, TransportFuture,
+    DeRecStateStore, DeRecTransport, DeRecUserSecretStore, MissingPolicy, PairingKeyMaterial,
+    Refusal, SecretKind, SecretStoreError, SecretStoreFuture, SecretValue, Share, ShareStoreError,
+    ShareStoreFuture, StateItem, StateKey, StateKind, StateStoreError, StateStoreFuture,
+    TransportFuture,
 };
 
 /// Lightweight error wrapper so we can put owned strings into the
@@ -35,15 +45,15 @@ use crate::protocol::{
 #[derive(Debug)]
 struct CallbackError(String);
 
-impl std::fmt::Display for CallbackError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for CallbackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for CallbackError {}
+impl error::Error for CallbackError {}
 
-fn boxed_err(msg: String) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+fn boxed_err(msg: String) -> Box<dyn error::Error + Send + Sync + 'static> {
     Box::new(CallbackError(msg))
 }
 
@@ -76,14 +86,14 @@ fn fetch_callback_bytes(
     label: &str,
     f: impl FnOnce(*mut *mut u8, *mut usize) -> i32,
 ) -> Result<Option<Vec<u8>>, String> {
-    let mut ptr: *mut u8 = std::ptr::null_mut();
+    let mut ptr: *mut u8 = ptr::null_mut();
     let mut len: usize = 0;
     let rc = f(&mut ptr as *mut _, &mut len as *mut _);
     if rc == 0 {
         if ptr.is_null() || len == 0 {
             return Ok(Some(Vec::new()));
         }
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
+        let bytes = unsafe { slice::from_raw_parts(ptr, len).to_vec() };
         free_buffer(user_data, ptr, len);
         Ok(Some(bytes))
     } else if rc == 1 {
@@ -99,7 +109,8 @@ fn fetch_callback_bytes(
     }
 }
 use crate::protocol::types::{
-    ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember,
+    ChannelQuery, ChannelRecord, ChannelStatus, HelperChannel, HelperFilter, ReplicaFilter,
+    ReplicaMember,
 };
 use crate::types::ChannelId;
 
@@ -126,7 +137,7 @@ fn record_key(record: &ChannelRecord) -> (u64, u64) {
 
 /// Decode a listing callback's JSON array; an absent or empty buffer is an
 /// empty list, not an error.
-fn decode_list<T: serde::de::DeserializeOwned>(
+fn decode_list<T: DeserializeOwned>(
     bytes_res: Result<Option<Vec<u8>>, String>,
     label: &str,
 ) -> Result<Vec<T>, ChannelStoreError> {
@@ -159,7 +170,7 @@ fn decode_list<T: serde::de::DeserializeOwned>(
 #[derive(serde::Serialize)]
 struct ChannelFilterWire<'a, Role: serde::Serialize> {
     ids: Vec<String>,
-    status: &'a [crate::protocol::types::ChannelStatus],
+    status: &'a [ChannelStatus],
     role: Option<&'a Role>,
     exclude: Vec<String>,
 }
@@ -167,7 +178,7 @@ struct ChannelFilterWire<'a, Role: serde::Serialize> {
 /// Encode a listing filter for the callback that will apply it.
 fn encode_filter<Role: serde::Serialize>(
     ids: &[u64],
-    status: &[crate::protocol::types::ChannelStatus],
+    status: &[ChannelStatus],
     role: Option<&Role>,
     exclude: &[u64],
     label: &str,
@@ -272,11 +283,11 @@ impl SecretValueRecord {
                     .map_err(|_| "SharedKey payload must be 32 bytes".to_string())?;
                 Ok(SecretValue::SharedKey(arr))
             }
-            1 => Ok(SecretValue::PairingSecret(
-                crate::protocol::PairingKeyMaterial::from_bytes(self.bytes),
-            )),
+            1 => Ok(SecretValue::PairingSecret(PairingKeyMaterial::from_bytes(
+                self.bytes,
+            ))),
             2 => {
-                let cm = derec_proto::ContactMessage::decode(self.bytes.as_slice())
+                let cm = ContactMessage::decode(self.bytes.as_slice())
                     .map_err(|e| format!("failed to decode ContactMessage: {e}"))?;
                 Ok(SecretValue::PairingContact(cm))
             }
@@ -728,12 +739,11 @@ pub struct TransportCallbacks {
 pub unsafe extern "C" fn derec_transport_endpoints_json(
     endpoints_ptr: *const u8,
     endpoints_len: usize,
-) -> crate::interop::ffi::message_json::DeRecMessageJsonResult {
+) -> DeRecMessageJsonResult {
     use crate::interop::ffi::common::{empty_buffer, vec_into_buffer};
     use crate::interop::ffi::error::{
         DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, ffi_error, success,
     };
-    use crate::interop::ffi::message_json::DeRecMessageJsonResult;
 
     let fail = |code, message: &str| DeRecMessageJsonResult {
         error: ffi_error(code, message),
@@ -744,12 +754,12 @@ pub unsafe extern "C" fn derec_transport_endpoints_json(
     } else if endpoints_ptr.is_null() {
         return fail(DEREC_CODE_FFI_NULL_PTR, "endpoints_ptr is null");
     } else {
-        unsafe { std::slice::from_raw_parts(endpoints_ptr, endpoints_len) }
+        unsafe { slice::from_raw_parts(endpoints_ptr, endpoints_len) }
     };
 
     let mut endpoints = Vec::new();
     while !framed.is_empty() {
-        let Ok(len) = prost::encoding::decode_varint(&mut framed) else {
+        let Ok(len) = decode_varint(&mut framed) else {
             return fail(
                 DEREC_CODE_FFI_BAD_PROTO,
                 "endpoint length prefix is malformed",
@@ -769,9 +779,7 @@ pub unsafe extern "C" fn derec_transport_endpoints_json(
                 "endpoint is not a valid TransportProtocol",
             );
         };
-        let Some(protocol) =
-            crate::interop::protocol_names::protocol_discriminant_to_name(endpoint.protocol)
-        else {
+        let Some(protocol) = protocol_discriminant_to_name(endpoint.protocol) else {
             return fail(
                 DEREC_CODE_FFI_BAD_PROTO,
                 "unknown transport protocol discriminant",
@@ -1066,13 +1074,9 @@ impl DeRecSecretStore for DotnetSecretStore {
                     }
                     _ => Vec::new(),
                 };
-                crate::interop::secret_batch::collect(
-                    channel_ids,
-                    entries,
-                    kind,
-                    missing_policy,
-                    |record| record.into_value(),
-                )
+                secret_batch::collect(channel_ids, entries, kind, missing_policy, |record| {
+                    record.into_value()
+                })
             });
         Box::pin(async move { res })
     }
@@ -1472,7 +1476,7 @@ impl DeRecTransport for DotnetTransport {
         let mut framed = Vec::new();
         for endpoint in endpoints {
             let entry = endpoint.encode_to_vec();
-            prost::encoding::encode_varint(entry.len() as u64, &mut framed);
+            encode_varint(entry.len() as u64, &mut framed);
             framed.extend_from_slice(&entry);
         }
 
@@ -1485,10 +1489,10 @@ impl DeRecTransport for DotnetTransport {
         );
         Box::pin(async move {
             if rc != 0 {
-                // crate::Error's variants take &'static str, so we lose
-                // the dynamic rc in the surface error — callers can log
-                // it through the transport callback's own side channel.
-                Err(crate::Error::Invariant("transport send failed"))
+                // The dynamic rc is not carried in the surface error —
+                // callers can log it through the transport callback's own
+                // side channel.
+                Err(Error::TransportSendFailed)
             } else {
                 Ok(())
             }
@@ -1788,12 +1792,13 @@ mod transport_endpoints_json_tests {
     use super::*;
     use crate::interop::ffi::common::derec_free_buffer;
     use crate::interop::ffi::error::{DEREC_CODE_FFI_BAD_PROTO, derec_free_error};
+    use derec_proto::Protocol;
 
-    fn frame(entries: &[derec_proto::TransportProtocol]) -> Vec<u8> {
+    fn frame(entries: &[TransportProtocol]) -> Vec<u8> {
         let mut framed = Vec::new();
         for entry in entries {
             let bytes = entry.encode_to_vec();
-            prost::encoding::encode_varint(bytes.len() as u64, &mut framed);
+            encode_varint(bytes.len() as u64, &mut framed);
             framed.extend_from_slice(&bytes);
         }
         framed
@@ -1806,8 +1811,7 @@ mod transport_endpoints_json_tests {
             unsafe { derec_free_error(&mut result.error) };
             return Err(code);
         }
-        let bytes =
-            unsafe { std::slice::from_raw_parts(result.bytes.ptr, result.bytes.len) }.to_vec();
+        let bytes = unsafe { slice::from_raw_parts(result.bytes.ptr, result.bytes.len) }.to_vec();
         derec_free_buffer(result.bytes.ptr, result.bytes.len);
         Ok(serde_json::from_slice(&bytes).expect("output is JSON"))
     }
@@ -1816,13 +1820,13 @@ mod transport_endpoints_json_tests {
     #[test]
     fn decodes_the_send_framing_into_named_endpoints() {
         let framed = frame(&[
-            derec_proto::TransportProtocol {
+            TransportProtocol {
                 uri: "grpcs://b.example".to_owned(),
-                protocol: derec_proto::Protocol::Grpc.into(),
+                protocol: Protocol::Grpc.into(),
             },
-            derec_proto::TransportProtocol {
+            TransportProtocol {
                 uri: "https://a.example/derec".to_owned(),
-                protocol: derec_proto::Protocol::Https.into(),
+                protocol: Protocol::Https.into(),
             },
         ]);
         assert_eq!(
@@ -1838,13 +1842,13 @@ mod transport_endpoints_json_tests {
     /// An unknown discriminant or a truncated buffer is refused.
     #[test]
     fn rejects_unknown_protocols_and_truncated_buffers() {
-        let unknown = frame(&[derec_proto::TransportProtocol {
+        let unknown = frame(&[TransportProtocol {
             uri: "x://y".to_owned(),
             protocol: 99,
         }]);
         assert_eq!(decode(&unknown), Err(DEREC_CODE_FFI_BAD_PROTO));
 
-        let mut truncated = frame(&[derec_proto::TransportProtocol {
+        let mut truncated = frame(&[TransportProtocol {
             uri: "https://a.example".to_owned(),
             protocol: 0,
         }]);

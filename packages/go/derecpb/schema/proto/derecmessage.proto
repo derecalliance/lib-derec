@@ -69,15 +69,31 @@ package org.derecalliance.derec.protobuf;
 // - detect duplicates or out-of-order delivery
 // - support replay protection
 //
-// These semantics are not yet implemented by this library: a sender may set
-// `sequence`, but it is not checked on receipt. Replay protection currently
-// relies on `timestamp`: an envelope older than the receiver's configured
-// inbound-message window is discarded. After decryption the receiver also
-// checks that `envelope.timestamp` equals the inner message's `timestamp`, and
-// discards the message if they differ or either is absent.
+// These semantics are not implemented by this library: a sender may set
+// `sequence`, but it is not checked on receipt. An envelope older than the
+// receiver's configured inbound-message window is discarded. After
+// decryption the receiver also checks that `envelope.timestamp` equals the
+// inner message's `timestamp`, and discards the message if they differ or
+// either is absent.
 //
-// Implementations SHOULD treat messages as idempotent and be resilient to
-// retries and duplicate deliveries.
+// Within the window, detecting a message delivered more than once is the
+// receiving application's transport layer's job. Both ends of a channel
+// encrypt under one key, so a message delivered back to its own sender
+// decrypts there too. The transport MUST:
+//
+// - identify an envelope by a hash of its `message` field only. `sequence`,
+//  `traceId` and the protocol version are not authenticated, and an
+//  envelope can be re-encoded, so a copy can arrive as different bytes;
+// - keep the identity of every envelope it accepted and of every envelope
+//  it sent until the later of its arrival (or sending) and its `timestamp`,
+//  plus the inbound-message window, and drop an inbound envelope whose
+//  identity it keeps;
+// - record an inbound identity only once the message was accepted.
+//
+// A message held back and delivered late is a first delivery and is not
+// caught this way. A receiver MUST NOT store a share version older than the
+// newest it stores on the channel, and SHOULD reject a channel-info update
+// older than the last one it accepted on the channel.
 //
 // # Key Rotation
 //

@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use crate::protocol::types::Timeouts;
 use crate::protocol::{AutoAcceptPolicy, ExpiredChannelCleanup, UnpairAck};
+use crate::transport::TransportProtocol;
+use derec_proto::ParameterRange;
 
 /// Every data setting of a [`DeRecProtocolBuilder`](crate::protocol::DeRecProtocolBuilder),
 /// each one optional, applied in one call by
@@ -40,6 +42,8 @@ use crate::protocol::{AutoAcceptPolicy, ExpiredChannelCleanup, UnpairAck};
 ///     "inbound_message_secs": 300,
 ///     "sharing_round_secs": 60,
 ///     "unpair_ack_secs": 60,
+///     "get_share_response_secs": 300,
+///     "pairing_secs": 30,
 ///     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
 ///   },
 ///   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
@@ -90,7 +94,7 @@ pub struct DeRecProtocolConfig {
     /// Merged per field; see [`TimeoutsConfig`].
     pub timeouts: Option<TimeoutsConfig>,
     /// See [`with_parameter_range`](crate::protocol::DeRecProtocolBuilder::with_parameter_range).
-    pub parameter_range: Option<derec_proto::ParameterRange>,
+    pub parameter_range: Option<ParameterRange>,
     /// See [`with_auto_accept`](crate::protocol::DeRecProtocolBuilder::with_auto_accept).
     pub auto_accept: Option<AutoAcceptPolicy>,
     /// See [`with_auto_respond_on_failure`](crate::protocol::DeRecProtocolBuilder::with_auto_respond_on_failure).
@@ -107,7 +111,7 @@ pub struct DeRecProtocolConfig {
     /// An unknown `protocol` discriminant is rejected when the endpoint is
     /// parsed; structural checks (URI length, control characters, scheme)
     /// run later, at `build()`.
-    pub own_transports: Option<Vec<crate::transport::TransportProtocol>>,
+    pub own_transports: Option<Vec<TransportProtocol>>,
     /// See [`with_replica_id`](crate::protocol::DeRecProtocolBuilder::with_replica_id).
     pub replica_id: Option<u64>,
 }
@@ -124,7 +128,9 @@ pub struct DeRecProtocolConfig {
 /// which clamps every value to at least one second.
 ///
 /// In JSON the fields are `inbound_message_secs`, `sharing_round_secs`,
-/// `unpair_ack_secs` (non-negative integers) and `expired_channels`
+/// `unpair_ack_secs`, `get_share_response_secs`, `pairing_secs` (non-negative
+/// integers) and
+/// `expired_channels`
 /// (an [`ExpiredChannelsConfig`] object).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(
@@ -151,6 +157,18 @@ pub struct TimeoutsConfig {
         serde(skip_serializing_if = "Option::is_none")
     )]
     pub unpair_ack_secs: Option<u64>,
+    /// [`Timeouts::get_share_response`], in seconds.
+    #[cfg_attr(
+        any(feature = "serde", target_arch = "wasm32"),
+        serde(skip_serializing_if = "Option::is_none")
+    )]
+    pub get_share_response_secs: Option<u64>,
+    /// [`Timeouts::pairing`], in seconds.
+    #[cfg_attr(
+        any(feature = "serde", target_arch = "wasm32"),
+        serde(skip_serializing_if = "Option::is_none")
+    )]
+    pub pairing_secs: Option<u64>,
     /// [`Timeouts::expired_channels`].
     #[cfg_attr(
         any(feature = "serde", target_arch = "wasm32"),
@@ -190,6 +208,10 @@ impl TimeoutsConfig {
             unpair_ack: self
                 .unpair_ack_secs
                 .map_or(base.unpair_ack, Duration::from_secs),
+            get_share_response: self
+                .get_share_response_secs
+                .map_or(base.get_share_response, Duration::from_secs),
+            pairing: self.pairing_secs.map_or(base.pairing, Duration::from_secs),
             expired_channels: self.expired_channels.map_or(base.expired_channels, |e| {
                 ExpiredChannelCleanup::new(e.enabled, e.timeout_in_secs)
             }),
@@ -231,12 +253,16 @@ impl DeRecProtocolConfig {
                 inbound_message_secs,
                 sharing_round_secs,
                 unpair_ack_secs,
+                get_share_response_secs,
+                pairing_secs,
                 expired_channels,
             } = t;
             let held = self.timeouts.get_or_insert_with(TimeoutsConfig::default);
             over(&mut held.inbound_message_secs, inbound_message_secs);
             over(&mut held.sharing_round_secs, sharing_round_secs);
             over(&mut held.unpair_ack_secs, unpair_ack_secs);
+            over(&mut held.get_share_response_secs, get_share_response_secs);
+            over(&mut held.pairing_secs, pairing_secs);
             over(&mut held.expired_channels, expired_channels);
         }
         over(&mut self.parameter_range, parameter_range);
@@ -298,6 +324,8 @@ mod layer_tests {
                     inbound_message_secs: Some(90),
                     sharing_round_secs: Some(30),
                     unpair_ack_secs: None,
+                    get_share_response_secs: None,
+                    pairing_secs: None,
                     expired_channels: Some(ExpiredChannelsConfig {
                         enabled: false,
                         timeout_in_secs: 10,
@@ -335,11 +363,16 @@ mod layer_tests {
 mod wire {
     use std::collections::HashMap;
 
+    use derec_proto::ParameterRange;
+    use derec_proto::Protocol;
+    use serde::de;
+    use serde::de::IgnoredAny;
     use serde::{Deserialize, Serialize};
 
     use super::{DeRecProtocolConfig, TimeoutsConfig};
     use crate::interop::protocol_names;
     use crate::protocol::{AutoAcceptPolicy, UnpairAck};
+    use crate::transport::TransportProtocol;
 
     #[derive(Serialize, Deserialize, Default)]
     #[serde(default, deny_unknown_fields)]
@@ -447,8 +480,8 @@ mod wire {
         max_unresponsive_deactivation_timeout: i64,
     }
 
-    impl From<derec_proto::ParameterRange> for ParameterRangeWire {
-        fn from(r: derec_proto::ParameterRange) -> Self {
+    impl From<ParameterRange> for ParameterRangeWire {
+        fn from(r: ParameterRange) -> Self {
             Self {
                 min_share_size: r.min_share_size,
                 max_share_size: r.max_share_size,
@@ -464,7 +497,7 @@ mod wire {
         }
     }
 
-    impl From<ParameterRangeWire> for derec_proto::ParameterRange {
+    impl From<ParameterRangeWire> for ParameterRange {
         fn from(r: ParameterRangeWire) -> Self {
             Self {
                 min_share_size: r.min_share_size,
@@ -498,7 +531,7 @@ mod wire {
             NumberOrDecimal::Number(n) => Ok(n),
             NumberOrDecimal::Decimal(s) => s
                 .parse()
-                .map_err(|_| serde::de::Error::custom(format!("{s:?} is not a decimal i64"))),
+                .map_err(|_| de::Error::custom(format!("{s:?} is not a decimal i64"))),
         }
     }
 
@@ -552,7 +585,7 @@ mod wire {
     enum DecimalU64 {
         Decimal(String),
         #[serde(skip_serializing)]
-        NotAString(serde::de::IgnoredAny),
+        NotAString(IgnoredAny),
     }
 
     fn decimal_u64(field: &str, value: Option<DecimalU64>) -> Result<Option<u64>, String> {
@@ -578,14 +611,10 @@ mod wire {
                     entries
                         .into_iter()
                         .map(|e| {
-                            let protocol =
-                                derec_proto::Protocol::try_from(e.protocol).map_err(|_| {
-                                    format!(
-                                        "unknown transport protocol discriminant {}",
-                                        e.protocol
-                                    )
-                                })?;
-                            Ok(crate::transport::TransportProtocol::new(e.uri, protocol))
+                            let protocol = Protocol::try_from(e.protocol).map_err(|_| {
+                                format!("unknown transport protocol discriminant {}", e.protocol)
+                            })?;
+                            Ok(TransportProtocol::new(e.uri, protocol))
                         })
                         .collect::<Result<Vec<_>, String>>()
                 })
@@ -650,6 +679,8 @@ mod tests {
             "inbound_message_secs": 120,
             "sharing_round_secs": 30,
             "unpair_ack_secs": 45,
+            "get_share_response_secs": 900,
+            "pairing_secs": 240,
             "expired_channels": { "enabled": false, "timeout_in_secs": 600 }
         },
         "parameter_range": {
@@ -705,6 +736,8 @@ mod tests {
                 inbound_message_secs: Some(120),
                 sharing_round_secs: Some(30),
                 unpair_ack_secs: Some(45),
+                get_share_response_secs: Some(900),
+                pairing_secs: Some(240),
                 expired_channels: Some(ExpiredChannelsConfig {
                     enabled: false,
                     timeout_in_secs: 600,
@@ -737,14 +770,8 @@ mod tests {
         assert_eq!(
             c.own_transports,
             Some(vec![
-                crate::transport::TransportProtocol::new(
-                    "grpcs://me.example.com:443",
-                    Protocol::Grpc
-                ),
-                crate::transport::TransportProtocol::new(
-                    "https://me.example.com/derec",
-                    Protocol::Https
-                ),
+                TransportProtocol::new("grpcs://me.example.com:443", Protocol::Grpc),
+                TransportProtocol::new("https://me.example.com/derec", Protocol::Https),
             ])
         );
         assert_eq!(c.replica_id, Some(9_007_199_254_740_993));

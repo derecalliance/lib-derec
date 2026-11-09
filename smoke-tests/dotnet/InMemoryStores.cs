@@ -274,6 +274,12 @@ internal sealed class RecordingTransport : ITransport
     public readonly List<(string Uri, int Protocol, byte[] Bytes)> Outbox = new();
 
     /// <summary>
+    /// Endpoints whose sends fail, the way a broken link to one peer would,
+    /// while every other peer stays reachable.
+    /// </summary>
+    public readonly HashSet<string> FailingUris = new();
+
+    /// <summary>
     /// The library hands over every endpoint the peer advertised, filtered
     /// but unranked, and delivery to any one of them is success. A real
     /// transport would try them in order and fall back; recording the first
@@ -283,6 +289,8 @@ internal sealed class RecordingTransport : ITransport
     {
         if (endpoints.Count == 0)
             throw new InvalidOperationException("transport: Send called with no endpoints");
+        if (FailingUris.Contains(endpoints[0].Uri))
+            throw new InvalidOperationException($"transport: simulated failure sending to {endpoints[0].Uri}");
         Outbox.Add((endpoints[0].Uri, (int)endpoints[0].Protocol, message));
     }
 

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_proto::{VerifyShareRequestMessage, VerifyShareResponseMessage};
+
+use crate::Error;
+
 /// The anti-replay gate binding a `VerifyShareResponse` to the request it
 /// answers, attached as a method so a new call site cannot process a
 /// response without running it.
@@ -22,21 +26,15 @@ pub(crate) trait VerifyShareResponseExt {
     /// Run this **before** the status and hash checks — a replayed response
     /// can be structurally sound and still be answering a different
     /// question.
-    fn validate_binding(
-        &self,
-        request: &derec_proto::VerifyShareRequestMessage,
-    ) -> Result<(), crate::Error>;
+    fn validate_binding(&self, request: &VerifyShareRequestMessage) -> Result<(), Error>;
 }
 
-impl VerifyShareResponseExt for derec_proto::VerifyShareResponseMessage {
-    fn validate_binding(
-        &self,
-        request: &derec_proto::VerifyShareRequestMessage,
-    ) -> Result<(), crate::Error> {
+impl VerifyShareResponseExt for VerifyShareResponseMessage {
+    fn validate_binding(&self, request: &VerifyShareRequestMessage) -> Result<(), Error> {
         use crate::primitives::verification::VerificationError;
 
         let mismatch = |field: &'static str, expected: u64, got: u64| {
-            crate::Error::from(VerificationError::ResponseBindingMismatch {
+            Error::from(VerificationError::ResponseBindingMismatch {
                 field,
                 expected,
                 got,

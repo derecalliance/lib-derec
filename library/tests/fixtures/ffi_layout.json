@@ -11,11 +11,11 @@
         },
         {
           "name": "wire_bytes",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "ApplyTraceIdResult",
-      "size": 56
+      "size": 72
     },
     {
       "align": 8,
@@ -69,15 +69,15 @@
         },
         {
           "name": "contact_wire_bytes",
-          "offset": 40
+          "offset": 56
         },
         {
           "name": "secret_key_material",
-          "offset": 56
+          "offset": 72
         }
       ],
       "name": "CreateContactMessageResult",
-      "size": 72
+      "size": 88
     },
     {
       "align": 8,
@@ -124,10 +124,18 @@
         {
           "name": "got",
           "offset": 36
+        },
+        {
+          "name": "has_channel_id",
+          "offset": 40
+        },
+        {
+          "name": "channel_id",
+          "offset": 48
         }
       ],
       "name": "DeRecError",
-      "size": 40
+      "size": 56
     },
     {
       "align": 8,
@@ -138,11 +146,11 @@
         },
         {
           "name": "bytes",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "DeRecMessageJsonResult",
-      "size": 56
+      "size": 72
     },
     {
       "align": 8,
@@ -153,11 +161,11 @@
         },
         {
           "name": "contact_wire_bytes",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "DeRecProtocolCreateContactResult",
-      "size": 56
+      "size": 72
     },
     {
       "align": 8,
@@ -168,11 +176,11 @@
         },
         {
           "name": "events_json",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "DeRecProtocolEventsResult",
-      "size": 56
+      "size": 72
     },
     {
       "align": 8,
@@ -183,11 +191,11 @@
         },
         {
           "name": "fingerprint",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "DeRecProtocolFingerprintResult",
-      "size": 48
+      "size": 64
     },
     {
       "align": 8,
@@ -198,11 +206,11 @@
         },
         {
           "name": "handle",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "DeRecProtocolNewResult",
-      "size": 48
+      "size": 64
     },
     {
       "align": 8,
@@ -213,19 +221,19 @@
         },
         {
           "name": "events_json",
-          "offset": 40
+          "offset": 56
         },
         {
           "name": "has_channel_id",
-          "offset": 56
+          "offset": 72
         },
         {
           "name": "channel_id",
-          "offset": 64
+          "offset": 80
         }
       ],
       "name": "DeRecProtocolProcessResult",
-      "size": 72
+      "size": 88
     },
     {
       "align": 8,
@@ -236,15 +244,15 @@
         },
         {
           "name": "events_json",
-          "offset": 40
+          "offset": 56
         },
         {
           "name": "conflicting_channel_ids_json",
-          "offset": 56
+          "offset": 72
         }
       ],
       "name": "DeRecProtocolRestoreResult",
-      "size": 72
+      "size": 88
     },
     {
       "align": 4,
@@ -270,11 +278,11 @@
         },
         {
           "name": "channels",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "DeRecRemovedChannelsResult",
-      "size": 56
+      "size": 72
     },
     {
       "align": 8,
@@ -285,11 +293,11 @@
         },
         {
           "name": "contact_json",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "DecodeContactMessageResult",
-      "size": 56
+      "size": 72
     },
     {
       "align": 8,
@@ -300,223 +308,10 @@
         },
         {
           "name": "wire_bytes",
-          "offset": 40
-        }
-      ],
-      "name": "EncodeContactMessageResult",
-      "size": 56
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "channel_id",
-          "offset": 40
-        },
-        {
-          "name": "request_proto_bytes",
-          "offset": 48
-        }
-      ],
-      "name": "ExtractGetSecretIdsVersionsRequestResult",
-      "size": 64
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "channel_id",
-          "offset": 40
-        },
-        {
-          "name": "response_proto_bytes",
-          "offset": 48
-        }
-      ],
-      "name": "ExtractGetSecretIdsVersionsResponseResult",
-      "size": 64
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "channel_id",
-          "offset": 40
-        },
-        {
-          "name": "request_proto_bytes",
-          "offset": 48
-        }
-      ],
-      "name": "ExtractGetShareRequestResult",
-      "size": 64
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "channel_id",
-          "offset": 40
-        },
-        {
-          "name": "response_proto_bytes",
-          "offset": 48
-        }
-      ],
-      "name": "ExtractGetShareResponseResult",
-      "size": 64
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "channel_id",
-          "offset": 40
-        },
-        {
-          "name": "request_proto_bytes",
-          "offset": 48
-        }
-      ],
-      "name": "ExtractPairRequestResult",
-      "size": 64
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "channel_id",
-          "offset": 40
-        },
-        {
-          "name": "response_proto_bytes",
-          "offset": 48
-        }
-      ],
-      "name": "ExtractPairResponseResult",
-      "size": 64
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "channel_id",
-          "offset": 40
-        },
-        {
-          "name": "request_proto_bytes",
-          "offset": 48
-        }
-      ],
-      "name": "ExtractPrePairRequestResult",
-      "size": 64
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "channel_id",
-          "offset": 40
-        },
-        {
-          "name": "response_proto_bytes",
-          "offset": 48
-        }
-      ],
-      "name": "ExtractPrePairResponseResult",
-      "size": 64
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "channel_id",
-          "offset": 40
-        },
-        {
-          "name": "request_proto_bytes",
-          "offset": 48
-        }
-      ],
-      "name": "ExtractStoreShareRequestResult",
-      "size": 64
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "channel_id",
-          "offset": 40
-        },
-        {
-          "name": "response_proto_bytes",
-          "offset": 48
-        }
-      ],
-      "name": "ExtractStoreShareResponseResult",
-      "size": 64
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "channel_id",
-          "offset": 40
-        },
-        {
-          "name": "memo",
-          "offset": 48
-        },
-        {
-          "name": "request_proto_bytes",
           "offset": 56
         }
       ],
-      "name": "ExtractUnpairRequestResult",
+      "name": "EncodeContactMessageResult",
       "size": 72
     },
     {
@@ -528,34 +323,15 @@
         },
         {
           "name": "channel_id",
-          "offset": 40
-        },
-        {
-          "name": "response_proto_bytes",
-          "offset": 48
-        }
-      ],
-      "name": "ExtractUnpairResponseResult",
-      "size": 64
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "channel_id",
-          "offset": 40
+          "offset": 56
         },
         {
           "name": "request_proto_bytes",
-          "offset": 48
+          "offset": 64
         }
       ],
-      "name": "ExtractVerifyShareRequestResult",
-      "size": 64
+      "name": "ExtractGetSecretIdsVersionsRequestResult",
+      "size": 80
     },
     {
       "align": 8,
@@ -566,15 +342,266 @@
         },
         {
           "name": "channel_id",
-          "offset": 40
+          "offset": 56
         },
         {
           "name": "response_proto_bytes",
-          "offset": 48
+          "offset": 64
+        }
+      ],
+      "name": "ExtractGetSecretIdsVersionsResponseResult",
+      "size": 80
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "channel_id",
+          "offset": 56
+        },
+        {
+          "name": "request_proto_bytes",
+          "offset": 64
+        }
+      ],
+      "name": "ExtractGetShareRequestResult",
+      "size": 80
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "channel_id",
+          "offset": 56
+        },
+        {
+          "name": "response_proto_bytes",
+          "offset": 64
+        }
+      ],
+      "name": "ExtractGetShareResponseResult",
+      "size": 80
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "channel_id",
+          "offset": 56
+        },
+        {
+          "name": "request_proto_bytes",
+          "offset": 64
+        }
+      ],
+      "name": "ExtractPairRequestResult",
+      "size": 80
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "channel_id",
+          "offset": 56
+        },
+        {
+          "name": "response_proto_bytes",
+          "offset": 64
+        }
+      ],
+      "name": "ExtractPairResponseResult",
+      "size": 80
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "channel_id",
+          "offset": 56
+        },
+        {
+          "name": "request_proto_bytes",
+          "offset": 64
+        }
+      ],
+      "name": "ExtractPrePairRequestResult",
+      "size": 80
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "channel_id",
+          "offset": 56
+        },
+        {
+          "name": "response_proto_bytes",
+          "offset": 64
+        }
+      ],
+      "name": "ExtractPrePairResponseResult",
+      "size": 80
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "channel_id",
+          "offset": 56
+        },
+        {
+          "name": "request_proto_bytes",
+          "offset": 64
+        }
+      ],
+      "name": "ExtractStoreShareRequestResult",
+      "size": 80
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "channel_id",
+          "offset": 56
+        },
+        {
+          "name": "response_proto_bytes",
+          "offset": 64
+        }
+      ],
+      "name": "ExtractStoreShareResponseResult",
+      "size": 80
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "channel_id",
+          "offset": 56
+        },
+        {
+          "name": "memo",
+          "offset": 64
+        },
+        {
+          "name": "request_proto_bytes",
+          "offset": 72
+        }
+      ],
+      "name": "ExtractUnpairRequestResult",
+      "size": 88
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "channel_id",
+          "offset": 56
+        },
+        {
+          "name": "response_proto_bytes",
+          "offset": 64
+        }
+      ],
+      "name": "ExtractUnpairResponseResult",
+      "size": 80
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "channel_id",
+          "offset": 56
+        },
+        {
+          "name": "request_proto_bytes",
+          "offset": 64
+        }
+      ],
+      "name": "ExtractVerifyShareRequestResult",
+      "size": 80
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "channel_id",
+          "offset": 56
+        },
+        {
+          "name": "response_proto_bytes",
+          "offset": 64
         }
       ],
       "name": "ExtractVerifyShareResponseResult",
-      "size": 64
+      "size": 80
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "id",
+          "offset": 56
+        },
+        {
+          "name": "timestamp",
+          "offset": 72
+        }
+      ],
+      "name": "MessageIdResult",
+      "size": 80
     },
     {
       "align": 8,
@@ -585,44 +612,10 @@
         },
         {
           "name": "fingerprint",
-          "offset": 40
-        }
-      ],
-      "name": "PairingFingerprintResult",
-      "size": 48
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "secret_list_bytes",
-          "offset": 40
-        }
-      ],
-      "name": "ProcessGetSecretIdsVersionsResponseMessageResult",
-      "size": 56
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "shared_key",
-          "offset": 40
-        },
-        {
-          "name": "channel_id",
           "offset": 56
         }
       ],
-      "name": "ProcessPairResponseMessageResult",
+      "name": "PairingFingerprintResult",
       "size": 64
     },
     {
@@ -633,24 +626,58 @@
           "offset": 0
         },
         {
-          "name": "mlkem_encapsulation_key",
-          "offset": 40
+          "name": "secret_list_bytes",
+          "offset": 56
+        }
+      ],
+      "name": "ProcessGetSecretIdsVersionsResponseMessageResult",
+      "size": 72
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
         },
         {
-          "name": "ecies_public_key",
+          "name": "shared_key",
           "offset": 56
         },
         {
-          "name": "nonce",
+          "name": "channel_id",
+          "offset": 72
+        }
+      ],
+      "name": "ProcessPairResponseMessageResult",
+      "size": 80
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "mlkem_encapsulation_key",
+          "offset": 56
+        },
+        {
+          "name": "ecies_public_key",
           "offset": 72
         },
         {
+          "name": "nonce",
+          "offset": 88
+        },
+        {
           "name": "fingerprint_commitment",
-          "offset": 80
+          "offset": 96
         }
       ],
       "name": "ProcessPrePairResponseMessageResult",
-      "size": 96
+      "size": 112
     },
     {
       "align": 8,
@@ -661,7 +688,7 @@
         }
       ],
       "name": "ProcessStoreShareResponseMessageResult",
-      "size": 40
+      "size": 56
     },
     {
       "align": 8,
@@ -672,7 +699,7 @@
         }
       ],
       "name": "ProcessUnpairResponseResult",
-      "size": 40
+      "size": 56
     },
     {
       "align": 8,
@@ -683,124 +710,10 @@
         },
         {
           "name": "envelope_wire_bytes",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "ProduceGetSecretIdsVersionsRequestMessageResult",
-      "size": 56
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "envelope_wire_bytes",
-          "offset": 40
-        }
-      ],
-      "name": "ProduceGetSecretIdsVersionsResponseMessageResult",
-      "size": 56
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "request_wire_bytes",
-          "offset": 40
-        }
-      ],
-      "name": "ProduceGetShareRequestMessageResult",
-      "size": 56
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "response_wire_bytes",
-          "offset": 40
-        }
-      ],
-      "name": "ProduceGetShareResponseMessageResult",
-      "size": 56
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "request_wire_bytes",
-          "offset": 40
-        },
-        {
-          "name": "initiator_contact_message_wire_bytes",
-          "offset": 56
-        },
-        {
-          "name": "secret_key_material",
-          "offset": 72
-        }
-      ],
-      "name": "ProducePairRequestMessageResult",
-      "size": 88
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "response_wire_bytes",
-          "offset": 40
-        },
-        {
-          "name": "peer_transports",
-          "offset": 56
-        },
-        {
-          "name": "shared_key",
-          "offset": 72
-        },
-        {
-          "name": "channel_id",
-          "offset": 88
-        }
-      ],
-      "name": "ProducePairResponseMessageResult",
-      "size": 96
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "envelope_wire_bytes",
-          "offset": 40
-        },
-        {
-          "name": "secret_key_material",
-          "offset": 56
-        }
-      ],
-      "name": "ProducePrePairNoKeysResponseMessageResult",
       "size": 72
     },
     {
@@ -812,11 +725,91 @@
         },
         {
           "name": "envelope_wire_bytes",
-          "offset": 40
+          "offset": 56
         }
       ],
-      "name": "ProducePrePairRequestMessageResult",
-      "size": 56
+      "name": "ProduceGetSecretIdsVersionsResponseMessageResult",
+      "size": 72
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "request_wire_bytes",
+          "offset": 56
+        }
+      ],
+      "name": "ProduceGetShareRequestMessageResult",
+      "size": 72
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "response_wire_bytes",
+          "offset": 56
+        }
+      ],
+      "name": "ProduceGetShareResponseMessageResult",
+      "size": 72
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "request_wire_bytes",
+          "offset": 56
+        },
+        {
+          "name": "initiator_contact_message_wire_bytes",
+          "offset": 72
+        },
+        {
+          "name": "secret_key_material",
+          "offset": 88
+        }
+      ],
+      "name": "ProducePairRequestMessageResult",
+      "size": 104
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "response_wire_bytes",
+          "offset": 56
+        },
+        {
+          "name": "peer_transports",
+          "offset": 72
+        },
+        {
+          "name": "shared_key",
+          "offset": 88
+        },
+        {
+          "name": "channel_id",
+          "offset": 104
+        }
+      ],
+      "name": "ProducePairResponseMessageResult",
+      "size": 112
     },
     {
       "align": 8,
@@ -827,52 +820,14 @@
         },
         {
           "name": "envelope_wire_bytes",
-          "offset": 40
-        }
-      ],
-      "name": "ProducePrePairResponseMessageResult",
-      "size": 56
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "wire_bytes",
-          "offset": 40
-        }
-      ],
-      "name": "ProduceStoreShareRequestMessageResult",
-      "size": 56
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "wire_bytes",
-          "offset": 40
-        },
-        {
-          "name": "committed_share_bytes",
           "offset": 56
         },
         {
-          "name": "secret_id",
+          "name": "secret_key_material",
           "offset": 72
-        },
-        {
-          "name": "version",
-          "offset": 80
         }
       ],
-      "name": "ProduceStoreShareResponseMessageResult",
+      "name": "ProducePrePairNoKeysResponseMessageResult",
       "size": 88
     },
     {
@@ -883,12 +838,84 @@
           "offset": 0
         },
         {
+          "name": "envelope_wire_bytes",
+          "offset": 56
+        }
+      ],
+      "name": "ProducePrePairRequestMessageResult",
+      "size": 72
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "envelope_wire_bytes",
+          "offset": 56
+        }
+      ],
+      "name": "ProducePrePairResponseMessageResult",
+      "size": 72
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "wire_bytes",
+          "offset": 56
+        }
+      ],
+      "name": "ProduceStoreShareRequestMessageResult",
+      "size": 72
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
+          "name": "wire_bytes",
+          "offset": 56
+        },
+        {
+          "name": "committed_share_bytes",
+          "offset": 72
+        },
+        {
+          "name": "secret_id",
+          "offset": 88
+        },
+        {
+          "name": "version",
+          "offset": 96
+        }
+      ],
+      "name": "ProduceStoreShareResponseMessageResult",
+      "size": 104
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
           "name": "request_wire_bytes",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "ProduceUnpairRequestMessageResult",
-      "size": 56
+      "size": 72
     },
     {
       "align": 8,
@@ -899,11 +926,11 @@
         },
         {
           "name": "response_wire_bytes",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "ProduceUnpairResponseMessageResult",
-      "size": 56
+      "size": 72
     },
     {
       "align": 8,
@@ -914,11 +941,11 @@
         },
         {
           "name": "request_wire_bytes",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "ProduceVerifyShareRequestMessageResult",
-      "size": 56
+      "size": 72
     },
     {
       "align": 8,
@@ -929,11 +956,11 @@
         },
         {
           "name": "response_wire_bytes",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "ProduceVerifyShareResponseMessageResult",
-      "size": 56
+      "size": 72
     },
     {
       "align": 8,
@@ -944,11 +971,11 @@
         },
         {
           "name": "shares_wire_bytes",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "ProtectSecretResult",
-      "size": 56
+      "size": 72
     },
     {
       "align": 8,
@@ -959,11 +986,11 @@
         },
         {
           "name": "trace_id",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "ReadTraceIdResult",
-      "size": 48
+      "size": 64
     },
     {
       "align": 8,
@@ -974,11 +1001,11 @@
         },
         {
           "name": "secret_data",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "RecoverFromShareResponsesResult",
-      "size": 56
+      "size": 72
     },
     {
       "align": 8,
@@ -1144,11 +1171,11 @@
         },
         {
           "name": "is_valid",
-          "offset": 40
+          "offset": 56
         }
       ],
       "name": "VerifyShareResponseResult",
-      "size": 48
+      "size": 64
     }
   ]
 }

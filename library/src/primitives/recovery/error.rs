@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_cryptography::vss::DerecVSSError;
+use std::error::Error;
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RecoveryError {
@@ -34,7 +37,7 @@ pub enum RecoveryError {
     #[error("failed to reconstruct secret from shares")]
     ReconstructionFailed {
         #[source]
-        source: derec_cryptography::vss::DerecVSSError,
+        source: DerecVSSError,
     },
 
     #[error(
@@ -43,6 +46,6 @@ pub enum RecoveryError {
     )]
     MalformedRecoveredSecret {
         #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: Box<dyn Error + Send + Sync>,
     },
 }

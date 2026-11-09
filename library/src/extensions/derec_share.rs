@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_cryptography::vss;
+use derec_proto::{DeRecShare, de_rec_share};
+
+use crate::Error;
+
 /// Binds a decoded [`DeRecShare`] to the secret and version it is supposed
 /// to be about.
 ///
@@ -11,11 +16,11 @@ pub(crate) trait DeRecShareExt {
     /// A share that decodes cleanly can still be the wrong share: recovery
     /// reads them from a helper that stores many, so the identifiers are
     /// what stop one secret's share being reconstructed into another's.
-    fn validate(&self, secret_id: u64, version: u32) -> Result<(), crate::Error>;
+    fn validate(&self, secret_id: u64, version: u32) -> Result<(), Error>;
 }
 
-impl DeRecShareExt for derec_proto::DeRecShare {
-    fn validate(&self, secret_id: u64, version: u32) -> Result<(), crate::Error> {
+impl DeRecShareExt for DeRecShare {
+    fn validate(&self, secret_id: u64, version: u32) -> Result<(), Error> {
         use crate::primitives::recovery::RecoveryError;
 
         if self.secret_id != secret_id {
@@ -45,24 +50,20 @@ impl DeRecShareExt for derec_proto::DeRecShare {
 /// A wire `DeRecShare`'s subshares as the [`vss`] subshares they encode.
 ///
 /// [`vss`]: derec_cryptography::vss
-pub(crate) fn into_vss_subshares(
-    subshares: Vec<derec_proto::de_rec_share::Subshare>,
-) -> Vec<derec_cryptography::vss::Subshare> {
+pub(crate) fn into_vss_subshares(subshares: Vec<de_rec_share::Subshare>) -> Vec<vss::Subshare> {
     subshares
         .into_iter()
-        .map(|p| derec_cryptography::vss::Subshare { x: p.x, y: p.y })
+        .map(|p| vss::Subshare { x: p.x, y: p.y })
         .collect()
 }
 
 /// [`vss`] subshares as the subshares of a wire `DeRecShare`.
 ///
 /// [`vss`]: derec_cryptography::vss
-pub(crate) fn to_wire_subshares(
-    subshares: &[derec_cryptography::vss::Subshare],
-) -> Vec<derec_proto::de_rec_share::Subshare> {
+pub(crate) fn to_wire_subshares(subshares: &[vss::Subshare]) -> Vec<de_rec_share::Subshare> {
     subshares
         .iter()
-        .map(|p| derec_proto::de_rec_share::Subshare {
+        .map(|p| de_rec_share::Subshare {
             x: p.x.clone(),
             y: p.y.clone(),
         })

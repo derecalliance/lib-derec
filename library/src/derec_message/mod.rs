@@ -32,11 +32,21 @@
 //! Malformed bytes surface as [`crate::Error::ProtobufDecode`]; recursion
 //! depth is bounded by `prost`'s decoder, and the DeRec schema is shallow
 //! enough that no additional caller-side recursion limit is needed.
+//!
+//! # Security: replay detection belongs to the transport
+//!
+//! The library processes a copy of a message as often as it is delivered
+//! within the inbound window. The application's transport layer MUST detect
+//! copies, of what it received and of what it sent, keyed on
+//! [`message_id`]; see the security note on
+//! [`crate::protocol::DeRecProtocol::process`] for the full contract.
 
-use crate::{primitives::pairing::PairingError, types::SharedKey};
-use derec_cryptography::pairing::PairingSecretKeyMaterial;
+use crate::{Error, primitives::pairing::PairingError, types::SharedKey, utils::random_u64};
+use derec_cryptography::channel;
+use derec_cryptography::pairing::{PairingSecretKeyMaterial, envelope};
 use derec_proto::{DeRecMessage, MessageBody};
 use prost::Message;
+use sha2::{Digest, Sha256};
 
 mod builder;
 pub use builder::*;
@@ -49,10 +59,10 @@ mod tests;
 pub fn extract_inner_message(
     message_bytes: &[u8],
     shared_key: &SharedKey,
-) -> Result<MessageBody, crate::Error> {
+) -> Result<MessageBody, Error> {
     let decrypted = decrypt_inner_message(message_bytes, shared_key)?;
 
-    let inner = MessageBody::decode_from_vec(&decrypted).map_err(crate::Error::ProtobufDecode)?;
+    let inner = MessageBody::decode_from_vec(&decrypted).map_err(Error::ProtobufDecode)?;
 
     Ok(inner)
 }
@@ -67,11 +77,9 @@ pub fn extract_inner_message(
 pub(crate) fn decrypt_inner_message(
     message_bytes: &[u8],
     shared_key: &SharedKey,
-) -> Result<Vec<u8>, crate::Error> {
-    Ok(
-        derec_cryptography::channel::decrypt_message(message_bytes, shared_key)
-            .map_err(DeRecMessageBuilderError::Encryption)?,
-    )
+) -> Result<Vec<u8>, Error> {
+    Ok(channel::decrypt_message(message_bytes, shared_key)
+        .map_err(DeRecMessageBuilderError::Encryption)?)
 }
 
 /// Re-stamp the `trace_id` field on an already-produced DeRecMessage envelope.
@@ -85,9 +93,8 @@ pub(crate) fn decrypt_inner_message(
 /// callers who want correlation can produce + then [`apply_trace_id`] to set
 /// their own. The orchestrator (`DeRecProtocol`) already does this
 /// automatically on every outbound request.
-pub fn apply_trace_id(envelope_bytes: &[u8], trace_id: u64) -> Result<Vec<u8>, crate::Error> {
-    let mut envelope =
-        DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn apply_trace_id(envelope_bytes: &[u8], trace_id: u64) -> Result<Vec<u8>, Error> {
+    let mut envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
     envelope.trace_id = trace_id;
     Ok(envelope.encode_to_vec())
 }
@@ -100,7 +107,7 @@ pub fn apply_trace_id(envelope_bytes: &[u8], trace_id: u64) -> Result<Vec<u8>, c
 /// there is a 2^-64 chance of drawing a token downstream code might read as
 /// "no correlation requested" — not worth coding around.
 pub(crate) fn fresh_trace_id() -> u64 {
-    crate::utils::random_u64()
+    random_u64()
 }
 
 /// Read the `trace_id` field off an inbound DeRecMessage envelope without
@@ -108,22 +115,71 @@ pub(crate) fn fresh_trace_id() -> u64 {
 ///
 /// Pair with [`apply_trace_id`] for request/response correlation when
 /// driving the protocol through primitives directly.
-pub fn read_trace_id(envelope_bytes: &[u8]) -> Result<u64, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn read_trace_id(envelope_bytes: &[u8]) -> Result<u64, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
     Ok(envelope.trace_id)
+}
+
+/// The identity of one delivered message, read off its envelope without the
+/// channel key. See [`message_id`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MessageId {
+    /// SHA-256 of the envelope's encrypted `message` field.
+    pub id: [u8; 32],
+    /// The envelope's send time, in seconds since the Unix epoch.
+    pub timestamp: u64,
+}
+
+/// Identify an envelope for replay and reflection detection.
+///
+/// Detecting a message delivered twice is the application's job, since it
+/// owns the transport. What to keep, for how long, and that the record must
+/// survive a restart is set out on
+/// [`process`](crate::protocol::DeRecProtocol::process). `id` is the same for
+/// every copy of one message and different for every other message:
+///
+/// - It covers only the encrypted `message` field. The cleartext fields
+///   around it (`sequence`, `traceId`, the protocol version) are not
+///   authenticated, and protobuf accepts more than one encoding of the same
+///   envelope, so a copy can arrive as different bytes and still be
+///   accepted. A hash of the raw envelope therefore does not identify it.
+/// - Changing the `message` field fails decryption, and every message is
+///   sealed under a fresh random nonce, so no other message, not even one
+///   with the same body, has the same `id`.
+///
+/// `timestamp` is the envelope's cleartext send time. Once
+/// [`process`](crate::protocol::DeRecProtocol::process) accepts the message
+/// it is proven equal to the authenticated time inside it.
+///
+/// The plaintext `PrePair` leg of `HashedKeys` pairing is the exception: its
+/// `message` field is not encrypted, so a copy re-encoded inside it gets a
+/// different `id`. That leg is not authenticated at all; the contact's nonce
+/// is what binds it.
+///
+/// # Errors
+///
+/// [`Error::ProtobufDecode`] when the bytes are not an envelope, and
+/// [`Error::InvalidInput`] when it carries no timestamp, which the protocol
+/// never accepts.
+pub fn message_id(envelope_bytes: &[u8]) -> Result<MessageId, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
+    let timestamp = envelope
+        .timestamp
+        .ok_or(Error::InvalidInput("envelope carries no timestamp"))?;
+    Ok(MessageId {
+        id: Sha256::digest(&envelope.message).into(),
+        timestamp: u64::try_from(timestamp.seconds).unwrap_or(0),
+    })
 }
 
 pub fn extract_inner_pairing_message(
     message_bytes: &[u8],
     pairing_secret: &PairingSecretKeyMaterial,
-) -> Result<MessageBody, crate::Error> {
-    let decrypted = derec_cryptography::pairing::envelope::decrypt(
-        message_bytes,
-        pairing_secret.ecies_secret_key(),
-    )
-    .map_err(PairingError::PairingEncryption)?;
+) -> Result<MessageBody, Error> {
+    let decrypted = envelope::decrypt(message_bytes, pairing_secret.ecies_secret_key())
+        .map_err(PairingError::PairingEncryption)?;
 
-    let inner = MessageBody::decode_from_vec(&decrypted).map_err(crate::Error::ProtobufDecode)?;
+    let inner = MessageBody::decode_from_vec(&decrypted).map_err(Error::ProtobufDecode)?;
 
     Ok(inner)
 }
@@ -139,6 +195,6 @@ pub fn extract_inner_pairing_message(
 /// see [`crate::primitives::pairing::request::produce_pre_pair_request`]
 /// and [`crate::primitives::pairing::response::produce_pre_pair`] for the
 /// producers that emit the bytes this function decodes.
-pub fn extract_inner_plaintext_message(message_bytes: &[u8]) -> Result<MessageBody, crate::Error> {
-    MessageBody::decode_from_vec(message_bytes).map_err(crate::Error::ProtobufDecode)
+pub fn extract_inner_plaintext_message(message_bytes: &[u8]) -> Result<MessageBody, Error> {
+    MessageBody::decode_from_vec(message_bytes).map_err(Error::ProtobufDecode)
 }

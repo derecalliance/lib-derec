@@ -350,7 +350,7 @@ Optional setters have defaults:
 | Setter | Default | Purpose |
 |--------|---------|---------|
 | `with_threshold(n)` | `3` | The starting threshold `t`, the minimum subshares required to reconstruct the secret, for a secret with no threshold stored. Each paired Helper contributes one subshare unless `ProtectSecret` gives it more weight; see [Weighted helpers](#weighted-helpers). Once a publish stores a `t`, that `t` applies; see [The threshold is recorded](#the-threshold-is-recorded). |
-| `with_timeouts(timeouts)` | see [Timeouts](#timeouts) | All four waiting periods in one call; unspecified fields keep their default. `inbound_message` 300s is the staleness/replay window, `sharing_round` and `unpair_ack` 60s are liveness budgets, `expired_channels` `Enabled { 300 }` sweeps channels awaiting fingerprint confirmation. |
+| `with_timeouts(timeouts)` | see [Timeouts](#timeouts) | Every waiting period in one call; unspecified fields keep their default. `inbound_message` 300s is the staleness/replay window, `sharing_round` and `unpair_ack` 60s are liveness budgets, `pairing` 30s is how old a contact or pairing request may be (see [Pairing lifetime](#pairing-lifetime)), `expired_channels` `Enabled { 300 }` sweeps channels awaiting fingerprint confirmation. |
 | `with_unsafe_connection(bool)` | `false` | Accept plaintext `http://` and `grpc://` endpoints. **Development only.** Loopback is accepted for your own endpoint regardless; see [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
 | `with_replica_id(id)` | unset | This device's replica identity. Required for any replica-mode pairing; application-assigned and rejected if `0`. |
@@ -415,6 +415,8 @@ SDK, is:
     "inbound_message_secs": 300,
     "sharing_round_secs": 60,
     "unpair_ack_secs": 60,
+    "get_share_response_secs": 300,
+    "pairing_secs": 30,
     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
   },
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
@@ -510,26 +512,53 @@ before any target-level events are emitted.
   still an error from `process`. See
   [Which versions to verify](#which-versions-to-verify).
 - `SecretsDiscovered { channel_id, secrets }`
-- `RecoveryShareReceived { … }` /
-  `SecretRecovered { secret: Secret }` (typed; `secret.secrets` is the
-  list of `UserSecret` the owner protected, alongside the captured
-  helper/replica roster) /
-  `RecoveryShareError { … }` /
-  `RecoveryShareRefused { channel_id, version, status, memo }` — a helper
+- `RecoveryShareReceived { channel_id, shares_received }` — a helper's
+  share was collected. A recovery reconstructs nothing until every helper it
+  asked has answered, or `timeouts.get_share_response_secs` has passed since
+  the requests went out (each silent helper is then reported as
+  `RecoverSecretFailed { …, error: "timeout" }`). It then decides exactly
+  once:
+  - `SecretRecovered { secret: Secret }` (typed; `secret.secrets` is the
+    list of `UserSecret` the owner protected, alongside the captured
+    helper/replica roster) — one secret reconstructs and every collected
+    share is part of it;
+  - `RecoveryDisputed { version, secret, supported_by, disputed_by }` — one
+    secret reconstructs, but other helpers hold valid shares of a different
+    split that does not. Either side can be the owner's: colluding helpers
+    can forge a complete split, and the honest ones may be too few to
+    reconstruct theirs. Show the owner what `secret` holds and who stands on
+    each side, and pass it to `restore` only once they confirm it;
+  - `RecoveryConflict { version, candidates, disputed_by }` — two or more
+    different secrets reconstruct. Each candidate carries the `secret` and
+    `supported_by`. The library never picks: involve the owner, and pass
+    the candidate they confirm to `restore`;
+  - `RecoveryIncomplete { secret_id, version, shares_received }` — nothing
+    reconstructs. The recovery is closed; start it again to retry.
+
+  `supported_by` / `disputed_by` name helpers as `RecoveryHelper
+  { channel_id, communication_info }`, the `communication_info` being what
+  the helper advertised when it paired, so the app can tell the owner who
+  is on each side. That is the helper's own configured communication info
+  (`with_communication_info`), not the `peer_communication_info` the
+  helper passed to `start(Pairing)`: a helper that configures none is named
+  by its channel alone.
+- `RecoveryShareRefused { channel_id, version, status, memo }` — a helper
   answered with a non-OK status (e.g. `UNKNOWN_SHARE_VERSION`) instead of a
-  share; it is not collected and the recovery stays open for the others
+  share; it is not collected, but it is that helper's answer
 - `RecoveryShareCorrupted { channel_id, version, reason }` — a helper
   answered with a share that cannot be part of the secret. `reason` is a
   `CorruptionReason`: `Malformed` (no decodable share for the requested
   secret and version, or a share bigger than this device's own configured
   `max_share_size`, rejected before it is even parsed) or `InvalidProof`
   (the share fails its own Merkle proof, e.g. a tampered value), both
-  reported as the share arrives; or `Inconsistent` (valid on its own, but
-  its commitment root or ciphertext disagrees with the shares the secret
-  was rebuilt from), reported alongside `SecretRecovered`. The share is set
-  aside and never blocks the recovery.
+  reported as the share arrives; or `Forged` (its group reconstructs under
+  one key, but not to a secret, or a single share reconstructs alone —
+  neither happens with an honest split), reported with the recovery's
+  decision. The share is set aside and never blocks the recovery.
   An honest helper never sends one, so the app may treat it as a sign of a
-  damaged or compromised helper — e.g. offer to unpair it
+  damaged or compromised helper — e.g. offer to unpair it. A share that
+  only disagrees with the others is never reported here: it is a dispute,
+  not evidence against its helper
 - `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }` /
   `UnpairFailed { channel_id, error }` — emitted by `restore` when an
   ephemeral recovery channel's teardown could not be delivered. The restore
@@ -556,9 +585,10 @@ before any target-level events are emitted.
   [Replica fingerprint verification is mandatory](#replica-fingerprint-verification-is-mandatory)),
   `IgnoreReason::Expired` (older than the inbound timeout),
   `IgnoreReason::TimestampMismatch` (the envelope and inner-message
-  timestamps differ, or either or both are absent) or
+  timestamps differ, or either or both are absent),
   `IgnoreReason::StaleResponse` (a verification response to a replaced
-  challenge).
+  challenge) or `IgnoreReason::Superseded` (a share request for a version
+  older than the newest one stored on the channel, and not stored itself).
 - `NoOp` — emitted when an inbound message was processed but had no
   application-visible consequence.
 
@@ -633,6 +663,37 @@ receiver ignores a message whose two timestamps differ, or where either or
 both are absent, as `MessageIgnored` with `IgnoreReason::TimestampMismatch`.
 A peer on 0.0.8 or earlier stamps its replies separately, so they are
 ignored this way.
+
+### Replays and reflections
+
+`process` ignores a message older than `Timeouts::inbound_message`, but
+within that window it processes every copy of a message it is handed. Both
+ends of a channel encrypt under one key, so a message this device sent,
+delivered back to it, decrypts as if the peer had sent it. Detecting both is
+the job of the application's transport layer, keyed on
+`derec_message::message_id(envelope)`:
+
+- `id` is a SHA-256 of the envelope's encrypted `message` field. It is the
+  same for every copy of one message and different for every other message.
+  The cleartext fields around it (`sequence`, `traceId`, the protocol
+  version) are not authenticated and an envelope can be re-encoded, so never
+  key on a hash of the raw bytes.
+- Keep the `id` of every envelope this device sends, and of every envelope
+  `process` accepted (it returned `Ok` without `MessageIgnored`), until
+  `max(received or sent at, timestamp) + inbound_message`. Drop an inbound
+  envelope whose `id` is kept, without calling `process`.
+- Keep the record across restarts, or hold inbound traffic for one window
+  after starting.
+
+A message held back and delivered late is a first delivery, so no record
+catches it. A `StoreShareRequest` for a version older than the newest one a
+helper stores on the channel, and not stored itself, is ignored as
+`MessageIgnored` with `IgnoreReason::Superseded`, so a dropped version never
+comes back. A contact update is the application's to order: the `timestamp`
+of the envelope that raised an `UpdateChannelInfo` `ActionRequired` is when
+the update was sent, and an update older than the last one accepted on the
+channel should be rejected. That needs `AutoAcceptPolicy::update_channel_info`
+off.
 
 ### When `process` fails
 
@@ -1152,6 +1213,44 @@ identity. After pairing completes, propagate a long-term endpoint via
 This flow is covered end to end — happy path and tampered-hash — for every
 SDK. See [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
+### Pairing lifetime
+
+A pairing is possible for `Timeouts::pairing` (default 30 s), measured from
+the contact's `timestamp` for the contact and from the request's `timestamp`
+for a `PairRequest` or `PrePairRequest`. Both sides enforce it, and nothing is
+sent when it runs out:
+
+- **Scanner:** `start(Pairing)` refuses a contact older than the lifetime with
+  `Error::Pairing(PairingError::Expired)` (code `pairing_expired`), and a
+  contact without a timestamp with `PairingError::InvalidContactMessage`.
+- **Creator, on arrival:** a request on a contact older than the lifetime, or
+  a request older than it, is reported as `MessageIgnored` with
+  `IgnoreReason::Expired`, before any `ActionRequired`, and is not answered.
+  The creator measures its contact's age from its own stored copy, so on its
+  own clock.
+- **Creator, on `accept`:** a request accepted after its lifetime, or on a
+  contact that expired while the prompt waited, is refused with
+  `PairingError::Expired`. No channel is recorded.
+
+An expired contact can never pair again, so its stored material is dropped
+when it is next used. A request that expired on a contact still inside its
+lifetime leaves the contact usable, and the scanner can start again.
+
+Pairing involves both parties, and each one checks whether it succeeded, so
+an expiry is a retry: tell the user to scan or share a fresh contact. Without
+this rule a request accepted after its scanner gave up left a channel only the
+creator held.
+
+The scanner keeps its side of a pairing in flight for
+`Timeouts::expired_channels`, so that timeout should be at least
+`Timeouts::pairing` plus the time a response takes to arrive; the defaults,
+300 s and 30 s, leave that margin. Ages are measured across the two devices'
+clocks, so clocks more than the lifetime apart cannot pair. Two starts on
+one contact are still the application's to reconcile: the scanner keeps only
+the last request's keys, so accepting the earlier one leaves a channel the
+scanner cannot open. Confirming a new pairing before relying on it catches
+both.
+
 ---
 
 ## Replica flows
@@ -1556,8 +1655,10 @@ For example, an owner with seven helpers:
 A version whose round is still open when the next one starts is deleted from
 every helper that stores the next one, unless it is the version returned. A
 helper that receives a request older than the latest version it holds on the
-channel ignores that request's `keepVersion`, so a replayed or delayed
-request never deletes a newer share.
+channel never deletes a newer share: a version it still holds is an identical
+re-send whose `keepVersion` is ignored, and one it does not hold is ignored as
+`MessageIgnored` with `IgnoreReason::Superseded`, unanswered, so a version
+already deleted is not stored again.
 
 A replica member publishing as the source cannot tell which versions it
 mirrored had committed on the previous source. Returning the newest version it
@@ -2341,13 +2442,16 @@ than allowed to block the recovery:
   secret and version, and pass its Merkle proof. A share that fails is
   reported as `RecoveryShareCorrupted` (`Malformed` / `InvalidProof`) and
   never collected.
-- Shares that are each valid can still disagree, carrying different
-  commitment roots or ciphertexts. They are grouped by `(root, ciphertext)`
-  and the groups are tried largest first (ties go to the group whose first
-  share arrived earliest); the first that reconstructs is the secret, so the
-  shares used always agree. Every share outside it is reported as
-  `RecoveryShareCorrupted` (`Inconsistent`), once per helper, alongside
-  `SecretRecovered`. No group is ever reconstructed from a single share.
+- Nothing is reconstructed until every helper asked has answered, or
+  `get_share_response_secs` has passed. Shares that are each valid can still
+  disagree, carrying different commitment roots or ciphertexts. They are
+  grouped by `(root, ciphertext)` and every group is tried; a group is a
+  secret only if it holds shares from at least two helpers, decrypts,
+  decodes, and fits the threshold it declares. A group that reconstructs
+  anything else is reported as `RecoveryShareCorrupted` (`Forged`). Any
+  other share outside the secret is a dispute: the decision is
+  `RecoveryDisputed` (or `RecoveryConflict` when several secrets
+  reconstruct) naming the helpers on each side, never a corruption.
 
 Since an honest helper never sends a corrupted share, the application may
 take `RecoveryShareCorrupted` as a sign that the helper's device or storage is
@@ -2463,8 +2567,8 @@ non-`Ok` status.
 
 The recoverable secret — the bytes reconstructed from a threshold of shares
 (`recovered.secret_data` in [Recovery](#recovery) above) — is `[version byte]
-· payload`. The leading byte is the format major version; for v1 the payload
-is **gzip (RFC 1952) compressed JSON**. Within that JSON:
+· payload`. The leading byte is the format major version; for v2 and v3 the
+payload is **gzip (RFC 1952) compressed JSON**. Within that JSON:
 
 - every byte-array field (`shared_key`, `id`, `data`, …) is **standard base64
   with padding (RFC 4648 §4)** — never base64url;
@@ -2475,7 +2579,7 @@ is **gzip (RFC 1952) compressed JSON**. Within that JSON:
 This format is deliberately independent of the DeRec wire protocol: transport
 messages (`DeRecMessage`, `StoreShareRequest`, `ReplicaSecretPayload`, etc.)
 remain protobuf and are unaffected. Only the recoverable secret placed in
-`secret_data` uses this versioned envelope (v1: JSON + base64 + gzip), which
+`secret_data` uses this versioned envelope (v3: JSON + base64 + gzip), which
 makes it a self-describing, cross-application interoperability surface — any
 implementation can read the version byte, gunzip, parse the JSON, and
 base64-decode the byte fields without sharing code or a compiled schema with
@@ -2502,8 +2606,9 @@ Applications using this SDK should ensure:
   keychain-grade — see the trait doc).
 - Proper authentication of helpers.
 - Safe transport channels.
-- Protection against replay attacks beyond the protocol's own timestamp-based
-  staleness check.
+- Detection of replayed and reflected messages within the inbound window,
+  keyed on `derec_message::message_id` (see
+  [Replays and reflections](#replays-and-reflections)).
 
 The DeRec protocol assumes helpers are independent and trusted entities.
 
@@ -2571,6 +2676,44 @@ immediately, so that copy usually arrives before the destination's user has
 confirmed. Confirming does not replay it: once the destination's
 `verify_fingerprint` succeeds, call `start(DeRecFlow::ReplicaDiscovery)` to
 pull the copy from the source.
+
+Until a device confirms a member, that member is not part of the group as
+far as the device is concerned. It is left out of every roster the device
+publishes (each new version, catch-up answers and the vault itself), it is
+not asked in a replica version check, and it cannot succeed a removed source.
+Every recipient installs a roster's members as paired, so listing an
+unconfirmed one would admit it on their behalf.
+
+### Every helper sees the vault's compressed length
+
+The vault (the user's secrets, every helper's channel key and
+`communication_info`, and the replica group key) is compressed as one gzip
+stream before it is encrypted and split. Encryption keeps the length, so
+every helper learns the compressed length of every version. A helper also
+chooses part of what is compressed: its own `communication_info`, which it
+changes with `UpdateChannelInfo`. When that text repeats part of a secret
+elsewhere in the vault, the vault compresses better, so over many versions a
+corrupted helper could learn another helper's channel key, the group key or
+the user's secrets a few characters at a time (the side channel behind CRIME
+and BREACH). Each guess costs a new version, which only the owner creates,
+after a contact change the owner's application has to accept. Keep
+`AutoAcceptPolicy::update_channel_info` off, and treat a helper that keeps
+changing its contact details as suspect.
+
+### Decoding a recovered vault has no memory limit
+
+In recovery the vault is decrypted from shares that nothing authenticates,
+so a forged recovery group can deliver any payload, including one built to
+exhaust memory. The decoder parses the vault while it inflates it: a payload
+that is not JSON is refused after its first bytes, and padding is not
+buffered. A payload that is valid JSON still receives the memory its largest
+value claims, and gzip lets a payload claim up to about 1030 times its own
+size. The library sets no limit. When memory runs out, a native process is
+killed by the operating system or aborts, with no error and no event; under
+WebAssembly the call fails with a trap, after which the instance must not be
+used. To bound it, configure `parameter_range.max_share_size`: a recovery
+share larger than that is refused before anything is decoded, so a vault can
+claim at most about 1030 times that size.
 
 ### The `derec.*` namespace in `CommunicationInfo` is library-owned
 

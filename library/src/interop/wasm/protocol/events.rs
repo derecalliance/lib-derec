@@ -9,6 +9,7 @@
 //! per-variant docs and the field-name conventions.
 
 use serde::Serialize;
+use serde_wasm_bindgen::Serializer;
 use wasm_bindgen::JsValue;
 
 use crate::interop::wasm::ts_bindings_utils::js_error;
@@ -16,7 +17,7 @@ use crate::protocol::{DeRecEvent, events::wire};
 
 pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
     let mirror = wire::Event::from_event(event).map_err(|e| js_error("wasm_serialize_error", e))?;
-    let serializer = serde_wasm_bindgen::Serializer::new()
+    let serializer = Serializer::new()
         .serialize_maps_as_objects(true)
         .serialize_missing_as_null(true);
     mirror

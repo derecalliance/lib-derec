@@ -2,7 +2,7 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use rusqlite::Connection;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Migrations bundled into the binary at compile time. Adding a new
 /// migration is two lines: drop a new `.sql` file under `migrations/`
@@ -104,6 +104,6 @@ fn apply_migrations(connection: &Connection) {
 /// Helper: open the lock, panic on a poisoned mutex (which here would
 /// only mean a prior panic while holding the lock — fatal either way
 /// for these smoke tests).
-pub fn lock(connection: &SharedConnection) -> std::sync::MutexGuard<'_, Connection> {
+pub fn lock(connection: &SharedConnection) -> MutexGuard<'_, Connection> {
     connection.lock().expect("SQLite connection mutex poisoned")
 }
