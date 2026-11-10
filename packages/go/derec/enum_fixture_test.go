@@ -100,6 +100,7 @@ var fixtureErrorCategories = map[string]int32{
 	"Protobuf":     derec.CategoryProtobuf,
 	"Invariant":    derec.CategoryInvariant,
 	"StateStore":   derec.CategoryStateStore,
+	"Transport":    derec.CategoryTransport,
 }
 
 var fixtureErrorCodes = map[string]int32{
@@ -134,6 +135,7 @@ var fixtureErrorCodes = map[string]int32{
 	"UnexpectedReplicaId":           derec.CodeUnexpectedReplicaID,
 	"IncompatibleParameterRange":    derec.CodeIncompatibleParameterRange,
 	"FingerprintCommitmentMismatch": derec.CodeFingerprintCommitmentMismatch,
+	"PairingExpired":                derec.CodePairingExpired,
 	"EmptyChannels":                 derec.CodeEmptyChannels,
 	"DuplicateChannelId":            derec.CodeDuplicateChannelID,
 	"InvalidThreshold":              derec.CodeInvalidThreshold,
@@ -158,6 +160,7 @@ var fixtureErrorCodes = map[string]int32{
 	"FfiNulInString":                derec.CodeFFINulInString,
 	"TransportInvalid":              derec.CodeTransportInvalid,
 	"NoUsableEndpoint":              derec.CodeNoUsableEndpoint,
+	"TransportSendFailed":           derec.CodeTransportSendFailed,
 }
 
 func checkNumberToNameEnum(t *testing.T, enumName, prefix string, goValues map[string]int32, name func(int32) string) {

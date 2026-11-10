@@ -1,22 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_library::Error;
+use derec_library::derec_message::{apply_trace_id, read_trace_id};
 use derec_library::primitives::discovery::{
     request as disc_request,
     response::{self as disc_response, SecretVersionEntry, VersionEntry},
 };
 use derec_library::primitives::pairing::{
-    PairingError, request as pair_request, response as pair_response,
+    PairingError, fingerprint, request as pair_request, response as pair_response,
 };
 use derec_library::primitives::recovery::{request as rec_request, response as rec_response};
 use derec_library::primitives::sharing::{request as share_request, response as share_response};
 use derec_library::primitives::verification::{
     request as verif_request, response as verif_response,
 };
-use derec_library::types::{ChannelId, ChannelKey};
-use derec_proto::{Protocol, SenderKind, TransportProtocol};
+use derec_library::protocol_version::ProtocolVersion;
+use derec_library::transport::TransportPolicy;
+use derec_library::types::{ChannelId, ChannelKey, SharedKey};
+use derec_proto::{
+    ContactMessage, ContactMode, DeRecMessage, PairResponseMessage, PrePairRequestMessage,
+    PrePairResponseMessage, Protocol, SenderKind, TransportProtocol,
+};
 use prost::Message;
 use std::collections::HashMap;
+use std::slice;
 
 pub fn run_all() {
     run_protocol_version_test();
@@ -38,7 +46,7 @@ pub fn run_all() {
 fn run_protocol_version_test() {
     println!("=== Protocol version test ===");
 
-    let version = derec_library::protocol_version::ProtocolVersion::current();
+    let version = ProtocolVersion::current();
 
     println!("protocol version = {version}");
     println!("major = {}", version.major);
@@ -54,7 +62,7 @@ fn run_pairing_flow_test() {
 
     let contact_result = pair_request::create_contact(
         channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://example.com/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -119,7 +127,7 @@ fn run_pairing_flow_test() {
         contact_result.secret_key.as_ref().unwrap(),
         None,
         None,
-        derec_library::transport::TransportPolicy::new(false),
+        TransportPolicy::new(false),
     )
     .expect("pair_response::produce failed");
 
@@ -171,7 +179,7 @@ fn run_pairing_flow_hashed_keys_test() {
 
     let alice_contact_result = pair_request::create_contact(
         channel_id,
-        derec_proto::ContactMode::HashedKeys,
+        ContactMode::HashedKeys,
         vec![TransportProtocol {
             uri: "https://example.com/alice/ephemeral".to_owned(),
             protocol: Protocol::Https.into(),
@@ -185,7 +193,7 @@ fn run_pairing_flow_hashed_keys_test() {
 
     assert_eq!(
         alice_contact.contact_mode,
-        derec_proto::ContactMode::HashedKeys as i32,
+        ContactMode::HashedKeys as i32,
         "contact must advertise HASHED_KEYS mode"
     );
     assert!(
@@ -246,11 +254,29 @@ fn run_pairing_flow_hashed_keys_test() {
     );
     assert_eq!(processed_prepair.nonce, alice_contact.nonce);
 
+    // Moving the last byte of the ML-KEM key to the front of the ECIES key
+    // leaves the concatenated keys, and so the binding hash input, unchanged;
+    // the scanner refuses the split anyway.
+    let mut split = extracted_prepair_resp.response.clone();
+    let mut mlkem = split.mlkem_encapsulation_key.take().unwrap();
+    let mut ecies = vec![mlkem.pop().unwrap()];
+    ecies.extend(split.ecies_public_key.take().unwrap());
+    split.mlkem_encapsulation_key = Some(mlkem);
+    split.ecies_public_key = Some(ecies);
+    assert!(
+        matches!(
+            pair_response::process_pre_pair(&alice_contact, &split),
+            Err(Error::Pairing(PairingError::PrePairHashMismatch))
+        ),
+        "keys split at another point must be refused"
+    );
+    println!("  keys split at another point refused (PrePairHashMismatch)  ✓");
+
     let mut filled_in_contact = alice_contact.clone();
     filled_in_contact.mlkem_encapsulation_key =
         Some(processed_prepair.mlkem_encapsulation_key.clone());
     filled_in_contact.ecies_public_key = Some(processed_prepair.ecies_public_key.clone());
-    filled_in_contact.contact_mode = derec_proto::ContactMode::InlineKeys as i32;
+    filled_in_contact.contact_mode = ContactMode::InlineKeys as i32;
     filled_in_contact.contact_binding_hash = None;
     filled_in_contact.fingerprint_commitment =
         Some(processed_prepair.fingerprint_commitment.clone());
@@ -280,7 +306,7 @@ fn run_pairing_flow_hashed_keys_test() {
         alice_secret.as_ref().unwrap(),
         None,
         None,
-        derec_library::transport::TransportPolicy::new(false),
+        TransportPolicy::new(false),
     )
     .expect("pair_response::produce failed");
 
@@ -322,15 +348,15 @@ fn endpoint(uri: &str) -> Vec<TransportProtocol> {
 /// An InlineKeys handshake up to the scanner holding the decrypted pair
 /// response: `(contact, response, scanner secret, creator's channel key)`.
 fn inline_keys_handshake() -> (
-    derec_proto::ContactMessage,
-    derec_proto::PairResponseMessage,
-    derec_library::primitives::pairing::request::ProduceResult,
-    derec_library::types::SharedKey,
+    ContactMessage,
+    PairResponseMessage,
+    pair_request::ProduceResult,
+    SharedKey,
 ) {
     let channel_id = ChannelId(31);
     let contact = pair_request::create_contact(
         channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         endpoint("https://example.com/alice"),
         None,
     )
@@ -357,7 +383,7 @@ fn inline_keys_handshake() -> (
         &creator_secret,
         None,
         None,
-        derec_library::transport::TransportPolicy::new(false),
+        TransportPolicy::new(false),
     )
     .expect("pair_response::produce failed");
     let response =
@@ -392,8 +418,8 @@ fn run_fingerprint_nonce_opens_the_commitment_test() {
         .expect("the honest response completes pairing");
     assert_eq!(processed.shared_key, creator_key);
     assert_eq!(
-        derec_library::primitives::pairing::fingerprint(&processed.shared_key),
-        derec_library::primitives::pairing::fingerprint(&creator_key),
+        fingerprint(&processed.shared_key),
+        fingerprint(&creator_key),
         "both sides display the same fingerprint"
     );
 
@@ -410,9 +436,7 @@ fn run_tampered_fingerprint_nonce_test() {
     assert!(
         matches!(
             result,
-            Err(derec_library::Error::Pairing(
-                PairingError::FingerprintCommitmentMismatch
-            ))
+            Err(Error::Pairing(PairingError::FingerprintCommitmentMismatch))
         ),
         "a nonce that does not open the commitment must be refused"
     );
@@ -421,13 +445,13 @@ fn run_tampered_fingerprint_nonce_test() {
 }
 
 fn no_keys_pre_pair_answer() -> (
-    derec_proto::ContactMessage,
-    derec_proto::PrePairRequestMessage,
-    derec_proto::PrePairResponseMessage,
+    ContactMessage,
+    PrePairRequestMessage,
+    PrePairResponseMessage,
 ) {
     let contact = pair_request::create_contact(
         ChannelId(32),
-        derec_proto::ContactMode::NoKeys,
+        ContactMode::NoKeys,
         endpoint("https://example.com/alice"),
         Some(4321),
     )
@@ -459,9 +483,7 @@ fn run_pre_pair_response_without_commitment_test() {
     assert!(
         matches!(
             result,
-            Err(derec_library::Error::Pairing(
-                PairingError::InvalidPairResponseMessage(_)
-            ))
+            Err(Error::Pairing(PairingError::InvalidPairResponseMessage(_)))
         ),
         "a PrePair response without a commitment must be refused"
     );
@@ -489,7 +511,7 @@ fn run_relay_reusing_creator_commitment_test() {
     filled_in.mlkem_encapsulation_key = Some(validated.mlkem_encapsulation_key);
     filled_in.ecies_public_key = Some(validated.ecies_public_key);
     filled_in.fingerprint_commitment = Some(validated.fingerprint_commitment);
-    filled_in.contact_mode = derec_proto::ContactMode::InlineKeys as i32;
+    filled_in.contact_mode = ContactMode::InlineKeys as i32;
 
     let pair_req = pair_request::produce(
         SenderKind::Helper,
@@ -509,7 +531,7 @@ fn run_relay_reusing_creator_commitment_test() {
         relay_secret,
         None,
         None,
-        derec_library::transport::TransportPolicy::new(false),
+        TransportPolicy::new(false),
     )
     .expect("relay pair_response::produce failed");
     let response =
@@ -521,9 +543,7 @@ fn run_relay_reusing_creator_commitment_test() {
     assert!(
         matches!(
             result,
-            Err(derec_library::Error::Pairing(
-                PairingError::FingerprintCommitmentMismatch
-            ))
+            Err(Error::Pairing(PairingError::FingerprintCommitmentMismatch))
         ),
         "the relay's nonce cannot open the creator's commitment"
     );
@@ -685,7 +705,7 @@ fn run_verification_flow_test() {
     )
     .expect("verif_request::produce failed");
 
-    let request_envelope = derec_proto::DeRecMessage::decode(produced.envelope.as_slice())
+    let request_envelope = DeRecMessage::decode(produced.envelope.as_slice())
         .expect("failed to decode request envelope");
     assert_eq!(
         request_envelope.channel_id,
@@ -920,14 +940,11 @@ fn run_envelope_trace_id_test() {
     let result = disc_request::produce(channel_id, &ChannelKey::new(0, shared_key.clone()), &[])
         .expect("disc_request::produce failed");
 
-    let trace_before =
-        derec_library::derec_message::read_trace_id(&result.envelope).expect("read failed");
+    let trace_before = read_trace_id(&result.envelope).expect("read failed");
     assert_eq!(trace_before, 0, "primitive default trace_id must be 0");
 
-    let stamped =
-        derec_library::derec_message::apply_trace_id(&result.envelope, 0xDEAD_BEEF_F00D_CAFE)
-            .expect("apply failed");
-    let trace_after = derec_library::derec_message::read_trace_id(&stamped).expect("read failed");
+    let stamped = apply_trace_id(&result.envelope, 0xDEAD_BEEF_F00D_CAFE).expect("apply failed");
+    let trace_after = read_trace_id(&stamped).expect("read failed");
     assert_eq!(
         trace_after, 0xDEAD_BEEF_F00D_CAFE,
         "trace_id must round-trip through apply + read"
@@ -999,7 +1016,7 @@ fn run_request_reply_to_test() {
     let result = disc_request::produce(
         channel_id,
         &ChannelKey::new(0, shared_key.clone()),
-        std::slice::from_ref(&reply_to.clone()),
+        slice::from_ref(&reply_to.clone()),
     )
     .expect("disc_request::produce failed");
 

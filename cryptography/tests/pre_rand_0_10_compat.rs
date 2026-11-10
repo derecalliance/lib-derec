@@ -59,7 +59,8 @@ fn an_old_initiator_no_longer_loads_but_an_old_responder_still_finishes() {
         &contact.mlkem_encapsulation_key,
         &contact.ecies_public_key,
         &nonce,
-    );
+    )
+    .unwrap();
     let handshake_key: [u8; 32] = bytes(fixture::PAIRING_SHARED_KEY)
         .try_into()
         .expect("fixture key is 32 bytes");

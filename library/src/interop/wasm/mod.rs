@@ -9,6 +9,8 @@ pub mod protocol_version;
 pub mod replica_id;
 pub(crate) mod ts_bindings_utils;
 
+use js_sys::Date;
+
 pub(crate) fn now_secs() -> u64 {
-    (js_sys::Date::now() / 1000.0) as u64
+    (Date::now() / 1000.0) as u64
 }

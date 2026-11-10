@@ -1206,7 +1206,7 @@ async fn restore_on_a_fresh_device(owner: &Node, recovered: &Secret, version: u3
         true,
     );
     device
-        .restore(recovered, version)
+        .restore(recovered, version, version)
         .await
         .expect("restore on a fresh device must succeed");
     *owner.protocol.lock().await = device;

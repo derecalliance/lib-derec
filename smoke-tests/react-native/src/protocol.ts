@@ -17,7 +17,7 @@
 // resolve them by BFS closure, key shares for lookup, and record transport
 // calls for assertions; they are Map-backed instead of localStorage-backed.
 
-import { channelFilterMatches, ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, StatusEnum, primitives, shareStoreRefusal } from "@derec-alliance/react-native";
+import { channelFilterMatches, ContactMode, DeRecProtocol, DeRecProtocolBuilder, envelope, FlowKind, SenderKind, StatusEnum, primitives, shareStoreRefusal } from "@derec-alliance/react-native";
 import { utf8Decode, utf8Encode } from "./utf8";
 import type {
   ChannelStatusName,
@@ -30,6 +30,7 @@ import type {
   ParameterRange,
   ReplicaFilter,
   ReplicaRoleName,
+  RecoveryHelper,
   SecretStore,
   SenderKindName,
   Share,
@@ -480,6 +481,12 @@ interface OutboundMessage {
 
 class RecordingTransport implements Transport {
   private outbox: OutboundMessage[] = [];
+  private readonly failingUris = new Set<string>();
+
+  /** Every later send to `uri` rejects, as a broken link would. */
+  failUri(uri: string): void {
+    this.failingUris.add(uri);
+  }
 
   // The library hands over every endpoint the peer advertised, filtered but
   // unranked, and delivery to any one of them is success. A real transport
@@ -492,6 +499,9 @@ class RecordingTransport implements Transport {
     const endpoint = endpoints[0];
     if (!endpoint) {
       throw new Error("transport: send called with no endpoints");
+    }
+    if (this.failingUris.has(endpoint.uri)) {
+      throw new Error("simulated transport failure");
     }
     this.outbox.push({ endpoint, message });
   }
@@ -532,6 +542,7 @@ function makeNode(
     parameterRange?: Partial<ParameterRange>;
     autoRespondOnFailure?: boolean;
     keyRotation?: boolean;
+    timeouts?: import("@derec-alliance/react-native").Timeouts;
   } = {},
 ): Node {
   const channelStore = options.channelStore ?? new InMemoryChannelStore();
@@ -572,6 +583,9 @@ function makeNode(
   }
   if (options.keyRotation !== undefined) {
     builder = builder.withKeyRotation(options.keyRotation);
+  }
+  if (options.timeouts !== undefined) {
+    builder = builder.withTimeouts(options.timeouts);
   }
   const protocol = builder.build();
   return { protocol, transport, channelStore, shareStore, secretStore, userSecretStore, stateStore };
@@ -797,16 +811,19 @@ async function runFingerprintMismatchFlow(): Promise<void> {
   );
   await node.secretStore.save(nodeSid, String(channelId), 0, sharedKey);
 
-  let caught: { code?: string; category?: string } | null = null;
+  let caught: { code?: string; category?: string; channel_id?: string } | null = null;
   try {
     await node.protocol.verifyFingerprint(channelId, "0000-0000-0000-0000");
   } catch (e) {
-    caught = e as { code?: string; category?: string };
+    caught = e as { code?: string; category?: string; channel_id?: string };
   }
   if (caught?.code !== "fingerprint_mismatch" || caught.category !== "pairing") {
     throw new Error(
       `verifyFingerprint(wrong) must fail with pairing/fingerprint_mismatch, got ${JSON.stringify(caught)}`,
     );
+  }
+  if (caught.channel_id !== String(channelId)) {
+    throw new Error(`verifyFingerprint(wrong) must name channel ${channelId}, got ${String(caught.channel_id)}`);
   }
 
   const storedBytes = await node.channelStore.load(
@@ -846,16 +863,19 @@ async function runNoKeysFingerprintMismatchFlow(): Promise<void> {
   const ownerSid = String(owner.protocol.secretId());
   const helperSid = String(helper.protocol.secretId());
 
-  let caught: { code?: string; category?: string } | null = null;
+  let caught: { code?: string; category?: string; channel_id?: string } | null = null;
   try {
     await owner.protocol.verifyFingerprint(BigInt(longTermChannelId), "0000-0000-0000-0000");
   } catch (e) {
-    caught = e as { code?: string; category?: string };
+    caught = e as { code?: string; category?: string; channel_id?: string };
   }
   if (caught?.code !== "fingerprint_mismatch" || caught.category !== "pairing") {
     throw new Error(
       `NoKeys verifyFingerprint(wrong) must fail with pairing/fingerprint_mismatch, got ${JSON.stringify(caught)}`,
     );
+  }
+  if (caught.channel_id !== String(longTermChannelId)) {
+    throw new Error(`NoKeys verifyFingerprint(wrong) must name channel ${longTermChannelId}, got ${String(caught.channel_id)}`);
   }
   console.log("  verifyFingerprint(wrong) fails with fingerprint_mismatch  ✓");
 
@@ -1220,6 +1240,28 @@ async function runNoKeysPairingFlow(): Promise<void> {
     }
   }
   console.log("  confirming the fingerprint opens the channel on both sides  ✓\n");
+
+  // The nonce is what authenticates a NoKeys PrePairRequest: a scanner that
+  // presents another one is refused when the creator accepts.
+  const nonceCreator = makeNode("Owner", "https://owner.example.com");
+  const nonceScanner = makeNode("Helper", "https://helper.example.com");
+  const contact = await nonceCreator.protocol.createContact(9999n, ContactMode.NoKeys, 8888n);
+  await nonceScanner.protocol.start(FlowKind.Pairing, {
+    kind: SenderKind.Helper,
+    contact: { ...contact, nonce: 7777n },
+  });
+  const prePair = drainOne(nonceScanner, "Helper");
+  const prePairAction = requireEvent(await nonceCreator.protocol.process(prePair), "ActionRequired", "Owner");
+  let mismatch: string | undefined;
+  try {
+    await nonceCreator.protocol.accept(prePairAction.action);
+  } catch (e) {
+    mismatch = (e as { message?: string }).message;
+  }
+  if (!mismatch?.includes("NoKeys PrePair nonce mismatch")) {
+    throw new Error(`accept must fail with the NoKeys nonce mismatch, got ${mismatch ?? "no error"}`);
+  }
+  console.log("  a PrePairRequest with the wrong nonce → accept fails with \"NoKeys PrePair nonce mismatch\"  ✓\n");
 
   console.log("✓ NoKeys pairing flow passed.\n");
 }
@@ -1677,6 +1719,42 @@ async function runStickyThresholdFlow(): Promise<void> {
   }
   console.log("  [Owner]  the pairing publish splits at the stored t=3, not the builder's 2  ✓");
 
+  // Recover that version and restore it on a fresh device whose builder
+  // says 2: its first publish splits at the restored t=3.
+  const v3 = v2 + 1;
+  await owner.protocol.start(FlowKind.RecoverSecret, { secretId, version: v3 });
+  const recovered = (await roundTrip()).find((e) => e.type === "SecretRecovered");
+  if (recovered?.type !== "SecretRecovered") throw new Error(`v${v3} must be recovered`);
+  if (recovered.secret.threshold !== 3) {
+    throw new Error(`the recovered roster must carry t=3, got ${recovered.secret.threshold}`);
+  }
+  const restored = makeNode("RestoredOwner", "https://restored.example.com", { secretId, threshold: 2 });
+  // The helpers may hold versions newer than the one recovered: the snapshot
+  // is recorded at the newest one, so the next publish numbers above it.
+  const newest = v3 + 2;
+  await restored.protocol.restore(recovered.secret, v3, newest);
+  const restoredSnapshot = await restored.userSecretStore.loadLatest(secretId.toString());
+  if (restoredSnapshot?.threshold !== 3) {
+    throw new Error("restore must keep t=3");
+  }
+  if (restoredSnapshot?.version !== newest) {
+    throw new Error(`restore must record the snapshot at the newest v${newest}, got v${restoredSnapshot?.version}`);
+  }
+  const after = await restored.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([7]), name: "sticky", data: new Uint8Array([7, 8, 9]) }],
+  });
+  const v4 = requireEvent(after, "ProtectSecretStarted", "RestoredOwner").version;
+  if (v4 !== newest + 1) {
+    throw new Error(`the first publish after restore must follow the newest v${newest}, got v${v4}`);
+  }
+  for (const channelId of [...channels, channelD]) {
+    const t = await stored(restored, channelId, v4);
+    if (t !== 3) {
+      throw new Error(`the first publish after restore must split at the restored t=3, got ${t}`);
+    }
+  }
+  console.log(`  [Restored] the first publish after restore (v${v4}) splits at the restored t=3, not the builder's 2  ✓`);
+
   console.log("\n✓ Sticky threshold flow passed.\n");
 }
 
@@ -1985,6 +2063,124 @@ async function runInvalidKeepVersionFlow(): Promise<void> {
 }
 
 /**
+ * The application's replay record: the identity of every envelope a device
+ * sent or accepted, keyed on `envelope.message_id`.
+ */
+class SeenEnvelopes {
+  private readonly ids = new Set<string>();
+
+  private static idOf(bytes: Uint8Array): string {
+    return Array.from(envelope.message_id(bytes).id, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  record(bytes: Uint8Array): void {
+    this.ids.add(SeenEnvelopes.idOf(bytes));
+  }
+
+  contains(bytes: Uint8Array): boolean {
+    return this.ids.has(SeenEnvelopes.idOf(bytes));
+  }
+}
+
+function raisedUpdateChannelInfo(events: DeRecEvent[]): boolean {
+  return events.some((e) => e.type === "ActionRequired" && e.action_kind === "UpdateChannelInfo");
+}
+
+/**
+ * The library processes every copy of a message delivered within the inbound
+ * window, including one delivered back to its own sender. An application that
+ * records the message id of what it sends and accepts drops a replay, a copy
+ * whose unauthenticated trace id was changed, and a reflection.
+ */
+async function runReplayDetectionFlow(): Promise<void> {
+  console.log("=== [Protocol] Replay detection ===\n");
+
+  const helper = makeNode("Helper", "https://helper.example.com");
+  const owner = makeNode("Owner", "https://owner.example.com");
+  const { longTermChannelId } = await doPair(helper, owner, 61n, "ReplayDetection");
+  owner.transport.drain();
+  const ownerSeen = new SeenEnvelopes();
+  const helperSeen = new SeenEnvelopes();
+
+  await owner.protocol.start(FlowKind.UpdateChannelInfo, {
+    target: BigInt(longTermChannelId),
+    communication_info: { name: "owner-renamed" },
+  });
+  const update = drainOne(owner, "Owner");
+  ownerSeen.record(update);
+
+  if (helperSeen.contains(update)) throw new Error("a first delivery is not in the record");
+  let events = await helper.protocol.process(update);
+  if (!raisedUpdateChannelInfo(events)) {
+    throw new Error(`the update must raise ActionRequired; got ${JSON.stringify(events.map((e) => e.type))}`);
+  }
+  helperSeen.record(update);
+
+  const restamped = envelope.apply_trace_id(update, 0x7e57n);
+  if (byteArraysEqual(restamped, update)) throw new Error("the copy travels as different bytes");
+  if (!helperSeen.contains(update) || !helperSeen.contains(restamped)) {
+    throw new Error("the replay and the re-stamped copy must be recognised");
+  }
+  events = await helper.protocol.process(restamped);
+  if (!raisedUpdateChannelInfo(events)) throw new Error("unchecked, the library processes the copy again");
+  console.log("  [Helper] replay and re-stamped copy share the original's message id  ✓");
+
+  if (!ownerSeen.contains(update)) throw new Error("the reflection must be recognised");
+  events = await owner.protocol.process(update);
+  if (!raisedUpdateChannelInfo(events)) throw new Error("unchecked, the library reads its own update as the peer's");
+  console.log("  [Owner]  reflected update matches an outbound message id  ✓");
+
+  console.log("Replay detection flow passed.\n");
+}
+
+/**
+ * A helper that dropped v2 under v3's `keepVersion` does not store v2 again
+ * when v2's request is delivered once more: it is ignored as `Superseded`,
+ * unanswered.
+ */
+async function runSupersededShareRequestFlow(): Promise<void> {
+  console.log("=== [Protocol] Superseded share request ===\n");
+
+  const secretId = 0x6565n;
+  const { owner, helpersByUri } = await pairKeepVersionHelpers(secretId, 63n, 64n);
+  owner.shareStore.keep = 0;
+  await runKeepVersionRound(owner, helpersByUri, 1, ["HelperA", "HelperB"]);
+
+  await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([3]), name: "kept", data: utf8Encode("round-2") }],
+    description: "round 2",
+  });
+  let v2ForA: Uint8Array | undefined;
+  for (const { endpoint, message } of owner.transport.drain()) {
+    const [helper, label] = helpersByUri.get(endpoint.uri)!;
+    if (label === "HelperA") v2ForA = message;
+    requireEvent(await processAll(helper, message), "ShareStored", label);
+    await owner.protocol.process(drainOne(helper, label));
+  }
+  if (!v2ForA) throw new Error("v2 was sent to HelperA");
+
+  await runKeepVersionRound(owner, helpersByUri, 3, ["HelperA", "HelperB"]);
+  const [helperA, , channelA] = helpersByUri.get("https://helper-a.example.com")!;
+  await assertHeldVersions(helperA, "HelperA", secretId, channelA, [3]);
+
+  const events = await helperA.protocol.process(v2ForA);
+  const [ignored] = events;
+  if (
+    events.length !== 1 ||
+    ignored?.type !== "MessageIgnored" ||
+    ignored.reason !== "Superseded" ||
+    ignored.channel_id !== channelA
+  ) {
+    throw new Error(`v2 delivered again must be MessageIgnored(Superseded); got ${JSON.stringify(events)}`);
+  }
+  await assertHeldVersions(helperA, "HelperA", secretId, channelA, [3]);
+  if (helperA.transport.drain().length !== 0) throw new Error("a superseded request is not answered");
+  console.log("  [HelperA] v2 delivered after v3 → MessageIgnored(Superseded), still holds [3]  ✓");
+
+  console.log("Superseded share request flow passed.\n");
+}
+
+/**
  * A weighted round: four helpers, threshold 3, helper-0 at weight 2.
  *
  * Helper-0 receives two subshares and every other helper one, as the
@@ -2258,19 +2454,29 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   if (discRequests.length !== 2) {
     throw new Error(`expected 2 DiscoveryRequests, got ${discRequests.length}`);
   }
+  const discovered: Array<Extract<DeRecEvent, { type: "SecretsDiscovered" }>> = [];
   for (const env of discRequests) {
     const cidStr = env.endpoint.uri;
     const helper = cidStr.includes("helper-a") ? helperA : helperB;
     const label = cidStr.includes("helper-a") ? "HelperA" : "HelperB";
     await processAll(helper, env.message);
     const resp = drainOne(helper, label);
-    await owner.protocol.process(resp);
+    for (const ev of await owner.protocol.process(resp)) {
+      if (ev.type === "SecretsDiscovered") discovered.push(ev);
+    }
   }
-
-  // Owner should have seen SecretsDiscovered for the secret on at least one
-  // recovery channel.
-  // (Events accumulated across the loop above are not captured here; we
-  // assert recovery success instead, which implies discovery succeeded.)
+  const discoveredEntry = discovered
+    .flatMap((d) => d.secrets)
+    .find((s) => s.secret_id === ownerSecretId.toString());
+  if (!discoveredEntry) {
+    throw new Error(`SecretsDiscovered must list secret ${ownerSecretId}, got ${JSON.stringify(discovered)}`);
+  }
+  if (!discoveredEntry.versions.some((v) => v.description === description)) {
+    throw new Error(`the version description must survive discovery, got ${JSON.stringify(discoveredEntry.versions)}`);
+  }
+  console.log(
+    `  [Owner]  SecretsDiscovered on ${discovered.length} channel(s): secret_id=${discoveredEntry.secret_id} "${description}"  ✓\n`,
+  );
 
 
   console.log("  -- Recovery: collect shares and reconstruct --\n");
@@ -2340,7 +2546,7 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   if (recovered.threshold !== THRESHOLD) {
     throw new Error(`the recovered roster must carry t=${THRESHOLD}, got ${recovered.threshold}`);
   }
-  await restored.protocol.restore(recovered, 1);
+  await restored.protocol.restore(recovered, 1, 1);
 
   const restoredSnapshot = await restored.userSecretStore.loadLatest(
     ownerSecretId.toString(),
@@ -2389,7 +2595,7 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   });
   let conflict: DeRecError | undefined;
   try {
-    await conflicting.protocol.restore(recovered, 1);
+    await conflicting.protocol.restore(recovered, 1, 1);
   } catch (e) {
     conflict = e as DeRecError;
   }
@@ -2410,6 +2616,759 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   );
 
   console.log("\n✓ Discovery & Recovery flow passed.\n");
+}
+
+/**
+ * A recovery decides only once every helper it asked has answered, so a
+ * helper that never answers holds the decision until
+ * `timeouts.get_share_response_secs` elapses. `tick()` then reports that
+ * helper as timed out and recovers from the shares in hand.
+ */
+async function runSilentHelperRecoveryFlow(): Promise<void> {
+  console.log("=== [Protocol] Silent Helper Recovery Flow ===\n");
+
+  const owner = makeNode("Owner", "https://owner.example.com", {
+    timeouts: { get_share_response_secs: 1 },
+  });
+  const helperA = makeNode("HelperA", "https://helper-a.example.com");
+  const helperB = makeNode("HelperB", "https://helper-b.example.com");
+  const helperC = makeNode("HelperC", "https://helper-c.example.com");
+
+  await doPair(helperA, owner, 1n, "Owner↔HelperA");
+  await doPair(helperB, owner, 2n, "Owner↔HelperB");
+  const { longTermChannelId: channelC } = await doPair(helperC, owner, 3n, "Owner↔HelperC");
+  console.log();
+
+  const helpersByUri: Record<string, [Node, string]> = {
+    "https://helper-a.example.com": [helperA, "HelperA"],
+    "https://helper-b.example.com": [helperB, "HelperB"],
+    "https://helper-c.example.com": [helperC, "HelperC"],
+  };
+
+  const secretData = utf8Encode("three helpers, one silent");
+  const protectEvents = await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([9]), name: "silent-helper secret", data: secretData }],
+  });
+  const version = requireEvent(protectEvents, "ProtectSecretStarted", "Owner").version;
+  for (const outbound of owner.transport.drain()) {
+    const [helper, label] = helpersByUri[outbound.endpoint.uri]!;
+    const helperEvents = await processAll(helper, outbound.message);
+    requireEvent(helperEvents, "ShareStored", label);
+    await owner.protocol.process(drainOne(helper, label));
+  }
+  console.log(`  [Owner]  start(ProtectSecret) → version ${version} stored on all three helpers`);
+
+  await owner.protocol.start(FlowKind.RecoverSecret, {
+    secretId: owner.protocol.secretId(),
+    version,
+  });
+
+  // HelperC never sees its request.
+  const recoveryEvents: DeRecEvent[] = [];
+  for (const outbound of owner.transport.drain()) {
+    if (outbound.endpoint.uri === "https://helper-c.example.com") continue;
+    const [helper, label] = helpersByUri[outbound.endpoint.uri]!;
+    await processAll(helper, outbound.message);
+    recoveryEvents.push(...(await owner.protocol.process(drainOne(helper, label))));
+  }
+
+  const received = recoveryEvents.filter((e) => e.type === "RecoveryShareReceived").length;
+  if (received !== 2) {
+    throw new Error(`HelperA and HelperB answer: expected 2 RecoveryShareReceived, got ${received}`);
+  }
+  if (recoveryEvents.some((e) => e.type === "SecretRecovered")) {
+    throw new Error(
+      `nothing is decided while HelperC's answer is due: [${recoveryEvents.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  const waiting = await owner.protocol.tick();
+  if (waiting.length !== 0) {
+    throw new Error(
+      `the recovery waits out its window: tick() → [${waiting.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  console.log("  [Owner]  2 shares in, HelperC silent → no SecretRecovered, tick() empty  ✓");
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 2100));
+  const settled = await owner.protocol.tick();
+  const [failed, recovered, ...rest] = settled;
+  if (
+    failed?.type !== "RecoverSecretFailed" ||
+    recovered?.type !== "SecretRecovered" ||
+    rest.length !== 0
+  ) {
+    throw new Error(
+      `expected a timeout then SecretRecovered, got [${settled.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  if (failed.channel_id !== channelC) {
+    throw new Error(`HelperC (${channelC}) is the one that timed out, got ${failed.channel_id}`);
+  }
+  if (failed.version !== version) {
+    throw new Error(`RecoverSecretFailed.version: expected ${version}, got ${failed.version}`);
+  }
+  if (failed.error !== "timeout") {
+    throw new Error(`RecoverSecretFailed.error: expected "timeout", got "${failed.error}"`);
+  }
+  const recoveredSecret = recovered.secret.secrets.find((s) => s.id.length === 1 && s.id[0] === 9);
+  if (!recoveredSecret || !byteArraysEqual(recoveredSecret.data, secretData)) {
+    throw new Error("recovered secret must carry the protected bytes");
+  }
+  console.log(
+    `  [Owner]  after the window, tick() → RecoverSecretFailed(${channelC}, "timeout"), SecretRecovered("${recoveredSecret.name}")  ✓`,
+  );
+
+  const closed = await owner.protocol.tick();
+  if (closed.length !== 0) {
+    throw new Error(
+      `the recovery is closed once decided: tick() → [${closed.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  console.log("  [Owner]  tick() after the decision is empty  ✓");
+
+  console.log("\n✓ Silent helper recovery flow passed.\n");
+}
+
+/**
+ * Protect a one-entry secret named `name` from `owner` across every helper in
+ * `helpers`, deliver the round, and return the version it published.
+ */
+async function protectAcross(
+  owner: AddressedNode,
+  helpers: AddressedNode[],
+  name: string,
+): Promise<number> {
+  const events = await owner.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([10]), name, data: utf8Encode(name) }],
+  });
+  const version = requireEvent(events, "ProtectSecretStarted", name).version;
+  await pumpAll([owner, ...helpers]);
+  return version;
+}
+
+/**
+ * Replace the share `to` holds on `toChannel` with the one `from` holds on
+ * `fromChannel`, both at `version`, through the helpers' own share stores.
+ * Both splits are of the same `(secret_id, version)`, so the moved share
+ * still passes every check it is put to on its own.
+ */
+async function transplantShare(
+  from: Node,
+  fromChannel: string,
+  to: Node,
+  toChannel: string,
+  version: number,
+): Promise<void> {
+  const [foreign] = await from.shareStore.load(String(from.protocol.secretId()), fromChannel, [version]);
+  if (!foreign) throw new Error("the foreign helper holds a share for the version");
+  const toSid = String(to.protocol.secretId());
+  const [held] = await to.shareStore.load(toSid, toChannel, [version]);
+  if (!held) throw new Error("the helper holds a share for the version");
+  await to.shareStore.save(toSid, toChannel, { ...held, bytes: foreign.bytes });
+}
+
+/**
+ * Owner A splits its secret at threshold 3 across five helpers. A second
+ * owner, B, with the same secret id, splits a different secret at version 1
+ * across its own helpers at `bThreshold`; two of A's helpers end up holding
+ * B's shares instead of A's. Returns A's decision events and the channels of
+ * the five helpers, in order.
+ */
+async function recoverWithTwoOfFiveFromAnotherSplit(
+  bThreshold: number,
+): Promise<{ events: DeRecEvent[]; channels: string[] }> {
+  const secretId = 44n;
+  const owner: AddressedNode = {
+    node: makeNode("owner-a", "https://owner-a.example.com", { secretId, threshold: 3 }),
+    uri: "https://owner-a.example.com",
+  };
+  // Each helper advertises its own name; that is what the owner records.
+  const helpers: AddressedNode[] = [1, 2, 3, 4, 5].map((i) => ({
+    node: makeNode(`helper-${i}`, `https://helper-${i}.example.com`),
+    uri: `https://helper-${i}.example.com`,
+  }));
+  const channels: string[] = [];
+  for (const [i, helper] of helpers.entries()) {
+    const { longTermChannelId } = await doPair(helper.node, owner.node, BigInt(10 + i), `OwnerA↔helper-${i + 1}`);
+    channels.push(longTermChannelId);
+  }
+  const version = await protectAcross(owner, helpers, "owner-a secret");
+
+  const other: AddressedNode = {
+    node: makeNode("owner-b", "https://owner-b.example.com", { secretId, threshold: bThreshold }),
+    uri: "https://owner-b.example.com",
+  };
+  const xs: AddressedNode[] = [1, 2, 3].map((i) => ({
+    node: makeNode(`x${i}`, `https://x${i}.example.com`),
+    uri: `https://x${i}.example.com`,
+  }));
+  const xChannels: string[] = [];
+  for (const [i, x] of xs.entries()) {
+    const { longTermChannelId } = await doPair(x.node, other.node, BigInt(21 + i), `OwnerB↔x${i + 1}`);
+    xChannels.push(longTermChannelId);
+  }
+  const otherVersion = await protectAcross(other, xs, "owner-b secret");
+  if (otherVersion !== version) {
+    throw new Error(`both splits are of the same version: ${otherVersion} ≠ ${version}`);
+  }
+
+  await transplantShare(xs[0]!.node, xChannels[0]!, helpers[3]!.node, channels[3]!, version);
+  await transplantShare(xs[1]!.node, xChannels[1]!, helpers[4]!.node, channels[4]!, version);
+
+  await owner.node.protocol.start(FlowKind.RecoverSecret, { secretId, version });
+  const events = await pumpAll([owner, ...helpers]);
+  if (events.some((e) => e.type === "RecoveryShareCorrupted")) {
+    throw new Error(
+      `a share of another split is not evidence against its helper: [${events.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  return { events, channels };
+}
+
+function helperChannels(helpers: RecoveryHelper[]): string[] {
+  return helpers.map((h) => h.channel_id);
+}
+
+function helperNames(helpers: RecoveryHelper[]): string[] {
+  return helpers.map((h) => h.communication_info?.["name"] ?? "");
+}
+
+function expectSame(label: string, got: unknown, want: unknown): void {
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    throw new Error(`${label}: expected ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
+  }
+}
+
+/**
+ * Three helpers back the owner's split; two hold valid shares of another
+ * split that cannot reconstruct. The library cannot tell which side is the
+ * owner's, so it reports a dispute naming both, not a recovery.
+ */
+async function runDisputedRecoveryFlow(): Promise<void> {
+  console.log("=== [Protocol] Disputed Recovery Flow ===\n");
+
+  const { events, channels } = await recoverWithTwoOfFiveFromAnotherSplit(3);
+  const disputed = requireEvent(events, "RecoveryDisputed", "OwnerA");
+  if (events.some((e) => e.type === "SecretRecovered")) {
+    throw new Error("a disputed secret is never reported as recovered");
+  }
+  expectSame("RecoveryDisputed.secret name", disputed.secret.secrets[0]?.name, "owner-a secret");
+  expectSame("RecoveryDisputed.supported_by channels", helperChannels(disputed.supported_by), channels.slice(0, 3));
+  expectSame("RecoveryDisputed.disputed_by channels", helperChannels(disputed.disputed_by), channels.slice(3));
+  expectSame("RecoveryDisputed.supported_by names", helperNames(disputed.supported_by), ["helper-1", "helper-2", "helper-3"]);
+  expectSame("RecoveryDisputed.disputed_by names", helperNames(disputed.disputed_by), ["helper-4", "helper-5"]);
+  console.log(
+    "  [OwnerA]  RecoveryDisputed(\"owner-a secret\") supported_by [helper-1..3], disputed_by [helper-4, helper-5], no SecretRecovered  ✓",
+  );
+
+  console.log("\n✓ Disputed recovery flow passed.\n");
+}
+
+/**
+ * When the other split's two shares reconstruct too, the owner faces two
+ * complete secrets and has to choose between them.
+ */
+async function runConflictingRecoveryFlow(): Promise<void> {
+  console.log("=== [Protocol] Conflicting Recovery Flow ===\n");
+
+  const { events, channels } = await recoverWithTwoOfFiveFromAnotherSplit(2);
+  const conflict = requireEvent(events, "RecoveryConflict", "OwnerA");
+  expectSame(
+    "RecoveryConflict.candidates",
+    conflict.candidates.map((c) => [c.secret.secrets[0]?.name, helperChannels(c.supported_by)]),
+    [
+      ["owner-a secret", channels.slice(0, 3)],
+      ["owner-b secret", channels.slice(3)],
+    ],
+  );
+  expectSame("RecoveryConflict.disputed_by (every share is on one side or the other)", conflict.disputed_by, []);
+  console.log(
+    "  [OwnerA]  RecoveryConflict candidates [(\"owner-a secret\", helper-1..3), (\"owner-b secret\", helper-4..5)], disputed_by []  ✓",
+  );
+
+  console.log("\n✓ Conflicting recovery flow passed.\n");
+}
+
+/**
+ * A recovering device can already be a helper for another owner. `restore`
+ * wipes only the recovery channels whose peer is a helper; the channel on
+ * which this device helps that owner, and the share it holds there, survive.
+ */
+async function runRestoreKeepsHelperDutiesFlow(): Promise<void> {
+  console.log("=== [Protocol] Restore Keeps Helper Duties Flow ===\n");
+
+  const ownSecretId = 4545n;
+  const lost: AddressedNode = {
+    node: makeNode("lost-device", "https://lost.example.com", { secretId: ownSecretId }),
+    uri: "https://lost.example.com",
+  };
+  const helperA: AddressedNode = {
+    node: makeNode("helper-a", "https://helper-a.example.com"),
+    uri: "https://helper-a.example.com",
+  };
+  const helperB: AddressedNode = {
+    node: makeNode("helper-b", "https://helper-b.example.com"),
+    uri: "https://helper-b.example.com",
+  };
+  const { longTermChannelId: channelA } = await doPair(helperA.node, lost.node, 1n, "Lost↔HelperA");
+  const { longTermChannelId: channelB } = await doPair(helperB.node, lost.node, 2n, "Lost↔HelperB");
+  const version = await protectAcross(lost, [helperA, helperB], "own secret");
+
+  const device: AddressedNode = {
+    node: makeNode("new-device", "https://device.example.com", { secretId: ownSecretId }),
+    uri: "https://device.example.com",
+  };
+  const deviceSid = String(device.node.protocol.secretId());
+
+  // The new device helps another owner first.
+  const otherOwner: AddressedNode = {
+    node: makeNode("other-owner", "https://other.example.com", { secretId: 9090n }),
+    uri: "https://other.example.com",
+  };
+  const otherHelper: AddressedNode = {
+    node: makeNode("other-helper", "https://other-helper.example.com"),
+    uri: "https://other-helper.example.com",
+  };
+  const { longTermChannelId: dutyChannel } = await doPair(device.node, otherOwner.node, 3n, "Other↔Device");
+  await doPair(otherHelper.node, otherOwner.node, 4n, "Other↔OtherHelper");
+  const otherVersion = await protectAcross(otherOwner, [device, otherHelper], "other owner's secret");
+  const heldBefore = await device.node.shareStore.load(deviceSid, dutyChannel, [otherVersion]);
+  if (heldBefore.length !== 1) {
+    throw new Error(`the device holds the other owner's share: got ${heldBefore.length} share(s)`);
+  }
+  console.log(`  [Device]  helps the other owner on duty channel ${dutyChannel}, holding its v${otherVersion} share  ✓`);
+
+  // Then it recovers its own secret over fresh recovery channels.
+  const recoveryChannels: string[] = [];
+  for (const [helper, original, transient] of [
+    [helperA, channelA, 100n],
+    [helperB, channelB, 101n],
+  ] as const) {
+    const contact: ContactMessage = await device.node.protocol.createContact(transient, ContactMode.InlineKeys);
+    await helper.node.protocol.start(FlowKind.Pairing, { kind: SenderKind.Helper, contact });
+    const events = await pumpAll([device, helper]);
+    const paired = events.find(
+      (e) => e.type === "PairingCompleted" && e.pairing_channel_id === String(transient),
+    ) as Extract<DeRecEvent, { type: "PairingCompleted" }> | undefined;
+    if (!paired) {
+      throw new Error(`the recovery pairing on ${transient} completes: [${events.map((e) => e.type).join(", ")}]`);
+    }
+    await helper.node.channelStore.linkChannel(
+      String(helper.node.protocol.secretId()),
+      original,
+      paired.channel_id,
+    );
+    recoveryChannels.push(paired.channel_id);
+  }
+
+  await device.node.protocol.start(FlowKind.RecoverSecret, { secretId: ownSecretId, version });
+  const recoveryEvents = await pumpAll([device, helperA, helperB]);
+  const recovered = requireEvent(recoveryEvents, "SecretRecovered", "Device").secret;
+  console.log("  [Device]  recovers its own secret over fresh recovery channels  ✓");
+
+  const restoreEvents = await device.node.protocol.restore(recovered, version, version);
+  const touched = restoreEvents.flatMap((e) =>
+    e.type === "UnpairStarted" || e.type === "Unpaired" || e.type === "UnpairFailed" ? [e.channel_id] : [],
+  );
+  if (touched.includes(dutyChannel)) {
+    throw new Error(
+      `restore must not unpair the channel to the other owner: [${restoreEvents.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  for (const recoveryChannel of recoveryChannels) {
+    if (!touched.includes(recoveryChannel)) {
+      throw new Error(`restore still wipes recovery channel ${recoveryChannel}`);
+    }
+  }
+  console.log("  [Device]  restore unpairs both recovery channels, never the duty channel  ✓");
+  await pumpAll([device, helperA, helperB]);
+
+  const dutyBytes = await device.node.channelStore.load(deviceSid, dutyChannel, "0");
+  if (!dutyBytes) throw new Error("the channel to the other owner survives restore");
+  const dutyStatus = JSON.parse(utf8Decode(dutyBytes)).Helper.status;
+  if (dutyStatus !== "Paired") {
+    throw new Error(`the channel to the other owner stays Paired, got ${dutyStatus}`);
+  }
+  const heldAfter = await device.node.shareStore.load(deviceSid, dutyChannel, [otherVersion]);
+  if (heldAfter.length !== 1) {
+    throw new Error(`the share held for the other owner survives restore: got ${heldAfter.length} share(s)`);
+  }
+  console.log("  [Device]  duty channel still Paired and the other owner's share still held  ✓");
+
+  await otherOwner.node.protocol.start(FlowKind.VerifyShares, {
+    secretId: otherOwner.node.protocol.secretId(),
+    version: otherVersion,
+  });
+  const verified = (await pumpAll([otherOwner, device, otherHelper])).flatMap((e) =>
+    e.type === "ShareVerified" ? [e.channel_id] : [],
+  );
+  if (!verified.includes(dutyChannel)) {
+    throw new Error(`the other owner can still verify the restored device's share: [${verified.join(", ")}]`);
+  }
+  console.log("  [Other]   VerifyShares → ShareVerified on the duty channel  ✓");
+
+  console.log("\n✓ Restore keeps helper duties flow passed.\n");
+}
+
+/**
+ * Start a replica pairing from `scanner`, as `kind`, against a fresh contact
+ * from `creator` at `transient`.
+ */
+async function startReplicaScan(
+  scanner: Node,
+  creator: Node,
+  transient: bigint,
+  kind: SenderKind,
+): Promise<void> {
+  const contact = await creator.protocol.createContact(transient, ContactMode.InlineKeys);
+  await scanner.protocol.start(FlowKind.Pairing, { kind, contact });
+}
+
+/**
+ * `ProtectSecret` on `owner` must be accepted: a replica pairing that never
+ * completed is no group, and must never stop the device from protecting.
+ */
+async function assertProtects(owner: Node, name: string, label = "ReplicaA"): Promise<void> {
+  try {
+    await owner.protocol.start(FlowKind.ProtectSecret, {
+      secrets: [{ id: new Uint8Array([11]), name, data: utf8Encode(name) }],
+    });
+  } catch (e) {
+    throw new Error(`ProtectSecret (${name}) must succeed: ${JSON.stringify(e)}`);
+  }
+  console.log(`  [${label}] ProtectSecret ${name}  ✓`);
+}
+
+/**
+ * A replica pairing that never completes must not leave this device unable
+ * to protect: neither while it is pending, nor after a later pairing
+ * completes, nor once the expiry sweep has cleared it. The device's own row
+ * lands on the channel of the pairing that was confirmed.
+ */
+async function runAbandonedReplicaPairingFlow(): Promise<void> {
+  console.log("=== [Protocol] Abandoned Replica Pairing Flow ===\n");
+
+  const aId = 0xA1A1n;
+  const a: AddressedNode = {
+    node: makeNode("replica-a", "https://replica-a.example.com", {
+      replicaId: aId,
+      timeouts: { expired_channels: { enabled: true, timeout_in_secs: 1 } },
+    }),
+    uri: "https://replica-a.example.com",
+  };
+  const b: AddressedNode = {
+    node: makeNode("replica-b", "https://replica-b.example.com", { replicaId: 0xB2B2n }),
+    uri: "https://replica-b.example.com",
+  };
+  const c: AddressedNode = {
+    node: makeNode("replica-c", "https://replica-c.example.com", { replicaId: 0xC3C3n }),
+    uri: "https://replica-c.example.com",
+  };
+
+  // B never hears of the request.
+  await startReplicaScan(a.node, b.node, 100n, SenderKind.ReplicaSource);
+  a.node.transport.drain();
+  await assertProtects(a.node, "while a replica pairing is pending");
+
+  await startReplicaScan(a.node, c.node, 200n, SenderKind.ReplicaSource);
+  const pairingEvents = await pumpAll([a, c]);
+  const completed = pairingEvents.find(
+    (e) => e.type === "PairingCompleted" && e.pairing_channel_id === "200",
+  ) as Extract<DeRecEvent, { type: "PairingCompleted" }> | undefined;
+  if (!completed) {
+    throw new Error(`the pairing with C completes: [${pairingEvents.map((e) => e.type).join(", ")}]`);
+  }
+  const groupChannel = completed.channel_id;
+  await crossConfirmFingerprint(a.node, c.node, BigInt(groupChannel));
+  await pumpAll([a, c]);
+  await assertProtects(a.node, "after a later pairing is confirmed");
+  await pumpAll([a, c]);
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 2100));
+  await a.node.protocol.tick();
+  await assertProtects(a.node, "after the expiry sweep");
+  await pumpAll([a, c]);
+
+  const aSid = String(a.node.protocol.secretId());
+  // The stored record carries ids as bare JSON numbers, beyond what a JS
+  // number holds exactly, so they are read from the text.
+  const roster = utf8Decode(
+    await a.node.channelStore.listReplicas(aSid, {
+      ids: [String(aId)],
+      status: [],
+      role: null,
+      exclude: [],
+    }),
+  );
+  const own = {
+    replica_id: /"replica_id":(\d+)/.exec(roster)?.[1],
+    channel_id: /"channel_id":(\d+)/.exec(roster)?.[1],
+    status: /"status":"(\w+)"/.exec(roster)?.[1],
+  };
+  if ((roster.match(/"replica_id":/g) ?? []).length !== 1 || own.replica_id !== String(aId)) {
+    const all = utf8Decode(await a.node.channelStore.listReplicas(aSid, ANY_REPLICAS));
+    throw new Error(`A keeps its own row: roster ${all}`);
+  }
+  if (own.channel_id !== groupChannel) {
+    throw new Error(`A's own row is on the confirmed group channel ${groupChannel}, got ${own.channel_id}`);
+  }
+  if (own.status !== "Paired") {
+    throw new Error(`A's own row is Paired, got ${own.status}`);
+  }
+  console.log(`  [ReplicaA] own row on the confirmed group channel ${groupChannel}, Paired  ✓`);
+
+  console.log("\n✓ Abandoned replica pairing flow passed.\n");
+}
+
+/**
+ * A contact's channel identifier is chosen by whoever created it, and a
+ * replica group's identifier travels in the clear on every envelope of the
+ * group. A contact on the group channel must be refused, and a pending
+ * pairing on that channel must never take the group key when it expires.
+ */
+async function runContactOnTheGroupChannelFlow(): Promise<void> {
+  console.log("=== [Protocol] Contact On The Group Channel Flow ===\n");
+
+  const a: AddressedNode = {
+    node: makeNode("replica-a", "https://replica-a.example.com", {
+      replicaId: 0xA1A1n,
+      timeouts: { expired_channels: { enabled: true, timeout_in_secs: 1 } },
+    }),
+    uri: "https://replica-a.example.com",
+  };
+  const c: AddressedNode = {
+    node: makeNode("replica-c", "https://replica-c.example.com", { replicaId: 0xC3C3n }),
+    uri: "https://replica-c.example.com",
+  };
+  const adversary = makeNode("adversary", "https://adversary.example.com");
+
+  await startReplicaScan(a.node, c.node, 200n, SenderKind.ReplicaSource);
+  const pairingEvents = await pumpAll([a, c]);
+  const completed = pairingEvents.find(
+    (e) => e.type === "PairingCompleted" && e.pairing_channel_id === "200",
+  ) as Extract<DeRecEvent, { type: "PairingCompleted" }> | undefined;
+  if (!completed) {
+    throw new Error(`the pairing with C completes: [${pairingEvents.map((e) => e.type).join(", ")}]`);
+  }
+  const groupChannel = completed.channel_id;
+  await crossConfirmFingerprint(a.node, c.node, BigInt(groupChannel));
+  await pumpAll([a, c]);
+
+  const contact = await adversary.protocol.createContact(BigInt(groupChannel), ContactMode.InlineKeys);
+  await expectChannelCode("a contact on the group channel must be refused", "channel_already_paired", String(groupChannel), () =>
+    a.node.protocol.start(FlowKind.Pairing, { kind: SenderKind.Owner, contact }),
+  );
+  if (a.node.transport.drain().length !== 0) {
+    throw new Error("nothing is sent for a refused contact");
+  }
+  console.log("  [ReplicaA] contact on the group channel refused with channel_already_paired, nothing sent  ✓");
+
+  await assertProtects(c.node, "group traffic after the refused contact", "ReplicaC");
+  const events: DeRecEvent[] = [];
+  for (const m of c.node.transport.drain()) {
+    events.push(...(await processAll(a.node, m.message)));
+  }
+  if (events.some((e) => e.type === "MessageIgnored")) {
+    throw new Error(`A still processes the group's traffic: ${JSON.stringify(events)}`);
+  }
+  await pumpAll([a, c]);
+  console.log("  [ReplicaA] group traffic still processed  ✓");
+
+  const aSid = String(a.node.protocol.secretId());
+  // The channel id is a u64 beyond what a JS number holds exactly, so the
+  // record is written as text.
+  const pending =
+    `{"Helper":{"channel_id":${groupChannel},"transports":[],"communication_info":{},` +
+    `"status":"Pending","created_at":0,"peer_role":"Helper","weight":1}}`;
+  await a.node.channelStore.save(aSid, groupChannel, "0", utf8Encode(pending));
+  await a.node.protocol.tick();
+  if (!(await a.node.secretStore.load(aSid, groupChannel, 0))) {
+    throw new Error("an expired pairing on the group channel must not take the group key");
+  }
+  await assertProtects(a.node, "after the expiry sweep");
+  console.log("  [ReplicaA] expired pairing on the group channel leaves the group key  ✓");
+
+  console.log("\n✓ Contact on the group channel flow passed.\n");
+}
+
+/**
+ * A joiner whose fingerprint is not yet confirmed is not a member: the source
+ * neither lists it in the roster it publishes nor asks it in a version check,
+ * and a check whose only member stays silent concludes once its budget
+ * elapses. Mirrors `run_unconfirmed_joiner_flow` in
+ * `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runUnconfirmedJoinerFlow(): Promise<void> {
+  console.log("=== [Protocol] Replica Unconfirmed Joiner Flow ===\n");
+
+  const source: AddressedNode = {
+    node: makeNode("source", "https://source-unconfirmed.example.com", {
+      replicaId: 0x5050n,
+      timeouts: { get_share_response_secs: 1 },
+    }),
+    uri: "https://source-unconfirmed.example.com",
+  };
+  const dest: AddressedNode = {
+    node: makeNode("dest", "https://dest-unconfirmed.example.com", { replicaId: 0xd1d1n }),
+    uri: "https://dest-unconfirmed.example.com",
+  };
+  const joiner: AddressedNode = {
+    node: makeNode("joiner", "https://joiner-unconfirmed.example.com", { replicaId: 0xd3d3n }),
+    uri: "https://joiner-unconfirmed.example.com",
+  };
+  const completedOn = (events: DeRecEvent[], transient: string): string => {
+    const completed = events.find(
+      (e) => e.type === "PairingCompleted" && e.pairing_channel_id === transient,
+    ) as Extract<DeRecEvent, { type: "PairingCompleted" }> | undefined;
+    if (!completed) {
+      throw new Error(`the pairing on ${transient} completes: [${events.map((e) => e.type).join(", ")}]`);
+    }
+    return completed.channel_id;
+  };
+
+  await startReplicaScan(dest.node, source.node, 191n, SenderKind.ReplicaDestination);
+  const group = completedOn(await pumpAll([source, dest]), "191");
+  await crossConfirmFingerprint(source.node, dest.node, BigInt(group));
+  await pumpAll([source, dest]);
+  await assertProtects(source.node, "unconfirmed joiner", "Source");
+  await pumpAll([source, dest]);
+
+  await startReplicaScan(joiner.node, source.node, 192n, SenderKind.ReplicaDestination);
+  completedOn(await pumpAll([source, dest, joiner]), "192");
+
+  await assertProtects(source.node, "unconfirmed joiner", "Source");
+  const published = await pumpAll([source, dest, joiner]);
+  const received = published.find(
+    (e) => e.type === "ReplicaSecretReceived" || e.type === "ReplicaSecretInstalled",
+  ) as { secret?: { replicas?: { members: Array<{ replica_id: string }> } | null } } | undefined;
+  const members = received?.secret?.replicas?.members;
+  if (!members) {
+    throw new Error(`the destination must receive the new version: ${JSON.stringify(published)}`);
+  }
+  const listed = members.map((m) => m.replica_id);
+  if (listed.length !== 2 || listed.includes(String(0xd3d3))) {
+    throw new Error(`an unconfirmed joiner must not be published: ${JSON.stringify(listed)}`);
+  }
+  console.log("  the published roster leaves out the unconfirmed joiner  ✓");
+
+  await source.node.protocol.start(FlowKind.ReplicaDiscovery);
+  const checked = await pumpAll([source, dest, joiner]);
+  if (checked.some((e) => e.type === "MessageIgnored")) {
+    throw new Error(`the joiner must not be asked: ${JSON.stringify(checked)}`);
+  }
+  if (!checked.some((e) => e.type === "ReplicaDiscoveryComplete")) {
+    throw new Error(`the check concludes on the destination's answer: ${JSON.stringify(checked)}`);
+  }
+  console.log("  the version check skips the joiner and concludes at once  ✓");
+
+  await source.node.protocol.start(FlowKind.ReplicaDiscovery);
+  source.node.transport.drain();
+  if ((await source.node.protocol.tick()).length !== 0) {
+    throw new Error("the check waits out its window");
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, 2100));
+  const concluded = await source.node.protocol.tick();
+  const done = concluded[0];
+  if (
+    concluded.length !== 1 ||
+    done?.type !== "ReplicaDiscoveryComplete" ||
+    (done.fetched_from ?? null) !== null
+  ) {
+    throw new Error(`expected ReplicaDiscoveryComplete: ${JSON.stringify(concluded)}`);
+  }
+  if ((await source.node.protocol.tick()).length !== 0) {
+    throw new Error("the check is closed once concluded");
+  }
+  console.log("  a silent member's check concludes on the timeout  ✓");
+
+  console.log("\n✓ Replica unconfirmed joiner flow passed.\n");
+}
+
+/**
+ * A pairing has a lifetime, `timeouts.pairing_secs`, and both sides enforce
+ * it without sending anything: the scanner refuses an expired contact, and
+ * the creator ignores a request on one and refuses a late accept. Pairing
+ * involves both parties, so the remedy is a fresh contact. Mirrors
+ * `run_pairing_expiry_flow` in `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runPairingExpiryFlow(): Promise<void> {
+  console.log("=== [Protocol] Pairing Expiry Flow ===\n");
+
+  const shortWindow = { timeouts: { pairing_secs: 1 } };
+  const creatorA = makeNode("helper-expiry-a", "https://helper-expiry-a.example.com");
+  const scannerA = makeNode("owner-expiry-a", "https://owner-expiry-a.example.com", shortWindow);
+  const creatorB = makeNode("helper-expiry-b", "https://helper-expiry-b.example.com", shortWindow);
+  const scannerB = makeNode("owner-expiry-b", "https://owner-expiry-b.example.com");
+  const creatorC = makeNode("helper-expiry-c", "https://helper-expiry-c.example.com", shortWindow);
+  const scannerC = makeNode("owner-expiry-c", "https://owner-expiry-c.example.com");
+
+  const createContact = (creator: Node, channelId: bigint) =>
+    creator.protocol.createContact(channelId, ContactMode.InlineKeys);
+  const scanAsOwner = (scanner: Node, contact: Awaited<ReturnType<typeof createContact>>) =>
+    scanner.protocol.start(FlowKind.Pairing, { kind: SenderKind.Owner, contact });
+  const codeOf = async (call: () => Promise<unknown>): Promise<string | undefined> => {
+    try {
+      await call();
+    } catch (e) {
+      return (e as { code?: string }).code;
+    }
+    return undefined;
+  };
+
+  const staleContact = await createContact(creatorA, 181n);
+  const expiringContact = await createContact(creatorB, 182n);
+  await scanAsOwner(scannerC, await createContact(creatorC, 183n));
+  const [request] = scannerC.transport.drain();
+  if (!request) throw new Error("scanner-c sends a pair request");
+  const late = (await creatorC.protocol.process(request.message)).find(
+    (e) => e.type === "ActionRequired",
+  ) as Extract<DeRecEvent, { type: "ActionRequired" }> | undefined;
+  if (!late) throw new Error("creator-c is asked to accept the pairing");
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 2100));
+
+  const scanCode = await codeOf(() => scanAsOwner(scannerA, staleContact));
+  if (scanCode !== "pairing_expired") {
+    throw new Error(`the scanner must refuse an expired contact with pairing_expired, got ${scanCode ?? "no error"}`);
+  }
+  if (scannerA.transport.drain().length !== 0) throw new Error("nothing is sent for an expired contact");
+  console.log("  [Owner] scanning a contact older than the window → pairing_expired, nothing sent  ✓");
+
+  await scanAsOwner(scannerB, expiringContact);
+  const [requestB] = scannerB.transport.drain();
+  if (!requestB) throw new Error("scanner-b sends a pair request");
+  const events = await creatorB.protocol.process(requestB.message);
+  const [ignored] = events;
+  if (
+    events.length !== 1 ||
+    ignored?.type !== "MessageIgnored" ||
+    ignored.reason !== "Expired" ||
+    ignored.channel_id !== "182"
+  ) {
+    throw new Error(`a request on an expired contact must be MessageIgnored(Expired); got ${JSON.stringify(events)}`);
+  }
+  if (creatorB.transport.drain().length !== 0) throw new Error("the creator does not answer it");
+  console.log("  [Helper] request on its expired contact → MessageIgnored(Expired), nothing sent  ✓");
+
+  const acceptCode = await codeOf(() => creatorC.protocol.accept(late.action));
+  if (acceptCode !== "pairing_expired") {
+    throw new Error(`a late accept must be refused with pairing_expired, got ${acceptCode ?? "no error"}`);
+  }
+  if (creatorC.transport.drain().length !== 0) throw new Error("a refused accept sends nothing");
+  const sid = String(creatorC.protocol.secretId());
+  const channels = JSON.parse(utf8Decode(await creatorC.channelStore.listHelpers(sid, ANY_HELPERS)));
+  if (channels.length !== 0) throw new Error(`a refused accept records no channel, got ${JSON.stringify(channels)}`);
+  console.log("  [Helper] accepting after the window → pairing_expired, no channel, nothing sent  ✓");
+
+  await scanAsOwner(scannerC, await createContact(creatorC, 184n));
+  const paired = await pumpAll([
+    { node: scannerC, uri: "https://owner-expiry-c.example.com" },
+    { node: creatorC, uri: "https://helper-expiry-c.example.com" },
+  ]);
+  if (!paired.some((e) => e.type === "PairingCompleted")) throw new Error("a fresh contact pairs");
+  console.log("  [Helper] a fresh contact pairs  ✓");
+
+  console.log("Pairing expiry flow passed.\n");
 }
 
 // Verifies that an Owner-initiated unpair (Required-ack mode, the default)
@@ -2464,17 +3423,37 @@ async function runUnpairingFlow(): Promise<void> {
   }
   console.log(`  [Owner]  processAll(UnpairResponse) → Unpaired`);
 
+  for (const [label, node] of [["Owner", owner], ["Helper", helper]] as const) {
+    if ((await node.channelStore.load(String(node.protocol.secretId()), longTermChannelId, "0")) !== null) {
+      throw new Error(`${label}: the channel record must be removed after unpair`);
+    }
+  }
+  console.log("  [Owner/Helper] channel records removed  ✓");
+
+  // Unpairing is the owner's to start: a helper's attempt is refused.
+  const helper2 = makeNode("Helper2", "https://helper.example.com");
+  const { longTermChannelId: helperChannel } = await doPair(
+    helper2,
+    makeNode("Owner2", "https://owner.example.com"),
+    8n,
+    "Unpair/HelperInitiated",
+  );
+  await expectChannelCode("helper-initiated unpair", "role_mismatch", String(helperChannel), () =>
+    helper2.protocol.start(FlowKind.Unpair, { channel_id: helperChannel, memo: "helper trying to unpair" }),
+  );
+  console.log("  [Helper] start(Unpair) → role_mismatch  ✓");
+
   console.log("\n✓ Unpairing flow passed.\n");
 }
 
 
 /**
- * Asserts the `autoReplyTo` constructor flag: with it `true`, every outbound
- * channel-mode request must carry `request.replyToTransports` led by its own
- * transport on the inner request body. Covers half (1) of the replyTo
- * contract; half (2) (responder honours an inbound `replyToTransports`) is
- * exercised by the Rust binding smoke test against the orchestrator handler
- * logic.
+ * Asserts both halves of the `replyTo` contract: (1) with `autoReplyTo`
+ * `true`, every outbound channel-mode request carries this node's own
+ * transports in `request.reply_to` on the inner request body; (2) a request
+ * whose `replyTo` differs from the channel's stored peer endpoint is answered
+ * at `replyTo`. Mirrors `run_reply_to_flow` in
+ * `smoke-tests/rust/src/protocol.rs`.
  */
 async function runReplyToFlow(): Promise<void> {
   console.log("=== [Protocol] replyTo Flow ===\n");
@@ -2551,8 +3530,27 @@ async function runReplyToFlow(): Promise<void> {
     );
   }
 
+  // Half (2): a request naming a replyTo the helper has never seen is
+  // answered there, not at the owner's stored endpoint.
+  const phantomUri = "https://phantom-replica.example.com";
+  const crafted = primitives.discovery.request.produce(
+    BigInt(longTermChannelId),
+    sharedKey,
+    0,
+    [{ uri: phantomUri, protocol: 0 }],
+  );
+  helper.transport.drain();
+  await processAll(helper, crafted.envelope);
+  const answered = helper.transport.drain();
+  if (answered.length !== 1 || answered[0]!.endpoint.uri !== phantomUri) {
+    throw new Error(
+      `the responder must route to request.replyTo (${phantomUri}), sent to [${answered.map((m) => m.endpoint.uri).join(", ")}]`,
+    );
+  }
+
   console.log("  ✓ auto_reply_to stamps replyTo on outbound requests");
   console.log("  ✓ default (no auto_reply_to) leaves replyTo unset");
+  console.log("  ✓ the responder answers at an inbound replyTo, not the stored endpoint");
   console.log("\n✓ replyTo flow passed.\n");
 }
 
@@ -2769,6 +3767,21 @@ async function runReplicaPairingAndSecretSyncFlow(): Promise<void> {
   console.log(
     `  ReplicaSecretInstalled: secret=${received.secret.secrets.length}secret/${received.secret.helpers.length}helpers/${(received.secret.replicas?.members.length ?? 0)}members, shares=${received.shares.length}  ✓`,
   );
+
+  // The destination acknowledges the copy, and the owner reports the ack.
+  const ack = drainOne(destination, "Destination");
+  const acked = (await owner.protocol.process(ack)).find(
+    (e) => e.type === "ReplicaSecretAcked" && BigInt(e.channel_id) === rekeyedDestChannel,
+  );
+  if (acked?.type !== "ReplicaSecretAcked") {
+    throw new Error("the owner must emit ReplicaSecretAcked for the destination's acknowledgement");
+  }
+  if (BigInt(acked.from_replica_id) !== destReplicaId || acked.status !== StatusEnum.Ok) {
+    throw new Error(
+      `ReplicaSecretAcked must come from ${destReplicaId} with status Ok, got from=${acked.from_replica_id} status=${acked.status}`,
+    );
+  }
+  console.log(`  [Owner] ReplicaSecretAcked from=${acked.from_replica_id} status=${acked.status} memo=${JSON.stringify(acked.memo)}  ✓`);
 
   // Drain helper outboxes from v=1 so the next round sees only v=2.
   helperA.transport.drain();
@@ -3023,13 +4036,15 @@ async function runReplicaIdWiringSadPathsFlow(): Promise<void> {
   } catch (e) {
     caught = e;
   }
-  if (caught === null) {
-    throw new Error("scanner without replica_id must refuse to start a replica pair");
+  if (errorCode(caught) !== "replica_id_not_configured") {
+    throw new Error(
+      `scanner without replica_id must refuse to start a replica pair with replica_id_not_configured, got ${JSON.stringify(caught)}`,
+    );
   }
   if (unconfiguredScanner.transport.drain().length !== 0) {
     throw new Error("no outbound traffic should have been queued");
   }
-  console.log("  scanner without replica_id refuses to start replica pair  ✓");
+  console.log("  scanner without replica_id refuses to start replica pair: replica_id_not_configured  ✓");
 
   // -- Scenario B: configured initiator's PairRequest is refused by
   //    an unconfigured responder.
@@ -3049,10 +4064,12 @@ async function runReplicaIdWiringSadPathsFlow(): Promise<void> {
   } catch (e) {
     caught2 = e;
   }
-  if (caught2 === null) {
-    throw new Error("unconfigured responder must refuse a replica-mode PairRequest");
+  if (errorCode(caught2) !== "replica_id_not_configured") {
+    throw new Error(
+      `unconfigured responder must refuse a replica-mode PairRequest with replica_id_not_configured, got ${JSON.stringify(caught2)}`,
+    );
   }
-  console.log("  responder without replica_id refuses inbound replica PairRequest  ✓");
+  console.log("  responder without replica_id refuses inbound replica PairRequest: replica_id_not_configured  ✓");
 
   console.log("\n✓ Replica id wiring sad-paths passed.\n");
 }
@@ -3902,7 +4919,7 @@ async function runKeyRotationFlow(): Promise<void> {
   console.log("  SecretRecovered names key_epoch 2 for both helpers  ✓");
 
   const device = makeNode("Device", ownerUri, { secretId, keyRotation: true });
-  await device.protocol.restore(recovered, 2);
+  await device.protocol.restore(recovered, 2, 2);
   for (const [channelId] of helpers) {
     const restoredEpoch = await storedKeyEpoch(device, secretId, channelId);
     if (restoredEpoch !== 2) {
@@ -3922,6 +4939,795 @@ async function runKeyRotationFlow(): Promise<void> {
   console.log("\n✓ Key rotation flow passed.\n");
 }
 
+/** The `code` of a structured binding error, or `undefined` for anything else. */
+function errorCode(e: unknown): string | undefined {
+  return typeof e === "object" && e !== null && "code" in e
+    ? String((e as { code: unknown }).code)
+    : undefined;
+}
+
+async function expectCode(
+  label: string,
+  expected: string,
+  call: () => unknown,
+): Promise<void> {
+  let code: string | undefined;
+  try {
+    await call();
+  } catch (e) {
+    code = errorCode(e);
+    if (code === undefined) throw e;
+  }
+  if (code !== expected) {
+    throw new Error(`${label}: expected error code ${expected}, got ${code ?? "no error"}`);
+  }
+}
+
+/** As `expectCode`, and the error must name `channelId` as the channel it is about. */
+async function expectChannelCode(
+  label: string,
+  expected: string,
+  channelId: string,
+  call: () => unknown,
+): Promise<void> {
+  let error: DeRecError | undefined;
+  try {
+    await call();
+  } catch (e) {
+    if (errorCode(e) === undefined) throw e;
+    error = e as DeRecError;
+  }
+  if (error?.code !== expected) {
+    throw new Error(`${label}: expected error code ${expected}, got ${error?.code ?? "no error"}`);
+  }
+  if (error.channel_id !== channelId) {
+    throw new Error(`${label}: the error must name channel ${channelId}, got ${String(error.channel_id)}`);
+  }
+}
+
+/** `true` for either replica arrival event: an install or an update. */
+function isReplicaArrival(
+  e: DeRecEvent,
+): e is Extract<DeRecEvent, { type: "ReplicaSecretReceived" | "ReplicaSecretInstalled" }> {
+  return e.type === "ReplicaSecretReceived" || e.type === "ReplicaSecretInstalled";
+}
+
+/** The channels of every `ShareVerified` in `events`. */
+function verifiedChannels(events: DeRecEvent[]): Set<string> {
+  return new Set(
+    events.flatMap((e) => (e.type === "ShareVerified" ? [e.channel_id] : [])),
+  );
+}
+
+/**
+ * A stored roster read back as JSON. The stored record carries ids as bare
+ * JSON numbers, beyond what a JS number holds exactly, so they are quoted
+ * before parsing.
+ */
+async function storedRoster(
+  node: Node,
+): Promise<Array<{
+  replica_id: string;
+  channel_id: string;
+  transports: Array<{ uri: string }>;
+  communication_info?: Record<string, string>;
+}>> {
+  const text = utf8Decode(
+    await node.channelStore.listReplicas(String(node.protocol.secretId()), ANY_REPLICAS),
+  );
+  return JSON.parse(text.replace(/"(replica_id|channel_id)":(\d+)/g, '"$1":"$2"'));
+}
+
+/**
+ * A replica destination that received a mirrored vault can verify the helpers
+ * holding that vault's shares. It never spoke to those helpers and never split
+ * the secret: the roster gives it each helper's channel and key, and the share
+ * map the committed bytes to check a proof against. A version it pulled with
+ * `ReplicaDiscovery` is as verifiable as one pushed to it. Mirrors
+ * `run_replica_mirror_then_verify_flow` in `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runReplicaMirrorThenVerifyFlow(): Promise<void> {
+  console.log("=== [Protocol] Replica mirror-then-verify Flow ===\n");
+
+  const source: AddressedNode = {
+    node: makeNode("Source", "https://mirror-source.example.com", {
+      secretId: 0xC0FFEEn,
+      replicaId: 0xAAAA_AAAA_AAAA_AAAAn,
+    }),
+    uri: "https://mirror-source.example.com",
+  };
+  const helperA: AddressedNode = {
+    node: makeNode("HelperA", "https://mirror-helper-a.example.com"),
+    uri: "https://mirror-helper-a.example.com",
+  };
+  const helperB: AddressedNode = {
+    node: makeNode("HelperB", "https://mirror-helper-b.example.com"),
+    uri: "https://mirror-helper-b.example.com",
+  };
+  const destination: AddressedNode = {
+    node: makeNode("Destination", "https://mirror-destination.example.com", {
+      replicaId: 0xBBBB_BBBB_BBBB_BBBBn,
+    }),
+    uri: "https://mirror-destination.example.com",
+  };
+  const all = [source, helperA, helperB, destination];
+
+  const { longTermChannelId: channelA } = await doPair(helperA.node, source.node, 1n, "Source↔HelperA");
+  const { longTermChannelId: channelB } = await doPair(helperB.node, source.node, 2n, "Source↔HelperB");
+  const { rekeyed } = await pairReplicaHandshake(source, destination, 3n);
+  await crossConfirmFingerprint(source.node, destination.node, rekeyed);
+  // The pair-completion auto-publish is not the round under test.
+  await pumpAll(all);
+
+  const protect = (data: string, description: string) =>
+    source.node.protocol.start(FlowKind.ProtectSecret, {
+      secrets: [{ id: new Uint8Array([1]), name: "mirrored secret", data: utf8Encode(data) }],
+      description,
+    });
+
+  await protect("vault-contents", "mirror round");
+  const mirrored = (await pumpAll(all)).find(isReplicaArrival);
+  if (!mirrored) throw new Error("the destination must report the mirrored vault");
+  if (mirrored.shares.length !== 2) {
+    throw new Error(`the mirrored payload must carry one share per helper, got ${mirrored.shares.length}`);
+  }
+
+  // The destination acts as the owner of the vault it received, over its own
+  // partition: it was never configured with the source's secret id.
+  const destinationSid = destination.node.protocol.secretId();
+  for (const channelId of [channelA, channelB]) {
+    const tracked = await destination.node.shareStore.load(String(destinationSid), channelId, [mirrored.version]);
+    if (tracked.length !== 1 || tracked[0]!.bytes.length === 0) {
+      throw new Error(
+        `the destination must hold the committed bytes for helper channel ${channelId} at v${mirrored.version}, got ${tracked.length} share(s)`,
+      );
+    }
+  }
+  console.log(`  [Destination] holds a tracking share per helper at the mirrored v${mirrored.version}  ✓`);
+
+  const verifyOnDestination = async (version: number): Promise<Set<string>> => {
+    await destination.node.protocol.start(FlowKind.VerifyShares, { secretId: destinationSid, version });
+    return verifiedChannels(await pumpAll(all));
+  };
+  const pushed = await verifyOnDestination(mirrored.version);
+  if (!pushed.has(channelA) || !pushed.has(channelB)) {
+    throw new Error(`the destination must verify both helpers on a pushed version, verified ${JSON.stringify([...pushed])}`);
+  }
+  console.log(`  [Destination] VerifyShares v${mirrored.version} (pushed) → ShareVerified from both helpers  ✓`);
+
+  const missed = await protect("vault-contents-v2", "round the destination misses");
+  const missedVersion = requireEvent(missed, "ProtectSecretStarted", "Source").version;
+  if (missedVersion <= mirrored.version) {
+    throw new Error(`the missed round must be newer: v${missedVersion} after v${mirrored.version}`);
+  }
+  // Delivered to the helpers only: the destination's copy is dropped.
+  for (const { endpoint, message } of source.node.transport.drain()) {
+    const helper = [helperA, helperB].find((h) => h.uri === endpoint.uri);
+    if (helper) await processAll(helper.node, message);
+  }
+  await pumpAll([source, helperA, helperB]);
+
+  await destination.node.protocol.start(FlowKind.ReplicaDiscovery);
+  const caughtUp = await pumpAll(all);
+  if (!caughtUp.some((e) => e.type === "ReplicaSecretReceived" && e.version === missedVersion)) {
+    throw new Error(`the catch-up must hydrate the missed v${missedVersion}, got [${caughtUp.map((e) => e.type).join(", ")}]`);
+  }
+  const pulled = await verifyOnDestination(missedVersion);
+  if (!pulled.has(channelA) || !pulled.has(channelB)) {
+    throw new Error(`a version obtained by catch-up must be as verifiable as a pushed one, verified ${JSON.stringify([...pulled])}`);
+  }
+  console.log(`  [Destination] VerifyShares v${missedVersion} (pulled by catch-up) → ShareVerified from both helpers  ✓`);
+
+  console.log("\n✓ Replica mirror-then-verify flow passed.\n");
+}
+
+/**
+ * A published roster describes every member the same way, the publisher
+ * included: every endpoint it advertised, in preference order, and its
+ * `communication_info`. Anything rebuilding the group from a `Secret` can
+ * otherwise neither name nor reach the member that wrote it. Mirrors
+ * `run_replica_roster_describes_every_member_flow` in
+ * `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runReplicaRosterDescribesEveryMemberFlow(): Promise<void> {
+  console.log("=== [Protocol] Replica roster describes every member Flow ===\n");
+
+  const sourceId = 0xCCCC_CCCC_CCCC_CCCCn;
+  const destinationId = 0xDDDD_DDDD_DDDD_DDDDn;
+  const identity = (label: string, name: string, replicaId: bigint) => {
+    const uri = `https://${label}.example.com`;
+    const endpoints = [uri, `grpcs://${label}.example.com:443`];
+    const channelStore = new InMemoryChannelStore();
+    const shareStore = new InMemoryShareStore();
+    const secretStore = new InMemorySecretStore();
+    const userSecretStore = new InMemoryUserSecretStore();
+    const stateStore = new InMemoryStateStore();
+    const transport = new RecordingTransport();
+    const protocol = new DeRecProtocolBuilder(DEFAULT_TEST_SECRET_ID)
+      .withStores({ channelStore, shareStore, secretStore, userSecretStore, stateStore })
+      .withTransport(transport)
+      .withOwnTransports([
+        { uri: endpoints[0]!, protocol: "https" },
+        { uri: endpoints[1]!, protocol: "grpc" },
+      ])
+      .withThreshold(THRESHOLD)
+      .withReplicaId(replicaId)
+      .withCommunicationInfo({ name })
+      .build();
+    const node: Node = { protocol, transport, channelStore, shareStore, secretStore, userSecretStore, stateStore };
+    return { entry: { node, uri } as AddressedNode, endpoints };
+  };
+  const source = identity("roster-source", "Alice-1", sourceId);
+  const destination = identity("roster-destination", "Alice-2", destinationId);
+  const scope = [source.entry, destination.entry];
+
+  const { rekeyed: groupChannel } = await pairReplicaHandshake(source.entry, destination.entry, 0x0570n);
+  await crossConfirmFingerprint(source.entry.node, destination.entry.node, groupChannel);
+  await pumpAll(scope);
+
+  await source.entry.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([1]), name: "roster secret", data: utf8Encode("roster-contents") }],
+  });
+  const secret = (await pumpAll(scope)).filter(isReplicaArrival).pop()?.secret;
+  if (!secret) throw new Error("the destination must receive the published secret");
+
+  const describe = (transports: Array<{ uri: string }>, info?: Record<string, string> | null) =>
+    JSON.stringify([transports.map((t) => t.uri), info?.name ?? null]);
+  const expected = [
+    [String(sourceId), source.endpoints, "Alice-1"],
+    [String(destinationId), destination.endpoints, "Alice-2"],
+  ] as const;
+
+  const members = secret.replicas?.members ?? [];
+  if (members.length !== 2) {
+    throw new Error(`both members are published, got ${JSON.stringify(members)}`);
+  }
+  for (const [replicaId, endpoints, name] of expected) {
+    const member = members.find((m) => m.replica_id === replicaId);
+    if (!member) throw new Error(`member ${replicaId} missing from ${JSON.stringify(members)}`);
+    const got = describe(member.transports, member.communication_info);
+    if (got !== describe(endpoints.map((uri) => ({ uri })), { name })) {
+      throw new Error(`published row for ${name}: got ${got}`);
+    }
+  }
+  console.log("  published roster names and reaches the writer as well as its peer  ✓");
+
+  // The destination's record of the source must be as complete as its
+  // record of itself.
+  const stored = await storedRoster(destination.entry.node);
+  for (const [replicaId, endpoints, name] of expected) {
+    const member = stored.find((m) => m.replica_id === replicaId);
+    if (!member) throw new Error(`the destination holds no row for ${replicaId}`);
+    const got = describe(member.transports, member.communication_info);
+    if (got !== describe(endpoints.map((uri) => ({ uri })), { name })) {
+      throw new Error(`the destination's stored row for ${name}: got ${got}`);
+    }
+  }
+  console.log("  destination stores every member, itself included, the same way  ✓");
+
+  console.log("\n✓ Replica roster describes every member flow passed.\n");
+}
+
+/**
+ * A destination can verify the versions it was synced, and only those. Alice
+ * protects across three helpers (v1), then pairs Bob, whose joining publishes
+ * v2. Both verify v2; only Alice verifies v1. Bob asking about v1 fails each
+ * channel locally with `NoProof` and sends no challenge, because he holds no
+ * reference bytes, not because a helper is at fault. A synced destination is
+ * already provisioned, so `restore` refuses it. Mirrors
+ * `run_replica_verifies_only_synced_versions_flow` in
+ * `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runReplicaVerifiesOnlySyncedVersionsFlow(): Promise<void> {
+  console.log("=== [Protocol] Replica verifies only synced versions Flow ===\n");
+
+  const alice: AddressedNode = {
+    node: makeNode("Alice", "https://synced-alice.example.com", { secretId: 0xC0FFEEn, replicaId: 0xA11CEn }),
+    uri: "https://synced-alice.example.com",
+  };
+  const helpers: AddressedNode[] = [1, 2, 3].map((i) => ({
+    node: makeNode(`Helper${i}`, `https://synced-helper-${i}.example.com`),
+    uri: `https://synced-helper-${i}.example.com`,
+  }));
+  const bob: AddressedNode = {
+    node: makeNode("Bob", "https://synced-bob.example.com", { replicaId: 0xB0Bn }),
+    uri: "https://synced-bob.example.com",
+  };
+  const all = [alice, ...helpers, bob];
+
+  const channels: string[] = [];
+  for (const [i, helper] of helpers.entries()) {
+    channels.push((await doPair(helper.node, alice.node, BigInt(i + 1), `Alice↔Helper${i + 1}`)).longTermChannelId);
+  }
+
+  const started = await alice.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([1]), name: "wallet", data: utf8Encode("alice-secret-v1") }],
+  });
+  const v1 = requireEvent(started, "ProtectSecretStarted", "Alice").version;
+  await pumpAll([alice, ...helpers]);
+
+  // Confirming the fingerprint puts Bob on the roster, and the publish that
+  // follows carries v2 to him.
+  const { rekeyed } = await pairReplicaHandshake(alice, bob, 4n);
+  await crossConfirmFingerprint(alice.node, bob.node, rekeyed);
+  const synced = (await pumpAll(all)).find(isReplicaArrival);
+  if (!synced) throw new Error("Bob must be synced when he joins the roster");
+  const v2 = synced.version;
+  if (v2 <= v1) throw new Error(`joining must publish a newer version (v1=${v1}, v2=${v2})`);
+
+  await expectCode("restore on a synced destination", "already_restored", () =>
+    bob.node.protocol.restore(synced.secret, v2, v2),
+  );
+  console.log("  [Bob] restore on a synced destination → already_restored  ✓");
+
+  const aliceSid = alice.node.protocol.secretId();
+  const bobSid = bob.node.protocol.secretId();
+  for (const channelId of channels) {
+    for (const [label, node, sid, version, want] of [
+      ["Alice", alice.node, aliceSid, v1, 1],
+      ["Alice", alice.node, aliceSid, v2, 1],
+      ["Bob", bob.node, bobSid, v1, 0],
+      ["Bob", bob.node, bobSid, v2, 1],
+    ] as const) {
+      const rows = (await node.shareStore.load(String(sid), channelId, [version])).length;
+      if (rows !== want) {
+        throw new Error(`${label} must hold ${want} tracking share(s) for helper ${channelId} at v${version}, got ${rows}`);
+      }
+    }
+  }
+  console.log(`  tracking shares: Alice v${v1}+v${v2}, Bob v${v2} only  ✓`);
+
+  for (const [who, node, sid, version] of [
+    ["Alice", alice.node, aliceSid, v2],
+    ["Bob", bob.node, bobSid, v2],
+    ["Alice", alice.node, aliceSid, v1],
+  ] as const) {
+    await node.protocol.start(FlowKind.VerifyShares, { secretId: sid, version });
+    const verified = verifiedChannels(await pumpAll(all));
+    if (!channels.every((c) => verified.has(c))) {
+      throw new Error(`${who} must verify v${version} against all three helpers, verified ${JSON.stringify([...verified])}`);
+    }
+  }
+
+  const events = await bob.node.protocol.start(FlowKind.VerifyShares, { secretId: bobSid, version: v1 });
+  const noProof = new Set(
+    events.flatMap((e) => (e.type === "VerifySharesFailed" && e.reason === "NoProof" ? [e.channel_id] : [])),
+  );
+  if (!channels.every((c) => noProof.has(c))) {
+    throw new Error(`Bob holds no v${v1} bytes, so every helper channel fails with NoProof, got ${JSON.stringify(events)}`);
+  }
+  if (bob.node.transport.drain().length !== 0) {
+    throw new Error(`no v${v1} challenge is sent without a proof to check the answer against`);
+  }
+  console.log(`  alice: v${v1} ✓ v${v2} ✓   bob: v${v1} NoProof (never synced) v${v2} ✓  ✓`);
+
+  console.log("\n✓ Replica verifies only synced versions flow passed.\n");
+}
+
+/**
+ * Pair `owner` with three helpers, publish one secret across them, deliver the
+ * round, and return the helpers, their channels and the published version.
+ */
+async function protectAcrossThree(
+  owner: Node,
+  data: Uint8Array,
+  secretByte: number,
+  name: string,
+): Promise<{ helpers: AddressedNode[]; channels: string[]; version: number }> {
+  const helpers: AddressedNode[] = ["a", "b", "c"].map((h) => ({
+    node: makeNode(`Helper${h.toUpperCase()}`, `https://${name}-helper-${h}.example.com`),
+    uri: `https://${name}-helper-${h}.example.com`,
+  }));
+  const channels: string[] = [];
+  for (const [i, helper] of helpers.entries()) {
+    channels.push((await doPair(helper.node, owner, BigInt(i + 1), `Owner↔Helper${i}`)).longTermChannelId);
+  }
+  const started = await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([secretByte]), name, data }],
+  });
+  const version = requireEvent(started, "ProtectSecretStarted", "Owner").version;
+  return { helpers, channels, version };
+}
+
+/**
+ * One of three helpers no longer holds the version asked for. It answers both
+ * the verification challenge and the recovery request with
+ * `UNKNOWN_SHARE_VERSION`; the owner reports `ShareVerifyRejected` and
+ * `RecoveryShareRefused` and recovers from the other two. The refusing helper
+ * answers first, so a refusal collected as a share would poison every
+ * reconstruction after it. Mirrors `run_helper_without_the_version_flow` in
+ * `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runHelperWithoutTheVersionFlow(): Promise<void> {
+  console.log("=== [Protocol] Helper without the version Flow ===\n");
+
+  const ownerUri = "https://forgetful-owner.example.com";
+  const owner = makeNode("Owner", ownerUri, { secretId: 42n });
+  const secretData = utf8Encode("three helpers, one forgetful");
+  const { helpers, channels, version } = await protectAcrossThree(owner, secretData, 7, "forgetful");
+  const all = [{ node: owner, uri: ownerUri }, ...helpers];
+  await pumpAll(all);
+  const [helperA] = helpers;
+  const [channelA] = channels;
+  if (!helperA || !channelA) throw new Error("three helpers are paired");
+
+  await helperA.node.shareStore.removeVersions(String(helperA.node.protocol.secretId()), channelA, [version]);
+
+  const ownerSid = owner.protocol.secretId();
+  await owner.protocol.start(FlowKind.VerifyShares, { secretId: ownerSid, version });
+  const verifyEvents = await pumpAll(all);
+  const rejected = verifyEvents.flatMap((e) =>
+    e.type === "ShareVerifyRejected" ? [[e.channel_id, e.status]] : [],
+  );
+  if (JSON.stringify(rejected) !== JSON.stringify([[channelA, StatusEnum.UnknownShareVersion]])) {
+    throw new Error(`HelperA must refuse the challenge with UNKNOWN_SHARE_VERSION, got ${JSON.stringify(rejected)}`);
+  }
+  const verified = verifyEvents.filter((e) => e.type === "ShareVerified").length;
+  if (verified !== 2) throw new Error(`HelperB and HelperC still prove possession, got ${verified}`);
+  console.log("  [Owner] VerifyShares → ShareVerifyRejected(UNKNOWN_SHARE_VERSION) from HelperA, 2 ShareVerified  ✓");
+
+  const asked = (await owner.protocol.start(FlowKind.RecoverSecret, { secretId: ownerSid, version })).filter(
+    (e) => e.type === "RecoverSecretStarted",
+  ).length;
+  if (asked !== 3) throw new Error(`every helper is asked for its share, got ${asked}`);
+  const recoveryEvents = await pumpAll(all);
+  const refused = recoveryEvents.flatMap((e) =>
+    e.type === "RecoveryShareRefused" ? [[e.channel_id, e.version, e.status]] : [],
+  );
+  if (JSON.stringify(refused) !== JSON.stringify([[channelA, version, StatusEnum.UnknownShareVersion]])) {
+    throw new Error(`the app sees exactly one refusal, from HelperA, got ${JSON.stringify(refused)}`);
+  }
+  if (recoveryEvents.some((e) => e.type === "RecoveryIncomplete" || e.type === "RecoveryConflict")) {
+    throw new Error(`a refusal must not leave the recovery undecided: ${JSON.stringify(recoveryEvents)}`);
+  }
+  const recovered = recoveryEvents.find((e) => e.type === "SecretRecovered");
+  if (
+    recovered?.type !== "SecretRecovered" ||
+    !recovered.secret.secrets.some((s) => s.id.length === 1 && s.id[0] === 7 && byteArraysEqual(s.data, secretData))
+  ) {
+    throw new Error(`the two remaining helpers must complete the recovery, got [${recoveryEvents.map((e) => e.type).join(", ")}]`);
+  }
+  console.log("  [Owner] RecoverSecret → RecoveryShareRefused(UNKNOWN_SHARE_VERSION) from HelperA, SecretRecovered from the rest  ✓");
+
+  const missing = version + 100;
+  await owner.protocol.start(FlowKind.RecoverSecret, { secretId: ownerSid, version: missing });
+  const missingEvents = await pumpAll(all);
+  const incomplete = missingEvents.flatMap((e) =>
+    e.type === "RecoveryIncomplete" ? [[e.secret_id, e.version, e.shares_received]] : [],
+  );
+  if (JSON.stringify(incomplete) !== JSON.stringify([[String(ownerSid), missing, 0]])) {
+    throw new Error(`a version no helper holds closes as RecoveryIncomplete naming its secret, got ${JSON.stringify(missingEvents)}`);
+  }
+  console.log("  [Owner] RecoverSecret for a version no helper holds → RecoveryIncomplete naming the secret, 0 shares  ✓");
+
+  console.log("\n✓ Helper without the version flow passed.\n");
+}
+
+/**
+ * One of three helpers holds a tampered share: one byte of its first
+ * subshare's `y` flipped in storage, so it still answers OK. The owner reports
+ * it as `RecoveryShareCorrupted(InvalidProof)` and recovers from the other
+ * two. The tampered helper answers first, so a corrupted share that were
+ * collected would fail every reconstruction after it. Mirrors
+ * `run_corrupted_share_flow` in `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runCorruptedShareFlow(): Promise<void> {
+  console.log("=== [Protocol] Corrupted share Flow ===\n");
+
+  const ownerUri = "https://tampered-owner.example.com";
+  const owner = makeNode("Owner", ownerUri, { secretId: 43n });
+  const secretData = utf8Encode("three helpers, one tampered");
+  const { helpers, channels, version } = await protectAcrossThree(owner, secretData, 8, "tampered");
+  const all = [{ node: owner, uri: ownerUri }, ...helpers];
+  await pumpAll(all);
+  const [helperA] = helpers;
+  const [channelA] = channels;
+  if (!helperA || !channelA) throw new Error("three helpers are paired");
+
+  // StoreShareRequest.share → CommittedDeRecShare.deRecShare →
+  // DeRecShare.subshares → Subshare.y.
+  const helperSid = String(helperA.node.protocol.secretId());
+  const [stored] = await helperA.node.shareStore.load(helperSid, channelA, [version]);
+  if (!stored) throw new Error(`HelperA must hold v${version}`);
+  const bytes = rewriteProtoField(stored.bytes, 1, (share) =>
+    rewriteProtoField(share, 1, (derecShare) =>
+      rewriteProtoField(derecShare, 2, (subshare) =>
+        rewriteProtoField(subshare, 2, (y) => {
+          const flipped = y.slice();
+          flipped[0]! ^= 0x01;
+          return flipped;
+        }),
+      ),
+    ),
+  );
+  await helperA.node.shareStore.save(helperSid, channelA, { ...stored, bytes });
+
+  await owner.protocol.start(FlowKind.RecoverSecret, { secretId: owner.protocol.secretId(), version });
+  const recoveryEvents = await pumpAll(all);
+  const corrupted = recoveryEvents.flatMap((e) =>
+    e.type === "RecoveryShareCorrupted" ? [[e.channel_id, e.version, e.reason]] : [],
+  );
+  if (JSON.stringify(corrupted) !== JSON.stringify([[channelA, version, "InvalidProof"]])) {
+    throw new Error(`the app sees exactly one corrupted share, from HelperA, got ${JSON.stringify(corrupted)}`);
+  }
+  if (recoveryEvents.some((e) => e.type === "RecoveryIncomplete" || e.type === "RecoveryConflict")) {
+    throw new Error(`a corrupted share must not leave the recovery undecided: ${JSON.stringify(recoveryEvents)}`);
+  }
+  const recovered = recoveryEvents.find((e) => e.type === "SecretRecovered");
+  if (
+    recovered?.type !== "SecretRecovered" ||
+    !recovered.secret.secrets.some((s) => s.id.length === 1 && s.id[0] === 8 && byteArraysEqual(s.data, secretData))
+  ) {
+    throw new Error(`the two untouched helpers must complete the recovery, got [${recoveryEvents.map((e) => e.type).join(", ")}]`);
+  }
+  console.log("  [Owner] RecoverSecret → RecoveryShareCorrupted(InvalidProof) from HelperA, SecretRecovered from the rest  ✓");
+
+  console.log("\n✓ Corrupted share flow passed.\n");
+}
+
+/**
+ * A `ProtectSecret` fan-out whose send to one helper fails reports
+ * `ProtectSecretFailed` for that helper and `ProtectSecretStarted` for the
+ * other: one failure neither stops the fan-out nor fails the call. Mirrors
+ * `run_protect_secret_per_target_failure_flow` in
+ * `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runProtectSecretPerTargetFailureFlow(): Promise<void> {
+  console.log("=== [Protocol] ProtectSecret per-target failure Flow ===\n");
+
+  const owner = makeNode("Owner", "https://owner.example.com", { secretId: 42n });
+  const helperA = makeNode("HelperA", "https://helper-a.example.com");
+  const helperB = makeNode("HelperB", "https://helper-b.example.com");
+  const { longTermChannelId: channelA } = await doPair(helperA, owner, 1n, "Owner↔HelperA");
+  const { longTermChannelId: channelB } = await doPair(helperB, owner, 2n, "Owner↔HelperB");
+
+  owner.transport.failUri("https://helper-b.example.com");
+  const events = await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([1, 2, 3]), name: "per-target-failure", data: utf8Encode("payload") }],
+  });
+  const started = events.filter((e) => e.type === "ProtectSecretStarted");
+  const failed = events.filter(
+    (e): e is Extract<DeRecEvent, { type: "ProtectSecretFailed" }> => e.type === "ProtectSecretFailed",
+  );
+  if (started.length !== 1 || failed.length !== 1) {
+    throw new Error(`expected one started and one failed, got ${started.length} + ${failed.length}`);
+  }
+  if (started[0]!.channel_id !== channelA) {
+    throw new Error(`the started event must be for HelperA, got ${started[0]!.channel_id}`);
+  }
+  if (failed[0]!.channel_id !== channelB || failed[0]!.error !== "transport send failed: the message reached none of the peer's endpoints") {
+    throw new Error(`the failed event must be for HelperB with the transport failure, got ${JSON.stringify(failed[0])}`);
+  }
+  console.log(`  HelperA: ProtectSecretStarted ✓   HelperB: ProtectSecretFailed("${failed[0]!.error}")  ✓`);
+
+  console.log("\n✓ ProtectSecret per-target failure flow passed.\n");
+}
+
+/** A channel's stored `SharedKey`, or `null` when the channel has none. */
+function channelKey(node: Node, secretId: bigint, channelId: bigint): Promise<Uint8Array | null> {
+  return node.secretStore.load(String(secretId), String(channelId), 0);
+}
+
+/**
+ * The replica group is one channel and one key. The first destination's
+ * pairing fixes the group key; a second destination pairs on an ephemeral key,
+ * then the handover moves it onto the group channel, after which every entry
+ * holds the identical key, the ephemeral channel is gone on both sides, and a
+ * follow-up round reaches the joiner on the group channel. Mirrors
+ * `run_replica_group_key_handover_flow` in `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runReplicaGroupKeyHandoverFlow(): Promise<void> {
+  console.log("=== [Protocol] Replica group-key handover Flow ===\n");
+
+  const sid = 0xBEEFn;
+  const source: AddressedNode = {
+    node: makeNode("Source", "https://handover-source.example.com", { secretId: sid, replicaId: 0xC0DE_C0DE_C0DE_C0DEn }),
+    uri: "https://handover-source.example.com",
+  };
+  const dest1: AddressedNode = {
+    node: makeNode("Dest1", "https://handover-dest1.example.com", { secretId: sid, replicaId: 0xD1D1_D1D1_D1D1_D1D1n }),
+    uri: "https://handover-dest1.example.com",
+  };
+  const dest2: AddressedNode = {
+    node: makeNode("Dest2", "https://handover-dest2.example.com", { secretId: sid, replicaId: 0xD2D2_D2D2_D2D2_D2D2n }),
+    uri: "https://handover-dest2.example.com",
+  };
+  const all = [source, dest1, dest2];
+  const requireKey = async (node: Node, channelId: bigint, label: string): Promise<Uint8Array> => {
+    const key = await channelKey(node, sid, channelId);
+    if (!key) throw new Error(`${label} must hold a key for channel ${channelId}`);
+    return key;
+  };
+
+  const { rekeyed: groupChannel } = await pairReplicaHandshake(source, dest1, 1n);
+  await crossConfirmFingerprint(source.node, dest1.node, groupChannel);
+  await pumpAll(all);
+  const groupKey = await requireKey(source.node, groupChannel, "Source");
+  if (!byteArraysEqual(groupKey, await requireKey(dest1.node, groupChannel, "Dest1"))) {
+    throw new Error("after the first pairing, Source and Dest1 must hold the same group key");
+  }
+  console.log("  step 1: pair Source↔Dest1 — the group key emerged, both sides agree  ✓");
+
+  const { rekeyed: ephemeral } = await pairReplicaHandshake(source, dest2, 2n);
+  const ephemeralKey = await requireKey(source.node, ephemeral, "Source");
+  if (!byteArraysEqual(ephemeralKey, await requireKey(dest2.node, ephemeral, "Dest2"))) {
+    throw new Error("before the handover, Source and Dest2 must share the ephemeral key");
+  }
+  if (byteArraysEqual(ephemeralKey, groupKey)) {
+    throw new Error("before the handover, Dest2's ephemeral key must not be the group key");
+  }
+  await crossConfirmFingerprint(source.node, dest2.node, ephemeral);
+  await pumpAll(all);
+
+  for (const [label, node] of [["Source", source.node], ["Dest1", dest1.node], ["Dest2", dest2.node]] as const) {
+    if (!byteArraysEqual(await requireKey(node, groupChannel, label), groupKey)) {
+      throw new Error(`${label} must hold the group key, fixed at the first pairing, on the group channel`);
+    }
+  }
+  for (const [label, node] of [["Source", source.node], ["Dest2", dest2.node]] as const) {
+    if ((await channelKey(node, sid, ephemeral)) !== null) {
+      throw new Error(`${label} must drop the ephemeral pairing channel's key after the handover`);
+    }
+  }
+  for (const [label, node] of [["Source", source.node], ["Dest1", dest1.node], ["Dest2", dest2.node]] as const) {
+    const roster = await storedRoster(node);
+    if (roster.length !== 3 || roster.some((m) => m.channel_id !== String(groupChannel))) {
+      throw new Error(`${label} must place all three members on the group channel, got ${JSON.stringify(roster)}`);
+    }
+  }
+  console.log("  step 2: pair Source↔Dest2 — group converged on one channel and one key  ✓");
+
+  const payload = utf8Encode("k_group payload");
+  await source.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([0x42]), name: "post-handover", data: payload }],
+    description: "post-handover round",
+  });
+  const postEvents = await pumpAll(all);
+  if (!postEvents.some((e) => e.type === "ReplicaSecretReceived" && e.channel_id === String(groupChannel))) {
+    throw new Error("the post-handover round must arrive on the group channel");
+  }
+  const snapshot = await dest2.node.userSecretStore.loadLatest(String(sid));
+  if (!snapshot?.secrets.some((s) => byteArraysEqual(s.data, payload))) {
+    throw new Error("Dest2 must decrypt the post-handover payload with the group key");
+  }
+  if (!byteArraysEqual(await requireKey(source.node, groupChannel, "Source"), groupKey)) {
+    throw new Error("the group key must stay stable across follow-up rounds");
+  }
+  console.log("  step 3: follow-up ProtectSecret round under the group key; Dest2 decrypted it  ✓");
+
+  console.log("\n✓ Replica group-key handover flow passed.\n");
+}
+
+/**
+ * A publish sent before the joiner's handover acknowledgement reaches the
+ * source still reaches the joiner, and so does every later one when that
+ * acknowledgement never arrives: the joiner drops its ephemeral channel as
+ * soon as it hydrates, so the source must already address it on the group
+ * channel. Mirrors `run_replica_publish_before_handover_ack_flow` in
+ * `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runReplicaPublishBeforeHandoverAckFlow(): Promise<void> {
+  console.log("=== [Protocol] Replica publish before handover ack Flow ===\n");
+
+  const sid = 0xBEEFn;
+  const source: AddressedNode = {
+    node: makeNode("Source", "https://lost-ack-source.example.com", { secretId: sid, replicaId: 0xC0DE_C0DE_C0DE_C0DEn }),
+    uri: "https://lost-ack-source.example.com",
+  };
+  const dest1: AddressedNode = {
+    node: makeNode("Dest1", "https://lost-ack-dest1.example.com", { secretId: sid, replicaId: 0xD1D1_D1D1_D1D1_D1D1n }),
+    uri: "https://lost-ack-dest1.example.com",
+  };
+  const dest2: AddressedNode = {
+    node: makeNode("Dest2", "https://lost-ack-dest2.example.com", { secretId: sid, replicaId: 0xD2D2_D2D2_D2D2_D2D2n }),
+    uri: "https://lost-ack-dest2.example.com",
+  };
+  const all = [source, dest1, dest2];
+
+  const { rekeyed: groupChannel } = await pairReplicaHandshake(source, dest1, 1n);
+  await crossConfirmFingerprint(source.node, dest1.node, groupChannel);
+  await pumpAll(all);
+
+  const { rekeyed: ephemeral } = await pairReplicaHandshake(source, dest2, 2n);
+  await crossConfirmFingerprint(source.node, dest2.node, ephemeral);
+  for (const { endpoint, message } of source.node.transport.drain()) {
+    const dest = [dest1, dest2].find((d) => d.uri === endpoint.uri);
+    if (dest) await processAll(dest.node, message);
+  }
+  if (dest2.node.transport.drain().length === 0) {
+    throw new Error("Dest2 must have acknowledged the handover before the acknowledgement is dropped");
+  }
+  await pumpAll(all);
+  console.log("  step 1: handover delivered, Dest2's acknowledgement lost  ✓");
+
+  for (const text of ["before the ack", "after the ack"]) {
+    const payload = utf8Encode(text);
+    await source.node.protocol.start(FlowKind.ProtectSecret, {
+      secrets: [{ id: new Uint8Array([0x42]), name: "handover", data: payload }],
+    });
+    await pumpAll(all);
+    const snapshot = await dest2.node.userSecretStore.loadLatest(String(sid));
+    if (!snapshot?.secrets.some((s) => byteArraysEqual(s.data, payload))) {
+      throw new Error(`Dest2 must receive the publish carrying "${text}"`);
+    }
+  }
+  console.log("  step 2: both publishes reached Dest2 on the group channel  ✓");
+
+  console.log("\n✓ Replica publish before handover ack flow passed.\n");
+}
+
+/**
+ * `start(Pairing)` with a fresh contact on a channel id that already finished
+ * pairing is refused with `channel_already_paired` and changes nothing: the
+ * channel stays Paired, its `SharedKey` stays, no `PairingSecret` or
+ * `PairingContact` appears, and nothing is sent. Mirrors
+ * `run_start_pairing_rejects_already_paired_channel` in
+ * `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runStartPairingRejectsAlreadyPairedChannelFlow(): Promise<void> {
+  console.log("=== [Protocol] start(Pairing) rejects already-Paired channel ===\n");
+
+  const policy = {
+    pairing: true,
+    prePair: true,
+    storeShare: true,
+    verifyShare: true,
+    discovery: true,
+    getShare: true,
+    unpair: true,
+    updateChannelInfo: true,
+  };
+  const owner: AddressedNode = {
+    node: makeNode("Owner", "https://repaired-owner.example.com", { autoAccept: policy }),
+    uri: "https://repaired-owner.example.com",
+  };
+  const helper: AddressedNode = {
+    node: makeNode("Helper", "https://repaired-helper.example.com", { autoAccept: policy }),
+    uri: "https://repaired-helper.example.com",
+  };
+
+  await helperStartPair(owner.node, helper.node, 1000n);
+  const completed = (await pumpAll([owner, helper])).find(
+    (e) => e.type === "PairingCompleted" && e.pairing_channel_id === "1000",
+  );
+  if (completed?.type !== "PairingCompleted") throw new Error("the first pairing completes");
+  const channelId = completed.channel_id;
+  const sid = String(helper.node.protocol.secretId());
+  const status = async (): Promise<string> => {
+    const bytes = await helper.node.channelStore.load(sid, channelId, "0");
+    if (!bytes) throw new Error("the helper's channel record must exist");
+    return JSON.parse(utf8Decode(bytes)).Helper.status;
+  };
+  if ((await status()) !== "Paired") throw new Error("the channel is Paired after the first pairing");
+
+  const fresh = await owner.node.protocol.createContact(BigInt(channelId), ContactMode.InlineKeys);
+  let refusal: DeRecError | undefined;
+  try {
+    await helper.node.protocol.start(FlowKind.Pairing, { kind: SenderKind.Helper, contact: fresh });
+  } catch (e) {
+    refusal = e as DeRecError;
+  }
+  if (refusal?.code !== "channel_already_paired") {
+    throw new Error(`a re-scan of a Paired channel must be refused with channel_already_paired, got ${JSON.stringify(refusal)}`);
+  }
+  if (refusal.channel_id !== channelId) {
+    throw new Error(`the refusal must name the offending channel ${channelId}, got ${String(refusal.channel_id)}`);
+  }
+  if ((await status()) !== "Paired") throw new Error("the channel must stay Paired after the refused start");
+  if (!(await helper.node.secretStore.load(sid, channelId, 0))) {
+    throw new Error("the SharedKey must remain after the refused start");
+  }
+  if ((await helper.node.secretStore.load(sid, channelId, 1)) || (await helper.node.secretStore.load(sid, channelId, 2))) {
+    throw new Error("no PairingSecret or PairingContact may appear after the refused start");
+  }
+  if (helper.node.transport.drain().length !== 0) {
+    throw new Error("a refused start must not send anything");
+  }
+  console.log("  [Helper] start(Pairing) on an already-Paired channel → channel_already_paired, no state change, nothing sent  ✓");
+
+  console.log("\n✓ start(Pairing) rejects already-Paired channel flow passed.\n");
+}
+
 export async function runProtocolSmoke(): Promise<void> {
   console.log("━━━ [Protocol] Starting ━━━\n");
 
@@ -3933,8 +5739,9 @@ export async function runProtocolSmoke(): Promise<void> {
   await runHashedKeysPairingFlow();
   await runNoKeysPairingFlow();
   runUnsafeConnectionConfigFlow();
-  runConfigSurfaceFlow();
+  await runConfigSurfaceFlow();
   await runWithConfigFlow();
+  await runProtectSecretPerTargetFailureFlow();
   await runSharingFlow();
   await runWeightedHelpersFlow();
   await runStickyWeightsFlow();
@@ -3945,6 +5752,8 @@ export async function runProtocolSmoke(): Promise<void> {
   await runHelperKeepVersionFlow();
   await runOwnerKeepVersionMissedRoundFlow();
   await runInvalidKeepVersionFlow();
+  await runSupersededShareRequestFlow();
+  await runReplayDetectionFlow();
   await runShareStoreRefusalFlow();
   await runRequestFailedTokenFlow();
   await runShareRefusedFlow();
@@ -3954,6 +5763,16 @@ export async function runProtocolSmoke(): Promise<void> {
   await runVerificationResponseVerdictsFlow();
   await runReplicaSecretRefusedFlow();
   await runDiscoveryAndRecoveryFlow();
+  await runHelperWithoutTheVersionFlow();
+  await runCorruptedShareFlow();
+  await runSilentHelperRecoveryFlow();
+  await runDisputedRecoveryFlow();
+  await runConflictingRecoveryFlow();
+  await runRestoreKeepsHelperDutiesFlow();
+  await runAbandonedReplicaPairingFlow();
+  await runContactOnTheGroupChannelFlow();
+  await runPairingExpiryFlow();
+  await runUnconfirmedJoinerFlow();
   await runUnpairingFlow();
   await runUpdateChannelInfoFlow();
   await runReplyToFlow();
@@ -3962,9 +5781,15 @@ export async function runProtocolSmoke(): Promise<void> {
   await runReplicaRemovalPublishesTheRosterFlow();
   await runReplicaIdWiringSadPathsFlow();
   await runReplicaPairingAndSecretSyncFlow();
+  await runReplicaMirrorThenVerifyFlow();
+  await runReplicaRosterDescribesEveryMemberFlow();
   await runUnconfirmedDestinationIgnoresTheCopyFlow();
+  await runReplicaVerifiesOnlySyncedVersionsFlow();
   await runReplicaSyncVersionProgressionFlow();
+  await runReplicaGroupKeyHandoverFlow();
+  await runReplicaPublishBeforeHandoverAckFlow();
   await runAutoAcceptFlow();
+  await runStartPairingRejectsAlreadyPairedChannelFlow();
   await runExpiredChannelCleanupFlow();
 
   console.log("━━━ [Protocol] All passed. ━━━\n");
@@ -4379,7 +6204,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   if ((recvA.secret.replicas?.members.length ?? 0) !== 2) throw new Error("step 1: roster must be 2 (source + A)");
   if (recvA.shares.length !== 0) throw new Error("step 1: shares must be empty");
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 1);
-  console.log("  step 1: pair replica A → v=1, secret(h=0,s=0,r=1,shares=0)  ✓");
+  console.log("  step 1: pair replica A → v=1, secret(h=0,s=0,r=2,shares=0)  ✓");
 
   // Step 2 — ProtectSecret([s1]) → v=2.
   const s1 = { id: new Uint8Array([0x01]), name: "secret-one", data: utf8Encode("first-user-secret") };
@@ -4400,7 +6225,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   if ((recvA.secret.replicas?.members.length ?? 0) !== 2) throw new Error("step 2: roster must be 2 (source + A)");
   if (recvA.shares.length !== 0) throw new Error("step 2: shares must be empty");
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 2);
-  console.log("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=1,shares=0)  ✓");
+  console.log("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=2,shares=0)  ✓");
 
   // Step 3 — pair replica B → v=3 (B bootstraps with s1).
   const { rekeyed: rekB } = await pairReplicaHandshake(ownerEntry, replicaBEntry, cidB);
@@ -4422,7 +6247,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
     if (recv.shares.length !== 0) throw new Error(`step 3 ${label}: shares must be empty`);
   }
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 3);
-  console.log("  step 3: pair replica B → v=3, secret(h=0,s=1,r=2,shares=0) on A+B  ✓");
+  console.log("  step 3: pair replica B → v=3, secret(h=0,s=1,r=3,shares=0) on A+B  ✓");
 
   // Step 4 — pair helper #1 → v=4 (below threshold).
   await helperStartPairAt(ownerEntry, helper1Entry, cidH1);
@@ -4434,7 +6259,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   await assertHydrated(replicaAEntry.node, PROTECTED_SECRET_ID, "A", 4, 1, 1, 3);
   await assertHydrated(replicaBEntry.node, PROTECTED_SECRET_ID, "B", 4, 1, 1, 3);
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 4);
-  console.log("  step 4: pair helper #1 → v=4, secret(h=1,s=1,r=2,shares=0)  ✓");
+  console.log("  step 4: pair helper #1 → v=4, secret(h=1,s=1,r=3,shares=0)  ✓");
 
   // Step 5 — pair helper #2 → v=5.
   await helperStartPairAt(ownerEntry, helper2Entry, cidH2);
@@ -4446,7 +6271,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   await assertHydrated(replicaAEntry.node, PROTECTED_SECRET_ID, "A", 5, 2, 1, 3);
   await assertHydrated(replicaBEntry.node, PROTECTED_SECRET_ID, "B", 5, 2, 1, 3);
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 5);
-  console.log("  step 5: pair helper #2 → v=5, secret(h=2,s=1,r=2,shares=0)  ✓");
+  console.log("  step 5: pair helper #2 → v=5, secret(h=2,s=1,r=3,shares=0)  ✓");
 
   // Step 6 — ProtectSecret([s1, s2]) → v=6.
   const s2 = { id: new Uint8Array([0x02]), name: "secret-two", data: utf8Encode("second-user-secret") };
@@ -4472,7 +6297,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
     throw new Error("step 6: A's snapshot must carry s2");
   }
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 6);
-  console.log("  step 6: ProtectSecret([s1, s2]) → v=6, secret(h=2,s=2,r=2,shares=0)  ✓");
+  console.log("  step 6: ProtectSecret([s1, s2]) → v=6, secret(h=2,s=2,r=3,shares=0)  ✓");
 
   // Step 7 — pair helper #3 → v=7, threshold met, VSS split runs.
   await helperStartPairAt(ownerEntry, helper3Entry, cidH3);
@@ -4487,7 +6312,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   await assertHydrated(replicaAEntry.node, PROTECTED_SECRET_ID, "A", 7, 3, 2, 3);
   await assertHydrated(replicaBEntry.node, PROTECTED_SECRET_ID, "B", 7, 3, 2, 3);
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 7);
-  console.log("  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
+  console.log("  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=3,shares=3); all 3 helpers ShareStored  ✓");
 
   // Step 8 — pair replica C → v=8, full bootstrap + fresh helper VSS.
   const { rekeyed: rekC } = await pairReplicaHandshake(ownerEntry, replicaCEntry, cidC);
@@ -4509,7 +6334,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   await assertHydrated(replicaBEntry.node, PROTECTED_SECRET_ID, "B", 8, 3, 2, 4);
   await assertHydrated(replicaCEntry.node, PROTECTED_SECRET_ID, "C", 8, 3, 2, 4);
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 8);
-  console.log("  step 8: pair replica C → v=8, secret(h=3,s=2,r=3,shares=3) on A+B+C; all helpers refreshed  ✓");
+  console.log("  step 8: pair replica C → v=8, secret(h=3,s=2,r=4,shares=3) on A+B+C; all helpers refreshed  ✓");
 
   console.log("\n✓ Replica sync version progression flow passed.");
 }
@@ -4755,14 +6580,17 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
 }
 
 
-// Exercises the expired-channel cleanup surface.
-//
-// The contradictory pair — `enabled: false` alongside a non-zero timeout —
-// is the point: the wrapper must forward both values verbatim and let the
-// library decide that a disabled policy ignores its timeout. A wrapper that
-// interpreted the flag locally (dropping the timeout, or substituting its
-// own default) would still pass a happy-path test, so the config is chosen
-// to fail if any interpretation crept into the JS layer.
+/**
+ * The expired-channel cleanup policy and the caller-driven sweep are
+ * independent: with the policy disabled, `removeExpiredChannels` still runs,
+ * spares a Pending pairing created within the current second, which stays
+ * usable, and never touches a Paired channel. Mirrors
+ * `run_expired_channel_cleanup_flow` in `smoke-tests/rust/src/protocol.rs`.
+ *
+ * The contradictory pair — `enabled: false` alongside a non-zero timeout —
+ * is the point: the wrapper must forward both values verbatim and let the
+ * library decide that a disabled policy ignores its timeout.
+ */
 async function runExpiredChannelCleanupFlow(): Promise<void> {
   console.log("[Protocol] expired-channel cleanup");
 
@@ -4789,6 +6617,34 @@ async function runExpiredChannelCleanupFlow(): Promise<void> {
   }
 
   console.log("  cleanup: disabled policy forwarded with its timeout; manual sweep callable ✓");
+
+  // A replica pairing is Pending on both ends until the fingerprints are
+  // compared, and the caller-driven sweep spares a channel younger than its
+  // threshold.
+  const disabled = { expired_channels: { enabled: false, timeout_in_secs: 900 } };
+  const owner: AddressedNode = {
+    node: makeNode("Owner", "https://cleanup-owner.example.com", { replicaId: 11n, timeouts: disabled }),
+    uri: "https://cleanup-owner.example.com",
+  };
+  const replica: AddressedNode = {
+    node: makeNode("Replica", "https://cleanup-replica.example.com", { replicaId: 12n, timeouts: disabled }),
+    uri: "https://cleanup-replica.example.com",
+  };
+  const { rekeyed } = await pairReplicaHandshake(owner, replica, 0xEC_0001n);
+  const pending = await owner.node.protocol.removeExpiredChannels(3600);
+  if (pending.length !== 0) {
+    throw new Error(`a Pending channel younger than the threshold survives the sweep, removed ${JSON.stringify(pending)}`);
+  }
+  // Still usable: the fingerprint round-trip completes, which it could not
+  // had the sweep dropped the channel or its keys.
+  await crossConfirmFingerprint(owner.node, replica.node, rekeyed);
+  console.log("  cleanup: a Pending replica pairing survives removeExpiredChannels(3600) and its fingerprint round-trip completes ✓");
+
+  const paired = await owner.node.protocol.removeExpiredChannels(0);
+  if (paired.length !== 0) {
+    throw new Error(`Paired channels are out of scope for the sweep, removed ${JSON.stringify(paired)}`);
+  }
+  console.log("  cleanup: Paired channels are never swept ✓");
 }
 
 
@@ -4858,7 +6714,7 @@ export function runUnsafeConnectionConfigFlow(): void {
  * silently drop the setting rather than fail — so each assertion here is
  * checking the value actually arrived.
  */
-export function runConfigSurfaceFlow(): void {
+export async function runConfigSurfaceFlow(): Promise<void> {
   console.log("=== [Protocol] config surface ===\n");
 
   const base = () =>
@@ -4907,13 +6763,34 @@ export function runConfigSurfaceFlow(): void {
   console.log("  two endpoints of one protocol refused  ✓");
 
   // Distinct protocols are what the list is for.
-  base()
+  const protocol = base()
     .withOwnTransports([
       { uri: "https://a.example", protocol: "https" },
       { uri: "grpcs://a.example:443", protocol: "grpc" },
     ])
     .build();
   console.log("  distinct protocols accepted  ✓");
+
+  // setOwnTransports replaces the set and is held to the same rule as the
+  // builder.
+  await protocol.setOwnTransports([{ uri: "https://only.example", protocol: "https" }]);
+  console.log("  setOwnTransports replaces the whole set  ✓");
+
+  refused = false;
+  try {
+    await protocol.setOwnTransports([
+      { uri: "https://a.example", protocol: "https" },
+      { uri: "https://b.example", protocol: "https" },
+    ]);
+  } catch {
+    refused = true;
+  }
+  if (!refused) {
+    throw new Error(
+      "setOwnTransports must apply the same one-per-protocol rule as the builder",
+    );
+  }
+  console.log("  setOwnTransports refuses a duplicate protocol  ✓");
 
   console.log("\n✓ config surface passed.\n");
 }

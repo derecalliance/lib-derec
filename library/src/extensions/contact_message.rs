@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::Error;
 use crate::derec_message::current_timestamp;
 use crate::primitives::pairing::PairingError;
 use crate::types::ChannelId;
-use derec_cryptography::pairing::{FingerprintCommitment, PairingContactMessageMaterial};
+use derec_cryptography::pairing::{
+    FingerprintCommitment, PairingContactMessageMaterial, contact_binding_hash,
+};
 use derec_proto::{ContactMessage, ContactMode, TransportProtocol};
 
 /// Extension trait that attaches structural validation as a method on
@@ -49,7 +52,7 @@ pub(crate) trait ContactMessageExt {
     /// resistance; a malformed `NoKeys` contact that carried
     /// unauthenticated key material would silently upgrade the flow to
     /// a mode the OOB channel wasn't trusted for.
-    fn validate(&self) -> Result<(), crate::Error>;
+    fn validate(&self) -> Result<(), Error>;
 
     /// [`Self::validate`], plus the declared `contact_mode` must be the one
     /// the calling flow expects. A pairing step that accepts only one mode
@@ -65,7 +68,7 @@ pub(crate) trait ContactMessageExt {
     /// - processing a PrePair response for a no-keys contact requires
     ///   [`ContactMode::NoKeys`]: no key material and no commitment, trust
     ///   rests on the out-of-band channel alone.
-    fn validate_for_mode(&self, expected: ContactMode) -> Result<(), crate::Error>;
+    fn validate_for_mode(&self, expected: ContactMode) -> Result<(), Error>;
 
     /// Returns `true` when this contact's mode requires a `PrePairRequest`
     /// round-trip before the responder can produce a `PairRequestMessage`.
@@ -108,12 +111,17 @@ pub(crate) trait ContactMessageExt {
     /// `own` is outside the binding hash.
     ///
     /// Timestamp is stamped with the current wall-clock.
+    ///
+    /// # Errors
+    ///
+    /// [`PairingError::ContactMessageKeygen`] if either public key in `pk`
+    /// does not have the size the protocol fixes.
     fn hashed_keys(
         channel_id: ChannelId,
         nonce: u64,
         own: Vec<TransportProtocol>,
         pk: &PairingContactMessageMaterial,
-    ) -> ContactMessage;
+    ) -> Result<ContactMessage, Error>;
 
     /// Build a [`ContactMode::NoKeys`] [`ContactMessage`]: no key
     /// material and no commitment — only `channel_id`, `nonce`, and
@@ -132,7 +140,7 @@ pub(crate) trait ContactMessageExt {
 }
 
 impl ContactMessageExt for ContactMessage {
-    fn validate(&self) -> Result<(), crate::Error> {
+    fn validate(&self) -> Result<(), Error> {
         let mode = ContactMode::try_from(self.contact_mode).map_err(|_| {
             #[cfg(feature = "logging")]
             tracing::warn!(
@@ -185,7 +193,7 @@ impl ContactMessageExt for ContactMessage {
         Ok(())
     }
 
-    fn validate_for_mode(&self, expected: ContactMode) -> Result<(), crate::Error> {
+    fn validate_for_mode(&self, expected: ContactMode) -> Result<(), Error> {
         if self.contact_mode != expected as i32 {
             #[cfg(feature = "logging")]
             tracing::warn!(
@@ -235,15 +243,16 @@ impl ContactMessageExt for ContactMessage {
         nonce: u64,
         own: Vec<TransportProtocol>,
         pk: &PairingContactMessageMaterial,
-    ) -> ContactMessage {
-        let binding_hash = derec_cryptography::pairing::contact_binding_hash(
+    ) -> Result<ContactMessage, Error> {
+        let binding_hash = contact_binding_hash(
             &pk.mlkem_encapsulation_key,
             &pk.ecies_public_key,
             nonce,
             channel_id.into(),
-        );
+        )
+        .map_err(|source| PairingError::ContactMessageKeygen { source })?;
 
-        ContactMessage {
+        Ok(ContactMessage {
             channel_id: channel_id.into(),
             contact_mode: ContactMode::HashedKeys as i32,
             mlkem_encapsulation_key: None,
@@ -253,7 +262,7 @@ impl ContactMessageExt for ContactMessage {
             timestamp: Some(current_timestamp()),
             supported_transports: own,
             fingerprint_commitment: None,
-        }
+        })
     }
 
     fn no_keys(channel_id: ChannelId, nonce: u64, own: Vec<TransportProtocol>) -> ContactMessage {
@@ -276,7 +285,7 @@ fn check_inline_keys_fields(
     mlkem_present: bool,
     ecies_present: bool,
     hash_present: bool,
-) -> Result<(), crate::Error> {
+) -> Result<(), Error> {
     if !mlkem_present {
         return Err(PairingError::InvalidContactMessage(
             "inline_keys contact missing mlkem_encapsulation_key",
@@ -303,7 +312,7 @@ fn check_hashed_keys_fields(
     mlkem_present: bool,
     ecies_present: bool,
     contact_binding_hash: Option<&[u8]>,
-) -> Result<(), crate::Error> {
+) -> Result<(), Error> {
     const BINDING_HASH_LEN: usize = 48;
     if mlkem_present || ecies_present {
         return Err(PairingError::InvalidContactMessage(
@@ -325,7 +334,7 @@ fn check_hashed_keys_fields(
 
 /// [`ContactMode::InlineKeys`]: the fingerprint commitment travels with the
 /// keys, so it is present and is a SHA-256 digest.
-fn check_fingerprint_commitment(commitment: Option<&[u8]>) -> Result<(), crate::Error> {
+fn check_fingerprint_commitment(commitment: Option<&[u8]>) -> Result<(), Error> {
     const COMMITMENT_LEN: usize = 32;
     match commitment {
         Some(c) if c.len() == COMMITMENT_LEN => Ok(()),
@@ -342,7 +351,7 @@ fn check_fingerprint_commitment(commitment: Option<&[u8]>) -> Result<(), crate::
 
 /// [`ContactMode::HashedKeys`] and [`ContactMode::NoKeys`]: the commitment
 /// arrives in the `PrePairResponse`, with the keys, never in the contact.
-fn check_no_fingerprint_commitment(commitment: Option<&[u8]>) -> Result<(), crate::Error> {
+fn check_no_fingerprint_commitment(commitment: Option<&[u8]>) -> Result<(), Error> {
     if commitment.is_some() {
         return Err(PairingError::InvalidContactMessage(
             "only an inline_keys contact carries fingerprint_commitment",
@@ -357,7 +366,7 @@ fn check_no_keys_fields(
     mlkem_present: bool,
     ecies_present: bool,
     hash_present: bool,
-) -> Result<(), crate::Error> {
+) -> Result<(), Error> {
     if mlkem_present || ecies_present {
         return Err(PairingError::InvalidContactMessage(
             "no_keys contact must not carry inline keys",
@@ -435,7 +444,7 @@ mod tests {
         }
     }
 
-    fn assert_invalid_contact(result: Result<(), crate::Error>, expected: &'static str) {
+    fn assert_invalid_contact(result: Result<(), Error>, expected: &'static str) {
         match result {
             Err(Error::Pairing(PairingError::InvalidContactMessage(m))) => {
                 assert_eq!(m, expected, "wrong InvalidContactMessage payload")

@@ -38,6 +38,11 @@ impl<
     /// No key outlives the pairing it was agreed for: without the record, the
     /// key would decrypt the peer's messages again.
     ///
+    /// Removing a record never removes a key by itself: a channel's key and
+    /// pairing material go only once nothing else is recorded on the channel,
+    /// so an expired `Pending` helper record on a replica group's channel
+    /// leaves the group key in place.
+    ///
     /// This is **independent of**
     /// [`Timeouts::expired_channels`](crate::protocol::types::Timeouts::expired_channels): it sweeps at
     /// the threshold it is given even when the policy is
@@ -73,6 +78,9 @@ impl<
     ) -> Result<Vec<ChannelId>> {
         let now = now_secs();
         let mut removed = self.remove_expired_helpers(now, older_than_secs).await?;
+        for &channel_id in &removed {
+            self.release_if_unused(channel_id).await?;
+        }
         for channel_id in self.remove_expired_members(now, older_than_secs).await? {
             if !removed.contains(&channel_id) {
                 removed.push(channel_id);
@@ -125,9 +133,12 @@ impl<
     ///
     /// A `Pending` channel never received a share, so what it can hold is its
     /// channel key, its pairing material, and the state of an unpair or a
-    /// verification started on it. The records go last and in one call: a
-    /// failure before then leaves them in place for the next sweep to retry,
-    /// rather than leaving a key with no record to find it by.
+    /// verification started on it. The key and pairing material go here only
+    /// on a channel no replica member is recorded on; any other channel is
+    /// left to [`release_if_unused`](Self::release_if_unused). The records go
+    /// last and in one call: a failure before then leaves them in place for
+    /// the next sweep to retry, rather than leaving a key with no record to
+    /// find it by.
     async fn remove_expired_helpers(
         &mut self,
         now: u64,
@@ -141,8 +152,20 @@ impl<
         let channel_ids: Vec<ChannelId> =
             expired.iter().map(|channel| channel.channel_id).collect();
 
+        let mut unshared = Vec::with_capacity(channel_ids.len());
+        for &channel_id in &channel_ids {
+            if self
+                .channel_store
+                .replicas_on_channel(self.secret_id, channel_id, ReplicaFilter::default())
+                .await?
+                .is_empty()
+            {
+                unshared.push(channel_id);
+            }
+        }
+
         self.remove_channel_states(&channel_ids).await?;
-        self.remove_channel_secrets(&channel_ids).await?;
+        self.remove_channel_secrets(&unshared).await?;
         self.remove_helper_channels(&channel_ids).await?;
 
         #[cfg(feature = "logging")]

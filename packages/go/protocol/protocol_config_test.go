@@ -52,10 +52,12 @@ func TestDeRecProtocolConfig_FullFixtureSetsEveryField(t *testing.T) {
 		Threshold:    proto.Uint32(3),
 		MaxSubshares: proto.Uint64(12),
 		Timeouts: &Timeouts{
-			InboundMessageSecs: proto.Uint64(120),
-			SharingRoundSecs:   proto.Uint64(30),
-			UnpairAckSecs:      proto.Uint64(45),
-			ExpiredChannels:    &RemoveExpiredChannelsPolicy{Enabled: true, TimeoutInSecs: 600},
+			InboundMessageSecs:   proto.Uint64(120),
+			SharingRoundSecs:     proto.Uint64(30),
+			UnpairAckSecs:        proto.Uint64(45),
+			GetShareResponseSecs: proto.Uint64(900),
+			PairingSecs:          proto.Uint64(240),
+			ExpiredChannels:      &RemoveExpiredChannelsPolicy{Enabled: true, TimeoutInSecs: 600},
 		},
 		ParameterRange: &ParameterRange{
 			MinShareSize:                       1,
@@ -152,7 +154,9 @@ func TestDeRecProtocolConfig_LayersLastWriteWins(t *testing.T) {
 	if cfg.Timeouts == nil ||
 		cfg.Timeouts.SharingRoundSecs == nil || *cfg.Timeouts.SharingRoundSecs != 30 ||
 		cfg.Timeouts.InboundMessageSecs == nil || *cfg.Timeouts.InboundMessageSecs != 120 ||
-		cfg.Timeouts.UnpairAckSecs != nil || cfg.Timeouts.ExpiredChannels != nil {
+		cfg.Timeouts.UnpairAckSecs != nil || cfg.Timeouts.GetShareResponseSecs != nil ||
+		cfg.Timeouts.PairingSecs != nil ||
+		cfg.Timeouts.ExpiredChannels != nil {
 		t.Fatalf("timeouts must merge per field, got %+v", cfg.Timeouts)
 	}
 	if !reflect.DeepEqual(cfg.AutoAccept, &AutoAcceptPolicy{Unpair: true}) {

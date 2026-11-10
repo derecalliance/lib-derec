@@ -6,9 +6,12 @@ use super::super::{
     KeyRing, MissingPolicy, PendingAction,
 };
 use super::replicas::discovery as replica;
-use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::derec_message::apply_trace_id;
+use crate::extensions::advertised_endpoints::reply_to_owned;
+use crate::extensions::channel_store::{ChannelStoreExt as _, send_channel_message};
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
 use crate::extensions::secret_store::SecretStoreExt as _;
+use crate::protocol::types::Share;
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -29,6 +32,7 @@ use derec_proto::{
     MessageBody, SenderKind, StatusEnum, StoreShareRequestMessage,
 };
 use prost::Message;
+use std::collections::{BTreeMap, HashMap};
 
 #[cfg_attr(
     feature = "logging",
@@ -136,14 +140,14 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
 
     let resp = response::produce(channel_id, &secret_list, exchange.key)?;
 
-    let envelope = crate::derec_message::apply_trace_id(&resp.envelope, exchange.trace_id)?;
+    let envelope = apply_trace_id(&resp.envelope, exchange.trace_id)?;
     let endpoint = stores
         .channels
         .resolve_response_endpoints(
             secret_id,
             channel_id,
             local.policy,
-            &crate::extensions::advertised_endpoints::reply_to_owned(request),
+            &reply_to_owned(request),
         )
         .await?;
     deliver(
@@ -174,7 +178,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
-    crate::extensions::channel_store::send_channel_message(
+    send_channel_message(
         stores.channels,
         stores.transport,
         local.secret_id,
@@ -183,7 +187,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         exchange.key,
         exchange.trace_id,
         local.policy,
-        &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        &reply_to_owned(request),
         exchange.obligation,
         status,
         memo,
@@ -267,9 +271,8 @@ fn on_response(
 /// failing the catalog: the version is still held, and refusing to report it
 /// would hide state the peer needs to see. The first description wins, so a
 /// re-store under the same version does not rewrite what was already reported.
-fn catalog(all_shares: Vec<crate::protocol::types::Share>) -> Vec<SecretVersionEntry> {
-    let mut secret_map: std::collections::HashMap<u64, std::collections::BTreeMap<u32, String>> =
-        std::collections::HashMap::new();
+fn catalog(all_shares: Vec<Share>) -> Vec<SecretVersionEntry> {
+    let mut secret_map: HashMap<u64, BTreeMap<u32, String>> = HashMap::new();
 
     for share in all_shares {
         let description = StoreShareRequestMessage::decode(share.bytes.as_slice())
@@ -353,7 +356,7 @@ async fn dispatch_one<S: StoreSet>(
         .peer_endpoints(local.secret_id, channel_id)
         .await?;
     let msg = request::produce(channel_id, key, round.reply_to)?;
-    let envelope = crate::derec_message::apply_trace_id(&msg.envelope, round.trace_id)?;
+    let envelope = apply_trace_id(&msg.envelope, round.trace_id)?;
     stores.transport.send(&endpoint, envelope).await?;
     Ok(())
 }

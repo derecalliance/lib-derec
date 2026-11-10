@@ -126,14 +126,15 @@ pub fn decapsulate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::random;
 
     fn keypair() -> (Vec<u8>, Vec<u8>) {
-        generate_keypair(&mut crate::random::os_rng())
+        generate_keypair(&mut random::os_rng())
     }
 
     #[test]
     fn test_encap_decap() {
-        let mut rng = crate::random::os_rng();
+        let mut rng = random::os_rng();
         let (dk, ek) = keypair();
         let (ct, k_send) = encapsulate(&ek, &mut rng).unwrap();
         let k_recv = decapsulate(&dk, &ct).unwrap();
@@ -143,7 +144,7 @@ mod tests {
     #[test]
     fn test_encapsulate_wrong_key_size_too_short() {
         let short_key = vec![0u8; ENCAPSULATION_KEY_SIZE_IN_BYTES - 1];
-        let err = encapsulate(&short_key, &mut crate::random::os_rng())
+        let err = encapsulate(&short_key, &mut random::os_rng())
             .expect_err("should fail with wrong-sized encapsulation key");
         assert!(
             matches!(
@@ -160,7 +161,7 @@ mod tests {
     #[test]
     fn test_encapsulate_wrong_key_size_too_long() {
         let long_key = vec![0u8; ENCAPSULATION_KEY_SIZE_IN_BYTES + 1];
-        let err = encapsulate(&long_key, &mut crate::random::os_rng())
+        let err = encapsulate(&long_key, &mut random::os_rng())
             .expect_err("should fail with oversized encapsulation key");
         assert!(matches!(
             err,
@@ -174,7 +175,7 @@ mod tests {
     #[test]
     fn test_decapsulate_wrong_dk_size() {
         let (_, ek) = keypair();
-        let (ct, _) = encapsulate(&ek, &mut crate::random::os_rng()).unwrap();
+        let (ct, _) = encapsulate(&ek, &mut random::os_rng()).unwrap();
 
         let bad_dk = vec![0u8; DECAPSULATION_KEY_SIZE_IN_BYTES - 10];
         let err =

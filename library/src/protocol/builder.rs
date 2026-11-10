@@ -29,6 +29,16 @@ use super::{
     DeRecChannelStore, DeRecProtocol, DeRecProtocolConfig, DeRecSecretStore, DeRecShareStore,
     DeRecStateStore, DeRecTransport, DeRecUserSecretStore, UnpairAck,
 };
+use crate::Error;
+use crate::primitives::pairing::parameter_range;
+use crate::protocol::AutoAcceptPolicy;
+use crate::protocol::ExpiredChannelCleanup;
+use crate::protocol::types::Timeouts;
+use crate::transport;
+use crate::transport::IntoOwnTransport;
+use crate::transport::TransportPolicy;
+use crate::transport::TransportValidationError;
+use derec_proto::ParameterRange;
 use derec_proto::TransportProtocol;
 
 pub struct BuilderSlotMissingMarker;
@@ -104,23 +114,18 @@ pub struct DeRecProtocolBuilder<
     user_secret_store: UserSecretStore,
     state_store: StateStore,
     transport: Transport,
-    own_transports: Option<
-        Result<
-            Vec<crate::transport::TransportProtocol>,
-            crate::transport::TransportValidationError,
-        >,
-    >,
+    own_transports: Option<Result<Vec<transport::TransportProtocol>, TransportValidationError>>,
     threshold: usize,
-    timeouts: crate::protocol::types::Timeouts,
+    timeouts: Timeouts,
     unsafe_connection: Option<bool>,
     communication_info: HashMap<String, String>,
     auto_respond_on_failure: bool,
     key_rotation: bool,
     unpair_ack: UnpairAck,
     auto_reply_to: bool,
-    auto_accept: crate::protocol::AutoAcceptPolicy,
+    auto_accept: AutoAcceptPolicy,
     replica_id: Option<u64>,
-    parameter_range: Option<derec_proto::ParameterRange>,
+    parameter_range: Option<ParameterRange>,
     max_subshares: Option<u64>,
 }
 
@@ -150,14 +155,14 @@ impl
             transport: BuilderSlotMissingMarker,
             own_transports: None,
             threshold: DEFAULT_THRESHOLD,
-            timeouts: crate::protocol::types::Timeouts::default(),
+            timeouts: Timeouts::default(),
             unsafe_connection: None,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
             key_rotation: false,
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
-            auto_accept: crate::protocol::AutoAcceptPolicy::default(),
+            auto_accept: AutoAcceptPolicy::default(),
             replica_id: None,
             parameter_range: None,
             max_subshares: None,
@@ -271,21 +276,21 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// Every value is clamped to at least one second — this is the single
     /// normalization point, so the clamp applies however the value was
     /// constructed.
-    pub fn with_timeouts(mut self, timeouts: crate::protocol::types::Timeouts) -> Self {
+    pub fn with_timeouts(mut self, timeouts: Timeouts) -> Self {
         let secs = |d: Duration| d.as_secs().max(1);
-        self.timeouts = crate::protocol::types::Timeouts {
+        self.timeouts = Timeouts {
             inbound_message: Duration::from_secs(secs(timeouts.inbound_message)),
             sharing_round: Duration::from_secs(secs(timeouts.sharing_round)),
             unpair_ack: Duration::from_secs(secs(timeouts.unpair_ack)),
+            get_share_response: Duration::from_secs(secs(timeouts.get_share_response)),
+            pairing: Duration::from_secs(secs(timeouts.pairing)),
             expired_channels: match timeouts.expired_channels {
-                crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs } => {
-                    crate::protocol::ExpiredChannelCleanup::Enabled {
+                ExpiredChannelCleanup::Enabled { timeout_in_secs } => {
+                    ExpiredChannelCleanup::Enabled {
                         timeout_in_secs: timeout_in_secs.max(1),
                     }
                 }
-                crate::protocol::ExpiredChannelCleanup::Disabled => {
-                    crate::protocol::ExpiredChannelCleanup::Disabled
-                }
+                ExpiredChannelCleanup::Disabled => ExpiredChannelCleanup::Disabled,
             },
         };
         self
@@ -466,7 +471,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// every field `false`, behaviour identical to today's
     /// `ActionRequired` flow. See the field-level docs on
     /// [`crate::protocol::AutoAcceptPolicy`] for the per-flow trade-offs.
-    pub fn with_auto_accept(mut self, policy: crate::protocol::AutoAcceptPolicy) -> Self {
+    pub fn with_auto_accept(mut self, policy: AutoAcceptPolicy) -> Self {
         self.auto_accept = policy;
         self
     }
@@ -543,7 +548,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     ///   owner. The library never stores timestamps itself.
     /// - the unresponsive deletion/deactivation timeout fields: negotiated
     ///   only; the library enforces nothing from them.
-    pub fn with_parameter_range(mut self, range: derec_proto::ParameterRange) -> Self {
+    pub fn with_parameter_range(mut self, range: ParameterRange) -> Self {
         self.parameter_range = Some(range);
         self
     }
@@ -569,14 +574,14 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     pub fn with_own_transports<I, T>(mut self, transports: I) -> Self
     where
         I: IntoIterator<Item = T>,
-        T: crate::transport::IntoOwnTransport,
+        T: IntoOwnTransport,
     {
         // Stash the fallible conversion, surface failures from `.build()`,
         // keep the setter chain infallible.
         self.own_transports = Some(
             transports
                 .into_iter()
-                .map(crate::transport::IntoOwnTransport::into_own_transport)
+                .map(IntoOwnTransport::into_own_transport)
                 .collect(),
         );
         self
@@ -1126,18 +1131,18 @@ impl<
             None => Vec::new(),
         };
         if own_transports.is_empty() {
-            return Err(crate::Error::InvalidInput(
+            return Err(Error::InvalidInput(
                 "own transports must not be empty: this application needs at \
                  least one endpoint peers can reach it on",
             ));
         }
         if let Some(range) = &self.parameter_range {
-            crate::primitives::pairing::parameter_range::validate(range)?;
+            parameter_range::validate(range)?;
         }
         if let Some(max) = self.max_subshares
             && max < self.threshold as u64
         {
-            return Err(crate::Error::InvalidInput(
+            return Err(Error::InvalidInput(
                 "max_subshares must be >= threshold; a lower cap fails every round that splits",
             ));
         }
@@ -1151,7 +1156,7 @@ impl<
         // policy are known. Every entry is checked — an unvalidated
         // secondary endpoint would otherwise be advertised to peers in
         // `supportedTransports` without ever passing policy.
-        let policy = crate::transport::TransportPolicy::new(unsafe_connection);
+        let policy = TransportPolicy::new(unsafe_connection);
         for own_transport in &own_transports {
             policy.check_own(own_transport)?;
         }
@@ -1188,6 +1193,23 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Result;
+    use crate::primitives::pairing::request;
+    use crate::protocol::DeRecEvent;
+    use crate::protocol::DeRecFlow;
+    use crate::protocol::ExpiredChannelsConfig;
+    use crate::protocol::StateItem;
+    use crate::protocol::StateKey;
+
+    use crate::protocol::StateStoreFuture;
+    use crate::protocol::TimeoutsConfig;
+    use crate::protocol::tests::{
+        InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+        InMemUserSecretStore, NoopTransport,
+    };
+    use crate::protocol::types::SecretValue;
+    use derec_proto::Protocol;
+    use std::future;
 
     /// A freshly-constructed builder carries `DEFAULT_THRESHOLD` until a
     /// setter overrides it — the same constant the FFI config's serde
@@ -1210,7 +1232,7 @@ mod tests {
     /// builder so it lands on the eventual `DeRecProtocol`.
     #[test]
     fn with_auto_accept_round_trips_policy() {
-        let policy = crate::protocol::AutoAcceptPolicy {
+        let policy = AutoAcceptPolicy {
             store_share: true,
             verify_share: true,
             ..Default::default()
@@ -1223,7 +1245,7 @@ mod tests {
     #[test]
     fn auto_accept_defaults_to_empty_policy() {
         let b = DeRecProtocolBuilder::new(0);
-        assert_eq!(b.auto_accept, crate::protocol::AutoAcceptPolicy::default());
+        assert_eq!(b.auto_accept, AutoAcceptPolicy::default());
     }
 
     /// Higher thresholds (production default and beyond) pass through.
@@ -1271,13 +1293,13 @@ mod tests {
                 _: u64,
                 _: ChannelQuery,
             ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
-                Box::pin(std::future::ready(Ok(false)))
+                Box::pin(future::ready(Ok(false)))
             }
             fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
@@ -1287,14 +1309,14 @@ mod tests {
                 _: u64,
                 _: HelperFilter,
             ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn replicas(
                 &self,
                 _: u64,
                 _: ReplicaFilter,
             ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn link_channel(
                 &mut self,
@@ -1302,21 +1324,21 @@ mod tests {
                 _: ChannelId,
                 _: ChannelId,
             ) -> ChannelStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn linked_channels(
                 &self,
                 _: u64,
                 cid: ChannelId,
             ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
-                Box::pin(std::future::ready(Ok(vec![cid])))
+                Box::pin(future::ready(Ok(vec![cid])))
             }
         }
 
         struct NoopShareStore;
         impl DeRecShareStore for NoopShareStore {
             fn load(&self, _: u64, _: ChannelId, _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn load_many(
                 &self,
@@ -1327,16 +1349,16 @@ mod tests {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save(&mut self, _: u64, _: ChannelId, _: Share) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_versions(
                 &mut self,
@@ -1344,7 +1366,7 @@ mod tests {
                 _: ChannelId,
                 _: &[u32],
             ) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_versions_many(
                 &mut self,
@@ -1354,7 +1376,7 @@ mod tests {
                 Box::pin(std::future::ready(Ok(())))
             }
             fn keep_version(&self, _: u64, _: u32) -> ShareStoreFuture<'_, u32> {
-                Box::pin(std::future::ready(Ok(0)))
+                Box::pin(future::ready(Ok(0)))
             }
         }
 
@@ -1366,7 +1388,7 @@ mod tests {
                 _: ChannelId,
                 _: SecretKind,
             ) -> SecretStoreFuture<'_, Option<SecretValue>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn load_many(
                 &self,
@@ -1375,13 +1397,13 @@ mod tests {
                 _: SecretKind,
                 _: MissingPolicy,
             ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_many(
                 &mut self,
@@ -1395,46 +1417,33 @@ mod tests {
         struct NoopUserSecretStore;
         impl DeRecUserSecretStore for NoopUserSecretStore {
             fn load_latest(&self, _: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save_latest(&mut self, _: u64, _: UserSecrets) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
         }
 
         struct NoopTransport;
         impl DeRecTransport for NoopTransport {
             fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
         }
 
         struct NoopStateStore;
-        impl crate::protocol::DeRecStateStore for NoopStateStore {
-            fn save(
-                &mut self,
-                _: u64,
-                _: crate::protocol::StateItem,
-            ) -> crate::protocol::StateStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+        impl DeRecStateStore for NoopStateStore {
+            fn save(&mut self, _: u64, _: StateItem) -> StateStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
             }
-            fn load(
-                &self,
-                _: u64,
-                _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>>
-            {
-                Box::pin(std::future::ready(Ok(None)))
+            fn load(&self, _: u64, _: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
+                Box::pin(future::ready(Ok(None)))
             }
-            fn remove(
-                &mut self,
-                _: u64,
-                _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, bool> {
-                Box::pin(std::future::ready(Ok(false)))
+            fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
+                Box::pin(future::ready(Ok(false)))
             }
             fn remove_many(
                 &mut self,
@@ -1468,9 +1477,9 @@ mod tests {
                 protocol: 0,
             }],
             0, // ← invalid threshold
-            crate::protocol::types::Timeouts::default(),
+            Timeouts::default(),
         );
-        assert!(matches!(result, Err(crate::Error::InvalidInput(_))));
+        assert!(matches!(result, Err(Error::InvalidInput(_))));
     }
 
     /// End-to-end: the typed builder propagates the threshold error
@@ -1497,13 +1506,13 @@ mod tests {
                 _: u64,
                 _: ChannelQuery,
             ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
-                Box::pin(std::future::ready(Ok(false)))
+                Box::pin(future::ready(Ok(false)))
             }
             fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
@@ -1513,14 +1522,14 @@ mod tests {
                 _: u64,
                 _: HelperFilter,
             ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn replicas(
                 &self,
                 _: u64,
                 _: ReplicaFilter,
             ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn link_channel(
                 &mut self,
@@ -1528,20 +1537,20 @@ mod tests {
                 _: ChannelId,
                 _: ChannelId,
             ) -> ChannelStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn linked_channels(
                 &self,
                 _: u64,
                 cid: ChannelId,
             ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
-                Box::pin(std::future::ready(Ok(vec![cid])))
+                Box::pin(future::ready(Ok(vec![cid])))
             }
         }
         struct NoopShareStore;
         impl DeRecShareStore for NoopShareStore {
             fn load(&self, _: u64, _: ChannelId, _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn load_many(
                 &self,
@@ -1552,16 +1561,16 @@ mod tests {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save(&mut self, _: u64, _: ChannelId, _: Share) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_versions(
                 &mut self,
@@ -1569,7 +1578,7 @@ mod tests {
                 _: ChannelId,
                 _: &[u32],
             ) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_versions_many(
                 &mut self,
@@ -1579,7 +1588,7 @@ mod tests {
                 Box::pin(std::future::ready(Ok(())))
             }
             fn keep_version(&self, _: u64, _: u32) -> ShareStoreFuture<'_, u32> {
-                Box::pin(std::future::ready(Ok(0)))
+                Box::pin(future::ready(Ok(0)))
             }
         }
         struct NoopSecretStore;
@@ -1590,7 +1599,7 @@ mod tests {
                 _: ChannelId,
                 _: SecretKind,
             ) -> SecretStoreFuture<'_, Option<SecretValue>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn load_many(
                 &self,
@@ -1599,13 +1608,13 @@ mod tests {
                 _: SecretKind,
                 _: MissingPolicy,
             ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_many(
                 &mut self,
@@ -1618,45 +1627,32 @@ mod tests {
         struct NoopUserSecretStore;
         impl DeRecUserSecretStore for NoopUserSecretStore {
             fn load_latest(&self, _: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save_latest(&mut self, _: u64, _: UserSecrets) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
         }
         struct NoopTransport;
         impl DeRecTransport for NoopTransport {
             fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
         }
 
         struct NoopStateStore;
-        impl crate::protocol::DeRecStateStore for NoopStateStore {
-            fn save(
-                &mut self,
-                _: u64,
-                _: crate::protocol::StateItem,
-            ) -> crate::protocol::StateStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+        impl DeRecStateStore for NoopStateStore {
+            fn save(&mut self, _: u64, _: StateItem) -> StateStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
             }
-            fn load(
-                &self,
-                _: u64,
-                _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>>
-            {
-                Box::pin(std::future::ready(Ok(None)))
+            fn load(&self, _: u64, _: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
+                Box::pin(future::ready(Ok(None)))
             }
-            fn remove(
-                &mut self,
-                _: u64,
-                _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, bool> {
-                Box::pin(std::future::ready(Ok(false)))
+            fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
+                Box::pin(future::ready(Ok(false)))
             }
             fn remove_many(
                 &mut self,
@@ -1685,7 +1681,7 @@ mod tests {
             .with_own_transports(["https://owner.example/derec"])
             .with_threshold(1)
             .build();
-        assert!(matches!(result, Err(crate::Error::InvalidInput(_))));
+        assert!(matches!(result, Err(Error::InvalidInput(_))));
     }
 
     /// `with_own_transport` defers URI validation to `build()`, so a
@@ -1712,13 +1708,13 @@ mod tests {
                 _: u64,
                 _: ChannelQuery,
             ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
-                Box::pin(std::future::ready(Ok(false)))
+                Box::pin(future::ready(Ok(false)))
             }
             fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
@@ -1728,14 +1724,14 @@ mod tests {
                 _: u64,
                 _: HelperFilter,
             ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn replicas(
                 &self,
                 _: u64,
                 _: ReplicaFilter,
             ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn link_channel(
                 &mut self,
@@ -1743,20 +1739,20 @@ mod tests {
                 _: ChannelId,
                 _: ChannelId,
             ) -> ChannelStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn linked_channels(
                 &self,
                 _: u64,
                 cid: ChannelId,
             ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
-                Box::pin(std::future::ready(Ok(vec![cid])))
+                Box::pin(future::ready(Ok(vec![cid])))
             }
         }
         struct NoopShareStore;
         impl DeRecShareStore for NoopShareStore {
             fn load(&self, _: u64, _: ChannelId, _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn load_many(
                 &self,
@@ -1767,16 +1763,16 @@ mod tests {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save(&mut self, _: u64, _: ChannelId, _: Share) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_versions(
                 &mut self,
@@ -1784,7 +1780,7 @@ mod tests {
                 _: ChannelId,
                 _: &[u32],
             ) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_versions_many(
                 &mut self,
@@ -1794,7 +1790,7 @@ mod tests {
                 Box::pin(std::future::ready(Ok(())))
             }
             fn keep_version(&self, _: u64, _: u32) -> ShareStoreFuture<'_, u32> {
-                Box::pin(std::future::ready(Ok(0)))
+                Box::pin(future::ready(Ok(0)))
             }
         }
         struct NoopSecretStore;
@@ -1805,7 +1801,7 @@ mod tests {
                 _: ChannelId,
                 _: SecretKind,
             ) -> SecretStoreFuture<'_, Option<SecretValue>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn load_many(
                 &self,
@@ -1814,13 +1810,13 @@ mod tests {
                 _: SecretKind,
                 _: MissingPolicy,
             ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_many(
                 &mut self,
@@ -1833,45 +1829,32 @@ mod tests {
         struct NoopUserSecretStore;
         impl DeRecUserSecretStore for NoopUserSecretStore {
             fn load_latest(&self, _: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save_latest(&mut self, _: u64, _: UserSecrets) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
         }
         struct NoopTransport;
         impl DeRecTransport for NoopTransport {
             fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
         }
 
         struct NoopStateStore;
-        impl crate::protocol::DeRecStateStore for NoopStateStore {
-            fn save(
-                &mut self,
-                _: u64,
-                _: crate::protocol::StateItem,
-            ) -> crate::protocol::StateStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+        impl DeRecStateStore for NoopStateStore {
+            fn save(&mut self, _: u64, _: StateItem) -> StateStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
             }
-            fn load(
-                &self,
-                _: u64,
-                _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>>
-            {
-                Box::pin(std::future::ready(Ok(None)))
+            fn load(&self, _: u64, _: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
+                Box::pin(future::ready(Ok(None)))
             }
-            fn remove(
-                &mut self,
-                _: u64,
-                _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, bool> {
-                Box::pin(std::future::ready(Ok(false)))
+            fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
+                Box::pin(future::ready(Ok(false)))
             }
             fn remove_many(
                 &mut self,
@@ -1902,8 +1885,8 @@ mod tests {
             .build();
         assert!(matches!(
             result,
-            Err(crate::Error::Transport(
-                crate::transport::TransportValidationError::UnknownScheme { .. }
+            Err(Error::Transport(
+                TransportValidationError::UnknownScheme { .. }
             ))
         ));
     }
@@ -1931,13 +1914,13 @@ mod tests {
                 _: u64,
                 _: ChannelQuery,
             ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
-                Box::pin(std::future::ready(Ok(false)))
+                Box::pin(future::ready(Ok(false)))
             }
             fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
@@ -1947,14 +1930,14 @@ mod tests {
                 _: u64,
                 _: HelperFilter,
             ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn replicas(
                 &self,
                 _: u64,
                 _: ReplicaFilter,
             ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn link_channel(
                 &mut self,
@@ -1962,20 +1945,20 @@ mod tests {
                 _: ChannelId,
                 _: ChannelId,
             ) -> ChannelStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn linked_channels(
                 &self,
                 _: u64,
                 cid: ChannelId,
             ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
-                Box::pin(std::future::ready(Ok(vec![cid])))
+                Box::pin(future::ready(Ok(vec![cid])))
             }
         }
         struct NoopShareStore;
         impl DeRecShareStore for NoopShareStore {
             fn load(&self, _: u64, _: ChannelId, _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn load_many(
                 &self,
@@ -1986,16 +1969,16 @@ mod tests {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save(&mut self, _: u64, _: ChannelId, _: Share) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_versions(
                 &mut self,
@@ -2003,7 +1986,7 @@ mod tests {
                 _: ChannelId,
                 _: &[u32],
             ) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_versions_many(
                 &mut self,
@@ -2013,7 +1996,7 @@ mod tests {
                 Box::pin(std::future::ready(Ok(())))
             }
             fn keep_version(&self, _: u64, _: u32) -> ShareStoreFuture<'_, u32> {
-                Box::pin(std::future::ready(Ok(0)))
+                Box::pin(future::ready(Ok(0)))
             }
         }
         struct NoopSecretStore;
@@ -2024,7 +2007,7 @@ mod tests {
                 _: ChannelId,
                 _: SecretKind,
             ) -> SecretStoreFuture<'_, Option<SecretValue>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn load_many(
                 &self,
@@ -2033,13 +2016,13 @@ mod tests {
                 _: SecretKind,
                 _: MissingPolicy,
             ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_many(
                 &mut self,
@@ -2052,44 +2035,31 @@ mod tests {
         struct NoopUserSecretStore;
         impl DeRecUserSecretStore for NoopUserSecretStore {
             fn load_latest(&self, _: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save_latest(&mut self, _: u64, _: UserSecrets) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
         }
         struct NoopTransport;
         impl DeRecTransport for NoopTransport {
             fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
         }
         struct NoopStateStore;
-        impl crate::protocol::DeRecStateStore for NoopStateStore {
-            fn save(
-                &mut self,
-                _: u64,
-                _: crate::protocol::StateItem,
-            ) -> crate::protocol::StateStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+        impl DeRecStateStore for NoopStateStore {
+            fn save(&mut self, _: u64, _: StateItem) -> StateStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
             }
-            fn load(
-                &self,
-                _: u64,
-                _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>>
-            {
-                Box::pin(std::future::ready(Ok(None)))
+            fn load(&self, _: u64, _: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
+                Box::pin(future::ready(Ok(None)))
             }
-            fn remove(
-                &mut self,
-                _: u64,
-                _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, bool> {
-                Box::pin(std::future::ready(Ok(false)))
+            fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
+                Box::pin(future::ready(Ok(false)))
             }
             fn remove_many(
                 &mut self,
@@ -2115,7 +2085,7 @@ mod tests {
             .with_user_secret_store(NoopUserSecretStore)
             .with_transport(NoopTransport)
             .with_state_store(NoopStateStore)
-            .with_own_transports([crate::transport::TransportProtocol::new(
+            .with_own_transports([transport::TransportProtocol::new(
                 "https://me.example.com/derec",
                 Protocol::Https,
             )])
@@ -2149,13 +2119,13 @@ mod tests {
                 _: u64,
                 _: ChannelQuery,
             ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
-                Box::pin(std::future::ready(Ok(false)))
+                Box::pin(future::ready(Ok(false)))
             }
             fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
@@ -2165,14 +2135,14 @@ mod tests {
                 _: u64,
                 _: HelperFilter,
             ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn replicas(
                 &self,
                 _: u64,
                 _: ReplicaFilter,
             ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn link_channel(
                 &mut self,
@@ -2180,20 +2150,20 @@ mod tests {
                 _: ChannelId,
                 _: ChannelId,
             ) -> ChannelStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn linked_channels(
                 &self,
                 _: u64,
                 cid: ChannelId,
             ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
-                Box::pin(std::future::ready(Ok(vec![cid])))
+                Box::pin(future::ready(Ok(vec![cid])))
             }
         }
         struct NoopShareStore;
         impl DeRecShareStore for NoopShareStore {
             fn load(&self, _: u64, _: ChannelId, _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn load_many(
                 &self,
@@ -2204,16 +2174,16 @@ mod tests {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save(&mut self, _: u64, _: ChannelId, _: Share) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_versions(
                 &mut self,
@@ -2221,7 +2191,7 @@ mod tests {
                 _: ChannelId,
                 _: &[u32],
             ) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_versions_many(
                 &mut self,
@@ -2231,7 +2201,7 @@ mod tests {
                 Box::pin(std::future::ready(Ok(())))
             }
             fn keep_version(&self, _: u64, _: u32) -> ShareStoreFuture<'_, u32> {
-                Box::pin(std::future::ready(Ok(0)))
+                Box::pin(future::ready(Ok(0)))
             }
         }
         struct NoopSecretStore;
@@ -2242,7 +2212,7 @@ mod tests {
                 _: ChannelId,
                 _: SecretKind,
             ) -> SecretStoreFuture<'_, Option<SecretValue>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn load_many(
                 &self,
@@ -2251,13 +2221,13 @@ mod tests {
                 _: SecretKind,
                 _: MissingPolicy,
             ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
-                Box::pin(std::future::ready(Ok(Vec::new())))
+                Box::pin(future::ready(Ok(Vec::new())))
             }
             fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove_many(
                 &mut self,
@@ -2270,44 +2240,31 @@ mod tests {
         struct NoopUserSecretStore;
         impl DeRecUserSecretStore for NoopUserSecretStore {
             fn load_latest(&self, _: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
-                Box::pin(std::future::ready(Ok(None)))
+                Box::pin(future::ready(Ok(None)))
             }
             fn save_latest(&mut self, _: u64, _: UserSecrets) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64) -> ShareStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
         }
         struct NoopTransport;
         impl DeRecTransport for NoopTransport {
             fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
-                Box::pin(std::future::ready(Ok(())))
+                Box::pin(future::ready(Ok(())))
             }
         }
         struct NoopStateStore;
-        impl crate::protocol::DeRecStateStore for NoopStateStore {
-            fn save(
-                &mut self,
-                _: u64,
-                _: crate::protocol::StateItem,
-            ) -> crate::protocol::StateStoreFuture<'_, ()> {
-                Box::pin(std::future::ready(Ok(())))
+        impl DeRecStateStore for NoopStateStore {
+            fn save(&mut self, _: u64, _: StateItem) -> StateStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
             }
-            fn load(
-                &self,
-                _: u64,
-                _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>>
-            {
-                Box::pin(std::future::ready(Ok(None)))
+            fn load(&self, _: u64, _: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
+                Box::pin(future::ready(Ok(None)))
             }
-            fn remove(
-                &mut self,
-                _: u64,
-                _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, bool> {
-                Box::pin(std::future::ready(Ok(false)))
+            fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
+                Box::pin(future::ready(Ok(false)))
             }
             fn remove_many(
                 &mut self,
@@ -2334,14 +2291,8 @@ mod tests {
             .with_transport(NoopTransport)
             .with_state_store(NoopStateStore)
             .with_own_transports(vec![
-                crate::transport::TransportProtocol::new(
-                    "grpcs://me.example.com:443",
-                    Protocol::Grpc,
-                ),
-                crate::transport::TransportProtocol::new(
-                    "https://me.example.com/derec",
-                    Protocol::Https,
-                ),
+                transport::TransportProtocol::new("grpcs://me.example.com:443", Protocol::Grpc),
+                transport::TransportProtocol::new("https://me.example.com/derec", Protocol::Https),
             ])
             .with_threshold(2)
             .build()
@@ -2367,26 +2318,26 @@ mod tests {
             .with_user_secret_store(InMemUserSecretStore::default())
             .with_transport(NoopTransport)
             .with_state_store(InMemStateStore)
-            .with_own_transports(Vec::<crate::transport::TransportProtocol>::new())
+            .with_own_transports(Vec::<transport::TransportProtocol>::new())
             .with_threshold(2)
             .build();
         match built {
-            Err(crate::Error::InvalidInput(_)) => {}
+            Err(Error::InvalidInput(_)) => {}
             Err(other) => panic!("expected InvalidInput, got {other:?}"),
             Ok(_) => panic!("an application serving no endpoint must not build"),
         }
     }
 
     fn build_with_parameter_range(
-        range: derec_proto::ParameterRange,
-    ) -> crate::Result<
+        range: ParameterRange,
+    ) -> Result<
         DeRecProtocol<
-            crate::protocol::tests::InMemChannelStore,
-            crate::protocol::tests::InMemShareStore,
-            crate::protocol::tests::InMemSecretStore,
-            crate::protocol::tests::InMemUserSecretStore,
-            crate::protocol::tests::InMemStateStore,
-            crate::protocol::tests::NoopTransport,
+            InMemChannelStore,
+            InMemShareStore,
+            InMemSecretStore,
+            InMemUserSecretStore,
+            InMemStateStore,
+            NoopTransport,
         >,
     > {
         use crate::protocol::tests::{
@@ -2410,14 +2361,14 @@ mod tests {
     fn build_with_max_subshares(
         threshold: usize,
         max_subshares: Option<u64>,
-    ) -> crate::Result<
+    ) -> Result<
         DeRecProtocol<
-            crate::protocol::tests::InMemChannelStore,
-            crate::protocol::tests::InMemShareStore,
-            crate::protocol::tests::InMemSecretStore,
-            crate::protocol::tests::InMemUserSecretStore,
-            crate::protocol::tests::InMemStateStore,
-            crate::protocol::tests::NoopTransport,
+            InMemChannelStore,
+            InMemShareStore,
+            InMemSecretStore,
+            InMemUserSecretStore,
+            InMemStateStore,
+            NoopTransport,
         >,
     > {
         use crate::protocol::tests::{
@@ -2462,7 +2413,7 @@ mod tests {
     fn build_rejects_a_cap_below_the_threshold() {
         for max in [0, 1, 2] {
             match build_with_max_subshares(3, Some(max)) {
-                Err(crate::Error::InvalidInput(msg)) => {
+                Err(Error::InvalidInput(msg)) => {
                     assert!(msg.contains("max_subshares"), "{msg}")
                 }
                 Err(other) => panic!("expected InvalidInput, got {other:?}"),
@@ -2473,7 +2424,7 @@ mod tests {
 
     #[test]
     fn build_accepts_a_valid_parameter_range() {
-        let range = derec_proto::ParameterRange {
+        let range = ParameterRange {
             min_share_size: 1,
             max_share_size: 1_000_000,
             min_time_between_verifications: 60,
@@ -2485,21 +2436,21 @@ mod tests {
 
     #[test]
     fn build_accepts_an_all_zero_parameter_range() {
-        assert!(build_with_parameter_range(derec_proto::ParameterRange::default()).is_ok());
+        assert!(build_with_parameter_range(ParameterRange::default()).is_ok());
     }
 
     #[test]
     fn build_rejects_an_invalid_parameter_range_naming_the_field() {
         let cases = [
-            derec_proto::ParameterRange {
+            ParameterRange {
                 min_share_size: -1,
                 ..Default::default()
             },
-            derec_proto::ParameterRange {
+            ParameterRange {
                 max_share_size: -1,
                 ..Default::default()
             },
-            derec_proto::ParameterRange {
+            ParameterRange {
                 min_share_size: 11,
                 max_share_size: 10,
                 ..Default::default()
@@ -2507,7 +2458,7 @@ mod tests {
         ];
         for range in cases {
             match build_with_parameter_range(range) {
-                Err(crate::Error::InvalidInput(msg)) => {
+                Err(Error::InvalidInput(msg)) => {
                     assert!(msg.contains("shareSize"), "{msg}")
                 }
                 Err(other) => panic!("expected InvalidInput, got {other:?}"),
@@ -2522,39 +2473,37 @@ mod tests {
     /// call — including pairings that had only just started.
     #[test]
     fn with_timeouts_expired_channels_clamps_zero_from_constructor() {
-        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
-            expired_channels: crate::protocol::ExpiredChannelCleanup::from_secs(0),
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(Timeouts {
+            expired_channels: ExpiredChannelCleanup::from_secs(0),
             ..Default::default()
         });
         assert_eq!(
             b.timeouts.expired_channels,
-            crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
+            ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
         );
     }
 
     #[test]
     fn with_timeouts_expired_channels_clamps_zero_from_new() {
-        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
-            expired_channels: crate::protocol::ExpiredChannelCleanup::new(true, 0),
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(Timeouts {
+            expired_channels: ExpiredChannelCleanup::new(true, 0),
             ..Default::default()
         });
         assert_eq!(
             b.timeouts.expired_channels,
-            crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
+            ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
         );
     }
 
     #[test]
     fn with_timeouts_expired_channels_clamps_zero_from_literal() {
-        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
-            expired_channels: crate::protocol::ExpiredChannelCleanup::Enabled {
-                timeout_in_secs: 0,
-            },
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(Timeouts {
+            expired_channels: ExpiredChannelCleanup::Enabled { timeout_in_secs: 0 },
             ..Default::default()
         });
         assert_eq!(
             b.timeouts.expired_channels,
-            crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
+            ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
         );
     }
 
@@ -2564,21 +2513,23 @@ mod tests {
     /// "no timeout".
     #[test]
     fn with_timeouts_clamps_every_duration_to_at_least_one_second() {
-        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(Timeouts {
             inbound_message: Duration::ZERO,
             sharing_round: Duration::ZERO,
             unpair_ack: Duration::from_millis(400),
+            pairing: Duration::ZERO,
             ..Default::default()
         });
         assert_eq!(b.timeouts.inbound_message, Duration::from_secs(1));
         assert_eq!(b.timeouts.sharing_round, Duration::from_secs(1));
         assert_eq!(b.timeouts.unpair_ack, Duration::from_secs(1));
+        assert_eq!(b.timeouts.pairing, Duration::from_secs(1));
     }
 
     /// Sub-second precision is truncated, not rounded — 2.5s is 2s.
     #[test]
     fn with_timeouts_truncates_sub_second_precision() {
-        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(Timeouts {
             sharing_round: Duration::from_millis(2500),
             ..Default::default()
         });
@@ -2589,8 +2540,8 @@ mod tests {
     /// struct-update ergonomics every binding relies on.
     #[test]
     fn with_timeouts_leaves_unspecified_fields_at_their_defaults() {
-        let d = crate::protocol::types::Timeouts::default();
-        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+        let d = Timeouts::default();
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(Timeouts {
             sharing_round: Duration::from_secs(30),
             ..Default::default()
         });
@@ -2602,14 +2553,11 @@ mod tests {
 
     #[test]
     fn with_timeouts_expired_channels_preserves_disabled() {
-        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
-            expired_channels: crate::protocol::ExpiredChannelCleanup::Disabled,
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(Timeouts {
+            expired_channels: ExpiredChannelCleanup::Disabled,
             ..Default::default()
         });
-        assert_eq!(
-            b.timeouts.expired_channels,
-            crate::protocol::ExpiredChannelCleanup::Disabled
-        );
+        assert_eq!(b.timeouts.expired_channels, ExpiredChannelCleanup::Disabled);
     }
 
     #[test]
@@ -2617,7 +2565,7 @@ mod tests {
         let b = DeRecProtocolBuilder::new(0);
         assert_eq!(
             b.timeouts.expired_channels,
-            crate::protocol::ExpiredChannelCleanup::Enabled {
+            ExpiredChannelCleanup::Enabled {
                 timeout_in_secs: 300
             }
         );
@@ -2641,7 +2589,7 @@ mod tests {
         const SECRET_ID: u64 = 0x0005_EC57;
         const CHANNEL_ID: u64 = 99;
 
-        let contact = crate::primitives::pairing::request::create_contact(
+        let contact = request::create_contact(
             ChannelId(CHANNEL_ID),
             ContactMode::InlineKeys,
             vec![TransportProtocol {
@@ -2685,17 +2633,17 @@ mod tests {
                 (&mut via_stores, &via_stores_transport),
             ] {
                 let events = protocol
-                    .start(crate::protocol::DeRecFlow::Pairing {
+                    .start(DeRecFlow::Pairing {
                         kind: SenderKind::Owner,
                         contact: contact.clone(),
-                        peer_communication_info: std::collections::HashMap::new(),
+                        peer_communication_info: HashMap::new(),
                     })
                     .await
                     .expect("pairing starts");
 
                 assert_eq!(events.len(), 1, "exactly one PairingStarted: {events:?}");
                 match &events[0] {
-                    crate::protocol::DeRecEvent::PairingStarted {
+                    DeRecEvent::PairingStarted {
                         channel_id, kind, ..
                     } => {
                         assert_eq!(*channel_id, ChannelId(CHANNEL_ID));
@@ -2735,10 +2683,7 @@ mod tests {
                     .await
                     .expect("secret load")
                     .expect("pairing contact persisted");
-                assert!(matches!(
-                    pairing_contact,
-                    crate::protocol::types::SecretValue::PairingContact(_)
-                ));
+                assert!(matches!(pairing_contact, SecretValue::PairingContact(_)));
             }
         });
     }
@@ -2811,18 +2756,18 @@ mod tests {
     #[derive(Debug, PartialEq)]
     struct Settings {
         threshold: usize,
-        timeouts: crate::protocol::types::Timeouts,
+        timeouts: Timeouts,
         unsafe_connection: Option<bool>,
         communication_info: HashMap<String, String>,
         auto_respond_on_failure: bool,
         key_rotation: bool,
         unpair_ack: UnpairAck,
         auto_reply_to: bool,
-        auto_accept: crate::protocol::AutoAcceptPolicy,
+        auto_accept: AutoAcceptPolicy,
         replica_id: Option<u64>,
-        parameter_range: Option<derec_proto::ParameterRange>,
+        parameter_range: Option<ParameterRange>,
         max_subshares: Option<u64>,
-        own_transports: Option<Option<Vec<crate::transport::TransportProtocol>>>,
+        own_transports: Option<Option<Vec<transport::TransportProtocol>>>,
     }
 
     fn settings<Cs, Sh, Ss, Us, St, Tr>(
@@ -2845,25 +2790,27 @@ mod tests {
         }
     }
 
-    fn full_config() -> crate::protocol::DeRecProtocolConfig {
-        crate::protocol::DeRecProtocolConfig {
+    fn full_config() -> DeRecProtocolConfig {
+        DeRecProtocolConfig {
             threshold: Some(4),
             max_subshares: Some(12),
-            timeouts: Some(crate::protocol::TimeoutsConfig {
+            timeouts: Some(TimeoutsConfig {
                 inbound_message_secs: Some(120),
                 sharing_round_secs: Some(30),
                 unpair_ack_secs: Some(45),
-                expired_channels: Some(crate::protocol::ExpiredChannelsConfig {
+                get_share_response_secs: Some(900),
+                pairing_secs: Some(240),
+                expired_channels: Some(ExpiredChannelsConfig {
                     enabled: false,
                     timeout_in_secs: 600,
                 }),
             }),
-            parameter_range: Some(derec_proto::ParameterRange {
+            parameter_range: Some(ParameterRange {
                 min_share_size: 1,
                 max_share_size: 4096,
                 ..Default::default()
             }),
-            auto_accept: Some(crate::protocol::AutoAcceptPolicy {
+            auto_accept: Some(AutoAcceptPolicy {
                 pairing: true,
                 store_share: true,
                 ..Default::default()
@@ -2875,14 +2822,8 @@ mod tests {
             unsafe_connection: Some(true),
             communication_info: Some(HashMap::from([("name".to_owned(), "alice".to_owned())])),
             own_transports: Some(vec![
-                crate::transport::TransportProtocol::new(
-                    "grpcs://me.example.com:443",
-                    derec_proto::Protocol::Grpc,
-                ),
-                crate::transport::TransportProtocol::new(
-                    "https://me.example.com/derec",
-                    derec_proto::Protocol::Https,
-                ),
+                transport::TransportProtocol::new("grpcs://me.example.com:443", Protocol::Grpc),
+                transport::TransportProtocol::new("https://me.example.com/derec", Protocol::Https),
             ]),
             replica_id: Some(9_007_199_254_740_993),
         }
@@ -2897,17 +2838,17 @@ mod tests {
             .with_replica_id(7)
             .with_auto_reply_to(true)
             .with_own_transports(["https://me.example.com"])
-            .with_timeouts(crate::protocol::types::Timeouts {
+            .with_timeouts(Timeouts {
                 sharing_round: Duration::from_secs(30),
                 ..Default::default()
             });
         let before = settings(&b);
-        let b = b.with_config(crate::protocol::DeRecProtocolConfig::default());
+        let b = b.with_config(DeRecProtocolConfig::default());
         assert_eq!(settings(&b), before);
 
         let fresh = DeRecProtocolBuilder::new(0);
         let defaults = settings(&fresh);
-        let fresh = fresh.with_config(crate::protocol::DeRecProtocolConfig::default());
+        let fresh = fresh.with_config(DeRecProtocolConfig::default());
         assert_eq!(settings(&fresh), defaults);
     }
 
@@ -2918,18 +2859,20 @@ mod tests {
         let via_setters = DeRecProtocolBuilder::new(0)
             .with_threshold(4)
             .with_max_subshares(12)
-            .with_timeouts(crate::protocol::types::Timeouts {
+            .with_timeouts(Timeouts {
                 inbound_message: Duration::from_secs(120),
                 sharing_round: Duration::from_secs(30),
                 unpair_ack: Duration::from_secs(45),
-                expired_channels: crate::protocol::ExpiredChannelCleanup::Disabled,
+                get_share_response: Duration::from_secs(900),
+                pairing: Duration::from_secs(240),
+                expired_channels: ExpiredChannelCleanup::Disabled,
             })
-            .with_parameter_range(derec_proto::ParameterRange {
+            .with_parameter_range(ParameterRange {
                 min_share_size: 1,
                 max_share_size: 4096,
                 ..Default::default()
             })
-            .with_auto_accept(crate::protocol::AutoAcceptPolicy {
+            .with_auto_accept(AutoAcceptPolicy {
                 pairing: true,
                 store_share: true,
                 ..Default::default()
@@ -2941,14 +2884,8 @@ mod tests {
             .with_unsafe_connection(true)
             .with_communication_info(HashMap::from([("name".to_owned(), "alice".to_owned())]))
             .with_own_transports(vec![
-                crate::transport::TransportProtocol::new(
-                    "grpcs://me.example.com:443",
-                    derec_proto::Protocol::Grpc,
-                ),
-                crate::transport::TransportProtocol::new(
-                    "https://me.example.com/derec",
-                    derec_proto::Protocol::Https,
-                ),
+                transport::TransportProtocol::new("grpcs://me.example.com:443", Protocol::Grpc),
+                transport::TransportProtocol::new("https://me.example.com/derec", Protocol::Https),
             ])
             .with_replica_id(9_007_199_254_740_993);
         assert_eq!(settings(&via_config), settings(&via_setters));
@@ -2959,24 +2896,24 @@ mod tests {
     /// builder already holds rather than against the library default.
     #[test]
     fn with_config_layers_last_write_wins_per_field() {
-        let general = crate::protocol::DeRecProtocolConfig {
+        let general = DeRecProtocolConfig {
             threshold: Some(4),
             replica_id: Some(11),
             auto_reply_to: Some(true),
-            timeouts: Some(crate::protocol::TimeoutsConfig {
+            timeouts: Some(TimeoutsConfig {
                 sharing_round_secs: Some(30),
                 ..Default::default()
             }),
-            own_transports: Some(vec![crate::transport::TransportProtocol::new(
+            own_transports: Some(vec![transport::TransportProtocol::new(
                 "https://general.example.com",
-                derec_proto::Protocol::Https,
+                Protocol::Https,
             )]),
             ..Default::default()
         };
-        let per_user = crate::protocol::DeRecProtocolConfig {
+        let per_user = DeRecProtocolConfig {
             threshold: Some(5),
             communication_info: Some(HashMap::from([("name".to_owned(), "bob".to_owned())])),
-            timeouts: Some(crate::protocol::TimeoutsConfig {
+            timeouts: Some(TimeoutsConfig {
                 inbound_message_secs: Some(120),
                 ..Default::default()
             }),
@@ -2987,7 +2924,7 @@ mod tests {
             .with_config(per_user)
             .with_threshold(6);
         let s = settings(&b);
-        let d = crate::protocol::types::Timeouts::default();
+        let d = Timeouts::default();
 
         assert_eq!(s.threshold, 6);
         assert_eq!(s.replica_id, Some(11));
@@ -3002,9 +2939,9 @@ mod tests {
         assert_eq!(s.timeouts.expired_channels, d.expired_channels);
         assert_eq!(
             s.own_transports,
-            Some(Some(vec![crate::transport::TransportProtocol::new(
+            Some(Some(vec![transport::TransportProtocol::new(
                 "https://general.example.com",
-                derec_proto::Protocol::Https,
+                Protocol::Https,
             )]))
         );
         assert_eq!(s.unpair_ack, UnpairAck::Required);
@@ -3014,10 +2951,10 @@ mod tests {
     /// `with_timeouts`.
     #[test]
     fn with_config_timeouts_are_clamped_like_with_timeouts() {
-        let b = DeRecProtocolBuilder::new(0).with_config(crate::protocol::DeRecProtocolConfig {
-            timeouts: Some(crate::protocol::TimeoutsConfig {
+        let b = DeRecProtocolBuilder::new(0).with_config(DeRecProtocolConfig {
+            timeouts: Some(TimeoutsConfig {
                 inbound_message_secs: Some(0),
-                expired_channels: Some(crate::protocol::ExpiredChannelsConfig {
+                expired_channels: Some(ExpiredChannelsConfig {
                     enabled: true,
                     timeout_in_secs: 0,
                 }),
@@ -3028,17 +2965,17 @@ mod tests {
         assert_eq!(b.timeouts.inbound_message, Duration::from_secs(1));
         assert_eq!(
             b.timeouts.expired_channels,
-            crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
+            ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
         );
     }
 
     type InMemBuilder = DeRecProtocolBuilder<
-        BuilderSlotSetMarker<crate::protocol::tests::InMemChannelStore>,
-        BuilderSlotSetMarker<crate::protocol::tests::InMemShareStore>,
-        BuilderSlotSetMarker<crate::protocol::tests::InMemSecretStore>,
-        BuilderSlotSetMarker<crate::protocol::tests::InMemUserSecretStore>,
-        BuilderSlotSetMarker<crate::protocol::tests::InMemStateStore>,
-        BuilderSlotSetMarker<crate::protocol::tests::NoopTransport>,
+        BuilderSlotSetMarker<InMemChannelStore>,
+        BuilderSlotSetMarker<InMemShareStore>,
+        BuilderSlotSetMarker<InMemSecretStore>,
+        BuilderSlotSetMarker<InMemUserSecretStore>,
+        BuilderSlotSetMarker<InMemStateStore>,
+        BuilderSlotSetMarker<NoopTransport>,
     >;
 
     fn in_mem_builder() -> InMemBuilder {
@@ -3057,9 +2994,9 @@ mod tests {
             .with_transport(NoopTransport)
     }
 
-    fn invalid_input_message<T>(result: crate::Result<T>) -> &'static str {
+    fn invalid_input_message<T>(result: Result<T>) -> &'static str {
         match result {
-            Err(crate::Error::InvalidInput(msg)) => msg,
+            Err(Error::InvalidInput(msg)) => msg,
             Err(other) => panic!("expected InvalidInput, got {other:?}"),
             Ok(_) => panic!("expected InvalidInput, got a built protocol"),
         }
@@ -3070,11 +3007,11 @@ mod tests {
     #[test]
     fn with_config_values_are_validated_at_build_like_the_setters() {
         let via_config = in_mem_builder()
-            .with_config(crate::protocol::DeRecProtocolConfig {
+            .with_config(DeRecProtocolConfig {
                 threshold: Some(1),
-                own_transports: Some(vec![crate::transport::TransportProtocol::new(
+                own_transports: Some(vec![transport::TransportProtocol::new(
                     "https://me.example.com",
-                    derec_proto::Protocol::Https,
+                    Protocol::Https,
                 )]),
                 ..Default::default()
             })
@@ -3090,7 +3027,7 @@ mod tests {
 
         let via_config = in_mem_builder()
             .with_own_transports(["https://me.example.com"])
-            .with_config(crate::protocol::DeRecProtocolConfig {
+            .with_config(DeRecProtocolConfig {
                 threshold: Some(3),
                 max_subshares: Some(2),
                 ..Default::default()
@@ -3114,7 +3051,7 @@ mod tests {
         assert!(msg.contains("own transports"), "{msg}");
         let msg = invalid_input_message(
             in_mem_builder()
-                .with_config(crate::protocol::DeRecProtocolConfig::default())
+                .with_config(DeRecProtocolConfig::default())
                 .build(),
         );
         assert!(msg.contains("own transports"), "{msg}");
@@ -3131,13 +3068,7 @@ mod tests {
         assert_eq!(protocol.threshold, 4);
         assert_eq!(protocol.max_subshares, Some(12));
         assert_eq!(protocol.replica_id, Some(9_007_199_254_740_993));
-        assert_eq!(
-            protocol.own_transports[0].protocol,
-            derec_proto::Protocol::Grpc as i32
-        );
-        assert_eq!(
-            protocol.own_transports[1].protocol,
-            derec_proto::Protocol::Https as i32
-        );
+        assert_eq!(protocol.own_transports[0].protocol, Protocol::Grpc as i32);
+        assert_eq!(protocol.own_transports[1].protocol, Protocol::Https as i32);
     }
 }

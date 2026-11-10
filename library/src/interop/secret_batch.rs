@@ -9,13 +9,15 @@
 //! ids, and deciding whether an empty entry is an error — happens here, once,
 //! for every binding.
 
+use std::fmt;
+
 use crate::protocol::{MissingPolicy, SecretKind, SecretStoreError, SecretValue};
 use crate::types::ChannelId;
 
 /// Pairs each entry with the channel it was requested for and applies
 /// `missing_policy` to the empty ones. An answer that does not carry exactly
 /// one entry per requested channel is refused rather than guessed at.
-pub(crate) fn collect<T, E: std::fmt::Display>(
+pub(crate) fn collect<T, E: fmt::Display>(
     requested: &[ChannelId],
     entries: Vec<Option<T>>,
     kind: SecretKind,

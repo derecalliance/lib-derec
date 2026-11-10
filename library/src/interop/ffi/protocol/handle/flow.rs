@@ -5,7 +5,12 @@
 //! Each one drives the protocol's async core via the per-handle tokio
 //! runtime and returns either a typed result or a JSON event array.
 
+use std::{slice, str};
+
+use derec_proto::StatusEnum;
+
 use super::DeRecProtocolHandle;
+use crate::Error;
 use crate::interop::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
 use crate::interop::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_UTF8, DEREC_CODE_FFI_INVALID_ENUM,
@@ -13,6 +18,9 @@ use crate::interop::ffi::error::{
 };
 use crate::interop::ffi::protocol::events::encode_events;
 use crate::interop::ffi::protocol::flow as flow_params;
+use crate::interop::recovered_secret::RecoveredSecretIn;
+use crate::protocol::RestoreError;
+use crate::protocol::utils::pending_action_wire;
 
 /// Start a new flow. `flow_kind` matches the constants in
 /// [`crate::interop::ffi::protocol::flow`]. `params_json_*` is a UTF-8 JSON blob
@@ -43,7 +51,7 @@ pub unsafe extern "C" fn derec_protocol_start(
     let params_bytes = if params_json_len == 0 {
         b""[..].to_vec()
     } else {
-        unsafe { std::slice::from_raw_parts(params_json_ptr, params_json_len) }.to_vec()
+        unsafe { slice::from_raw_parts(params_json_ptr, params_json_len) }.to_vec()
     };
 
     let flow = match flow_params::parse_flow(flow_kind, &params_bytes) {
@@ -162,7 +170,7 @@ pub unsafe extern "C" fn derec_protocol_process(
     let bytes = if message_len == 0 {
         Vec::new()
     } else {
-        unsafe { std::slice::from_raw_parts(message_ptr, message_len) }.to_vec()
+        unsafe { slice::from_raw_parts(message_ptr, message_len) }.to_vec()
     };
 
     let h = unsafe { &*handle };
@@ -234,8 +242,8 @@ pub unsafe extern "C" fn derec_protocol_accept(
     if action_len == 0 || action_ptr.is_null() {
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "action_ptr is null or len == 0").into();
     }
-    let bytes = unsafe { std::slice::from_raw_parts(action_ptr, action_len) };
-    let action = match crate::protocol::utils::pending_action_wire::deserialize(bytes) {
+    let bytes = unsafe { slice::from_raw_parts(action_ptr, action_len) };
+    let action = match pending_action_wire::deserialize(bytes) {
         Ok(a) => a,
         Err(e) => {
             return ffi_error(
@@ -284,8 +292,8 @@ pub unsafe extern "C" fn derec_protocol_reject(
     if action_len == 0 || action_ptr.is_null() {
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "action_ptr is null or len == 0");
     }
-    let bytes = unsafe { std::slice::from_raw_parts(action_ptr, action_len) };
-    let action = match crate::protocol::utils::pending_action_wire::deserialize(bytes) {
+    let bytes = unsafe { slice::from_raw_parts(action_ptr, action_len) };
+    let action = match pending_action_wire::deserialize(bytes) {
         Ok(a) => a,
         Err(e) => {
             return ffi_error(
@@ -299,14 +307,14 @@ pub unsafe extern "C" fn derec_protocol_reject(
     } else if memo_ptr.is_null() {
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "memo_ptr is null but len > 0");
     } else {
-        let bytes = unsafe { std::slice::from_raw_parts(memo_ptr, memo_len) };
-        match std::str::from_utf8(bytes) {
+        let bytes = unsafe { slice::from_raw_parts(memo_ptr, memo_len) };
+        match str::from_utf8(bytes) {
             Ok(s) => s.to_owned(),
             Err(_) => return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "memo is not valid UTF-8"),
         }
     };
 
-    let status_enum = match derec_proto::StatusEnum::try_from(status) {
+    let status_enum = match StatusEnum::try_from(status) {
         Ok(s) => s,
         Err(_) => {
             return ffi_error(
@@ -333,6 +341,7 @@ pub unsafe extern "C" fn derec_protocol_reject(
 /// ```json
 /// {
 ///   "version": 7,
+///   "newest_version": 9,
 ///   "recovered_secret": {
 ///     "helpers": [{ "channel_id": "11",
 ///                   "transports": [{ "uri": "https://helper.example", "protocol": "https" }],
@@ -350,6 +359,10 @@ pub unsafe extern "C" fn derec_protocol_reject(
 ///   }
 /// }
 /// ```
+///
+/// `version` is the recovered version and `newest_version` the newest one any
+/// helper reported, both required; see
+/// [`DeRecProtocol::restore`](crate::protocol::DeRecProtocol::restore).
 ///
 /// Field names mirror `SecretWire` in `protocol/events/wire.rs` — the
 /// same shape `SecretRecovered` carries, so the `secret` of that event can
@@ -400,8 +413,8 @@ pub unsafe extern "C" fn derec_protocol_restore(
         )
         .into();
     }
-    let bytes = unsafe { std::slice::from_raw_parts(params_json_ptr, params_json_len) };
-    let json = match std::str::from_utf8(bytes) {
+    let bytes = unsafe { slice::from_raw_parts(params_json_ptr, params_json_len) };
+    let json = match str::from_utf8(bytes) {
         Ok(s) => s,
         Err(_) => {
             return ffi_error(DEREC_CODE_FFI_BAD_UTF8, "params_json is not valid UTF-8").into();
@@ -426,7 +439,10 @@ pub unsafe extern "C" fn derec_protocol_restore(
 
     let h = unsafe { &*handle };
     let mut inner = h.lock_inner();
-    match h.runtime.block_on(inner.restore(&secret, params.version)) {
+    match h
+        .runtime
+        .block_on(inner.restore(&secret, params.version, params.newest_version))
+    {
         Ok(events) => {
             let json = encode_events(events);
             DeRecProtocolRestoreResult {
@@ -437,7 +453,7 @@ pub unsafe extern "C" fn derec_protocol_restore(
         }
         Err(e) => {
             let conflicting = match &e {
-                crate::Error::Restore(crate::protocol::RestoreError::Conflict(ids)) => {
+                Error::Restore(RestoreError::Conflict(ids)) => {
                     let ids: Vec<String> = ids.iter().map(|c| c.0.to_string()).collect();
                     vec_into_buffer(serde_json::to_vec(&ids).expect("a list of strings serializes"))
                 }
@@ -455,5 +471,6 @@ pub unsafe extern "C" fn derec_protocol_restore(
 #[derive(serde::Deserialize)]
 struct RestoreParamsJson {
     version: u32,
-    recovered_secret: crate::interop::recovered_secret::RecoveredSecretIn,
+    newest_version: u32,
+    recovered_secret: RecoveredSecretIn,
 }

@@ -19,11 +19,17 @@
 //! - Byte fields serialize as bytes: a JSON array of numbers over the FFI,
 //!   a `Uint8Array` over WASM.
 
+use crate::interop::protocol_names;
+use crate::protocol::RecoveryHelper;
+use crate::protocol::events::PendingActionKind;
+use crate::protocol::types::ReplicaRole;
 use crate::protocol::utils::{pending_action_wire, reserved_keys::encode_replica_id};
 use crate::protocol::{
     Action, ChannelRequest, DeRecEvent, PendingAction,
     types::{ChannelShare, Secret},
 };
+use crate::protocol::{CorruptionReason, IgnoreReason, NotRestoredReason, VerifyFailureReason};
+use derec_proto::TransportProtocol;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -195,11 +201,6 @@ pub(crate) enum Event {
         channel_id: String,
         shares_received: u32,
     },
-    RecoveryShareError {
-        channel_id: String,
-        shares_received: u32,
-        error: String,
-    },
     RecoveryShareRefused {
         channel_id: String,
         version: u32,
@@ -210,7 +211,7 @@ pub(crate) enum Event {
         channel_id: String,
         version: u32,
         /// [`corruption_reason_label`] — `"Malformed"`, `"InvalidProof"` or
-        /// `"Inconsistent"`.
+        /// `"Forged"`.
         reason: String,
     },
     SecretRecovered {
@@ -218,6 +219,24 @@ pub(crate) enum Event {
         /// [`Self::ReplicaSecretReceived::secret`] — the typed
         /// `Secret` snapshot the owner originally protected.
         secret: SecretWire,
+    },
+    RecoveryConflict {
+        version: u32,
+        candidates: Vec<RecoveryCandidateWire>,
+        disputed_by: Vec<RecoveryHelperWire>,
+    },
+    RecoveryDisputed {
+        version: u32,
+        /// Same shape as [`Self::SecretRecovered::secret`], so a confirmed
+        /// secret is passed to `restore` the same way.
+        secret: SecretWire,
+        supported_by: Vec<RecoveryHelperWire>,
+        disputed_by: Vec<RecoveryHelperWire>,
+    },
+    RecoveryIncomplete {
+        secret_id: String,
+        version: u32,
+        shares_received: u32,
     },
     Unpaired {
         channel_id: String,
@@ -329,7 +348,8 @@ pub(crate) enum Event {
     MessageIgnored {
         channel_id: String,
         /// [`ignore_reason_label`] — `"PendingVerification"`, `"Expired"`,
-        /// `"TimestampMismatch"`, `"StaleResponse"` or `"KeyUnavailable"`.
+        /// `"TimestampMismatch"`, `"StaleResponse"`, `"Superseded"` or
+        /// `"KeyUnavailable"`.
         reason: String,
         trace_id: String,
     },
@@ -422,6 +442,34 @@ pub struct DiscoveredVersion {
 }
 
 #[derive(Serialize)]
+pub struct RecoveryCandidateWire {
+    /// Same shape as [`Event::SecretRecovered::secret`], so a chosen
+    /// candidate is passed to `restore` the same way.
+    pub secret: SecretWire,
+    pub supported_by: Vec<RecoveryHelperWire>,
+}
+
+#[derive(Serialize)]
+pub struct RecoveryHelperWire {
+    pub channel_id: String,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub communication_info: HashMap<String, String>,
+}
+
+impl From<RecoveryHelper> for RecoveryHelperWire {
+    fn from(h: RecoveryHelper) -> Self {
+        Self {
+            channel_id: h.channel_id.0.to_string(),
+            communication_info: h.communication_info,
+        }
+    }
+}
+
+fn helpers_wire(helpers: Vec<RecoveryHelper>) -> Vec<RecoveryHelperWire> {
+    helpers.into_iter().map(Into::into).collect()
+}
+
+#[derive(Serialize)]
 pub struct SecretWire {
     pub helpers: Vec<Helper>,
     pub secrets: Vec<UserSecret>,
@@ -465,11 +513,11 @@ pub struct Endpoint {
     pub protocol: &'static str,
 }
 
-impl From<derec_proto::TransportProtocol> for Endpoint {
-    fn from(t: derec_proto::TransportProtocol) -> Self {
+impl From<TransportProtocol> for Endpoint {
+    fn from(t: TransportProtocol) -> Self {
         Endpoint {
             uri: t.uri,
-            protocol: crate::interop::protocol_names::protocol_discriminant_to_name(t.protocol)
+            protocol: protocol_names::protocol_discriminant_to_name(t.protocol)
                 .unwrap_or("unknown"),
         }
     }
@@ -551,7 +599,7 @@ impl From<Secret> for SecretWire {
                     .map(|r| Replica {
                         replica_id: encode_replica_id(r.replica_id),
                         transports: r.transports.into_iter().map(Into::into).collect(),
-                        role: crate::protocol::types::ReplicaRole::from_i32(r.role)
+                        role: ReplicaRole::from_i32(r.role)
                             .map(|role| format!("{role:?}"))
                             .unwrap_or_default(),
                         communication_info: r.communication_info,
@@ -829,15 +877,6 @@ impl Event {
                 channel_id: channel_id.0.to_string(),
                 shares_received: shares_received as u32,
             },
-            DeRecEvent::RecoveryShareError {
-                channel_id,
-                shares_received,
-                error,
-            } => Self::RecoveryShareError {
-                channel_id: channel_id.0.to_string(),
-                shares_received: shares_received as u32,
-                error,
-            },
             DeRecEvent::RecoveryShareRefused {
                 channel_id,
                 version,
@@ -860,6 +899,41 @@ impl Event {
             },
             DeRecEvent::SecretRecovered { secret } => Self::SecretRecovered {
                 secret: secret.into(),
+            },
+            DeRecEvent::RecoveryConflict {
+                version,
+                candidates,
+                disputed_by,
+            } => Self::RecoveryConflict {
+                version,
+                candidates: candidates
+                    .into_iter()
+                    .map(|c| RecoveryCandidateWire {
+                        secret: c.secret.into(),
+                        supported_by: helpers_wire(c.supported_by),
+                    })
+                    .collect(),
+                disputed_by: helpers_wire(disputed_by),
+            },
+            DeRecEvent::RecoveryDisputed {
+                version,
+                secret,
+                supported_by,
+                disputed_by,
+            } => Self::RecoveryDisputed {
+                version,
+                secret: secret.into(),
+                supported_by: helpers_wire(supported_by),
+                disputed_by: helpers_wire(disputed_by),
+            },
+            DeRecEvent::RecoveryIncomplete {
+                secret_id,
+                version,
+                shares_received,
+            } => Self::RecoveryIncomplete {
+                secret_id: secret_id.to_string(),
+                version,
+                shares_received: shares_received as u32,
             },
             DeRecEvent::Unpaired { channel_id } => Self::Unpaired {
                 channel_id: channel_id.0.to_string(),
@@ -1123,23 +1197,20 @@ impl Event {
 
 /// Wire label for an [`IgnoreReason`](crate::protocol::IgnoreReason): the
 /// variant name, matching `library/tests/fixtures/enums.json`.
-pub(crate) fn ignore_reason_label(reason: crate::protocol::IgnoreReason) -> &'static str {
-    use crate::protocol::IgnoreReason;
+pub(crate) fn ignore_reason_label(reason: IgnoreReason) -> &'static str {
     match reason {
         IgnoreReason::PendingVerification => "PendingVerification",
         IgnoreReason::Expired => "Expired",
         IgnoreReason::TimestampMismatch => "TimestampMismatch",
         IgnoreReason::StaleResponse => "StaleResponse",
+        IgnoreReason::Superseded => "Superseded",
         IgnoreReason::KeyUnavailable => "KeyUnavailable",
     }
 }
 
 /// Wire label for a [`VerifyFailureReason`](crate::protocol::VerifyFailureReason):
 /// the variant name, matching `library/tests/fixtures/enums.json`.
-pub(crate) fn verify_failure_reason_label(
-    reason: crate::protocol::VerifyFailureReason,
-) -> &'static str {
-    use crate::protocol::VerifyFailureReason;
+pub(crate) fn verify_failure_reason_label(reason: VerifyFailureReason) -> &'static str {
     match reason {
         VerifyFailureReason::NoSharedKey => "NoSharedKey",
         VerifyFailureReason::NoProof => "NoProof",
@@ -1149,10 +1220,7 @@ pub(crate) fn verify_failure_reason_label(
 
 /// Wire label for a [`NotRestoredReason`](crate::protocol::NotRestoredReason):
 /// the variant name, matching `library/tests/fixtures/enums.json`.
-pub(crate) fn not_restored_reason_label(
-    reason: crate::protocol::NotRestoredReason,
-) -> &'static str {
-    use crate::protocol::NotRestoredReason;
+pub(crate) fn not_restored_reason_label(reason: NotRestoredReason) -> &'static str {
     match reason {
         NotRestoredReason::NoTransports => "NoTransports",
     }
@@ -1160,18 +1228,15 @@ pub(crate) fn not_restored_reason_label(
 
 /// Wire label for a [`CorruptionReason`](crate::protocol::CorruptionReason):
 /// the variant name, matching `library/tests/fixtures/enums.json`.
-pub(crate) fn corruption_reason_label(reason: crate::protocol::CorruptionReason) -> &'static str {
-    use crate::protocol::CorruptionReason;
+pub(crate) fn corruption_reason_label(reason: CorruptionReason) -> &'static str {
     match reason {
         CorruptionReason::Malformed => "Malformed",
         CorruptionReason::InvalidProof => "InvalidProof",
-        CorruptionReason::Inconsistent => "Inconsistent",
+        CorruptionReason::Forged => "Forged",
     }
 }
 
-pub(crate) fn pending_action_kind_label(
-    kind: crate::protocol::events::PendingActionKind,
-) -> &'static str {
+pub(crate) fn pending_action_kind_label(kind: PendingActionKind) -> &'static str {
     use crate::protocol::events::PendingActionKind as K;
     match kind {
         K::Pairing => "Pairing",
@@ -1238,7 +1303,11 @@ fn extract_share_metadata(action: &PendingAction) -> (Option<u32>, Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::protocol::types::HelperInfo;
     use crate::types::ChannelId;
+
+    use derec_proto::StatusEnum;
 
     fn action_required(action: PendingAction) -> serde_json::Value {
         let mapped = Event::from_event(DeRecEvent::ActionRequired {
@@ -1302,7 +1371,7 @@ mod tests {
     /// protobuf-default `0` reads as `1`.
     #[test]
     fn a_recovered_helper_carries_its_weight() {
-        let helper = |channel_id, weight| crate::protocol::types::HelperInfo {
+        let helper = |channel_id, weight| HelperInfo {
             channel_id,
             transports: Vec::new(),
             shared_key: vec![0; 32],
@@ -1328,7 +1397,7 @@ mod tests {
         let verified = |subshares| {
             serde_json::to_string(
                 &Event::from_event(DeRecEvent::ShareVerified {
-                    channel_id: crate::types::ChannelId(11),
+                    channel_id: ChannelId(11),
                     version: 2,
                     subshares,
                     threshold: None,
@@ -1354,7 +1423,7 @@ mod tests {
         let verified = |threshold| {
             serde_json::to_string(
                 &Event::from_event(DeRecEvent::ShareVerified {
-                    channel_id: crate::types::ChannelId(11),
+                    channel_id: ChannelId(11),
                     version: 2,
                     subshares: Some(1),
                     threshold,
@@ -1487,7 +1556,7 @@ mod tests {
         let mapped = Event::from_event(DeRecEvent::ShareVerifyRejected {
             channel_id: ChannelId(u64::MAX),
             version: 3,
-            status: derec_proto::StatusEnum::UnknownShareVersion as i32,
+            status: StatusEnum::UnknownShareVersion as i32,
             memo: "no stored share".to_owned(),
         })
         .expect("ShareVerifyRejected must map");
@@ -1496,10 +1565,7 @@ mod tests {
         assert_eq!(json["type"], "ShareVerifyRejected");
         assert_eq!(json["channel_id"], u64::MAX.to_string());
         assert_eq!(json["version"], 3);
-        assert_eq!(
-            json["status"],
-            derec_proto::StatusEnum::UnknownShareVersion as i32
-        );
+        assert_eq!(json["status"], StatusEnum::UnknownShareVersion as i32);
         assert_eq!(json["memo"], "no stored share");
     }
 
@@ -1520,15 +1586,9 @@ mod tests {
     #[test]
     fn verify_shares_failed_maps_reason_and_error() {
         for (reason, label) in [
-            (
-                crate::protocol::VerifyFailureReason::NoSharedKey,
-                "NoSharedKey",
-            ),
-            (crate::protocol::VerifyFailureReason::NoProof, "NoProof"),
-            (
-                crate::protocol::VerifyFailureReason::DispatchFailed,
-                "DispatchFailed",
-            ),
+            (VerifyFailureReason::NoSharedKey, "NoSharedKey"),
+            (VerifyFailureReason::NoProof, "NoProof"),
+            (VerifyFailureReason::DispatchFailed, "DispatchFailed"),
         ] {
             let mapped = Event::from_event(DeRecEvent::VerifySharesFailed {
                 channel_id: ChannelId(u64::MAX),
@@ -1551,7 +1611,7 @@ mod tests {
     fn message_ignored_maps_stale_response() {
         let mapped = Event::from_event(DeRecEvent::MessageIgnored {
             channel_id: ChannelId(7),
-            reason: crate::protocol::IgnoreReason::StaleResponse,
+            reason: IgnoreReason::StaleResponse,
             trace_id: 1,
         })
         .expect("MessageIgnored must map");
@@ -1565,7 +1625,7 @@ mod tests {
         let mapped = Event::from_event(DeRecEvent::ShareRefused {
             channel_id: ChannelId(u64::MAX),
             version: 6,
-            status: derec_proto::StatusEnum::VerificationFailed as i32,
+            status: StatusEnum::VerificationFailed as i32,
             memo: "bad merkle path".to_owned(),
         })
         .expect("ShareRefused must map");
@@ -1574,10 +1634,7 @@ mod tests {
         assert_eq!(json["type"], "ShareRefused");
         assert_eq!(json["channel_id"], u64::MAX.to_string());
         assert_eq!(json["version"], 6);
-        assert_eq!(
-            json["status"],
-            derec_proto::StatusEnum::VerificationFailed as i32
-        );
+        assert_eq!(json["status"], StatusEnum::VerificationFailed as i32);
         assert_eq!(json["memo"], "bad merkle path");
     }
 
@@ -1588,7 +1645,7 @@ mod tests {
             from_replica_id: 7,
             secret_id: u64::MAX,
             version: 3,
-            status: derec_proto::StatusEnum::VerificationFailed as i32,
+            status: StatusEnum::VerificationFailed as i32,
             memo: "bad merkle path".to_owned(),
         })
         .expect("ReplicaSecretRefused must map");
@@ -1599,10 +1656,7 @@ mod tests {
         assert_eq!(json["from_replica_id"], "7");
         assert_eq!(json["secret_id"], u64::MAX.to_string());
         assert_eq!(json["version"], 3);
-        assert_eq!(
-            json["status"],
-            derec_proto::StatusEnum::VerificationFailed as i32
-        );
+        assert_eq!(json["status"], StatusEnum::VerificationFailed as i32);
         assert_eq!(json["memo"], "bad merkle path");
     }
 
@@ -1611,7 +1665,7 @@ mod tests {
         let mapped = Event::from_event(DeRecEvent::RecoveryShareRefused {
             channel_id: ChannelId(u64::MAX),
             version: 4,
-            status: derec_proto::StatusEnum::UnknownShareVersion as i32,
+            status: StatusEnum::UnknownShareVersion as i32,
             memo: "no stored share".to_owned(),
         })
         .expect("RecoveryShareRefused must map");
@@ -1620,25 +1674,16 @@ mod tests {
         assert_eq!(json["type"], "RecoveryShareRefused");
         assert_eq!(json["channel_id"], u64::MAX.to_string());
         assert_eq!(json["version"], 4);
-        assert_eq!(
-            json["status"],
-            derec_proto::StatusEnum::UnknownShareVersion as i32
-        );
+        assert_eq!(json["status"], StatusEnum::UnknownShareVersion as i32);
         assert_eq!(json["memo"], "no stored share");
     }
 
     #[test]
     fn recovery_share_corrupted_maps_channel_version_and_reason() {
         for (reason, label) in [
-            (crate::protocol::CorruptionReason::Malformed, "Malformed"),
-            (
-                crate::protocol::CorruptionReason::InvalidProof,
-                "InvalidProof",
-            ),
-            (
-                crate::protocol::CorruptionReason::Inconsistent,
-                "Inconsistent",
-            ),
+            (CorruptionReason::Malformed, "Malformed"),
+            (CorruptionReason::InvalidProof, "InvalidProof"),
+            (CorruptionReason::Forged, "Forged"),
         ] {
             let mapped = Event::from_event(DeRecEvent::RecoveryShareCorrupted {
                 channel_id: ChannelId(u64::MAX),
@@ -1659,7 +1704,7 @@ mod tests {
     fn message_ignored_maps_with_channel_reason_and_trace() {
         let mapped = Event::from_event(DeRecEvent::MessageIgnored {
             channel_id: ChannelId(u64::MAX),
-            reason: crate::protocol::IgnoreReason::PendingVerification,
+            reason: IgnoreReason::PendingVerification,
             trace_id: 42,
         })
         .expect("MessageIgnored must map");
@@ -1680,7 +1725,7 @@ mod tests {
             Event::from_event(DeRecEvent::PeerNotRestored {
                 channel_id: ChannelId(u64::MAX),
                 replica_id: None,
-                reason: crate::protocol::NotRestoredReason::NoTransports,
+                reason: NotRestoredReason::NoTransports,
             })
             .expect("PeerNotRestored must map"),
         )
@@ -1694,7 +1739,7 @@ mod tests {
             Event::from_event(DeRecEvent::PeerNotRestored {
                 channel_id: ChannelId(21),
                 replica_id: Some(u64::MAX),
-                reason: crate::protocol::NotRestoredReason::NoTransports,
+                reason: NotRestoredReason::NoTransports,
             })
             .expect("PeerNotRestored must map"),
         )
@@ -1725,9 +1770,9 @@ mod tests {
         let expected_bytes = pending_action_wire::serialize(action.clone()).expect("serializes");
         let mapped = Event::from_event(DeRecEvent::RequestFailed {
             channel_id: ChannelId(u64::MAX),
-            action_kind: crate::protocol::PendingActionKind::StoreShare,
+            action_kind: PendingActionKind::StoreShare,
             responded: false,
-            status: derec_proto::StatusEnum::Fail as i32,
+            status: StatusEnum::Fail as i32,
             memo: "request could not be processed".to_owned(),
             error_code: "store".to_owned(),
             message: "backend unavailable".to_owned(),
@@ -1740,7 +1785,7 @@ mod tests {
         assert_eq!(json["channel_id"], u64::MAX.to_string());
         assert_eq!(json["action_kind"], "StoreShare");
         assert_eq!(json["responded"], false);
-        assert_eq!(json["status"], derec_proto::StatusEnum::Fail as i32);
+        assert_eq!(json["status"], StatusEnum::Fail as i32);
         assert_eq!(json["memo"], "request could not be processed");
         assert_eq!(json["error_code"], "store");
         assert_eq!(json["message"], "backend unavailable");
@@ -1753,9 +1798,9 @@ mod tests {
     fn request_failed_omits_the_token_and_keeps_the_status_when_answered() {
         let mapped = Event::from_event(DeRecEvent::RequestFailed {
             channel_id: ChannelId(4),
-            action_kind: crate::protocol::PendingActionKind::Failed,
+            action_kind: PendingActionKind::Failed,
             responded: true,
-            status: derec_proto::StatusEnum::FormatError as i32,
+            status: StatusEnum::FormatError as i32,
             memo: "message body could not be decoded".to_owned(),
             error_code: "internal".to_owned(),
             message: "cause".to_owned(),
@@ -1768,7 +1813,7 @@ mod tests {
         assert_eq!(json["responded"], true);
         let object = json.as_object().expect("object");
         assert!(!object.contains_key("action"));
-        assert_eq!(json["status"], derec_proto::StatusEnum::FormatError as i32);
+        assert_eq!(json["status"], StatusEnum::FormatError as i32);
         assert_eq!(json["memo"], "message body could not be decoded");
     }
 
@@ -1776,7 +1821,7 @@ mod tests {
     fn error_response_received_maps_status_and_memo() {
         let mapped = Event::from_event(DeRecEvent::ErrorResponseReceived {
             channel_id: ChannelId(u64::MAX),
-            status: derec_proto::StatusEnum::FormatError as i32,
+            status: StatusEnum::FormatError as i32,
             memo: "message body could not be decoded".to_owned(),
         })
         .expect("ErrorResponseReceived must map");
@@ -1784,7 +1829,7 @@ mod tests {
         let json = serde_json::to_value(&mapped).expect("serializes");
         assert_eq!(json["type"], "ErrorResponseReceived");
         assert_eq!(json["channel_id"], u64::MAX.to_string());
-        assert_eq!(json["status"], derec_proto::StatusEnum::FormatError as i32);
+        assert_eq!(json["status"], StatusEnum::FormatError as i32);
         assert_eq!(json["memo"], "message body could not be decoded");
     }
 
@@ -1792,7 +1837,7 @@ mod tests {
     fn pairing_refused_maps_status_memo_and_error() {
         let mapped = Event::from_event(DeRecEvent::PairingRefused {
             channel_id: ChannelId(u64::MAX),
-            status: derec_proto::StatusEnum::ReplicaIdConflict as i32,
+            status: StatusEnum::ReplicaIdConflict as i32,
             memo: "replica id in use".to_owned(),
             error_code: "replica_id_conflict".to_owned(),
             message: "replica id 7 is already in use by another member of the group".to_owned(),
@@ -1802,10 +1847,7 @@ mod tests {
         let json = serde_json::to_value(&mapped).expect("serializes");
         assert_eq!(json["type"], "PairingRefused");
         assert_eq!(json["channel_id"], u64::MAX.to_string());
-        assert_eq!(
-            json["status"],
-            derec_proto::StatusEnum::ReplicaIdConflict as i32
-        );
+        assert_eq!(json["status"], StatusEnum::ReplicaIdConflict as i32);
         assert_eq!(json["memo"], "replica id in use");
         assert_eq!(json["error_code"], "replica_id_conflict");
         assert_eq!(

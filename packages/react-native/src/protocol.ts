@@ -161,6 +161,7 @@ interface RestoreReplicasParams {
 export function buildRestoreParams(
   recoveredSecret: Extract<DeRecEvent, { type: 'SecretRecovered' }>['secret'],
   version: number,
+  newestVersion: number,
 ): Record<string, unknown> {
   const recovered: Record<string, unknown> = {
     helpers: recoveredSecret.helpers.map((helper) => {
@@ -212,7 +213,7 @@ export function buildRestoreParams(
   if (recoveredSecret.threshold != null) {
     recovered.threshold = recoveredSecret.threshold;
   }
-  return { version, recovered_secret: recovered };
+  return { version, newest_version: newestVersion, recovered_secret: recovered };
 }
 
 /**
@@ -822,6 +823,12 @@ export class DeRecProtocol {
    * A helper's or member's `communication_info` may be absent or `null`;
    * both mean the same thing — no entries.
    *
+   * `version` is the version that was recovered and `newestVersion` the
+   * newest one any helper reported in Discovery (`version` itself when that
+   * is the newest). The next publish is `newestVersion + 1`: a helper ignores
+   * a version older than the newest it stores (`'Superseded'`). A
+   * `newestVersion` below `version` rejects with `invalid_input`.
+   *
    * Rejects with a `DeRecError`; among its codes:
    *
    * | code               | meaning                                                     |
@@ -833,8 +840,9 @@ export class DeRecProtocol {
   async restore(
     recoveredSecret: Extract<DeRecEvent, { type: 'SecretRecovered' }>['secret'],
     version: number,
+    newestVersion: number,
   ): Promise<DeRecEvent[]> {
-    const params = buildRestoreParams(recoveredSecret, version);
+    const params = buildRestoreParams(recoveredSecret, version, newestVersion);
     const buffer = (await this.host.restore(jsonToBytes(params))) as ArrayBuffer;
     return decodeEvents(buffer);
   }

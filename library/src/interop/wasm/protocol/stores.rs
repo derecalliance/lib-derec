@@ -153,14 +153,18 @@
 //! }
 //! ```
 
+use std::{error, fmt};
+
 use derec_proto::TransportProtocol;
-use js_sys::{Array, Function, Promise, Uint8Array};
+use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use prost::Message as _;
+use serde::de::DeserializeOwned;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::{
     Error,
+    interop::secret_batch,
     protocol::{
         error::{ChannelStoreError, Refusal, SecretStoreError, ShareStoreError, StateStoreError},
         traits::{
@@ -169,9 +173,9 @@ use crate::{
             ShareStoreFuture, StateStoreFuture, TransportFuture,
         },
         types::{
-            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
-            ReplicaMember, SecretKind, SecretValue, Share, StateItem, StateKey, StateKind,
-            UserSecret, UserSecrets,
+            ChannelQuery, ChannelRecord, ChannelStatus, HelperChannel, HelperFilter, MissingPolicy,
+            ReplicaFilter, ReplicaMember, SecretKind, SecretValue, Share, StateItem, StateKey,
+            StateKind, UserSecret, UserSecrets,
         },
     },
     types::ChannelId,
@@ -181,20 +185,20 @@ use crate::{
 #[derive(Debug)]
 struct JsCallError(String);
 
-impl std::fmt::Display for JsCallError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for JsCallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl std::error::Error for JsCallError {}
+impl error::Error for JsCallError {}
 
-fn box_err(msg: String) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+fn box_err(msg: String) -> Box<dyn error::Error + Send + Sync + 'static> {
     Box::new(JsCallError(msg))
 }
 
 fn call_method(obj: &JsValue, method: &str, args: &Array) -> Result<JsValue, String> {
-    let func_val = js_sys::Reflect::get(obj, &JsValue::from_str(method))
+    let func_val = Reflect::get(obj, &JsValue::from_str(method))
         .map_err(|e| format!("failed to get method '{method}': {e:?}"))?;
     let func = Function::from(func_val);
     func.apply(obj, args)
@@ -210,7 +214,7 @@ async fn resolve_promise(val: JsValue) -> Result<JsValue, String> {
 /// Same as [`call_method`], but keeps the thrown value instead of
 /// stringifying it, so a caller can read a `refusal` property off it.
 fn call_method_value(obj: &JsValue, method: &str, args: &Array) -> Result<JsValue, JsValue> {
-    let func_val = js_sys::Reflect::get(obj, &JsValue::from_str(method))?;
+    let func_val = Reflect::get(obj, &JsValue::from_str(method))?;
     Function::from(func_val).apply(obj, args)
 }
 
@@ -225,7 +229,7 @@ async fn resolve_promise_value(val: JsValue) -> Result<JsValue, JsValue> {
 /// — and maps its wire string to a [`Refusal`]. `None` for any other shape,
 /// which callers treat as an ordinary backend failure.
 fn refusal_from_js(value: &JsValue) -> Option<Refusal> {
-    js_sys::Reflect::get(value, &JsValue::from_str("refusal"))
+    Reflect::get(value, &JsValue::from_str("refusal"))
         .ok()
         .and_then(|v| v.as_string())
         .and_then(|reason| refusal_from_reason(&reason))
@@ -325,13 +329,9 @@ impl DeRecSecretStore for JsSecretStore {
                     (!raw.is_null() && !raw.is_undefined()).then(|| Uint8Array::new(&raw).to_vec())
                 })
                 .collect();
-            crate::interop::secret_batch::collect(
-                &requested,
-                entries,
-                kind,
-                missing_policy,
-                |bytes| decode_secret_value(kind, &bytes),
-            )
+            secret_batch::collect(&requested, entries, kind, missing_policy, |bytes| {
+                decode_secret_value(kind, &bytes)
+            })
         })
     }
 
@@ -479,13 +479,13 @@ fn record_key(record: &ChannelRecord) -> (String, String) {
 /// as their Rust variant names, matching the records the same store returns.
 fn encode_filter<Role: serde::Serialize>(
     ids: &[u64],
-    status: &[crate::protocol::types::ChannelStatus],
+    status: &[ChannelStatus],
     role: Option<&Role>,
     exclude: &[u64],
 ) -> Result<JsValue, ChannelStoreError> {
-    let obj = js_sys::Object::new();
+    let obj = Object::new();
     let set = |key: &str, value: &JsValue| -> Result<(), ChannelStoreError> {
-        js_sys::Reflect::set(&obj, &JsValue::from_str(key), value)
+        Reflect::set(&obj, &JsValue::from_str(key), value)
             .map(|_| ())
             .map_err(|e| ChannelStoreError::Backend(box_err(format!("{e:?}"))))
     };
@@ -518,7 +518,7 @@ fn encode_filter<Role: serde::Serialize>(
     Ok(obj.into())
 }
 
-async fn list_records<T: serde::de::DeserializeOwned>(
+async fn list_records<T: DeserializeOwned>(
     obj: &JsValue,
     method: &str,
     secret_str: &str,
@@ -737,27 +737,27 @@ impl DeRecChannelStore for JsChannelStore {
 pub struct JsShareStore(pub JsValue);
 
 fn share_to_js(share: &Share) -> JsValue {
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
+    let obj = Object::new();
+    Reflect::set(
         &obj,
         &"secretId".into(),
         &JsValue::from_str(&share.secret_id.to_string()),
     )
     .unwrap_or_default();
-    js_sys::Reflect::set(
+    Reflect::set(
         &obj,
         &"version".into(),
         &JsValue::from_f64(share.version as f64),
     )
     .unwrap_or_default();
     let js_bytes = Uint8Array::from(share.bytes.as_slice());
-    js_sys::Reflect::set(&obj, &"bytes".into(), &js_bytes).unwrap_or_default();
+    Reflect::set(&obj, &"bytes".into(), &js_bytes).unwrap_or_default();
     for (key, value) in [
         ("subshares", share.subshares),
         ("threshold", share.threshold),
     ] {
         if let Some(value) = value {
-            js_sys::Reflect::set(&obj, &key.into(), &JsValue::from_f64(f64::from(value)))
+            Reflect::set(&obj, &key.into(), &JsValue::from_f64(f64::from(value)))
                 .unwrap_or_default();
         }
     }
@@ -779,7 +779,7 @@ fn optional_string_from_js(
     what: &str,
     key: &str,
 ) -> Result<Option<String>, ShareStoreError> {
-    let value = js_sys::Reflect::get(item, &key.into()).unwrap_or(JsValue::UNDEFINED);
+    let value = Reflect::get(item, &key.into()).unwrap_or(JsValue::UNDEFINED);
     if value.is_undefined() || value.is_null() {
         return Ok(None);
     }
@@ -797,7 +797,7 @@ fn optional_u32_from_js(
     what: &str,
     key: &str,
 ) -> Result<Option<u32>, ShareStoreError> {
-    let value = js_sys::Reflect::get(item, &key.into()).unwrap_or(JsValue::UNDEFINED);
+    let value = Reflect::get(item, &key.into()).unwrap_or(JsValue::UNDEFINED);
     if value.is_undefined() || value.is_null() {
         return Ok(None);
     }
@@ -809,7 +809,7 @@ fn optional_u32_from_js(
 }
 
 fn share_from_js(item: &JsValue) -> Result<Share, ShareStoreError> {
-    let secret_id_str = js_sys::Reflect::get(item, &"secretId".into())
+    let secret_id_str = Reflect::get(item, &"secretId".into())
         .ok()
         .and_then(|v| v.as_string())
         .unwrap_or_default();
@@ -818,13 +818,13 @@ fn share_from_js(item: &JsValue) -> Result<Share, ShareStoreError> {
             "share.secretId must be a numeric string: {e}"
         )))
     })?;
-    let version = js_sys::Reflect::get(item, &"version".into())
+    let version = Reflect::get(item, &"version".into())
         .ok()
         .and_then(|v| u32_from_js(&v))
         .ok_or_else(|| {
             ShareStoreError::Backend(box_err("share.version must be a u32".to_string()))
         })?;
-    let bytes_val = js_sys::Reflect::get(item, &"bytes".into()).unwrap_or(JsValue::null());
+    let bytes_val = Reflect::get(item, &"bytes".into()).unwrap_or(JsValue::null());
     let bytes = Uint8Array::new(&bytes_val).to_vec();
     Ok(Share {
         secret_id,
@@ -1127,8 +1127,8 @@ impl DeRecShareStore for JsShareStore {
 pub struct JsUserSecretStore(pub JsValue);
 
 fn user_secrets_to_js(value: &UserSecrets) -> JsValue {
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
+    let obj = Object::new();
+    Reflect::set(
         &obj,
         &"version".into(),
         &JsValue::from_f64(f64::from(value.version)),
@@ -1136,22 +1136,20 @@ fn user_secrets_to_js(value: &UserSecrets) -> JsValue {
     .unwrap_or_default();
     let entries = Array::new();
     for s in &value.secrets {
-        let entry = js_sys::Object::new();
+        let entry = Object::new();
         let id = Uint8Array::from(s.id.as_slice());
         let data = Uint8Array::from(s.data.as_slice());
-        js_sys::Reflect::set(&entry, &"id".into(), &id).unwrap_or_default();
-        js_sys::Reflect::set(&entry, &"name".into(), &JsValue::from_str(&s.name))
-            .unwrap_or_default();
-        js_sys::Reflect::set(&entry, &"data".into(), &data).unwrap_or_default();
+        Reflect::set(&entry, &"id".into(), &id).unwrap_or_default();
+        Reflect::set(&entry, &"name".into(), &JsValue::from_str(&s.name)).unwrap_or_default();
+        Reflect::set(&entry, &"data".into(), &data).unwrap_or_default();
         entries.push(&entry);
     }
-    js_sys::Reflect::set(&obj, &"secrets".into(), &entries).unwrap_or_default();
+    Reflect::set(&obj, &"secrets".into(), &entries).unwrap_or_default();
     if let Some(d) = value.description.as_deref() {
-        js_sys::Reflect::set(&obj, &"description".into(), &JsValue::from_str(d))
-            .unwrap_or_default();
+        Reflect::set(&obj, &"description".into(), &JsValue::from_str(d)).unwrap_or_default();
     }
     if let Some(author) = value.author_replica_id {
-        js_sys::Reflect::set(
+        Reflect::set(
             &obj,
             &"author_replica_id".into(),
             &JsValue::from_str(&author.to_string()),
@@ -1159,7 +1157,7 @@ fn user_secrets_to_js(value: &UserSecrets) -> JsValue {
         .unwrap_or_default();
     }
     if let Some(threshold) = value.threshold {
-        js_sys::Reflect::set(
+        Reflect::set(
             &obj,
             &"threshold".into(),
             &JsValue::from_f64(f64::from(threshold)),
@@ -1170,7 +1168,7 @@ fn user_secrets_to_js(value: &UserSecrets) -> JsValue {
 }
 
 fn user_secrets_from_js(value: &JsValue) -> Result<UserSecrets, ShareStoreError> {
-    let version = js_sys::Reflect::get(value, &"version".into())
+    let version = Reflect::get(value, &"version".into())
         .ok()
         .and_then(|v| u32_from_js(&v))
         .ok_or_else(|| {
@@ -1184,7 +1182,7 @@ fn user_secrets_from_js(value: &JsValue) -> Result<UserSecrets, ShareStoreError>
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     }
-    let entries_val = js_sys::Reflect::get(value, &"secrets".into()).unwrap_or(JsValue::UNDEFINED);
+    let entries_val = Reflect::get(value, &"secrets".into()).unwrap_or(JsValue::UNDEFINED);
     if !Array::is_array(&entries_val) {
         return Err(ShareStoreError::Backend(box_err(
             "userSecrets.secrets must be an array".to_string(),
@@ -1319,7 +1317,7 @@ impl DeRecTransport for JsTransport {
                 .map_err(|_| Error::InvalidInput("transport.send call failed"))?;
             resolve_promise(promise_val)
                 .await
-                .map_err(|_| Error::InvalidInput("transport.send promise rejected"))?;
+                .map_err(|_| Error::TransportSendFailed)?;
             Ok(())
         })
     }

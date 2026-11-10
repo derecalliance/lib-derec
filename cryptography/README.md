@@ -114,6 +114,12 @@ covers the keys, one made for another initiator's keys does not open over
 these. Neither party can steer the channel key, and so the fingerprint below,
 by searching over its own contribution.
 
+The commitment, like the `HashedKeys` binding hash `contact_binding_hash`,
+concatenates the two keys without their lengths. Each key has a fixed size
+(`mlkem::ENCAPSULATION_KEY_SIZE_IN_BYTES`, `ecies::PUBLIC_KEY_SIZE_IN_BYTES`),
+and both functions return `DerecPairingError::InvalidSize` for any other, so
+no other split of the same bytes can produce the same hash.
+
 ---
 
 ## Replica Fingerprint

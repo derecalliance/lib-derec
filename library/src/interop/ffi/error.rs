@@ -24,8 +24,12 @@
 
 use std::ffi::CString;
 use std::os::raw::c_char;
+use std::{mem, ptr};
 
+use crate::Error;
+use crate::error_codes::classify;
 use crate::primitives::{recovery::RecoveryError, sharing::SharingError};
+use crate::protocol::RestoreError;
 
 #[repr(C)]
 pub struct DeRecError {
@@ -41,6 +45,10 @@ pub struct DeRecError {
     pub expected: u32,
     /// Valid when `code == DEREC_CODE_VERSION_MISMATCH`.
     pub got: u32,
+    /// Whether `channel_id` is set: the error names the channel it is about.
+    pub has_channel_id: bool,
+    /// The channel the error is about. Valid when `has_channel_id`.
+    pub channel_id: u64,
 }
 
 pub const DEREC_CATEGORY_OK: i32 = 0;
@@ -59,6 +67,7 @@ pub const DEREC_CATEGORY_INVALID_INPUT: i32 = 12;
 pub const DEREC_CATEGORY_PROTOBUF: i32 = 13;
 pub const DEREC_CATEGORY_INVARIANT: i32 = 14;
 pub const DEREC_CATEGORY_STATE_STORE: i32 = 15;
+pub const DEREC_CATEGORY_TRANSPORT: i32 = 16;
 
 pub const DEREC_CODE_OK: i32 = 0;
 pub const DEREC_CODE_NON_OK_STATUS: i32 = 1;
@@ -155,6 +164,11 @@ pub const DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE: i32 = 47;
 /// commitment, so applications can treat it as a possible
 /// man-in-the-middle.
 pub const DEREC_CODE_FINGERPRINT_COMMITMENT_MISMATCH: i32 = 48;
+/// The pairing outlived `Timeouts::pairing`: the scanner refuses a contact
+/// older than it, and the contact's creator refuses to accept a request
+/// that arrives after it. Surfaced as [`DEREC_CATEGORY_PAIRING`]; nothing is
+/// sent to the peer, and a fresh contact starts a new pairing.
+pub const DEREC_CODE_PAIRING_EXPIRED: i32 = 49;
 
 pub const DEREC_CODE_EMPTY_CHANNELS: i32 = 60;
 pub const DEREC_CODE_DUPLICATE_CHANNEL_ID: i32 = 61;
@@ -200,6 +214,11 @@ pub const DEREC_CODE_NO_USABLE_ENDPOINT: i32 = 121;
 
 // 122 is retired (formerly the conflicting plaintext opt-in); never reassign it.
 
+/// The application's transport delivered a message to none of the peer's
+/// endpoints: the `send` callback returned non-zero.
+/// `DEREC_CATEGORY_TRANSPORT`.
+pub const DEREC_CODE_TRANSPORT_SEND_FAILED: i32 = 123;
+
 /// Return codes for [`crate::interop::ffi::protocol::stores::ShareStoreCallbacks::save`]
 /// and `ShareStoreCallbacks::record_verification`: `0` is success, each of
 /// these three refuses the write/verification with the matching
@@ -214,11 +233,13 @@ pub(crate) fn success() -> DeRecError {
     DeRecError {
         category: DEREC_CATEGORY_OK,
         code: DEREC_CODE_OK,
-        message: std::ptr::null_mut(),
+        message: ptr::null_mut(),
         peer_status: 0,
-        peer_memo: std::ptr::null_mut(),
+        peer_memo: ptr::null_mut(),
         expected: 0,
         got: 0,
+        has_channel_id: false,
+        channel_id: 0,
     }
 }
 
@@ -228,19 +249,21 @@ pub(crate) fn ffi_error(code: i32, msg: impl AsRef<str>) -> DeRecError {
         code,
         message: to_owned_cstring(msg.as_ref()),
         peer_status: 0,
-        peer_memo: std::ptr::null_mut(),
+        peer_memo: ptr::null_mut(),
         expected: 0,
         got: 0,
+        has_channel_id: false,
+        channel_id: 0,
     }
 }
 
 /// Maps a [`crate::Error`] into a typed FFI error. Single source of truth for
 /// category/code mapping — extend the arms here when adding new variants.
-pub(crate) fn from_lib_error(err: crate::Error) -> DeRecError {
+pub(crate) fn from_lib_error(err: Error) -> DeRecError {
     // Restore errors carry richer per-variant messages (e.g. the
     // colliding channel-id list on `Conflict`); delegate so callers
     // see the formatted detail instead of the bare thiserror string.
-    if let crate::Error::Restore(e) = err {
+    if let Error::Restore(e) = err {
         return from_restore_error(e);
     }
     let (category, code) = categorize(&err);
@@ -249,15 +272,15 @@ pub(crate) fn from_lib_error(err: crate::Error) -> DeRecError {
     let (peer_status, peer_memo) = err
         .as_non_ok_status()
         .map(|(s, m)| (s, to_owned_cstring(m)))
-        .unwrap_or((0, std::ptr::null_mut()));
+        .unwrap_or((0, ptr::null_mut()));
 
     let (expected, got) = match &err {
-        crate::Error::Sharing(SharingError::VersionMismatch { expected, got })
-        | crate::Error::Recovery(RecoveryError::VersionMismatch { expected, got }) => {
-            (*expected, *got)
-        }
+        Error::Sharing(SharingError::VersionMismatch { expected, got })
+        | Error::Recovery(RecoveryError::VersionMismatch { expected, got }) => (*expected, *got),
         _ => (0, 0),
     };
+
+    let channel_id = err.channel_id();
 
     DeRecError {
         category,
@@ -267,12 +290,13 @@ pub(crate) fn from_lib_error(err: crate::Error) -> DeRecError {
         peer_memo,
         expected,
         got,
+        has_channel_id: channel_id.is_some(),
+        channel_id: channel_id.map_or(0, |id| id.0),
     }
 }
 
 /// Map a [`crate::protocol::RestoreError`] to a typed FFI error.
-pub(crate) fn from_restore_error(err: crate::protocol::RestoreError) -> DeRecError {
-    use crate::protocol::RestoreError;
+pub(crate) fn from_restore_error(err: RestoreError) -> DeRecError {
     let message = match &err {
         RestoreError::Conflict(ids) => {
             let id_list: Vec<String> = ids.iter().map(|c| c.0.to_string()).collect();
@@ -281,15 +305,17 @@ pub(crate) fn from_restore_error(err: crate::protocol::RestoreError) -> DeRecErr
         RestoreError::Invariant(msg) => msg.to_string(),
         RestoreError::AlreadyRestored => err.to_string(),
     };
-    let (category, code) = categorize(&crate::Error::Restore(err));
+    let (category, code) = categorize(&Error::Restore(err));
     DeRecError {
         category,
         code,
         message: to_owned_cstring(&message),
         peer_status: 0,
-        peer_memo: std::ptr::null_mut(),
+        peer_memo: ptr::null_mut(),
         expected: 0,
         got: 0,
+        has_channel_id: false,
+        channel_id: 0,
     }
 }
 
@@ -317,7 +343,7 @@ pub unsafe extern "C" fn derec_free_error(error: *mut DeRecError) {
     // struct.
     let error = unsafe { &mut *error };
     if !error.message.is_null() {
-        let message = std::mem::replace(&mut error.message, std::ptr::null_mut());
+        let message = mem::replace(&mut error.message, ptr::null_mut());
         // SAFETY: `message` was produced by `CString::into_raw` in
         // `to_owned_cstring`. We swapped in null above so even if a
         // future caller invokes us again on the same struct, the
@@ -325,14 +351,14 @@ pub unsafe extern "C" fn derec_free_error(error: *mut DeRecError) {
         unsafe { drop(CString::from_raw(message)) };
     }
     if !error.peer_memo.is_null() {
-        let peer_memo = std::mem::replace(&mut error.peer_memo, std::ptr::null_mut());
+        let peer_memo = mem::replace(&mut error.peer_memo, ptr::null_mut());
         // SAFETY: same as `message`.
         unsafe { drop(CString::from_raw(peer_memo)) };
     }
 }
 
-fn categorize(err: &crate::Error) -> (i32, i32) {
-    let (category, code) = crate::error_codes::classify(err);
+fn categorize(err: &Error) -> (i32, i32) {
+    let (category, code) = classify(err);
     (category as i32, code as i32)
 }
 

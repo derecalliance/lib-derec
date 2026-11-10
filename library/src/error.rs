@@ -37,47 +37,60 @@
 //! logic errors or unexpected states and should normally not occur in correct
 //! usage of the library.
 
+use derec_proto::SenderKind;
+
+use crate::derec_message::DeRecMessageBuilderError;
+use crate::primitives::{
+    discovery::DiscoveryError, pairing::PairingError, recovery::RecoveryError,
+    sharing::SharingError, unpairing::UnpairingError, verification::VerificationError,
+};
+use crate::protocol::{
+    ChannelStoreError, RestoreError, SecretStoreError, ShareStoreError, StateStoreError,
+};
+use crate::transport::TransportValidationError;
+use crate::types::ChannelId;
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
-    Pairing(#[from] crate::primitives::pairing::PairingError),
+    Pairing(#[from] PairingError),
 
     #[error(transparent)]
-    Recovery(#[from] crate::primitives::recovery::RecoveryError),
+    Recovery(#[from] RecoveryError),
 
     #[error(transparent)]
-    Discovery(#[from] crate::primitives::discovery::DiscoveryError),
+    Discovery(#[from] DiscoveryError),
 
     #[error(transparent)]
-    Sharing(#[from] crate::primitives::sharing::SharingError),
+    Sharing(#[from] SharingError),
 
     #[error(transparent)]
-    Verification(#[from] crate::primitives::verification::VerificationError),
+    Verification(#[from] VerificationError),
 
     #[error(transparent)]
-    Unpairing(#[from] crate::primitives::unpairing::UnpairingError),
+    Unpairing(#[from] UnpairingError),
 
     #[error(transparent)]
-    Restore(#[from] crate::protocol::RestoreError),
+    Restore(#[from] RestoreError),
 
     #[error(transparent)]
-    DeRecMessage(#[from] crate::derec_message::DeRecMessageBuilderError),
+    DeRecMessage(#[from] DeRecMessageBuilderError),
 
     #[error(transparent)]
-    SecretStore(#[from] crate::protocol::SecretStoreError),
+    SecretStore(#[from] SecretStoreError),
 
     #[error(transparent)]
-    ChannelStore(#[from] crate::protocol::ChannelStoreError),
+    ChannelStore(#[from] ChannelStoreError),
 
     #[error(transparent)]
-    ShareStore(#[from] crate::protocol::ShareStoreError),
+    ShareStore(#[from] ShareStoreError),
 
     #[error(transparent)]
-    StateStore(#[from] crate::protocol::StateStoreError),
+    StateStore(#[from] StateStoreError),
 
     #[error(transparent)]
-    Transport(#[from] crate::transport::TransportValidationError),
+    Transport(#[from] TransportValidationError),
 
     #[error("invalid input: {0}")]
     InvalidInput(&'static str),
@@ -93,17 +106,20 @@ pub enum Error {
 
     #[error("role mismatch on channel {channel_id:?}: expected {expected:?}, got {actual:?}")]
     RoleMismatch {
-        channel_id: crate::types::ChannelId,
-        expected: derec_proto::SenderKind,
-        actual: derec_proto::SenderKind,
+        channel_id: ChannelId,
+        expected: SenderKind,
+        actual: SenderKind,
     },
 
-    /// `start(Pairing)` was called for a `channel_id` that already has
-    /// a `Paired` or `Unpairing` channel record. Re-pairing would silently
-    /// overwrite the stored `SharedKey`; the caller must skip the call, or
-    /// unpair first and wait for [`DeRecEvent::Unpaired`](crate::protocol::DeRecEvent::Unpaired).
+    /// `start(Pairing)` was called for a `channel_id` this device already
+    /// uses: it has a `Paired` or `Unpairing` channel record, a replica
+    /// member is recorded on it, or a key is stored under it. The contact's
+    /// creator chooses its channel identifier, and pairing on one in use
+    /// would overwrite or later remove the key stored there; the caller must
+    /// skip the call, or unpair first and wait for
+    /// [`DeRecEvent::Unpaired`](crate::protocol::DeRecEvent::Unpaired).
     #[error("channel {channel_id:?} is already paired")]
-    ChannelAlreadyPaired { channel_id: crate::types::ChannelId },
+    ChannelAlreadyPaired { channel_id: ChannelId },
 
     /// A replica-mode flow was attempted but the protocol was built without
     /// [`DeRecProtocolBuilder::with_replica_id`](crate::protocol::DeRecProtocolBuilder::with_replica_id).
@@ -148,7 +164,18 @@ pub enum Error {
     /// can never be used. Pairing again is the only way forward. A channel
     /// already `Paired` is left as it is; removing it is an unpair.
     #[error("fingerprint does not match channel {channel_id:?}: possible man-in-the-middle")]
-    FingerprintMismatch { channel_id: crate::types::ChannelId },
+    FingerprintMismatch { channel_id: ChannelId },
+
+    /// A [`DeRecTransport`](crate::protocol::DeRecTransport) reported that
+    /// a message reached none of the peer's endpoints.
+    ///
+    /// The variant a transport returns when delivery failed, and the one the
+    /// FFI and WASM bindings report when the application's transport
+    /// callback fails, so the same failure reads the same in every SDK. The
+    /// protocol state a failed send leaves is the same as for a message lost
+    /// in transit: the request is retried, or times out.
+    #[error("transport send failed: the message reached none of the peer's endpoints")]
+    TransportSendFailed,
 
     /// A peer advertised no endpoint this library will record.
     ///
@@ -175,31 +202,29 @@ pub enum Error {
 }
 
 impl Error {
+    /// The channel this error is about, for the variants that name one:
+    /// [`Error::ChannelAlreadyPaired`], [`Error::FingerprintMismatch`] and
+    /// [`Error::RoleMismatch`]. Every SDK reports it as the error's
+    /// `channel_id`.
+    pub fn channel_id(&self) -> Option<ChannelId> {
+        match self {
+            Error::ChannelAlreadyPaired { channel_id }
+            | Error::FingerprintMismatch { channel_id }
+            | Error::RoleMismatch { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        }
+    }
+
     pub fn as_non_ok_status(&self) -> Option<(i32, &str)> {
         match self {
-            Error::Pairing(crate::primitives::pairing::PairingError::NonOkStatus {
-                status,
-                memo,
-            }) => Some((*status, memo)),
-            Error::Sharing(crate::primitives::sharing::SharingError::NonOkStatus {
-                status,
-                memo,
-            }) => Some((*status, memo)),
-            Error::Verification(
-                crate::primitives::verification::VerificationError::NonOkStatus { status, memo },
-            ) => Some((*status, memo)),
-            Error::Discovery(crate::primitives::discovery::DiscoveryError::NonOkStatus {
-                status,
-                memo,
-            }) => Some((*status, memo)),
-            Error::Recovery(crate::primitives::recovery::RecoveryError::NonOkStatus {
-                status,
-                memo,
-            }) => Some((*status, memo)),
-            Error::Unpairing(crate::primitives::unpairing::UnpairingError::NonOkStatus {
-                status,
-                memo,
-            }) => Some((*status, memo)),
+            Error::Pairing(PairingError::NonOkStatus { status, memo }) => Some((*status, memo)),
+            Error::Sharing(SharingError::NonOkStatus { status, memo }) => Some((*status, memo)),
+            Error::Verification(VerificationError::NonOkStatus { status, memo }) => {
+                Some((*status, memo))
+            }
+            Error::Discovery(DiscoveryError::NonOkStatus { status, memo }) => Some((*status, memo)),
+            Error::Recovery(RecoveryError::NonOkStatus { status, memo }) => Some((*status, memo)),
+            Error::Unpairing(UnpairingError::NonOkStatus { status, memo }) => Some((*status, memo)),
             _ => None,
         }
     }

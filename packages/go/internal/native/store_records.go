@@ -439,9 +439,13 @@ type stateItemWire struct {
 	// ShareChannels is index-aligned with Shares. Absent on rows written
 	// before 0.0.7; the library reads such a row as no shares collected.
 	ShareChannels *[]string `json:"share_channels,omitempty"`
-	Pending       *[]string `json:"pending,omitempty"`
-	Confirmed     *[]string `json:"confirmed,omitempty"`
-	Failed        *[]string `json:"failed,omitempty"`
+	// Pending is SharingRound's unanswered helpers, and PendingRecovery's
+	// helpers still to answer a share request. A PendingRecovery row without
+	// it, or without started_at, decodes in the library as none pending,
+	// sent at 0, so the next sweep settles it on the shares it holds.
+	Pending   *[]string `json:"pending,omitempty"`
+	Confirmed *[]string `json:"confirmed,omitempty"`
+	Failed    *[]string `json:"failed,omitempty"`
 	// Replica-leg accounting, keyed by replica_id. Absent on rows written
 	// before the leg existed, which decode as empty rather than failing.
 	PendingReplicas *[]string               `json:"pending_replicas,omitempty"`
@@ -514,6 +518,10 @@ func EncodeStateItem(item StateItem) ([]byte, error) {
 		if item.ShareChannels != nil {
 			shareChannels := stringifyUint64s(item.ShareChannels)
 			w.ShareChannels = &shareChannels
+		}
+		if item.Pending != nil {
+			pending := stringifyUint64s(item.Pending)
+			w.Pending = &pending
 		}
 	case StateKindSharingRound:
 		pending := stringifyUint64s(item.Pending)

@@ -16,10 +16,14 @@ use crate::{
             },
         },
     },
+    transport::TransportValidationError,
     types::ChannelId,
 };
-use derec_proto::{DeRecMessage, MessageBody, StatusEnum};
+use derec_proto::{
+    DeRecMessage, MessageBody, Protocol, StatusEnum, TransportProtocol, UnpairResponseMessage,
+};
 use prost::Message;
+use std::slice;
 
 #[test]
 fn test_produce_unpair_request_produces_non_empty_envelope() {
@@ -165,7 +169,7 @@ fn test_process_unpair_response_accepts_ok() {
 
 #[test]
 fn test_process_unpair_response_surfaces_missing_result() {
-    let response = derec_proto::UnpairResponseMessage {
+    let response = UnpairResponseMessage {
         result: None,
         timestamp: None,
     };
@@ -238,16 +242,16 @@ fn test_extract_unpair_request_rejects_scheme_mismatched_reply_to() {
     let channel_id = ChannelId(9);
     let shared_key = make_shared_key(17);
 
-    let malicious_reply_to = derec_proto::TransportProtocol {
+    let malicious_reply_to = TransportProtocol {
         uri: "ws://attacker.example/inbox".to_owned(),
-        protocol: derec_proto::Protocol::Https as i32,
+        protocol: Protocol::Https as i32,
     };
 
     let produced = produce_unpair_request_message(
         channel_id,
         "bye",
         &crate::types::ChannelKey::new(0, shared_key.clone()),
-        std::slice::from_ref(&malicious_reply_to),
+        slice::from_ref(&malicious_reply_to),
         None,
     )
     .expect("failed to produce unpair request");
@@ -257,7 +261,7 @@ fn test_extract_unpair_request_rejects_scheme_mismatched_reply_to() {
     assert!(matches!(
         result,
         Err(Error::Transport(
-            crate::transport::TransportValidationError::SchemeMismatch { .. }
+            TransportValidationError::SchemeMismatch { .. }
         ))
     ));
 }

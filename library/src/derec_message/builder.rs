@@ -69,10 +69,17 @@
 use std::marker::PhantomData;
 
 use crate::{
-    derec_message::DeRecMessageBuilderError, protocol_version::ProtocolVersion, types::ChannelId,
+    derec_message::DeRecMessageBuilderError,
+    protocol_version::ProtocolVersion,
+    types::{ChannelId, ChannelKey},
+    utils::{os_rng, random_u64},
 };
+use derec_cryptography::{channel, pairing::envelope};
 use derec_proto::{DeRecMessage, MessageBody};
+#[cfg(target_arch = "wasm32")]
+use js_sys::Date;
 use prost_types::Timestamp;
+use rand::Rng;
 
 /// Typestate marker indicating that the payload has not yet been encrypted.
 #[derive(Debug)]
@@ -245,7 +252,7 @@ impl<State, Mode> DeRecMessageBuilder<State, Mode> {
     ///
     /// The updated builder with a random `trace_id`.
     pub fn auto_trace_id(mut self) -> Self {
-        self.trace_id = Some(crate::utils::random_u64());
+        self.trace_id = Some(random_u64());
         self
     }
 
@@ -330,8 +337,7 @@ impl DeRecMessageBuilder<NotEncrypted, PairingMode> {
             .ok_or(DeRecMessageBuilderError::MissingMessage)?;
 
         let encoded = message.encode_to_vec();
-        let encrypted =
-            derec_cryptography::pairing::envelope::encrypt(&encoded, public_key.as_ref())?;
+        let encrypted = envelope::encrypt(&encoded, public_key.as_ref())?;
 
         Ok(DeRecMessageBuilder {
             message: None,
@@ -406,7 +412,7 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
     /// - the underlying channel encryption routine fails
     pub fn encrypt(
         self,
-        channel_key: &crate::types::ChannelKey,
+        channel_key: &ChannelKey,
     ) -> Result<DeRecMessageBuilder<Encrypted, ChannelMode>, DeRecMessageBuilderError> {
         let message = self
             .message
@@ -417,14 +423,10 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
             .ok_or(DeRecMessageBuilderError::MissingChannelId)?;
 
         let mut nonce = [0u8; 32];
-        rand::Rng::fill_bytes(&mut crate::utils::os_rng(), &mut nonce[..12]);
+        Rng::fill_bytes(&mut os_rng(), &mut nonce[..12]);
 
         let encoded = message.encode_to_vec();
-        let encrypted = derec_cryptography::channel::encrypt_message(
-            &encoded,
-            channel_key.key.as_bytes(),
-            &nonce,
-        )?;
+        let encrypted = channel::encrypt_message(&encoded, channel_key.key.as_bytes(), &nonce)?;
 
         Ok(DeRecMessageBuilder {
             message: None,
@@ -528,7 +530,7 @@ pub fn current_timestamp() -> Timestamp {
 
 #[cfg(target_arch = "wasm32")]
 pub fn current_timestamp() -> Timestamp {
-    let millis = js_sys::Date::now() as i64;
+    let millis = Date::now() as i64;
 
     Timestamp {
         seconds: millis / 1000,

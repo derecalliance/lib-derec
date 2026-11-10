@@ -710,7 +710,7 @@ describe('event byte fields', () => {
   });
 
   it('passes RecoveryShareCorrupted through with every reason', async () => {
-    const reasons: CorruptionReason[] = ['Malformed', 'InvalidProof', 'Inconsistent'];
+    const reasons: CorruptionReason[] = ['Malformed', 'InvalidProof', 'Forged'];
     const events = reasons.map(reason => ({
       type: 'RecoveryShareCorrupted',
       channel_id: '18446744073709551615',
@@ -754,6 +754,7 @@ describe('event byte fields', () => {
         helpers: [{channel_id: '18446744073709551615', transports: [], shared_key: new Uint8Array([1])}],
         secrets: [],
       },
+      1,
       1,
     )) as Array<Extract<DeRecEvent, {type: 'PeerNotRestored'}>>;
 

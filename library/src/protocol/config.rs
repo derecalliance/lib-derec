@@ -14,12 +14,18 @@ use super::traits::{
     DeRecUserSecretStore,
 };
 use super::types::{PairingKeyMaterial, SecretValue};
+use crate::Error;
+use crate::protocol::types::Timeouts;
+use crate::transport;
+use crate::transport::IntoOwnTransport;
+use crate::utils;
 use crate::{
     Result, primitives::pairing::request::create_contact as create_contact_message,
     types::ChannelId,
 };
 use derec_proto::{ContactMessage, ContactMode, TransportProtocol};
 use std::collections::HashMap;
+use std::result;
 
 impl<
     Ch: DeRecChannelStore,
@@ -60,10 +66,10 @@ impl<
         transport: T,
         own_transports: Vec<TransportProtocol>,
         threshold: usize,
-        timeouts: crate::protocol::types::Timeouts,
+        timeouts: Timeouts,
     ) -> Result<Self> {
         if threshold < 2 {
-            return Err(crate::Error::InvalidInput(
+            return Err(Error::InvalidInput(
                 "threshold must be >= 2; 0 or 1 lets a single helper reconstruct the secret \
                  and defeats threshold sharing",
             ));
@@ -153,17 +159,17 @@ impl<
     ///
     /// # What is persisted
     ///
-    /// Each mode leaves behind what its inbound handler will need to look the
-    /// contact back up:
+    /// Every mode stores the contact itself as
+    /// [`SecretKind::PairingContact`](crate::protocol::SecretKind::PairingContact).
+    /// Its timestamp is what the inbound handlers measure the contact's age
+    /// against (see [`Timeouts::pairing`](crate::protocol::types::Timeouts::pairing)),
+    /// and for `NoKeys` its `nonce` is what authenticates the caller.
     ///
-    /// - `InlineKeys` and `HashedKeys` store the generated secret key as
-    ///   [`SecretKind::PairingSecret`](crate::protocol::SecretKind::PairingSecret). The handler decrypts the encrypted
-    ///   `PairRequest` with it, and republishes the keys on the `PrePair` leg
-    ///   for `HashedKeys`.
-    /// - `NoKeys` has no key material yet, so the contact itself is stored as
-    ///   [`SecretKind::PairingContact`](crate::protocol::SecretKind::PairingContact). The inbound `PrePairRequest` handler
-    ///   authenticates the caller by matching its `nonce` against it, then
-    ///   generates fresh key material for the response.
+    /// `InlineKeys` and `HashedKeys` also store the generated secret key as
+    /// [`SecretKind::PairingSecret`](crate::protocol::SecretKind::PairingSecret).
+    /// The handler decrypts the encrypted `PairRequest` with it, and
+    /// republishes the keys on the `PrePair` leg for `HashedKeys`. `NoKeys`
+    /// has no key material yet; its `PrePairRequest` handler generates it.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
     pub async fn create_contact(
         &mut self,
@@ -171,7 +177,7 @@ impl<
         contact_mode: ContactMode,
         nonce: Option<u64>,
     ) -> Result<ContactMessage> {
-        let channel_id = channel_id.unwrap_or_else(|| ChannelId(crate::utils::random_u64()));
+        let channel_id = channel_id.unwrap_or_else(|| ChannelId(utils::random_u64()));
 
         #[cfg(feature = "logging")]
         tracing::debug!(
@@ -183,26 +189,22 @@ impl<
         let result =
             create_contact_message(channel_id, contact_mode, self.own_transports.clone(), nonce)?;
 
-        match result.secret_key {
-            Some(secret_key) => {
-                self.secret_store
-                    .save(
-                        self.secret_id,
-                        channel_id,
-                        SecretValue::PairingSecret(PairingKeyMaterial::from_secret(&secret_key)),
-                    )
-                    .await?;
-            }
-            None => {
-                self.secret_store
-                    .save(
-                        self.secret_id,
-                        channel_id,
-                        SecretValue::PairingContact(result.contact_message.clone()),
-                    )
-                    .await?;
-            }
+        if let Some(secret_key) = result.secret_key {
+            self.secret_store
+                .save(
+                    self.secret_id,
+                    channel_id,
+                    SecretValue::PairingSecret(PairingKeyMaterial::from_secret(&secret_key)),
+                )
+                .await?;
         }
+        self.secret_store
+            .save(
+                self.secret_id,
+                channel_id,
+                SecretValue::PairingContact(result.contact_message.clone()),
+            )
+            .await?;
 
         #[cfg(feature = "logging")]
         tracing::info!(channel_id = channel_id.0, "contact message created");
@@ -231,7 +233,7 @@ impl<
     /// [`DeRecProtocolBuilder::with_own_transports`](crate::protocol::DeRecProtocolBuilder::with_own_transports).
     /// A device serves at most one endpoint per protocol, so the list is a
     /// preference order over distinct protocols; see the
-    /// [`transport`](crate::transport) module docs.
+    /// [`transport`] module docs.
     ///
     /// Only mutates local state — to propagate the change to paired peers,
     /// follow up with [`DeRecFlow::UpdateChannelInfo`](crate::protocol::DeRecFlow::UpdateChannelInfo).
@@ -268,22 +270,19 @@ impl<
     /// Held to exactly the rules [`DeRecProtocolBuilder::build`](crate::protocol::DeRecProtocolBuilder::build)
     /// applies, so a set can never reach a state the builder would refuse.
     /// Nothing is stored unless every check passes.
-    pub fn set_own_transports<I, E>(&mut self, own_transports: I) -> crate::Result<()>
+    pub fn set_own_transports<I, E>(&mut self, own_transports: I) -> Result<()>
     where
         I: IntoIterator<Item = E>,
-        E: crate::transport::IntoOwnTransport,
+        E: IntoOwnTransport,
     {
-        let validated: Vec<crate::transport::TransportProtocol> = own_transports
+        let validated: Vec<transport::TransportProtocol> = own_transports
             .into_iter()
-            .map(crate::transport::IntoOwnTransport::into_own_transport)
-            .collect::<std::result::Result<_, _>>()?;
+            .map(IntoOwnTransport::into_own_transport)
+            .collect::<result::Result<_, _>>()?;
         if validated.is_empty() {
-            return Err(crate::Error::InvalidInput(
-                "own transports must not be empty",
-            ));
+            return Err(Error::InvalidInput("own transports must not be empty"));
         }
-        let wire: Vec<derec_proto::TransportProtocol> =
-            validated.into_iter().map(Into::into).collect();
+        let wire: Vec<TransportProtocol> = validated.into_iter().map(Into::into).collect();
         self.transport_policy().check_own_set(&wire)?;
         self.own_transports = wire;
         Ok(())
@@ -298,6 +297,7 @@ mod own_transport_setter_tests {
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, NoopTransport,
     };
+    use crate::transport::TransportValidationError;
 
     const SECRET_ID: u64 = 0x60A7;
 
@@ -310,7 +310,7 @@ mod own_transport_setter_tests {
         NoopTransport,
     >;
 
-    fn build(endpoints: &[&str]) -> crate::Result<Proto> {
+    fn build(endpoints: &[&str]) -> Result<Proto> {
         DeRecProtocolBuilder::new(SECRET_ID)
             .with_channel_store(InMemChannelStore::default())
             .with_share_store(InMemShareStore::default())
@@ -350,9 +350,7 @@ mod own_transport_setter_tests {
         assert!(
             matches!(
                 err,
-                crate::Error::Transport(
-                    crate::transport::TransportValidationError::DuplicateProtocol { .. }
-                )
+                Error::Transport(TransportValidationError::DuplicateProtocol { .. })
             ),
             "got {err:?}"
         );
@@ -384,9 +382,7 @@ mod own_transport_setter_tests {
         assert!(
             matches!(
                 err,
-                crate::Error::Transport(
-                    crate::transport::TransportValidationError::DuplicateProtocol { .. }
-                )
+                Error::Transport(TransportValidationError::DuplicateProtocol { .. })
             ),
             "got {err:?}"
         );
@@ -406,7 +402,7 @@ mod own_transport_setter_tests {
         let err = p
             .set_own_transports(Vec::<String>::new())
             .expect_err("an empty endpoint list must be refused");
-        assert!(matches!(err, crate::Error::InvalidInput(_)), "got {err:?}");
+        assert!(matches!(err, Error::InvalidInput(_)), "got {err:?}");
         assert_eq!(uris(&p), before, "a refused set must not mutate the list");
     }
 
@@ -419,7 +415,7 @@ mod own_transport_setter_tests {
         let err = p
             .set_own_transports(["https://good.example", "not a uri"])
             .expect_err("a malformed endpoint must be refused");
-        assert!(matches!(err, crate::Error::Transport(_)), "got {err:?}");
+        assert!(matches!(err, Error::Transport(_)), "got {err:?}");
         assert_eq!(
             uris(&p),
             before,
@@ -437,13 +433,24 @@ mod transport_gate_tests {
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
+    use crate::transport::TransportPolicy;
+    use crate::transport::TransportValidationError;
+    use derec_proto::GetSecretIdsVersionsRequestMessage;
+    use derec_proto::GetShareRequestMessage;
+    use derec_proto::PairRequestMessage;
+    use derec_proto::PrePairRequestMessage;
+    use derec_proto::Protocol;
+    use derec_proto::StoreShareRequestMessage;
+    use derec_proto::UnpairRequestMessage;
+    use derec_proto::UpdateChannelInfoRequestMessage;
+    use derec_proto::VerifyShareRequestMessage;
 
     const SECRET_ID: u64 = 0x60A7;
 
     fn builder_with(
         own: &str,
         unsafe_connection: bool,
-    ) -> crate::Result<
+    ) -> Result<
         DeRecProtocol<
             InMemChannelStore,
             InMemShareStore,
@@ -491,9 +498,7 @@ mod transport_gate_tests {
             assert!(
                 matches!(
                     err,
-                    crate::Error::Transport(
-                        crate::transport::TransportValidationError::PlaintextRefused { .. }
-                    )
+                    Error::Transport(TransportValidationError::PlaintextRefused { .. })
                 ),
                 "expected a plaintext refusal, got {err:?}"
             );
@@ -538,32 +543,30 @@ mod transport_gate_tests {
         use derec_proto::{MessageBody, TransportProtocol};
         let one = || TransportProtocol {
             uri: "http://127.0.0.1:9999".to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         };
         // Only the reply-to pair reaches the funnel, and the list is what
         // a current sender populates.
         let eps = || vec![one()];
 
         let bodies = [
-            MessageBody::StoreShareRequest(derec_proto::StoreShareRequestMessage {
+            MessageBody::StoreShareRequest(StoreShareRequestMessage {
                 reply_to_transports: eps(),
                 ..Default::default()
             }),
-            MessageBody::VerifyShareRequest(derec_proto::VerifyShareRequestMessage {
+            MessageBody::VerifyShareRequest(VerifyShareRequestMessage {
                 reply_to_transports: eps(),
                 ..Default::default()
             }),
-            MessageBody::GetSecretIdsVersionsRequest(
-                derec_proto::GetSecretIdsVersionsRequestMessage {
-                    reply_to_transports: eps(),
-                    ..Default::default()
-                },
-            ),
-            MessageBody::GetShareRequest(derec_proto::GetShareRequestMessage {
+            MessageBody::GetSecretIdsVersionsRequest(GetSecretIdsVersionsRequestMessage {
                 reply_to_transports: eps(),
                 ..Default::default()
             }),
-            MessageBody::UnpairRequest(derec_proto::UnpairRequestMessage {
+            MessageBody::GetShareRequest(GetShareRequestMessage {
+                reply_to_transports: eps(),
+                ..Default::default()
+            }),
+            MessageBody::UnpairRequest(UnpairRequestMessage {
                 reply_to_transports: eps(),
                 ..Default::default()
             }),
@@ -577,11 +580,7 @@ mod transport_gate_tests {
                 "the funnel missed the peer endpoint on {body:?}"
             );
             // And the strict policy refuses it — peer loopback is not free.
-            assert!(
-                crate::transport::TransportPolicy::new(false)
-                    .check_peer(found[0])
-                    .is_err()
-            );
+            assert!(TransportPolicy::new(false).check_peer(found[0]).is_err());
         }
     }
 
@@ -593,10 +592,10 @@ mod transport_gate_tests {
     #[test]
     fn pair_request_is_not_gated_by_the_funnel() {
         use derec_proto::MessageBody;
-        let body = MessageBody::PairRequest(derec_proto::PairRequestMessage {
-            supported_transports: vec![derec_proto::TransportProtocol {
+        let body = MessageBody::PairRequest(PairRequestMessage {
+            supported_transports: vec![TransportProtocol {
                 uri: "http://127.0.0.1:9999".to_owned(),
-                protocol: derec_proto::Protocol::Https as i32,
+                protocol: Protocol::Https as i32,
             }],
             ..Default::default()
         });
@@ -609,14 +608,13 @@ mod transport_gate_tests {
     #[test]
     fn update_channel_info_is_not_gated_by_the_funnel() {
         use derec_proto::MessageBody;
-        let body =
-            MessageBody::UpdateChannelInfoRequest(derec_proto::UpdateChannelInfoRequestMessage {
-                supported_transports: vec![derec_proto::TransportProtocol {
-                    uri: "http://127.0.0.1:9999".to_owned(),
-                    protocol: derec_proto::Protocol::Https as i32,
-                }],
-                ..Default::default()
-            });
+        let body = MessageBody::UpdateChannelInfoRequest(UpdateChannelInfoRequestMessage {
+            supported_transports: vec![TransportProtocol {
+                uri: "http://127.0.0.1:9999".to_owned(),
+                protocol: Protocol::Https as i32,
+            }],
+            ..Default::default()
+        });
         assert_eq!(body.peer_supplied_endpoints().count(), 0);
     }
 
@@ -627,10 +625,10 @@ mod transport_gate_tests {
     #[test]
     fn pre_pair_request_is_not_gated_by_the_funnel() {
         use derec_proto::MessageBody;
-        let body = MessageBody::PrePairRequest(derec_proto::PrePairRequestMessage {
-            supported_transports: vec![derec_proto::TransportProtocol {
+        let body = MessageBody::PrePairRequest(PrePairRequestMessage {
+            supported_transports: vec![TransportProtocol {
                 uri: "http://127.0.0.1:9999".to_owned(),
-                protocol: derec_proto::Protocol::Https as i32,
+                protocol: Protocol::Https as i32,
             }],
             ..Default::default()
         });

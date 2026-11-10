@@ -17,6 +17,8 @@
 
 use std::collections::HashMap;
 
+use derec_proto::TransportProtocol;
+
 use crate::protocol::types::{HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret};
 
 /// One advertised endpoint: a URI plus the protocol name (`"https"`,
@@ -29,9 +31,9 @@ struct EndpointIn {
     protocol: i32,
 }
 
-impl From<EndpointIn> for derec_proto::TransportProtocol {
+impl From<EndpointIn> for TransportProtocol {
     fn from(e: EndpointIn) -> Self {
-        derec_proto::TransportProtocol {
+        TransportProtocol {
             uri: e.uri,
             protocol: e.protocol,
         }
@@ -107,7 +109,7 @@ pub(crate) struct RecoveredSecretIn {
     threshold: Option<u32>,
 }
 
-fn endpoints(transports: Option<Vec<EndpointIn>>) -> Vec<derec_proto::TransportProtocol> {
+fn endpoints(transports: Option<Vec<EndpointIn>>) -> Vec<TransportProtocol> {
     transports
         .unwrap_or_default()
         .into_iter()
@@ -209,6 +211,7 @@ impl RecoveredSecretIn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use derec_proto::Protocol;
 
     fn decode(json: &str) -> Result<Secret, String> {
         serde_json::from_str::<RecoveredSecretIn>(json)
@@ -264,7 +267,7 @@ mod tests {
         let secret = decode(&with(r#""grpc""#)).unwrap();
         assert_eq!(
             secret.helpers[0].transports[0].protocol,
-            derec_proto::Protocol::Grpc as i32
+            Protocol::Grpc as i32
         );
         assert!(decode(&with("1")).is_err());
         assert!(decode(&with(r#""ftp""#)).is_err());
@@ -290,10 +293,7 @@ mod tests {
         assert_eq!(g.members[0].replica_id, 51966);
         assert_eq!(g.members[0].role, ReplicaRole::Source as i32);
         assert_eq!(g.members[1].role, ReplicaRole::Destination as i32);
-        assert_eq!(
-            g.members[0].transports[0].protocol,
-            derec_proto::Protocol::Https as i32
-        );
+        assert_eq!(g.members[0].transports[0].protocol, Protocol::Https as i32);
         let json = format!(
             r#"{{"replicas":{{"channel_id":"21","shared_key":{KEY},"members":[
                 {{"replica_id":"","transports":[],"role":"Source"}}]}}}}"#

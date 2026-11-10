@@ -186,6 +186,7 @@ func (x *PrePairRequestMessage) GetSupportedTransports() []*TransportProtocol {
 //     ```
 //
 //     and verify it matches the original `ContactMessage.contactBindingHash`.
+//     Keys whose sizes are not the fixed ones count as a mismatch.
 //   - Only on a match, proceed to construct and send a normal
 //     `PairRequestMessage`.
 //

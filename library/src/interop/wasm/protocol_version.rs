@@ -1,5 +1,8 @@
 use wasm_bindgen::prelude::*;
 
+use crate::interop::wasm::ts_bindings_utils::js_error;
+use crate::protocol_version::ProtocolVersion;
+
 #[derive(serde::Serialize)]
 struct ProtocolVersionJs {
     major: u32,
@@ -11,10 +14,10 @@ struct ProtocolVersionJs {
 /// as `{ major, minor }`.
 #[wasm_bindgen(js_name = "protocol_version")]
 pub fn protocol_version() -> Result<JsValue, JsValue> {
-    let version = crate::protocol_version::ProtocolVersion::current();
+    let version = ProtocolVersion::current();
     serde_wasm_bindgen::to_value(&ProtocolVersionJs {
         major: version.major,
         minor: version.minor,
     })
-    .map_err(|e| crate::interop::wasm::ts_bindings_utils::js_error("serialize", e.to_string()))
+    .map_err(|e| js_error("serialize", e.to_string()))
 }

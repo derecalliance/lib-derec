@@ -506,8 +506,9 @@ public sealed class DeRecProtocol : IDisposable
     /// <para>
     /// Timeouts are otherwise only evaluated by <see cref="ProcessAsync"/>, so
     /// a publish whose helpers all go quiet has nothing left to close it: the
-    /// round stays open and no <c>SharingComplete</c> is ever raised. Call
-    /// this from a scheduler — a timer, a hosted background service, a cron
+    /// round stays open and no <c>SharingComplete</c> is ever raised. A
+    /// recovery waiting on a silent helper is likewise decided only here once
+    /// its timeout has passed. Call this from a scheduler — a timer, a hosted background service, a cron
     /// trigger — at an interval shorter than the configured timeout.
     /// </para>
     /// <para>
@@ -554,6 +555,16 @@ public sealed class DeRecProtocol : IDisposable
     /// was recovered, or ask them, before calling this, which commits it to
     /// this device.
     /// </para>
+    /// <para>
+    /// <paramref name="version"/> is the version that was recovered and
+    /// <paramref name="newestVersion"/> the newest one any helper reported in
+    /// Discovery (<paramref name="version"/> itself when that is the newest).
+    /// The next publish is <c>newestVersion + 1</c>: a helper ignores a
+    /// version older than the newest it stores
+    /// (<see cref="IgnoreReason.Superseded"/>). A
+    /// <paramref name="newestVersion"/> below <paramref name="version"/> is
+    /// <see cref="DeRecCode.InvalidInput"/>.
+    /// </para>
     /// </summary>
     /// <exception cref="DeRecException">
     /// Thrown with <see cref="DeRecCode.AlreadyRestored"/>,
@@ -564,10 +575,15 @@ public sealed class DeRecProtocol : IDisposable
     /// channels at ids restore is about to write; clear exactly those and
     /// retry.
     /// </exception>
-    public Task<IReadOnlyList<DeRecEvent>> RestoreAsync(Secret recoveredSecret, uint version)
+    public Task<IReadOnlyList<DeRecEvent>> RestoreAsync(Secret recoveredSecret, uint version, uint newestVersion)
     {
         EnsureNotDisposed();
-        var dto = new RestoreParamsDto { Version = version, RecoveredSecret = recoveredSecret };
+        var dto = new RestoreParamsDto
+        {
+            Version = version,
+            NewestVersion = newestVersion,
+            RecoveredSecret = recoveredSecret,
+        };
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
         return Task.Run<IReadOnlyList<DeRecEvent>>(() =>
         {
@@ -592,6 +608,7 @@ public sealed class DeRecProtocol : IDisposable
     private sealed record RestoreParamsDto
     {
         [JsonPropertyName("version")] public required uint Version { get; init; }
+        [JsonPropertyName("newest_version")] public required uint NewestVersion { get; init; }
         [JsonPropertyName("recovered_secret")] public required Secret RecoveredSecret { get; init; }
     }
 
@@ -1671,7 +1688,7 @@ public sealed record RemoveExpiredChannelsPolicy(bool Enabled, ulong TimeoutInSe
 /// These were one setting until it became clear they answer different
 /// questions. <see cref="InboundMessage"/> is a <b>security</b> boundary — it
 /// bounds how stale a message may be and still be accepted, so it must
-/// tolerate transport latency and clock skew. The other three are
+/// tolerate transport latency and clock skew. The others are
 /// <b>liveness</b> budgets: how long to keep hoping a peer will answer.
 /// </para>
 /// </remarks>
@@ -1690,6 +1707,26 @@ public sealed record RemoveExpiredChannelsPolicy(bool Enabled, ulong TimeoutInSe
 /// How long to wait for an unpair acknowledgement before dropping local
 /// channel state anyway. Library default: 60s.
 /// </param>
+/// <param name="GetShareResponse">
+/// How long a recovery waits for a helper to answer its share request. A
+/// recovery decides only once every helper it asked has answered or this has
+/// elapsed since the requests went out; on expiry each silent helper is
+/// reported as <c>RecoverSecretFailedEvent</c> with error <c>"timeout"</c>.
+/// The budget is a <b>human</b> one when helpers approve share requests by
+/// hand. The same budget bounds a replica version check
+/// (<c>FlowKind.ReplicaDiscovery</c>): once it elapses, the check concludes on
+/// the versions already reported. Library default: 300s.
+/// </param>
+/// <param name="Pairing">
+/// How long a pairing stays possible: how old a contact may be when it is
+/// scanned or answered, and how old a pairing request may be when it is
+/// accepted. Both sides enforce it and nothing is sent on expiry: the scanner
+/// refuses an expired contact, and the creator ignores a request on one and
+/// refuses a late accept, with <see cref="DeRecCode.PairingExpired"/>. The
+/// remedy is to scan or share a fresh contact. A scanner's
+/// <see cref="ExpiredChannels"/> timeout should be at least this plus the
+/// time a response takes to arrive. Library default: 30s.
+/// </param>
 /// <param name="ExpiredChannels">
 /// Removal of channels still awaiting out-of-band fingerprint confirmation.
 /// Unlike the others this can be disabled. The budget is a <b>human</b> one —
@@ -1700,6 +1737,8 @@ public sealed record Timeouts(
     TimeSpan? InboundMessage = null,
     TimeSpan? SharingRound = null,
     TimeSpan? UnpairAck = null,
+    TimeSpan? GetShareResponse = null,
+    TimeSpan? Pairing = null,
     RemoveExpiredChannelsPolicy? ExpiredChannels = null);
 
 public sealed class AutoAcceptPolicy

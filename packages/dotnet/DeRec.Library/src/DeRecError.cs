@@ -28,6 +28,7 @@ public static class DeRecCategory
     public const int Protobuf = 13;
     public const int Invariant = 14;
     public const int StateStore = 15;
+    public const int Transport = 16;
 
     /// <summary>
     /// Stable name of a category value, e.g. <c>"pairing"</c>, or
@@ -193,6 +194,17 @@ public static class DeRecCode
     /// </summary>
     public const int FingerprintCommitmentMismatch = 48;
 
+    /// <summary>
+    /// The pairing outlived <see cref="Protocol.Timeouts.Pairing"/>: the
+    /// contact, or the pairing request answering it, is older than the
+    /// window. Raised by the scanner on an expired contact and by the
+    /// creator's <c>Accept</c> on a late pairing request. Nothing was sent;
+    /// the remedy is to scan or share a fresh contact.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Pairing"/>.
+    /// </summary>
+    public const int PairingExpired = 49;
+
     public const int EmptyChannels = 60;
     public const int DuplicateChannelId = 61;
     public const int InvalidThreshold = 62;
@@ -269,6 +281,13 @@ public static class DeRecCode
     public const int NoUsableEndpoint = 121;
 
     // 122 is retired (formerly the conflicting plaintext opt-in); never reassign it.
+
+    /// <summary>
+    /// The application's transport delivered a message to none of the peer's
+    /// endpoints: <see cref="ITransport"/> failed the send.
+    /// <see cref="DeRecException.Category"/> is <see cref="DeRecCategory.Transport"/>.
+    /// </summary>
+    public const int TransportSendFailed = 123;
 
     /// <summary>
     /// Stable name of a code value, e.g. <c>"no_usable_endpoint"</c>, or

@@ -260,6 +260,12 @@ type ReplicaDiscoveryParams struct{}
 // no event when told to leave: when a roster excluding it arrives it drops its
 // whole secret_id partition and emits EventTypeSelfRemovedFromGroup. The
 // secret survives on the remaining members and the helpers.
+//
+// Removal does not replace the group key, so it relies on the removed device's
+// library deleting its copy. That covers a lost or stolen device whose storage
+// was not read. Whoever read a device's storage keeps the group key and can
+// decrypt every later publication it obtains, the one completing the removal
+// included.
 type UnpairReplicaParams struct {
 	ReplicaID uint64
 	Memo      *string
@@ -461,7 +467,11 @@ func (p *DeRecProtocol) Reject(action []byte, status derecpb.StatusEnum, memo st
 // Restore rebuilds this protocol's secret_id namespace from a recovered
 // Secret — the same typed snapshot carried by SecretRecoveredEvent.Secret
 // (and ReplicaSecretReceivedEvent.Secret); pass it verbatim along with the
-// version it was recovered at.
+// version it was recovered at and newestVersion, the newest version any
+// helper reported in Discovery (version itself when that is the newest).
+// The next publish is newestVersion+1: a helper ignores a version older than
+// the newest it stores (IgnoreReasonSuperseded). A newestVersion below
+// version fails with derec.CodeInvalidInput.
 //
 // Recovery and restore are separate steps on purpose: the SecretRecovered
 // event writes nothing. Show the user what was recovered, or ask them, before
@@ -475,12 +485,13 @@ func (p *DeRecProtocol) Reject(action []byte, status derecpb.StatusEnum, memo st
 // fails with a *derec.Error whose Code is derec.CodeRestoreConflict and
 // whose ConflictingChannelIDs lists exactly those ids, so the application
 // can clear them and retry.
-func (p *DeRecProtocol) Restore(secret Secret, version uint32) ([]Event, error) {
+func (p *DeRecProtocol) Restore(secret Secret, version, newestVersion uint32) ([]Event, error) {
 	if p.closed {
 		return nil, errors.New("protocol: Restore: protocol is closed")
 	}
 	paramsJSON, err := json.Marshal(restoreParamsWire{
 		Version:         version,
+		NewestVersion:   newestVersion,
 		RecoveredSecret: secret,
 	})
 	if err != nil {
@@ -493,11 +504,12 @@ func (p *DeRecProtocol) Restore(secret Secret, version uint32) ([]Event, error) 
 	return decodeEvents(eventsJSON)
 }
 
-// restoreParamsWire carries the version alongside Secret's own MarshalJSON
+// restoreParamsWire carries the versions alongside Secret's own MarshalJSON
 // output (see events.go) — no separate wire mirror is needed since Secret
 // already encodes to the byte-array-as-number-array shape Restore's FFI
 // params require.
 type restoreParamsWire struct {
 	Version         uint32 `json:"version"`
+	NewestVersion   uint32 `json:"newest_version"`
 	RecoveredSecret Secret `json:"recovered_secret"`
 }

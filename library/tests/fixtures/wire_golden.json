@@ -2,6 +2,7 @@
   "$schema_note": "Params JSON every SDK must produce byte-for-byte. Shapes are owned by the Rust *ParamsJson structs in library/src/ffi/protocol/flow.rs.",
   "restore": {
     "version": 7,
+    "newest_version": 9,
     "recovered_secret": {
       "helpers": [
         {

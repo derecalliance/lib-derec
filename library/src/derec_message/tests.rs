@@ -3,10 +3,11 @@
 
 use super::*;
 use crate::{
-    derec_message::DeRecMessageBuilder, protocol_version::ProtocolVersion, types::ChannelId,
+    Error, derec_message::DeRecMessageBuilder, protocol_version::ProtocolVersion, types::ChannelId,
+    utils::os_rng,
 };
 use derec_cryptography::pairing::ecies;
-use derec_proto::{MessageBody, PairRequestMessage};
+use derec_proto::{DeRecMessage, MessageBody, PairRequestMessage};
 use prost::Message;
 
 const CHANNEL_ID: ChannelId = ChannelId(42);
@@ -15,7 +16,7 @@ const SHARED_KEY: crate::types::SharedKey = crate::types::SharedKey::new([0xAB; 
 const CHANNEL_KEY: crate::types::ChannelKey = crate::types::ChannelKey::new(SEQUENCE, SHARED_KEY);
 
 fn pairing_keypair() -> (Vec<u8>, Vec<u8>) {
-    ecies::generate_key(&mut crate::utils::os_rng()).unwrap()
+    ecies::generate_key(&mut os_rng()).unwrap()
 }
 
 fn sample_message() -> PairRequestMessage {
@@ -333,8 +334,7 @@ fn test_trace_id_round_trips_through_proto_encoding() {
         .expect("build should succeed");
 
     let wire_bytes = original.encode_to_vec();
-    let decoded =
-        derec_proto::DeRecMessage::decode(wire_bytes.as_slice()).expect("envelope should decode");
+    let decoded = DeRecMessage::decode(wire_bytes.as_slice()).expect("envelope should decode");
 
     assert_eq!(decoded.trace_id, 0xFEED_FACE_BAAD_F00D);
 }
@@ -358,7 +358,7 @@ fn test_extract_inner_plaintext_message_rejects_garbage() {
     let err = extract_inner_plaintext_message(b"not a valid protobuf")
         .expect_err("garbage bytes must not decode as a MessageBody");
 
-    assert!(matches!(err, crate::Error::ProtobufDecode(_)));
+    assert!(matches!(err, Error::ProtobufDecode(_)));
 }
 
 #[test]
@@ -409,4 +409,76 @@ fn read_sequence_reads_the_channel_key_epoch() {
 #[test]
 fn read_sequence_refuses_bytes_that_are_not_an_envelope() {
     assert!(read_sequence(&[0xFF; 4]).is_err());
+}
+
+fn sealed_envelope() -> DeRecMessage {
+    DeRecMessageBuilder::channel()
+        .channel_id(CHANNEL_ID)
+        .timestamp(current_timestamp())
+        .message_body(MessageBody::PairRequest(sample_message()))
+        .encrypt(&CHANNEL_KEY)
+        .unwrap()
+        .build()
+        .unwrap()
+}
+
+/// The fields outside the ciphertext are not authenticated: a copy with any
+/// of them changed, or re-encoded with an unknown field, is still accepted.
+/// Such a copy is the same message, so it must carry the same id.
+#[test]
+fn test_message_id_ignores_the_unauthenticated_envelope_fields() {
+    let envelope = sealed_envelope();
+    let original = envelope.encode_to_vec();
+    let id = message_id(&original).unwrap();
+
+    let mut altered = envelope.clone();
+    altered.sequence = 99;
+    altered.trace_id = 1234;
+    altered.protocol_version_minor += 1;
+    let mut altered = altered.encode_to_vec();
+    // Field 15 as a varint: unknown to the schema, skipped on decode.
+    altered.extend_from_slice(&[0x78, 0x01]);
+
+    assert_ne!(original, altered);
+    assert_eq!(message_id(&altered).unwrap(), id);
+}
+
+/// Every message is sealed under a fresh nonce, so two messages carrying the
+/// same body are still two messages.
+#[test]
+fn test_message_id_differs_for_two_messages_with_the_same_body() {
+    let first = message_id(&sealed_envelope().encode_to_vec()).unwrap();
+    let second = message_id(&sealed_envelope().encode_to_vec()).unwrap();
+
+    assert_ne!(first.id, second.id);
+}
+
+#[test]
+fn test_message_id_carries_the_envelope_timestamp() {
+    let envelope = sealed_envelope();
+    let sent = envelope.timestamp.unwrap().seconds as u64;
+
+    assert_eq!(
+        message_id(&envelope.encode_to_vec()).unwrap().timestamp,
+        sent
+    );
+}
+
+#[test]
+fn test_message_id_rejects_an_envelope_without_a_timestamp() {
+    let mut envelope = sealed_envelope();
+    envelope.timestamp = None;
+
+    assert!(matches!(
+        message_id(&envelope.encode_to_vec()),
+        Err(Error::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn test_message_id_rejects_garbage() {
+    assert!(matches!(
+        message_id(b"not a valid protobuf"),
+        Err(Error::ProtobufDecode(_))
+    ));
 }

@@ -11,6 +11,11 @@ use sha2::*;
 use zeroize::Zeroizing;
 
 use super::DerecPairingError;
+use crate::random;
+
+/// Size of a public key as [`generate_key`] encodes it: an uncompressed
+/// secp256k1 point.
+pub const PUBLIC_KEY_SIZE_IN_BYTES: usize = 65;
 
 /// Generates a new secp256k1 keypair for use with ECIES.
 ///
@@ -25,7 +30,7 @@ use super::DerecPairingError;
 pub fn generate_key<R: CryptoRng + ?Sized>(
     rng: &mut R,
 ) -> Result<(Vec<u8>, Vec<u8>), DerecPairingError> {
-    let sk: Zeroizing<ark_secp256k1::Fr> = Zeroizing::new(crate::random::field_element(rng));
+    let sk: Zeroizing<ark_secp256k1::Fr> = Zeroizing::new(random::field_element(rng));
     let pk = ark_secp256k1::Affine::generator() * *sk;
 
     let mut sk_bytes = Vec::new();

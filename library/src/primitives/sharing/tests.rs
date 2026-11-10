@@ -8,22 +8,27 @@ use crate::{
         SharingError,
         request::{
             ExtractResult as ExtractStoreShareRequestResult,
-            ProduceResult as ProduceStoreShareRequestMessageResult, SplitResult,
-            extract as extract_store_share_request, produce as produce_store_share_request_message,
-            split,
+            ProduceResult as ProduceStoreShareRequestMessageResult, SHARE_ALGORITHM_VSS,
+            SplitResult, extract as extract_store_share_request,
+            produce as produce_store_share_request_message, split,
         },
         response::{
             ExtractResult as ExtractStoreShareResponseResult,
             ProduceResult as ProduceStoreShareResponseMessageResult,
             extract as extract_store_share_response,
             process as process_store_share_response_message,
-            produce as produce_store_share_response_message,
+            produce as produce_store_share_response_message, validate_share,
         },
     },
+    transport::TransportValidationError,
     types::{ChannelId, WeightedChannel},
 };
-use derec_proto::{CommittedDeRecShare, DeRecShare};
+use derec_proto::{
+    CommittedDeRecShare, DeRecShare, Protocol, StatusEnum, StoreShareRequestMessage,
+    TransportProtocol,
+};
 use prost::Message;
+use std::slice;
 
 /// Every channel at weight 1: one subshare each.
 fn make_channel_ids(ids: &[u64]) -> Vec<WeightedChannel> {
@@ -35,7 +40,7 @@ fn make_channel_ids(ids: &[u64]) -> Vec<WeightedChannel> {
 /// to pass directly to `produce_store_share_response_message`.
 fn make_request_with_mutated_share(
     mutate: impl FnOnce(&mut CommittedDeRecShare),
-) -> derec_proto::StoreShareRequestMessage {
+) -> StoreShareRequestMessage {
     use crate::derec_message::current_timestamp;
 
     let secret_id: u64 = 1;
@@ -51,7 +56,7 @@ fn make_request_with_mutated_share(
     mutate(committed_share);
 
     let timestamp = current_timestamp();
-    derec_proto::StoreShareRequestMessage {
+    StoreShareRequestMessage {
         share: committed_share.encode_to_vec(),
         share_algorithm: 0,
         version,
@@ -269,7 +274,7 @@ fn test_produce_store_share_request_message_with_keep_version_and_description() 
     )
     .expect("produce_store_share_request_message should succeed");
 
-    let request = crate::primitives::sharing::request::extract(&envelope, &shared_key)
+    let request = extract_store_share_request(&envelope, &shared_key)
         .expect("extract should succeed")
         .request;
     assert_eq!(request.keep_version, 2);
@@ -306,7 +311,7 @@ fn a_keep_version_at_or_above_the_shared_version_is_refused() {
         assert!(
             matches!(
                 err,
-                crate::Error::Sharing(SharingError::InvalidKeepVersion {
+                Error::Sharing(SharingError::InvalidKeepVersion {
                     keep_version: k,
                     version: v,
                 }) if k == keep_version && v == version
@@ -320,9 +325,9 @@ fn a_keep_version_at_or_above_the_shared_version_is_refused() {
 fn a_helper_refuses_a_keep_version_at_or_above_the_shared_version() {
     let mut request = make_request_with_mutated_share(|_| {});
     request.keep_version = request.version;
-    let fault = crate::primitives::sharing::response::validate_share(&request)
-        .expect_err("keep_version equal to version must be refused");
-    assert_eq!(fault.status, derec_proto::StatusEnum::FormatError);
+    let fault =
+        validate_share(&request).expect_err("keep_version equal to version must be refused");
+    assert_eq!(fault.status, StatusEnum::FormatError);
 }
 
 #[test]
@@ -698,7 +703,7 @@ fn validate_share_classifies_each_failure_by_status() {
     use crate::primitives::sharing::response::validate_share;
     use derec_proto::StatusEnum;
 
-    let status_of = |request: &derec_proto::StoreShareRequestMessage| {
+    let status_of = |request: &StoreShareRequestMessage| {
         validate_share(request)
             .map(|_| ())
             .map_err(|f| (f.status, f.memo))
@@ -783,9 +788,9 @@ fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
     let committed_share = shares.get(&channel_id).expect("missing share");
     let shared_key = SharedKey::new([1u8; 32]);
 
-    let malicious_reply_to = derec_proto::TransportProtocol {
+    let malicious_reply_to = TransportProtocol {
         uri: "ws://attacker.example/inbox".to_owned(),
-        protocol: derec_proto::Protocol::Https as i32,
+        protocol: Protocol::Https as i32,
     };
 
     let ProduceStoreShareRequestMessageResult { envelope } = produce_store_share_request_message(
@@ -796,7 +801,7 @@ fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
         0,
         String::new(),
         &crate::types::ChannelKey::new(0, shared_key.clone()),
-        std::slice::from_ref(&malicious_reply_to),
+        slice::from_ref(&malicious_reply_to),
     )
     .expect("failed to produce store share request");
 
@@ -805,7 +810,7 @@ fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
     assert!(matches!(
         result,
         Err(Error::Transport(
-            crate::transport::TransportValidationError::SchemeMismatch { .. }
+            TransportValidationError::SchemeMismatch { .. }
         ))
     ));
 }
@@ -845,10 +850,7 @@ fn helper_bound_request_never_carries_a_replica_id() {
     // Helpers know nothing about replicas. `SHARE_ALGORITHM_VSS` is
     // helper-bound, so the writer identity is unconditionally absent —
     // there is no argument by which a caller could set it.
-    assert_eq!(
-        extracted.request.share_algorithm,
-        crate::primitives::sharing::request::SHARE_ALGORITHM_VSS
-    );
+    assert_eq!(extracted.request.share_algorithm, SHARE_ALGORITHM_VSS);
     assert_eq!(extracted.request.replica_id, None);
 }
 

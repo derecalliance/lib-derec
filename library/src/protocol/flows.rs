@@ -21,10 +21,20 @@ use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::{Result, types::ChannelId};
 use std::collections::{HashMap, HashSet};
 
+use crate::Error;
+use crate::derec_message;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
+use crate::protocol::types::Secret;
+use crate::protocol::types::SharingRoundState;
+use crate::protocol::types::Target;
+use crate::protocol::types::UserSecret;
+use crate::types::ReplicaId;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
+use derec_proto::ContactMessage;
+use derec_proto::SenderKind;
+use derec_proto::TransportProtocol;
 
 impl<
     Ch: DeRecChannelStore,
@@ -58,10 +68,10 @@ impl<
         tracing::instrument(skip_all, fields(trace_id = tracing::field::Empty))
     )]
     pub async fn start(&mut self, flow: DeRecFlow) -> Result<Vec<DeRecEvent>> {
-        let trace_id = crate::derec_message::fresh_trace_id();
+        let trace_id = derec_message::fresh_trace_id();
         #[cfg(feature = "logging")]
         tracing::Span::current().record("trace_id", trace_id);
-        let reply_to: Vec<derec_proto::TransportProtocol> = if self.auto_reply_to {
+        let reply_to: Vec<TransportProtocol> = if self.auto_reply_to {
             self.own_transports.clone()
         } else {
             Vec::new()
@@ -180,8 +190,17 @@ impl<
     /// re-pair with helpers on a fresh channel-id namespace
     ///   → start(RecoverSecret { secret_id, version })
     ///   → SecretRecovered { secret } event arrives
-    ///   → DeRecProtocol::restore(&secret, version)
+    ///   → DeRecProtocol::restore(&secret, version, newest_version)
     /// ```
+    ///
+    /// `newest_version` is the newest version any helper reported for
+    /// `secret_id` in [`DeRecFlow::Discovery`], or `recovered_version` when
+    /// that is the newest. The next publish is `newest_version + 1`: a helper
+    /// refuses a version older than the newest it stores
+    /// ([`IgnoreReason::Superseded`](crate::protocol::IgnoreReason::Superseded)),
+    /// so a device that restores an older kept version and numbers its next
+    /// publish from it would reach no helper. A `newest_version` below
+    /// `recovered_version` is [`crate::Error::InvalidInput`].
     ///
     /// What `restore` actually requires is a `secret_id` namespace with
     /// no user-secret snapshot and no channels at the roster ids it is
@@ -192,8 +211,8 @@ impl<
     /// On success: canonical helper channels are persisted with their
     /// `SharedKey`; canonical replica channels are persisted
     /// with the group key from `secret.replicas.shared_key`;
-    /// the user-secret snapshot is committed at `recovered_version`
-    /// with the roster's threshold
+    /// the user-secret snapshot of the recovered secrets is committed at
+    /// `newest_version` with the roster's threshold
     /// ([`Secret::threshold`](crate::protocol::types::Secret::threshold));
     /// every channel under `self.secret_id` at no roster id (i.e. the
     /// recovery-mode channels) is unpaired as `start(`[`DeRecFlow::Unpair`]`)`
@@ -203,7 +222,7 @@ impl<
     /// `UnpairAck::Required` its `Unpaired` arrives later, from `process`
     /// on the helper's answer or from the timeout sweep. The protocol
     /// resumes normal operation immediately — the next
-    /// `start(ProtectSecret)` publishes `recovered_version + 1` to the
+    /// `start(ProtectSecret)` publishes `newest_version + 1` to the
     /// restored helpers only, since a channel still being unpaired is
     /// never a publish target.
     ///
@@ -230,7 +249,7 @@ impl<
     /// and recovery cannot attribute a collected share to a canonical
     /// Helper channel, so this device has no reference bytes for that
     /// version. Run `start(`[`DeRecFlow::ProtectSecret`]`)` once —
-    /// it publishes `recovered_version + 1` and writes the tracking
+    /// it publishes `newest_version + 1` and writes the tracking
     /// shares that make verification work from then on.
     ///
     /// Pass that publish the stored weights unchanged: restore has written
@@ -284,14 +303,16 @@ impl<
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
     pub async fn restore(
         &mut self,
-        secret: &crate::protocol::types::Secret,
+        secret: &Secret,
         recovered_version: u32,
+        newest_version: u32,
     ) -> Result<Vec<DeRecEvent>> {
         handlers::restore::restore(
             &mut borrow_stores!(self),
             &local!(self),
             secret,
             recovered_version,
+            newest_version,
             self.unpair_ack,
         )
         .await
@@ -327,7 +348,7 @@ impl<
     /// stored threshold, or the builder's when none is stored.
     pub(super) async fn start_protect_secret(
         &mut self,
-        secrets: Vec<crate::protocol::types::UserSecret>,
+        secrets: Vec<UserSecret>,
         description: Option<String>,
         weights: Option<HashMap<ChannelId, u32>>,
         threshold: Option<u32>,
@@ -355,12 +376,12 @@ impl<
             .iter()
             .filter_map(|(cid, r)| r.as_ref().ok().map(|_| *cid))
             .collect();
-        let pending_replicas: HashSet<crate::types::ReplicaId> = result
+        let pending_replicas: HashSet<ReplicaId> = result
             .replica_outcomes
             .iter()
             .filter_map(|(rid, r)| r.as_ref().ok().map(|_| *rid))
             .collect();
-        let behind_replicas: HashSet<crate::types::ReplicaId> = result
+        let behind_replicas: HashSet<ReplicaId> = result
             .replica_outcomes
             .iter()
             .filter_map(|(rid, r)| r.as_ref().err().map(|_| *rid))
@@ -382,7 +403,7 @@ impl<
             self.state_store
                 .save(
                     self.secret_id,
-                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    StateItem::SharingRound(Box::new(SharingRoundState {
                         version,
                         pending,
                         confirmed: HashSet::new(),
@@ -425,8 +446,8 @@ impl<
 
     async fn start_pairing(
         &mut self,
-        kind: derec_proto::SenderKind,
-        contact: derec_proto::ContactMessage,
+        kind: SenderKind,
+        contact: ContactMessage,
         peer_communication_info: HashMap<String, String>,
         trace_id: u64,
     ) -> Result<Vec<DeRecEvent>> {
@@ -449,7 +470,7 @@ impl<
 
     async fn start_discovery(
         &mut self,
-        target: crate::protocol::types::Target,
+        target: Target,
         round: &Round<'_>,
     ) -> Result<Vec<DeRecEvent>> {
         let resolved = self
@@ -460,7 +481,7 @@ impl<
             .require_role(
                 self.secret_id,
                 &resolved, // Owner-initiated flow: every target must be a Helper peer.
-                derec_proto::SenderKind::Helper,
+                SenderKind::Helper,
             )
             .await?;
         handlers::discovery::start(&mut borrow_stores!(self), &local!(self), target, round).await
@@ -470,7 +491,7 @@ impl<
         &mut self,
         secret_id: u64,
         version: u32,
-        target: crate::protocol::types::Target,
+        target: Target,
         round: &Round<'_>,
     ) -> Result<Vec<DeRecEvent>> {
         // Verification only ever challenges the helpers holding this
@@ -479,7 +500,7 @@ impl<
         // it was verifying a different secret into an error, rather than
         // reporting success for a secret it never touched.
         if secret_id != self.secret_id {
-            return Err(crate::Error::InvalidInput(
+            return Err(Error::InvalidInput(
                 "VerifyShares secret_id must be this instance's own secret_id",
             ));
         }
@@ -491,7 +512,7 @@ impl<
             .require_role(
                 self.secret_id,
                 &resolved, // Owner-initiated flow: every target must be a Helper peer.
-                derec_proto::SenderKind::Helper,
+                SenderKind::Helper,
             )
             .await?;
         handlers::verification::start(
@@ -539,7 +560,7 @@ impl<
             .require_role(
                 self.secret_id,
                 &[channel_id], // Owner-initiated teardown: the peer must be a Helper.
-                derec_proto::SenderKind::Helper,
+                SenderKind::Helper,
             )
             .await?;
         let share_holders = self.share_holders([channel_id]).await?;
@@ -559,9 +580,9 @@ impl<
 
     async fn start_update_channel_info(
         &mut self,
-        target: crate::protocol::types::Target,
+        target: Target,
         communication_info: Option<HashMap<String, String>>,
-        own_transports: Vec<derec_proto::TransportProtocol>,
+        own_transports: Vec<TransportProtocol>,
         trace_id: u64,
     ) -> Result<Vec<DeRecEvent>> {
         handlers::update_channel_info::start(
@@ -584,8 +605,10 @@ mod tests {
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
         InMemUserSecretStore, StoreRig, run_async,
     };
+    use crate::protocol::types::Share;
     use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, SecretValue};
     use crate::protocol::{DeRecChannelStore, DeRecSecretStore, DeRecShareStore};
+    use derec_proto::Protocol;
 
     const SECRET_ID: u64 = 0x7E57;
 
@@ -601,12 +624,12 @@ mod tests {
                 SECRET_ID,
                 ChannelRecord::Helper(HelperChannel {
                     channel_id,
-                    transports: vec![derec_proto::TransportProtocol {
+                    transports: vec![TransportProtocol {
                         uri: format!("https://helper-{cid}.example"),
-                        protocol: derec_proto::Protocol::Https as i32,
+                        protocol: Protocol::Https as i32,
                     }],
                     communication_info: HashMap::new(),
-                    peer_role: derec_proto::SenderKind::Helper,
+                    peer_role: SenderKind::Helper,
                     status: ChannelStatus::Paired,
                     created_at: 0,
                     weight: 1,
@@ -653,7 +676,7 @@ mod tests {
 
             let events = protocol
                 .start(DeRecFlow::Discovery {
-                    target: crate::protocol::types::Target::All,
+                    target: Target::All,
                 })
                 .await
                 .expect("discovery starts");
@@ -662,7 +685,7 @@ mod tests {
                 .transport
                 .sent_envelopes()
                 .iter()
-                .map(|e| crate::derec_message::read_trace_id(e).expect("envelope decodes"))
+                .map(|e| derec_message::read_trace_id(e).expect("envelope decodes"))
                 .collect();
             assert_eq!(on_the_wire.len(), 3, "one request per helper");
             assert!(
@@ -709,12 +732,12 @@ mod tests {
                 .start(DeRecFlow::VerifyShares {
                     secret_id: SECRET_ID ^ 0xFFFF,
                     version: 1,
-                    target: crate::protocol::types::Target::All,
+                    target: Target::All,
                 })
                 .await
                 .expect_err("a foreign secret_id must be refused");
             assert!(
-                matches!(err, crate::Error::InvalidInput(_)),
+                matches!(err, Error::InvalidInput(_)),
                 "expected InvalidInput, got {err:?}"
             );
 
@@ -724,7 +747,7 @@ mod tests {
                 .start(DeRecFlow::VerifyShares {
                     secret_id: SECRET_ID,
                     version: 1,
-                    target: crate::protocol::types::Target::All,
+                    target: Target::All,
                 })
                 .await
                 .expect("this instance's own secret_id is the legal value");
@@ -746,12 +769,12 @@ mod tests {
                     SECRET_ID,
                     ChannelRecord::Helper(HelperChannel {
                         channel_id: ChannelId(12),
-                        transports: vec![derec_proto::TransportProtocol {
+                        transports: vec![TransportProtocol {
                             uri: "https://helper-12.example".to_owned(),
-                            protocol: derec_proto::Protocol::Https as i32,
+                            protocol: Protocol::Https as i32,
                         }],
                         communication_info: HashMap::new(),
-                        peer_role: derec_proto::SenderKind::Helper,
+                        peer_role: SenderKind::Helper,
                         status: ChannelStatus::Pending,
                         created_at: 0,
                         weight: 1,
@@ -765,7 +788,7 @@ mod tests {
                 .save(
                     SECRET_ID,
                     ChannelId(11),
-                    crate::protocol::types::Share {
+                    Share {
                         secret_id: SECRET_ID,
                         version: 1,
                         bytes: vec![0x11; 8],
@@ -791,7 +814,7 @@ mod tests {
                 (
                     "UpdateChannelInfo",
                     DeRecFlow::UpdateChannelInfo {
-                        target: crate::protocol::types::Target::All,
+                        target: Target::All,
                         communication_info: Some(HashMap::from([(
                             "name".to_owned(),
                             "owner".to_owned(),
@@ -802,7 +825,7 @@ mod tests {
                 (
                     "Discovery",
                     DeRecFlow::Discovery {
-                        target: crate::protocol::types::Target::All,
+                        target: Target::All,
                     },
                 ),
                 (
@@ -810,7 +833,7 @@ mod tests {
                     DeRecFlow::VerifyShares {
                         secret_id: SECRET_ID,
                         version: 1,
-                        target: crate::protocol::types::Target::All,
+                        target: Target::All,
                     },
                 ),
             ];
@@ -863,7 +886,7 @@ mod tests {
             for _ in 0..2 {
                 protocol
                     .start(DeRecFlow::Discovery {
-                        target: crate::protocol::types::Target::All,
+                        target: Target::All,
                     })
                     .await
                     .expect("discovery starts");
@@ -873,7 +896,7 @@ mod tests {
                 .transport
                 .sent_envelopes()
                 .iter()
-                .map(|e| crate::derec_message::read_trace_id(e).expect("envelope decodes"))
+                .map(|e| derec_message::read_trace_id(e).expect("envelope decodes"))
                 .collect();
             assert_eq!(tokens.len(), 2);
             assert_ne!(tokens[0], tokens[1], "each round draws its own token");
@@ -890,7 +913,14 @@ mod tests {
 /// regression net for the attribute itself.
 #[cfg(all(test, feature = "logging"))]
 mod trace_id_span_tests {
+    use crate::protocol::DeRecFlow;
+    use crate::protocol::builder::DeRecProtocolBuilder;
+    use crate::protocol::handlers::replicas::discovery;
+    use crate::protocol::tests::InMemShareStore;
+    use crate::protocol::tests::InMemUserSecretStore;
+    use crate::protocol::tests::LocalFixture;
     use crate::protocol::tests::{StoreRig, run_async};
+    use crate::protocol::types::Target;
     use std::io;
     use std::sync::{Arc, Mutex};
 
@@ -932,15 +962,10 @@ mod trace_id_span_tests {
         tracing::subscriber::with_default(subscriber, || {
             run_async(async {
                 let mut rig = StoreRig::new();
-                let lf = crate::protocol::tests::LocalFixture::with_replica(0x5EC, 1001);
+                let lf = LocalFixture::with_replica(0x5EC, 1001);
                 // No peers, so the flow returns immediately — the span is
                 // still entered, which is all this asserts.
-                let _ = super::super::handlers::replicas::discovery::start(
-                    &mut rig.stores(),
-                    &lf.local(),
-                    TRACE_ID,
-                )
-                .await;
+                let _ = discovery::start(&mut rig.stores(), &lf.local(), TRACE_ID).await;
             });
         });
 
@@ -968,19 +993,19 @@ mod trace_id_span_tests {
         tracing::subscriber::with_default(subscriber, || {
             run_async(async {
                 let rig = StoreRig::new();
-                let mut protocol = crate::protocol::builder::DeRecProtocolBuilder::new(0x5EC)
+                let mut protocol = DeRecProtocolBuilder::new(0x5EC)
                     .with_channel_store(rig.channels.clone())
-                    .with_share_store(crate::protocol::tests::InMemShareStore::default())
+                    .with_share_store(InMemShareStore::default())
                     .with_secret_store(rig.secrets.clone())
-                    .with_user_secret_store(crate::protocol::tests::InMemUserSecretStore::default())
+                    .with_user_secret_store(InMemUserSecretStore::default())
                     .with_state_store(rig.state.clone())
                     .with_transport(rig.transport.clone())
                     .with_own_transports(["https://owner.example"])
                     .build()
                     .expect("test rig builds");
                 let _ = protocol
-                    .start(crate::protocol::DeRecFlow::Discovery {
-                        target: crate::protocol::types::Target::All,
+                    .start(DeRecFlow::Discovery {
+                        target: Target::All,
                     })
                     .await;
             });

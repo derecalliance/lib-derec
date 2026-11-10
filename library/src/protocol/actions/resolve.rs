@@ -156,6 +156,7 @@ impl<
                 handlers::pairing::pre_pair::accept(
                     &mut borrow_stores!(self),
                     &local!(self),
+                    &pairing_config!(self),
                     channel_id,
                     &request,
                     trace_id,

@@ -110,5 +110,7 @@ internal struct DeRecError
     public IntPtr PeerMemo;
     public uint Expected;
     public uint Got;
+    [MarshalAs(UnmanagedType.U1)] public bool HasChannelId;
+    public ulong ChannelId;
 }
 

@@ -155,6 +155,11 @@ message ContactMessage {
   // )
   // ```
   //
+  // The keys are concatenated without their lengths, so the hash binds
+  // them only because each has a fixed size: 1568 bytes for the ML-KEM-1024
+  // encapsulation key and 65 bytes for the uncompressed secp256k1 point.
+  // Keys of any other size MUST be refused rather than hashed.
+  //
   // The recipient obtains the actual keys via `PrePairRequest` and
   // recomputes this hash to confirm integrity before proceeding to
   // `PairRequestMessage`.
@@ -238,6 +243,9 @@ message ContactMessage {
   // SHA-256("DeRec fingerprint commitment v1"
   //         || mlkemEncapsulationKey || eciesPublicKey || fingerprintNonce)
   // ```
+  //
+  // As in `contactBindingHash`, the keys are bound only by their fixed
+  // sizes, and keys of any other size MUST be refused.
   //
   // Present, exactly 32 bytes, in `INLINE_KEYS` mode only. In
   // `HASHED_KEYS` and `NO_KEYS` mode the commitment travels with the keys,

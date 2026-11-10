@@ -20,13 +20,15 @@ use crate::{
         },
     },
     primitives::make_shared_key,
+    transport::TransportValidationError,
     types::ChannelId,
 };
 use derec_proto::{
-    DeRecResult, GetSecretIdsVersionsResponseMessage, MessageBody, StatusEnum,
-    get_secret_ids_versions_response_message::VersionList,
+    DeRecResult, GetSecretIdsVersionsResponseMessage, MessageBody, Protocol, StatusEnum,
+    TransportProtocol, get_secret_ids_versions_response_message::VersionList,
 };
 use prost::Message;
+use std::slice;
 
 fn entry(id: u64, versions: &[(u32, &str)]) -> SecretVersionEntry {
     SecretVersionEntry {
@@ -559,15 +561,15 @@ fn test_extract_discovery_request_rejects_scheme_mismatched_reply_to() {
     let channel_id = ChannelId(7);
     let shared_key = SharedKey::new([73u8; 32]);
 
-    let malicious_reply_to = derec_proto::TransportProtocol {
+    let malicious_reply_to = TransportProtocol {
         uri: "ws://attacker.example/inbox".to_owned(),
-        protocol: derec_proto::Protocol::Https as i32,
+        protocol: Protocol::Https as i32,
     };
 
     let ProduceRequestResult { envelope } = produce_discovery_request(
         channel_id,
         &crate::types::ChannelKey::new(0, shared_key.clone()),
-        std::slice::from_ref(&malicious_reply_to),
+        slice::from_ref(&malicious_reply_to),
     )
     .expect("failed to produce discovery request");
 
@@ -576,7 +578,7 @@ fn test_extract_discovery_request_rejects_scheme_mismatched_reply_to() {
     assert!(matches!(
         result,
         Err(Error::Transport(
-            crate::transport::TransportValidationError::SchemeMismatch { .. }
+            TransportValidationError::SchemeMismatch { .. }
         ))
     ));
 }

@@ -25,6 +25,7 @@ async fn seed_no_keys_contact(secrets: &mut InMemSecretStore) {
                 channel_id: CHANNEL.0,
                 contact_mode: derec_proto::ContactMode::NoKeys as i32,
                 nonce: NONCE,
+                timestamp: Some(crate::derec_message::current_timestamp()),
                 ..Default::default()
             }),
         )
@@ -42,7 +43,7 @@ fn request_answering_on(uri: &str, protocol: derec_proto::Protocol) -> PendingAc
                 uri: uri.to_owned(),
                 protocol: protocol as i32,
             }],
-            timestamp: None,
+            timestamp: Some(crate::derec_message::current_timestamp()),
         },
     )
 }
@@ -147,7 +148,7 @@ fn a_plaintext_entry_is_skipped_when_a_secure_one_is_offered() {
                             protocol: derec_proto::Protocol::Https as i32,
                         },
                     ],
-                    timestamp: None,
+                    timestamp: Some(crate::derec_message::current_timestamp()),
                 },
             ))
             .await

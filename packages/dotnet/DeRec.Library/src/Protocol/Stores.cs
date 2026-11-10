@@ -731,7 +731,7 @@ public sealed record StateKey(StateKind Kind, ulong? ChannelId, ulong? SecretId,
 /// <param name="ChannelId">Set for <see cref="StateKind.PendingVerification"/> and <see cref="StateKind.PendingUnpair"/>.</param>
 /// <param name="SecretId">The secret being recovered, set for <see cref="StateKind.PendingRecovery"/>. See <see cref="StateKey"/>.</param>
 /// <param name="Version">Set for <see cref="StateKind.PendingRecovery"/> and <see cref="StateKind.SharingRound"/>.</param>
-/// <param name="StartedAt">Unix seconds when the operation was initiated (for <see cref="StateKind.PendingUnpair"/> and <see cref="StateKind.SharingRound"/>).</param>
+/// <param name="StartedAt">Unix seconds when the operation was initiated (for <see cref="StateKind.PendingUnpair"/>, <see cref="StateKind.SharingRound"/> and <see cref="StateKind.PendingRecovery"/>).</param>
 /// <param name="Bytes">
 /// Prost-encoded <c>VerifyShareRequestMessage</c> for
 /// <see cref="StateKind.PendingVerification"/>; otherwise null.
@@ -741,7 +741,14 @@ public sealed record StateKey(StateKind Kind, ulong? ChannelId, ulong? SecretId,
 /// received share, for <see cref="StateKind.PendingRecovery"/>;
 /// otherwise null.
 /// </param>
-/// <param name="Pending">Channel-id set of helpers yet to respond (only for <see cref="StateKind.SharingRound"/>).</param>
+/// <param name="Pending">
+/// Channel-id set of helpers yet to respond (for
+/// <see cref="StateKind.SharingRound"/> and
+/// <see cref="StateKind.PendingRecovery"/>). A recovery row without it, or
+/// without <paramref name="StartedAt"/>, is read by the library as none
+/// pending, sent at <c>0</c>, so the next sweep settles it on the shares it
+/// holds.
+/// </param>
 /// <param name="Confirmed">Channel-id set of helpers that confirmed storage (only for <see cref="StateKind.SharingRound"/>).</param>
 /// <param name="Failed">Channel-id set of helpers that rejected or timed out (only for <see cref="StateKind.SharingRound"/>).</param>
 /// <param name="PendingReplicas">
@@ -816,8 +823,15 @@ public sealed record StateItem(
 
     public static StateItem PendingVerification(ulong channelId, byte[] requestBytes) =>
         new(StateKind.PendingVerification, channelId, null, null, null, requestBytes, null);
-    public static StateItem PendingRecovery(ulong secretId, uint version, byte[][] shares, ulong[] shareChannels) =>
-        new(StateKind.PendingRecovery, null, secretId, version, null, null, shares, ShareChannels: shareChannels);
+    public static StateItem PendingRecovery(
+        ulong secretId,
+        uint version,
+        byte[][] shares,
+        ulong[] shareChannels,
+        ulong[] pending,
+        ulong startedAt) =>
+        new(StateKind.PendingRecovery, null, secretId, version, startedAt, null, shares, pending,
+            ShareChannels: shareChannels);
     public static StateItem PendingUnpair(ulong channelId, ulong startedAt) =>
         new(StateKind.PendingUnpair, channelId, null, null, startedAt, null, null);
     public static StateItem SharingRound(

@@ -6,6 +6,8 @@
 //! Protocol semantics live in `library/src/primitives/verification/`. Items
 //! below describe only the FFI surface.
 
+use std::slice;
+
 use crate::interop::ffi::common::{
     DeRecBuffer, empty_buffer, parse_transport_protocol_list, vec_into_buffer,
 };
@@ -13,6 +15,7 @@ use crate::interop::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_NULL_PTR, DeRecError,
     ffi_error, from_lib_error, success,
 };
+use crate::primitives::verification::{request, response};
 use derec_proto::{DeRecMessage, VerifyShareRequestMessage, VerifyShareResponseMessage};
 use prost::Message as _;
 
@@ -87,7 +90,7 @@ pub extern "C" fn produce_verify_share_request_message(
         Err(e) => return with_err(e),
     };
 
-    match crate::primitives::verification::request::produce(
+    match request::produce(
         channel_id.into(),
         secret_id,
         version,
@@ -137,7 +140,7 @@ pub extern "C" fn extract_verify_share_request(
         }
     };
 
-    match crate::primitives::verification::request::extract(request_bytes, &shared_key) {
+    match request::extract(request_bytes, &shared_key) {
         Ok(r) => ExtractVerifyShareRequestResult {
             error: success(),
             channel_id,
@@ -196,7 +199,7 @@ pub extern "C" fn produce_verify_share_response_message(
         }
     };
 
-    match crate::primitives::verification::response::produce(
+    match response::produce(
         channel_id.into(),
         &request,
         &crate::types::ChannelKey::new(epoch, shared_key),
@@ -245,7 +248,7 @@ pub extern "C" fn extract_verify_share_response(
         }
     };
 
-    match crate::primitives::verification::response::extract(response_bytes, &shared_key) {
+    match response::extract(response_bytes, &shared_key) {
         Ok(r) => ExtractVerifyShareResponseResult {
             error: success(),
             channel_id,
@@ -301,7 +304,7 @@ pub extern "C" fn process_verify_share_response_message(
             Err(e) => return with_err(e),
         };
 
-    let request = match derec_proto::VerifyShareRequestMessage::decode(request_bytes) {
+    let request = match VerifyShareRequestMessage::decode(request_bytes) {
         Ok(r) => r,
         Err(e) => {
             return with_err(ffi_error(
@@ -320,7 +323,7 @@ pub extern "C" fn process_verify_share_response_message(
         }
     };
 
-    match crate::primitives::verification::response::process(&request, &response, share_content) {
+    match response::process(&request, &response, share_content) {
         Ok(is_valid) => VerifyShareResponseResult {
             error: success(),
             is_valid,
@@ -339,7 +342,7 @@ fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], 
     if len == 0 {
         Ok(&[])
     } else {
-        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+        Ok(unsafe { slice::from_raw_parts(ptr, len) })
     }
 }
 

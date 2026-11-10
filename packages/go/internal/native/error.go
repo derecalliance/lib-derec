@@ -24,6 +24,9 @@ type DeRecError struct {
 	PeerMemo   *byte
 	Expected   uint32
 	Got        uint32
+	// HasChannelID reports whether ChannelID is set.
+	HasChannelID bool
+	ChannelID    uint64
 }
 
 // Error is the typed error every fallible FFI call returns, exposed publicly
@@ -41,6 +44,11 @@ type Error struct {
 	// over; set only by Restore when Code is CodeRestoreConflict, empty
 	// otherwise.
 	ConflictingChannelIDs []uint64
+	// ChannelID is the channel the error is about: the one named by
+	// CodeChannelAlreadyPaired, CodeFingerprintMismatch and
+	// CodeRoleMismatch, or, on a failed Process, the channel the failing
+	// message arrived on. Nil otherwise.
+	ChannelID *uint64
 }
 
 // Error implements the error interface, naming the category and code
@@ -102,6 +110,10 @@ func errorFrom(e DeRecError) error {
 		PeerMemo:   cString(e.PeerMemo),
 		Expected:   e.Expected,
 		Got:        e.Got,
+	}
+	if e.HasChannelID {
+		id := e.ChannelID
+		out.ChannelID = &id
 	}
 	freeErrorOnce.Do(func() {
 		purego.RegisterFunc(&freeErrorFn, symbol("derec_free_error"))

@@ -3,6 +3,7 @@
 
 use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::{
+    Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     primitives::discovery::DiscoveryError,
     types::{ChannelId, ChannelKey, SharedKey},
@@ -179,7 +180,7 @@ pub fn produce(
     channel_id: ChannelId,
     secret_list: &[SecretVersionEntry],
     channel_key: &ChannelKey,
-) -> Result<ProduceResult, crate::Error> {
+) -> Result<ProduceResult, Error> {
     let timestamp = current_timestamp();
 
     let secret_list: Vec<VersionList> = secret_list.iter().map(VersionList::from).collect();
@@ -282,11 +283,8 @@ pub fn produce(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
-pub fn extract(
-    envelope_bytes: &[u8],
-    shared_key: &SharedKey,
-) -> Result<ExtractResult, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractResult, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
     let response = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::GetSecretIdsVersionsResponse(message) => message,
@@ -294,7 +292,7 @@ pub fn extract(
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected GetSecretIdsVersionsResponseMessage");
 
-            return Err(crate::Error::Invariant(
+            return Err(Error::Invariant(
                 "Invalid message. Expected: GetSecretIdsVersionsResponseMessage",
             ));
         }
@@ -374,10 +372,8 @@ pub fn extract(
     feature = "logging",
     tracing::instrument(skip_all, fields(secrets_count = response.secret_list.len()))
 )]
-pub fn process(
-    response: &GetSecretIdsVersionsResponseMessage,
-) -> Result<ProcessResult, crate::Error> {
-    let result = response.result.as_ref().ok_or(crate::Error::Invariant(
+pub fn process(response: &GetSecretIdsVersionsResponseMessage) -> Result<ProcessResult, Error> {
+    let result = response.result.as_ref().ok_or(Error::Invariant(
         "GetSecretIdsVersionsResponseMessage is missing result field",
     ))?;
 

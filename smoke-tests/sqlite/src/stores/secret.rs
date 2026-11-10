@@ -6,6 +6,7 @@ use derec_library::protocol::{
 };
 use derec_library::types::ChannelId;
 use std::collections::HashMap;
+use std::future;
 
 use crate::codec::{
     decode_secret_value, encode_secret_value, secret_kind_tag, sql_to_u64, u64_to_sql,
@@ -42,7 +43,7 @@ impl DeRecSecretStore for SqliteSecretStore {
             )
             .ok()
             .map(|bytes| decode_secret_value(&bytes));
-        Box::pin(std::future::ready(Ok(result)))
+        Box::pin(future::ready(Ok(result)))
     }
 
     fn load_many(
@@ -53,7 +54,7 @@ impl DeRecSecretStore for SqliteSecretStore {
         missing_policy: MissingPolicy,
     ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
         if channel_ids.is_empty() {
-            return Box::pin(std::future::ready(Ok(Vec::new())));
+            return Box::pin(future::ready(Ok(Vec::new())));
         }
 
         let conn = lock(&self.connection);
@@ -94,12 +95,12 @@ impl DeRecSecretStore for SqliteSecretStore {
             }
         }
         if missing_policy == MissingPolicy::Fail && !missing.is_empty() {
-            return Box::pin(std::future::ready(Err(SecretStoreError::MissingEntries {
+            return Box::pin(future::ready(Err(SecretStoreError::MissingEntries {
                 kind,
                 channel_ids: missing,
             })));
         }
-        Box::pin(std::future::ready(Ok(result)))
+        Box::pin(future::ready(Ok(result)))
     }
 
     fn save(
@@ -127,7 +128,7 @@ impl DeRecSecretStore for SqliteSecretStore {
             ],
         )
         .expect("secret save failed");
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 
     fn remove(
@@ -146,7 +147,7 @@ impl DeRecSecretStore for SqliteSecretStore {
             ],
         )
         .expect("secret remove failed");
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 
     fn remove_many(

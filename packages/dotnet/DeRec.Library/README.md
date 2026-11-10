@@ -466,10 +466,13 @@ byte[] recovered = Recovery.Response.Recover(
 When driving the orchestrator instead of the primitives, a helper that
 answers with a share that cannot be part of the secret is reported as a
 `RecoveryShareCorruptedEvent` (`Reason` is a `CorruptionReason` constant:
-`Malformed`, `InvalidProof` or `Inconsistent`); the share is set aside and
-never blocks the recovery from the others. An honest helper never sends one,
-so treat it as a sign of a damaged or compromised helper — for example, offer
-to unpair it.
+`Malformed`, `InvalidProof` or `Forged` — its group reconstructs under one
+key, but not to a secret, or a single share reconstructs alone, reported with
+the recovery's decision); the share is set aside and never blocks the
+recovery from the others. An honest helper never sends one, so treat it as a
+sign of a damaged or compromised helper — for example, offer to unpair it. A
+share that only disagrees with the others is never reported this way: it is a
+dispute, not evidence against its helper.
 
 ### Helpers and shares
 
@@ -497,17 +500,53 @@ to unpair it.
   one-to-one, or its share store returns, for each requesting channel, the
   share intended for it first, in a deterministic order.
 
+Each helper's answer to a recovery request surfaces as
+`RecoveryShareReceivedEvent`, `RecoveryShareRefusedEvent` or
+`RecoveryShareCorruptedEvent`. A recovery reconstructs nothing until every
+helper it asked has answered, or `Timeouts.GetShareResponse`
+(`timeouts.get_share_response_secs`) has passed since the requests went out —
+each silent helper is then reported as `RecoverSecretFailedEvent` with
+`Error` `"timeout"` by the next `TickAsync`. It then decides exactly once:
+
+- `SecretRecoveredEvent { Secret }` — one secret reconstructs and every
+  collected share is part of it;
+- `RecoveryDisputedEvent { Version, Secret, SupportedBy, DisputedBy }` — one
+  secret reconstructs, but other helpers hold valid shares of a different
+  split that does not. Either side can be the owner's: colluding helpers can
+  forge a complete split, and the honest ones may be too few to reconstruct
+  theirs. Show the owner what `Secret` holds and who stands on each side, and
+  pass it to `RestoreAsync` only once they confirm it;
+- `RecoveryConflictEvent { Version, Candidates, DisputedBy }` — two or more
+  different secrets reconstruct. Each `RecoveryCandidate` carries the
+  `Secret` and `SupportedBy`. The library never picks: involve the owner, and
+  pass the candidate they confirm to `RestoreAsync`;
+- `RecoveryIncompleteEvent { SecretId, Version, SharesReceived }` — nothing
+  reconstructs. The recovery is closed; start it again to retry.
+
+`SupportedBy` / `DisputedBy` name helpers as `RecoveryHelper(ChannelId,
+CommunicationInfo)`, the `CommunicationInfo` being what the helper advertised
+when it paired, so the app can tell the owner who is on each side.
+That is the helper's own configured communication info, not the peer
+communication info it passed when starting the pairing: a helper that
+configures none is named by its channel alone.
+
 The recovering device receives a `SecretRecoveredEvent` carrying the typed
 `Secret`. Pass it
-to `protocol.RestoreAsync(secret, version)` — on the same `DeRecProtocol`
+to `protocol.RestoreAsync(secret, version, newestVersion)` — on the same `DeRecProtocol`
 that ran recovery, since it is the one holding the recovery-mode channels
 `RestoreAsync` unpairs — to
 commit canonical helper / replica state and wipe the throwaway recovery-mode
 channels. A helper or member with no endpoint in the recovered roster gets no
 channel; `RestoreAsync` returns a `PeerNotRestoredEvent` for it (`Reason` is
-`NotRestoredReason.NoTransports`) and restores the rest. Errors throw
+`NotRestoredReason.NoTransports`) and restores the rest. `newestVersion` is
+the newest version any helper reported in Discovery (`version` itself when
+that is the newest): the recovered secrets are recorded at it, so the next
+publish is `newestVersion + 1`, since a helper ignores a version older than
+the newest it stores (`IgnoreReason.Superseded`). Errors throw
 `DeRecException` with `Code` in
-{`AlreadyRestored`, `RestoreConflict`, `Invariant`, store-category code}.
+{`AlreadyRestored`, `RestoreConflict`, `Invariant`, `InvalidInput`,
+store-category code}; `InvalidInput` means `newestVersion` is below
+`version`.
 On `RestoreConflict`, `DeRecException.ConflictingChannelIds`
 (`IReadOnlyList<ulong>`, empty for every other code) lists the existing
 channels that collide with ids in the recovered `Secret` — clear exactly
@@ -516,7 +555,7 @@ those and retry:
 ```csharp
 try
 {
-    await protocol.RestoreAsync(recovered.Secret, version);
+    await protocol.RestoreAsync(recovered.Secret, version, newestVersion);
 }
 catch (DeRecException e) when (e.Code == DeRecCode.RestoreConflict)
 {
@@ -805,6 +844,33 @@ envelope and the inner message. A message whose two timestamps differ, or
 where either or both are absent, is ignored as `MessageIgnoredEvent` with
 `IgnoreReason.TimestampMismatch`; this includes replies from 0.0.8 peers.
 
+Within the inbound window `ProcessAsync` handles every copy of a message it is
+given, including one of this device's own messages delivered back to it.
+Detecting both is the app's transport's job: `Envelope.ReadMessageId(bytes)`
+returns an `Id` that is the same for every copy of one message, whatever its
+unauthenticated fields (sequence, trace id, protocol version) say, and a
+`Timestamp`. Keep the `Id` of every envelope you send and of every envelope
+`ProcessAsync` accepted (no exception and no `MessageIgnoredEvent`) until
+`max(received or sent at, Timestamp) + InboundMessage`, drop an inbound
+envelope whose `Id` you kept, and keep the record across restarts. Never key
+on a hash of the raw bytes. A helper ignores a `StoreShareRequest` for a
+version older than the newest it stores on the channel, and not stored
+itself, as `MessageIgnoredEvent` with `IgnoreReason.Superseded`, unanswered.
+Reject a contact update older than the last one you accepted on the channel,
+using the `Timestamp` of the envelope that raised it; that needs auto-accept
+off for `UpdateChannelInfo`.
+
+A pairing has a lifetime, `Timeouts.Pairing` (default 30 s). Both sides
+enforce it and nothing is sent on expiry: `StartAsync(FlowKind.Pairing, …)`
+refuses a contact older than it with `DeRecCode.PairingExpired`; the contact's
+creator reports a request on such a contact, or a request older than the
+lifetime, as `MessageIgnoredEvent` with `IgnoreReason.Expired` before any
+`ActionRequiredEvent`, and `AcceptAsync` refuses a request that outlived it
+with `DeRecCode.PairingExpired`. Pairing involves both parties, so treat an
+expiry as a retry and ask the user to scan or share a fresh contact. Keep the
+scanner's `ExpiredChannels` timeout at least `Pairing` plus the time a response
+takes to arrive.
+
 ### Key rotation
 
 With `WithKeyRotation(true)`, the owner advances each helper channel's key one epoch in every sharing round that reaches the threshold (a round below it advances none), and the replica group channel's key on every publish to replicas. Each step is K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" || be32(e+1)). Rotation is off by default, and off keeps the channel on its current key. The envelope's `sequence` carries the epoch, and peers follow on their own, so the setting is the owner's alone (`KeyRotation` in a config). A message under an epoch whose key the device cannot obtain is ignored as `MessageIgnoredEvent` with `IgnoreReason.KeyUnavailable`. A device keeps its newest key and the key of every secret version it still stores, so any kept version restores. The key ring is stored as a secret of kind `SecretKind.KeyRing` (`3`): persist its bytes as given, with any length, beside the kind-`0` shared key. Forward secrecy covers a compromised helper device, or a key alone, plus recorded traffic, and only for epochs older than the oldest key held; the owner and replica devices hold the plaintext secret and the keys of every version they store. A 0.0.x peer cannot follow a rotated channel: it must upgrade and re-pair.
@@ -904,6 +970,8 @@ The record reads and writes the canonical JSON shared by every SDK
     "inbound_message_secs": 300,
     "sharing_round_secs": 60,
     "unpair_ack_secs": 60,
+    "get_share_response_secs": 300,
+    "pairing_secs": 30,
     "expired_channels": { "enabled": true, "timeout_in_secs": 300 }
   },
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
@@ -1122,6 +1190,10 @@ catch (DeRecException ex) when (ex.Code == DeRecCode.VersionMismatch)
 `Invariant`, `ProtobufDecode`, …). Both are global — the same value means the
 same thing across categories.
 
+`DeRecException.ChannelId` (`ulong?`) names the channel an error is about:
+set for `ChannelAlreadyPaired`, `FingerprintMismatch` and `RoleMismatch`, and
+on a failed `ProcessAsync` (below).
+
 ### When `ProcessAsync` fails
 
 `ProcessAsync` settles expired deadlines (sharing-round and unpair
@@ -1214,6 +1286,40 @@ usually arrives before the destination's user has confirmed. Confirming does
 not replay it: once the destination's `VerifyFingerprintAsync` succeeds,
 call `StartAsync(FlowKind.ReplicaDiscovery, new ReplicaDiscoveryParams())` to
 pull the copy from the source.
+
+Until a device confirms a member, that member is not part of the group as
+far as the device is concerned. It is left out of every roster the device
+publishes (each new version, catch-up answers and the vault itself), it is
+not asked in a replica version check, and it cannot succeed a removed source.
+Every recipient installs a roster's members as paired, so listing an
+unconfirmed one would admit it on their behalf.
+
+### Every helper sees the vault's compressed length
+
+The vault (the user's secrets, every helper's channel key and
+`CommunicationInfo`, and the replica group key) is compressed as one gzip stream
+before it is encrypted and split. Encryption keeps the length, so every
+helper learns the compressed length of every version. A helper also chooses
+part of what is compressed: its own `CommunicationInfo`, which it changes with
+`UpdateChannelInfo`. When that text repeats part of a secret elsewhere in
+the vault, the vault compresses better, so over many versions a corrupted
+helper could learn another helper's channel key, the group key or the
+user's secrets a few characters at a time (the side channel behind CRIME
+and BREACH). Each guess costs a new version, which only the owner creates,
+after a contact change the owner's application has to accept. Keep `AutoAcceptPolicy.UpdateChannelInfo`
+off, and treat a helper that keeps changing its contact details as suspect.
+
+### Decoding a recovered vault has no memory limit
+
+In recovery the vault is decrypted from shares that nothing authenticates,
+so a forged recovery group can deliver any payload, including one built to
+exhaust memory. The decoder parses the vault while it inflates it: a
+payload that is not JSON is refused after its first bytes, and padding is
+not buffered. A payload that is valid JSON still receives the memory its
+largest value claims, and gzip lets a payload claim up to about 1030 times
+its own size. The library sets no limit. When memory runs out, the process is killed by the operating system or aborts inside the native library, with no error and no event. To bound it, configure
+`ParameterRange.MaxShareSize`: a recovery share larger than that is refused before anything is
+decoded, so a vault can claim at most about 1030 times that size.
 
 ### The `derec.*` namespace in `CommunicationInfo` is library-owned
 

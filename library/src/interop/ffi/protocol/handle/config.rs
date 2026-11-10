@@ -5,6 +5,7 @@
 //! `DeRecProtocol::set_*` methods.
 
 use std::collections::HashMap;
+use std::slice;
 
 use super::DeRecProtocolHandle;
 use crate::interop::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
@@ -39,7 +40,7 @@ pub unsafe extern "C" fn derec_protocol_set_communication_info(
     } else if info_json_ptr.is_null() {
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "info_json_ptr null with len > 0");
     } else {
-        let bytes = unsafe { std::slice::from_raw_parts(info_json_ptr, info_json_len) };
+        let bytes = unsafe { slice::from_raw_parts(info_json_ptr, info_json_len) };
         match serde_json::from_slice(bytes) {
             Ok(m) => m,
             Err(e) => {
@@ -87,7 +88,7 @@ pub unsafe extern "C" fn derec_protocol_set_own_transports(
     if json_len == 0 || json_ptr.is_null() {
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "json_ptr null or len == 0");
     }
-    let bytes = unsafe { std::slice::from_raw_parts(json_ptr, json_len) };
+    let bytes = unsafe { slice::from_raw_parts(json_ptr, json_len) };
     let entries: Vec<OwnTransportEntry> = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(e) => {

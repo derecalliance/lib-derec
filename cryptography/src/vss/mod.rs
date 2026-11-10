@@ -56,7 +56,11 @@ const MAX_HELPERS: u64 = 1 << MERKLE_TREE_DEPTH;
 ///   own. There can be at most 128 shares (one Merkle leaf each); the weights' sum `n` and
 ///   the threshold are not capped, so `2 <= threshold <= n`.
 /// * `msg` - The secret message to be shared, as a byte slice.
-/// * `entropy` - A cryptographically secure random seed of length `λ` (32 bytes).
+/// * `entropy` - A 32-byte seed that MUST be secret, uniformly random and fresh for every
+///   call: draw it from a cryptographically secure generator, as the example does. The split
+///   is a deterministic function of `msg` and `entropy`. Anyone who can guess `entropy` can
+///   test a guess of `msg` against a single share by splitting it again, and reusing
+///   `entropy` makes two splits of the same message identical. No error reports either.
 ///
 /// # Returns
 ///
@@ -95,11 +99,18 @@ const MAX_HELPERS: u64 = 1 << MERKLE_TREE_DEPTH;
 ///
 /// ```rust
 /// use derec_cryptography::vss::{share, recover, VSSShare};
-/// let shares = share(3, &[1, 1, 1, 1, 1], b"my secret", &[0u8; 32]).unwrap();
+/// use rand::rand_core::UnwrapErr;
+/// use rand::rngs::SysRng;
+/// use rand::Rng;
+///
+/// let mut entropy = [0u8; 32];
+/// UnwrapErr(SysRng).fill_bytes(&mut entropy);
+/// let shares = share(3, &[1, 1, 1, 1, 1], b"my secret", &entropy).unwrap();
 /// assert_eq!(shares.len(), 5);
 ///
 /// // The first helper holds two subshares: with it, one more helper is enough.
-/// let weighted = share(3, &[2, 1, 1, 1], b"my secret", &[0u8; 32]).unwrap();
+/// UnwrapErr(SysRng).fill_bytes(&mut entropy);
+/// let weighted = share(3, &[2, 1, 1, 1], b"my secret", &entropy).unwrap();
 /// let pair = vec![weighted[0].clone(), weighted[3].clone()];
 /// assert_eq!(recover(&pair).unwrap(), b"my secret");
 /// ```
@@ -177,8 +188,13 @@ pub fn share(
 ///
 /// ```rust
 /// use derec_cryptography::vss::{share, verify};
+/// use rand::rand_core::UnwrapErr;
+/// use rand::rngs::SysRng;
+/// use rand::Rng;
 ///
-/// let shares = share(2, &[1, 1, 1], b"my secret", &[0u8; 32]).unwrap();
+/// let mut entropy = [0u8; 32];
+/// UnwrapErr(SysRng).fill_bytes(&mut entropy);
+/// let shares = share(2, &[1, 1, 1], b"my secret", &entropy).unwrap();
 /// assert!(verify(&shares[0]));
 /// ```
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
@@ -244,8 +260,13 @@ pub fn verify(share: &VSSShare) -> bool {
 ///
 /// ```rust
 /// use derec_cryptography::vss::{share, recover};
+/// use rand::rand_core::UnwrapErr;
+/// use rand::rngs::SysRng;
+/// use rand::Rng;
 ///
-/// let shares = share(3, &[1, 1, 1, 1, 1], b"my secret", &[0u8; 32]).unwrap();
+/// let mut entropy = [0u8; 32];
+/// UnwrapErr(SysRng).fill_bytes(&mut entropy);
+/// let shares = share(3, &[1, 1, 1, 1, 1], b"my secret", &entropy).unwrap();
 /// let secret = recover(&shares[..3].to_vec()).unwrap();
 /// assert_eq!(secret, b"my secret");
 /// ```
@@ -379,6 +400,7 @@ fn commit_shares<R: rand::CryptoRng + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::random;
 
     const ENTROPY: &[u8; λ] = &[0u8; λ];
 
@@ -700,7 +722,7 @@ mod tests {
     /// Re-commits `leaves` under a fresh Merkle tree, so every share's proof opens to the
     /// root and only the subshare-list checks stand between a malformed share and `verify`.
     fn commit(leaves: Vec<Vec<Subshare>>, encrypted_secret: &[u8]) -> Vec<VSSShare> {
-        commit_shares(leaves, encrypted_secret, &mut crate::random::os_rng())
+        commit_shares(leaves, encrypted_secret, &mut random::os_rng())
     }
 
     fn leaves_of(shares: &[VSSShare]) -> Vec<Vec<Subshare>> {

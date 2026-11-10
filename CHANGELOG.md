@@ -9,6 +9,29 @@ all of them unless it names a specific binding.
 
 ### 1.0.0-alpha.1 (unreleased)
 
+- **Changed: `restore` takes the newest version the helpers hold.**
+  *(breaking; every SDK)*
+
+  A helper ignores a `StoreShareRequest` for a version older than the newest
+  it stores (`IgnoreReason::Superseded`, 0.0.11). A device that restored an
+  older kept version committed its snapshot at that version, so its next
+  publish was numbered below what the helpers held and reached none of them.
+  `restore` now takes `newest_version`, the newest version any helper
+  reported in Discovery: the recovered secrets are recorded at it, and the
+  next publish is `newest_version + 1`. The keys of the restored channels
+  stay pinned to the recovered version, which is what the helpers hold them
+  for. A `newest_version` below the recovered version is `InvalidInput`.
+
+  - Rust: `DeRecProtocol::restore(&secret, recovered_version, newest_version)`.
+  - FFI: `derec_protocol_restore` params JSON gains a required
+    `newest_version` beside `version`.
+  - .NET `RestoreAsync(secret, version, newestVersion)`, Go
+    `Restore(secret, version, newestVersion)`, Node, web and React Native
+    `restore(secret, version, newestVersion)`.
+
+  **Migration:** pass the highest version Discovery reported for the
+  `secret_id`; pass the recovered version when that is the newest.
+
 - **Added: shared-key rotation.** *(security; breaking for any custom store
   and for 0.0.x peers)*
 
@@ -475,6 +498,387 @@ all of them unless it names a specific binding.
   Migration: implement `DeRecTransport` (`ITransport`, `Transport`) directly,
   with the loop the adapter ran: dial each endpoint in order, return on the
   first success, and return the last error when every endpoint failed.
+
+### 0.0.11
+
+A security release. Recovery no longer accepts whichever group of shares
+reconstructs first. It waits for an answer from every helper it asked, tries
+every group, and when the answers disagree it reports the disagreement to
+the application instead of choosing a side. Fewer than the threshold of
+helpers can no longer have the owner silently recover a forged secret, and
+with it a forged helper list. Pairing gains a lifetime, replica rosters list
+only confirmed members, restore keeps the channels on which this device is
+a helper, and every SDK gets `message_id` to detect replayed and reflected
+messages.
+
+No wire message changes: an owner on this version recovers from helpers on
+0.0.10, and helpers need no upgrade. Two things in progress during the
+upgrade must be redone: a contact created before it, and a replica pairing
+not yet confirmed.
+
+- **Fixed (security): one helper could forge the recovered secret.**
+  *(bug fix; every SDK)*
+
+  Recovery took the first group of matching shares that decrypted and needed
+  only two subshares, which one weighted helper's share could hold on its
+  own. A single helper could send its own complete split of a secret it
+  made up, have the owner recover it, and — through the helper list inside
+  it — have `restore` replace every real helper with ones it controlled. The
+  honest helpers' shares were then reported as corrupted. A group now needs
+  shares from at least two helpers, and the secret it reconstructs must fit
+  the threshold it declares.
+
+- **Changed: a recovery decides only once every helper has answered.**
+  *(breaking; every SDK)*
+
+  `SecretRecovered` used to arrive with the share that first completed a
+  group. Now nothing is reconstructed until every helper asked has answered
+  — a share, a refusal or a corrupted share — or until
+  `get_share_response` has passed since the requests went out. On that
+  timeout `tick` reports each silent helper as `RecoverSecretFailed` with
+  error `"timeout"` and decides on the shares in hand. The timeout is a new
+  field, `Timeouts::get_share_response` (`get_share_response_secs` in the
+  config JSON; .NET `Timeouts.GetShareResponse`, Go
+  `Timeouts.GetShareResponseSecs`, TypeScript `get_share_response_secs`),
+  default 300 seconds. A recovery started with no helper to ask closes at
+  once with `RecoveryIncomplete`.
+
+  The `PendingRecovery` state row records the helpers still to answer and
+  when the requests went out, as `pending` and `started_at` in the state
+  JSON (`StateItem.Pending` and `StartedAt` in .NET and Go; the .NET
+  `StateItem.PendingRecovery` factory takes both). A row written by an
+  earlier version decodes as none pending, sent at `0`, so the next `tick`
+  decides it on the shares it holds. A custom state store that keeps rows as
+  opaque JSON needs no change; one that maps fields must carry `pending` and
+  `started_at`.
+
+  **Migration:** keep calling `tick` while a recovery is open, at an
+  interval shorter than `get_share_response`, or a helper that never answers
+  holds the decision until the next `process`. Do not count shares to
+  predict when `SecretRecovered` arrives.
+
+- **Added: `RecoveryDisputed`, `RecoveryConflict` and `RecoveryIncomplete`.**
+  *(breaking; every SDK)*
+
+  A recovery now ends in exactly one of four events:
+
+  - `SecretRecovered { secret }` — one secret reconstructs, and every
+    collected share is part of it;
+  - `RecoveryDisputed { version, secret, supported_by, disputed_by }` — one
+    secret reconstructs, but other helpers hold valid shares of a different
+    split that does not. Either side can be the owner's: colluding helpers
+    can forge a complete split, and the honest ones may be too few to
+    reconstruct theirs;
+  - `RecoveryConflict { version, candidates, disputed_by }` — two or more
+    different secrets reconstruct; each candidate carries its `secret` and
+    `supported_by`;
+  - `RecoveryIncomplete { secret_id, version, shares_received }` — nothing
+    reconstructs. The recovery is closed.
+
+  `supported_by` and `disputed_by` name helpers as `RecoveryHelper
+  { channel_id, communication_info }`, where `communication_info` is what
+  the helper itself configured and advertised when it paired — not the
+  `peer_communication_info` passed to `start(Pairing)`.
+
+  **Migration:** handle all four. On `RecoveryDisputed` or
+  `RecoveryConflict`, show the owner what each secret holds and which
+  helpers stand behind it, and pass the one the owner confirms to `restore`
+  exactly as the `secret` of `SecretRecovered`. Never restore either
+  automatically. On `RecoveryIncomplete`, start the recovery again once more
+  helpers are reachable.
+
+- **Changed: a share that only disagrees is no longer reported as
+  corrupted.** *(breaking; every SDK)*
+
+  `CorruptionReason::Inconsistent` is removed. A valid share outside the
+  recovered secret was reported as corrupted, with the advice to unpair its
+  helper — but when a forged group wins, that share is the honest helper's.
+  Such shares now appear in `disputed_by`. `CorruptionReason::Forged`
+  (wire `"Forged"`) is added for what an honest split never produces: a
+  group that reconstructs under one key but not to a secret, or to one whose
+  declared threshold its own shares contradict, or a single share that
+  reconstructs alone. `RecoveryShareCorrupted` therefore reports only what
+  the shares themselves prove, and unpairing on it stays safe.
+
+  **Migration:** replace any handling of `Inconsistent` with `Forged`. Do
+  not unpair helpers named in `disputed_by` without the owner's decision.
+
+- **Removed: `RecoveryShareError`.** *(breaking; every SDK)*
+
+  Nothing emits it any more: a group whose reconstructed bytes do not decode
+  is reported as `Forged`, and a recovery that reconstructs nothing ends in
+  `RecoveryIncomplete`.
+
+  **Migration:** remove its handler and handle `RecoveryIncomplete`.
+
+- **Fixed (security): restore unpaired the owners this device helps.**
+  *(bug fix; every SDK)*
+
+  After a recovery, `restore` unpairs the recovery-mode channels it no
+  longer needs. It picked them as every channel the recovered roster does
+  not list, whatever the peer's role, so on a device that is also a helper
+  for other owners it unpaired those channels too and deleted the shares it
+  held for them — at once without a required acknowledgement, on the
+  timeout with one, since an owner refuses an unpair from its helper. Those
+  owners went on counting the device as a helper holding their share. Only
+  channels whose peer is a helper are recovery channels now; a channel whose
+  peer is an owner is left untouched, with its key and its share.
+
+- **Fixed: one unfinished replica pairing could stop a device from
+  protecting, for good.** *(bug fix; every SDK)*
+
+  A device starting a replica pairing wrote its own row into the replica
+  roster at once, pointing at the contact's channel, and a device holds a
+  single own row. When that pairing never completed — declined, or one
+  message lost — every `ProtectSecret` failed until the expiry sweep, since
+  the row pointed at a channel with no key. A later pairing could not claim
+  the row, so confirming it failed as well, and once the sweep deleted the
+  stale row the device was left in a group with no row of its own, unable to
+  protect again. The responder had the same problem with a pairing it
+  accepted but whose peer never confirmed. A pairing in flight now leaves
+  only its `Pending` placeholder, and a device writes its own row when it
+  confirms a replica pairing's fingerprint: the first confirmed pairing
+  fixes the group's channel, as before. A roster holding only unconfirmed
+  peers is no group, so publishing to helpers is unaffected.
+
+  **Migration:** this device's own row now appears in the channel store only
+  after `verify_fingerprint`, not when the handshake completes; code that
+  reads the roster in between sees only the peer. A replica pairing in
+  progress during the upgrade must be started again.
+
+- **Fixed (security): a contact on a replica group's channel could delete
+  the group key.** *(bug fix; every SDK)*
+
+  The creator of a contact chooses its channel identifier, and a replica
+  group's identifier travels in the clear on every envelope of the group.
+  Scanning a contact that reused it was accepted, since only a non-`Pending`
+  helper record on the channel counted as in use. While that pairing was
+  pending the device ignored the group's messages, and when it expired the
+  sweep deleted every key stored under the channel, the group key with it;
+  every later `ProtectSecret` failed and the group had to be re-created.
+  `start(Pairing)` now refuses, with `ChannelAlreadyPaired`, a channel that
+  holds a key or has a replica member recorded on it, and the expiry sweep
+  removes a channel's key only once nothing else is recorded on the channel.
+
+- **Changed (security): detecting replayed and reflected messages is the
+  application's job, and every SDK gets the tool for it.** *(new API; every
+  SDK)*
+
+  Within the inbound window `process` handles every copy of a message it is
+  given, and both ends of a channel encrypt under one key, so a message
+  delivered back to its sender decrypts there as the peer's. An application
+  could not tell copies apart: `sequence`, `traceId` and the protocol version
+  are not authenticated, and an envelope can be re-encoded, so a copy can
+  arrive as different bytes. `derec_message::message_id(envelope)` returns
+  `{ id, timestamp }`, where `id` is a SHA-256 of the encrypted `message`
+  field: the same for every copy of one message, different for every other.
+  The contract is documented on `process` and in `derecmessage.proto`: keep
+  the `id` of every envelope sent and accepted until
+  `max(received or sent at, timestamp) + inbound_message`, keep that record
+  across restarts (or hold inbound traffic for one window after starting),
+  drop an inbound envelope whose `id` is kept, and reject a contact update
+  older than the last one accepted on the channel. The `AutoAcceptPolicy` documentation no
+  longer calls accepting `UpdateChannelInfo` safe because only the peer can
+  send it.
+
+  Exposed as `message_id_from_envelope` (C), `envelope_message_id` (wasm),
+  `envelope.ReadMessageID` (Go), `Envelope.ReadMessageId` (.NET) and
+  `envelope.message_id` (Node, web, React Native), next to the trace-id
+  helpers.
+
+- **Fixed (security): a delivered-again share request brought back a version
+  the helper had dropped.** *(bug fix; every SDK)*
+
+  A helper that had deleted a version under a newer request's `keepVersion`
+  stored it again when the older request arrived a second time within the
+  inbound window, replayed or held back. A `StoreShareRequest` for a version
+  older than the newest one stored on the channel, and not stored itself, is
+  now ignored as `MessageIgnored` with the new reason `Superseded`: it raises
+  no `ActionRequired` and is not answered. An identical re-send of a version
+  still held is acknowledged as before.
+
+  **Migration:** code matching `IgnoreReason` exhaustively must handle
+  `Superseded`.
+
+- **Fixed (security): a late accept left a channel only one side held.**
+  *(bug fix; new setting; every SDK)*
+
+  A pairing request had no deadline at its creator, while the scanner drops
+  its side of a pairing after `expired_channels`. A request accepted after
+  that recorded a paired channel the scanner could not open: an owner then
+  sent a share to it on every `ProtectSecret`, and a helper kept a channel to
+  an owner that no longer knew it. A pairing now has a lifetime,
+  `Timeouts::pairing` (default 30 s), and both sides enforce it without
+  sending anything. The scanner's `start(Pairing)` refuses a contact older
+  than the lifetime with the new `PairingError::Expired` (code
+  `pairing_expired`). The creator reports a request on such a contact, or a
+  request older than the lifetime, as `MessageIgnored` with
+  `IgnoreReason::Expired` before any prompt, and `accept` refuses a request
+  that outlived it with `PairingError::Expired`. The remedy is a fresh
+  contact. The creator now keeps its contact in every mode, so it measures
+  the contact's age on its own clock.
+
+  Exposed as `timeouts.pairing_secs` in the shared config, `Timeouts.Pairing`
+  (.NET), `Timeouts.PairingSecs` (Go) and `timeouts.pairing_secs` (Node, web,
+  React Native), with the code `CodePairingExpired` (Go) and
+  `DeRecCode.PairingExpired` (.NET).
+
+  **Migration:** a scanner's `expired_channels` timeout should be at least
+  `pairing` plus the time a response takes to arrive. A contact without a
+  timestamp is refused, and a contact created before this version cannot be
+  answered: create a new one. An application that carries contacts in its
+  own format (a QR payload, a DTO) and rebuilds the `ContactMessage` from it
+  must now carry the contact's `timestamp` too: until this version it was
+  optional and unused, and a contact rebuilt without it is refused with
+  `invalid_contact_message` ("contact carries no timestamp").
+
+- **Fixed (security): a replica version check could hang, and a member could
+  miss a removal.** *(bug fix; every SDK)*
+
+  Until its fingerprint is confirmed and the group channel is handed over, a
+  member that has just joined talks on its own pairing channel, under that
+  channel's key, so for that window the group spans two channels and two
+  keys. `start(ReplicaDiscovery)` sealed every question under the key of the
+  first member in the roster, and `start(UnpairReplica)` sealed every notice
+  under the key of the member being removed, so a member on the other
+  channel could not read its message. Each message is now sealed under the
+  key of the channel it travels on. A version check also no longer waits
+  forever on a member that never answers: once `Timeouts::get_share_response`
+  (default 300 s) has elapsed, `tick` or the next `process` concludes it on
+  the versions already reported, with `ReplicaDiscoveryComplete`.
+
+- **Fixed: the pairing hashes bound the two public keys only through a
+  size check made elsewhere.** *(hardening; Rust)*
+
+  `contact_binding_hash` (the `HashedKeys` commitment) and
+  `fingerprint_commitment` concatenate the ML-KEM and ECIES public keys
+  without their lengths, so moving bytes from the end of one key to the
+  start of the other left the hash unchanged. Only ML-KEM's own size check,
+  in a later step, refused such a split. Both functions now refuse keys of
+  any size but the protocol's (1568 and 65 bytes) with
+  `DerecPairingError::InvalidSize`, and return a `Result`; a `PrePair`
+  response whose keys have the wrong sizes is refused with
+  `PrePairHashMismatch`. The hashed bytes are unchanged, so pairing with
+  0.0.10 devices still works. `InitiatorSecretKeyMaterial::fingerprint_commitment`
+  and `ContactMessageExt::hashed_keys` return a `Result` too.
+
+- **Docs: seeds passed to the cryptography primitives must be secret,
+  random and fresh.** *(docs; Rust)*
+
+  `vss::share`, `pairing::contact_message` and
+  `pairing::pairing_request_message` are deterministic in their `entropy`
+  argument, and their examples passed all zeros. With a guessable seed,
+  anyone holding one share can test a guess of the secret, and anyone who
+  knows a pairing seed holds the pairing keys. The docs now state that the
+  seed must be secret, uniformly random and fresh for every call, and every
+  example draws it from the operating system's generator. The library's own
+  flows always did.
+
+- **Docs: removing a replica member does not protect against a compromised
+  device.** *(docs; every SDK)*
+
+  The group key does not change when a member is removed, so removal relies
+  on the removed device's library deleting its copy. A device whose storage
+  was read keeps the key and can decrypt every later publication it
+  obtains, including the one that completes its removal. `UnpairReplica`
+  and `ReplicaRemoved` now say so in every SDK.
+
+- **Fixed (hardening): decoding a recovered vault inflated all of it before
+  checking it.** *(hardening; every SDK)*
+
+  The vault decoder inflated the whole gzip stream into memory and only then
+  parsed the JSON. In recovery the vault comes from shares that nothing
+  authenticates, so a forged payload of about 1 MB could make a device
+  allocate a gigabyte before being refused, or several gigabytes if it was
+  valid JSON. The decoder now parses the JSON while the stream is being
+  inflated: a payload that is not JSON is refused after its first bytes, and
+  padding around the JSON is not buffered. Errors are unchanged. The format
+  is unchanged, and v2 and v3 vaults decode as before.
+
+- **Docs: the vault's compressed length and its decoding cost.** *(docs;
+  every SDK)*
+
+  The vault is one gzip stream that mixes the user's secrets and channel
+  keys with contact details a helper chooses, and every helper learns its
+  compressed length, so a corrupted helper could learn secrets slowly
+  through that length. Decoding sets no memory limit: a valid-JSON vault
+  receives the memory its largest value claims, up to about 1030 times its
+  size, and running out kills a native process. The secret module docs, the
+  library README and every SDK README now describe both, with the
+  mitigations: keep auto-accept of `UpdateChannelInfo` off, and set
+  `parameter_range.max_share_size` to bound decoding.
+
+- **Fixed (security): an unconfirmed replica joiner was published as a
+  member.** *(bug fix; every SDK)*
+
+  A joiner whose fingerprint the publishing device had not confirmed was
+  still listed in the roster it published, in each new version, in catch-up
+  answers and in the vault. Every recipient installs a roster's members as
+  `Paired`, so one member's unconfirmed pairing became an accepted
+  membership on every other device, and could come back to the publisher
+  through a later roster from another member. A roster now lists only
+  confirmed members. For the same reason, an unconfirmed member can no
+  longer be chosen to succeed a removed source, and a replica version check
+  no longer asks it: it drops the question at its pending gate, so the check
+  used to wait out `get_share_response` for nothing.
+
+- **Changed: a failed transport send reports the same error in every SDK.**
+  *(breaking for code matching the old text; every SDK)*
+
+  When the application's transport delivered a message to none of a peer's
+  endpoints, the C ABI bindings (Go, .NET, React Native) reported it as
+  `invariant` / `invariant` with "internal invariant violated: transport send
+  failed", and Node and web as `input` / `invalid_input` with "invalid input:
+  transport.send promise rejected". Neither category was true, and the same
+  failure read differently per SDK, including in `ProtectSecretFailed.error`.
+  Every binding now reports the new `Error::TransportSendFailed`: category
+  `transport` (16) and code `transport_send_failed` (123), with the text
+  "transport send failed: the message reached none of the peer's endpoints".
+  A Rust `DeRecTransport` should return the same variant when delivery fails.
+  Code 122 stays retired. The constants are `DEREC_CATEGORY_TRANSPORT` /
+  `DEREC_CODE_TRANSPORT_SEND_FAILED` (C), `CategoryTransport` /
+  `CodeTransportSendFailed` (Go), `DeRecCategory.Transport` /
+  `DeRecCode.TransportSendFailed` (.NET), and the `"transport"` /
+  `"transport_send_failed"` names (TypeScript).
+
+- **Added: SDK errors name the channel they are about.** *(every SDK —
+  breaking for the C ABI: `DeRecError` gains two fields)*
+
+  `ChannelAlreadyPaired`, `FingerprintMismatch` and `RoleMismatch` name a
+  channel in Rust, and the SDKs dropped it: an app that re-scanned a contact
+  for a channel it already holds learned only that some channel was paired,
+  since the contact's creator chooses the id. Rust's `Error` gains a
+  `channel_id()` method, and every SDK now carries the id on its error: `has_channel_id` /
+  `channel_id` on the C `DeRecError`, `ChannelID *uint64` on Go's
+  `derec.Error`, `DeRecException.ChannelId` (.NET) and `channel_id` (Node, web,
+  React Native). The .NET and TypeScript fields already named the failing
+  channel of a `process()` call and keep doing so; Go's `ProcessError.ChannelID`
+  is unchanged and its inner `derec.Error` now carries the same id. Every
+  result struct that embeds `DeRecError` grows by 16 bytes on 64-bit targets;
+  `ffi_layout.json` and the React Native header are regenerated. Every smoke
+  suite asserts the id on the re-scan, fingerprint-mismatch and helper-unpair
+  refusals.
+
+- **Tests: every SDK smoke suite covers what the Rust suite covers.**
+  *(tests; every SDK)*
+
+  The Go, .NET, Node, web and React Native smoke suites now exercise the
+  behaviours they were missing against the Rust reference: a replica
+  destination verifying the source's helpers, recovery past a corrupted share
+  and past a helper without the version, one target failing while a round's
+  fan-out continues, the group key handover and a lost handover
+  acknowledgement, the roster describing every member, a responder answering
+  at an inbound `replyTo`, the NoKeys wrong-nonce and HashedKeys tampered-hash
+  refusals, a re-scan of a paired channel, and expired-channel cleanup with a
+  pending pairing. Go also gained the auto-accept, unpair,
+  `UpdateChannelInfo`, Discovery, replica sync and replica-id flows it lacked.
+  The Rust suite in turn now covers what only the SDKs tested: `RequestFailed`
+  answered through its token or by `auto_respond_on_failure`, an oversized
+  share, `InvalidWeight`, verification verdicts, `ReplicaSecretRefused`, an
+  undecodable request, and a republish after restore with the stored weights.
+  The per-target failure flow asserts the exact transport error in every
+  suite, and the expired-channel cleanup flow no longer depends on pairing
+  and sweeping within the same clock second.
 
 ### 0.0.10
 

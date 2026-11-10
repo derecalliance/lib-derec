@@ -196,7 +196,7 @@ fn a_restore_after_rotations_talks_to_helpers() {
         let restored = fresh_owner();
         restored
             .build()
-            .restore(&secret, 3)
+            .restore(&secret, 3, 3)
             .await
             .expect("restore succeeds");
         for (channel_id, _) in &helpers {
@@ -237,7 +237,7 @@ fn a_restore_after_rotations_brings_a_helper_that_missed_a_round_forward() {
         let restored = fresh_owner();
         restored
             .build()
-            .restore(&secret, 3)
+            .restore(&secret, 3, 3)
             .await
             .expect("restore succeeds");
         assert_eq!(restored.ring(C).epoch, 3);
@@ -255,7 +255,7 @@ fn a_restore_after_rotations_brings_a_helper_that_missed_a_round_forward() {
 
 /// The design's scenario: V1 at epoch 1, V2 to V15 lost, V16 with keep V1.
 /// Two helpers at epoch 16 that keep V1 with K1 pinned, and an owner that
-/// lost everything and restored V1, at epoch 1.
+/// lost everything and restored V1, at epoch 1, knowing the helpers hold V16.
 async fn restored_at_v1_while_helpers_are_at_16() -> (Party, Vec<(ChannelId, Party)>) {
     let (owner, helpers) = fleet(Party::rotating(OWNER_URI), 2).await;
     round(&owner, &helpers).await;
@@ -277,7 +277,7 @@ async fn restored_at_v1_while_helpers_are_at_16() -> (Party, Vec<(ChannelId, Par
     let restored = fresh_owner();
     restored
         .build()
-        .restore(&secret, 1)
+        .restore(&secret, 1, 16)
         .await
         .expect("restore succeeds");
     for (channel_id, _) in &helpers {
@@ -288,14 +288,15 @@ async fn restored_at_v1_while_helpers_are_at_16() -> (Party, Vec<(ChannelId, Par
 }
 
 /// The owner restores V1 on a fresh device, at epoch 1, while the helpers are
-/// at 16 and hold K1 for V1. The restored owner's V2 travels under K2, which
-/// each helper derives from K1; the helper answers under K2 and pins V2 to
-/// epoch 2.
+/// at 16 and hold K1 for V1. The restored owner's next version, V17 keeping
+/// V1, travels under K2, which each helper derives from K1; the helper
+/// answers under K2, pins V17 to epoch 2 and still holds K1 for V1.
 #[test]
 fn restoring_a_kept_older_version_still_talks_to_helpers() {
     run_async(async {
         let (restored, helpers) = restored_at_v1_while_helpers_are_at_16().await;
 
+        restored.keep(1);
         restored.protect().await;
         for (_, helper) in &helpers {
             let sent = restored.take_sent_to(helper.uri);
@@ -323,14 +324,14 @@ fn restoring_a_kept_older_version_still_talks_to_helpers() {
         for (channel_id, helper) in &helpers {
             let ring = helper.ring(*channel_id);
             assert_eq!((ring.epoch, ring.key), (16, key_at(*channel_id, 16)));
-            assert!(ring.pins.contains(&(2, 2)), "{ring:?}");
+            assert!(ring.pins.contains(&(17, 2)), "{ring:?}");
             assert!(
                 ring.old.contains(&(1, key_at(*channel_id, 1))),
                 "K1 is still held: {ring:?}"
             );
-            assert_eq!(helper.stored_versions(*channel_id), vec![1, 2, 16]);
+            assert_eq!(helper.stored_versions(*channel_id), vec![1, 17]);
         }
-        verified(&restored, &helpers, 2).await;
+        verified(&restored, &helpers, 17).await;
     });
 }
 
@@ -358,7 +359,7 @@ fn an_auto_accepted_verification_is_answered_under_the_request_epoch() {
             helper.drop_sent();
         }
 
-        restored.verify(2).await;
+        restored.verify(17).await;
         let mut events = Vec::new();
         for (channel_id, helper) in &helpers {
             let sent = restored.take_sent_to(helper.uri);
@@ -389,9 +390,9 @@ fn an_auto_accepted_verification_is_answered_under_the_request_epoch() {
             assert!(
                 events.iter().any(|e| matches!(
                     e,
-                    DeRecEvent::ShareVerified { channel_id: c, version: 2, .. } if c == channel_id
+                    DeRecEvent::ShareVerified { channel_id: c, version: 17, .. } if c == channel_id
                 )),
-                "{channel_id:?} verified v2: {events:?}"
+                "{channel_id:?} verified v17: {events:?}"
             );
             assert_eq!(restored.ring(*channel_id).epoch, 2, "the owner stays at 2");
         }
@@ -399,11 +400,12 @@ fn an_auto_accepted_verification_is_answered_under_the_request_epoch() {
 }
 
 /// A StoreShare under epoch 2, below the helper's newest epoch 16, that the
-/// application accepts is answered under K2 and pins V2 to epoch 2.
+/// application accepts is answered under K2 and pins V17 to epoch 2.
 #[test]
 fn a_store_share_accepted_under_an_older_epoch_pins_that_epoch() {
     run_async(async {
         let (restored, helpers) = restored_at_v1_while_helpers_are_at_16().await;
+        restored.keep(1);
         restored.protect().await;
         let (channel_id, helper) = &helpers[0];
         let by_hand = Party {
@@ -424,8 +426,8 @@ fn a_store_share_accepted_under_an_older_epoch_pins_that_epoch() {
         );
         let ring = helper.ring(*channel_id);
         assert_eq!(ring.epoch, 16);
-        assert!(ring.pins.contains(&(2, 2)), "{ring:?}");
-        assert_eq!(helper.stored_versions(*channel_id), vec![1, 2, 16]);
+        assert!(ring.pins.contains(&(17, 2)), "{ring:?}");
+        assert_eq!(helper.stored_versions(*channel_id), vec![1, 17]);
     });
 }
 
@@ -819,7 +821,7 @@ fn a_secret_without_epoch_fields_restores_at_epoch_zero() {
         let restored = fresh_owner();
         restored
             .build()
-            .restore(&secret, 1)
+            .restore(&secret, 1, 1)
             .await
             .expect("restore succeeds");
         for (channel_id, _) in &helpers {

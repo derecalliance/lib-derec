@@ -4,6 +4,7 @@
 use derec_library::protocol::types::Share;
 use derec_library::protocol::{DeRecShareStore, ShareStoreFuture};
 use derec_library::types::ChannelId;
+use std::future;
 
 use crate::codec::{
     sql_to_subshares, sql_to_threshold, sql_to_u64, subshares_to_sql, threshold_to_sql, u64_to_sql,
@@ -62,7 +63,7 @@ impl DeRecShareStore for SqliteShareStore {
                 .expect("share load query failed");
             collect_shares(rows)
         };
-        Box::pin(std::future::ready(Ok(result)))
+        Box::pin(future::ready(Ok(result)))
     }
 
     fn load_many(
@@ -72,7 +73,7 @@ impl DeRecShareStore for SqliteShareStore {
         versions: &[u32],
     ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
         if channel_ids.is_empty() {
-            return Box::pin(std::future::ready(Ok(Vec::new())));
+            return Box::pin(future::ready(Ok(Vec::new())));
         }
         let conn = lock(&self.connection);
         let cid_placeholders = vec!["?"; channel_ids.len()].join(", ");
@@ -124,7 +125,7 @@ impl DeRecShareStore for SqliteShareStore {
             })
             .expect("load_many query failed");
         let shares = rows.map(|r| r.expect("share row failed")).collect();
-        Box::pin(std::future::ready(Ok(shares)))
+        Box::pin(future::ready(Ok(shares)))
     }
 
     fn load_all(
@@ -133,7 +134,7 @@ impl DeRecShareStore for SqliteShareStore {
         channel_ids: &[ChannelId],
     ) -> ShareStoreFuture<'_, Vec<Share>> {
         if channel_ids.is_empty() {
-            return Box::pin(std::future::ready(Ok(Vec::new())));
+            return Box::pin(future::ready(Ok(Vec::new())));
         }
         let conn = lock(&self.connection);
         let cid_placeholders = vec!["?"; channel_ids.len()].join(", ");
@@ -152,7 +153,7 @@ impl DeRecShareStore for SqliteShareStore {
         let rows = stmt
             .query_map(bound.as_slice(), map_share_row)
             .expect("load_all query failed");
-        Box::pin(std::future::ready(Ok(collect_shares(rows))))
+        Box::pin(future::ready(Ok(collect_shares(rows))))
     }
 
     fn latest_version(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<u32>> {
@@ -165,7 +166,7 @@ impl DeRecShareStore for SqliteShareStore {
             )
             .ok()
             .flatten();
-        Box::pin(std::future::ready(Ok(max.map(|v| v as u32))))
+        Box::pin(future::ready(Ok(max.map(|v| v as u32))))
     }
 
     fn save(
@@ -197,7 +198,7 @@ impl DeRecShareStore for SqliteShareStore {
             ],
         )
         .expect("share save failed");
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 
     fn remove_channel(
@@ -211,7 +212,7 @@ impl DeRecShareStore for SqliteShareStore {
             rusqlite::params![u64_to_sql(secret_id), u64_to_sql(channel_id.0)],
         )
         .expect("share remove_channel failed");
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 
     fn remove_versions(
@@ -221,7 +222,7 @@ impl DeRecShareStore for SqliteShareStore {
         versions: &[u32],
     ) -> ShareStoreFuture<'_, ()> {
         if versions.is_empty() {
-            return Box::pin(std::future::ready(Ok(())));
+            return Box::pin(future::ready(Ok(())));
         }
         let conn = lock(&self.connection);
         let placeholders = vec!["?"; versions.len()].join(", ");
@@ -239,7 +240,7 @@ impl DeRecShareStore for SqliteShareStore {
             params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
         conn.execute(&sql, bound.as_slice())
             .expect("share remove_versions failed");
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 
     fn remove_versions_many(
@@ -265,7 +266,7 @@ impl DeRecShareStore for SqliteShareStore {
     }
 
     fn keep_version(&self, _: u64, version: u32) -> ShareStoreFuture<'_, u32> {
-        Box::pin(std::future::ready(Ok(version.saturating_sub(1))))
+        Box::pin(future::ready(Ok(version.saturating_sub(1))))
     }
 }
 

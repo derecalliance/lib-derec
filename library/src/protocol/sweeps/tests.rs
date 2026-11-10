@@ -18,7 +18,12 @@ mod sharing_round_outcome {
     use crate::protocol::traits::DeRecSecretStore as _;
     use crate::types::ReplicaId;
 
-    use std::collections::HashSet;
+    use crate::primitives::sharing::request;
+    use crate::protocol::CollectedShare;
+    use crate::protocol::types::{Secret, UserSecret};
+    use derec_proto::{DeRecResult, DeRecSecret, GetShareResponseMessage};
+    use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
 
     const SECRET_ID: u64 = 0xF00D;
 
@@ -1222,6 +1227,270 @@ mod sharing_round_outcome {
                     .iter()
                     .any(|e| matches!(e, DeRecEvent::ReplicaSyncComplete { .. })),
                 "a round with no replica leg must not report one"
+            );
+        });
+    }
+
+    /// Shares of a recoverable secret named `name`, split at threshold 2
+    /// over `channels`, as the Helpers on those channels would answer them.
+    fn recovery_shares(name: &str, channels: &[u64]) -> Vec<CollectedShare> {
+        use crate::extensions::derec_result::DeRecResultExt as _;
+        use prost::Message as _;
+        let secret = Secret {
+            secrets: vec![UserSecret {
+                id: vec![0x01],
+                name: name.to_owned(),
+                data: b"seed".to_vec(),
+            }],
+            threshold: Some(2),
+            ..Default::default()
+        };
+        let payload = DeRecSecret {
+            secret_data: secret.encode(),
+            creation_time: None,
+            helper_threshold_for_recovery: 2,
+            helper_threshold_for_confirming_share_receipt: 2,
+            helpers: Vec::new(),
+        }
+        .encode_to_vec();
+        let weighted: Vec<_> = channels.iter().map(|&c| (ChannelId(c), 1)).collect();
+        let split = request::split(&weighted, 77, 1, &payload, 2).expect("split");
+        channels
+            .iter()
+            .map(|&c| CollectedShare {
+                channel_id: ChannelId(c),
+                response: GetShareResponseMessage {
+                    result: Some(DeRecResult::ok()),
+                    committed_de_rec_share: split.shares[&ChannelId(c)].encode_to_vec(),
+                    secret_id: 77,
+                    version: 1,
+                    ..Default::default()
+                },
+            })
+            .collect()
+    }
+
+    /// A recovery whose Helpers go quiet still decides. `tick` reports each
+    /// silent Helper as timed out and settles on the shares already in hand.
+    #[test]
+    fn tick_settles_a_recovery_whose_helpers_went_silent() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeouts.get_share_response = Duration::from_secs(60);
+
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingRecovery {
+                        secret_id: 77,
+                        version: 1,
+                        shares: recovery_shares("real", &[9001, 9002]),
+                        pending: [ChannelId(9003)].into_iter().collect(),
+                        started_at: now_secs().saturating_sub(600),
+                    },
+                )
+                .await
+                .expect("seed pending recovery");
+
+            let events = protocol.tick().await;
+
+            match events.as_slice() {
+                [
+                    DeRecEvent::RecoverSecretFailed {
+                        channel_id,
+                        version: 1,
+                        error,
+                    },
+                    DeRecEvent::SecretRecovered { secret },
+                ] => {
+                    assert_eq!(*channel_id, ChannelId(9003));
+                    assert_eq!(error, "timeout");
+                    assert_eq!(secret.secrets[0].name, "real");
+                }
+                other => panic!("expected a timeout then SecretRecovered, got {other:?}"),
+            }
+            assert!(
+                protocol
+                    .state_store
+                    .load(
+                        SECRET_ID,
+                        StateKey::PendingRecovery {
+                            secret_id: 77,
+                            version: 1
+                        }
+                    )
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "the recovery is closed"
+            );
+        });
+    }
+
+    /// A recovery still inside its window survives a `tick`.
+    #[test]
+    fn tick_leaves_a_recent_recovery_open() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeouts.get_share_response = Duration::from_secs(600);
+
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingRecovery {
+                        secret_id: 77,
+                        version: 1,
+                        shares: recovery_shares("real", &[9001, 9002]),
+                        pending: [ChannelId(9003)].into_iter().collect(),
+                        started_at: now_secs(),
+                    },
+                )
+                .await
+                .expect("seed pending recovery");
+
+            let events = protocol.tick().await;
+
+            assert!(events.is_empty(), "got {events:?}");
+            assert!(
+                protocol
+                    .state_store
+                    .load(
+                        SECRET_ID,
+                        StateKey::PendingRecovery {
+                            secret_id: 77,
+                            version: 1
+                        }
+                    )
+                    .await
+                    .expect("load")
+                    .is_some(),
+                "a Helper's answer is still due"
+            );
+        });
+    }
+
+    /// The timeout settles a recovery holding two complete secrets as a
+    /// conflict, never by picking one.
+    #[test]
+    fn tick_settles_conflicting_shares_as_a_conflict() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeouts.get_share_response = Duration::from_secs(60);
+
+            let mut shares = recovery_shares("forged", &[9001, 9002]);
+            shares.extend(recovery_shares("real", &[9003, 9004]));
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingRecovery {
+                        secret_id: 77,
+                        version: 1,
+                        shares,
+                        pending: [ChannelId(9005)].into_iter().collect(),
+                        started_at: now_secs().saturating_sub(600),
+                    },
+                )
+                .await
+                .expect("seed pending recovery");
+
+            let events = protocol.tick().await;
+
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [
+                        DeRecEvent::RecoverSecretFailed { .. },
+                        DeRecEvent::RecoveryConflict { version: 1, candidates, disputed_by },
+                    ] if candidates.len() == 2 && disputed_by.is_empty()
+                ),
+                "got {events:?}"
+            );
+        });
+    }
+
+    /// A version check whose members go quiet still concludes. Past
+    /// `get_share_response`, `tick` closes it on the versions already
+    /// reported; a member that never answered contributes nothing.
+    #[test]
+    fn tick_concludes_a_discovery_whose_members_went_silent() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeouts.get_share_response = Duration::from_secs(60);
+
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingReplicaDiscovery {
+                        local_version: 3,
+                        pending: HashSet::from([ReplicaId(1003)]),
+                        reported: HashMap::from([(ReplicaId(1002), 2)]),
+                        started_at: now_secs().saturating_sub(600),
+                    },
+                )
+                .await
+                .expect("seed pending discovery");
+
+            let events = protocol.tick().await;
+
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [DeRecEvent::ReplicaDiscoveryComplete {
+                        local_version: 3,
+                        group_version: 2,
+                        fetched_from: None,
+                    }]
+                ),
+                "got {events:?}"
+            );
+            assert!(
+                protocol
+                    .state_store
+                    .load(SECRET_ID, StateKey::PendingReplicaDiscovery)
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "the check is closed"
+            );
+        });
+    }
+
+    /// A version check still inside its window survives a `tick`.
+    #[test]
+    fn tick_leaves_a_recent_discovery_open() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeouts.get_share_response = Duration::from_secs(600);
+
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingReplicaDiscovery {
+                        local_version: 3,
+                        pending: HashSet::from([ReplicaId(1003)]),
+                        reported: HashMap::new(),
+                        started_at: now_secs(),
+                    },
+                )
+                .await
+                .expect("seed pending discovery");
+
+            let events = protocol.tick().await;
+
+            assert!(events.is_empty(), "got {events:?}");
+            assert!(
+                protocol
+                    .state_store
+                    .load(SECRET_ID, StateKey::PendingReplicaDiscovery)
+                    .await
+                    .expect("load")
+                    .is_some(),
+                "a member's answer is still due"
             );
         });
     }

@@ -36,6 +36,7 @@ use crate::{
         DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_BAD_UTF8,
         DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error, success,
     },
+    primitives::sharing::{request, response},
     types::{ChannelId, WeightedChannel},
 };
 use derec_proto::{
@@ -43,7 +44,7 @@ use derec_proto::{
 };
 use prost::Message as _;
 use std::collections::HashMap;
-use std::str;
+use std::{slice, str};
 
 #[repr(C)]
 pub struct ProtectSecretResult {
@@ -129,13 +130,7 @@ pub extern "C" fn protect_secret(
         Err(e) => return with_err(e),
     };
 
-    match crate::primitives::sharing::request::split(
-        &channels,
-        secret_id,
-        version,
-        secret_data,
-        threshold,
-    ) {
+    match request::split(&channels, secret_id, version, secret_data, threshold) {
         Ok(r) => ProtectSecretResult {
             error: success(),
             shares_wire_bytes: vec_into_buffer(serialize_committed_shares(&r.shares)),
@@ -219,7 +214,7 @@ pub extern "C" fn produce_store_share_request_message(
         Err(e) => return with_err(e),
     };
 
-    match crate::primitives::sharing::request::produce(
+    match request::produce(
         ChannelId(channel_id),
         version,
         secret_id,
@@ -272,7 +267,7 @@ pub extern "C" fn extract_store_share_request(
         }
     };
 
-    match crate::primitives::sharing::request::extract(request_bytes, &shared_key) {
+    match request::extract(request_bytes, &shared_key) {
         Ok(r) => ExtractStoreShareRequestResult {
             error: success(),
             channel_id,
@@ -327,7 +322,7 @@ pub extern "C" fn produce_store_share_response_message(
         }
     };
 
-    match crate::primitives::sharing::response::produce(
+    match response::produce(
         ChannelId(channel_id),
         &request,
         &crate::types::ChannelKey::new(epoch, shared_key),
@@ -378,7 +373,7 @@ pub extern "C" fn extract_store_share_response(
         }
     };
 
-    match crate::primitives::sharing::response::extract(response_bytes, &shared_key) {
+    match response::extract(response_bytes, &shared_key) {
         Ok(r) => ExtractStoreShareResponseResult {
             error: success(),
             channel_id,
@@ -418,7 +413,7 @@ pub extern "C" fn process_store_share_response_message(
         }
     };
 
-    match crate::primitives::sharing::response::process(version, &response) {
+    match response::process(version, &response) {
         Ok(()) => ProcessStoreShareResponseMessageResult { error: success() },
         Err(e) => with_err(from_lib_error(e)),
     }
@@ -457,8 +452,8 @@ fn parse_weighted_channels(
     if weights_ptr.is_null() {
         return Err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "weights_ptr is null"));
     }
-    let channels = unsafe { std::slice::from_raw_parts(channels_ptr, len) };
-    let weights = unsafe { std::slice::from_raw_parts(weights_ptr, len) };
+    let channels = unsafe { slice::from_raw_parts(channels_ptr, len) };
+    let weights = unsafe { slice::from_raw_parts(weights_ptr, len) };
     Ok(channels
         .iter()
         .zip(weights)
@@ -476,7 +471,7 @@ fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], 
     if len == 0 {
         Ok(&[])
     } else {
-        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+        Ok(unsafe { slice::from_raw_parts(ptr, len) })
     }
 }
 
@@ -495,12 +490,13 @@ mod tests {
     use super::*;
     use crate::interop::ffi::common::derec_free_buffer;
     use derec_proto::DeRecShare;
+    use std::ptr;
 
     /// Decodes the committed-shares container into each channel's subshare count.
     fn subshare_counts(result: ProtectSecretResult) -> HashMap<u64, usize> {
         assert_eq!(result.error.code, 0, "protect_secret should succeed");
         let buffer = result.shares_wire_bytes;
-        let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) }.to_vec();
+        let bytes = unsafe { slice::from_raw_parts(buffer.ptr, buffer.len) }.to_vec();
         derec_free_buffer(buffer.ptr, buffer.len);
 
         let read_u32 = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
@@ -557,7 +553,7 @@ mod tests {
             secret.as_ptr(),
             secret.len(),
             channels.as_ptr(),
-            std::ptr::null(),
+            ptr::null(),
             channels.len(),
             2,
             1,
@@ -573,7 +569,7 @@ mod tests {
             42,
             secret.as_ptr(),
             secret.len(),
-            std::ptr::null(),
+            ptr::null(),
             weights.as_ptr(),
             weights.len(),
             2,

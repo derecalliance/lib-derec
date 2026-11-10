@@ -34,6 +34,14 @@ internal static class Envelope
         public uint Sequence;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct MessageIdResult
+    {
+        public DeRecError Error;
+        public Buffer Id;
+        public ulong Timestamp;
+    }
+
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern ApplyTraceIdResult apply_trace_id_to_envelope(
         byte[] envelope,
@@ -49,6 +57,12 @@ internal static class Envelope
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern ReadSequenceResult read_sequence_from_envelope(
+        byte[] envelope,
+        UIntPtr envelopeLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern MessageIdResult message_id_from_envelope(
         byte[] envelope,
         UIntPtr envelopeLen
     );

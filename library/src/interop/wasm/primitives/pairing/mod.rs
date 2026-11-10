@@ -4,6 +4,7 @@
 pub mod request;
 pub mod response;
 
+use crate::interop::wasm::primitives::helpers::from_js;
 use crate::interop::wasm::ts_bindings_utils::js_error;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
@@ -56,6 +57,6 @@ pub(super) fn optional_parameter_range(
     if value.is_null() || value.is_undefined() {
         return Ok(None);
     }
-    let range: ParameterRange = crate::interop::wasm::primitives::helpers::from_js(value)?;
+    let range: ParameterRange = from_js(value)?;
     Ok(Some(range.into()))
 }

@@ -16,6 +16,7 @@
 
 use derec_library::protocol::types::state_record::StateItemRecord;
 use derec_library::protocol::{DeRecStateStore, StateItem, StateKey, StateKind, StateStoreFuture};
+use std::future;
 
 use crate::codec::u64_to_sql;
 use crate::db::{SharedConnection, lock};
@@ -87,7 +88,7 @@ impl DeRecStateStore for SqliteStateStore {
             rusqlite::params![u64_to_sql(secret_id), kind, sub_a, sub_b, encode(&item)],
         )
         .expect("protocol_state save failed");
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 
     fn load(&self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
@@ -101,7 +102,7 @@ impl DeRecStateStore for SqliteStateStore {
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .ok();
-        Box::pin(std::future::ready(Ok(row.as_deref().map(decode))))
+        Box::pin(future::ready(Ok(row.as_deref().map(decode))))
     }
 
     fn remove(&mut self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, bool> {
@@ -114,7 +115,7 @@ impl DeRecStateStore for SqliteStateStore {
                 rusqlite::params![u64_to_sql(secret_id), kind, sub_a, sub_b],
             )
             .expect("protocol_state remove failed");
-        Box::pin(std::future::ready(Ok(affected > 0)))
+        Box::pin(future::ready(Ok(affected > 0)))
     }
 
     fn remove_many(&mut self, secret_id: u64, keys: &[StateKey]) -> StateStoreFuture<'_, ()> {
@@ -149,6 +150,6 @@ impl DeRecStateStore for SqliteStateStore {
         let items: Vec<StateItem> = rows
             .map(|r| decode(&r.expect("protocol_state row read failed")))
             .collect();
-        Box::pin(std::future::ready(Ok(items)))
+        Box::pin(future::ready(Ok(items)))
     }
 }

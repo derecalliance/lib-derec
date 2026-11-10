@@ -52,6 +52,7 @@
 use rand::Rng as _;
 use rand::SeedableRng;
 use rand::rngs::ChaCha20Rng;
+use std::array;
 use zeroize::Zeroizing;
 
 pub mod ecies;
@@ -79,7 +80,10 @@ const CHANNEL_KEY_LABEL: &[u8] = b"DeRec channel key v1";
 /// 5. Returns the secret components as `PairingSecretKeyMaterial` to be retained by the initiator.
 ///
 /// # Arguments
-/// * `entropy` - A cryptographically secure random seed of length `λ` (32 bytes).
+/// * `entropy` - A 32-byte seed that MUST be secret, uniformly random and fresh for every
+///   call: draw it from a cryptographically secure generator, as the example does. Every key
+///   this function returns is derived from it, so anyone who knows or guesses it holds the
+///   secret keys.
 ///
 /// # Returns
 /// - `Ok((PairingContactMessageMaterial, PairingSecretKeyMaterial))` on success, containing:
@@ -93,7 +97,13 @@ const CHANNEL_KEY_LABEL: &[u8] = b"DeRec channel key v1";
 /// # Example
 /// ```rust
 /// use derec_cryptography::pairing::*;
-/// let (contact_msg, secret_keys) = contact_message([0u8; 32]).unwrap();
+/// use rand::rand_core::UnwrapErr;
+/// use rand::rngs::SysRng;
+/// use rand::Rng;
+///
+/// let mut entropy = [0u8; 32];
+/// UnwrapErr(SysRng).fill_bytes(&mut entropy);
+/// let (contact_msg, secret_keys) = contact_message(entropy).unwrap();
 /// // Send `contact_msg` to the responder, keep `secret_keys` for later.
 /// ```
 #[cfg_attr(
@@ -159,19 +169,30 @@ pub fn contact_message(
 ///       || ecies_public_key
 ///       || fingerprint_nonce )
 /// ```
+///
+/// The keys are concatenated without their lengths, so the hash binds them
+/// only because each has a fixed size.
+///
+/// # Errors
+///
+/// [`DerecPairingError::InvalidSize`] if `mlkem_encapsulation_key` is not
+/// [`mlkem::ENCAPSULATION_KEY_SIZE_IN_BYTES`] bytes or `ecies_public_key` is
+/// not [`ecies::PUBLIC_KEY_SIZE_IN_BYTES`] bytes.
 pub fn fingerprint_commitment(
     mlkem_encapsulation_key: &[u8],
     ecies_public_key: &[u8],
     fingerprint_nonce: &FingerprintNonce,
-) -> FingerprintCommitment {
+) -> Result<FingerprintCommitment, DerecPairingError> {
     use sha2::{Digest, Sha256};
+
+    check_public_key_sizes(mlkem_encapsulation_key, ecies_public_key)?;
 
     let mut hasher = Sha256::new();
     hasher.update(FINGERPRINT_COMMITMENT_LABEL);
     hasher.update(mlkem_encapsulation_key);
     hasher.update(ecies_public_key);
     hasher.update(fingerprint_nonce);
-    hasher.finalize().into()
+    Ok(hasher.finalize().into())
 }
 
 /// The channel key both parties derive from the handshake key and the
@@ -221,7 +242,15 @@ pub fn channel_key(
 /// ```
 ///
 /// Integers are big-endian and the field order is fixed — both sides must
-/// hash identical bytes, byte-for-byte, for the comparison to succeed.
+/// hash identical bytes, byte-for-byte, for the comparison to succeed. The
+/// keys are concatenated without their lengths, so the hash binds them only
+/// because each has a fixed size.
+///
+/// # Errors
+///
+/// [`DerecPairingError::InvalidSize`] if `mlkem_encapsulation_key` is not
+/// [`mlkem::ENCAPSULATION_KEY_SIZE_IN_BYTES`] bytes or `ecies_public_key` is
+/// not [`ecies::PUBLIC_KEY_SIZE_IN_BYTES`] bytes.
 ///
 /// # Constant-time use
 ///
@@ -234,15 +263,40 @@ pub fn contact_binding_hash(
     ecies_public_key: &[u8],
     nonce: u64,
     channel_id: u64,
-) -> [u8; 48] {
+) -> Result<[u8; 48], DerecPairingError> {
     use sha2::{Digest, Sha384};
+
+    check_public_key_sizes(mlkem_encapsulation_key, ecies_public_key)?;
 
     let mut hasher = Sha384::new();
     hasher.update(mlkem_encapsulation_key);
     hasher.update(ecies_public_key);
     hasher.update(nonce.to_be_bytes());
     hasher.update(channel_id.to_be_bytes());
-    hasher.finalize().into()
+    Ok(hasher.finalize().into())
+}
+
+/// Refuses public keys of any size but the protocol's, which is what makes
+/// their plain concatenation in a hash unambiguous.
+fn check_public_key_sizes(
+    mlkem_encapsulation_key: &[u8],
+    ecies_public_key: &[u8],
+) -> Result<(), DerecPairingError> {
+    for (key, expected) in [
+        (
+            mlkem_encapsulation_key,
+            mlkem::ENCAPSULATION_KEY_SIZE_IN_BYTES,
+        ),
+        (ecies_public_key, ecies::PUBLIC_KEY_SIZE_IN_BYTES),
+    ] {
+        if key.len() != expected {
+            return Err(DerecPairingError::InvalidSize {
+                expected,
+                got: key.len(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Generates a pairing request message and corresponding secret key material for the responder in the pairing protocol.
@@ -255,7 +309,10 @@ pub fn contact_binding_hash(
 /// 4. Returns the secret components as `ResponderSecretKeyMaterial` to be retained by the responder.
 ///
 /// # Arguments
-/// * `entropy` - A cryptographically secure random seed of length `λ` (32 bytes).
+/// * `entropy` - A 32-byte seed that MUST be secret, uniformly random and fresh for every
+///   call: draw it from a cryptographically secure generator, as the example does. Every key
+///   this function returns is derived from it, so anyone who knows or guesses it holds the
+///   secret keys.
 /// * `received` - The `PairingContactMessageMaterial` received from the initiator.
 ///
 /// # Returns
@@ -270,9 +327,17 @@ pub fn contact_binding_hash(
 /// # Example
 /// ```rust
 /// use derec_cryptography::pairing::*;
+/// use rand::rand_core::UnwrapErr;
+/// use rand::rngs::SysRng;
+/// use rand::Rng;
 ///
-/// let (contact_msg, _) = contact_message([0u8; 32]).unwrap();
-/// let (request_msg, secret_keys) = pairing_request_message([0u8; 32], &contact_msg).unwrap();
+/// let seed = || {
+///     let mut entropy = [0u8; 32];
+///     UnwrapErr(SysRng).fill_bytes(&mut entropy);
+///     entropy
+/// };
+/// let (contact_msg, _) = contact_message(seed()).unwrap();
+/// let (request_msg, secret_keys) = pairing_request_message(seed(), &contact_msg).unwrap();
 /// // Send `request_msg` to the initiator, keep `secret_keys` for later.
 /// ```
 #[cfg_attr(
@@ -357,10 +422,18 @@ pub fn pairing_request_message(
 /// # Example
 /// ```rust
 /// use derec_cryptography::pairing::*;
+/// use rand::rand_core::UnwrapErr;
+/// use rand::rngs::SysRng;
+/// use rand::Rng;
 ///
-/// let (contact_msg, initiator_secrets) = contact_message([0u8; 32]).unwrap();
-/// let commitment = initiator_secrets.fingerprint_commitment();
-/// let (request_msg, secret_keys) = pairing_request_message([0u8; 32], &contact_msg).unwrap();
+/// let seed = || {
+///     let mut entropy = [0u8; 32];
+///     UnwrapErr(SysRng).fill_bytes(&mut entropy);
+///     entropy
+/// };
+/// let (contact_msg, initiator_secrets) = contact_message(seed()).unwrap();
+/// let commitment = initiator_secrets.fingerprint_commitment().unwrap();
+/// let (request_msg, secret_keys) = pairing_request_message(seed(), &contact_msg).unwrap();
 /// // The pairing response reveals `initiator_secrets.fingerprint_nonce`.
 /// let shared_key = finish_pairing_responder(
 ///     &secret_keys,
@@ -391,7 +464,7 @@ pub fn finish_pairing_responder(
         &received.mlkem_encapsulation_key,
         &received.ecies_public_key,
         fingerprint_nonce,
-    );
+    )?;
     if !bool::from(opened.ct_eq(fingerprint_commitment)) {
         #[cfg(feature = "logging")]
         tracing::warn!("fingerprint nonce does not open the initiator's commitment");
@@ -416,7 +489,7 @@ pub fn finish_pairing_responder(
         "XOR combiner inputs — lengths only, no secret bytes"
     );
 
-    let handshake_key: Zeroizing<[u8; 32]> = Zeroizing::new(std::array::from_fn(|i| {
+    let handshake_key: Zeroizing<[u8; 32]> = Zeroizing::new(array::from_fn(|i| {
         mlkem_shared_key[i] ^ ecies_shared_key[i]
     }));
     let shared_key = channel_key(&handshake_key, fingerprint_nonce);
@@ -455,9 +528,17 @@ pub fn finish_pairing_responder(
 /// # Example
 /// ```rust
 /// use derec_cryptography::pairing::*;
+/// use rand::rand_core::UnwrapErr;
+/// use rand::rngs::SysRng;
+/// use rand::Rng;
 ///
-/// let (contact_msg, initiator_secrets) = contact_message([0u8; 32]).unwrap();
-/// let (request_msg, _) = pairing_request_message([0u8; 32], &contact_msg).unwrap();
+/// let seed = || {
+///     let mut entropy = [0u8; 32];
+///     UnwrapErr(SysRng).fill_bytes(&mut entropy);
+///     entropy
+/// };
+/// let (contact_msg, initiator_secrets) = contact_message(seed()).unwrap();
+/// let (request_msg, _) = pairing_request_message(seed(), &contact_msg).unwrap();
 /// let shared_key = finish_pairing_initiator(&initiator_secrets, &request_msg).unwrap();
 /// ```
 #[cfg_attr(
@@ -505,7 +586,7 @@ pub fn finish_pairing_initiator(
         "XOR combiner inputs — lengths only, no secret bytes"
     );
 
-    let handshake_key: Zeroizing<[u8; 32]> = Zeroizing::new(std::array::from_fn(|i| {
+    let handshake_key: Zeroizing<[u8; 32]> = Zeroizing::new(array::from_fn(|i| {
         mlkem_shared_key[i] ^ ecies_shared_key[i]
     }));
     let shared_key = channel_key(&handshake_key, &secrets.fingerprint_nonce);
@@ -532,7 +613,7 @@ mod tests {
         let alice_shared_key = finish_pairing_responder(
             &alice_secrets,
             &bob_contact,
-            &bob_secrets.fingerprint_commitment(),
+            &bob_secrets.fingerprint_commitment().unwrap(),
             &bob_secrets.fingerprint_nonce,
         )
         .unwrap();
@@ -552,7 +633,7 @@ mod tests {
             finish_pairing_responder(
                 &alice_secrets,
                 &bob_contact,
-                &bob_secrets.fingerprint_commitment(),
+                &bob_secrets.fingerprint_commitment().unwrap(),
                 &wrong_nonce,
             ),
             Err(DerecPairingError::FingerprintCommitmentMismatch)
@@ -570,7 +651,7 @@ mod tests {
             finish_pairing_responder(
                 &alice_secrets,
                 &bob_contact,
-                &carol_secrets.fingerprint_commitment(),
+                &carol_secrets.fingerprint_commitment().unwrap(),
                 &carol_secrets.fingerprint_nonce,
             ),
             Err(DerecPairingError::FingerprintCommitmentMismatch)
@@ -594,16 +675,22 @@ mod tests {
         assert_ne!(a.fingerprint_nonce, [0u8; 32]);
     }
 
+    /// ML-KEM and ECIES public keys of the sizes the protocol fixes.
+    fn sized_keys() -> (Vec<u8>, Vec<u8>) {
+        (
+            vec![0x33; mlkem::ENCAPSULATION_KEY_SIZE_IN_BYTES],
+            vec![0x44; ecies::PUBLIC_KEY_SIZE_IN_BYTES],
+        )
+    }
+
     /// Pins both derivations so any other implementation of the protocol can
     /// check its own against the same bytes.
     #[test]
     fn commitment_and_channel_key_match_their_reference_values() {
-        fn hex(bytes: &[u8]) -> String {
-            bytes.iter().map(|b| format!("{b:02x}")).collect()
-        }
+        let (mlkem, ecies) = sized_keys();
         let nonce = [0x11u8; 32];
         assert_eq!(
-            hex(&fingerprint_commitment(b"mlkem", b"ecies", &nonce)),
+            hex(&fingerprint_commitment(&mlkem, &ecies, &nonce).unwrap()),
             COMMITMENT_REFERENCE
         );
         assert_eq!(
@@ -612,131 +699,93 @@ mod tests {
         );
     }
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     const COMMITMENT_REFERENCE: &str =
-        "65a2bb3a2f900e1f4c37ad40459c551c08fd74af56131c3f089dfb3306a9ff1d";
+        "165d4dd9187602da255cbc50ef0e0106e94848c43000ac9555e0e0cd9eb87fb4";
     const CHANNEL_KEY_REFERENCE: &str =
         "cea938e8f8f3ae7c3f4e4af68ee07f8018b97fd41d85d2902236525ca4191a29";
+    const BINDING_REFERENCE: &str = "8bbc349c0ef454627cade2feb5cbdc3bc1aecede08f8aefa\
+                                     ef935f0bbd5c68824777a819ba9d9a2f6754bec23abd7e4d";
 
-    /// Reference inputs used across the binding-hash tests. `mlkem` and `ecies`
-    /// are short opaque payloads — the function treats them as raw bytes, so
-    /// the exact length doesn't matter for any of the assertions.
-    fn ref_inputs() -> (&'static [u8], &'static [u8], u64, u64) {
-        (
-            b"mlkem_encapsulation_key_bytes",
-            b"ecies_public_key_bytes",
-            0xCAFE_BABE_DEAD_BEEF,
-            0x0102_0304_0506_0708,
-        )
+    const NONCE: u64 = 0xCAFE_BABE_DEAD_BEEF;
+    const CHANNEL_ID: u64 = 0x0102_0304_0506_0708;
+
+    /// Pins the binding hash so any other implementation of the protocol can
+    /// check its own against the same bytes.
+    #[test]
+    fn contact_binding_hash_matches_its_reference_value() {
+        let (mlkem, ecies) = sized_keys();
+        let hash = contact_binding_hash(&mlkem, &ecies, NONCE, CHANNEL_ID).unwrap();
+        assert_eq!(hex(&hash), BINDING_REFERENCE);
     }
 
     #[test]
-    fn contact_binding_hash_is_48_bytes() {
-        let (mlkem, ecies, nonce, channel_id) = ref_inputs();
-        let hash = contact_binding_hash(mlkem, ecies, nonce, channel_id);
-        // SHA-384 always produces a 48-byte digest. The return type already
-        // enforces this; the assertion exists so this test fails loudly if
-        // the helper is ever switched to a different hash function without
-        // updating the signature.
-        assert_eq!(hash.len(), 48);
+    fn contact_binding_hash_is_sensitive_to_each_input() {
+        let (mlkem, ecies) = sized_keys();
+        let base = contact_binding_hash(&mlkem, &ecies, NONCE, CHANNEL_ID).unwrap();
+
+        let mut other_mlkem = mlkem.clone();
+        other_mlkem[0] ^= 1;
+        let mut other_ecies = ecies.clone();
+        other_ecies[0] ^= 1;
+        for perturbed in [
+            contact_binding_hash(&other_mlkem, &ecies, NONCE, CHANNEL_ID),
+            contact_binding_hash(&mlkem, &other_ecies, NONCE, CHANNEL_ID),
+            contact_binding_hash(&mlkem, &ecies, NONCE + 1, CHANNEL_ID),
+            contact_binding_hash(&mlkem, &ecies, NONCE, CHANNEL_ID + 1),
+        ] {
+            assert_ne!(perturbed.unwrap(), base);
+        }
+    }
+
+    /// Moving bytes from the end of the first key to the start of the second
+    /// leaves the concatenation unchanged, so a split other than the fixed
+    /// sizes must be refused rather than hashed.
+    #[test]
+    fn contact_binding_hash_refuses_keys_split_at_another_point() {
+        let (mlkem, ecies) = sized_keys();
+        let (shorter, moved) = mlkem.split_at(mlkem.len() - 1);
+        let longer = [moved, &ecies].concat();
+
+        assert!(matches!(
+            contact_binding_hash(shorter, &longer, NONCE, CHANNEL_ID),
+            Err(DerecPairingError::InvalidSize { .. })
+        ));
     }
 
     #[test]
-    fn contact_binding_hash_is_deterministic() {
-        let (mlkem, ecies, nonce, channel_id) = ref_inputs();
-        let a = contact_binding_hash(mlkem, ecies, nonce, channel_id);
-        let b = contact_binding_hash(mlkem, ecies, nonce, channel_id);
-        assert_eq!(a, b, "binding hash must be deterministic");
+    fn contact_binding_hash_refuses_empty_keys() {
+        assert!(matches!(
+            contact_binding_hash(&[], &[], 0, 0),
+            Err(DerecPairingError::InvalidSize { .. })
+        ));
     }
 
     #[test]
-    fn contact_binding_hash_is_sensitive_to_mlkem_key() {
-        let (mlkem, ecies, nonce, channel_id) = ref_inputs();
-        let base = contact_binding_hash(mlkem, ecies, nonce, channel_id);
-        let perturbed = contact_binding_hash(b"different_mlkem_key", ecies, nonce, channel_id);
-        assert_ne!(
-            base, perturbed,
-            "changing the mlkem key must change the hash"
+    fn fingerprint_commitment_refuses_keys_split_at_another_point() {
+        let (mlkem, ecies) = sized_keys();
+        let (shorter, moved) = mlkem.split_at(mlkem.len() - 1);
+        let longer = [moved, &ecies].concat();
+
+        assert!(matches!(
+            fingerprint_commitment(shorter, &longer, &[0x11; 32]),
+            Err(DerecPairingError::InvalidSize { .. })
+        ));
+    }
+
+    #[test]
+    fn generated_keys_have_the_sizes_the_hashes_require() {
+        let (contact, _) = contact_message([7u8; 32]).unwrap();
+        assert_eq!(
+            contact.mlkem_encapsulation_key.len(),
+            mlkem::ENCAPSULATION_KEY_SIZE_IN_BYTES
         );
-    }
-
-    #[test]
-    fn contact_binding_hash_is_sensitive_to_ecies_key() {
-        let (mlkem, ecies, nonce, channel_id) = ref_inputs();
-        let base = contact_binding_hash(mlkem, ecies, nonce, channel_id);
-        let perturbed = contact_binding_hash(mlkem, b"different_ecies_key", nonce, channel_id);
-        assert_ne!(
-            base, perturbed,
-            "changing the ecies key must change the hash"
+        assert_eq!(
+            contact.ecies_public_key.len(),
+            ecies::PUBLIC_KEY_SIZE_IN_BYTES
         );
-    }
-
-    #[test]
-    fn contact_binding_hash_is_sensitive_to_nonce() {
-        let (mlkem, ecies, nonce, channel_id) = ref_inputs();
-        let base = contact_binding_hash(mlkem, ecies, nonce, channel_id);
-        let perturbed = contact_binding_hash(mlkem, ecies, nonce.wrapping_add(1), channel_id);
-        assert_ne!(base, perturbed, "changing the nonce must change the hash");
-    }
-
-    #[test]
-    fn contact_binding_hash_is_sensitive_to_channel_id() {
-        let (mlkem, ecies, nonce, channel_id) = ref_inputs();
-        let base = contact_binding_hash(mlkem, ecies, nonce, channel_id);
-        let perturbed = contact_binding_hash(mlkem, ecies, nonce, channel_id.wrapping_add(1));
-        assert_ne!(
-            base, perturbed,
-            "changing the channel_id must change the hash"
-        );
-    }
-
-    /// Field order matters: swapping the mlkem and ecies key positions must
-    /// produce a different digest (unless they're equal). Without this
-    /// guarantee, an attacker who controls one of the published keys could
-    /// craft a substitution that hashes to the same value.
-    #[test]
-    fn contact_binding_hash_is_sensitive_to_key_field_order() {
-        let mlkem: &[u8] = b"AAAA";
-        let ecies: &[u8] = b"BBBB";
-        let (_, _, nonce, channel_id) = ref_inputs();
-        let normal = contact_binding_hash(mlkem, ecies, nonce, channel_id);
-        let swapped = contact_binding_hash(ecies, mlkem, nonce, channel_id);
-        assert_ne!(
-            normal, swapped,
-            "swapping mlkem and ecies field order must change the hash"
-        );
-    }
-
-    /// Integers must be encoded big-endian. Without that contract, a
-    /// little-endian implementation on the other side of the protocol would
-    /// silently produce a different digest for the same logical input.
-    #[test]
-    fn contact_binding_hash_encodes_integers_big_endian() {
-        let (mlkem, ecies, _, _) = ref_inputs();
-        let nonce: u64 = 0x0102_0304_0506_0708;
-        let channel_id: u64 = 0x1112_1314_1516_1718;
-        let hash = contact_binding_hash(mlkem, ecies, nonce, channel_id);
-
-        // Recompute byte-for-byte with the documented encoding and assert
-        // equality. If anyone changes the helper to write little-endian or
-        // swap the integer order, this test fails immediately.
-        use sha2::{Digest, Sha384};
-        let mut hasher = Sha384::new();
-        hasher.update(mlkem);
-        hasher.update(ecies);
-        hasher.update(nonce.to_be_bytes());
-        hasher.update(channel_id.to_be_bytes());
-        let expected: [u8; 48] = hasher.finalize().into();
-        assert_eq!(hash, expected);
-    }
-
-    /// Empty key inputs are valid input — `Sha384::update(&[])` is a no-op,
-    /// so the digest folds in only the two integer fields. We pin this
-    /// behavior explicitly because the helper is the canonical site for
-    /// the formula; if it ever rejects empty slices, callers that haven't
-    /// validated key non-emptiness upstream would surface confusing errors.
-    #[test]
-    fn contact_binding_hash_accepts_empty_inputs() {
-        let hash = contact_binding_hash(&[], &[], 0, 0);
-        assert_eq!(hash.len(), 48);
     }
 }

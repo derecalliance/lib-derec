@@ -32,6 +32,7 @@ export const DEREC_ERROR_CATEGORIES = [
   "protobuf",
   "invariant",
   "state_store",
+  "transport",
 ] as const;
 
 export type DeRecErrorCategory = (typeof DEREC_ERROR_CATEGORIES)[number];
@@ -76,6 +77,7 @@ export const DEREC_ERROR_CODES = [
   "unexpected_replica_id",
   "incompatible_parameter_range",
   "fingerprint_commitment_mismatch",
+  "pairing_expired",
   "empty_channels",
   "duplicate_channel_id",
   "invalid_threshold",
@@ -100,6 +102,7 @@ export const DEREC_ERROR_CODES = [
   "ffi_nul_in_string",
   "transport_invalid",
   "no_usable_endpoint",
+  "transport_send_failed",
 ] as const;
 
 export type DeRecErrorCode = (typeof DEREC_ERROR_CODES)[number];
@@ -119,7 +122,12 @@ export interface DeRecError {
    * Clear exactly these and retry `restore`.
    */
   channel_ids?: string[];
-  /** The channel the failing inbound message arrived on, when `process()` could tell. */
+  /**
+   * The channel the error is about: the one named by
+   * `"channel_already_paired"`, `"fingerprint_mismatch"` and
+   * `"role_mismatch"`, or, on a failed `process()`, the channel the failing
+   * inbound message arrived on.
+   */
   channel_id?: string;
   /**
    * On a failed `process()`: the events it produced before failing, such as

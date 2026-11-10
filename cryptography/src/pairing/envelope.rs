@@ -82,6 +82,7 @@
 
 use crate::channel;
 use crate::pairing::{DerecEncryptionError, ecies};
+use crate::random;
 use rand::Rng as _;
 
 /// Length of nonce used for AES-GCM (we reuse 32 bytes but only first 12 are used)
@@ -134,7 +135,7 @@ pub fn encrypt(bytes: &[u8], public_key: &[u8]) -> Result<Vec<u8>, DerecEncrypti
         return Err(DerecEncryptionError::InvalidPublicKey);
     }
 
-    let (esk, epk) = ecies::generate_key(&mut crate::random::os_rng()).map_err(|_e| {
+    let (esk, epk) = ecies::generate_key(&mut random::os_rng()).map_err(|_e| {
         #[cfg(feature = "logging")]
         tracing::warn!(error = %_e, "ephemeral keypair generation failed");
         DerecEncryptionError::EncryptionFailed
@@ -147,7 +148,7 @@ pub fn encrypt(bytes: &[u8], public_key: &[u8]) -> Result<Vec<u8>, DerecEncrypti
     })?;
 
     let mut nonce = [0u8; NONCE_SIZE];
-    crate::random::os_rng().fill_bytes(&mut nonce);
+    random::os_rng().fill_bytes(&mut nonce);
 
     let ciphertext = channel::encrypt_message(bytes, &shared, &nonce).map_err(|_e| {
         #[cfg(feature = "logging")]
@@ -263,8 +264,7 @@ mod tests {
     use crate::pairing::ecies;
 
     fn generate_recipient_keypair() -> (Vec<u8>, Vec<u8>) {
-        ecies::generate_key(&mut crate::random::os_rng())
-            .expect("failed to generate recipient keypair")
+        ecies::generate_key(&mut random::os_rng()).expect("failed to generate recipient keypair")
     }
 
     #[test]

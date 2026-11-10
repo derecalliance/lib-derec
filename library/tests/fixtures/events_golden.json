@@ -372,12 +372,6 @@
       "type": "RecoveryShareReceived"
     },
     {
-      "channel_id": "1040",
-      "error": "share error",
-      "shares_received": 1,
-      "type": "RecoveryShareError"
-    },
-    {
       "channel_id": "1041",
       "memo": "recovery refused",
       "status": 8,
@@ -453,6 +447,267 @@
         "threshold": 3
       },
       "type": "SecretRecovered"
+    },
+    {
+      "candidates": [
+        {
+          "secret": {
+            "helpers": [
+              {
+                "channel_id": "7001",
+                "communication_info": {
+                  "name": "Helper"
+                },
+                "key_epoch": 16,
+                "shared_key": [
+                  17,
+                  18,
+                  19
+                ],
+                "transports": [
+                  {
+                    "protocol": "https",
+                    "uri": "https://helper.example/derec"
+                  }
+                ],
+                "weight": 2
+              }
+            ],
+            "replicas": {
+              "channel_id": "7002",
+              "key_epoch": 3,
+              "members": [
+                {
+                  "communication_info": {
+                    "device": "Laptop"
+                  },
+                  "replica_id": "7003",
+                  "role": "Source",
+                  "transports": [
+                    {
+                      "protocol": "grpc",
+                      "uri": "grpc://replica.example:443"
+                    }
+                  ]
+                }
+              ],
+              "shared_key": [
+                65,
+                66
+              ]
+            },
+            "secrets": [
+              {
+                "data": [
+                  49,
+                  50,
+                  51
+                ],
+                "id": [
+                  33,
+                  34
+                ],
+                "name": "wallet"
+              }
+            ],
+            "threshold": 3
+          },
+          "supported_by": [
+            {
+              "channel_id": "1040",
+              "communication_info": {
+                "name": "alice"
+              }
+            },
+            {
+              "channel_id": "1046",
+              "communication_info": {
+                "name": "bob"
+              }
+            }
+          ]
+        },
+        {
+          "secret": {
+            "helpers": [
+              {
+                "channel_id": "7001",
+                "communication_info": {
+                  "name": "Helper"
+                },
+                "key_epoch": 16,
+                "shared_key": [
+                  17,
+                  18,
+                  19
+                ],
+                "transports": [
+                  {
+                    "protocol": "https",
+                    "uri": "https://helper.example/derec"
+                  }
+                ],
+                "weight": 2
+              }
+            ],
+            "replicas": {
+              "channel_id": "7002",
+              "key_epoch": 3,
+              "members": [
+                {
+                  "communication_info": {
+                    "device": "Laptop"
+                  },
+                  "replica_id": "7003",
+                  "role": "Source",
+                  "transports": [
+                    {
+                      "protocol": "grpc",
+                      "uri": "grpc://replica.example:443"
+                    }
+                  ]
+                }
+              ],
+              "shared_key": [
+                65,
+                66
+              ]
+            },
+            "secrets": [
+              {
+                "data": [
+                  49,
+                  50,
+                  51
+                ],
+                "id": [
+                  33,
+                  34
+                ],
+                "name": "wallet"
+              }
+            ],
+            "threshold": 3
+          },
+          "supported_by": [
+            {
+              "channel_id": "1047",
+              "communication_info": {
+                "name": "carol"
+              }
+            },
+            {
+              "channel_id": "1048",
+              "communication_info": {
+                "name": "dave"
+              }
+            }
+          ]
+        }
+      ],
+      "disputed_by": [
+        {
+          "channel_id": "1049",
+          "communication_info": {
+            "name": "erin"
+          }
+        }
+      ],
+      "type": "RecoveryConflict",
+      "version": 26
+    },
+    {
+      "disputed_by": [
+        {
+          "channel_id": "1052",
+          "communication_info": {
+            "name": "heidi"
+          }
+        }
+      ],
+      "secret": {
+        "helpers": [
+          {
+            "channel_id": "7001",
+            "communication_info": {
+              "name": "Helper"
+            },
+            "key_epoch": 16,
+            "shared_key": [
+              17,
+              18,
+              19
+            ],
+            "transports": [
+              {
+                "protocol": "https",
+                "uri": "https://helper.example/derec"
+              }
+            ],
+            "weight": 2
+          }
+        ],
+        "replicas": {
+          "channel_id": "7002",
+          "key_epoch": 3,
+          "members": [
+            {
+              "communication_info": {
+                "device": "Laptop"
+              },
+              "replica_id": "7003",
+              "role": "Source",
+              "transports": [
+                {
+                  "protocol": "grpc",
+                  "uri": "grpc://replica.example:443"
+                }
+              ]
+            }
+          ],
+          "shared_key": [
+            65,
+            66
+          ]
+        },
+        "secrets": [
+          {
+            "data": [
+              49,
+              50,
+              51
+            ],
+            "id": [
+              33,
+              34
+            ],
+            "name": "wallet"
+          }
+        ],
+        "threshold": 3
+      },
+      "supported_by": [
+        {
+          "channel_id": "1050",
+          "communication_info": {
+            "name": "frank"
+          }
+        },
+        {
+          "channel_id": "1051",
+          "communication_info": {
+            "name": "grace"
+          }
+        }
+      ],
+      "type": "RecoveryDisputed",
+      "version": 28
+    },
+    {
+      "secret_id": "1079",
+      "shares_received": 3,
+      "type": "RecoveryIncomplete",
+      "version": 27
     },
     {
       "channel_id": "1043",

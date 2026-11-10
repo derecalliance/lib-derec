@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_cryptography::{channel::DerecChannelError, pairing::DerecEncryptionError};
 use std::time::SystemTime;
 use thiserror::Error;
 
@@ -20,8 +21,8 @@ pub enum DeRecMessageBuilderError {
     InvalidTimestamp(SystemTime),
 
     #[error(transparent)]
-    Encryption(#[from] derec_cryptography::channel::DerecChannelError),
+    Encryption(#[from] DerecChannelError),
 
     #[error(transparent)]
-    PairingEncryption(#[from] derec_cryptography::pairing::DerecEncryptionError),
+    PairingEncryption(#[from] DerecEncryptionError),
 }

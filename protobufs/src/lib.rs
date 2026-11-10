@@ -351,6 +351,7 @@ mod reply_to_wire {
     use super::*;
     use prost::Message as _;
     use prost::encoding::{WireType, encode_key, encode_varint};
+    use std::slice;
 
     fn endpoint(uri: &str, protocol: Protocol) -> TransportProtocol {
         TransportProtocol {
@@ -379,7 +380,7 @@ mod reply_to_wire {
         let first = endpoint("https://first.example/derec", Protocol::Https);
         let second = endpoint("grpcs://second.example:443", Protocol::Grpc);
 
-        let mut wire = encode_at_tag(5, std::slice::from_ref(&first));
+        let mut wire = encode_at_tag(5, slice::from_ref(&first));
         wire.extend(encode_at_tag(6, &[first, second]));
 
         let decoded = VerifyShareRequestMessage::decode(wire.as_slice())

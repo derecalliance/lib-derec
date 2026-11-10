@@ -155,7 +155,7 @@ pub async fn run() {
     let mut device = Peer::rotating(device_db.connection(), "Device", OWNER_URI);
     device
         .protocol
-        .restore(&recovered, 2)
+        .restore(&recovered, 2, 2)
         .await
         .expect("restore on a fresh device must succeed");
     for cid in [cid_a, cid_b] {

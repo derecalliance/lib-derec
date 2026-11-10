@@ -389,6 +389,8 @@ public sealed class DeRecProtocolBuilder
                     InboundMessage: set.InboundMessage ?? held.InboundMessage,
                     SharingRound: set.SharingRound ?? held.SharingRound,
                     UnpairAck: set.UnpairAck ?? held.UnpairAck,
+                    GetShareResponse: set.GetShareResponse ?? held.GetShareResponse,
+                    Pairing: set.Pairing ?? held.Pairing,
                     ExpiredChannels: set.ExpiredChannels ?? held.ExpiredChannels),
             },
             ParameterRange = config.ParameterRange ?? current.ParameterRange,

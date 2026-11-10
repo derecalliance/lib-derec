@@ -3,11 +3,12 @@
 
 use crate::extensions::request_message::RequestMessageExt as _;
 use crate::{
+    Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, ChannelKey, SharedKey},
-    utils::verify_timestamps,
+    utils::{random_u64, verify_timestamps},
 };
-use derec_proto::{DeRecMessage, MessageBody, VerifyShareRequestMessage};
+use derec_proto::{DeRecMessage, MessageBody, TransportProtocol, VerifyShareRequestMessage};
 use prost::Message;
 
 pub struct ProduceResult {
@@ -128,10 +129,10 @@ pub fn produce(
     secret_id: u64,
     version: u32,
     channel_key: &ChannelKey,
-    reply_to: &[derec_proto::TransportProtocol],
-) -> Result<ProduceResult, crate::Error> {
+    reply_to: &[TransportProtocol],
+) -> Result<ProduceResult, Error> {
     let timestamp = current_timestamp();
-    let nonce = crate::utils::random_u64();
+    let nonce = random_u64();
 
     let reply_to_transports = reply_to.to_vec();
     let message = VerifyShareRequestMessage {
@@ -233,11 +234,8 @@ pub fn produce(
 /// [`DeRecProtocol`](crate::protocol::DeRecProtocol), owns that decision and
 /// should run [`TransportPolicy::check_peer`](crate::transport::TransportPolicy::check_peer)
 /// on any endpoint this returns.
-pub fn extract(
-    envelope_bytes: &[u8],
-    shared_key: &SharedKey,
-) -> Result<ExtractResult, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractResult, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
     let request = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::VerifyShareRequest(message) => message,
@@ -245,7 +243,7 @@ pub fn extract(
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected VerifyShareRequestMessage");
 
-            return Err(crate::Error::Invariant(
+            return Err(Error::Invariant(
                 "Invalid message. Expected: VerifyShareRequestMessage",
             ));
         }

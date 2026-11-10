@@ -4,15 +4,20 @@
 use super::super::{
     ChannelKey, ChannelRequest, CollectedShare, CorruptionReason, DeRecChannelStore, DeRecEvent,
     DeRecShareStore, DeRecStateStore, DeRecTransport, KeyRing, MissingPolicy, PendingAction,
+    RecoveryCandidate, RecoveryHelper, now_secs,
 };
 use super::NO_SHARE_FOR_VERSION;
 use super::replicas::recovery as replica;
-use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::derec_message::apply_trace_id;
+use crate::extensions::advertised_endpoints::reply_to_owned;
+use crate::extensions::channel_store::{ChannelStoreExt as _, send_channel_message};
 use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
 use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::protocol::context::{Exchange, Local, Round};
+use crate::protocol::obligation;
 use crate::protocol::stores::{StoreSet, Stores};
+use crate::protocol::types::{ChannelStatus, HelperChannel, HelperFilter, Secret};
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -23,9 +28,11 @@ use crate::{
 use derec_cryptography::vss;
 use derec_proto::{
     DeRecResult, DeRecSecret, GetShareRequestMessage, GetShareResponseMessage, MessageBody,
-    SenderKind, StatusEnum, StoreShareRequestMessage,
+    SenderKind, StatusEnum, StoreShareRequestMessage, TransportProtocol,
 };
 use prost::Message;
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 
 /// Route an inbound recovery message.
 ///
@@ -42,34 +49,33 @@ use prost::Message;
 ///   `PendingRecovery` row under `(secret_id, recovered secret, version)`.
 ///   No row means unsolicited or stale; the response is dropped.
 ///
+/// Every response is that helper's answer: it leaves the row's `pending`
+/// set, and the recovery decides — see [`settle`] — only once that set is
+/// empty, or when the timeout sweep closes it. Nothing is reconstructed
+/// while an answer is still due, so a share still on its way can never
+/// contradict a secret already reported.
+///
 /// A response whose status is not OK is the helper refusing the request —
 /// typically `UNKNOWN_SHARE_VERSION` from a helper that holds no share for
 /// the version asked for. It carries no share, so it is never added to the
-/// collected set: it surfaces as [`DeRecEvent::RecoveryShareRefused`] and
-/// leaves the recovery state exactly as it was, still open for the other
-/// helpers' shares.
+/// collected set: it surfaces as [`DeRecEvent::RecoveryShareRefused`].
 ///
 /// An OK response is checked on its own before it is collected (see
 /// [`response::inspect`]); one that fails surfaces as
-/// [`DeRecEvent::RecoveryShareCorrupted`] and, like a refusal, leaves the
-/// state untouched. Before that check ever parses the share, its committed
+/// [`DeRecEvent::RecoveryShareCorrupted`] and, like a refusal, is not
+/// collected. Before that check ever parses the share, its committed
 /// bytes are measured against this device's own configured
 /// `parameter_range.max_share_size` (`0` or no range means unbounded); an
 /// oversized response is set aside the same way, without being decoded —
 /// the owner holds no proofs to validate against here, so size is the only
 /// admission check available, mirroring the helper-side check in
-/// `handlers::sharing::on_request`. The collected set holds one share per channel and is
-/// reconstructed from its consistent part (see
-/// [`recover_consistent`]); shares outside that part are reported
-/// as [`CorruptionReason::Inconsistent`] with the recovered secret.
+/// `handlers::sharing::on_request`. The collected set holds one share per
+/// channel.
 ///
-/// Once the threshold is met, VSS reconstructs the *outer* protect-side
-/// wrapping: a `DeRecSecret` envelope whose `secret_data` holds the
-/// gzip-compressed JSON encoding of the secret (see
-/// [`crate::protocol::types::secret`]). Both layers are decoded before
-/// [`DeRecEvent::SecretRecovered`] is emitted; either failing yields
-/// [`RecoveryError::MalformedRecoveredSecret`] — the math reconstructed
-/// *something*, but not a wire shape the protocol recognises.
+/// What VSS reconstructs is the *outer* protect-side wrapping: a
+/// `DeRecSecret` envelope whose `secret_data` holds the gzip-compressed JSON
+/// encoding of the secret (see [`crate::protocol::types::secret`]). Both
+/// layers must decode for a group to count as a secret at all.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
@@ -149,6 +155,44 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     version: u32,
     round: &Round<'_>,
 ) -> Result<Vec<DeRecEvent>> {
+    let all_channels: Vec<HelperChannel> = stores
+        .channels
+        .helpers_matching(
+            local.secret_id,
+            HelperFilter {
+                status: vec![ChannelStatus::Paired],
+                role: Some(SenderKind::Helper),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    let channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.channel_id).collect();
+    let keys: HashMap<ChannelId, Option<KeyRing>> = stores
+        .secrets
+        .key_rings_many(local.secret_id, &channel_ids, MissingPolicy::Fail)
+        .await?
+        .into_iter()
+        .collect();
+
+    let (mut events, asked) =
+        dispatch_all(stores, all_channels, keys, target_secret_id, version, round).await;
+
+    if asked.is_empty() {
+        stores
+            .state
+            .remove(
+                local.secret_id,
+                StateKey::PendingRecovery {
+                    secret_id: target_secret_id,
+                    version,
+                },
+            )
+            .await?;
+        events.extend(settle(target_secret_id, version, &[], &HashMap::new()));
+        return Ok(events);
+    }
+
     stores
         .state
         .save(
@@ -157,31 +201,11 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
                 secret_id: target_secret_id,
                 version,
                 shares: Vec::new(),
+                pending: asked,
+                started_at: now_secs(),
             },
         )
         .await?;
-
-    let all_channels: Vec<crate::protocol::types::HelperChannel> = stores
-        .channels
-        .helpers_matching(
-            local.secret_id,
-            crate::protocol::types::HelperFilter {
-                status: vec![crate::protocol::types::ChannelStatus::Paired],
-                role: Some(derec_proto::SenderKind::Helper),
-                ..Default::default()
-            },
-        )
-        .await?;
-
-    let channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.channel_id).collect();
-    let keys: std::collections::HashMap<ChannelId, Option<KeyRing>> = stores
-        .secrets
-        .key_rings_many(local.secret_id, &channel_ids, MissingPolicy::Fail)
-        .await?
-        .into_iter()
-        .collect();
-
-    let events = dispatch_all(stores, all_channels, keys, target_secret_id, version, round).await;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -266,7 +290,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
             NO_SHARE_FOR_VERSION,
         )
         .await;
-        return crate::protocol::obligation::refused(
+        return obligation::refused(
             exchange.obligation,
             DeRecEvent::NoOp,
             StatusEnum::UnknownShareVersion,
@@ -280,17 +304,17 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
 
     let resp = response::produce(exchange.channel_id, request, &stored, exchange.key)?;
 
-    let envelope = crate::derec_message::apply_trace_id(&resp.envelope, exchange.trace_id)?;
+    let envelope = apply_trace_id(&resp.envelope, exchange.trace_id)?;
     let endpoints = stores
         .channels
         .resolve_response_endpoints(
             local.secret_id,
             exchange.channel_id,
             local.policy,
-            &crate::extensions::advertised_endpoints::reply_to_owned(request),
+            &reply_to_owned(request),
         )
         .await?;
-    crate::protocol::obligation::deliver(
+    obligation::deliver(
         exchange.obligation,
         stores.transport,
         &endpoints,
@@ -330,7 +354,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
-    crate::extensions::channel_store::send_channel_message(
+    send_channel_message(
         stores.channels,
         stores.transport,
         local.secret_id,
@@ -339,7 +363,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         exchange.key,
         exchange.trace_id,
         local.policy,
-        &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        &reply_to_owned(request),
         exchange.obligation,
         status,
         memo,
@@ -416,12 +440,17 @@ async fn on_response<S: StoreSet>(
         version: response.version,
     };
 
-    let mut shares = match stores
+    let (mut shares, mut pending, started_at) = match stores
         .state
         .load(local.secret_id, state_key.clone())
         .await?
     {
-        Some(StateItem::PendingRecovery { shares, .. }) => shares,
+        Some(StateItem::PendingRecovery {
+            shares,
+            pending,
+            started_at,
+            ..
+        }) => (shares, pending, started_at),
         Some(_) => {
             return Err(Error::Invariant(
                 "state store returned wrong StateItem variant for PendingRecovery key",
@@ -439,6 +468,48 @@ async fn on_response<S: StoreSet>(
         }
     };
 
+    pending.remove(&channel_id);
+    let event = judge_response(local, channel_id, response, &mut shares);
+
+    let mut events = vec![event];
+    if pending.is_empty() {
+        let helpers = describe_helpers(&*stores.channels, local.secret_id, &shares).await?;
+        stores.state.remove(local.secret_id, state_key).await?;
+        events.extend(settle(
+            response.secret_id,
+            response.version,
+            &shares,
+            &helpers,
+        ));
+    } else {
+        stores
+            .state
+            .save(
+                local.secret_id,
+                StateItem::PendingRecovery {
+                    secret_id: response.secret_id,
+                    version: response.version,
+                    shares,
+                    pending,
+                    started_at,
+                },
+            )
+            .await?;
+    }
+    Ok(events)
+}
+
+/// Judge one Helper's answer on its own, collecting it into `shares` when it
+/// is a valid share, and return the event that reports it.
+///
+/// A refusal or a corrupted share is not collected. A Helper that answers
+/// again replaces its earlier share.
+fn judge_response(
+    local: &Local<'_>,
+    channel_id: ChannelId,
+    response: &GetShareResponseMessage,
+    shares: &mut Vec<CollectedShare>,
+) -> DeRecEvent {
     if let Some(Err((status, memo))) = response
         .result
         .as_ref()
@@ -453,12 +524,12 @@ async fn on_response<S: StoreSet>(
             memo = %memo,
             "recovery share request refused by helper"
         );
-        return Ok(vec![DeRecEvent::RecoveryShareRefused {
+        return DeRecEvent::RecoveryShareRefused {
             channel_id,
             version: response.version,
             status,
             memo,
-        }]);
+        };
     }
 
     let oversized = local.parameter_range.is_some_and(|range| {
@@ -471,10 +542,7 @@ async fn on_response<S: StoreSet>(
     } else {
         inspect(response.secret_id, response.version, response)
             .err()
-            .map(|fault| match fault {
-                ShareFault::Malformed(_) => CorruptionReason::Malformed,
-                ShareFault::InvalidProof => CorruptionReason::InvalidProof,
-            })
+            .map(ShareFault::reason)
     };
 
     if let Some(reason) = fault {
@@ -486,11 +554,11 @@ async fn on_response<S: StoreSet>(
             ?reason,
             "recovery share is corrupted; set aside"
         );
-        return Ok(vec![DeRecEvent::RecoveryShareCorrupted {
+        return DeRecEvent::RecoveryShareCorrupted {
             channel_id,
             version: response.version,
             reason,
-        }]);
+        };
     }
 
     shares.retain(|share| share.channel_id != channel_id);
@@ -498,152 +566,204 @@ async fn on_response<S: StoreSet>(
         channel_id,
         response: response.clone(),
     });
-    let shares_received = shares.len();
-    let inputs: Vec<&GetShareResponseMessage> = shares.iter().map(|s| &s.response).collect();
 
-    let event = match recover_consistent(response.secret_id, response.version, &inputs) {
-        Ok(result) => {
-            let typed_secret = match decode_recovered_secret(&result.secret_data) {
-                Ok(s) => s,
-                Err(e) => {
-                    #[cfg(feature = "logging")]
-                    tracing::warn!(
-                        channel_id = channel_id.0,
-                        secret_id = response.secret_id,
-                        version = response.version,
-                        shares_received,
-                        error = %e,
-                        "recovered bytes did not decode as canonical Secret protobuf"
-                    );
+    #[cfg(feature = "logging")]
+    tracing::debug!(
+        channel_id = channel_id.0,
+        secret_id = response.secret_id,
+        version = response.version,
+        shares_received = shares.len(),
+        "recovery share collected"
+    );
 
-                    return Ok(vec![DeRecEvent::RecoveryShareError {
-                        channel_id,
-                        shares_received,
-                        error: e.to_string(),
-                    }]);
-                }
-            };
-
-            stores.state.remove(local.secret_id, state_key).await?;
-
-            #[cfg(feature = "logging")]
-            tracing::info!(
-                channel_id = channel_id.0,
-                secret_id = response.secret_id,
-                version = response.version,
-                shares_received,
-                outliers = result.outliers.len(),
-                "secret reconstructed from shares"
-            );
-
-            let mut events: Vec<DeRecEvent> = result
-                .outliers
-                .iter()
-                .map(|&i| DeRecEvent::RecoveryShareCorrupted {
-                    channel_id: shares[i].channel_id,
-                    version: response.version,
-                    reason: CorruptionReason::Inconsistent,
-                })
-                .collect();
-            events.push(DeRecEvent::SecretRecovered {
-                secret: typed_secret,
-            });
-            return Ok(events);
-        }
-        Err(Error::Recovery(RecoveryError::ReconstructionFailed { ref source }))
-            if matches!(
-                source,
-                derec_cryptography::vss::DerecVSSError::InsufficientShares
-            ) =>
-        {
-            stores
-                .state
-                .save(
-                    local.secret_id,
-                    StateItem::PendingRecovery {
-                        secret_id: response.secret_id,
-                        version: response.version,
-                        shares,
-                    },
-                )
-                .await?;
-
-            #[cfg(feature = "logging")]
-            tracing::debug!(
-                channel_id = channel_id.0,
-                secret_id = response.secret_id,
-                version = response.version,
-                shares_received,
-                "reconstruction not yet possible — insufficient shares"
-            );
-
-            DeRecEvent::RecoveryShareReceived {
-                channel_id,
-                shares_received,
-            }
-        }
-        Err(e) => {
-            stores
-                .state
-                .save(
-                    local.secret_id,
-                    StateItem::PendingRecovery {
-                        secret_id: response.secret_id,
-                        version: response.version,
-                        shares,
-                    },
-                )
-                .await?;
-
-            #[cfg(feature = "logging")]
-            tracing::warn!(
-                channel_id = channel_id.0,
-                secret_id = response.secret_id,
-                version = response.version,
-                shares_received,
-                error = %e,
-                "recovery share response received but reconstruction failed"
-            );
-
-            DeRecEvent::RecoveryShareError {
-                channel_id,
-                shares_received,
-                error: e.to_string(),
-            }
-        }
-    };
-
-    Ok(vec![event])
+    DeRecEvent::RecoveryShareReceived {
+        channel_id,
+        shares_received: shares.len(),
+    }
 }
 
-fn decode_recovered_secret(outer_bytes: &[u8]) -> Result<crate::protocol::types::Secret> {
+/// What the owner knows of each Helper whose share was collected: the
+/// `communication_info` stored on its channel. A channel no longer stored is
+/// absent.
+pub(in crate::protocol) async fn describe_helpers<C: DeRecChannelStore>(
+    channels: &C,
+    secret_id: u64,
+    shares: &[CollectedShare],
+) -> Result<HashMap<ChannelId, HashMap<String, String>>> {
+    if shares.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids: Vec<ChannelId> = shares.iter().map(|s| s.channel_id).collect();
+    Ok(channels
+        .helpers_matching(
+            secret_id,
+            HelperFilter {
+                ids,
+                ..Default::default()
+            },
+        )
+        .await?
+        .into_iter()
+        .map(|c| (c.channel_id, c.communication_info))
+        .collect())
+}
+
+/// Decide a closed recovery of `(secret_id, version)` from every share it
+/// collected, returning the events that report the decision. `helpers` is
+/// what [`describe_helpers`] returned for `shares`.
+///
+/// Called once per recovery: when its last answer arrives, or when the
+/// timeout sweep closes it. Every reconstructing group is a candidate (see
+/// [`candidates`]). Shares in a group that reconstructs something that is
+/// not a secret are reported as [`CorruptionReason::Forged`] first. Every
+/// other share outside the candidates disputes them. Then:
+///
+/// - no candidate is [`DeRecEvent::RecoveryIncomplete`];
+/// - one candidate is [`DeRecEvent::SecretRecovered`], or
+///   [`DeRecEvent::RecoveryDisputed`] when any share disputes it;
+/// - several are [`DeRecEvent::RecoveryConflict`].
+pub(in crate::protocol) fn settle(
+    secret_id: u64,
+    version: u32,
+    shares: &[CollectedShare],
+    helpers: &HashMap<ChannelId, HashMap<String, String>>,
+) -> Vec<DeRecEvent> {
+    let responses: Vec<&GetShareResponseMessage> = shares.iter().map(|s| &s.response).collect();
+    let CandidateSet {
+        candidates,
+        forged,
+        faults,
+    } = candidates(secret_id, version, &responses);
+
+    let helper = |i: usize| RecoveryHelper {
+        channel_id: shares[i].channel_id,
+        communication_info: helpers
+            .get(&shares[i].channel_id)
+            .cloned()
+            .unwrap_or_default(),
+    };
+
+    let mut events: Vec<DeRecEvent> = faults
+        .iter()
+        .copied()
+        .chain(forged.iter().map(|&i| (i, CorruptionReason::Forged)))
+        .map(|(i, reason)| DeRecEvent::RecoveryShareCorrupted {
+            channel_id: shares[i].channel_id,
+            version,
+            reason,
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            secret_id,
+            version,
+            shares_received = shares.len() - faults.len(),
+            "recovery closed without reconstructing a secret"
+        );
+        events.push(DeRecEvent::RecoveryIncomplete {
+            secret_id,
+            version,
+            shares_received: shares.len() - faults.len(),
+        });
+        return events;
+    }
+
+    let accounted: HashSet<usize> = candidates
+        .iter()
+        .flat_map(|c| c.members.iter().copied())
+        .chain(forged.iter().copied())
+        .chain(faults.iter().map(|&(i, _)| i))
+        .collect();
+    let disputed_by: Vec<RecoveryHelper> = (0..shares.len())
+        .filter(|i| !accounted.contains(i))
+        .map(helper)
+        .collect();
+
+    let mut candidates = candidates;
+    if candidates.len() == 1 {
+        let candidate = candidates.remove(0);
+        if disputed_by.is_empty() {
+            #[cfg(feature = "logging")]
+            tracing::info!(
+                secret_id,
+                version,
+                used = candidate.members.len(),
+                "secret reconstructed from shares"
+            );
+            events.push(DeRecEvent::SecretRecovered {
+                secret: candidate.secret,
+            });
+        } else {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                secret_id,
+                version,
+                supported = candidate.members.len(),
+                disputed = disputed_by.len(),
+                "reconstructed secret is disputed by shares of another split"
+            );
+            events.push(DeRecEvent::RecoveryDisputed {
+                version,
+                secret: candidate.secret,
+                supported_by: candidate.members.iter().map(|&i| helper(i)).collect(),
+                disputed_by,
+            });
+        }
+        return events;
+    }
+
+    #[cfg(feature = "logging")]
+    tracing::warn!(
+        secret_id,
+        version,
+        candidates = candidates.len(),
+        "recovery reconstructed conflicting secrets"
+    );
+    events.push(DeRecEvent::RecoveryConflict {
+        version,
+        candidates: candidates
+            .into_iter()
+            .map(|c| RecoveryCandidate {
+                supported_by: c.members.iter().map(|&i| helper(i)).collect(),
+                secret: c.secret,
+            })
+            .collect(),
+        disputed_by,
+    });
+    events
+}
+
+fn decode_recovered_secret(outer_bytes: &[u8]) -> Result<Secret> {
     let derec_secret =
         DeRecSecret::decode(outer_bytes).map_err(|e| RecoveryError::MalformedRecoveredSecret {
             source: Box::new(e),
         })?;
-    let secret =
-        crate::protocol::types::Secret::decode(&derec_secret.secret_data).map_err(|e| {
-            RecoveryError::MalformedRecoveredSecret {
-                source: Box::new(e),
-            }
-        })?;
+    let secret = Secret::decode(&derec_secret.secret_data).map_err(|e| {
+        RecoveryError::MalformedRecoveredSecret {
+            source: Box::new(e),
+        }
+    })?;
     Ok(secret)
 }
 
-/// Send a share request to every resolved channel, reporting each outcome.
+/// Send a share request to every resolved channel, reporting each outcome
+/// and returning the channels a request reached.
 ///
 /// One event per target, in the order the targets were resolved. A failure is
 /// isolated to its own target: it becomes a `RecoverSecretFailed` and the
 /// fan-out continues, so one unreachable helper cannot suppress the rest.
 async fn dispatch_all<S: StoreSet>(
     stores: &mut Stores<'_, S>,
-    all_channels: Vec<crate::protocol::types::HelperChannel>,
-    mut keys: std::collections::HashMap<ChannelId, Option<KeyRing>>,
+    all_channels: Vec<HelperChannel>,
+    mut keys: HashMap<ChannelId, Option<KeyRing>>,
     target_secret_id: u64,
     version: u32,
     round: &Round<'_>,
-) -> Vec<DeRecEvent> {
+) -> (Vec<DeRecEvent>, HashSet<ChannelId>) {
     let mut events = Vec::with_capacity(all_channels.len());
+    let mut asked = HashSet::with_capacity(all_channels.len());
     for channel in all_channels {
         let Some(key) = keys.remove(&channel.channel_id).flatten() else {
             events.push(DeRecEvent::RecoverSecretFailed {
@@ -667,6 +787,7 @@ async fn dispatch_all<S: StoreSet>(
         .await
         {
             Ok(()) => {
+                asked.insert(channel.channel_id);
                 events.push(DeRecEvent::RecoverSecretStarted {
                     channel_id: channel.channel_id,
                     version,
@@ -697,20 +818,20 @@ async fn dispatch_all<S: StoreSet>(
             }
         }
     }
-    events
+    (events, asked)
 }
 
 async fn dispatch_one<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     channel_id: ChannelId,
-    endpoints: &[derec_proto::TransportProtocol],
+    endpoints: &[TransportProtocol],
     secret_id: u64,
     version: u32,
     key: &ChannelKey,
     round: &Round<'_>,
 ) -> Result<()> {
     let msg = request::produce(channel_id, secret_id, version, key, round.reply_to)?;
-    let envelope = crate::derec_message::apply_trace_id(&msg.envelope, round.trace_id)?;
+    let envelope = apply_trace_id(&msg.envelope, round.trace_id)?;
     stores.transport.send(endpoints, envelope).await?;
     Ok(())
 }
@@ -721,10 +842,20 @@ enum ShareFault {
     /// The response carries no decodable committed share for the requested
     /// `(secret_id, version)`: missing result, empty or undecodable share
     /// bytes, or a share bound to another secret or version.
-    Malformed(Error),
+    Malformed,
     /// The share decodes but its Merkle proof does not open to its own
     /// commitment.
     InvalidProof,
+}
+
+impl ShareFault {
+    /// How [`DeRecEvent::RecoveryShareCorrupted`] reports this fault.
+    fn reason(self) -> CorruptionReason {
+        match self {
+            Self::Malformed => CorruptionReason::Malformed,
+            Self::InvalidProof => CorruptionReason::InvalidProof,
+        }
+    }
 }
 
 /// Every check a single OK-status share admits without the others: it
@@ -740,112 +871,167 @@ fn inspect(
     response: &GetShareResponseMessage,
 ) -> std::result::Result<vss::VSSShare, ShareFault> {
     let share = response::extract_share_from_response(response, secret_id, version)
-        .map_err(ShareFault::Malformed)?;
+        .map_err(|_| ShareFault::Malformed)?;
     if !vss::verify(&share) {
         return Err(ShareFault::InvalidProof);
     }
     Ok(share)
 }
 
-/// The fewest subshares VSS reconstructs from: [`vss::share`] refuses a
-/// threshold below two, and a share always carries fewer subshares than the
-/// threshold, so a single share is never a complete set.
-const MIN_RECONSTRUCTION_SUBSHARES: usize = 2;
+/// The fewest distinct shares a group is tried with: [`vss::share`] refuses a
+/// threshold below two and a weight of the threshold or more, so every honest
+/// split needs subshares from at least two helpers. A share received is not
+/// trusted to keep that bound, so a single share is never tried however many
+/// subshares it carries.
+const MIN_RECONSTRUCTION_SHARES: usize = 2;
 
-/// A secret reconstructed from the consistent part of a collected set.
-struct ConsistentRecovery {
-    /// The reconstructed secret bytes.
-    secret_data: Vec<u8>,
-    /// Indices into the `responses` passed to [`recover_consistent`] of the
-    /// shares that were not used because their commitment root or ciphertext
-    /// disagrees with the set that reconstructed.
-    outliers: Vec<usize>,
+/// One secret reconstructed from a collected set.
+struct Candidate {
+    /// The reconstructed secret, decoded.
+    secret: Secret,
+    /// Indices into the `responses` passed to [`candidates`] of the shares
+    /// that reconstruct it.
+    members: Vec<usize>,
 }
 
-/// Reconstruct from the consistent part of a set of individually valid
-/// shares, naming the shares left out.
+/// Every secret a collected set reconstructs, the shares that provably
+/// forge one, and the shares that fail on their own.
+struct CandidateSet {
+    /// Distinct secrets, largest group first, ties going to the group whose
+    /// first share was collected earliest.
+    candidates: Vec<Candidate>,
+    /// Indices of the shares in a group that reconstructs under one key but
+    /// not to a secret, in collection order.
+    forged: Vec<usize>,
+    /// Indices of the shares that fail [`inspect`], with why. They are in no
+    /// group.
+    faults: Vec<(usize, CorruptionReason)>,
+}
+
+/// Every secret a set of collected shares reconstructs.
 ///
-/// The invariant that every share used carries the same Merkle root and the
-/// same ciphertext is kept by construction rather than by rejecting the whole
-/// set: shares are grouped by `(commitment, encrypted_secret)`, and groups
-/// are tried largest first, ties going to the group whose first share arrived
-/// earliest. The first group that reconstructs is the result, and every share
-/// outside it is an outlier.
+/// Shares are grouped by `(commitment, encrypted_secret)`, and every group is
+/// tried, so a forged group cannot hide an honest one by reconstructing
+/// first. A share repeated across channels counts once: a share whose
+/// subshares equal those of a share already taken is skipped. A group is a
+/// candidate when it holds at least [`MIN_RECONSTRUCTION_SHARES`] distinct
+/// shares, decrypts, decodes as a secret, and fits the threshold that secret
+/// declares (see [`fits_declared_threshold`]). Two groups that reconstruct
+/// the same bytes are one candidate.
 ///
-/// Reconstruction is the arbiter because it is what proves a group whole: a
-/// key interpolated from fewer than the threshold of genuine subshares fails the
-/// ciphertext's authentication, so a group can only succeed by holding a
-/// complete set of one split. A group needs at least two subshares to be
-/// tried, and a share repeated across channels counts once: a share whose
-/// subshares equal those of a share already taken is skipped.
+/// A group that decrypts and is not a candidate is forged: it holds a whole
+/// split under one key — which takes at least the threshold of subshares —
+/// yet too few Helpers for an honest split, or bytes that are not a secret,
+/// or a threshold its own shares contradict. An honest split produces none
+/// of these.
 ///
-/// No threshold is known before reconstruction, so a set that reconstructs
-/// from no group is not an error of any share: it fails with
-/// [`RecoveryError::ReconstructionFailed`] carrying
-/// [`vss::DerecVSSError::InsufficientShares`], and waits for more.
+/// Decryption is what proves a group whole: a key interpolated from fewer
+/// than the threshold of genuine subshares fails the ciphertext's
+/// authentication. No threshold is known before reconstruction, so a group
+/// that fails is not evidence against any of its shares.
 ///
-/// Every response must already have passed [`inspect`]; one that does not is
-/// reported as the error it fails with.
-fn recover_consistent(
+/// Every share was inspected when it was collected; one that no longer
+/// passes is reported in [`CandidateSet::faults`] and left out.
+fn candidates(
     secret_id: u64,
     version: u32,
     responses: &[&GetShareResponseMessage],
-) -> Result<ConsistentRecovery> {
-    let mut shares = Vec::with_capacity(responses.len());
-    for response in responses {
-        let share = inspect(secret_id, version, response).map_err(|fault| match fault {
-            ShareFault::Malformed(e) => e,
-            ShareFault::InvalidProof => RecoveryError::ReconstructionFailed {
-                source: vss::DerecVSSError::CorruptShares,
-            }
-            .into(),
-        })?;
-        shares.push(share);
+) -> CandidateSet {
+    let mut faults = Vec::new();
+    let mut shares: Vec<(usize, vss::VSSShare)> = Vec::with_capacity(responses.len());
+    for (i, response) in responses.iter().enumerate() {
+        match inspect(secret_id, version, response) {
+            Ok(share) => shares.push((i, share)),
+            Err(fault) => faults.push((i, fault.reason())),
+        }
     }
 
     let mut groups: Vec<Vec<usize>> = Vec::new();
-    for (i, share) in shares.iter().enumerate() {
+    for (pos, (_, share)) in shares.iter().enumerate() {
         let existing = groups.iter_mut().find(|group| {
-            let first = &shares[group[0]];
+            let first = &shares[group[0]].1;
             first.commitment == share.commitment && first.encrypted_secret == share.encrypted_secret
         });
         match existing {
-            Some(group) => group.push(i),
-            None => groups.push(vec![i]),
+            Some(group) => group.push(pos),
+            None => groups.push(vec![pos]),
         }
     }
-    groups.sort_by_key(|group| std::cmp::Reverse(group.len()));
+    groups.sort_by_key(|group| Reverse(group.len()));
 
+    let mut found: Vec<(Vec<u8>, Candidate)> = Vec::new();
+    let mut forged = Vec::new();
     for group in &groups {
         let mut distinct: Vec<vss::VSSShare> = Vec::with_capacity(group.len());
-        for &i in group {
-            if !distinct.iter().any(|s| s.subshares == shares[i].subshares) {
-                distinct.push(shares[i].clone());
+        for &pos in group {
+            if !distinct
+                .iter()
+                .any(|s| s.subshares == shares[pos].1.subshares)
+            {
+                distinct.push(shares[pos].1.clone());
             }
         }
-        let subshares: usize = distinct.iter().map(|s| s.subshares.len()).sum();
-        if subshares < MIN_RECONSTRUCTION_SUBSHARES {
+        let members: Vec<usize> = group.iter().map(|&pos| shares[pos].0).collect();
+        let Ok(secret_data) = vss::recover(&distinct) else {
+            continue;
+        };
+        if distinct.len() < MIN_RECONSTRUCTION_SHARES {
+            #[cfg(feature = "logging")]
+            tracing::warn!("a single share reconstructed on its own; forged");
+            forged.extend(members);
             continue;
         }
-        if let Ok(secret_data) = vss::recover(&distinct) {
-            let outliers = (0..shares.len()).filter(|i| !group.contains(i)).collect();
+        let secret = match decode_recovered_secret(&secret_data) {
+            Ok(secret) => secret,
+            Err(_e) => {
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    used = group.len(),
+                    error = %_e,
+                    "group decrypted to bytes that are not a secret; forged"
+                );
+                forged.extend(members);
+                continue;
+            }
+        };
+        if !fits_declared_threshold(&secret, &distinct) {
             #[cfg(feature = "logging")]
-            tracing::info!(
+            tracing::warn!(
                 used = group.len(),
-                groups = groups.len(),
-                "secret reconstructed from the consistent shares"
+                threshold = secret.threshold,
+                "reconstructed secret does not fit its declared threshold; forged"
             );
-            return Ok(ConsistentRecovery {
-                secret_data,
-                outliers,
-            });
+            forged.extend(members);
+            continue;
+        }
+        match found.iter_mut().find(|(bytes, _)| *bytes == secret_data) {
+            Some((_, same)) => {
+                same.members.extend(members);
+                same.members.sort_unstable();
+            }
+            None => found.push((secret_data, Candidate { secret, members })),
         }
     }
 
-    Err(RecoveryError::ReconstructionFailed {
-        source: vss::DerecVSSError::InsufficientShares,
+    forged.sort_unstable();
+    CandidateSet {
+        candidates: found.into_iter().map(|(_, c)| c).collect(),
+        forged,
+        faults,
     }
-    .into())
+}
+
+/// Whether `shares` could be an honest split of `secret` at the threshold it
+/// declares: every share carries fewer subshares than the threshold, and
+/// together they carry at least the threshold. A secret that records no
+/// threshold is not checked.
+fn fits_declared_threshold(secret: &Secret, shares: &[vss::VSSShare]) -> bool {
+    let Some(threshold) = secret.threshold else {
+        return true;
+    };
+    let threshold = threshold as usize;
+    let total: usize = shares.iter().map(|s| s.subshares.len()).sum();
+    total >= threshold && shares.iter().all(|s| s.subshares.len() < threshold)
 }
 
 #[cfg(test)]
@@ -859,9 +1045,12 @@ mod recovery_ids_tests {
     //! in-place re-share, so every assertion here deliberately uses
     //! `LOCAL != TARGET`.
 
+    use super::tests::{encode_protect_wrapping, fixture_secret};
     use super::*;
+    use crate::derec_message::extract_inner_message;
+    use crate::primitives::sharing::request;
     use crate::protocol::DeRecSecretStore;
-    use crate::protocol::context::Exchange;
+    use crate::protocol::context::{Exchange, Round};
     use crate::protocol::tests::LocalFixture;
     use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, RecordingTransport,
@@ -870,9 +1059,10 @@ mod recovery_ids_tests {
     use crate::protocol::types::{
         ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole, SecretValue,
     };
-    use crate::types::ChannelId;
     use crate::types::SharedKey;
-    use derec_proto::{DeRecMessage, SenderKind, TransportProtocol};
+    use crate::types::{ChannelId, ReplicaId};
+    use crate::utils::now_secs;
+    use derec_proto::{DeRecMessage, Protocol, SenderKind, TransportProtocol};
     use prost::Message;
 
     /// The ephemeral instance's own secret id — owns every local partition.
@@ -887,7 +1077,7 @@ mod recovery_ids_tests {
     fn endpoint(uri: &str) -> TransportProtocol {
         TransportProtocol {
             uri: uri.to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         }
     }
 
@@ -930,7 +1120,7 @@ mod recovery_ids_tests {
         let record = match ReplicaRole::from_sender_kind(peer_role) {
             Some(role) => ChannelRecord::Replica(ReplicaMember {
                 channel_id: ChannelId(cid),
-                replica_id: crate::types::ReplicaId(cid),
+                replica_id: ReplicaId(cid),
                 transports: vec![transport.clone()],
                 communication_info: Default::default(),
                 role,
@@ -962,11 +1152,8 @@ mod recovery_ids_tests {
     /// a helper would actually see.
     fn decode_request(envelope: &[u8], key_byte: u8) -> GetShareRequestMessage {
         let msg = DeRecMessage::decode(envelope).expect("outbound envelope decodes");
-        let inner = crate::derec_message::extract_inner_message(
-            &msg.message,
-            &crate::types::SharedKey::new([key_byte; 32]),
-        )
-        .expect("inner message decrypts");
+        let inner = extract_inner_message(&msg.message, &SharedKey::new([key_byte; 32]))
+            .expect("inner message decrypts");
         match inner {
             MessageBody::GetShareRequest(r) => r,
             other => panic!("expected GetShareRequest, got {other:?}"),
@@ -984,10 +1171,8 @@ mod recovery_ids_tests {
     ) -> Vec<GetShareResponseMessage> {
         let cids: Vec<ChannelId> = channel_ids.iter().copied().map(ChannelId).collect();
         let weighted: Vec<_> = cids.iter().map(|&cid| (cid, 1)).collect();
-        let split = crate::primitives::sharing::request::split(
-            &weighted, secret_id, version, payload, threshold,
-        )
-        .expect("split succeeds");
+        let split = request::split(&weighted, secret_id, version, payload, threshold)
+            .expect("split succeeds");
         cids.iter()
             .map(|cid| GetShareResponseMessage {
                 result: Some(DeRecResult::ok()),
@@ -1009,13 +1194,30 @@ mod recovery_ids_tests {
         StateKey::PendingRecovery { secret_id, version }
     }
 
+    /// An open recovery of `(target, VERSION)` still waiting on `channels`.
+    async fn seed_pending(state: &mut InMemPersistedStateStore, target: u64, channels: &[u64]) {
+        state
+            .save(
+                LOCAL,
+                StateItem::PendingRecovery {
+                    secret_id: target,
+                    version: VERSION,
+                    shares: Vec::new(),
+                    pending: channels.iter().copied().map(ChannelId).collect(),
+                    started_at: now_secs(),
+                },
+            )
+            .await
+            .expect("seed pending");
+    }
+
     // ---------------------------------------------------------------
     // Definition 1 — outbound: requests go to the LOCAL instance's
     // helpers and carry the TARGET secret id.
     // ---------------------------------------------------------------
 
     /// A fixed round, so a test can assert what reaches the wire.
-    const ROUND: crate::protocol::context::Round<'static> = crate::protocol::context::Round {
+    const ROUND: Round<'static> = Round {
         reply_to: &[],
         trace_id: 0x7ACE,
     };
@@ -1226,7 +1428,7 @@ mod recovery_ids_tests {
     }
 
     #[test]
-    fn start_dispatches_nothing_when_the_local_instance_has_no_channels() {
+    fn start_closes_incomplete_when_the_local_instance_has_no_channels() {
         run_async(async {
             let lf = LocalFixture::new(LOCAL);
             let mut rig = StoreRig::new();
@@ -1239,7 +1441,25 @@ mod recovery_ids_tests {
                 .expect("start succeeds");
 
             assert!(rig.transport.sent_uris().is_empty());
-            assert!(events.is_empty());
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [DeRecEvent::RecoveryIncomplete {
+                        secret_id: TARGET,
+                        version: VERSION,
+                        shares_received: 0,
+                    }]
+                ),
+                "with no Helper to ask the recovery closes at once, got {events:?}"
+            );
+            assert!(
+                rig.state
+                    .load(LOCAL, pending_key(TARGET, VERSION))
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "nothing is left waiting"
+            );
         });
     }
 
@@ -1253,17 +1473,7 @@ mod recovery_ids_tests {
         run_async(async {
             let lf = LocalFixture::new(LOCAL);
             let mut rig = StoreRig::new();
-            rig.state
-                .save(
-                    LOCAL,
-                    StateItem::PendingRecovery {
-                        secret_id: TARGET,
-                        version: VERSION,
-                        shares: Vec::new(),
-                    },
-                )
-                .await
-                .expect("seed pending");
+            seed_pending(&mut rig.state, TARGET, &[11, 12, 13]).await;
 
             let responses = helper_responses(TARGET, VERSION, &[11, 12, 13], 2, b"payload");
 
@@ -1286,17 +1496,7 @@ mod recovery_ids_tests {
         run_async(async {
             let lf = LocalFixture::new(LOCAL);
             let mut rig = StoreRig::new();
-            rig.state
-                .save(
-                    LOCAL,
-                    StateItem::PendingRecovery {
-                        secret_id: TARGET,
-                        version: VERSION,
-                        shares: Vec::new(),
-                    },
-                )
-                .await
-                .expect("seed pending");
+            seed_pending(&mut rig.state, TARGET, &[11, 12, 13]).await;
 
             let responses = helper_responses(TARGET, VERSION, &[11, 12, 13], 3, b"payload");
 
@@ -1322,19 +1522,9 @@ mod recovery_ids_tests {
         run_async(async {
             let lf = LocalFixture::new(LOCAL);
             let mut rig = StoreRig::new();
-            rig.state
-                .save(
-                    LOCAL,
-                    StateItem::PendingRecovery {
-                        secret_id: TARGET,
-                        version: VERSION,
-                        shares: Vec::new(),
-                    },
-                )
-                .await
-                .expect("seed pending");
+            seed_pending(&mut rig.state, TARGET, &[11, 12]).await;
 
-            let payload = super::tests::encode_protect_wrapping(&super::tests::fixture_secret());
+            let payload = encode_protect_wrapping(&fixture_secret());
             let responses = helper_responses(TARGET, VERSION, &[11, 12], 2, &payload);
 
             on_response(&mut rig.stores(), &lf.local(), ChannelId(11), &responses[0])
@@ -1345,10 +1535,15 @@ mod recovery_ids_tests {
                 .expect("second share accepted");
 
             let recovered = match events.as_slice() {
-                [DeRecEvent::SecretRecovered { secret }] => secret.clone(),
+                [
+                    DeRecEvent::RecoveryShareReceived {
+                        shares_received: 2, ..
+                    },
+                    DeRecEvent::SecretRecovered { secret },
+                ] => secret.clone(),
                 other => panic!("expected SecretRecovered, got {other:?}"),
             };
-            assert_eq!(recovered, super::tests::fixture_secret());
+            assert_eq!(recovered, fixture_secret());
         });
     }
 
@@ -1357,19 +1552,9 @@ mod recovery_ids_tests {
         run_async(async {
             let lf = LocalFixture::new(LOCAL);
             let mut rig = StoreRig::new();
-            rig.state
-                .save(
-                    LOCAL,
-                    StateItem::PendingRecovery {
-                        secret_id: TARGET,
-                        version: VERSION,
-                        shares: Vec::new(),
-                    },
-                )
-                .await
-                .expect("seed pending");
+            seed_pending(&mut rig.state, TARGET, &[11, 12]).await;
 
-            let payload = super::tests::encode_protect_wrapping(&super::tests::fixture_secret());
+            let payload = encode_protect_wrapping(&fixture_secret());
             let responses = helper_responses(TARGET, VERSION, &[11, 12], 2, &payload);
 
             on_response(&mut rig.stores(), &lf.local(), ChannelId(11), &responses[0])
@@ -1413,19 +1598,8 @@ mod recovery_ids_tests {
             const TARGET_B: u64 = 0xB2;
 
             let mut rig = StoreRig::new();
-            for target in [TARGET_A, TARGET_B] {
-                rig.state
-                    .save(
-                        LOCAL,
-                        StateItem::PendingRecovery {
-                            secret_id: target,
-                            version: VERSION,
-                            shares: Vec::new(),
-                        },
-                    )
-                    .await
-                    .expect("seed pending");
-            }
+            seed_pending(&mut rig.state, TARGET_A, &[11, 12, 13]).await;
+            seed_pending(&mut rig.state, TARGET_B, &[21, 22, 23]).await;
 
             // Same version, different vaults — the accumulators must not
             // share a row, or shares from one recovery poison the other.
@@ -1492,19 +1666,9 @@ mod recovery_ids_tests {
         run_async(async {
             let lf = LocalFixture::new(LOCAL);
             let mut rig = StoreRig::new();
-            rig.state
-                .save(
-                    LOCAL,
-                    StateItem::PendingRecovery {
-                        secret_id: TARGET,
-                        version: VERSION,
-                        shares: Vec::new(),
-                    },
-                )
-                .await
-                .expect("seed pending");
+            seed_pending(&mut rig.state, TARGET, &[11, 12, 13]).await;
 
-            let payload = super::tests::encode_protect_wrapping(&super::tests::fixture_secret());
+            let payload = encode_protect_wrapping(&fixture_secret());
             let responses = helper_responses(TARGET, VERSION, &[12, 13], 2, &payload);
 
             let refused = on_response(
@@ -1552,8 +1716,11 @@ mod recovery_ids_tests {
                 .await
                 .expect("second share accepted");
             match second.as_slice() {
-                [DeRecEvent::SecretRecovered { secret }] => {
-                    assert_eq!(*secret, super::tests::fixture_secret())
+                [
+                    DeRecEvent::RecoveryShareReceived { .. },
+                    DeRecEvent::SecretRecovered { secret },
+                ] => {
+                    assert_eq!(*secret, fixture_secret())
                 }
                 other => panic!("expected SecretRecovered, got {other:?}"),
             }
@@ -1585,27 +1752,21 @@ mod recovery_ids_tests {
     /// of the secret is reported against the channel it arrived on and set
     /// aside, so it never blocks reconstruction from the honest shares.
     mod corrupted_shares {
+        use super::super::tests::{encode_protect_wrapping, fixture_secret};
         use super::*;
         use crate::protocol::CorruptionReason;
-        use derec_proto::{CommittedDeRecShare, DeRecShare};
+        use derec_proto::{CommittedDeRecShare, DeRecShare, ParameterRange};
+        use prost::encoding::bytes;
 
-        async fn seeded() -> (LocalFixture, StoreRig) {
-            seeded_with(LocalFixture::new(LOCAL)).await
+        /// An open recovery waiting on `channels`: it decides when the last
+        /// of them answers.
+        async fn seeded(channels: &[u64]) -> (LocalFixture, StoreRig) {
+            seeded_with(LocalFixture::new(LOCAL), channels).await
         }
 
-        async fn seeded_with(lf: LocalFixture) -> (LocalFixture, StoreRig) {
+        async fn seeded_with(lf: LocalFixture, channels: &[u64]) -> (LocalFixture, StoreRig) {
             let mut rig = StoreRig::new();
-            rig.state
-                .save(
-                    LOCAL,
-                    StateItem::PendingRecovery {
-                        secret_id: TARGET,
-                        version: VERSION,
-                        shares: Vec::new(),
-                    },
-                )
-                .await
-                .expect("seed pending");
+            seed_pending(&mut rig.state, TARGET, channels).await;
             (lf, rig)
         }
 
@@ -1615,7 +1776,7 @@ mod recovery_ids_tests {
         /// `CommittedDeRecShare::decode`.
         fn padded(response: &GetShareResponseMessage, extra_len: usize) -> GetShareResponseMessage {
             let mut bytes = response.committed_de_rec_share.clone();
-            prost::encoding::bytes::encode(9_999, &vec![0xAA_u8; extra_len], &mut bytes);
+            bytes::encode(9_999, &vec![0xAA_u8; extra_len], &mut bytes);
             GetShareResponseMessage {
                 committed_de_rec_share: bytes,
                 ..response.clone()
@@ -1623,7 +1784,7 @@ mod recovery_ids_tests {
         }
 
         fn secret_payload() -> Vec<u8> {
-            super::super::tests::encode_protect_wrapping(&super::super::tests::fixture_secret())
+            encode_protect_wrapping(&fixture_secret())
         }
 
         fn rewrite_share(
@@ -1682,7 +1843,7 @@ mod recovery_ids_tests {
         fn recovered(events: &[DeRecEvent]) -> bool {
             events.iter().any(|e| match e {
                 DeRecEvent::SecretRecovered { secret } => {
-                    assert_eq!(*secret, super::super::tests::fixture_secret());
+                    assert_eq!(*secret, fixture_secret());
                     true
                 }
                 _ => false,
@@ -1709,7 +1870,7 @@ mod recovery_ids_tests {
         #[test]
         fn a_tampered_share_arriving_first_is_reported_and_recovery_completes() {
             run_async(async {
-                let (lf, mut rig) = seeded().await;
+                let (lf, mut rig) = seeded(&[11, 12, 13]).await;
                 let good = helper_responses(TARGET, VERSION, &[11, 12, 13], 2, &secret_payload());
                 let bad = with_flipped_y(&good[0]);
 
@@ -1751,7 +1912,7 @@ mod recovery_ids_tests {
         fn a_tampered_share_at_any_position_before_completion_is_set_aside() {
             run_async(async {
                 for position in 0..3 {
-                    let (lf, mut rig) = seeded().await;
+                    let (lf, mut rig) = seeded(&[11, 12, 13, 14]).await;
                     let good =
                         helper_responses(TARGET, VERSION, &[11, 12, 13, 14], 3, &secret_payload());
                     let bad = with_flipped_y(&good[0]);
@@ -1787,7 +1948,7 @@ mod recovery_ids_tests {
         #[test]
         fn a_tampered_share_after_completion_is_dropped() {
             run_async(async {
-                let (lf, mut rig) = seeded().await;
+                let (lf, mut rig) = seeded(&[12, 13]).await;
                 let good = helper_responses(TARGET, VERSION, &[11, 12, 13], 2, &secret_payload());
 
                 deliver(&mut rig, &lf, 12, &good[1]).await;
@@ -1807,7 +1968,7 @@ mod recovery_ids_tests {
         #[test]
         fn a_tampered_share_below_threshold_is_reported_and_later_shares_complete() {
             run_async(async {
-                let (lf, mut rig) = seeded().await;
+                let (lf, mut rig) = seeded(&[11, 12, 13, 14]).await;
                 let good =
                     helper_responses(TARGET, VERSION, &[11, 12, 13, 14], 3, &secret_payload());
 
@@ -1837,16 +1998,17 @@ mod recovery_ids_tests {
 
         /// A share that verifies on its own but belongs to another split —
         /// another root and ciphertext, or the same root with an altered
-        /// ciphertext — is judged against the others: it is excluded from the
-        /// reconstruction and reported once, when the secret is recovered.
+        /// ciphertext — is excluded from the reconstruction. It is not
+        /// evidence against its Helper, so it disputes the secret rather than
+        /// being reported as corrupted.
         #[test]
-        fn a_self_consistent_share_from_another_split_is_reported_as_inconsistent() {
+        fn a_self_consistent_share_from_another_split_disputes_the_secret() {
             run_async(async {
                 let good = helper_responses(TARGET, VERSION, &[11, 12, 13], 2, &secret_payload());
                 let other_split =
                     helper_responses(TARGET, VERSION, &[11, 12, 13], 2, b"another round entirely");
                 for outlier in [other_split[0].clone(), with_flipped_ciphertext(&good[0])] {
-                    let (lf, mut rig) = seeded().await;
+                    let (lf, mut rig) = seeded(&[11, 12, 13]).await;
 
                     let first = deliver(&mut rig, &lf, 11, &outlier).await;
                     assert!(
@@ -1872,15 +2034,24 @@ mod recovery_ids_tests {
                     );
 
                     let third = deliver(&mut rig, &lf, 13, &good[2]).await;
-                    assert_eq!(
-                        corrupted(&third),
-                        vec![(ChannelId(11), CorruptionReason::Inconsistent)]
-                    );
-                    assert!(
-                        matches!(third.last(), Some(DeRecEvent::SecretRecovered { .. })),
-                        "got {third:?}"
-                    );
-                    assert!(recovered(&third));
+                    assert!(corrupted(&third).is_empty(), "got {third:?}");
+                    match third.last() {
+                        Some(DeRecEvent::RecoveryDisputed {
+                            version,
+                            secret,
+                            supported_by,
+                            disputed_by,
+                        }) => {
+                            assert_eq!(*version, VERSION);
+                            assert_eq!(*secret, fixture_secret());
+                            let ids = |hs: &[RecoveryHelper]| {
+                                hs.iter().map(|h| h.channel_id).collect::<Vec<_>>()
+                            };
+                            assert_eq!(ids(supported_by), vec![ChannelId(12), ChannelId(13)]);
+                            assert_eq!(ids(disputed_by), vec![ChannelId(11)]);
+                        }
+                        other => panic!("expected RecoveryDisputed, got {other:?}"),
+                    }
                 }
             });
         }
@@ -1890,7 +2061,7 @@ mod recovery_ids_tests {
         #[test]
         fn an_undecodable_share_is_reported_as_malformed() {
             run_async(async {
-                let (lf, mut rig) = seeded().await;
+                let (lf, mut rig) = seeded(&[11, 12, 13]).await;
                 let good = helper_responses(TARGET, VERSION, &[11, 12], 2, &secret_payload());
                 deliver(&mut rig, &lf, 12, &good[1]).await;
 
@@ -1918,12 +2089,15 @@ mod recovery_ids_tests {
                     .committed_de_rec_share
                     .len()
                     .max(good[1].committed_de_rec_share.len()) as i64;
-                let range = derec_proto::ParameterRange {
+                let range = ParameterRange {
                     max_share_size: max,
                     ..Default::default()
                 };
-                let (lf, mut rig) =
-                    seeded_with(LocalFixture::with_parameter_range(LOCAL, range)).await;
+                let (lf, mut rig) = seeded_with(
+                    LocalFixture::with_parameter_range(LOCAL, range),
+                    &[11, 12, 13],
+                )
+                .await;
                 let oversized = padded(&good[2], 256);
 
                 let first = deliver(&mut rig, &lf, 13, &oversized).await;
@@ -1959,7 +2133,7 @@ mod recovery_ids_tests {
         #[test]
         fn recovery_accepts_large_shares_without_a_limit() {
             run_async(async {
-                let (lf, mut rig) = seeded().await;
+                let (lf, mut rig) = seeded(&[11, 12]).await;
                 let good = helper_responses(TARGET, VERSION, &[11, 12], 2, &secret_payload());
                 let large = padded(&good[0], 64 * 1024);
 
@@ -1975,12 +2149,12 @@ mod recovery_ids_tests {
         #[test]
         fn recovery_accepts_large_shares_when_max_share_size_is_zero() {
             run_async(async {
-                let range = derec_proto::ParameterRange {
+                let range = ParameterRange {
                     max_share_size: 0,
                     ..Default::default()
                 };
                 let (lf, mut rig) =
-                    seeded_with(LocalFixture::with_parameter_range(LOCAL, range)).await;
+                    seeded_with(LocalFixture::with_parameter_range(LOCAL, range), &[11, 12]).await;
                 let good = helper_responses(TARGET, VERSION, &[11, 12], 2, &secret_payload());
                 let large = padded(&good[0], 64 * 1024);
 
@@ -1997,7 +2171,7 @@ mod recovery_ids_tests {
         #[test]
         fn a_repeated_answer_from_one_channel_counts_once() {
             run_async(async {
-                let (lf, mut rig) = seeded().await;
+                let (lf, mut rig) = seeded(&[11, 12, 13]).await;
                 let good = helper_responses(TARGET, VERSION, &[11, 12, 13], 3, &secret_payload());
 
                 deliver(&mut rig, &lf, 11, &good[0]).await;
@@ -2022,7 +2196,7 @@ mod recovery_ids_tests {
         #[test]
         fn one_share_arriving_on_two_channels_counts_once() {
             run_async(async {
-                let (lf, mut rig) = seeded().await;
+                let (lf, mut rig) = seeded(&[11, 12, 21]).await;
                 let good = helper_responses(TARGET, VERSION, &[11, 12], 2, &secret_payload());
 
                 deliver(&mut rig, &lf, 11, &good[0]).await;
@@ -2050,10 +2224,11 @@ mod recovery_ids_tests {
     /// waiting, and the exchange is not a failure of the helper's `process`.
     mod helper_without_the_share {
         use super::*;
+        use crate::derec_message::{DeRecMessageBuilder, extract_inner_message};
         use crate::protocol::tests::{InMemShareStore, InMemUserSecretStore};
-        use crate::protocol::{AutoAcceptPolicy, DeRecProtocolBuilder};
+        use crate::protocol::{AutoAcceptPolicy, DeRecProtocol, DeRecProtocolBuilder};
 
-        type TestProto = crate::protocol::DeRecProtocol<
+        type TestProto = DeRecProtocol<
             InMemChannelStore,
             InMemShareStore,
             InMemSecretStore,
@@ -2093,7 +2268,7 @@ mod recovery_ids_tests {
 
         fn request_envelope() -> Vec<u8> {
             let timestamp = current_timestamp();
-            crate::derec_message::DeRecMessageBuilder::channel()
+            DeRecMessageBuilder::channel()
                 .channel_id(ChannelId(OWNER_CHANNEL))
                 .timestamp(timestamp)
                 .message_body(MessageBody::GetShareRequest(GetShareRequestMessage {
@@ -2116,11 +2291,8 @@ mod recovery_ids_tests {
             let envelopes = transport.sent_envelopes();
             assert_eq!(envelopes.len(), 1, "exactly one answer must be sent");
             let msg = DeRecMessage::decode(envelopes[0].as_slice()).expect("envelope decodes");
-            match crate::derec_message::extract_inner_message(
-                &msg.message,
-                &crate::types::SharedKey::new([KEY_BYTE; 32]),
-            )
-            .expect("inner message decrypts")
+            match extract_inner_message(&msg.message, &SharedKey::new([KEY_BYTE; 32]))
+                .expect("inner message decrypts")
             {
                 MessageBody::GetShareResponse(r) => r,
                 other => panic!("expected GetShareResponse, got {other:?}"),
@@ -2198,10 +2370,11 @@ mod recovery_ids_tests {
 
     mod wiring {
         use super::*;
+        use crate::derec_message::DeRecMessageBuilder;
         use crate::protocol::tests::{InMemShareStore, InMemUserSecretStore};
-        use crate::protocol::{DeRecFlow, DeRecProtocolBuilder};
+        use crate::protocol::{DeRecFlow, DeRecProtocol, DeRecProtocolBuilder};
 
-        type TestProto = crate::protocol::DeRecProtocol<
+        type TestProto = DeRecProtocol<
             InMemChannelStore,
             InMemShareStore,
             InMemSecretStore,
@@ -2367,7 +2540,7 @@ mod recovery_ids_tests {
             key_byte: u8,
             response: &GetShareResponseMessage,
         ) -> Vec<u8> {
-            crate::derec_message::DeRecMessageBuilder::channel()
+            DeRecMessageBuilder::channel()
                 .channel_id(ChannelId(channel_id))
                 .timestamp(response.timestamp.expect("response timestamp"))
                 .message_body(MessageBody::GetShareResponse(response.clone()))
@@ -2477,26 +2650,28 @@ mod recovery_ids_tests {
     mod partition_holding_two_secrets {
         use super::*;
         use crate::protocol::Share;
+        use derec_proto::de_rec_share::Subshare;
+        use derec_proto::{CommittedDeRecShare, DeRecShare, StoreShareRequestMessage};
 
         /// A stored `StoreShareRequestMessage`, shaped the way `accept`
         /// re-decodes it: the requested secret id lives on the innermost
         /// `DeRecShare`, which is what `response::produce` checks against.
         fn stored_share(secret_id: u64, version: u32) -> Vec<u8> {
-            let share = derec_proto::DeRecShare {
+            let share = DeRecShare {
                 encrypted_secret: vec![0xAB; 4],
-                subshares: vec![derec_proto::de_rec_share::Subshare {
+                subshares: vec![Subshare {
                     x: vec![0x01],
                     y: vec![0x02],
                 }],
                 secret_id,
                 version,
             };
-            let committed = derec_proto::CommittedDeRecShare {
+            let committed = CommittedDeRecShare {
                 de_rec_share: share.encode_to_vec(),
                 commitment: vec![0xCD; 4],
                 merkle_path: Vec::new(),
             };
-            derec_proto::StoreShareRequestMessage {
+            StoreShareRequestMessage {
                 share: committed.encode_to_vec(),
                 secret_id,
                 version,
@@ -2593,7 +2768,10 @@ mod recovery_ids_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{HelperInfo, ReplicaInfo, Secret, UserSecret};
+    use crate::protocol::types::{
+        HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret,
+    };
+    use derec_proto::{DeRecSecret, Protocol, TransportProtocol};
     use prost::Message;
     use std::collections::HashMap;
 
@@ -2602,7 +2780,7 @@ mod tests {
     /// path. The protect side is the canonical source of this wrapping;
     /// `decode_recovered_secret` is its inverse.
     pub(super) fn encode_protect_wrapping(secret: &Secret) -> Vec<u8> {
-        let derec_secret = derec_proto::DeRecSecret {
+        let derec_secret = DeRecSecret {
             secret_data: secret.encode(),
             creation_time: None,
             helper_threshold_for_recovery: 2,
@@ -2616,9 +2794,9 @@ mod tests {
         Secret {
             helpers: vec![HelperInfo {
                 channel_id: 7,
-                transports: vec![derec_proto::TransportProtocol {
+                transports: vec![TransportProtocol {
                     uri: "https://helper.example".to_owned(),
-                    protocol: derec_proto::Protocol::Https as i32,
+                    protocol: Protocol::Https as i32,
                 }],
                 shared_key: vec![0xAA; 32],
                 communication_info: HashMap::from([("name".to_owned(), "Helper".to_owned())]),
@@ -2637,25 +2815,25 @@ mod tests {
                     data: b"hunter2".to_vec(),
                 },
             ],
-            replicas: Some(crate::protocol::types::Replicas {
+            replicas: Some(Replicas {
                 channel_id: 11,
                 members: vec![
                     ReplicaInfo {
                         replica_id: 0xBEEF,
-                        transports: vec![derec_proto::TransportProtocol {
+                        transports: vec![TransportProtocol {
                             uri: "https://owner.example".to_owned(),
-                            protocol: derec_proto::Protocol::Https as i32,
+                            protocol: Protocol::Https as i32,
                         }],
-                        role: crate::protocol::types::ReplicaRole::Source as i32,
+                        role: ReplicaRole::Source as i32,
                         communication_info: HashMap::new(),
                     },
                     ReplicaInfo {
                         replica_id: 0xCAFE,
-                        transports: vec![derec_proto::TransportProtocol {
+                        transports: vec![TransportProtocol {
                             uri: "https://replica.example".to_owned(),
-                            protocol: derec_proto::Protocol::Https as i32,
+                            protocol: Protocol::Https as i32,
                         }],
-                        role: crate::protocol::types::ReplicaRole::Destination as i32,
+                        role: ReplicaRole::Destination as i32,
                         communication_info: HashMap::new(),
                     },
                 ],
@@ -2693,7 +2871,7 @@ mod tests {
         let source = group
             .members
             .iter()
-            .find(|m| m.role == crate::protocol::types::ReplicaRole::Source as i32)
+            .find(|m| m.role == ReplicaRole::Source as i32)
             .expect("the roster names exactly one source");
         assert_eq!(source.replica_id, 0xBEEF);
     }
@@ -2702,7 +2880,7 @@ mod tests {
     /// secret decode rejects it. The protect side never produces this.
     #[test]
     fn decode_recovered_secret_rejects_empty_inner_secret() {
-        let wrapped = derec_proto::DeRecSecret {
+        let wrapped = DeRecSecret {
             secret_data: Vec::new(),
             creation_time: None,
             helper_threshold_for_recovery: 1,
@@ -2731,7 +2909,7 @@ mod tests {
     #[test]
     fn decode_recovered_secret_rejects_non_gzip_inner() {
         // Valid outer DeRecSecret, but secret_data is not a gzip stream.
-        let wrapped = derec_proto::DeRecSecret {
+        let wrapped = DeRecSecret {
             secret_data: vec![0x01, 0x02, 0x03, 0x04],
             creation_time: None,
             helper_threshold_for_recovery: 1,
@@ -2748,7 +2926,7 @@ mod tests {
 
     #[test]
     fn decode_recovered_secret_rejects_unknown_version() {
-        let wrapped = derec_proto::DeRecSecret {
+        let wrapped = DeRecSecret {
             secret_data: vec![0xFF, 0x00],
             creation_time: None,
             helper_threshold_for_recovery: 1,
@@ -2765,9 +2943,13 @@ mod tests {
 
 #[cfg(test)]
 mod share_judging_tests {
+    use super::tests::{encode_protect_wrapping, fixture_secret};
     use super::*;
     use crate::primitives::sharing::request::{SplitResult, split as sharing_split};
-    use derec_proto::{CommittedDeRecShare, DeRecShare};
+    use crate::protocol::tests::pre_0_0_9_derec_share;
+    use crate::protocol::types::Secret;
+    use derec_proto::{CommittedDeRecShare, DeRecShare, committed_de_rec_share::SiblingHash};
+    use sha2::{Digest, Sha256};
 
     const SECRET_ID: u64 = 9;
     const VERSION: u32 = 2;
@@ -2825,11 +3007,11 @@ mod share_judging_tests {
         };
         assert!(matches!(
             inspect(SECRET_ID, VERSION, &garbage),
-            Err(ShareFault::Malformed(_))
+            Err(ShareFault::Malformed)
         ));
         assert!(matches!(
             inspect(SECRET_ID, VERSION + 1, &good[0]),
-            Err(ShareFault::Malformed(_))
+            Err(ShareFault::Malformed)
         ));
         let no_result = GetShareResponseMessage {
             result: None,
@@ -2837,7 +3019,7 @@ mod share_judging_tests {
         };
         assert!(matches!(
             inspect(SECRET_ID, VERSION, &no_result),
-            Err(ShareFault::Malformed(_))
+            Err(ShareFault::Malformed)
         ));
     }
 
@@ -2846,75 +3028,405 @@ mod share_judging_tests {
         let good = responses(b"payload", 2, 3);
         let mut committed =
             CommittedDeRecShare::decode(good[0].committed_de_rec_share.as_slice()).unwrap();
-        committed.de_rec_share = crate::protocol::tests::pre_0_0_9_derec_share(SECRET_ID, VERSION);
+        committed.de_rec_share = pre_0_0_9_derec_share(SECRET_ID, VERSION);
         let old = GetShareResponseMessage {
             committed_de_rec_share: committed.encode_to_vec(),
             ..good[0].clone()
         };
         assert!(matches!(
             inspect(SECRET_ID, VERSION, &old),
-            Err(ShareFault::Malformed(_))
+            Err(ShareFault::Malformed)
         ));
     }
 
-    #[test]
-    fn recover_consistent_reconstructs_from_the_group_that_completes_and_names_the_rest() {
-        let good = responses(b"the real secret", 2, 3);
-        let other = responses(b"another split", 2, 3);
-        let set = [&other[0], &good[0], &good[1]];
-
-        let result = recover_consistent(SECRET_ID, VERSION, &set).expect("good pair completes");
-        assert_eq!(result.secret_data, b"the real secret");
-        assert_eq!(result.outliers, vec![0]);
+    /// A recoverable vault naming `name` as its only user secret and declaring
+    /// `threshold`.
+    fn vault(name: &str, threshold: Option<u32>) -> Secret {
+        let mut secret = fixture_secret();
+        secret.secrets.truncate(1);
+        secret.secrets[0].name = name.to_owned();
+        secret.threshold = threshold;
+        secret
     }
 
-    #[test]
-    fn recover_consistent_waits_while_no_group_completes() {
-        let good = responses(b"the real secret", 3, 4);
-        let other = responses(b"another split", 2, 3);
-        let set = [&other[0], &good[0], &good[1]];
+    fn vault_bytes(name: &str, threshold: Option<u32>) -> Vec<u8> {
+        encode_protect_wrapping(&vault(name, threshold))
+    }
 
-        let err = recover_consistent(SECRET_ID, VERSION, &set)
-            .err()
-            .expect("no group completes");
-        assert!(matches!(
-            err,
-            Error::Recovery(RecoveryError::ReconstructionFailed {
-                source: derec_cryptography::vss::DerecVSSError::InsufficientShares
+    fn names(set: &CandidateSet) -> Vec<&str> {
+        set.candidates
+            .iter()
+            .map(|c| c.secret.secrets[0].name.as_str())
+            .collect()
+    }
+
+    fn members(set: &CandidateSet) -> Vec<Vec<usize>> {
+        set.candidates.iter().map(|c| c.members.clone()).collect()
+    }
+
+    fn collected(responses: &[&GetShareResponseMessage]) -> Vec<CollectedShare> {
+        responses
+            .iter()
+            .enumerate()
+            .map(|(i, r)| CollectedShare {
+                channel_id: ChannelId(100 + i as u64),
+                response: (*r).clone(),
             })
+            .collect()
+    }
+
+    /// The share a single malicious helper builds: every subshare of its own
+    /// threshold-2 split of `payload` in one share, under a Merkle root of its
+    /// own whose path opens from that one leaf.
+    fn forged_single_share(payload: &[u8]) -> GetShareResponseMessage {
+        let parts = responses(payload, 2, 2);
+        let decode = |r: &GetShareResponseMessage| {
+            let committed =
+                CommittedDeRecShare::decode(r.committed_de_rec_share.as_slice()).unwrap();
+            let share = DeRecShare::decode(committed.de_rec_share.as_slice()).unwrap();
+            (committed, share)
+        };
+        let (mut committed, mut share) = decode(&parts[0]);
+        let (_, other) = decode(&parts[1]);
+        share.subshares.extend(other.subshares);
+
+        let mut leaf = vec![0x00];
+        leaf.extend_from_slice(&(share.subshares.len() as u64).to_be_bytes());
+        for subshare in &share.subshares {
+            leaf.extend_from_slice(&(subshare.x.len() as u64).to_be_bytes());
+            leaf.extend_from_slice(&subshare.x);
+            leaf.extend_from_slice(&(subshare.y.len() as u64).to_be_bytes());
+            leaf.extend_from_slice(&subshare.y);
+        }
+        let mut root = Sha256::digest(&leaf).to_vec();
+        let depth = committed.merkle_path.len();
+        committed.merkle_path = (0..depth)
+            .map(|level| {
+                let sibling = vec![level as u8; 32];
+                let mut node = vec![0x02];
+                node.extend_from_slice(&root);
+                node.extend_from_slice(&sibling);
+                root = Sha256::digest(&node).to_vec();
+                SiblingHash {
+                    is_left: false,
+                    hash: sibling,
+                }
+            })
+            .collect();
+        committed.commitment = root;
+        committed.de_rec_share = share.encode_to_vec();
+
+        let forged = GetShareResponseMessage {
+            committed_de_rec_share: committed.encode_to_vec(),
+            ..parts[0].clone()
+        };
+        assert!(
+            inspect(SECRET_ID, VERSION, &forged).is_ok(),
+            "the forged share must pass every per-share check"
+        );
+        forged
+    }
+
+    fn assert_none(set: CandidateSet) {
+        assert!(
+            set.candidates.is_empty(),
+            "no group may reconstruct: {:?}",
+            names(&set)
+        );
+    }
+
+    #[test]
+    fn candidates_reconstruct_the_group_that_completes_and_leave_the_rest_out() {
+        let good = responses(&vault_bytes("real", Some(2)), 2, 3);
+        let other = responses(&vault_bytes("other", Some(2)), 2, 3);
+        let set = candidates(SECRET_ID, VERSION, &[&other[0], &good[0], &good[1]]);
+        assert_eq!(names(&set), vec!["real"]);
+        assert_eq!(members(&set), vec![vec![1, 2]]);
+        assert!(set.faults.is_empty());
+    }
+
+    #[test]
+    fn candidates_never_come_from_one_forged_share() {
+        let forged = forged_single_share(&vault_bytes("forged", Some(2)));
+        let set = candidates(SECRET_ID, VERSION, &[&forged]);
+        assert_eq!(set.forged, vec![0]);
+        assert_none(set);
+    }
+
+    #[test]
+    fn candidates_ignore_a_forged_share_among_honest_ones_below_threshold() {
+        let honest = responses(&vault_bytes("real", Some(3)), 3, 4);
+        let forged = forged_single_share(&vault_bytes("forged", Some(2)));
+
+        assert_none(candidates(
+            SECRET_ID,
+            VERSION,
+            &[&honest[0], &forged, &honest[1]],
+        ));
+
+        let set = candidates(
+            SECRET_ID,
+            VERSION,
+            &[&honest[0], &forged, &honest[1], &honest[2]],
+        );
+        assert_eq!(names(&set), vec!["real"]);
+        assert_eq!(members(&set), vec![vec![0, 2, 3]]);
+        assert_eq!(set.forged, vec![1]);
+    }
+
+    /// Two colluding helpers can still forge a complete split. Every group is
+    /// tried, so the honest secret is found beside it rather than hidden by
+    /// whichever reconstructs first.
+    #[test]
+    fn candidates_include_every_group_that_reconstructs() {
+        let honest = responses(&vault_bytes("real", Some(2)), 2, 3);
+        let forged = responses(&vault_bytes("forged", Some(2)), 2, 2);
+        let set = candidates(
+            SECRET_ID,
+            VERSION,
+            &[&forged[0], &honest[0], &forged[1], &honest[1], &honest[2]],
+        );
+        assert_eq!(names(&set), vec!["real", "forged"]);
+        assert_eq!(members(&set), vec![vec![1, 3, 4], vec![0, 2]]);
+    }
+
+    #[test]
+    fn candidates_mark_a_group_that_does_not_fit_its_declared_threshold_forged() {
+        let lying = responses(&vault_bytes("lying", Some(3)), 2, 2);
+        let set = candidates(SECRET_ID, VERSION, &[&lying[0], &lying[1]]);
+        assert_eq!(set.forged, vec![0, 1]);
+        assert_none(set);
+    }
+
+    #[test]
+    fn candidates_accept_a_secret_that_records_no_threshold() {
+        let good = responses(&vault_bytes("legacy", None), 2, 2);
+        let set = candidates(SECRET_ID, VERSION, &[&good[0], &good[1]]);
+        assert_eq!(names(&set), vec!["legacy"]);
+    }
+
+    #[test]
+    fn candidates_mark_a_group_that_decrypts_to_undecodable_bytes_forged() {
+        let garbage = responses(b"not a vault", 2, 2);
+        let set = candidates(SECRET_ID, VERSION, &[&garbage[0], &garbage[1]]);
+        assert_eq!(set.forged, vec![0, 1]);
+        assert_none(set);
+    }
+
+    #[test]
+    fn candidates_are_empty_while_no_group_completes() {
+        let good = responses(&vault_bytes("real", Some(3)), 3, 4);
+        let other = responses(&vault_bytes("other", Some(2)), 2, 3);
+        assert_none(candidates(
+            SECRET_ID,
+            VERSION,
+            &[&other[0], &good[0], &good[1]],
         ));
     }
 
     #[test]
-    fn recover_consistent_never_reconstructs_from_a_single_share() {
-        let good = responses(b"the real secret", 2, 3);
-        let err = recover_consistent(SECRET_ID, VERSION, &[&good[0]])
-            .err()
-            .expect("one share is never a complete set");
-        assert!(matches!(
-            err,
-            Error::Recovery(RecoveryError::ReconstructionFailed {
-                source: derec_cryptography::vss::DerecVSSError::InsufficientShares
-            })
-        ));
+    fn candidates_never_come_from_a_single_share() {
+        let good = responses(&vault_bytes("real", Some(2)), 2, 3);
+        assert_none(candidates(SECRET_ID, VERSION, &[&good[0]]));
     }
 
     #[test]
-    fn recover_consistent_counts_a_repeated_share_once() {
-        let good = responses(b"the real secret", 2, 3);
-        let err = recover_consistent(SECRET_ID, VERSION, &[&good[0], &good[0]])
-            .err()
-            .expect("one subshare twice is still one subshare");
-        assert!(matches!(
-            err,
-            Error::Recovery(RecoveryError::ReconstructionFailed {
-                source: derec_cryptography::vss::DerecVSSError::InsufficientShares
-            })
-        ));
+    fn candidates_count_a_repeated_share_once() {
+        let good = responses(&vault_bytes("real", Some(2)), 2, 3);
+        assert_none(candidates(SECRET_ID, VERSION, &[&good[0], &good[0]]));
 
-        let result = recover_consistent(SECRET_ID, VERSION, &[&good[0], &good[0], &good[1]])
-            .expect("two distinct subshares complete a threshold-2 split");
-        assert_eq!(result.secret_data, b"the real secret");
-        assert!(result.outliers.is_empty());
+        let set = candidates(SECRET_ID, VERSION, &[&good[0], &good[0], &good[1]]);
+        assert_eq!(names(&set), vec!["real"]);
+        assert_eq!(members(&set), vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn candidates_report_a_stored_share_that_no_longer_inspects() {
+        let good = responses(&vault_bytes("real", Some(2)), 2, 3);
+        let garbage = GetShareResponseMessage {
+            committed_de_rec_share: vec![0xFF; 8],
+            ..good[0].clone()
+        };
+        let set = candidates(SECRET_ID, VERSION, &[&garbage, &good[1], &good[2]]);
+        assert_eq!(names(&set), vec!["real"]);
+        assert_eq!(set.faults, vec![(0, CorruptionReason::Malformed)]);
+    }
+
+    /// What `describe_helpers` would return for channels `100..100 + n`.
+    fn named(n: usize) -> HashMap<ChannelId, HashMap<String, String>> {
+        (0..n)
+            .map(|i| {
+                (
+                    ChannelId(100 + i as u64),
+                    HashMap::from([("name".to_owned(), format!("helper-{i}"))]),
+                )
+            })
+            .collect()
+    }
+
+    fn names_of(helpers: &[RecoveryHelper]) -> Vec<&str> {
+        helpers
+            .iter()
+            .map(|h| h.communication_info["name"].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn settle_recovers_when_every_share_is_part_of_the_secret() {
+        let good = responses(&vault_bytes("real", Some(2)), 2, 3);
+        let shares = collected(&[&good[0], &good[1], &good[2]]);
+
+        match settle(SECRET_ID, VERSION, &shares, &named(3)).as_slice() {
+            [DeRecEvent::SecretRecovered { secret }] => {
+                assert_eq!(secret.secrets[0].name, "real")
+            }
+            other => panic!("expected SecretRecovered, got {other:?}"),
+        }
+    }
+
+    /// Three colluding Helpers forge a complete split; the two honest ones
+    /// are too few to reconstruct theirs. Size says nothing about which side
+    /// is the owner's, so the secret is reported as disputed, naming both
+    /// sides, and no Helper is reported as corrupted.
+    #[test]
+    fn settle_reports_a_secret_disputed_by_a_split_that_cannot_reconstruct() {
+        let forged = responses(&vault_bytes("forged", Some(3)), 3, 3);
+        let honest = responses(&vault_bytes("real", Some(3)), 3, 5);
+        let shares = collected(&[&forged[0], &honest[0], &forged[1], &honest[1], &forged[2]]);
+
+        match settle(SECRET_ID, VERSION, &shares, &named(5)).as_slice() {
+            [
+                DeRecEvent::RecoveryDisputed {
+                    version: VERSION,
+                    secret,
+                    supported_by,
+                    disputed_by,
+                },
+            ] => {
+                assert_eq!(secret.secrets[0].name, "forged");
+                assert_eq!(
+                    names_of(supported_by),
+                    vec!["helper-0", "helper-2", "helper-4"]
+                );
+                assert_eq!(names_of(disputed_by), vec!["helper-1", "helper-3"]);
+            }
+            other => panic!("expected RecoveryDisputed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settle_raises_a_conflict_when_two_secrets_reconstruct() {
+        let honest = responses(&vault_bytes("real", Some(2)), 2, 3);
+        let forged = responses(&vault_bytes("forged", Some(2)), 2, 2);
+        let other = responses(&vault_bytes("other", Some(3)), 3, 3);
+        let shares = collected(&[&forged[0], &honest[0], &forged[1], &honest[1], &other[0]]);
+
+        match settle(SECRET_ID, VERSION, &shares, &named(5)).as_slice() {
+            [
+                DeRecEvent::RecoveryConflict {
+                    version: VERSION,
+                    candidates,
+                    disputed_by,
+                },
+            ] => {
+                let got: Vec<(&str, Vec<&str>)> = candidates
+                    .iter()
+                    .map(|c| (c.secret.secrets[0].name.as_str(), names_of(&c.supported_by)))
+                    .collect();
+                assert_eq!(
+                    got,
+                    vec![
+                        ("forged", vec!["helper-0", "helper-2"]),
+                        ("real", vec!["helper-1", "helper-3"]),
+                    ]
+                );
+                assert_eq!(names_of(disputed_by), vec!["helper-4"]);
+            }
+            other => panic!("expected RecoveryConflict, got {other:?}"),
+        }
+    }
+
+    /// One share that reconstructs on its own holds the whole split, which
+    /// no honest Helper's weight allows: provably forged.
+    #[test]
+    fn settle_reports_a_single_share_that_reconstructs_alone_as_forged() {
+        let good = responses(&vault_bytes("real", Some(2)), 2, 2);
+        let forged = forged_single_share(&vault_bytes("forged", Some(2)));
+        let shares = collected(&[&forged, &good[0], &good[1]]);
+
+        match settle(SECRET_ID, VERSION, &shares, &named(3)).as_slice() {
+            [
+                DeRecEvent::RecoveryShareCorrupted {
+                    channel_id,
+                    version: VERSION,
+                    reason: CorruptionReason::Forged,
+                },
+                DeRecEvent::SecretRecovered { secret },
+            ] => {
+                assert_eq!(*channel_id, ChannelId(100));
+                assert_eq!(secret.secrets[0].name, "real");
+            }
+            other => panic!("expected Forged then SecretRecovered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settle_reports_a_group_that_reconstructs_no_secret_as_forged() {
+        for bogus in [
+            responses(b"not a vault", 2, 2),
+            responses(&vault_bytes("lying", Some(3)), 2, 2),
+        ] {
+            let good = responses(&vault_bytes("real", Some(2)), 2, 2);
+            let shares = collected(&[&bogus[0], &good[0], &bogus[1], &good[1]]);
+
+            let events = settle(SECRET_ID, VERSION, &shares, &named(4));
+            let forged: Vec<ChannelId> = events
+                .iter()
+                .filter_map(|e| match e {
+                    DeRecEvent::RecoveryShareCorrupted {
+                        channel_id,
+                        reason: CorruptionReason::Forged,
+                        ..
+                    } => Some(*channel_id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(forged, vec![ChannelId(100), ChannelId(102)]);
+            assert!(
+                matches!(events.last(), Some(DeRecEvent::SecretRecovered { .. })),
+                "a forged group does not dispute the honest secret: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn settle_closes_incomplete_when_nothing_reconstructs() {
+        let good = responses(&vault_bytes("real", Some(3)), 3, 4);
+        let shares = collected(&[&good[0], &good[1]]);
+
+        let events = settle(SECRET_ID, VERSION, &shares, &named(2));
+        assert!(
+            matches!(
+                events.as_slice(),
+                [DeRecEvent::RecoveryIncomplete {
+                    secret_id: SECRET_ID,
+                    version: VERSION,
+                    shares_received: 2,
+                }]
+            ),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn settle_with_no_shares_is_incomplete() {
+        assert!(matches!(
+            settle(SECRET_ID, VERSION, &[], &HashMap::new()).as_slice(),
+            [DeRecEvent::RecoveryIncomplete {
+                secret_id: SECRET_ID,
+                version: VERSION,
+                shares_received: 0,
+            }]
+        ));
     }
 }

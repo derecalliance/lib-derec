@@ -33,7 +33,13 @@
 //! afterwards, because a host whose numbers are doubles cannot represent an
 //! id above 2^53 exactly.
 
+use derec_proto::{
+    committed_de_rec_share, get_secret_ids_versions_response_message,
+    get_secret_ids_versions_response_message::version_list,
+};
 use serde::{Deserialize, Serialize};
+
+use crate::primitives::discovery::response;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Timestamp {
@@ -472,12 +478,8 @@ pub struct VersionListEntry {
     pub version_description: String,
 }
 
-impl From<derec_proto::get_secret_ids_versions_response_message::version_list::VersionEntry>
-    for VersionListEntry
-{
-    fn from(
-        value: derec_proto::get_secret_ids_versions_response_message::version_list::VersionEntry,
-    ) -> Self {
+impl From<version_list::VersionEntry> for VersionListEntry {
+    fn from(value: version_list::VersionEntry) -> Self {
         Self {
             version: value.version,
             version_description: value.version_description,
@@ -485,9 +487,7 @@ impl From<derec_proto::get_secret_ids_versions_response_message::version_list::V
     }
 }
 
-impl From<VersionListEntry>
-    for derec_proto::get_secret_ids_versions_response_message::version_list::VersionEntry
-{
+impl From<VersionListEntry> for version_list::VersionEntry {
     fn from(value: VersionListEntry) -> Self {
         Self {
             version: value.version,
@@ -502,8 +502,8 @@ pub struct VersionList {
     pub versions: Vec<VersionListEntry>,
 }
 
-impl From<derec_proto::get_secret_ids_versions_response_message::VersionList> for VersionList {
-    fn from(value: derec_proto::get_secret_ids_versions_response_message::VersionList) -> Self {
+impl From<get_secret_ids_versions_response_message::VersionList> for VersionList {
+    fn from(value: get_secret_ids_versions_response_message::VersionList) -> Self {
         Self {
             secret_id: value.secret_id,
             versions: value.versions.into_iter().map(Into::into).collect(),
@@ -511,7 +511,7 @@ impl From<derec_proto::get_secret_ids_versions_response_message::VersionList> fo
     }
 }
 
-impl From<VersionList> for derec_proto::get_secret_ids_versions_response_message::VersionList {
+impl From<VersionList> for get_secret_ids_versions_response_message::VersionList {
     fn from(value: VersionList) -> Self {
         Self {
             secret_id: value.secret_id,
@@ -608,8 +608,8 @@ pub struct VersionEntry {
     pub description: String,
 }
 
-impl From<crate::primitives::discovery::response::VersionEntry> for VersionEntry {
-    fn from(value: crate::primitives::discovery::response::VersionEntry) -> Self {
+impl From<response::VersionEntry> for VersionEntry {
+    fn from(value: response::VersionEntry) -> Self {
         Self {
             version: value.version,
             description: value.description,
@@ -617,7 +617,7 @@ impl From<crate::primitives::discovery::response::VersionEntry> for VersionEntry
     }
 }
 
-impl From<VersionEntry> for crate::primitives::discovery::response::VersionEntry {
+impl From<VersionEntry> for response::VersionEntry {
     fn from(value: VersionEntry) -> Self {
         Self {
             version: value.version,
@@ -634,8 +634,8 @@ pub struct SecretVersionEntry {
     pub versions: Vec<VersionEntry>,
 }
 
-impl From<crate::primitives::discovery::response::SecretVersionEntry> for SecretVersionEntry {
-    fn from(value: crate::primitives::discovery::response::SecretVersionEntry) -> Self {
+impl From<response::SecretVersionEntry> for SecretVersionEntry {
+    fn from(value: response::SecretVersionEntry) -> Self {
         Self {
             secret_id: value.secret_id,
             versions: value.versions.into_iter().map(Into::into).collect(),
@@ -643,7 +643,7 @@ impl From<crate::primitives::discovery::response::SecretVersionEntry> for Secret
     }
 }
 
-impl From<SecretVersionEntry> for crate::primitives::discovery::response::SecretVersionEntry {
+impl From<SecretVersionEntry> for response::SecretVersionEntry {
     fn from(value: SecretVersionEntry) -> Self {
         Self {
             secret_id: value.secret_id,
@@ -659,8 +659,8 @@ pub struct SiblingHash {
     pub hash: Vec<u8>,
 }
 
-impl From<derec_proto::committed_de_rec_share::SiblingHash> for SiblingHash {
-    fn from(value: derec_proto::committed_de_rec_share::SiblingHash) -> Self {
+impl From<committed_de_rec_share::SiblingHash> for SiblingHash {
+    fn from(value: committed_de_rec_share::SiblingHash) -> Self {
         Self {
             is_left: value.is_left,
             hash: value.hash,
@@ -668,7 +668,7 @@ impl From<derec_proto::committed_de_rec_share::SiblingHash> for SiblingHash {
     }
 }
 
-impl From<SiblingHash> for derec_proto::committed_de_rec_share::SiblingHash {
+impl From<SiblingHash> for committed_de_rec_share::SiblingHash {
     fn from(value: SiblingHash) -> Self {
         Self {
             is_left: value.is_left,

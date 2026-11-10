@@ -69,6 +69,8 @@ fn build(
             sharing_round: std::time::Duration::from_secs(timeout_in_secs),
             unpair_ack: std::time::Duration::from_secs(timeout_in_secs),
             inbound_message: std::time::Duration::from_secs(timeout_in_secs),
+            get_share_response: std::time::Duration::from_secs(timeout_in_secs),
+            pairing: std::time::Duration::from_secs(timeout_in_secs),
             expired_channels: policy,
         })
         .build()
@@ -666,5 +668,30 @@ fn a_failed_key_removal_keeps_the_record_for_the_next_sweep() {
         assert!(protocol.remove_expired_channels(300).await.is_err());
         assert_eq!(channels.helper_rows.lock().unwrap().len(), 1);
         assert!(has_key(&secrets.0, 1));
+    });
+}
+
+/// A pending pairing recorded on the group channel expires without taking
+/// the group key: the channel is still in use by the group.
+#[test]
+fn an_expired_pairing_on_the_group_channel_leaves_the_group_key() {
+    run_async(async {
+        let (channels, secrets) = (InMemChannelStore::default(), InMemSecretStore::default());
+        let (mut c, mut s) = (channels.clone(), secrets.clone());
+        seed_member_on(&mut c, 9000, 9, ChannelStatus::Paired, 600).await;
+        seed_member_on(&mut c, 9000, 8, ChannelStatus::Paired, 600).await;
+        seed(&mut c, 9000, ChannelStatus::Pending, 600).await;
+        seed_key(&mut s, 9000).await;
+
+        let mut protocol = build_with_secrets(channels.clone(), secrets.clone());
+        protocol.replica_id = Some(9);
+        protocol
+            .remove_expired_channels(60)
+            .await
+            .expect("sweep succeeds");
+
+        assert!(channels.helper_rows.lock().unwrap().is_empty());
+        assert_eq!(channels.member_rows.lock().unwrap().len(), 2);
+        assert!(has_key(&secrets, 9000), "the group key survives the sweep");
     });
 }

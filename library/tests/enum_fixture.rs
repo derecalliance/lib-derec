@@ -19,16 +19,18 @@
 //! the fixture is what then makes the SDK tests fail until each SDK is updated.
 
 use std::collections::BTreeSet;
+use std::fs;
 
 use derec_library::protocol::events::{
     CorruptionReason, IgnoreReason, NotRestoredReason, PendingActionKind, VerifyFailureReason,
 };
 use derec_library::protocol::types::{ChannelStatus, ReplicaRole, SecretKind, StateKind};
+use derec_proto::{ContactMode, SenderKind, StatusEnum};
 
 /// Names the fixture records for one enum, in wire encoding.
 fn fixture_names(enum_name: &str) -> BTreeSet<String> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/enums.json");
-    let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+    let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
     let doc: serde_json::Value =
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parsing {path}: {e}"));
     doc["enums"][enum_name]["variants"]
@@ -171,6 +173,7 @@ fn ignore_reason_fixture_is_complete() {
         IgnoreReason::Expired,
         IgnoreReason::TimestampMismatch,
         IgnoreReason::StaleResponse,
+        IgnoreReason::Superseded,
         IgnoreReason::KeyUnavailable,
     ];
     let names: Vec<&str> = all
@@ -180,6 +183,7 @@ fn ignore_reason_fixture_is_complete() {
             IgnoreReason::Expired => "Expired",
             IgnoreReason::TimestampMismatch => "TimestampMismatch",
             IgnoreReason::StaleResponse => "StaleResponse",
+            IgnoreReason::Superseded => "Superseded",
             IgnoreReason::KeyUnavailable => "KeyUnavailable",
         })
         .collect();
@@ -221,14 +225,14 @@ fn corruption_reason_fixture_is_complete() {
     let all = [
         CorruptionReason::Malformed,
         CorruptionReason::InvalidProof,
-        CorruptionReason::Inconsistent,
+        CorruptionReason::Forged,
     ];
     let names: Vec<&str> = all
         .iter()
         .map(|r| match r {
             CorruptionReason::Malformed => "Malformed",
             CorruptionReason::InvalidProof => "InvalidProof",
-            CorruptionReason::Inconsistent => "Inconsistent",
+            CorruptionReason::Forged => "Forged",
         })
         .collect();
     assert_matches_fixture("CorruptionReason", &names);
@@ -236,8 +240,6 @@ fn corruption_reason_fixture_is_complete() {
 
 #[test]
 fn protobuf_enum_fixtures_are_complete() {
-    use derec_proto::{ContactMode, SenderKind, StatusEnum};
-
     let sender: Vec<&str> = [
         SenderKind::Owner,
         SenderKind::Helper,
@@ -315,7 +317,7 @@ fn protobuf_enum_fixtures_are_complete() {
 fn numeric_discriminants_match_the_fixture() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/enums.json");
     let doc: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(path).expect("read fixture"))
+        serde_json::from_str(&fs::read_to_string(path).expect("read fixture"))
             .expect("parse fixture");
 
     let wire = |enum_name: &str, variant: &str| -> i64 {
@@ -356,15 +358,12 @@ fn numeric_discriminants_match_the_fixture() {
     }
     assert_eq!(
         wire("SenderKind", "ReplicaDestination"),
-        derec_proto::SenderKind::ReplicaDestination as i64
+        SenderKind::ReplicaDestination as i64
     );
-    assert_eq!(
-        wire("ContactMode", "NoKeys"),
-        derec_proto::ContactMode::NoKeys as i64
-    );
+    assert_eq!(wire("ContactMode", "NoKeys"), ContactMode::NoKeys as i64);
     assert_eq!(
         wire("StatusEnum", "ReplicaIdConflict"),
-        derec_proto::StatusEnum::ReplicaIdConflict as i64
+        StatusEnum::ReplicaIdConflict as i64
     );
 }
 
@@ -377,14 +376,14 @@ fn numeric_discriminants_match_the_fixture() {
 fn typescript_declarations_cover_the_fixture() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
     let fixture: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(format!("{root}/library/tests/fixtures/enums.json"))
+        &fs::read_to_string(format!("{root}/library/tests/fixtures/enums.json"))
             .expect("read fixture"),
     )
     .expect("parse fixture");
 
     for pkg in ["nodejs", "web"] {
         let path = format!("{root}/packages/{pkg}/index.d.ts");
-        let dts = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        let dts = fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
 
         // Event tags are the discriminants of the DeRecEvent union. A tag the
         // core emits but the union omits leaves callers unable to name it.
@@ -408,8 +407,7 @@ fn typescript_declarations_cover_the_fixture() {
         // and two `FlowKind` members were declared in the `.d.ts` but absent
         // here, so TypeScript accepted them and they evaluated to `undefined`.
         let js_path = format!("{root}/packages/{pkg}/index.js");
-        let js =
-            std::fs::read_to_string(&js_path).unwrap_or_else(|e| panic!("reading {js_path}: {e}"));
+        let js = fs::read_to_string(&js_path).unwrap_or_else(|e| panic!("reading {js_path}: {e}"));
         for (enum_name, js_object) in [
             ("ContactMode", "ContactMode"),
             ("FlowKind", "FlowKind"),
@@ -472,7 +470,7 @@ fn typescript_declarations_cover_the_fixture() {
 fn every_typescript_surface_names_every_event_and_reason() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
     let fixture: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(format!("{root}/library/tests/fixtures/enums.json"))
+        &fs::read_to_string(format!("{root}/library/tests/fixtures/enums.json"))
             .expect("read fixture"),
     )
     .expect("parse fixture");
@@ -491,8 +489,7 @@ fn every_typescript_surface_names_every_event_and_reason() {
         "packages/react-native/src/types.ts",
     ] {
         let path = format!("{root}/{surface}");
-        let source =
-            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
 
         let mut missing: Vec<String> = wires("DeRecEvent")
             .into_iter()
@@ -571,7 +568,7 @@ fn quoted_literals_between(source: &str, start: &str, end: &str) -> BTreeSet<Str
 fn derec_error_code_union_covers_fixture_and_wasm_extras() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
     let fixture: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(format!("{root}/library/tests/fixtures/enums.json"))
+        &fs::read_to_string(format!("{root}/library/tests/fixtures/enums.json"))
             .expect("read fixture"),
     )
     .expect("parse fixture");
@@ -634,7 +631,7 @@ fn derec_error_code_union_covers_fixture_and_wasm_extras() {
 
     for pkg in ["nodejs", "web"] {
         let path = format!("{root}/packages/{pkg}/index.d.ts");
-        let dts = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        let dts = fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
         let declared = quoted_literals_between(&dts, "export type DeRecErrorCode =", ";");
         let expected: BTreeSet<String> = fixture_codes.union(&wasm_only).cloned().collect();
         assert_eq!(
@@ -645,7 +642,7 @@ fn derec_error_code_union_covers_fixture_and_wasm_extras() {
 
     let rn_path = format!("{root}/packages/react-native/src/errors.ts");
     let rn_source =
-        std::fs::read_to_string(&rn_path).unwrap_or_else(|e| panic!("reading {rn_path}: {e}"));
+        fs::read_to_string(&rn_path).unwrap_or_else(|e| panic!("reading {rn_path}: {e}"));
     let rn_declared = quoted_literals_between(
         &rn_source,
         "export const DEREC_ERROR_CODES = [",

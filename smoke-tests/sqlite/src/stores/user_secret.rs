@@ -4,6 +4,7 @@
 use derec_library::protocol::DeRecUserSecretStore;
 use derec_library::protocol::ShareStoreFuture;
 use derec_library::protocol::types::UserSecrets;
+use std::future;
 
 use crate::codec::{
     assemble_user_secrets, encode_user_secrets_payload, sql_to_threshold, sql_to_u64,
@@ -43,7 +44,7 @@ impl DeRecUserSecretStore for SqliteUserSecretStore {
         let value = row.map(|(v, d, p, a, t)| {
             assemble_user_secrets(v, d, p, a.map(sql_to_u64), sql_to_threshold(t))
         });
-        Box::pin(std::future::ready(Ok(value)))
+        Box::pin(future::ready(Ok(value)))
     }
 
     fn save_latest(&mut self, secret_id: u64, value: UserSecrets) -> ShareStoreFuture<'_, ()> {
@@ -68,7 +69,7 @@ impl DeRecUserSecretStore for SqliteUserSecretStore {
             ],
         )
         .expect("user_secret save_latest failed");
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 
     fn remove(&mut self, secret_id: u64) -> ShareStoreFuture<'_, ()> {
@@ -78,6 +79,6 @@ impl DeRecUserSecretStore for SqliteUserSecretStore {
             rusqlite::params![u64_to_sql(secret_id)],
         )
         .expect("user_secret remove failed");
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 }

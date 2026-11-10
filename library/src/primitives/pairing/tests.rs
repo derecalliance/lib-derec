@@ -2,9 +2,11 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use crate::Error;
+use crate::derec_message::DeRecMessageBuilder;
 use crate::derec_message::current_timestamp;
+use crate::extensions::contact_message::ContactMessageExt as _;
 use crate::extensions::derec_result::DeRecResultExt as _;
-use crate::primitives::pairing::PairingError;
+use crate::primitives::pairing::{PairingError, fingerprint};
 use crate::primitives::pairing::{
     request::{
         CreateContactResult as CreateContactMessageResult,
@@ -21,18 +23,21 @@ use crate::primitives::pairing::{
         ProducePrePairResult as ProducePrePairResponseResult,
         ProduceResult as ProducePairingResponseMessageResult, extract as extract_pairing_response,
         extract_pre_pair as extract_pre_pair_response, process as process_pairing_response_message,
-        process_pre_pair, produce as produce_pairing_response_message, produce_pre_pair,
+        process_pre_pair, process_pre_pair_no_keys, produce as produce_pairing_response_message,
+        produce_pre_pair, produce_pre_pair_no_keys,
     },
 };
 
-fn test_policy() -> crate::transport::TransportPolicy {
-    crate::transport::TransportPolicy::new(true)
+fn test_policy() -> TransportPolicy {
+    TransportPolicy::new(true)
 }
+use crate::transport::TransportPolicy;
 use crate::types::ChannelId;
+use derec_cryptography::pairing::{PairingSecretKeyMaterial, fingerprint_commitment};
 use derec_proto::{
     ContactMessage, ContactMode, DeRecMessage, DeRecResult, MessageBody, PairRequestMessage,
-    PairResponseMessage, PrePairResponseMessage, Protocol, SenderKind, StatusEnum,
-    TransportProtocol,
+    PairResponseMessage, ParameterRange, PrePairRequestMessage, PrePairResponseMessage, Protocol,
+    SenderKind, StatusEnum, TransportProtocol,
 };
 use prost::Message;
 
@@ -54,7 +59,7 @@ fn mismatch_envelope_timestamp(wire_bytes: &[u8]) -> Vec<u8> {
 fn test_create_contact_message_empty_transport_uri() {
     let result = create_contact_message(
         ChannelId(42),
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: String::new(),
             protocol: Protocol::Https.into(),
@@ -78,7 +83,7 @@ fn test_create_contact_message() {
         ..
     } = create_contact_message(
         channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
@@ -116,7 +121,7 @@ fn test_create_contact_message() {
 fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
     let invalid_contact_msg = ContactMessage {
         channel_id: ChannelId(42).into(),
-        contact_mode: derec_proto::ContactMode::InlineKeys as i32,
+        contact_mode: ContactMode::InlineKeys as i32,
         mlkem_encapsulation_key: Some(Vec::new()),
         ecies_public_key: Some(vec![1; 33]),
         contact_binding_hash: None,
@@ -151,7 +156,7 @@ fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
 fn test_produce_pairing_request_message_empty_ecies_public_key() {
     let invalid_contact_msg = ContactMessage {
         channel_id: ChannelId(42).into(),
-        contact_mode: derec_proto::ContactMode::InlineKeys as i32,
+        contact_mode: ContactMode::InlineKeys as i32,
         mlkem_encapsulation_key: Some(vec![1; 32]),
         ecies_public_key: Some(Vec::new()),
         contact_binding_hash: None,
@@ -186,7 +191,7 @@ fn test_produce_pairing_request_message_empty_ecies_public_key() {
 fn test_produce_pairing_request_message_empty_transport_uri() {
     let invalid_contact_msg = ContactMessage {
         channel_id: ChannelId(42).into(),
-        contact_mode: derec_proto::ContactMode::InlineKeys as i32,
+        contact_mode: ContactMode::InlineKeys as i32,
         contact_binding_hash: None,
         fingerprint_commitment: Some(vec![3; 32]),
         mlkem_encapsulation_key: Some(vec![1; 32]),
@@ -227,7 +232,7 @@ fn test_produce_pairing_request_message() {
         secret_key: alice_sk_state,
     } = create_contact_message(
         channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: alice_transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
@@ -280,7 +285,7 @@ fn test_produce_pairing_request_message_initiator_contact_message() {
         contact_message, ..
     } = create_contact_message(
         ChannelId(42),
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: alice_transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
@@ -322,7 +327,7 @@ fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
         ..
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -370,7 +375,7 @@ fn test_produce_pairing_response_message_empty_ecies_public_key() {
         ..
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -418,7 +423,7 @@ fn test_produce_pairing_response_message_missing_transport_protocol() {
         ..
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -462,7 +467,7 @@ fn test_produce_pairing_response_message_empty_transport_uri() {
         ..
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -506,7 +511,7 @@ fn test_extract_pairing_request_rejects_envelope_timestamp_mismatch() {
         secret_key: alice_sk_state,
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -547,7 +552,7 @@ fn test_process_pairing_response_message_missing_result() {
         secret_key: alice_sk_state,
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -614,7 +619,7 @@ fn test_process_pairing_response_message_result_non_ok() {
         secret_key: alice_sk_state,
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -684,7 +689,7 @@ fn test_process_pairing_response_message_invalid_status() {
         secret_key: alice_sk_state,
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -754,7 +759,7 @@ fn test_process_pairing_response_message_nonce_mismatch() {
         secret_key: alice_sk_state,
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -821,7 +826,7 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
         secret_key: alice_sk_state,
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -887,7 +892,7 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
         secret_key: alice_sk_state,
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -953,7 +958,7 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
         secret_key: initiator_secret_key,
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -1016,7 +1021,7 @@ fn test_alice_bob_pairing_flow() {
         secret_key: alice_sk_state,
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: alice_transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
@@ -1114,7 +1119,7 @@ fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
         secret_key: alice_sk_state,
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -1486,7 +1491,7 @@ fn test_produce_pre_pair_rejects_responder_secret_key_material() {
     )
     .expect("produce_pairing_request_message should succeed");
 
-    let dummy_request = derec_proto::PrePairRequestMessage {
+    let dummy_request = PrePairRequestMessage {
         supported_transports: Vec::new(),
         nonce: 1234,
         timestamp: Some(current_timestamp()),
@@ -1517,7 +1522,7 @@ fn test_produce_pre_pair_response_keys_match_initiator_contact_keys_in_inline_mo
     )
     .expect("failed to create contact");
 
-    let dummy_request = derec_proto::PrePairRequestMessage {
+    let dummy_request = PrePairRequestMessage {
         supported_transports: Vec::new(),
         nonce: 7,
         timestamp: Some(current_timestamp()),
@@ -1550,7 +1555,7 @@ fn test_produce_pre_pair_response_keys_match_initiator_contact_keys_in_inline_mo
 /// retained internally (so tests can cross-check what was republished).
 fn build_pre_pair_response_envelope(
     channel_id: ChannelId,
-) -> (Vec<u8>, ContactMessage, derec_proto::PrePairRequestMessage) {
+) -> (Vec<u8>, ContactMessage, PrePairRequestMessage) {
     let CreateContactMessageResult {
         contact_message: alice_contact,
         secret_key: alice_secret,
@@ -1759,6 +1764,26 @@ fn test_process_pre_pair_rejects_tampered_ecies_key() {
     ));
 }
 
+/// Moving the last byte of the ML-KEM key to the front of the ECIES key
+/// leaves the concatenation, and so the binding hash input, unchanged.
+#[test]
+fn test_process_pre_pair_rejects_keys_split_at_another_point() {
+    let (contact, mut response) = run_pre_pair_leg(ChannelId(42));
+
+    let mut mlkem = response.mlkem_encapsulation_key.take().unwrap();
+    let moved = mlkem.pop().unwrap();
+    let mut ecies = vec![moved];
+    ecies.extend(response.ecies_public_key.take().unwrap());
+    response.mlkem_encapsulation_key = Some(mlkem);
+    response.ecies_public_key = Some(ecies);
+
+    let result = process_pre_pair(&contact, &response);
+    assert!(matches!(
+        result,
+        Err(Error::Pairing(PairingError::PrePairHashMismatch))
+    ));
+}
+
 #[test]
 fn test_process_pre_pair_rejects_non_ok_status() {
     let (contact, mut response) = run_pre_pair_leg(ChannelId(42));
@@ -1838,7 +1863,7 @@ fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
         secret_key: alice_sk_state,
     } = create_contact_message(
         alice_channel_id,
-        derec_proto::ContactMode::InlineKeys,
+        ContactMode::InlineKeys,
         vec![TransportProtocol {
             uri: alice_transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
@@ -2061,7 +2086,6 @@ fn well_formed_hashed_keys_contact() -> ContactMessage {
 
 #[test]
 fn test_validate_contact_for_mode_accepts_well_formed_inline_keys() {
-    use crate::extensions::contact_message::ContactMessageExt as _;
     let c = well_formed_inline_keys_contact();
     c.validate_for_mode(ContactMode::InlineKeys)
         .expect("well-formed inline_keys must pass");
@@ -2069,7 +2093,6 @@ fn test_validate_contact_for_mode_accepts_well_formed_inline_keys() {
 
 #[test]
 fn test_validate_contact_for_mode_accepts_well_formed_hashed_keys() {
-    use crate::extensions::contact_message::ContactMessageExt as _;
     let c = well_formed_hashed_keys_contact();
     c.validate_for_mode(ContactMode::HashedKeys)
         .expect("well-formed hashed_keys must pass");
@@ -2077,7 +2100,6 @@ fn test_validate_contact_for_mode_accepts_well_formed_hashed_keys() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_mode_mismatch() {
-    use crate::extensions::contact_message::ContactMessageExt as _;
     let inline = well_formed_inline_keys_contact();
     let err = inline
         .validate_for_mode(ContactMode::HashedKeys)
@@ -2101,7 +2123,6 @@ fn test_validate_contact_for_mode_rejects_mode_mismatch() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_inline_missing_mlkem_key() {
-    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_inline_keys_contact();
     c.mlkem_encapsulation_key = Some(Vec::new());
     let err = c.validate_for_mode(ContactMode::InlineKeys).unwrap_err();
@@ -2123,7 +2144,6 @@ fn test_validate_contact_for_mode_rejects_inline_missing_mlkem_key() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_inline_missing_ecies_key() {
-    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_inline_keys_contact();
     c.ecies_public_key = None;
     let err = c.validate_for_mode(ContactMode::InlineKeys).unwrap_err();
@@ -2136,7 +2156,6 @@ fn test_validate_contact_for_mode_rejects_inline_missing_ecies_key() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_inline_with_binding_hash() {
-    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_inline_keys_contact();
     c.contact_binding_hash = Some(vec![0xCD; 48]);
     let err = c.validate_for_mode(ContactMode::InlineKeys).unwrap_err();
@@ -2149,7 +2168,6 @@ fn test_validate_contact_for_mode_rejects_inline_with_binding_hash() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_hashed_with_inline_keys() {
-    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_hashed_keys_contact();
     c.mlkem_encapsulation_key = Some(vec![1; 1184]);
     let err = c.validate_for_mode(ContactMode::HashedKeys).unwrap_err();
@@ -2171,7 +2189,6 @@ fn test_validate_contact_for_mode_rejects_hashed_with_inline_keys() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_hashed_missing_binding_hash() {
-    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_hashed_keys_contact();
     c.contact_binding_hash = None;
     let err = c.validate_for_mode(ContactMode::HashedKeys).unwrap_err();
@@ -2193,7 +2210,6 @@ fn test_validate_contact_for_mode_rejects_hashed_missing_binding_hash() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_hashed_wrong_hash_length() {
-    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_hashed_keys_contact();
     c.contact_binding_hash = Some(vec![0xAB; 32]);
     let err = c.validate_for_mode(ContactMode::HashedKeys).unwrap_err();
@@ -2246,8 +2262,6 @@ fn pairing_envelope_carrying(
     request: PairRequestMessage,
     timestamp: prost_types::Timestamp,
 ) -> Vec<u8> {
-    use crate::derec_message::DeRecMessageBuilder;
-
     DeRecMessageBuilder::pairing()
         .channel_id(channel_id)
         .timestamp(timestamp)
@@ -2411,8 +2425,6 @@ fn test_extract_pairing_request_accepts_a_well_formed_request() {
 /// failing later with a less obvious error.
 #[test]
 fn test_validate_rejects_a_contact_advertising_no_endpoint() {
-    use crate::extensions::contact_message::ContactMessageExt as _;
-
     let contact = ContactMessage {
         channel_id: 5001,
         contact_mode: ContactMode::NoKeys as i32,
@@ -2433,8 +2445,6 @@ fn test_validate_rejects_a_contact_advertising_no_endpoint() {
 /// A contact carrying a non-empty list is valid.
 #[test]
 fn test_validate_accepts_a_contact_carrying_only_the_list() {
-    use crate::extensions::contact_message::ContactMessageExt as _;
-
     let contact = ContactMessage {
         channel_id: 5002,
         contact_mode: ContactMode::NoKeys as i32,
@@ -2533,8 +2543,8 @@ fn endpoint(uri: &str) -> TransportProtocol {
 
 /// Every field at its widest except `shareSize`, so a disjoint pair of these
 /// fails on that field alone.
-fn share_size_range(min: i64, max: i64) -> derec_proto::ParameterRange {
-    derec_proto::ParameterRange {
+fn share_size_range(min: i64, max: i64) -> ParameterRange {
+    ParameterRange {
         min_share_size: min,
         max_share_size: max,
         min_time_between_verifications: 0,
@@ -2839,7 +2849,7 @@ fn endpoint_at(uri: &str) -> Vec<TransportProtocol> {
 fn inline_keys_handshake() -> (
     ContactMessage,
     PairResponseMessage,
-    derec_cryptography::pairing::PairingSecretKeyMaterial,
+    PairingSecretKeyMaterial,
     crate::types::SharedKey,
 ) {
     let CreateContactMessageResult {
@@ -2899,11 +2909,12 @@ fn the_pair_response_reveals_the_nonce_the_contact_committed_to() {
         .expect("an accepted response reveals the nonce")
         .try_into()
         .expect("the nonce is 32 bytes");
-    let opened = derec_cryptography::pairing::fingerprint_commitment(
+    let opened = fingerprint_commitment(
         contact.mlkem_encapsulation_key.as_deref().unwrap(),
         contact.ecies_public_key.as_deref().unwrap(),
         &nonce,
-    );
+    )
+    .unwrap();
     assert_eq!(contact.fingerprint_commitment, Some(opened.to_vec()));
 }
 
@@ -2915,10 +2926,7 @@ fn both_sides_derive_the_channel_key_from_the_revealed_nonce() {
         process_pairing_response_message(&contact, &response, &scanner_secret, None)
             .expect("the honest response completes pairing");
     assert_eq!(shared_key, creator_key);
-    assert_eq!(
-        crate::primitives::pairing::fingerprint(&shared_key),
-        crate::primitives::pairing::fingerprint(&creator_key)
-    );
+    assert_eq!(fingerprint(&shared_key), fingerprint(&creator_key));
 }
 
 #[test]
@@ -2976,8 +2984,7 @@ fn no_keys_pre_pair_leg() -> (ContactMessage, PrePairResponseMessage) {
     let PrePairExtractResult { request } =
         extract_pre_pair(&envelope).expect("extract_pre_pair failed");
     let answer =
-        crate::primitives::pairing::response::produce_pre_pair_no_keys(ChannelId(7), &request)
-            .expect("produce_pre_pair_no_keys failed");
+        produce_pre_pair_no_keys(ChannelId(7), &request).expect("produce_pre_pair_no_keys failed");
     let PrePairResponseExtractResult { response } =
         extract_pre_pair_response(&answer.envelope).expect("extract_pre_pair_response failed");
     (contact, response)
@@ -2989,7 +2996,7 @@ fn a_no_keys_pre_pair_response_without_a_commitment_is_refused() {
     response.fingerprint_commitment = None;
 
     assert!(matches!(
-        crate::primitives::pairing::response::process_pre_pair_no_keys(&contact, &response),
+        process_pre_pair_no_keys(&contact, &response),
         Err(Error::Pairing(PairingError::InvalidPairResponseMessage(
             "fingerprint_commitment is not a SHA-256 digest"
         )))
@@ -3010,17 +3017,14 @@ fn a_relay_cannot_pass_off_the_creators_commitment_as_its_own() {
             .envelope,
     )
     .expect("extract_pre_pair failed");
-    let relay =
-        crate::primitives::pairing::response::produce_pre_pair_no_keys(ChannelId(7), &request)
-            .expect("relay keygen failed");
+    let relay = produce_pre_pair_no_keys(ChannelId(7), &request).expect("relay keygen failed");
     let PrePairResponseExtractResult {
         response: mut relayed,
     } = extract_pre_pair_response(&relay.envelope).expect("extract relayed response failed");
     relayed.fingerprint_commitment = creator_answer.fingerprint_commitment;
 
-    let validated =
-        crate::primitives::pairing::response::process_pre_pair_no_keys(&contact, &relayed)
-            .expect("nothing binds NoKeys keys to the contact, so the scanner accepts them");
+    let validated = process_pre_pair_no_keys(&contact, &relayed)
+        .expect("nothing binds NoKeys keys to the contact, so the scanner accepts them");
     let filled_in = ContactMessage {
         mlkem_encapsulation_key: Some(validated.mlkem_encapsulation_key),
         ecies_public_key: Some(validated.ecies_public_key),

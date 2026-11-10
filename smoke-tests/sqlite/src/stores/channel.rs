@@ -7,6 +7,7 @@ use derec_library::protocol::types::{
 use derec_library::protocol::{ChannelStoreFuture, DeRecChannelStore};
 use derec_library::types::ChannelId;
 use std::collections::{HashSet, VecDeque};
+use std::future;
 
 use crate::codec::{
     channel_status_tag, decode_helper, decode_member, encode_channel, replica_role_tag,
@@ -52,7 +53,7 @@ impl DeRecChannelStore for SqliteChannelStore {
                 .ok()
                 .map(|bytes| ChannelRecord::Replica(decode_member(&bytes))),
         };
-        Box::pin(std::future::ready(Ok(result)))
+        Box::pin(future::ready(Ok(result)))
     }
 
     fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
@@ -99,7 +100,7 @@ impl DeRecChannelStore for SqliteChannelStore {
                 .expect("replica member save failed");
             }
         }
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 
     fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
@@ -126,7 +127,7 @@ impl DeRecChannelStore for SqliteChannelStore {
                 )
                 .expect("replica member remove failed"),
         };
-        Box::pin(std::future::ready(Ok(affected > 0)))
+        Box::pin(future::ready(Ok(affected > 0)))
     }
 
     fn remove_many(
@@ -209,7 +210,7 @@ impl DeRecChannelStore for SqliteChannelStore {
         for row in rows {
             out.push(decode_helper(&row.expect("helpers row failed")));
         }
-        Box::pin(std::future::ready(Ok(out)))
+        Box::pin(future::ready(Ok(out)))
     }
 
     fn replicas(
@@ -261,7 +262,7 @@ impl DeRecChannelStore for SqliteChannelStore {
         for row in rows {
             out.push(decode_member(&row.expect("replicas row failed")));
         }
-        Box::pin(std::future::ready(Ok(out)))
+        Box::pin(future::ready(Ok(out)))
     }
 
     fn link_channel(
@@ -283,7 +284,7 @@ impl DeRecChannelStore for SqliteChannelStore {
             )
             .expect("link_channel reverse insert failed");
         }
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(future::ready(Ok(())))
     }
 
     fn linked_channels(
@@ -319,7 +320,7 @@ impl DeRecChannelStore for SqliteChannelStore {
         }
 
         let result: Vec<ChannelId> = visited.into_iter().map(ChannelId).collect();
-        Box::pin(std::future::ready(Ok(result)))
+        Box::pin(future::ready(Ok(result)))
     }
 }
 

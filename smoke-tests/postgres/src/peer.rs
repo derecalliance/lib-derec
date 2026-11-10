@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::{DeRecEvent, DeRecProtocol, DeRecProtocolBuilder};
+use derec_library::protocol::types::Timeouts;
+use derec_library::protocol::{
+    AutoAcceptPolicy, DeRecEvent, DeRecProtocol, DeRecProtocolBuilder, ExpiredChannelCleanup,
+};
 use derec_proto::TransportProtocol;
+use std::mem;
 
 use crate::db::SharedClient;
 use crate::stores::{
@@ -74,7 +78,7 @@ impl Peer {
         client: SharedClient,
         label: &'static str,
         uri: &str,
-        policy: derec_library::protocol::AutoAcceptPolicy,
+        policy: AutoAcceptPolicy,
     ) -> Self {
         Self::with_full_options(
             client,
@@ -94,15 +98,15 @@ impl Peer {
         label: &'static str,
         uri: &str,
         options: PeerOptions,
-        policy: derec_library::protocol::ExpiredChannelCleanup,
+        policy: ExpiredChannelCleanup,
     ) -> Self {
         Self::with_full_options(
             client,
             label,
             uri,
             options,
-            derec_library::protocol::AutoAcceptPolicy::default(),
-            Some(derec_library::protocol::types::Timeouts {
+            AutoAcceptPolicy::default(),
+            Some(Timeouts {
                 expired_channels: policy,
                 ..Default::default()
             }),
@@ -121,7 +125,7 @@ impl Peer {
             label,
             uri,
             options,
-            derec_library::protocol::AutoAcceptPolicy::default(),
+            AutoAcceptPolicy::default(),
             None,
             false,
         )
@@ -146,8 +150,8 @@ impl Peer {
         label: &'static str,
         uri: &str,
         options: PeerOptions,
-        auto_accept: derec_library::protocol::AutoAcceptPolicy,
-        timeouts: Option<derec_library::protocol::types::Timeouts>,
+        auto_accept: AutoAcceptPolicy,
+        timeouts: Option<Timeouts>,
         key_rotation: bool,
     ) -> Self {
         let transport = InProcessTransport::new();
@@ -200,7 +204,7 @@ pub async fn deliver(peer: &mut Peer, bytes: &[u8]) -> Vec<DeRecEvent> {
 
     let mut i = 0;
     while i < collected.len() {
-        let action = match std::mem::replace(&mut collected[i], DeRecEvent::NoOp) {
+        let action = match mem::replace(&mut collected[i], DeRecEvent::NoOp) {
             DeRecEvent::ActionRequired { action, .. } => Some(action),
             other => {
                 collected[i] = other;

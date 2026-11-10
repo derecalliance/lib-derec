@@ -33,9 +33,11 @@ use ark_ff::{BigInteger, PrimeField, Zero};
 use ark_poly::{Polynomial, univariate::DensePolynomial};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rand::CryptoRng;
+use std::cell::RefCell;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::*;
+use crate::random;
 
 // we use the scalar field of the ark_bw6_761 curve so it is large enough for 256-bit secrets
 use ark_bw6_761::Fr as F;
@@ -62,10 +64,10 @@ pub fn share<R: CryptoRng + ?Sized>(
     total_shares: u64,
     rng: &mut R,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let rng_cell = std::cell::RefCell::new(rng);
+    let rng_cell = RefCell::new(rng);
 
-    let sample_coeff = || crate::random::field_element::<F, R>(&mut **rng_cell.borrow_mut());
-    let sample_x = || crate::random::field_element::<F, R>(&mut **rng_cell.borrow_mut());
+    let sample_coeff = || random::field_element::<F, R>(&mut **rng_cell.borrow_mut());
+    let sample_x = || random::field_element::<F, R>(&mut **rng_cell.borrow_mut());
 
     share_with_samplers(secret, threshold, total_shares, sample_coeff, sample_x)
 }
@@ -231,7 +233,7 @@ mod tests {
     fn test_shamir_correctness() {
         // test if recovery on shares produces the shared secret
 
-        let mut rng = crate::random::os_rng();
+        let mut rng = random::os_rng();
 
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);

@@ -15,6 +15,13 @@
 //! formats, chained-bytes contracts, etc.).
 
 use std::ffi::{CString, c_char};
+use std::{mem, ptr, slice};
+
+use derec_proto::TransportProtocol;
+use prost::encoding::decode_varint;
+
+use crate::Error;
+use crate::interop::ffi::error::DeRecError;
 
 #[repr(C)]
 pub struct DeRecBuffer {
@@ -61,7 +68,7 @@ pub extern "C" fn derec_free_string(ptr: *mut c_char) {
 
 pub(crate) fn empty_buffer() -> DeRecBuffer {
     DeRecBuffer {
-        ptr: std::ptr::null_mut(),
+        ptr: ptr::null_mut(),
         len: 0,
     }
 }
@@ -69,7 +76,7 @@ pub(crate) fn empty_buffer() -> DeRecBuffer {
 pub(crate) fn vec_into_buffer(mut data: Vec<u8>) -> DeRecBuffer {
     let ptr = data.as_mut_ptr();
     let len = data.len();
-    std::mem::forget(data);
+    mem::forget(data);
     DeRecBuffer { ptr, len }
 }
 
@@ -131,7 +138,7 @@ pub(crate) fn parse_transport_protocol_list(
     ptr: *const u8,
     len: usize,
     field: &str,
-) -> Result<Vec<derec_proto::TransportProtocol>, crate::interop::ffi::error::DeRecError> {
+) -> Result<Vec<TransportProtocol>, DeRecError> {
     use crate::extensions::transport_protocol::TransportProtocolExt as _;
     use crate::interop::ffi::error::{
         DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, ffi_error, from_lib_error,
@@ -148,10 +155,10 @@ pub(crate) fn parse_transport_protocol_list(
         ));
     }
 
-    let mut bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let mut bytes = unsafe { slice::from_raw_parts(ptr, len) };
     let mut out = Vec::new();
     while !bytes.is_empty() {
-        let entry_len = prost::encoding::decode_varint(&mut bytes).map_err(|_| {
+        let entry_len = decode_varint(&mut bytes).map_err(|_| {
             ffi_error(
                 DEREC_CODE_FFI_BAD_PROTO,
                 format!("{field} has a malformed length prefix"),
@@ -166,14 +173,14 @@ pub(crate) fn parse_transport_protocol_list(
         let (entry, rest) = bytes.split_at(entry_len);
         bytes = rest;
 
-        let tp = derec_proto::TransportProtocol::decode(entry).map_err(|_| {
+        let tp = TransportProtocol::decode(entry).map_err(|_| {
             ffi_error(
                 DEREC_CODE_FFI_BAD_PROTO,
                 format!("{field} contains an invalid TransportProtocol"),
             )
         })?;
         tp.validate()
-            .map_err(|e| from_lib_error(crate::Error::Transport(e)))?;
+            .map_err(|e| from_lib_error(Error::Transport(e)))?;
         out.push(tp);
     }
     Ok(out)

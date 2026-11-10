@@ -14,6 +14,59 @@
 //! until it is listed. Regenerate with
 //! `DEREC_BLESS_FIXTURES=1 cargo test -p derec-library --features ffi --lib interop::ffi::tests`.
 
+use std::{env, fs};
+
+use super::common::DeRecBuffer;
+use super::discovery::{
+    ExtractGetSecretIdsVersionsRequestResult, ExtractGetSecretIdsVersionsResponseResult,
+    ProcessGetSecretIdsVersionsResponseMessageResult,
+    ProduceGetSecretIdsVersionsRequestMessageResult,
+    ProduceGetSecretIdsVersionsResponseMessageResult,
+};
+use super::envelope::{ApplyTraceIdResult, MessageIdResult, ReadTraceIdResult};
+use super::error::DeRecError;
+use super::message_json::DeRecMessageJsonResult;
+use super::pairing::{
+    CreateContactMessageResult, DecodeContactMessageResult, EncodeContactMessageResult,
+    ExtractPairRequestResult, ExtractPairResponseResult, ExtractPrePairRequestResult,
+    ExtractPrePairResponseResult, PairingFingerprintResult, ProcessPairResponseMessageResult,
+    ProcessPrePairResponseMessageResult, ProducePairRequestMessageResult,
+    ProducePairResponseMessageResult, ProducePrePairNoKeysResponseMessageResult,
+    ProducePrePairRequestMessageResult, ProducePrePairResponseMessageResult,
+};
+use super::protocol::handle::DeRecProtocolNewResult;
+use super::protocol::handle::config::DeRecRemovedChannelsResult;
+use super::protocol::handle::flow::{
+    DeRecProtocolEventsResult, DeRecProtocolProcessResult, DeRecProtocolRestoreResult,
+};
+use super::protocol::handle::pairing::{
+    DeRecProtocolCreateContactResult, DeRecProtocolFingerprintResult,
+};
+use super::protocol::stores::{
+    ChannelStoreCallbacks, SecretStoreCallbacks, ShareStoreCallbacks, StateStoreCallbacks,
+    TransportCallbacks, UserSecretStoreCallbacks,
+};
+use super::protocol_version::DeRecProtocolVersion;
+use super::recovery::{
+    ExtractGetShareRequestResult, ExtractGetShareResponseResult,
+    ProduceGetShareRequestMessageResult, ProduceGetShareResponseMessageResult,
+    RecoverFromShareResponsesResult,
+};
+use super::sharing::{
+    ExtractStoreShareRequestResult, ExtractStoreShareResponseResult,
+    ProcessStoreShareResponseMessageResult, ProduceStoreShareRequestMessageResult,
+    ProduceStoreShareResponseMessageResult, ProtectSecretResult,
+};
+use super::unpairing::{
+    ExtractUnpairRequestResult, ExtractUnpairResponseResult, ProcessUnpairResponseResult,
+    ProduceUnpairRequestMessageResult, ProduceUnpairResponseMessageResult,
+};
+use super::verification::{
+    ExtractVerifyShareRequestResult, ExtractVerifyShareResponseResult,
+    ProduceVerifyShareRequestMessageResult, ProduceVerifyShareResponseMessageResult,
+    VerifyShareResponseResult,
+};
+
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/ffi_layout.json"
@@ -47,132 +100,139 @@ macro_rules! layouts {
 
 fn generated() -> serde_json::Value {
     let mut structs = layouts![
-        super::common::DeRecBuffer { ptr, len },
-        super::discovery::ProduceGetSecretIdsVersionsRequestMessageResult {
+        DeRecBuffer { ptr, len },
+        ProduceGetSecretIdsVersionsRequestMessageResult {
             error,
             envelope_wire_bytes
         },
-        super::discovery::ExtractGetSecretIdsVersionsRequestResult {
+        ExtractGetSecretIdsVersionsRequestResult {
             error,
             channel_id,
             request_proto_bytes
         },
-        super::discovery::ProduceGetSecretIdsVersionsResponseMessageResult {
+        ProduceGetSecretIdsVersionsResponseMessageResult {
             error,
             envelope_wire_bytes
         },
-        super::discovery::ExtractGetSecretIdsVersionsResponseResult {
+        ExtractGetSecretIdsVersionsResponseResult {
             error,
             channel_id,
             response_proto_bytes
         },
-        super::discovery::ProcessGetSecretIdsVersionsResponseMessageResult {
+        ProcessGetSecretIdsVersionsResponseMessageResult {
             error,
             secret_list_bytes
         },
-        super::envelope::ApplyTraceIdResult { error, wire_bytes },
-        super::envelope::ReadTraceIdResult { error, trace_id },
+        ApplyTraceIdResult { error, wire_bytes },
+        ReadTraceIdResult { error, trace_id },
         super::envelope::ReadSequenceResult { error, sequence },
+        MessageIdResult {
+            error,
+            id,
+            timestamp
+        },
         super::channel_key::DeriveChannelKeyResult { error, key_bytes },
-        super::error::DeRecError {
+        DeRecError {
             category,
             code,
             message,
             peer_status,
             peer_memo,
             expected,
-            got
+            got,
+            has_channel_id,
+            channel_id
         },
-        super::message_json::DeRecMessageJsonResult { error, bytes },
-        super::pairing::CreateContactMessageResult {
+        DeRecMessageJsonResult { error, bytes },
+        CreateContactMessageResult {
             error,
             contact_wire_bytes,
             secret_key_material
         },
-        super::pairing::EncodeContactMessageResult { error, wire_bytes },
-        super::pairing::DecodeContactMessageResult {
+        EncodeContactMessageResult { error, wire_bytes },
+        DecodeContactMessageResult {
             error,
             contact_json
         },
-        super::pairing::ProducePairRequestMessageResult {
+        ProducePairRequestMessageResult {
             error,
             request_wire_bytes,
             initiator_contact_message_wire_bytes,
             secret_key_material
         },
-        super::pairing::ExtractPairRequestResult {
+        ExtractPairRequestResult {
             error,
             channel_id,
             request_proto_bytes
         },
-        super::pairing::ProducePairResponseMessageResult {
+        ProducePairResponseMessageResult {
             error,
             response_wire_bytes,
             peer_transports,
             shared_key,
             channel_id
         },
-        super::pairing::ExtractPairResponseResult {
+        ExtractPairResponseResult {
             error,
             channel_id,
             response_proto_bytes
         },
-        super::pairing::ProcessPairResponseMessageResult {
+        ProcessPairResponseMessageResult {
             error,
             shared_key,
             channel_id
         },
-        super::pairing::ProducePrePairRequestMessageResult {
+        ProducePrePairRequestMessageResult {
             error,
             envelope_wire_bytes
         },
-        super::pairing::ExtractPrePairRequestResult {
+        ExtractPrePairRequestResult {
             error,
             channel_id,
             request_proto_bytes
         },
-        super::pairing::ProducePrePairResponseMessageResult {
+        ProducePrePairResponseMessageResult {
             error,
             envelope_wire_bytes
         },
-        super::pairing::ExtractPrePairResponseResult {
+        ExtractPrePairResponseResult {
             error,
             channel_id,
             response_proto_bytes
         },
-        super::pairing::ProducePrePairNoKeysResponseMessageResult {
+        ProducePrePairNoKeysResponseMessageResult {
             error,
             envelope_wire_bytes,
             secret_key_material
         },
-        super::pairing::PairingFingerprintResult { error, fingerprint },
-        super::pairing::ProcessPrePairResponseMessageResult {
+        PairingFingerprintResult { error, fingerprint },
+        ProcessPrePairResponseMessageResult {
             error,
             mlkem_encapsulation_key,
             ecies_public_key,
             nonce,
             fingerprint_commitment
         },
-        super::protocol::handle::config::DeRecRemovedChannelsResult { error, channels },
-        super::protocol::handle::flow::DeRecProtocolEventsResult { error, events_json },
-        super::protocol::handle::flow::DeRecProtocolRestoreResult {
+        DeRecRemovedChannelsResult { error, channels },
+        DeRecProtocolEventsResult { error, events_json },
+        DeRecProtocolRestoreResult {
             error,
             events_json,
             conflicting_channel_ids_json
         },
-        super::protocol::handle::flow::DeRecProtocolProcessResult {
+        DeRecProtocolProcessResult {
             error,
             events_json,
             has_channel_id,
             channel_id
         },
-        super::protocol::handle::DeRecProtocolNewResult { error, handle },
-        super::protocol::handle::pairing::DeRecProtocolFingerprintResult { error, fingerprint },
-        super::protocol::handle::pairing::DeRecProtocolCreateContactResult {
+        DeRecProtocolNewResult { error, handle },
+        DeRecProtocolFingerprintResult { error, fingerprint },
+        DeRecProtocolCreateContactResult {
             error,
             contact_wire_bytes
         },
-        super::protocol::stores::ChannelStoreCallbacks {
+        ChannelStoreCallbacks {
             user_data,
             load,
             save,
@@ -184,7 +244,7 @@ fn generated() -> serde_json::Value {
             linked_channels,
             free_buffer
         },
-        super::protocol::stores::SecretStoreCallbacks {
+        SecretStoreCallbacks {
             user_data,
             load,
             load_many,
@@ -193,7 +253,7 @@ fn generated() -> serde_json::Value {
             remove_many,
             free_buffer
         },
-        super::protocol::stores::ShareStoreCallbacks {
+        ShareStoreCallbacks {
             user_data,
             load,
             load_many,
@@ -207,14 +267,14 @@ fn generated() -> serde_json::Value {
             record_verification,
             free_buffer
         },
-        super::protocol::stores::UserSecretStoreCallbacks {
+        UserSecretStoreCallbacks {
             user_data,
             load_latest,
             save_latest,
             remove,
             free_buffer
         },
-        super::protocol::stores::StateStoreCallbacks {
+        StateStoreCallbacks {
             user_data,
             save,
             load,
@@ -223,89 +283,89 @@ fn generated() -> serde_json::Value {
             load_all,
             free_buffer
         },
-        super::protocol::stores::TransportCallbacks { user_data, send },
-        super::protocol_version::DeRecProtocolVersion { major, minor },
-        super::recovery::ProduceGetShareRequestMessageResult {
+        TransportCallbacks { user_data, send },
+        DeRecProtocolVersion { major, minor },
+        ProduceGetShareRequestMessageResult {
             error,
             request_wire_bytes
         },
-        super::recovery::ExtractGetShareRequestResult {
+        ExtractGetShareRequestResult {
             error,
             channel_id,
             request_proto_bytes
         },
-        super::recovery::ProduceGetShareResponseMessageResult {
+        ProduceGetShareResponseMessageResult {
             error,
             response_wire_bytes
         },
-        super::recovery::ExtractGetShareResponseResult {
+        ExtractGetShareResponseResult {
             error,
             channel_id,
             response_proto_bytes
         },
-        super::recovery::RecoverFromShareResponsesResult { error, secret_data },
-        super::sharing::ProtectSecretResult {
+        RecoverFromShareResponsesResult { error, secret_data },
+        ProtectSecretResult {
             error,
             shares_wire_bytes
         },
-        super::sharing::ProduceStoreShareRequestMessageResult { error, wire_bytes },
-        super::sharing::ExtractStoreShareRequestResult {
+        ProduceStoreShareRequestMessageResult { error, wire_bytes },
+        ExtractStoreShareRequestResult {
             error,
             channel_id,
             request_proto_bytes
         },
-        super::sharing::ProduceStoreShareResponseMessageResult {
+        ProduceStoreShareResponseMessageResult {
             error,
             wire_bytes,
             committed_share_bytes,
             secret_id,
             version
         },
-        super::sharing::ExtractStoreShareResponseResult {
+        ExtractStoreShareResponseResult {
             error,
             channel_id,
             response_proto_bytes
         },
-        super::sharing::ProcessStoreShareResponseMessageResult { error },
-        super::unpairing::ProduceUnpairRequestMessageResult {
+        ProcessStoreShareResponseMessageResult { error },
+        ProduceUnpairRequestMessageResult {
             error,
             request_wire_bytes
         },
-        super::unpairing::ExtractUnpairRequestResult {
+        ExtractUnpairRequestResult {
             error,
             channel_id,
             memo,
             request_proto_bytes
         },
-        super::unpairing::ProduceUnpairResponseMessageResult {
+        ProduceUnpairResponseMessageResult {
             error,
             response_wire_bytes
         },
-        super::unpairing::ExtractUnpairResponseResult {
+        ExtractUnpairResponseResult {
             error,
             channel_id,
             response_proto_bytes
         },
-        super::unpairing::ProcessUnpairResponseResult { error },
-        super::verification::ProduceVerifyShareRequestMessageResult {
+        ProcessUnpairResponseResult { error },
+        ProduceVerifyShareRequestMessageResult {
             error,
             request_wire_bytes
         },
-        super::verification::ExtractVerifyShareRequestResult {
+        ExtractVerifyShareRequestResult {
             error,
             channel_id,
             request_proto_bytes
         },
-        super::verification::ProduceVerifyShareResponseMessageResult {
+        ProduceVerifyShareResponseMessageResult {
             error,
             response_wire_bytes
         },
-        super::verification::ExtractVerifyShareResponseResult {
+        ExtractVerifyShareResponseResult {
             error,
             channel_id,
             response_proto_bytes
         },
-        super::verification::VerifyShareResponseResult { error, is_valid },
+        VerifyShareResponseResult { error, is_valid },
     ];
     structs.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     serde_json::json!({
@@ -319,13 +379,13 @@ fn generated() -> serde_json::Value {
 fn the_ffi_layout_fixture_matches_the_c_abi() {
     assert_eq!(usize::BITS, 64, "the fixture records the 64-bit layout");
     let generated = generated();
-    if std::env::var_os("DEREC_BLESS_FIXTURES").is_some() {
+    if env::var_os("DEREC_BLESS_FIXTURES").is_some() {
         let text = serde_json::to_string_pretty(&generated).expect("fixture serializes") + "\n";
-        std::fs::write(FIXTURE, text).expect("fixture is writable");
+        fs::write(FIXTURE, text).expect("fixture is writable");
         return;
     }
     let checked_in: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(FIXTURE)
+        &fs::read_to_string(FIXTURE)
             .expect("ffi_layout.json exists; regenerate with DEREC_BLESS_FIXTURES=1"),
     )
     .expect("ffi_layout.json is valid JSON");

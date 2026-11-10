@@ -9,6 +9,7 @@
 //! that outlives its pairing window are all settled from here.
 
 mod channels;
+mod recovery;
 mod sharing_round;
 mod unpair;
 
@@ -50,11 +51,14 @@ impl<
     ///   remain.
     /// - A `Pending` channel outlives its pairing window together with its
     ///   channel key and pairing material.
+    /// - A recovery waiting on a helper that never answers is never decided:
+    ///   no [`DeRecEvent::SecretRecovered`] or other outcome, and a replica
+    ///   version check waiting on a silent member never concludes.
     ///
     /// # What it does
     ///
     /// The same time-driven steps [`Self::process`] runs, in the same order;
-    /// `process` handles its message between steps 2 and 3:
+    /// `process` handles its message between steps 4 and 5:
     ///
     /// 1. Expired-channel cleanup, when
     ///    [`Timeouts::expired_channels`](crate::protocol::types::Timeouts::expired_channels)
@@ -66,7 +70,13 @@ impl<
     /// 2. Unpair-acknowledgement timeouts: every unpair older than
     ///    [`Timeouts::unpair_ack`](crate::protocol::types::Timeouts::unpair_ack)
     ///    drops its channel and emits [`DeRecEvent::Unpaired`].
-    /// 3. The sharing rounds, each loaded and written once. A round older
+    /// 3. Recovery timeouts: a recovery still waiting on a helper past
+    ///    [`Timeouts::get_share_response`](crate::protocol::types::Timeouts::get_share_response)
+    ///    reports each silent helper as [`DeRecEvent::RecoverSecretFailed`]
+    ///    and decides on the shares it holds.
+    /// 4. Replica version-check timeouts: a check still waiting on a member
+    ///    past the same budget concludes on the versions already reported.
+    /// 5. The sharing rounds, each loaded and written once. A round older
     ///    than [`Timeouts::sharing_round`](crate::protocol::types::Timeouts::sharing_round)
     ///    first fails every helper still pending, with
     ///    [`DeRecEvent::ShareRejected`], and reports every member still pending
@@ -74,20 +84,18 @@ impl<
     ///    result. Then the tally closes a round whose participants have all
     ///    settled, emitting [`DeRecEvent::SharingComplete`] (and
     ///    [`DeRecEvent::ReplicaSyncComplete`] for a round with a replica leg).
-    /// 4. The republish after an unpair dropped in step 2, when that helper
+    /// 6. The republish after an unpair dropped in step 2, when that helper
     ///    held a share (see [`DeRecFlow::Unpair`](crate::protocol::DeRecFlow::Unpair)).
     ///
     /// Nothing else has a deadline: an outstanding
     /// [`DeRecFlow::VerifyShares`](crate::protocol::DeRecFlow::VerifyShares)
-    /// challenge, a [`DeRecFlow::RecoverSecret`](crate::protocol::DeRecFlow::RecoverSecret)
-    /// collection and a [`DeRecFlow::ReplicaDiscovery`](crate::protocol::DeRecFlow::ReplicaDiscovery)
-    /// check stay open until answered, and `tick` does not touch them.
+    /// challenge stays open until answered, and `tick` does not touch it.
     ///
     /// # Errors
     ///
     /// `tick` never fails. Store failures are swallowed as in
     /// [`Self::process`], so the work is retried on the next call, and a
-    /// failed republish in step 4 is logged: the remaining helpers keep the
+    /// failed republish in step 6 is logged: the remaining helpers keep the
     /// previous version until the next
     /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret).
     ///
@@ -151,7 +159,10 @@ impl<
             }
         }
 
-        self.check_unpair_timeouts().await
+        let mut events = self.check_unpair_timeouts().await;
+        events.append(&mut self.check_recovery_timeouts().await);
+        events.append(&mut self.check_replica_discovery_timeout().await);
+        events
     }
 }
 

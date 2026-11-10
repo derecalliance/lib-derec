@@ -58,6 +58,7 @@ use derec_proto::{
     UnpairRequestMessage, UpdateChannelInfoRequestMessage, VerifyShareRequestMessage,
 };
 use prost::Message;
+use std::collections::HashMap;
 
 const TAG_PAIRING: u8 = 0;
 const TAG_PRE_PAIR: u8 = 7;
@@ -200,7 +201,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
             Action::Pairing {
                 request,
                 kind: i32_to_sender_kind(kind_i32)?,
-                peer_communication_info: std::collections::HashMap::new(),
+                peer_communication_info: HashMap::new(),
             }
         }
         TAG_PRE_PAIR => Action::PrePair(

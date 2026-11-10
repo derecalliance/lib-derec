@@ -122,7 +122,7 @@ DeRecProtocolHandle* newProtocol() {
 // `library/tests/fixtures/wire_golden.json`'s restore fixture (whose replica
 // group is dropped: its 10-byte key would fail the invariant check first).
 const std::string kRestoreParams =
-    R"({"version":7,"recovered_secret":{"helpers":[)"
+    R"({"version":7,"newest_version":9,"recovered_secret":{"helpers":[)"
     R"({"channel_id":"11","transports":[{"uri":"https://helper-a.example.com","protocol":"https"}],)"
     R"("shared_key":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]},)"
     R"({"channel_id":"22","transports":[{"uri":"https://helper-b.example.com","protocol":"https"}],)"

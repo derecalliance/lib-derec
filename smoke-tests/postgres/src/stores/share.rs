@@ -4,6 +4,7 @@
 use derec_library::protocol::types::Share;
 use derec_library::protocol::{DeRecShareStore, ShareStoreFuture};
 use derec_library::types::ChannelId;
+use std::future;
 use tokio_postgres::types::ToSql;
 
 use crate::codec::{sql_to_subshares, sql_to_threshold, subshares_to_sql, threshold_to_sql};
@@ -266,7 +267,7 @@ impl DeRecShareStore for PostgresShareStore {
     }
 
     fn keep_version(&self, _: u64, version: u32) -> ShareStoreFuture<'_, u32> {
-        Box::pin(std::future::ready(Ok(version.saturating_sub(1))))
+        Box::pin(future::ready(Ok(version.saturating_sub(1))))
     }
 }
 

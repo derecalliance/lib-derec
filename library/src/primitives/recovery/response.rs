@@ -18,10 +18,11 @@
 //! malicious share cannot steer the result.
 
 use crate::extensions::derec_result::DeRecResultExt as _;
-use crate::extensions::derec_share::DeRecShareExt as _;
+use crate::extensions::derec_share::{DeRecShareExt as _, into_vss_subshares};
 use crate::primitives::recovery::RecoveryError;
 use crate::utils::verify_timestamps;
 use crate::{
+    Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, ChannelKey, SharedKey},
 };
@@ -136,7 +137,7 @@ pub fn produce(
     request: &GetShareRequestMessage,
     stored_request: &StoreShareRequestMessage,
     channel_key: &ChannelKey,
-) -> Result<ProduceResult, crate::Error> {
+) -> Result<ProduceResult, Error> {
     let (_, derec_share) = read_committed_share(&stored_request.share)?;
     derec_share.validate(request.secret_id, request.version)?;
 
@@ -257,18 +258,15 @@ pub fn produce(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
-pub fn extract(
-    envelope_bytes: &[u8],
-    shared_key: &SharedKey,
-) -> Result<ExtractResult, crate::Error> {
-    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractResult, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
     let response = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::GetShareResponse(message) => message,
         _ => {
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected GetShareResponseMessage");
-            return Err(crate::Error::Invariant(
+            return Err(Error::Invariant(
                 "Invalid message. Expected: GetShareResponseMessage",
             ));
         }
@@ -391,7 +389,7 @@ pub fn recover(
     secret_id: u64,
     version: u32,
     responses: &[&GetShareResponseMessage],
-) -> Result<RecoverResult, crate::Error> {
+) -> Result<RecoverResult, Error> {
     if responses.is_empty() {
         #[cfg(feature = "logging")]
         tracing::warn!("responses list is empty");
@@ -419,7 +417,7 @@ pub fn recover(
 /// a request and the owner consuming the answer — so the empty-check and the
 /// two decodes live here rather than once per side. Says nothing about
 /// *which* share this is; that is [`DeRecShareExt::validate`].
-fn read_committed_share(bytes: &[u8]) -> Result<(CommittedDeRecShare, DeRecShare), crate::Error> {
+fn read_committed_share(bytes: &[u8]) -> Result<(CommittedDeRecShare, DeRecShare), Error> {
     if bytes.is_empty() {
         #[cfg(feature = "logging")]
         tracing::warn!("stored share is empty");
@@ -436,8 +434,8 @@ pub(crate) fn extract_share_from_response(
     response: &GetShareResponseMessage,
     secret_id: u64,
     version: u32,
-) -> Result<vss::VSSShare, crate::Error> {
-    let result = response.result.as_ref().ok_or(crate::Error::Invariant(
+) -> Result<vss::VSSShare, Error> {
+    let result = response.result.as_ref().ok_or(Error::Invariant(
         "GetShareResponseMessage is missing result field",
     ))?;
 
@@ -448,7 +446,7 @@ pub(crate) fn extract_share_from_response(
     derec_share.validate(secret_id, version)?;
 
     Ok(vss::VSSShare {
-        subshares: crate::extensions::derec_share::into_vss_subshares(derec_share.subshares),
+        subshares: into_vss_subshares(derec_share.subshares),
         encrypted_secret: derec_share.encrypted_secret,
         commitment: committed_derec_share.commitment,
         merkle_path: committed_derec_share

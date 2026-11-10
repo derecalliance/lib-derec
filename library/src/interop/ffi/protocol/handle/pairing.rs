@@ -6,7 +6,9 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+use std::ptr;
 
+use derec_proto::ContactMode;
 use prost::Message as _;
 
 use super::DeRecProtocolHandle;
@@ -30,7 +32,7 @@ impl From<DeRecError> for DeRecProtocolFingerprintResult {
     fn from(error: DeRecError) -> Self {
         Self {
             error,
-            fingerprint: std::ptr::null_mut(),
+            fingerprint: ptr::null_mut(),
         }
     }
 }
@@ -156,7 +158,7 @@ pub unsafe extern "C" fn derec_protocol_create_contact(
     if handle.is_null() {
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
     }
-    let mode = match derec_proto::ContactMode::try_from(contact_mode) {
+    let mode = match ContactMode::try_from(contact_mode) {
         Ok(m) => m,
         Err(_) => {
             return ffi_error(

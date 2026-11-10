@@ -15,10 +15,12 @@
 //! [`Category::Ffi`] with the `ffi_*` codes, and WASM under its own `wasm`
 //! category.
 
+use crate::Error;
 use crate::primitives::{
     discovery::DiscoveryError, pairing::PairingError, recovery::RecoveryError,
     sharing::SharingError, unpairing::UnpairingError, verification::VerificationError,
 };
+use crate::protocol::{SecretKind, SecretStoreError};
 
 macro_rules! vocabulary {
     ($(#[$meta:meta])* $enum:ident { $($variant:ident = $value:literal => $name:literal,)* }) => {
@@ -84,6 +86,7 @@ vocabulary! {
         Protobuf = 13 => "protobuf",
         Invariant = 14 => "invariant",
         StateStore = 15 => "state_store",
+        Transport = 16 => "transport",
     }
 }
 
@@ -122,6 +125,7 @@ vocabulary! {
         UnexpectedReplicaId = 46 => "unexpected_replica_id",
         IncompatibleParameterRange = 47 => "incompatible_parameter_range",
         FingerprintCommitmentMismatch = 48 => "fingerprint_commitment_mismatch",
+        PairingExpired = 49 => "pairing_expired",
         EmptyChannels = 60 => "empty_channels",
         DuplicateChannelId = 61 => "duplicate_channel_id",
         InvalidThreshold = 62 => "invalid_threshold",
@@ -146,12 +150,13 @@ vocabulary! {
         FfiNulInString = 106 => "ffi_nul_in_string",
         TransportInvalid = 120 => "transport_invalid",
         NoUsableEndpoint = 121 => "no_usable_endpoint",
+        TransportSendFailed = 123 => "transport_send_failed",
     }
 }
 
 /// Classifies a library error into the category and code every binding
 /// reports for it.
-pub(crate) fn classify(err: &crate::Error) -> (Category, Code) {
+pub(crate) fn classify(err: &Error) -> (Category, Code) {
     use crate::Error as E;
     match err {
         E::Pairing(e) => (Category::Pairing, pairing_code(e)),
@@ -163,8 +168,8 @@ pub(crate) fn classify(err: &crate::Error) -> (Category, Code) {
         E::DeRecMessage(_) => (Category::DeRecMessage, Code::BuilderError),
         E::SecretStore(e) => {
             let code = match e {
-                crate::protocol::SecretStoreError::MissingEntries {
-                    kind: crate::protocol::SecretKind::SharedKey,
+                SecretStoreError::MissingEntries {
+                    kind: SecretKind::SharedKey,
                     ..
                 } => Code::MissingSharedKey,
                 _ => Code::StoreError,
@@ -176,6 +181,7 @@ pub(crate) fn classify(err: &crate::Error) -> (Category, Code) {
         E::StateStore(_) => (Category::StateStore, Code::StoreError),
         E::Transport(_) => (Category::InvalidInput, Code::TransportInvalid),
         E::NoUsableEndpoint { .. } => (Category::InvalidInput, Code::NoUsableEndpoint),
+        E::TransportSendFailed => (Category::Transport, Code::TransportSendFailed),
         E::InvalidInput(_) => (Category::InvalidInput, Code::InvalidInput),
         E::ProtobufDecode(_) => (Category::Protobuf, Code::ProtobufDecode),
         E::ProtobufEncode(_) => (Category::Protobuf, Code::ProtobufEncode),
@@ -206,6 +212,7 @@ fn pairing_code(e: &PairingError) -> Code {
         PairingError::ProtocolViolation(_) => Code::ProtocolViolation,
         PairingError::PrePairHashMismatch => Code::PrePairHashMismatch,
         PairingError::FingerprintCommitmentMismatch => Code::FingerprintCommitmentMismatch,
+        PairingError::Expired(_) => Code::PairingExpired,
         PairingError::MissingReplicaId { .. } => Code::MissingReplicaId,
         PairingError::UnexpectedReplicaId { .. } => Code::UnexpectedReplicaId,
         PairingError::IncompatibleParameterRange { .. } => Code::IncompatibleParameterRange,
@@ -271,6 +278,7 @@ fn unpairing_code(e: &UnpairingError) -> Code {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn every_member_round_trips_through_its_discriminant() {
@@ -291,7 +299,7 @@ mod tests {
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         };
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for &code in Code::ALL {
             assert!(is_snake(code.name()), "{:?}", code);
             assert!(seen.insert(code.name()), "duplicate {}", code.name());
@@ -306,12 +314,43 @@ mod tests {
     fn restore_errors_are_classified_like_every_other_error() {
         use crate::protocol::RestoreError;
         assert_eq!(
-            classify(&crate::Error::Restore(RestoreError::AlreadyRestored)),
+            classify(&Error::Restore(RestoreError::AlreadyRestored)),
             (Category::InvalidInput, Code::AlreadyRestored)
         );
         assert_eq!(
-            classify(&crate::Error::Restore(RestoreError::Conflict(Vec::new()))),
+            classify(&Error::Restore(RestoreError::Conflict(Vec::new()))),
             (Category::InvalidInput, Code::RestoreConflict)
         );
+    }
+
+    /// The variants that name a channel report it, so every SDK can carry
+    /// it on its error; the rest report none.
+    #[test]
+    fn errors_naming_a_channel_report_it() {
+        use crate::types::ChannelId;
+        use derec_proto::SenderKind;
+        let channel = ChannelId(0xC0FFEE);
+        for error in [
+            Error::ChannelAlreadyPaired {
+                channel_id: channel,
+            },
+            Error::FingerprintMismatch {
+                channel_id: channel,
+            },
+            Error::RoleMismatch {
+                channel_id: channel,
+                expected: SenderKind::Owner,
+                actual: SenderKind::Helper,
+            },
+        ] {
+            assert_eq!(error.channel_id(), Some(channel), "{error:?}");
+        }
+        for error in [
+            Error::TransportSendFailed,
+            Error::ReplicaIdNotConfigured,
+            Error::NoUsableEndpoint { offered: 1 },
+        ] {
+            assert_eq!(error.channel_id(), None, "{error:?}");
+        }
     }
 }

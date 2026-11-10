@@ -33,12 +33,15 @@
 //! step that writes where it should not is caught rather than ignored.
 
 use std::collections::HashMap;
+use std::iter;
+use std::time::Duration;
 
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::{ChannelQuery, ChannelStatus, Secret, Target, UserSecret};
 use derec_library::protocol::{DeRecChannelStore, DeRecFlow};
 use derec_library::types::ChannelId;
 use derec_proto::{ContactMode, SenderKind};
+use tokio::time::sleep;
 
 use crate::db::Database;
 use crate::flows::assertions::{
@@ -279,9 +282,9 @@ async fn step_4_rotate_helpers(
         let mut spare = spare;
         let transient = ChannelId(3000 + i as u64);
         let channel = {
-            let cast: Vec<&StatelessPeer> = std::iter::once(owner)
+            let cast: Vec<&StatelessPeer> = iter::once(owner)
                 .chain(helpers.iter().map(|h| &h.peer))
-                .chain(std::iter::once(&spare.peer))
+                .chain(iter::once(&spare.peer))
                 .collect();
             // The replacements come in on the two modes with a PrePair leg,
             // so rotation is never proven only over InlineKeys.
@@ -805,7 +808,7 @@ async fn step_1_pair_helpers(owner: &StatelessPeer, helpers: &mut [HelperDevice]
         let transient = ChannelId(1000 + i as u64);
         let mode = HELPER_CONTACT_MODES[i];
         let channel = {
-            let cast: Vec<&StatelessPeer> = std::iter::once(owner)
+            let cast: Vec<&StatelessPeer> = iter::once(owner)
                 .chain(helpers.iter().map(|h| &h.peer))
                 .collect();
             pair_helper(owner, &helpers[i].peer, transient, &cast, mode).await
@@ -1355,7 +1358,7 @@ async fn recover_from_helpers(
 
     let restore_events = owner
         .session()
-        .restore(&recovered, version)
+        .restore(&recovered, version, version)
         .await
         .expect("owner.restore() failed");
     let recovery_channels: Vec<ChannelId> = restore_events
@@ -1530,7 +1533,7 @@ async fn step_10_a_silent_helper_is_resolved_by_a_scheduled_tick(
     );
 
     // Nothing arrives. Only the clock moves.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    sleep(Duration::from_secs(2)).await;
 
     let events = owner.session().tick().await;
 

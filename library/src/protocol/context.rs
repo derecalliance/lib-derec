@@ -10,10 +10,14 @@
 //! [`PairingConfig`] carries what a peer is told at pairing time and is
 //! meaningless outside it.
 
+use crate::protocol::obligation::Obligation;
 use crate::transport::TransportPolicy;
 use crate::types::ChannelId;
+use crate::types::ReplicaId;
+use derec_proto::ParameterRange;
 use derec_proto::TransportProtocol;
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// Identity and configuration constant for the lifetime of a protocol
 /// instance.
@@ -52,7 +56,7 @@ pub(crate) struct Local<'a> {
     /// against the bytes of an incoming `StoreShareRequest`. The frequency
     /// fields are checked for overlap at pairing but enforced by the
     /// application's share store, not read from this field.
-    pub(crate) parameter_range: Option<&'a derec_proto::ParameterRange>,
+    pub(crate) parameter_range: Option<&'a ParameterRange>,
     /// Whether this device advances channel keys: helper channels in each
     /// sharing round that reaches the threshold, the group channel on each
     /// publish to replicas.
@@ -72,11 +76,8 @@ impl Local<'_> {
     ///
     /// Empty when replica flows are off, which excludes nothing — correctly,
     /// since a device with no group identity holds no row to leave out.
-    pub(crate) fn exclude_self(&self) -> Vec<crate::types::ReplicaId> {
-        self.replica_id
-            .map(crate::types::ReplicaId)
-            .into_iter()
-            .collect()
+    pub(crate) fn exclude_self(&self) -> Vec<ReplicaId> {
+        self.replica_id.map(ReplicaId).into_iter().collect()
     }
 }
 
@@ -101,7 +102,7 @@ pub(crate) struct Exchange<'a> {
     /// Every response to it is sent through
     /// [`deliver`](crate::protocol::obligation::deliver) with this, so it is
     /// answered once.
-    pub(crate) obligation: Option<&'a crate::protocol::obligation::Obligation>,
+    pub(crate) obligation: Option<&'a Obligation>,
 }
 
 /// What one [`DeRecProtocol::start`](crate::protocol::DeRecProtocol::start)
@@ -120,7 +121,7 @@ pub(crate) struct Round<'a> {
     /// endpoints recorded at pairing. Governed by
     /// [`with_auto_reply_to`](crate::protocol::DeRecProtocolBuilder::with_auto_reply_to);
     /// pairing ignores it, carrying its endpoints in its own field instead.
-    pub(crate) reply_to: &'a [derec_proto::TransportProtocol],
+    pub(crate) reply_to: &'a [TransportProtocol],
     /// The correlation token every request in this round carries, and that
     /// each peer echoes on its response. Drawn once per `start`, so a
     /// fan-out is one trace rather than one per target.
@@ -132,7 +133,10 @@ pub(crate) struct Round<'a> {
 /// Separate from [`Local`] because it is read by the pairing entry points
 /// alone; the other flows would carry a field they can never use.
 pub(crate) struct PairingConfig<'a> {
-    pub(crate) parameter_range: Option<&'a derec_proto::ParameterRange>,
+    pub(crate) parameter_range: Option<&'a ParameterRange>,
+    /// How old a contact or a pairing request may be and still pair. See
+    /// [`Timeouts::pairing`](crate::protocol::types::Timeouts::pairing).
+    pub(crate) lifetime: Duration,
 }
 
 /// Borrow a [`DeRecProtocol`]'s identity into a [`Local`].
@@ -164,6 +168,7 @@ macro_rules! pairing_config {
     ($protocol:expr) => {
         $crate::protocol::context::PairingConfig {
             parameter_range: $protocol.parameter_range.as_ref(),
+            lifetime: $protocol.timeouts.pairing,
         }
     };
 }

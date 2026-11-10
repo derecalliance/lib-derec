@@ -8,14 +8,17 @@
 //! whole secret, which is the second leg of catch-up. The owner↔helper side
 //! lives in [`handlers::recovery`](super::super::recovery), which routes here
 //! when the payload names an author.
-use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
-use crate::extensions::channel_store::ChannelStoreExt as _;
+use super::super::sharing::{build_catch_up_payload, hydrate_catch_up};
+use crate::derec_message::{DeRecMessageBuilder, apply_trace_id, current_timestamp};
+use crate::extensions::advertised_endpoints::reply_to_owned;
+use crate::extensions::channel_store::{ChannelStoreExt as _, filter_reply_to};
 use crate::primitives::sharing::request::SHARE_ALGORITHM_REPLICA_SECRET;
 use crate::protocol::DeRecEvent;
 use crate::protocol::context::{Exchange, Local};
+use crate::protocol::obligation::{Obligation, deliver};
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::ReplicaMember;
-use crate::types::ReplicaId;
+use crate::types::{ChannelId, ReplicaId};
 use crate::{Error, Result};
 use derec_proto::{
     DeRecResult, GetShareRequestMessage, GetShareResponseMessage, MessageBody, StatusEnum,
@@ -82,9 +85,9 @@ async fn on_request<S: StoreSet>(
     request: &GetShareRequestMessage,
     key: &crate::protocol::ChannelKey,
     inbound_trace_id: u64,
-    obligation: Option<&crate::protocol::obligation::Obligation>,
+    obligation: Option<&Obligation>,
 ) -> Result<Vec<DeRecEvent>> {
-    let composite = super::super::sharing::build_catch_up_payload(stores, local).await?;
+    let composite = build_catch_up_payload(stores, local).await?;
 
     let (status, memo, share) = match composite {
         Some(payload) => (StatusEnum::Ok, String::new(), payload.encode_to_vec()),
@@ -117,21 +120,18 @@ async fn on_request<S: StoreSet>(
         .encrypt(key)?
         .build()?
         .encode_to_vec();
-    let envelope = crate::derec_message::apply_trace_id(&envelope, inbound_trace_id)?;
+    let envelope = apply_trace_id(&envelope, inbound_trace_id)?;
     // A reply-to overrides the recorded endpoints for this exchange only,
     // and only once it has passed the same transport policy every other
     // peer-supplied endpoint is held to; an offer refused in full is no
     // reply-to at all.
-    let reply_to = crate::extensions::channel_store::filter_reply_to(
-        local.policy,
-        &crate::extensions::advertised_endpoints::reply_to_owned(request),
-    );
+    let reply_to = filter_reply_to(local.policy, &reply_to_owned(request));
     let endpoint = if reply_to.is_empty() {
         member.transports.clone()
     } else {
         reply_to
     };
-    crate::protocol::obligation::deliver(
+    deliver(
         obligation,
         stores.transport,
         &endpoint,
@@ -148,7 +148,7 @@ async fn on_request<S: StoreSet>(
 async fn on_response<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-    arrived_on: crate::types::ChannelId,
+    arrived_on: ChannelId,
     from: ReplicaId,
     response: &GetShareResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
@@ -162,7 +162,7 @@ async fn on_response<S: StoreSet>(
         ));
     }
 
-    super::super::sharing::hydrate_catch_up(
+    hydrate_catch_up(
         stores,
         local,
         arrived_on,

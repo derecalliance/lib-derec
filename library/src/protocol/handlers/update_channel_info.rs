@@ -14,7 +14,9 @@ use crate::extensions::message_body::MessageBodyExt as _;
 use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::protocol::context::{Exchange, Local};
+use crate::protocol::obligation::{deliver, reported};
 use crate::protocol::stores::{StoreSet, Stores};
+use crate::protocol::types::{ChannelQuery, ChannelRecord};
 use crate::{Error, Result, protocol::types::Target, types::ChannelId};
 use derec_proto::{
     CommunicationInfo, DeRecResult, MessageBody, StatusEnum, TransportProtocol,
@@ -107,10 +109,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     let secret_id = local.secret_id;
     let channel = stores
         .channels
-        .load(
-            secret_id,
-            crate::protocol::types::ChannelQuery::Helper { channel_id },
-        )
+        .load(secret_id, ChannelQuery::Helper { channel_id })
         .await?
         .ok_or(Error::InvalidInput(
             "channel id not present in channel store",
@@ -137,23 +136,23 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     // Either record kind can carry an endpoint change; the fields live on the
     // variants rather than the enum.
     let channel = match channel {
-        crate::protocol::types::ChannelRecord::Helper(mut h) => {
+        ChannelRecord::Helper(mut h) => {
             if let Some(ci) = new_info {
                 h.communication_info = ci;
             }
             if let Some(tps) = new_transport.clone() {
                 h.transports = tps;
             }
-            crate::protocol::types::ChannelRecord::Helper(h)
+            ChannelRecord::Helper(h)
         }
-        crate::protocol::types::ChannelRecord::Replica(mut r) => {
+        ChannelRecord::Replica(mut r) => {
             if let Some(ci) = new_info {
                 r.communication_info = ci;
             }
             if let Some(tps) = new_transport {
                 r.transports = tps;
             }
-            crate::protocol::types::ChannelRecord::Replica(r)
+            ChannelRecord::Replica(r)
         }
     };
 
@@ -178,7 +177,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .channels
         .peer_endpoints(secret_id, channel_id)
         .await?;
-    let sent = crate::protocol::obligation::deliver(
+    let sent = deliver(
         exchange.obligation,
         stores.transport,
         &endpoint,
@@ -196,7 +195,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         "update_channel_info applied; Ok response sent"
     );
 
-    crate::protocol::obligation::reported(
+    reported(
         exchange.obligation,
         vec![DeRecEvent::ChannelInfoUpdated { channel_id }],
         sent,
@@ -230,7 +229,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         .channels
         .peer_endpoints(local.secret_id, exchange.channel_id)
         .await?;
-    crate::protocol::obligation::deliver(
+    deliver(
         exchange.obligation,
         stores.transport,
         &endpoint,
@@ -431,7 +430,10 @@ mod tests {
     use super::*;
     use crate::derec_message::current_timestamp;
     use crate::protocol::context::Exchange;
+    use crate::protocol::types::ChannelQuery;
+    use crate::transport::TransportValidationError;
     use crate::types::SharedKey;
+    use derec_proto::{Protocol, SenderKind, TransportProtocol};
 
     /// A peer-supplied `UpdateChannelInfoRequest.supported_transports` entry
     /// declaring `Protocol::Https` but carrying a URI with an
@@ -446,9 +448,9 @@ mod tests {
         let channel_id = ChannelId(31);
         let shared_key = SharedKey::new([11u8; 32]);
 
-        let malicious_transport = derec_proto::TransportProtocol {
+        let malicious_transport = TransportProtocol {
             uri: "ws://attacker.example/inbox".to_owned(),
-            protocol: derec_proto::Protocol::Https as i32,
+            protocol: Protocol::Https as i32,
         };
 
         let request = UpdateChannelInfoRequestMessage {
@@ -473,7 +475,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(Error::Transport(
-                crate::transport::TransportValidationError::SchemeMismatch { .. }
+                TransportValidationError::SchemeMismatch { .. }
             ))
         ));
     }
@@ -491,9 +493,9 @@ mod tests {
             let channel_id = ChannelId(41);
             let shared_key = SharedKey::new([7u8; 32]);
             let lf = LocalFixture {
-                own_transports: vec![derec_proto::TransportProtocol {
+                own_transports: vec![TransportProtocol {
                     uri: "grpcs://me.example.com:443".to_owned(),
-                    protocol: derec_proto::Protocol::Grpc as i32,
+                    protocol: Protocol::Grpc as i32,
                 }],
                 ..LocalFixture::new(0x0C1)
             };
@@ -503,12 +505,12 @@ mod tests {
                     lf.secret_id,
                     ChannelRecord::Helper(HelperChannel {
                         channel_id,
-                        transports: vec![derec_proto::TransportProtocol {
+                        transports: vec![TransportProtocol {
                             uri: "grpcs://peer.example.com:443".to_owned(),
-                            protocol: derec_proto::Protocol::Grpc as i32,
+                            protocol: Protocol::Grpc as i32,
                         }],
                         communication_info: HashMap::new(),
-                        peer_role: derec_proto::SenderKind::Owner,
+                        peer_role: SenderKind::Owner,
                         status: ChannelStatus::Paired,
                         created_at: 0,
                         weight: 1,
@@ -516,9 +518,9 @@ mod tests {
                 )
                 .await
                 .expect("seed channel");
-            let moved_to = derec_proto::TransportProtocol {
+            let moved_to = TransportProtocol {
                 uri: "https://peer.example.com/derec".to_owned(),
-                protocol: derec_proto::Protocol::Https as i32,
+                protocol: Protocol::Https as i32,
             };
             let request = UpdateChannelInfoRequestMessage {
                 supported_transports: vec![moved_to.clone()],
@@ -561,10 +563,7 @@ mod tests {
                 .expect("accept");
             let stored = rig
                 .channels
-                .load(
-                    lf.secret_id,
-                    crate::protocol::types::ChannelQuery::Helper { channel_id },
-                )
+                .load(lf.secret_id, ChannelQuery::Helper { channel_id })
                 .await
                 .expect("load")
                 .and_then(|r| r.as_helper().cloned())

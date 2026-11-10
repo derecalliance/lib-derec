@@ -21,6 +21,8 @@
 //! Build it by accumulating the `response_proto_bytes` returned by repeated
 //! calls to [`extract_get_share_response`].
 
+use std::slice;
+
 use crate::interop::ffi::common::{
     DeRecBuffer, empty_buffer, parse_transport_protocol_list, read_len_prefixed_vec, read_u32_le,
     vec_into_buffer,
@@ -29,6 +31,7 @@ use crate::interop::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_NULL_PTR, DeRecError,
     ffi_error, from_lib_error, success,
 };
+use crate::primitives::recovery::{request, response};
 use derec_proto::{
     DeRecMessage, GetShareRequestMessage, GetShareResponseMessage, StoreShareRequestMessage,
 };
@@ -103,7 +106,7 @@ pub extern "C" fn produce_get_share_request_message(
         Err(e) => return with_err(e),
     };
 
-    match crate::primitives::recovery::request::produce(
+    match request::produce(
         channel_id.into(),
         secret_id,
         version,
@@ -153,7 +156,7 @@ pub extern "C" fn extract_get_share_request(
         }
     };
 
-    match crate::primitives::recovery::request::extract(request_bytes, &shared_key) {
+    match request::extract(request_bytes, &shared_key) {
         Ok(r) => ExtractGetShareRequestResult {
             error: success(),
             channel_id,
@@ -228,7 +231,7 @@ pub extern "C" fn produce_get_share_response_message(
         }
     };
 
-    match crate::primitives::recovery::response::produce(
+    match response::produce(
         channel_id.into(),
         &request,
         &stored_share,
@@ -277,7 +280,7 @@ pub extern "C" fn extract_get_share_response(
         }
     };
 
-    match crate::primitives::recovery::response::extract(response_bytes, &shared_key) {
+    match response::extract(response_bytes, &shared_key) {
         Ok(r) => ExtractGetShareResponseResult {
             error: success(),
             channel_id,
@@ -333,7 +336,7 @@ pub extern "C" fn recover_from_share_responses(
 
     let borrowed: Vec<&GetShareResponseMessage> = responses.iter().collect();
 
-    match crate::primitives::recovery::response::recover(secret_id, version, &borrowed) {
+    match response::recover(secret_id, version, &borrowed) {
         Ok(r) => RecoverFromShareResponsesResult {
             error: success(),
             secret_data: vec_into_buffer(r.secret_data),
@@ -369,7 +372,7 @@ fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], 
     if len == 0 {
         Ok(&[])
     } else {
-        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+        Ok(unsafe { slice::from_raw_parts(ptr, len) })
     }
 }
 
