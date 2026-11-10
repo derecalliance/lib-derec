@@ -18,7 +18,7 @@ use crate::interop::wasm::now_secs;
 use crate::primitives::sharing::response::validate_committed_share;
 use crate::protocol::DeRecUserSecretStore;
 use crate::protocol::context::{Exchange, Local};
-use crate::protocol::handlers::sharing::{repin, subshare_count};
+use crate::protocol::handlers::sharing::subshare_count;
 use crate::protocol::obligation::{Obligation, attempted, deliver, refused, reported};
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{
@@ -726,10 +726,12 @@ async fn on_request<S: StoreSet>(
         .as_ref()
         .is_some_and(|group| group.channel_id == channel.channel_id.0);
     if on_group {
-        repin(stores, partition, channel.channel_id, |ring| {
-            ring.pinned(version, key)
-        })
-        .await?;
+        stores
+            .secrets
+            .repin(partition, channel.channel_id, |ring| {
+                ring.pinned(version, key)
+            })
+            .await?;
     }
 
     let hydrated = hydrate(
@@ -743,10 +745,12 @@ async fn on_request<S: StoreSet>(
     .await?;
 
     if on_group {
-        repin(stores, partition, channel.channel_id, |ring| {
-            ring.retain_pins(|v| v == version)
-        })
-        .await?;
+        stores
+            .secrets
+            .repin(partition, channel.channel_id, |ring| {
+                ring.retain_pins(|v| v == version)
+            })
+            .await?;
     }
 
     // Every member answers on the group channel under the group key. Before

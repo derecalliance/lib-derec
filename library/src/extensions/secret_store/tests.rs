@@ -304,3 +304,60 @@ fn save_key_ring_refuses_a_ring_it_cannot_encode() {
         );
     });
 }
+
+/// A channel with no key holds no pins: the edit never runs and nothing is
+/// written.
+#[test]
+fn repin_leaves_a_channel_without_a_key_alone() {
+    run_async(async {
+        let mut secrets = InMemSecretStore::default();
+
+        secrets
+            .repin(SECRET_ID, CHANNEL, |_| panic!("no ring to edit"))
+            .await
+            .expect("repin");
+
+        assert!(secrets.data.lock().unwrap().is_empty());
+    });
+}
+
+/// An edit that changes nothing writes nothing: a channel with only its
+/// `SharedKey` row gains no ring row.
+#[test]
+fn repin_writes_nothing_when_the_pins_do_not_change() {
+    run_async(async {
+        let mut secrets = InMemSecretStore::default();
+        seed_key(&mut secrets, CHANNEL, key(9)).await;
+
+        secrets
+            .repin(SECRET_ID, CHANNEL, |ring| ring.retain_pins(|_| true))
+            .await
+            .expect("repin");
+
+        let data = secrets.data.lock().unwrap();
+        assert!(!data.contains_key(&(SECRET_ID, CHANNEL.0, SecretKind::KeyRing as u8)));
+    });
+}
+
+/// A changed ring is saved and read back.
+#[test]
+fn repin_saves_a_changed_ring() {
+    run_async(async {
+        let mut secrets = InMemSecretStore::default();
+        let ring = ring_at(2);
+        secrets
+            .save_key_ring(SECRET_ID, CHANNEL, &ring)
+            .await
+            .expect("save");
+
+        secrets
+            .repin(SECRET_ID, CHANNEL, |ring| ring.pinned(5, &ring.current()))
+            .await
+            .expect("repin");
+
+        assert_eq!(
+            secrets.key_ring(SECRET_ID, CHANNEL).await.expect("read"),
+            Some(ring.pinned(5, &ring.current()))
+        );
+    });
+}

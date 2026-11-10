@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use super::decode_gzip_json;
 use crate::protocol::types::secret::SecretError;
 use crate::protocol::types::{HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret};
+use crate::utils::is_zero;
 
 mod base64_bytes {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -341,10 +342,6 @@ where
 {
     use serde::Deserialize as _;
     Ok(Option::<u32>::deserialize(d)?.unwrap_or_default())
-}
-
-fn is_zero(epoch: &u32) -> bool {
-    *epoch == 0
 }
 
 fn de_map<'de, D>(d: D) -> Result<HashMap<String, String>, D::Error>

@@ -29,6 +29,7 @@ use crate::protocol::{
     types::{ChannelShare, Secret},
 };
 use crate::protocol::{CorruptionReason, IgnoreReason, NotRestoredReason, VerifyFailureReason};
+use crate::utils::is_zero;
 use derec_proto::TransportProtocol;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -497,10 +498,6 @@ pub struct ReplicasWire {
     /// The epoch of `shared_key` on the group channel, omitted when `0`.
     #[serde(skip_serializing_if = "is_zero")]
     pub key_epoch: u32,
-}
-
-fn is_zero(value: &u32) -> bool {
-    *value == 0
 }
 
 /// One advertised endpoint, carrying its protocol by name (`"https"`,

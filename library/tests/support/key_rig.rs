@@ -80,6 +80,10 @@ pub fn key_at(channel_id: ChannelId, epoch: u32) -> [u8; 32] {
 }
 
 /// The contents of a stored ring, read from its encoding.
+///
+/// Decoded here rather than through `KeyRing`, whose pins and old keys are not
+/// public: the stored bytes are the format every store persists, and an
+/// independent reader fails when that format changes.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RingView {
     pub epoch: u32,

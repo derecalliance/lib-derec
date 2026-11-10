@@ -147,6 +147,25 @@ pub(crate) trait SecretStoreExt: DeRecSecretStore {
         .await?;
         Ok(())
     }
+
+    /// Rewrite the pins of `channel_id` with `edit`, saving the ring only
+    /// when it changes. A channel with no key holds no pins, and is left as
+    /// it is.
+    async fn repin(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        edit: impl FnOnce(&KeyRing) -> KeyRing,
+    ) -> Result<()> {
+        let Some(ring) = self.key_ring(secret_id, channel_id).await? else {
+            return Ok(());
+        };
+        let edited = edit(&ring);
+        if edited != ring {
+            self.save_key_ring(secret_id, channel_id, &edited).await?;
+        }
+        Ok(())
+    }
 }
 
 impl<T: DeRecSecretStore> SecretStoreExt for T {}

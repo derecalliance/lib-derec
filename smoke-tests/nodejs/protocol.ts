@@ -4891,26 +4891,18 @@ async function runVerifyNoProofFlow(): Promise<void> {
 
 /**
  * The epoch of the key ring `node` stores for `channelId`, read from its own
- * secret store: the ring's bytes are a version byte followed by the
- * big-endian u32 epoch.
+ * secret store: the ring's bytes are a version byte, 1 for the encoding
+ * `KeyRing::as_bytes` documents, followed by the big-endian u32 epoch.
  */
 async function storedKeyEpoch(node: Node, secretId: bigint, channelId: string): Promise<number> {
   const ring = await node.secretStore.load(secretId.toString(), channelId, 3);
   if (!ring || ring.length < 5) {
     throw new Error(`channel ${channelId} must store a KeyRing`);
   }
+  if (ring[0] !== 1) {
+    throw new Error(`channel ${channelId} stores KeyRing encoding ${ring[0]}, this reader knows 1`);
+  }
   return new DataView(ring.buffer, ring.byteOffset, ring.byteLength).getUint32(1);
-}
-
-/**
- * The `sequence` of a DeRecMessage envelope (field 3, a varint): the epoch of
- * the key its payload is under.
- */
-function envelopeSequence(envelope: Uint8Array): number {
-  const { start, end } = protoField(envelope, 3);
-  let value = 0;
-  for (let i = end - 1; i >= start; i--) value = value * 128 + (envelope[i]! & 0x7f);
-  return value;
 }
 
 /** `envelope` with its `sequence` (field 3) replaced by `sequence`. */
@@ -4998,8 +4990,8 @@ async function runKeyRotationFlow(): Promise<void> {
 
   await owner.protocol.start(FlowKind.VerifyShares, { secretId, version: 2, target: BigInt(channelA) });
   const challenge = drainOne(owner, "Owner");
-  if (envelopeSequence(challenge) !== 2) {
-    throw new Error(`the challenge must be under K2, sequence ${envelopeSequence(challenge)}`);
+  if (envelope.read_sequence(challenge) !== 2) {
+    throw new Error(`the challenge must be under K2, sequence ${envelope.read_sequence(challenge)}`);
   }
   const ignored = await helperA.protocol.process(withSequence(challenge, 2 + 513));
   const keyIgnored = ignored[0];

@@ -140,10 +140,10 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 /// channel one epoch. Each new epoch is stored together with the pin of
 /// this round's version before anything is sent, and the published secret
 /// records each channel's key and epoch. With it off, every channel stays on
-/// its current key. The checks that can refuse a round without sending
-/// anything (the replica roster, the group key and the round's
-/// `keepVersion`) run before any channel moves, so a refused publish moves no
-/// epoch.
+/// its current key. The rings are stored only after every check that can
+/// refuse the round (the replica roster, the group key and the round's
+/// `keepVersion`), the secret build and the split have passed, so a round
+/// that fails before sending moves no epoch.
 ///
 /// The snapshot is persisted only *after* distribution attempts
 /// complete, so an interrupted round never leaves the version ahead of
@@ -231,19 +231,17 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     };
 
     // Every Helper is sent a share under the epoch this round moves its
-    // channel to. The new epoch and the version's pin are stored before
-    // anything is sent, and before the secret naming the new key is built. A
-    // response still in flight under the previous epoch stays decryptable,
-    // because the pin of the previous version keeps that key.
+    // channel to. The moved rings are built here and stored only once the
+    // secret naming the new keys is built and split, so a round that fails
+    // before sending moves no epoch. A response still in flight under the
+    // previous epoch stays decryptable, because the pin of the previous
+    // version keeps that key.
+    let mut moved_rings: Vec<(ChannelId, KeyRing)> = Vec::new();
     if local.key_rotation && splits {
         for (channel, ring) in helpers.iter_mut() {
             if let Some(advanced) = ring.advanced() {
-                let advanced = advanced.pinned(version, &advanced.current());
-                stores
-                    .secrets
-                    .save_key_ring(secret_id, channel.channel_id, &advanced)
-                    .await?;
-                *ring = advanced;
+                *ring = advanced.pinned(version, &advanced.current());
+                moved_rings.push((channel.channel_id, ring.clone()));
             }
         }
     }
@@ -262,10 +260,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
                 };
                 let pinned = moved.pinned(version, &moved.current());
                 if pinned != ring {
-                    stores
-                        .secrets
-                        .save_key_ring(secret_id, channel_id, &pinned)
-                        .await?;
+                    moved_rings.push((channel_id, pinned.clone()));
                 }
                 for (member, member_ring) in replicas.iter_mut() {
                     if member.channel_id == channel_id {
@@ -313,6 +308,13 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     } else {
         None
     };
+
+    for (channel_id, ring) in &moved_rings {
+        stores
+            .secrets
+            .save_key_ring(secret_id, *channel_id, ring)
+            .await?;
+    }
 
     let mut outcomes: Vec<(ChannelId, Result<()>)> = Vec::new();
     let mut replica_outcomes: Vec<(ReplicaId, Result<()>)> = Vec::new();
@@ -636,10 +638,12 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
             // The pin goes first: a share stored without its pin could leave
             // its key unheld, while a pin without its share is dropped by the
             // next prune.
-            repin(stores, secret_id, channel_id, |ring| {
-                ring.pinned(version, exchange.key)
-            })
-            .await?;
+            stores
+                .secrets
+                .repin(secret_id, channel_id, |ring| {
+                    ring.pinned(version, exchange.key)
+                })
+                .await?;
             let save_result = stores
                 .shares
                 .save(
@@ -723,10 +727,12 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .filter(|v| !stale.contains(v))
         .chain(std::iter::once(version))
         .collect();
-    repin(stores, secret_id, channel_id, |ring| {
-        ring.retain_pins(|v| stored.contains(&v))
-    })
-    .await?;
+    stores
+        .secrets
+        .repin(secret_id, channel_id, |ring| {
+            ring.retain_pins(|v| stored.contains(&v))
+        })
+        .await?;
 
     let resp = sharing_response::produce(channel_id, request, exchange.key)?;
     let envelope = crate::derec_message::apply_trace_id(&resp.envelope, exchange.trace_id)?;
@@ -1262,27 +1268,6 @@ async fn resolve_keep_version<S: StoreSet>(
     Ok(keep_version)
 }
 
-/// Rewrite the pins of `channel_id` with `edit`, saving the ring only when
-/// it changes. A channel with no key holds no pins, and is left as it is.
-pub(in crate::protocol) async fn repin<S: StoreSet>(
-    stores: &mut Stores<'_, S>,
-    secret_id: u64,
-    channel_id: ChannelId,
-    edit: impl FnOnce(&KeyRing) -> KeyRing,
-) -> Result<()> {
-    let Some(ring) = stores.secrets.key_ring(secret_id, channel_id).await? else {
-        return Ok(());
-    };
-    let edited = edit(&ring);
-    if edited != ring {
-        stores
-            .secrets
-            .save_key_ring(secret_id, channel_id, &edited)
-            .await?;
-    }
-    Ok(())
-}
-
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(trace_id = round.trace_id, secret_id = local.secret_id)))]
 #[allow(clippy::too_many_arguments)]
 async fn distribute_shares<S: StoreSet>(
@@ -1407,10 +1392,12 @@ async fn dispatch_share_to_helper<S: StoreSet>(
     let key = &ring.current();
     // Pinned before the request leaves, so the key a reply may arrive under
     // is held until the Helper confirms a later version.
-    repin(stores, secret_id, channel.channel_id, |ring| {
-        ring.pinned(version, key)
-    })
-    .await?;
+    stores
+        .secrets
+        .repin(secret_id, channel.channel_id, |ring| {
+            ring.pinned(version, key)
+        })
+        .await?;
     let msg = produce_store_share_request_message(
         channel.channel_id,
         version,

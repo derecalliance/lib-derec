@@ -5403,13 +5403,15 @@ func runReplicaRemovalPublishesTheRoster() {
 }
 
 // storedKeyEpoch is the epoch of the key ring p stores for channelID, read
-// from its own secret store: the ring's bytes are a version byte followed by
-// the big-endian u32 epoch.
+// from its own secret store: the ring's bytes are a version byte, 1 for the
+// encoding KeyRing::as_bytes documents, followed by the big-endian u32 epoch.
 func storedKeyEpoch(p *peer, channelID uint64) uint32 {
 	value, ok, err := p.secretStore.Load(protocolSecretID, channelID, protocol.SecretKindKeyRing)
 	must(err, fmt.Sprintf("[%s] secretStore.Load(KeyRing)", p.label))
 	assertTrue(ok && value.Kind == protocol.SecretKindKeyRing && len(value.Bytes) >= 5,
 		"[%s] channel %d must store a KeyRing, got ok=%v %+v", p.label, channelID, ok, value)
+	assertTrue(value.Bytes[0] == 1,
+		"[%s] channel %d stores KeyRing encoding %d, this reader knows 1", p.label, channelID, value.Bytes[0])
 	return binary.BigEndian.Uint32(value.Bytes[1:5])
 }
 

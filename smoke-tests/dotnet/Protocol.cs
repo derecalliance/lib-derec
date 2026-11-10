@@ -2085,7 +2085,9 @@ internal static class Protocol
     /// <summary>
     /// The epoch of the key ring <paramref name="node"/> stores for
     /// <paramref name="channelId"/>, read from its own secret store: the
-    /// ring's bytes are a version byte followed by the big-endian u32 epoch.
+    /// ring's bytes are a version byte, 1 for the encoding
+    /// <c>KeyRing::as_bytes</c> documents, followed by the big-endian u32
+    /// epoch.
     /// </summary>
     private static uint StoredKeyEpoch(Node node, ulong secretId, ulong channelId)
     {
@@ -2093,6 +2095,8 @@ internal static class Protocol
             ?? throw new InvalidOperationException($"channel {channelId} must store a KeyRing");
         if (ring.Kind != SecretKind.KeyRing || ring.Bytes.Length < 5)
             throw new InvalidOperationException($"channel {channelId} holds no KeyRing bytes");
+        if (ring.Bytes[0] != 1)
+            throw new InvalidOperationException($"channel {channelId} stores KeyRing encoding {ring.Bytes[0]}, this reader knows 1");
         return System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(ring.Bytes.AsSpan(1, 4));
     }
 
