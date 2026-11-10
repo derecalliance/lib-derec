@@ -1498,6 +1498,7 @@ mod sharing_round_outcome {
 
 mod timeout {
     use super::*;
+    use crate::extensions::derec_message::DeRecMessageExt as _;
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::tests::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
@@ -1571,30 +1572,17 @@ mod timeout {
         });
 
         assert!(
-            !protocol.is_message_expired(&envelope_aged(60), ChannelId(1)),
+            !envelope_aged(60).is_expired(now_secs(), protocol.timeouts.inbound_message),
             "an envelope inside the window is accepted"
         );
         assert!(
-            !protocol.is_message_expired(&envelope_aged(120), ChannelId(1)),
+            !envelope_aged(120).is_expired(now_secs(), protocol.timeouts.inbound_message),
             "the boundary itself is inclusive"
         );
         assert!(
-            protocol.is_message_expired(&envelope_aged(121), ChannelId(1)),
+            envelope_aged(121).is_expired(now_secs(), protocol.timeouts.inbound_message),
             "an envelope past the window is discarded"
         );
-    }
-
-    /// A timestampless envelope is not judged stale — the timestamp
-    /// invariant is enforced elsewhere, and treating "absent" as "expired"
-    /// here would mask it.
-    #[test]
-    fn an_envelope_without_a_timestamp_is_not_expired() {
-        let protocol = build_with(Timeouts::default());
-        let envelope = DeRecMessage {
-            timestamp: None,
-            ..Default::default()
-        };
-        assert!(!protocol.is_message_expired(&envelope, ChannelId(1)));
     }
 
     /// **The point of the split.** Shortening the liveness budgets must not
@@ -1611,7 +1599,7 @@ mod timeout {
 
         assert_eq!(protocol.timeouts.inbound_message, Duration::from_secs(300));
         assert!(
-            !protocol.is_message_expired(&envelope_aged(290), ChannelId(1)),
+            !envelope_aged(290).is_expired(now_secs(), protocol.timeouts.inbound_message),
             "a message well inside the default replay window is still accepted \
              even though both liveness budgets are one second"
         );

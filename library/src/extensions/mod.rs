@@ -32,6 +32,7 @@ pub(crate) mod channel_store;
 pub(crate) mod committed_derec_share;
 pub(crate) mod communication_info;
 pub(crate) mod contact_message;
+pub(crate) mod derec_message;
 pub(crate) mod derec_result;
 pub(crate) mod derec_share;
 pub(crate) mod message_body;

@@ -11,7 +11,7 @@
 use super::context::{local, pairing_config};
 use super::error::ProcessError;
 use super::events::DeRecEvent;
-use super::keychain::Lookup;
+use super::keychain::{KeyRing, Lookup};
 use super::stores::borrow_stores;
 use super::traits::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport,
@@ -19,19 +19,20 @@ use super::traits::{
 };
 use super::types::{SecretKind, SecretValue};
 use super::{DeRecProtocol, handlers};
-use crate::extensions::channel_store::ChannelStoreExt as _;
-use crate::extensions::secret_store::SecretStoreExt as _;
-use crate::{Error, Result, types::ChannelId};
-use derec_proto::DeRecMessage;
-use prost::Message;
-
 use crate::derec_message;
+use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::extensions::derec_message::DeRecMessageExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
 use crate::protocol::IgnoreReason;
+use crate::protocol::types::{ChannelQuery, ChannelStatus, ReplicaFilter};
+use crate::types::{ChannelId, ChannelKey};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
-use std::result;
+use crate::{Error, Result};
+use derec_proto::{DeRecMessage, PrePairRequestMessage, PrePairResponseMessage};
+use prost::Message;
 
 impl<
     Ch: DeRecChannelStore,
@@ -248,7 +249,7 @@ impl<
     async fn handle_message(
         &mut self,
         message: &[u8],
-    ) -> result::Result<(ChannelId, Vec<DeRecEvent>), (Option<ChannelId>, Error)> {
+    ) -> std::result::Result<(ChannelId, Vec<DeRecEvent>), (Option<ChannelId>, Error)> {
         let envelope =
             DeRecMessage::decode(message).map_err(|e| (None, Error::ProtobufDecode(e)))?;
         let channel_id = ChannelId(envelope.channel_id);
@@ -266,62 +267,18 @@ impl<
         Ok((channel_id, events))
     }
 
-    async fn is_pending_verification(&self, channel_id: ChannelId) -> Result<bool> {
-        use crate::protocol::types::{ChannelQuery, ChannelStatus, ReplicaFilter};
-
-        if let Some(record) = self
-            .channel_store
-            .load(self.secret_id, ChannelQuery::Helper { channel_id })
-            .await?
-            && record.status() == ChannelStatus::Pending
-        {
-            return Ok(true);
-        }
-
-        Ok(!self
-            .channel_store
-            .replicas_on_channel(
-                self.secret_id,
-                channel_id,
-                ReplicaFilter {
-                    status: vec![ChannelStatus::Pending],
-                    ..Default::default()
-                },
-            )
-            .await?
-            .is_empty())
-    }
-
-    pub(super) fn is_message_expired(
-        &self,
-        envelope: &DeRecMessage,
-        #[cfg_attr(not(feature = "logging"), allow(unused))] channel_id: ChannelId,
-    ) -> bool {
-        let Some(ts) = &envelope.timestamp else {
-            return false;
-        };
-        let msg_secs = ts.seconds as u64;
-        let now = now_secs();
-        let age = now.saturating_sub(msg_secs);
-        if age > self.timeouts.inbound_message.as_secs() {
-            #[cfg(feature = "logging")]
-            tracing::warn!(
-                channel_id = channel_id.0,
-                message_age_secs = age,
-                timeout_secs = self.timeouts.inbound_message.as_secs(),
-                "message discarded — older than configured timeout"
-            );
-            return true;
-        }
-        false
-    }
-
     async fn process_inner(
         &mut self,
         message: &DeRecMessage,
         channel_id: ChannelId,
     ) -> Result<Vec<DeRecEvent>> {
-        if self.is_message_expired(message, channel_id) {
+        if message.is_expired(now_secs(), self.timeouts.inbound_message) {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                channel_id = channel_id.0,
+                timeout_secs = self.timeouts.inbound_message.as_secs(),
+                "message discarded — older than configured timeout"
+            );
             return Ok(vec![DeRecEvent::MessageIgnored {
                 channel_id,
                 reason: IgnoreReason::Expired,
@@ -373,60 +330,69 @@ impl<
             return Ok(None);
         };
 
-        if self.is_pending_verification(channel_id).await? {
+        if let Some(events) = self
+            .ignore_if_pending_verification(message, channel_id)
+            .await?
+        {
+            return Ok(Some(events));
+        }
+
+        let Some((key, inner_message)) = self.open(&ring, message, channel_id).await? else {
             #[cfg(feature = "logging")]
             tracing::warn!(
                 channel_id = channel_id.0,
-                "message ignored — channel is pending fingerprint verification"
+                sequence = message.sequence,
+                "message ignored — no key for its epoch"
             );
             return Ok(Some(vec![DeRecEvent::MessageIgnored {
                 channel_id,
-                reason: IgnoreReason::PendingVerification,
+                reason: IgnoreReason::KeyUnavailable,
                 trace_id: message.trace_id,
             }]));
-        }
-
-        let (key, advanced) = match ring.lookup(message.sequence) {
-            Lookup::Unavailable => {
-                #[cfg(feature = "logging")]
-                tracing::warn!(
-                    channel_id = channel_id.0,
-                    sequence = message.sequence,
-                    "message ignored — no key for its epoch"
-                );
-                return Ok(Some(vec![DeRecEvent::MessageIgnored {
-                    channel_id,
-                    reason: crate::protocol::IgnoreReason::KeyUnavailable,
-                    trace_id: message.trace_id,
-                }]));
-            }
-            Lookup::Held(key) | Lookup::Behind(key) => (key, None),
-            Lookup::Ahead { key, advanced } => (key, Some(advanced)),
         };
-
-        let plaintext = crate::derec_message::decrypt_inner_message(&message.message, &key.key)?;
-
-        // The sender holds the newer key, so the move is kept even if
-        // handling then fails. A save failure leaves the ring where it was,
-        // and processing the same bytes again retries it.
-        if let Some(advanced) = advanced {
-            self.secret_store
-                .save_key_ring(self.secret_id, channel_id, &advanced)
-                .await?;
-        }
 
         let events = handlers::handle(
             &mut borrow_stores!(self),
             &local!(self),
             message,
             channel_id,
-            &plaintext,
+            &inner_message,
             &key,
             self.auto_respond_on_failure,
         )
         .await?;
 
         Ok(Some(events))
+    }
+
+    /// Decrypt `message` under the key `ring` holds for its `sequence`, and
+    /// store the ring moved forward when that epoch is ahead of the newest.
+    /// Returns the key and the decrypted payload, or `None` when the ring
+    /// has no key for the epoch.
+    ///
+    /// The sender holds the newer key, so the move is kept even if handling
+    /// then fails. A save failure leaves the ring where it was, and
+    /// processing the same bytes again retries it.
+    async fn open(
+        &mut self,
+        ring: &KeyRing,
+        message: &DeRecMessage,
+        channel_id: ChannelId,
+    ) -> Result<Option<(ChannelKey, Vec<u8>)>> {
+        let (key, advanced) = match ring.lookup(message.sequence) {
+            Lookup::Unavailable => return Ok(None),
+            Lookup::Held(key) | Lookup::Behind(key) => (key, None),
+            Lookup::Ahead { key, advanced } => (key, Some(advanced)),
+        };
+
+        let inner_message = derec_message::decrypt_inner_message(&message.message, &key.key)?;
+
+        if let Some(advanced) = advanced {
+            self.secret_store
+                .save_key_ring(self.secret_id, channel_id, &advanced)
+                .await?;
+        }
+        Ok(Some((key, inner_message)))
     }
 
     /// Dispatch a pairing message, trying the plaintext leg before the
@@ -457,58 +423,12 @@ impl<
         if let Ok(inner) = derec_message::extract_inner_plaintext_message(&message.message) {
             match inner {
                 MessageBody::PrePairRequest(request) => {
-                    let has_pairing_secret = matches!(
-                        self.secret_store
-                            .load(self.secret_id, channel_id, SecretKind::PairingSecret)
-                            .await?,
-                        Some(SecretValue::PairingSecret(_))
-                    );
-                    let has_pairing_contact = matches!(
-                        self.secret_store
-                            .load(self.secret_id, channel_id, SecretKind::PairingContact)
-                            .await?,
-                        Some(SecretValue::PairingContact(_))
-                    );
-                    if !has_pairing_secret && !has_pairing_contact {
-                        return Ok(None);
-                    }
-                    if let Some(events) = handlers::pairing::ignored_if_expired(
-                        &mut borrow_stores!(self),
-                        &local!(self),
-                        &pairing_config!(self),
-                        channel_id,
-                        request.timestamp.as_ref(),
-                        message.trace_id,
-                    )
-                    .await?
-                    {
-                        return Ok(Some(events));
-                    }
-                    let events = handlers::pairing::pre_pair::on_request(
-                        channel_id,
-                        &request,
-                        message.trace_id,
-                    )?;
-                    return Ok(Some(events));
+                    return self
+                        .process_pre_pair_request(message, channel_id, &request)
+                        .await;
                 }
-                MessageBody::PrePairResponse(resp) => {
-                    let Some(SecretValue::PairingContact(contact)) = self
-                        .secret_store
-                        .load(self.secret_id, channel_id, SecretKind::PairingContact)
-                        .await?
-                    else {
-                        return Ok(None);
-                    };
-                    let events = handlers::pairing::pre_pair::on_response(
-                        &mut borrow_stores!(self),
-                        &local!(self),
-                        &pairing_config!(self),
-                        channel_id,
-                        &contact,
-                        &resp,
-                    )
-                    .await?;
-                    return Ok(Some(events));
+                MessageBody::PrePairResponse(response) => {
+                    return self.process_pre_pair_response(channel_id, &response).await;
                 }
                 _ => {} // Fall through to the encrypted Pair path.
             }
@@ -533,6 +453,111 @@ impl<
         )
         .await?;
         Ok(Some(events))
+    }
+
+    /// Handle a `PrePairRequest` on a channel this device holds a
+    /// correlation record for, or return `None` when it holds neither kind.
+    async fn process_pre_pair_request(
+        &mut self,
+        message: &DeRecMessage,
+        channel_id: ChannelId,
+        request: &PrePairRequestMessage,
+    ) -> Result<Option<Vec<DeRecEvent>>> {
+        let has_pairing_secret = matches!(
+            self.secret_store
+                .load(self.secret_id, channel_id, SecretKind::PairingSecret)
+                .await?,
+            Some(SecretValue::PairingSecret(_))
+        );
+        let has_pairing_contact = matches!(
+            self.secret_store
+                .load(self.secret_id, channel_id, SecretKind::PairingContact)
+                .await?,
+            Some(SecretValue::PairingContact(_))
+        );
+        if !has_pairing_secret && !has_pairing_contact {
+            return Ok(None);
+        }
+        if let Some(events) = handlers::pairing::ignored_if_expired(
+            &mut borrow_stores!(self),
+            &local!(self),
+            &pairing_config!(self),
+            channel_id,
+            request.timestamp.as_ref(),
+            message.trace_id,
+        )
+        .await?
+        {
+            return Ok(Some(events));
+        }
+        let events =
+            handlers::pairing::pre_pair::on_request(channel_id, request, message.trace_id)?;
+        Ok(Some(events))
+    }
+
+    /// Handle a `PrePairResponse` against the contact this device stored,
+    /// or return `None` when it stored none for the channel.
+    async fn process_pre_pair_response(
+        &mut self,
+        channel_id: ChannelId,
+        response: &PrePairResponseMessage,
+    ) -> Result<Option<Vec<DeRecEvent>>> {
+        let Some(SecretValue::PairingContact(contact)) = self
+            .secret_store
+            .load(self.secret_id, channel_id, SecretKind::PairingContact)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let events = handlers::pairing::pre_pair::on_response(
+            &mut borrow_stores!(self),
+            &local!(self),
+            &pairing_config!(self),
+            channel_id,
+            &contact,
+            response,
+        )
+        .await?;
+        Ok(Some(events))
+    }
+
+    async fn ignore_if_pending_verification(
+        &self,
+        message: &DeRecMessage,
+        channel_id: ChannelId,
+    ) -> Result<Option<Vec<DeRecEvent>>> {
+        let helper_pending = self
+            .channel_store
+            .load(self.secret_id, ChannelQuery::Helper { channel_id })
+            .await?
+            .is_some_and(|record| record.status() == ChannelStatus::Pending);
+        let pending = helper_pending
+            || !self
+                .channel_store
+                .replicas_on_channel(
+                    self.secret_id,
+                    channel_id,
+                    ReplicaFilter {
+                        status: vec![ChannelStatus::Pending],
+                        ..Default::default()
+                    },
+                )
+                .await?
+                .is_empty();
+        if !pending {
+            return Ok(None);
+        }
+
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            channel_id = channel_id.0,
+            "message ignored — channel is pending fingerprint verification"
+        );
+        Ok(Some(vec![DeRecEvent::MessageIgnored {
+            channel_id,
+            reason: IgnoreReason::PendingVerification,
+            trace_id: message.trace_id,
+        }]))
     }
 }
 
