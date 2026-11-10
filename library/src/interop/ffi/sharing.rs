@@ -155,6 +155,9 @@ pub extern "C" fn produce_store_share_request_message(
     description_len: usize,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
     // `reply_to` is optional: pass `reply_to_len == 0` for "no override"
     // (the responder routes to the transports recorded for the channel).
     // When set, the bytes are a length-delimited sequence of
@@ -218,7 +221,7 @@ pub extern "C" fn produce_store_share_request_message(
         &committed_share,
         keep_version,
         description,
-        &shared_key,
+        &crate::types::ChannelKey::new(epoch, shared_key),
         &reply_to,
     ) {
         Ok(r) => ProduceStoreShareRequestMessageResult {
@@ -287,6 +290,9 @@ pub extern "C" fn produce_store_share_response_message(
     request_proto_len: usize,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
 ) -> ProduceStoreShareResponseMessageResult {
     let with_err = |error| ProduceStoreShareResponseMessageResult {
         error,
@@ -316,7 +322,11 @@ pub extern "C" fn produce_store_share_response_message(
         }
     };
 
-    match response::produce(ChannelId(channel_id), &request, &shared_key) {
+    match response::produce(
+        ChannelId(channel_id),
+        &request,
+        &crate::types::ChannelKey::new(epoch, shared_key),
+    ) {
         Ok(r) => ProduceStoreShareResponseMessageResult {
             error: success(),
             wire_bytes: vec_into_buffer(r.envelope),
@@ -465,9 +475,9 @@ fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], 
     }
 }
 
-fn parse_shared_key(ptr: *const u8, len: usize) -> Result<[u8; 32], DeRecError> {
+fn parse_shared_key(ptr: *const u8, len: usize) -> Result<crate::types::SharedKey, DeRecError> {
     let bytes = parse_buffer(ptr, len, "shared_key_ptr")?;
-    bytes.try_into().map_err(|_| {
+    crate::types::SharedKey::try_from(bytes).map_err(|_| {
         ffi_error(
             DEREC_CODE_FFI_BAD_SHARED_KEY,
             "shared_key must be exactly 32 bytes",

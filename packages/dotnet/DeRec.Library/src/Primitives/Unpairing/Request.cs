@@ -27,7 +27,11 @@ public static partial class Unpairing
                 Array.Empty<TransportProtocol>();
         }
 
-        public static DeRecMessage Produce(ulong channelId, string memo, byte[] sharedKey, IReadOnlyList<TransportProtocol>? replyTo = null)
+        /// <summary>
+        /// <c>epoch</c> is the epoch of <c>sharedKey</c> in the channel's key chain,
+        /// stamped into the envelope's <c>sequence</c>; 0 for a freshly paired channel.
+        /// </summary>
+        public static DeRecMessage Produce(ulong channelId, string memo, byte[] sharedKey, uint epoch, IReadOnlyList<TransportProtocol>? replyTo = null)
         {
             byte[] memoBytes = System.Text.Encoding.UTF8.GetBytes(memo ?? string.Empty);
             byte[]? replyToBytes = replyTo is { Count: > 0 }
@@ -42,6 +46,7 @@ public static partial class Unpairing
                     (UIntPtr)memoBytes.Length,
                     sharedKey,
                     (UIntPtr)sharedKey.Length,
+                    epoch,
                     replyToBytes,
                     replyToLen
                 );

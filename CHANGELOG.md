@@ -7,6 +7,498 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
+### 1.0.0-alpha.1 (unreleased)
+
+- **Changed: `restore` takes the newest version the helpers hold.**
+  *(breaking; every SDK)*
+
+  A helper ignores a `StoreShareRequest` for a version older than the newest
+  it stores (`IgnoreReason::Superseded`, 0.0.11). A device that restored an
+  older kept version committed its snapshot at that version, so its next
+  publish was numbered below what the helpers held and reached none of them.
+  `restore` now takes `newest_version`, the newest version any helper
+  reported in Discovery: the recovered secrets are recorded at it, and the
+  next publish is `newest_version + 1`. The keys of the restored channels
+  stay pinned to the recovered version, which is what the helpers hold them
+  for. A `newest_version` below the recovered version is `InvalidInput`.
+
+  - Rust: `DeRecProtocol::restore(&secret, recovered_version, newest_version)`.
+  - FFI: `derec_protocol_restore` params JSON gains a required
+    `newest_version` beside `version`.
+  - .NET `RestoreAsync(secret, version, newestVersion)`, Go
+    `Restore(secret, version, newestVersion)`, Node, web and React Native
+    `restore(secret, version, newestVersion)`.
+
+  **Migration:** pass the highest version Discovery reported for the
+  `secret_id`; pass the recovered version when that is the newest.
+
+- **Added: shared-key rotation.** *(security; breaking for any custom store
+  and for 0.0.x peers)*
+
+  A channel's key used to stay the one pairing established for as long as the
+  channel lived. It can now move forward: with rotation on, the owner advances
+  each helper channel one epoch in every sharing round that reaches the
+  threshold (a round below it advances none), and the replica group channel
+  one epoch per publish, so a key taken from a helper later does not open the
+  traffic that preceded the oldest key it still holds.
+
+  - **Opt-in.** `DeRecProtocolBuilder::with_key_rotation(bool)`
+    (`withKeyRotation` / `WithKeyRotation`), or `key_rotation` in a config.
+    Off by default. Off keeps a channel on its current key; it never returns
+    to the pairing key. Following a rotated peer needs no setting.
+  - **The chain.** K(e+1) = HMAC-SHA256(K(e), `"derec channel key v1"` ||
+    be32(e+1)), K(0) being the pairing key. `DeRecMessage.sequence` is now the
+    epoch of the key the payload is encrypted under (0 at pairing); it was
+    unused before. A receiver derives at most 512 steps from a key it holds,
+    and a forged epoch changes no state.
+  - **Retention follows stored versions.** A party holds its newest key and the
+    key of every secret version it still stores, and drops a key when the last
+    version under it goes. Any version kept with `keepVersion` therefore
+    restores. The published secret records each helper's and each replica's
+    `key_epoch` (JSON `key_epoch`, omitted when 0), and the recovered-secret
+    JSON the SDKs pass back carries it. The publishing device keeps an old key
+    only for answers still in flight: when a helper fails or times out of a
+    round, that round's pin on its channel goes, so a helper that receives
+    requests but never answers leaves at most one pin behind. A helper the
+    request cannot even be sent to, reported as `ProtectSecretFailed`, keeps
+    one pin, and with rotation on one key, per such round until it is
+    unpaired: an application that sees `ProtectSecretFailed` for the same
+    helper round after round should tell the user the helper is unreachable
+    and offer to unpair it, which drops its keys. On the replica group
+    channel, a round that closes with a member behind keeps only the oldest
+    pin, its own and newer ones. A publish refused before anything is sent
+    moves no epoch.
+  - **New secret kind: `SecretKind::KeyRing = 3`.** Every `DeRecSecretStore`
+    implementation must persist it: the key ring is the authoritative copy,
+    and the `SharedKey` row is a mirror written after it. Migration: store the
+    `(kind, bytes)` row opaquely, with `bytes` of any length, and do not
+    assume 32 bytes or validate the content. Rust implementors store
+    `KeyRing::as_bytes`; in .NET (`SecretKind.KeyRing`), Go
+    (`SecretKindKeyRing`), Node, web and React Native (kind `3`) the bytes
+    arrive already encoded. A table or column that fixed the secret length at
+    32 bytes, or limited `kind` to 0 to 2, must be widened. A channel with no
+    `KeyRing` row is at epoch 0 under its `SharedKey`. `KeyRing::as_bytes`
+    returns a `Result`: a ring with more than 65,535 pins or old keys is an
+    `Error::Invariant`, and the protocol refuses to save it, rather than
+    writing a truncated count. With the `serde` feature, a deserialized
+    `KeyRing` is checked by the same rules as `KeyRing::from_bytes`. A store
+    that answers a `KeyRing` query with another kind is an error, not epoch 0.
+  - **`VerifyFailureReason::NoSharedKey` is reported** for a channel whose
+    shared key or key ring the store answered with a value of another kind;
+    Discovery, UpdateChannelInfo and RecoverSecret report their per-channel
+    `*Failed` event for it, and ProtectSecret fails with `Error::Invariant`.
+  - **New event reason: `IgnoreReason::KeyUnavailable`** (`"KeyUnavailable"`),
+    reported as `MessageIgnored` when a message names an epoch whose key the
+    device cannot obtain. Every SDK exposes it.
+  - **Pending actions.** The token records the epoch it is answered under, and
+    accepting or rejecting a token whose epoch's key can no longer be obtained
+    fails with "the action can no longer be answered: its channel key is no
+    longer held".
+  - **Fingerprints** describe the pairing key. They are meaningful while a
+    channel is `Pending`; after a rotation a fingerprint differs from the one
+    shown at pairing.
+  - **Peers on 0.0.x cannot follow a rotated channel.** There is no
+    negotiation: once an owner rotates, a 0.0.x helper cannot open the
+    messages and times out. Upgrade it and pair again.
+  - **Scope of the guarantee.** Every key derives from the one before it, so a
+    party holding K(e) can compute every later key; forward secrecy covers
+    only epochs older than the oldest key a party still holds. It is claimed
+    against the compromise of a helper device, or of a key alone, plus
+    recorded transport traffic. A compromised helper plus a recording exposes
+    the shares sent to that helper from its oldest held key on; the threshold
+    still applies. It is not claimed against the owner device or replica
+    devices, which hold the plaintext secret and the keys of the versions they
+    store. A key does not heal the chain, and the helper never starts a
+    rotation.
+  - **Primitives take the key's epoch.** *(breaking for every SDK's
+    primitives)* An application driving the protocol through primitives
+    could only send at epoch 0. Every channel `produce` now takes the epoch
+    along with the key, and stamps it into the envelope's `sequence`:
+    - Rust: `produce(.., &ChannelKey, ..)` in place of `&SharedKey`.
+      `ChannelKey` is new and public in `derec_library::types`:
+      `ChannelKey::new(epoch, key)`, `epoch()`, `key()`.
+    - FFI, WASM and every SDK: a new `epoch` argument right after the shared
+      key in every `produce_*` call, for discovery, recovery, sharing,
+      unpairing and verification requests and responses. Pass `0` for a
+      freshly paired channel.
+    - `extract` calls are unchanged and take the key alone. Pairing
+      primitives are unchanged; pairing envelopes always carry epoch 0.
+    - `DeRecMessageBuilder::encrypt` takes `&ChannelKey` and sets `sequence`
+      from it. `DeRecMessageBuilder::sequence` is removed: the epoch is set by
+      encryption, so key and epoch cannot disagree.
+
+    Two helpers let a primitives caller follow a rotated channel. They have
+    the same spelling in every SDK:
+    - **`read_sequence`** reads an envelope's epoch without decrypting it.
+      Rust `derec_message::read_sequence`; .NET `Envelope.ReadSequence`; Go
+      `envelope.ReadSequence`; Node/web/React Native `envelope.read_sequence`;
+      C `read_sequence_from_envelope`.
+    - **`derive`** returns the key at a later epoch. Rust
+      `ChannelKey::derive`; .NET `ChannelKey.Derive`; Go `channelkey.Derive`;
+      Node/web/React Native `channel_key.derive`; C `derive_channel_key`.
+      It is forward only, and refuses more than 512 epochs in one call
+      (`ChannelKey::MAX_DERIVE_STEPS`) as invalid input.
+
+    To receive, read the sequence, then use the key held at that epoch or
+    derive it, then call `extract`. Primitives keep no keys: tracking each
+    channel's newest epoch, and the keys older versions travelled under, is
+    the caller's job.
+
+- **Changed: `SharedKey` is a type that wipes the key on drop.** *(security
+  hardening; breaking for Rust only)*
+
+  `SharedKey` was an alias for `[u8; 32]`, so the channel key was `Copy`:
+  every move left another copy in memory, none of them was ever wiped, `Debug`
+  printed the key, and `==` was not constant-time. It is now a newtype that
+  is not `Copy` (an explicit `clone()` makes a copy), zeroes its bytes on
+  drop, prints `SharedKey(<redacted>)` and compares in constant time. The
+  pairing primitives return it, so the key is wrapped from the moment the
+  library derives it.
+
+  With the `serde` feature it serializes exactly as the `[u8; 32]` it wraps:
+  keys already persisted through serde read back unchanged. .NET, Go, Node,
+  web and React Native are unaffected; the key still crosses the binding
+  boundary as 32 bytes.
+
+  Migration (Rust):
+
+  | Before | After |
+  | --- | --- |
+  | `let key: SharedKey = [7; 32];` | `SharedKey::new([7; 32])` or `[7; 32].into()` |
+  | `let key: SharedKey = bytes.try_into()?;` | `SharedKey::try_from(bytes.as_slice())?` |
+  | `key.to_vec()`, `&key[..]` | `key.as_bytes().to_vec()`, `key.as_bytes()` |
+  | `SecretValue::SharedKey(*key)` | `SecretValue::SharedKey(key.clone())` |
+
+  `derec_message::extract_inner_message` takes `&SharedKey`, as the
+  primitives' `extract` calls do. `DeRecMessageBuilder::encrypt` and the
+  primitives' `produce` calls take a `&ChannelKey`, which wraps a `SharedKey`
+  with its epoch; see shared-key rotation above.
+
+- **Fixed: `scripts/lib/build-env.sh` can be sourced from zsh.** Sourced
+  from zsh it failed on `BASH_SOURCE` and silently dropped the repository's
+  path remap. Sourced from any interactive shell it also left `set -euo
+  pipefail` on in that shell. It now finds its own path under bash or zsh and
+  sets no shell options; the packaging scripts set their own.
+
+- **Changed: an `ActionRequired` token carries no shared key.** *(security
+  fix; breaking for Rust; every SDK)*
+
+  The token handed to the application to pass back to `accept` or `reject`
+  held the channel's shared key in clear for `StoreShare`, `VerifyShare`,
+  `Discovery`, `GetShare`, `Unpair` and `UpdateChannelInfo`. An application
+  that queued, persisted or logged a token held a copy of the key outside
+  its secret store. Now `accept` and `reject` load the key from the secret
+  store when they run, as they already did for the pairing secret and for
+  `RespondToFailure`.
+
+  - A channel with no stored key can no longer be answered with a key copied
+    into the token: `accept` and `reject` return `InvalidInput`, and nothing
+    is stored or sent.
+  - A token issued by v0.0.10 is refused: `accept` and `reject` fail to
+    decode it, with the same error as any malformed token (`decode_error` in
+    Node and web, FFI code 103 `ffi_bad_proto` in .NET, Go and React Native), and
+    nothing is sent, so its sender times out as for any unanswered request.
+  - .NET, Go, Node, web and React Native pass the token through unchanged:
+    no code change.
+
+  **Migration (every SDK):** before upgrading, resolve every pending token
+  with `accept` or `reject`, or drop it. A token still held after the upgrade
+  cannot be resolved: drop it when its decode fails, and its sender treats
+  the request as unanswered. An application that keeps tokens only in memory
+  has none left after the restart that upgrades it.
+
+  **Migration (Rust):** code that read `shared_key` from a `PendingAction`
+  loads it from the secret store instead:
+
+  ```rust
+  // Before
+  let PendingAction::GetShare { shared_key, .. } = &action else { return };
+
+  // After
+  let Some(SecretValue::SharedKey(shared_key)) = secret_store
+      .load(secret_id, action.channel_id(), SecretKind::SharedKey)
+      .await?
+  else { return };
+  ```
+
+- **Changed: `PendingAction` is a struct around an `Action`.** *(breaking for
+  Rust only)*
+
+  `PendingAction` was an enum whose every variant repeated `channel_id` and
+  `trace_id`. It is now a struct holding those once, read through
+  `channel_id()` and `trace_id()`, and the decision itself through
+  `action()`: an `Action` that is `Pairing`, `PrePair`, `Request(ChannelRequest)`
+  or `RespondToFailure`. `ChannelRequest` holds the six requests on a paired
+  channel. Only the library creates a `PendingAction`, so an action is
+  resolved exactly as `process` raised it, and keeping it intact until then
+  is the application's part. `kind()` is unchanged.
+
+  .NET, Go, Node, web and React Native are unaffected: they hold the action
+  as opaque bytes, and the `ActionRequired` fields they read are unchanged.
+
+  **Migration (Rust):** match on `action.action()` instead of on the action
+  itself. The arms keep their bodies:
+
+  ```rust
+  // Before
+  match &action {
+      PendingAction::StoreShare { request, .. } => {
+          if request.share.len() > limit {
+              protocol.reject(action, StatusEnum::SizeLimitExceeded, "too large").await?
+          } else {
+              protocol.accept(action).await?;
+          }
+      }
+      PendingAction::Unpair { request, .. } => confirm_with_user(&request.memo),
+      _ => { protocol.accept(action).await?; }
+  }
+
+  // After
+  match action.action() {
+      Action::Request(ChannelRequest::StoreShare(request)) => {
+          if request.share.len() > limit {
+              protocol.reject(action, StatusEnum::SizeLimitExceeded, "too large").await?
+          } else {
+              protocol.accept(action).await?;
+          }
+      }
+      Action::Request(ChannelRequest::Unpair(request)) => confirm_with_user(&request.memo),
+      _ => { protocol.accept(action).await?; }
+  }
+  ```
+
+  | Before | After |
+  | --- | --- |
+  | `PendingAction::StoreShare { request, .. }` (and `VerifyShare`, `Discovery`, `GetShare`, `Unpair`, `UpdateChannelInfo`) | `Action::Request(ChannelRequest::StoreShare(request))` |
+  | `PendingAction::Pairing { request, kind, .. }` | `Action::Pairing { request, kind, .. }` |
+  | `PendingAction::PrePair { request, .. }` | `Action::PrePair(request)` |
+  | `PendingAction::RespondToFailure { reply, request, .. }` | `Action::RespondToFailure { reply, request }` |
+  | the `channel_id` / `trace_id` fields | `action.channel_id()` / `action.trace_id()` |
+
+  Code that only needs the kind matches without destructuring:
+
+  ```rust
+  // Before
+  matches!(event, DeRecEvent::ActionRequired { action: PendingAction::StoreShare { .. }, .. })
+
+  // After
+  matches!(event, DeRecEvent::ActionRequired { action, .. }
+      if action.kind() == PendingActionKind::StoreShare)
+  ```
+
+  A `PendingAction` can no longer be built by hand: it has no public
+  constructor, so the only actions `accept` and `reject` receive are those
+  `process` raised.
+
+- **Changed: a pending action is sealed, and an altered one is refused.**
+  *(security fix; every SDK)*
+
+  Nothing tied the action `accept` or `reject` received to the one `process`
+  raised: a token edited, extended or built from scratch while the
+  application held it was acted on as if the peer had sent it — an `Unpair`
+  for any paired channel, a `StoreShare` whose `keepVersion` deletes held
+  versions, an `UpdateChannelInfo` re-routing a channel. Now every action
+  answered under a channel key carries a seal, an HMAC-SHA256 under a key
+  derived from that channel's shared key, and `accept` and `reject` check it
+  before anything is loaded, stored or sent. An action that was altered,
+  built by hand or moved to another channel is refused with `InvalidInput`.
+  Nothing is persisted for this: the key is the one the secret store already
+  holds.
+
+  - `Pairing` and `PrePair` carry no seal: their request is one anyone
+    holding the contact can send anyway, and it is checked against the
+    stored contact.
+  - `RespondToFailure` is sealed under its reply channel's key. When that
+    key cannot be read, `RequestFailed` carries no token, as it already did
+    when the reply channel has no key.
+  - The seal does not stop an action being resolved twice; resolving each
+    once stays the application's part.
+  - The token grows by 36 bytes: the 32-byte seal and the 4-byte epoch of
+    the channel key the action is answered under, which the seal covers.
+    .NET, Go, Node, web and React Native pass it through unchanged: no code
+    change.
+  - New dependency: `hmac` 0.13 (RustCrypto), on the `sha2` the library
+    already uses.
+
+  **Migration:** none beyond the earlier entries. An application that
+  rebuilt, merged or rewrote tokens itself must hand back exactly the bytes
+  `process` produced.
+
+- **Fixed: an unpair whose teardown fails is finished later, and reported
+  once.** *(bug fix; every SDK)*
+
+  A pending unpair's entry was removed before its channel was dropped, and
+  the drop ignored a failure to remove the channel's keys. So a teardown
+  that failed left the channel record, keys and shares behind for good:
+  neither the acknowledgement nor the timeout sweep would see the unpair
+  again. A sweep whose entry removal failed reported `Unpaired` twice. Now
+  the channel is dropped first, every removal's failure is reported, and the
+  entry goes last; `Unpaired` is reported once both are done. A failure
+  keeps the entry, so processing the same acknowledgement again (see the
+  sharing-round entry below) or the next acknowledgement timeout finishes
+  the teardown. A rejected or malformed acknowledgement keeps the entry the
+  same way. Timed-out unpairs are dropped together, the keys and the
+  records each in one store call.
+
+- **Fixed: `accept` applies this helper's share-size range.** *(bug fix;
+  every SDK)* The configured `minShareSize`/`maxShareSize` was enforced by
+  `process` only. A `StoreShare` action whose share was altered before
+  `accept` was stored whatever its size; it is now answered
+  `SIZE_LIMIT_EXCEEDED` and nothing is stored.
+
+- **Changed: removing a helper or a replica member publishes the next
+  version.** *(behavior change; every SDK)*
+
+  `start(Unpair)` only tore the channel down, leaving the remaining helpers
+  on a split the removed helper still held a share of, and
+  `start(UnpairReplica)` only announced the removal, which completed when the
+  application next called `start(ProtectSecret)`. Now:
+
+  - When an unpaired helper's channel is dropped and that helper held a share
+    this device distributed, the latest snapshot is published to the helpers
+    that remain, with the stored weights and threshold. Under
+    `UnpairAck::Required` this happens on the helper's answer in `process`, or
+    on the acknowledgement timeout in `process` or `tick`; under `NotRequired`,
+    in `start(Unpair)` itself. The recovery channels `restore` unpairs never
+    held a share and publish nothing.
+  - `start(UnpairReplica)` publishes the roster that omits the member, as the
+    latest snapshot or an empty payload when there is none. A group with
+    nothing published can now complete a removal.
+
+  Migration: drop any `start(ProtectSecret)` the application ran after an
+  unpair or a replica removal, or it publishes one version more than needed.
+  A publish error (`InvalidWeight`, for one) is now returned by
+  `start(Unpair)`, `start(UnpairReplica)` and `process`, with the unpair
+  already done; `tick` logs it.
+
+- **Fixed: a publish the library starts on its own no longer runs below the
+  threshold.** *(bug fix; every SDK)*
+
+  Pairing or confirming a helper with a snapshot stored ran a round even when
+  the helpers' weights stayed below the threshold: it split nothing, sent
+  nothing and consumed a version. Those rounds, and the new unpair ones, now
+  run only when the helpers meet the threshold or a replica member needs the
+  roster. An explicit `start(ProtectSecret)` below the threshold is unchanged.
+
+- **Added: `remove_many` on the channel, secret and state stores.**
+  *(breaking; every SDK)*
+
+  `DeRecChannelStore::remove_many` removes every record a list of
+  `ChannelQuery` addresses in one call, with
+  `remove`'s semantics per entry (a replica query removes that member only)
+  and skipping entries that name no record. The library uses it when it
+  removes several records at once, so a backend can delete them in one
+  statement or transaction. The FFI `ChannelStoreCallbacks` gains a
+  `remove_many` slot right after `remove`, taking a JSON array of
+  `[channel_id, replica_id]` decimal-string pairs. Spelled `RemoveMany`
+  (.NET, Go) and `removeMany(secretId, queries)` (Node, web, React Native).
+
+  `DeRecSecretStore::remove_many(secret_id, &[(ChannelId, SecretKind)])` and
+  `DeRecStateStore::remove_many(secret_id, &[StateKey])` do the same for
+  secrets and state rows: `remove` per entry, skipping what is not stored.
+  Over FFI each gets a `remove_many` slot right after `remove`: the secret
+  slot takes a JSON array of `[channel_id, kind]` pairs (decimal-string id,
+  numeric kind), the state slot a JSON array of the key records `remove`
+  takes. In Node, web and React Native they are
+  `SecretStore.removeMany(secretId, entries)` and
+  `StateStore.removeMany(secretId, keysJson)`; in .NET
+  `ISecretStore.RemoveMany(secretId, IReadOnlyList<(ulong ChannelId, SecretKind Kind)>)`
+  and `IStateStore.RemoveMany(secretId, IReadOnlyList<StateKey>)`; in Go
+  `SecretStore.RemoveMany(secretID, []protocol.SecretEntry)` and
+  `StateStore.RemoveMany(secretID, []protocol.StateKey)`.
+
+  Migration: implement all three on every store.
+
+- **Fixed: the expired-channel sweep leaves nothing behind.** *(bug fix;
+  every SDK)*
+
+  Removing an expired `Pending` helper channel now also removes the unpair
+  or verification state started on it, which was left to time out on its
+  own. The sweep removes the channels' state, keys and pairing material
+  before the records, each with one `remove_many` call per store, so a store
+  failure partway leaves the record for the next sweep to retry rather than
+  a key with nothing pointing at it.
+
+- **Added: `DeRecShareStore::remove_versions_many`.** *(breaking; every SDK)*
+
+  `remove_versions_many(secret_id, &[(ChannelId, Vec<u32>)])` drops, for
+  each entry, the shares stored on that channel at those versions in one
+  call: `remove_versions` per entry, skipping versions that are not stored.
+  The owner uses it to drop the proofs its open sharing rounds gave up,
+  failed and pruned alike, in one call per settling pass, where it made one
+  call per helper channel per round. Over FFI the `ShareStoreCallbacks`
+  gains a `remove_versions_many` slot right after `remove_versions`, taking
+  a JSON array of `[channel_id, versions]` pairs (decimal-string id, array
+  of version numbers). In .NET it is
+  `IShareStore.RemoveVersionsMany(secretId, IReadOnlyList<(ulong ChannelId, uint[] Versions)>)`,
+  in Go `ShareStore.RemoveVersionsMany(secretID, []protocol.ShareVersionsEntry)`,
+  and in Node, web and React Native `ShareStore.removeVersionsMany(secretId, entries)`
+  with `[channelId, versions]` pairs.
+
+  Migration: implement it on every share store.
+
+- **Changed: `DeRecShareStore::load_many` returns each share with its
+  channel.** *(breaking; every SDK)*
+
+  It returns `Vec<(ChannelId, Share)>` instead of `Vec<Share>`, so a caller
+  loading several channels at once can tell which channel each share came
+  from. The owner uses it to read every confirmed helper's tracking share in
+  one call when a round completes, where it made one call per helper. Over
+  FFI, the `load_many` callback's buffer becomes a JSON array of
+  `[channel_id, share]` pairs (`channel_id` a decimal string, `share` the
+  object it already returned); in Node, web and React Native `loadMany`
+  resolves to `[channelId, share][]`; .NET `IShareStore.LoadMany` returns
+  `IEnumerable<(ulong ChannelId, Share Share)>`; Go `ShareStore.LoadMany`
+  returns `[]protocol.ShareEntry` (`ChannelID`, `Share`).
+
+  Migration: return the channel each share is stored under alongside it.
+  Every store already keys shares by channel.
+
+- **Fixed: `ReplicaDiscovery` asks only `Paired` members.** *(bug fix;
+  every SDK)*
+
+  It asked every other member, `Pending` and `Unpairing` ones included, and
+  waits for every member it reached with no timeout. A `Pending` member whose
+  pairing expired, or a lost device flagged `Unpairing`, never answered, so
+  the check never finished and no `ReplicaDiscoveryComplete` was emitted.
+
+- **Fixed: a sharing round acts only on what it has stored.** *(bug fix;
+  every SDK)*
+
+  A store failure while settling a round was swallowed, mostly without a
+  log, and the round went on as if the write had worked. A round whose save
+  failed still dropped its failed helpers' proofs and reported their
+  timeouts. A round whose removal failed was reported complete, and could
+  be completed or timed out again later. A failed weight read reported
+  `threshold_met: false` for a round that may have met it. A failed
+  departed-member removal left the member's row behind for good. Now a
+  round reports its events and gives up its proofs only once its new state
+  is stored. A round that cannot read its helpers' weights or remove its
+  departed members is kept as it is and completes on a later call. Each
+  failure is logged.
+
+  A state store failure while `process` records a message's answers on the
+  open rounds is now returned as a `ProcessError`, carrying the call's
+  events. It used to be logged only: the call succeeded, and the round
+  later timed out a helper that had confirmed. Processing the same message
+  again, within the inbound message timeout, records the answers; that call
+  repeats only the message's own events, never a round's. `tick` still logs
+  the failure and settles the round on its next call.
+
+- **Removed: the transport adapters.** *(breaking; every SDK)*
+
+  `SendOne`, `SequentialFailover` and `SingleEndpointTransport` (Rust, .NET's
+  `ISendOne`, Go) and `SendOne`, `sequentialFailover` and
+  `singleEndpointTransport` (Node, web, React Native) are gone. They assumed
+  the message is dialed inside `send`, which is not how transports that
+  collect messages during `process` and deliver them afterwards work. The
+  `send` contract is unchanged: try the endpoints in the peer's order, stop at
+  the first success, fail only when none worked.
+
+  Migration: implement `DeRecTransport` (`ITransport`, `Transport`) directly,
+  with the loop the adapter ran: dial each endpoint in order, return on the
+  first success, and return the last error when every endpoint failed.
+
 ### 0.0.11
 
 A security release. Recovery no longer accepts whichever group of shares

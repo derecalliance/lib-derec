@@ -5,6 +5,7 @@ package native
 
 import (
 	"encoding/json"
+	"strconv"
 	"sync"
 	"unsafe"
 
@@ -23,6 +24,7 @@ type channelStore interface {
 	Load(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error)
 	Save(secretID uint64, record ChannelRecord) error
 	Remove(secretID, channelID, replicaID uint64) (bool, error)
+	RemoveMany(secretID uint64, queries []ChannelQuery) error
 	ListHelpers(secretID uint64, filter HelperFilter) ([]HelperChannel, error)
 	ListReplicas(secretID uint64, filter ReplicaFilter) ([]ReplicaMember, error)
 	LinkChannel(secretID, a, b uint64) error
@@ -38,6 +40,7 @@ type ChannelStoreCallbacks struct {
 	Load           uintptr
 	Save           uintptr
 	Remove         uintptr
+	RemoveMany     uintptr
 	ListHelpers    uintptr
 	ListReplicas   uintptr
 	LinkChannel    uintptr
@@ -88,6 +91,42 @@ func dispatchChannelRemove(s *storeSet, secretID, channelID, replicaID uint64) (
 		return ffiStatusFailure, false
 	}
 	return ffiStatusOK, existed
+}
+
+func dispatchChannelRemoveMany(s *storeSet, secretID uint64, queriesJSON []byte) (status int32) {
+	defer recoverInto(&status)
+	queries, err := decodeChannelQueries(queriesJSON)
+	if err != nil {
+		return ffiStatusFailure
+	}
+	if err := s.channel.RemoveMany(secretID, queries); err != nil {
+		return ffiStatusFailure
+	}
+	return ffiStatusOK
+}
+
+// decodeChannelQueries parses the core's JSON array of [channel_id,
+// replica_id] pairs, each id a decimal string.
+func decodeChannelQueries(data []byte) ([]ChannelQuery, error) {
+	var pairs [][2]string
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &pairs); err != nil {
+			return nil, err
+		}
+	}
+	queries := make([]ChannelQuery, 0, len(pairs))
+	for _, p := range pairs {
+		channelID, err := strconv.ParseUint(p[0], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		replicaID, err := strconv.ParseUint(p[1], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		queries = append(queries, ChannelQuery{ChannelID: channelID, ReplicaID: replicaID})
+	}
+	return queries, nil
 }
 
 func dispatchChannelListHelpers(s *storeSet, secretID uint64, filterJSON []byte) (status int32, out []byte) {
@@ -184,6 +223,15 @@ func channelRemoveCallback(userData uintptr, secretID, channelID, replicaID uint
 	return st
 }
 
+func channelRemoveManyCallback(userData uintptr, secretID uint64, queriesPtr *byte, queriesLen uintptr) (status int32) {
+	defer recoverInto(&status)
+	s, ok := lookupStores(storeHandle(userData))
+	if !ok {
+		return ffiStatusFailure
+	}
+	return dispatchChannelRemoveMany(s, secretID, readFilterBytes(queriesPtr, queriesLen))
+}
+
 func channelListHelpersCallback(userData uintptr, secretID uint64, filterPtr *byte, filterLen uintptr, outPtr, outLen *uintptr) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
@@ -237,7 +285,7 @@ func channelLinkedChannelsCallback(userData uintptr, secretID, channelID uint64,
 
 // channelCallbackPtrs holds the purego.NewCallback address for every
 // ChannelStoreCallbacks fn-pointer field except FreeBuffer (shared package-
-// wide via sharedFreeBufferCallback). All seven functions are stateless
+// wide via sharedFreeBufferCallback). All eight functions are stateless
 // package-level funcs that resolve their *storeSet from UserData at call
 // time, so each needs exactly one registration total, reused across every
 // buildChannelStoreCallbacks call — purego.NewCallback has a fixed 2000-slot
@@ -246,7 +294,7 @@ func channelLinkedChannelsCallback(userData uintptr, secretID, channelID uint64,
 var (
 	channelCallbacksOnce sync.Once
 	channelCallbackPtrs  struct {
-		load, save, remove, listHelpers, listReplicas, linkChannel, linkedChannels uintptr
+		load, save, remove, removeMany, listHelpers, listReplicas, linkChannel, linkedChannels uintptr
 	}
 )
 
@@ -255,6 +303,7 @@ func registerChannelCallbacks() {
 		channelCallbackPtrs.load = purego.NewCallback(channelLoadCallback)
 		channelCallbackPtrs.save = purego.NewCallback(channelSaveCallback)
 		channelCallbackPtrs.remove = purego.NewCallback(channelRemoveCallback)
+		channelCallbackPtrs.removeMany = purego.NewCallback(channelRemoveManyCallback)
 		channelCallbackPtrs.listHelpers = purego.NewCallback(channelListHelpersCallback)
 		channelCallbackPtrs.listReplicas = purego.NewCallback(channelListReplicasCallback)
 		channelCallbackPtrs.linkChannel = purego.NewCallback(channelLinkChannelCallback)
@@ -272,6 +321,7 @@ func buildChannelStoreCallbacks(h storeHandle) ChannelStoreCallbacks {
 		Load:           channelCallbackPtrs.load,
 		Save:           channelCallbackPtrs.save,
 		Remove:         channelCallbackPtrs.remove,
+		RemoveMany:     channelCallbackPtrs.removeMany,
 		ListHelpers:    channelCallbackPtrs.listHelpers,
 		ListReplicas:   channelCallbackPtrs.listReplicas,
 		LinkChannel:    channelCallbackPtrs.linkChannel,

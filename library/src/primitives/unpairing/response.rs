@@ -6,7 +6,7 @@ use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     primitives::unpairing::UnpairingError,
-    types::{ChannelId, SharedKey},
+    types::{ChannelId, ChannelKey, SharedKey},
     utils::verify_timestamps,
 };
 use derec_proto::{DeRecMessage, DeRecResult, MessageBody, StatusEnum, UnpairResponseMessage};
@@ -39,7 +39,9 @@ pub struct ProcessResult {
 /// # Arguments
 ///
 /// * `channel_id` - Channel identifier for the requesting peer.
-/// * `shared_key` - 32-byte symmetric channel key.
+/// * `channel_key` - The channel key and its epoch. The payload is encrypted
+///   under the key and the envelope's `sequence` carries the epoch, so the
+///   receiver can pick the key that opens it; see [`crate::types::ChannelKey`].
 ///
 /// # Errors
 ///
@@ -52,9 +54,10 @@ pub struct ProcessResult {
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 ///
-/// let response::ProduceResult { envelope } = response::produce(channel_id, &shared_key)
+/// let response::ProduceResult { envelope } = response::produce(channel_id, &channel_key)
 ///     .expect("failed to build unpair response");
 ///
 /// assert!(!envelope.is_empty());
@@ -63,8 +66,8 @@ pub struct ProcessResult {
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
-pub fn produce(channel_id: ChannelId, shared_key: &SharedKey) -> Result<ProduceResult, Error> {
-    let envelope = build_response(channel_id, StatusEnum::Ok, "", shared_key)?;
+pub fn produce(channel_id: ChannelId, channel_key: &ChannelKey) -> Result<ProduceResult, Error> {
+    let envelope = build_response(channel_id, StatusEnum::Ok, "", channel_key)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("unpair response (ok) envelope produced");
@@ -110,17 +113,18 @@ pub fn produce(channel_id: ChannelId, shared_key: &SharedKey) -> Result<ProduceR
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 ///
 /// // Initiator: send an unpair request.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, "no longer needed", &shared_key, &[], None)
+///     request::produce(channel_id, "no longer needed", &channel_key, &[], None)
 ///         .expect("produce request failed");
 ///
 /// // Responder: extract and ack with a successful response.
 /// let _ = request::extract(&req_envelope, &shared_key).expect("extract request failed");
 /// let response::ProduceResult { envelope: resp_envelope } =
-///     response::produce(channel_id, &shared_key).expect("produce response failed");
+///     response::produce(channel_id, &channel_key).expect("produce response failed");
 ///
 /// // Initiator: extract the response.
 /// let response::ExtractResult { response: ack } =
@@ -174,15 +178,16 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractR
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 ///
 /// // Initiator → Responder → Initiator roundtrip.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, "no longer needed", &shared_key, &[], None)
+///     request::produce(channel_id, "no longer needed", &channel_key, &[], None)
 ///         .expect("produce request failed");
 /// let _ = request::extract(&req_envelope, &shared_key).expect("extract request failed");
 /// let response::ProduceResult { envelope: resp_envelope } =
-///     response::produce(channel_id, &shared_key).expect("produce response failed");
+///     response::produce(channel_id, &channel_key).expect("produce response failed");
 /// let response::ExtractResult { response: ack } =
 ///     response::extract(&resp_envelope, &shared_key).expect("extract response failed");
 ///
@@ -209,7 +214,7 @@ fn build_response(
     channel_id: ChannelId,
     status: StatusEnum,
     memo: &str,
-    shared_key: &SharedKey,
+    channel_key: &ChannelKey,
 ) -> Result<Vec<u8>, Error> {
     let timestamp = current_timestamp();
 
@@ -225,7 +230,7 @@ fn build_response(
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::UnpairResponse(response))
-        .encrypt(shared_key)?
+        .encrypt(channel_key)?
         .build()?
         .encode_to_vec();
 

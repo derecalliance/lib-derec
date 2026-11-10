@@ -211,7 +211,7 @@ pub async fn run() {
     .await;
     step_7_admit_remaining_replicas(&owner, &helpers, &mut replicas).await;
     let secrets = step_8_protect_more_secrets(&owner, &helpers, &replicas, secrets).await;
-    step_9_remove_a_replica(&owner, &helpers, &mut replicas, &secrets).await;
+    step_9_remove_a_replica(&owner, &helpers, &mut replicas).await;
     step_10_a_silent_helper_is_resolved_by_a_scheduled_tick(
         &mut owner, &helpers, &replicas, &secrets,
     )
@@ -270,7 +270,7 @@ async fn step_4_rotate_helpers(
         "step 4 (after unpairing 2)",
         Tables {
             channels: 3,
-            secrets: 3,
+            secrets: 6,
             shares: 0,
             user_secrets: 1,
             ..Default::default()
@@ -312,7 +312,7 @@ async fn step_4_rotate_helpers(
         "step 4",
         Tables {
             channels: 5,
-            secrets: 5,
+            secrets: 10,
             shares: 4 + 5,
             user_secrets: 1,
             ..Default::default()
@@ -337,7 +337,7 @@ async fn step_4_rotate_helpers(
             "step 4",
             Tables {
                 channels: 1,
-                secrets: 1,
+                secrets: 2,
                 shares,
                 ..Default::default()
             },
@@ -406,9 +406,9 @@ async fn step_5_admit_first_replica(
         snapshot_version(&owner.client(), SECRET_ID).await,
         "the replica is at the owner's version after admission"
     );
-    // The owner gains a sixth `secrets` row — the group channel key — and the
-    // admission publish (v5), which keeps v4, adds one share row per helper
-    // and drops the v3 rows.
+    // The owner gains two `secrets` rows — the group channel key and its key
+    // ring — and the admission publish (v5), which keeps v4, adds one share
+    // row per helper and drops the v3 rows.
     assert_tables(
         &owner.client(),
         SECRET_ID,
@@ -417,7 +417,7 @@ async fn step_5_admit_first_replica(
         Tables {
             channels: 5,
             replica_members: 2,
-            secrets: 6,
+            secrets: 12,
             shares: 5 + 5,
             user_secrets: 1,
             ..Default::default()
@@ -477,7 +477,7 @@ async fn step_6_recover_with_a_replica_in_the_roster(
         Tables {
             channels: 5,
             replica_members: 2,
-            secrets: 6,
+            secrets: 12,
             shares: 0,
             user_secrets: 1,
             ..Default::default()
@@ -541,7 +541,7 @@ async fn step_7_admit_remaining_replicas(
         Tables {
             channels: 5,
             replica_members: 4,
-            secrets: 6,
+            secrets: 12,
             shares: 5 + 5,
             user_secrets: 1,
             ..Default::default()
@@ -611,7 +611,7 @@ async fn step_8_protect_more_secrets(
         Tables {
             channels: 5,
             replica_members: 4,
-            secrets: 6,
+            secrets: 12,
             shares: 5 + 5,
             user_secrets: 1,
             ..Default::default()
@@ -633,12 +633,12 @@ async fn step_8_protect_more_secrets(
 ///
 /// The evicted device is told to leave, then receives the roster that omits
 /// it; only once it has seen both does it drop its copy of the secret. The
-/// remaining members drop its row and carry on.
+/// remaining members drop its row and carry on. Starting the removal publishes
+/// that roster itself, so the application runs no `ProtectSecret` here.
 async fn step_9_remove_a_replica(
     owner: &StatelessPeer,
     helpers: &[HelperDevice],
     replicas: &mut Vec<ReplicaDevice>,
-    secrets: &[UserSecret],
 ) {
     let evicted = replicas.pop().expect("three replicas were admitted");
     assert_eq!(evicted.replica_id, REPLICA_FOUR);
@@ -654,15 +654,11 @@ async fn step_9_remove_a_replica(
 
     // The publish that completes the removal has to reach the evictee too —
     // its absence from that roster is what tells it it may leave.
-    let refs: Vec<&ReplicaDevice> = replicas.iter().chain(iter::once(&evicted)).collect();
-    protect(
-        owner,
-        helpers,
-        &refs,
-        secrets.to_vec(),
-        "roster without the retired tablet",
-    )
-    .await;
+    let mut cast: Vec<&StatelessPeer> = vec![owner];
+    cast.extend(helpers.iter().map(|h| &h.peer));
+    cast.extend(replicas.iter().map(|r| &r.peer));
+    cast.push(&evicted.peer);
+    pump(&cast).await;
 
     let expected = vec![REPLICA_OWNER, REPLICA_TWO, REPLICA_THREE];
     assert_eq!(
@@ -696,7 +692,7 @@ async fn step_9_remove_a_replica(
         Tables {
             channels: 5,
             replica_members: 3,
-            secrets: 6,
+            secrets: 12,
             shares: 5 + 5,
             user_secrets: 1,
             ..Default::default()
@@ -903,7 +899,9 @@ async fn step_2_protect_secrets(
     );
 
     // The owner keeps its own copy of every share it handed out, so its share
-    // count is helpers × versions. Helpers keep only their own.
+    // count is helpers × versions. Helpers keep only their own. A round pins
+    // its version to the channel's key epoch on both ends, so every channel
+    // now has a `KeyRing` row beside its `SharedKey` row.
     assert_tables(
         &owner.client(),
         SECRET_ID,
@@ -911,7 +909,7 @@ async fn step_2_protect_secrets(
         "step 2",
         Tables {
             channels: 5,
-            secrets: 5,
+            secrets: 10,
             shares: 10,
             user_secrets: 1,
             ..Default::default()
@@ -932,7 +930,7 @@ async fn step_2_protect_secrets(
             "step 2",
             Tables {
                 channels: 1,
-                secrets: 1,
+                secrets: 2,
                 shares: 2,
                 ..Default::default()
             },
@@ -1000,10 +998,10 @@ async fn step_3_recover_after_device_loss(
     );
 
     // Post-recovery the owner is whole again: five re-paired channels, their
-    // keys and the snapshot. Restore writes no tracking shares — recovery
-    // cannot attribute a collected share to a helper channel — so the owner
-    // holds none until it next publishes. The old channels are gone with the
-    // old device.
+    // keys, their key rings rebuilt at the roster's epochs, and the snapshot.
+    // Restore writes no tracking shares — recovery cannot attribute a
+    // collected share to a helper channel — so the owner holds none until it
+    // next publishes. The old channels are gone with the old device.
     assert_tables(
         &owner.client(),
         SECRET_ID,
@@ -1011,7 +1009,7 @@ async fn step_3_recover_after_device_loss(
         "step 3",
         Tables {
             channels: 5,
-            secrets: 5,
+            secrets: 10,
             shares: 0,
             user_secrets: 1,
             ..Default::default()
@@ -1035,7 +1033,7 @@ async fn step_3_recover_after_device_loss(
             "step 3",
             Tables {
                 channels: 1,
-                secrets: 1,
+                secrets: 2,
                 shares: 2,
                 ..Default::default()
             },
@@ -1360,7 +1358,7 @@ async fn recover_from_helpers(
 
     let restore_events = owner
         .session()
-        .restore(&recovered, version)
+        .restore(&recovered, version, version)
         .await
         .expect("owner.restore() failed");
     let recovery_channels: Vec<ChannelId> = restore_events
@@ -1429,7 +1427,7 @@ async fn assert_helpers(helpers: &[HelperDevice], step: &str) {
             step,
             Tables {
                 channels: 1,
-                secrets: 1,
+                secrets: 2,
                 shares: 2,
                 ..Default::default()
             },
@@ -1441,10 +1439,11 @@ async fn assert_helpers(helpers: &[HelperDevice], step: &str) {
 /// Assert a replica device.
 ///
 /// A member hydrates the **whole** roster, helper channels included — it must
-/// be able to publish on its own, which means holding every helper's channel
-/// and key, plus the group channel: six `secrets` rows in all. It also stores
-/// the mirrored share map for every version it synced since joining, one row
-/// per helper per version, so it can verify those helpers itself.
+/// be able to publish on its own, which means holding every helper's channel,
+/// key and key ring, plus the group channel's: twelve `secrets` rows in all.
+/// It also stores the mirrored share map for every version it synced since
+/// joining, one row per helper per version, so it can verify those helpers
+/// itself.
 async fn assert_replica(replica: &ReplicaDevice, step: &str, members: i64, shares: i64) {
     assert_tables(
         &replica.peer.client(),
@@ -1454,7 +1453,7 @@ async fn assert_replica(replica: &ReplicaDevice, step: &str, members: i64, share
         Tables {
             channels: 5,
             replica_members: members,
-            secrets: 6,
+            secrets: 12,
             shares,
             user_secrets: 1,
             ..Default::default()

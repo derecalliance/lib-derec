@@ -39,6 +39,17 @@ pub fn read_trace_id(envelope_bytes: &[u8]) -> Result<u64, JsValue> {
         .map_err(|e| js_error("envelope_decode_error", e.to_string()))
 }
 
+/// Read `sequence` off an inbound envelope without touching the encrypted
+/// inner payload: the epoch of the channel key that encrypted it. A caller
+/// driving the protocol through primitives reads it to pick the key to pass
+/// to an `*_extract` call, deriving it forward with `channel_key_derive` when
+/// the epoch is newer than the key it holds.
+#[wasm_bindgen(js_name = "envelope_read_sequence")]
+pub fn read_sequence(envelope_bytes: &[u8]) -> Result<u32, JsValue> {
+    derec_message::read_sequence(envelope_bytes)
+        .map_err(|e| js_error("envelope_decode_error", e.to_string()))
+}
+
 /// Identify an envelope for replay and reflection detection: `{ id, timestamp }`,
 /// where `id` (32 bytes) is the same for every copy of one message, whatever
 /// its unauthenticated cleartext fields say, and different for every other

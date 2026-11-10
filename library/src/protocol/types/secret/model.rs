@@ -78,6 +78,16 @@ pub struct HelperInfo {
     /// field and is read as `1`.
     #[prost(uint32, tag = "7")]
     pub weight: u32,
+    /// The epoch of [`HelperInfo::shared_key`] on this Helper's channel: the
+    /// key the round that wrote this roster sent its share under. Restore and
+    /// replica hydration rebuild the channel's key ring at this epoch, with
+    /// the roster's version pinned to it.
+    ///
+    /// In the recoverable JSON encoding it is `key_epoch`, omitted when `0`;
+    /// an absent key decodes as `0`, the epoch of the key pairing
+    /// established.
+    #[prost(uint32, tag = "8")]
+    pub key_epoch: u32,
 }
 
 impl HelperInfo {
@@ -216,6 +226,10 @@ pub struct Replicas {
     /// The one channel every member is addressed on.
     #[prost(uint64, tag = "3")]
     pub channel_id: u64,
+    /// The epoch of [`Replicas::shared_key`] on the group channel, read the
+    /// same way as [`HelperInfo::key_epoch`].
+    #[prost(uint32, tag = "4")]
+    pub key_epoch: u32,
 }
 
 /// Stands in for a byte field that must not be printed.
@@ -249,6 +263,7 @@ impl fmt::Debug for HelperInfo {
             .field("shared_key", &Redacted(&self.shared_key))
             .field("communication_info", &self.communication_info)
             .field("weight", &self.weight)
+            .field("key_epoch", &self.key_epoch)
             .finish()
     }
 }
@@ -259,6 +274,7 @@ impl fmt::Debug for Replicas {
             .field("members", &self.members)
             .field("shared_key", &Redacted(&self.shared_key))
             .field("channel_id", &self.channel_id)
+            .field("key_epoch", &self.key_epoch)
             .finish()
     }
 }
@@ -315,6 +331,7 @@ mod redaction_tests {
             shared_key: KEY.to_vec(),
             communication_info: Default::default(),
             weight: 1,
+            key_epoch: 0,
         };
         let out = rendered(&helper);
         assert!(!out.contains(&decimal_rendering(&KEY)), "{out}");
@@ -325,6 +342,7 @@ mod redaction_tests {
             members: Vec::new(),
             shared_key: KEY.to_vec(),
             channel_id: 9,
+            key_epoch: 0,
         };
         let out = rendered(&replicas);
         assert!(!out.contains(&decimal_rendering(&KEY)), "{out}");
@@ -346,12 +364,14 @@ mod redaction_tests {
                 shared_key: KEY.to_vec(),
                 communication_info: Default::default(),
                 weight: 1,
+                key_epoch: 0,
             }],
             secrets: vec![user_secret()],
             replicas: Some(Replicas {
                 members: Vec::new(),
                 shared_key: KEY.to_vec(),
                 channel_id: 9,
+                key_epoch: 0,
             }),
             threshold: None,
         };

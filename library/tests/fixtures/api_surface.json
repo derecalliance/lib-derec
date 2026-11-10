@@ -100,6 +100,12 @@
       "ts": "withAutoRespondOnFailure"
     },
     {
+      "rust": "key_rotation",
+      "dotnet": "WithKeyRotation",
+      "go": "KeyRotation",
+      "ts": "withKeyRotation"
+    },
+    {
       "rust": "unpair_ack",
       "dotnet": "WithUnpairAck",
       "go": "UnpairAck",
@@ -314,6 +320,20 @@
           ]
         },
         {
+          "rust": "remove_many",
+          "dotnet": "RemoveMany",
+          "go": "RemoveMany",
+          "ts": "removeMany",
+          "rust_params": [
+            "secret_id",
+            "queries"
+          ],
+          "params": [
+            "secret_id",
+            "queries"
+          ]
+        },
+        {
           "rust": "helpers",
           "dotnet": "ListHelpers",
           "go": "ListHelpers",
@@ -443,6 +463,20 @@
             "channel_id",
             "kind"
           ]
+        },
+        {
+          "rust": "remove_many",
+          "dotnet": "RemoveMany",
+          "go": "RemoveMany",
+          "ts": "removeMany",
+          "rust_params": [
+            "secret_id",
+            "entries"
+          ],
+          "params": [
+            "secret_id",
+            "entries"
+          ]
         }
       ]
     },
@@ -554,6 +588,20 @@
             "secret_id",
             "channel_id",
             "versions"
+          ]
+        },
+        {
+          "rust": "remove_versions_many",
+          "dotnet": "RemoveVersionsMany",
+          "go": "RemoveVersionsMany",
+          "ts": "removeVersionsMany",
+          "rust_params": [
+            "secret_id",
+            "entries"
+          ],
+          "params": [
+            "secret_id",
+            "entries"
           ]
         },
         {
@@ -683,6 +731,20 @@
           ]
         },
         {
+          "rust": "remove_many",
+          "dotnet": "RemoveMany",
+          "go": "RemoveMany",
+          "ts": "removeMany",
+          "rust_params": [
+            "secret_id",
+            "keys"
+          ],
+          "params": [
+            "secret_id",
+            "keys"
+          ]
+        },
+        {
           "rust": "load_all",
           "dotnet": "LoadAll",
           "go": "LoadAll",
@@ -737,13 +799,6 @@
       "ts": "advertisedEndpoints"
     },
     {
-      "what": "sequential failover transport",
-      "why": "the send contract has four rules and none is about dialing; written by hand per binding it is untested code reaching identical behaviour, and the shortest thing that compiles is endpoints[0], which forfeits failover silently",
-      "dotnet": "SequentialFailover",
-      "go": "SequentialFailover",
-      "ts": "sequentialFailover"
-    },
-    {
       "what": "replica id generator",
       "why": "a replica id must be random and never 0; minting it in the core means no binding can produce one the core refuses",
       "dotnet": "DeRecProtocolBuilder.GenerateReplicaId",
@@ -760,13 +815,6 @@
       "ts": "protocol_version",
       "ffi": "derec_protocol_version",
       "wasm": "protocol_version"
-    },
-    {
-      "what": "single endpoint transport",
-      "why": "taking endpoints[0] inline reads as finished; naming the type records that failover was considered and declined, which is a claim a reviewer can disagree with",
-      "dotnet": "SingleEndpointTransport",
-      "go": "SingleEndpointTransport",
-      "ts": "singleEndpointTransport"
     }
   ],
   "primitives": [
@@ -1129,6 +1177,22 @@
       "dotnet": "Envelope.ReadMessageId",
       "go": "envelope.ReadMessageID",
       "ts": "envelope.message_id"
+    },
+    {
+      "rust": "derec_message::read_sequence",
+      "ffi": "read_sequence_from_envelope",
+      "wasm": "envelope_read_sequence",
+      "dotnet": "Envelope.ReadSequence",
+      "go": "envelope.ReadSequence",
+      "ts": "envelope.read_sequence"
+    },
+    {
+      "rust": "types::ChannelKey::derive",
+      "ffi": "derive_channel_key",
+      "wasm": "channel_key_derive",
+      "dotnet": "ChannelKey.Derive",
+      "go": "channelkey.Derive",
+      "ts": "channel_key.derive"
     }
   ],
   "records": [

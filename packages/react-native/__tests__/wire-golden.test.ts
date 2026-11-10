@@ -128,7 +128,7 @@ describe('wire golden vectors', () => {
   it('restore params omit the threshold when the roster records none', () => {
     const input = goldenRestoreInput();
     delete input.threshold;
-    const params = buildRestoreParams(input, 7) as { recovered_secret: Record<string, unknown> };
+    const params = buildRestoreParams(input, 7, 9) as { recovered_secret: Record<string, unknown> };
     expect(params.recovered_secret).not.toHaveProperty('threshold');
   });
 
@@ -138,14 +138,14 @@ describe('wire golden vectors', () => {
   });
 
   it('restore params match the shared fixture', () => {
-    expect(buildRestoreParams(goldenRestoreInput(), 7)).toEqual(golden.restore);
+    expect(buildRestoreParams(goldenRestoreInput(), 7, 9)).toEqual(golden.restore);
   });
 
   it('restore params treat null communication_info as omitted, same as absent or empty', () => {
     const input = goldenRestoreInput();
     input.helpers[0].communication_info = null as unknown as Record<string, string>;
     input.replicas!.members[0].communication_info = null as unknown as Record<string, string>;
-    const params = buildRestoreParams(input, 7) as {
+    const params = buildRestoreParams(input, 7, 9) as {
       recovered_secret: {
         helpers: Array<Record<string, unknown>>;
         replicas: { members: Array<Record<string, unknown>> };

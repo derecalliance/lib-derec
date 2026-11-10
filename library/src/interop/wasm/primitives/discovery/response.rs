@@ -39,14 +39,21 @@ pub fn produce(
     channel_id: u64,
     secret_list: JsValue,
     shared_key: &[u8],
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
 
     let entries: Vec<SecretVersionEntry> = from_js(secret_list)?;
     let secret_list: Vec<DomainSecretVersionEntry> = entries.into_iter().map(Into::into).collect();
 
-    let result = response::produce(channel_id.into(), &secret_list, &shared_key)
-        .map_err(js_error_from_lib)?;
+    let result = response::produce(
+        channel_id.into(),
+        &secret_list,
+        &crate::types::ChannelKey::new(epoch, shared_key),
+    )
+    .map_err(js_error_from_lib)?;
 
     to_js(&ProduceResult {
         envelope: result.envelope,

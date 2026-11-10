@@ -120,6 +120,7 @@ pub struct DeRecProtocolBuilder<
     unsafe_connection: Option<bool>,
     communication_info: HashMap<String, String>,
     auto_respond_on_failure: bool,
+    key_rotation: bool,
     unpair_ack: UnpairAck,
     auto_reply_to: bool,
     auto_accept: AutoAcceptPolicy,
@@ -158,6 +159,7 @@ impl
             unsafe_connection: None,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
+            key_rotation: false,
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
             auto_accept: AutoAcceptPolicy::default(),
@@ -354,7 +356,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     ///   usable); anything else is `FAIL` with a generic memo, so no local
     ///   error text reaches the peer.
     /// - `false`: nothing is sent. The event carries `responded: false` and a
-    ///   [`PendingAction::RespondToFailure`](crate::protocol::PendingAction::RespondToFailure)
+    ///   [`Action::RespondToFailure`](crate::protocol::Action::RespondToFailure)
     ///   token; pass it to [`DeRecProtocol::reject`] with the status and memo
     ///   to send. The library never expires the token, so a request the
     ///   application never answers leaves its sender to time out.
@@ -390,6 +392,29 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// Default: `false`.
     pub fn with_auto_respond_on_failure(mut self, enabled: bool) -> Self {
         self.auto_respond_on_failure = enabled;
+        self
+    }
+
+    /// Whether this device, as an owner, advances each helper channel's key
+    /// one epoch in every sharing round that reaches the threshold, and, as a
+    /// replica source, the group channel's key one epoch on every publish to
+    /// replicas.
+    ///
+    /// Each step derives the next key from the current one,
+    /// `K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" ‖ be32(e+1))`, so a
+    /// key taken from this device or a helper does not reveal the keys before
+    /// it. The published secret records the epoch and key of every channel,
+    /// and a restored device continues from there. Peers follow on their own
+    /// the first time a message under a newer epoch decrypts, whatever their
+    /// own setting.
+    ///
+    /// Turning it off stops the advance: the channel stays on its current
+    /// key, never the one pairing established. Turning it on again continues
+    /// from that key.
+    ///
+    /// Default: `false`.
+    pub fn with_key_rotation(mut self, enabled: bool) -> Self {
+        self.key_rotation = enabled;
         self
     }
 
@@ -534,9 +559,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     ///
     /// The order is meaningful: peers record these endpoints in this order,
     /// and their transport receives them in it, so it is the order in which
-    /// they try to reach this device (the default
-    /// [`SequentialFailover`](crate::protocol::SequentialFailover) tries them
-    /// in turn). The library itself does not rank endpoints. The first entry
+    /// they try to reach this device. The library itself does not rank
+    /// endpoints. The first entry
     /// is also this device's primary endpoint.
     ///
     /// Because delivery is push-only, an endpoint listed here is one this
@@ -622,6 +646,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             parameter_range,
             auto_accept,
             auto_respond_on_failure,
+            key_rotation,
             auto_reply_to,
             unpair_ack,
             unsafe_connection,
@@ -647,6 +672,9 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         }
         if let Some(enabled) = auto_respond_on_failure {
             self = self.with_auto_respond_on_failure(enabled);
+        }
+        if let Some(enabled) = key_rotation {
+            self = self.with_key_rotation(enabled);
         }
         if let Some(enabled) = auto_reply_to {
             self = self.with_auto_reply_to(enabled);
@@ -768,6 +796,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -819,6 +848,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -870,6 +900,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -924,6 +955,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -971,6 +1003,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore>
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -1027,6 +1060,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -1144,6 +1178,7 @@ impl<
         )?;
         protocol.communication_info = self.communication_info;
         protocol.auto_respond_on_failure = self.auto_respond_on_failure;
+        protocol.key_rotation = self.key_rotation;
         protocol.unpair_ack = self.unpair_ack;
         protocol.auto_reply_to = self.auto_reply_to;
         protocol.auto_accept = self.auto_accept;
@@ -1165,7 +1200,7 @@ mod tests {
     use crate::protocol::ExpiredChannelsConfig;
     use crate::protocol::StateItem;
     use crate::protocol::StateKey;
-    use crate::protocol::StateKind;
+
     use crate::protocol::StateStoreFuture;
     use crate::protocol::TimeoutsConfig;
     use crate::protocol::tests::{
@@ -1266,6 +1301,9 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
+            fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn helpers(
                 &self,
                 _: u64,
@@ -1307,8 +1345,8 @@ mod tests {
                 _: u64,
                 _: &[ChannelId],
                 _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(future::ready(Ok(Vec::new())))
+            ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(future::ready(Ok(Vec::new())))
@@ -1329,6 +1367,13 @@ mod tests {
                 _: &[u32],
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn remove_versions_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, Vec<u32>)],
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn keep_version(&self, _: u64, _: u32) -> ShareStoreFuture<'_, u32> {
                 Box::pin(future::ready(Ok(0)))
@@ -1359,6 +1404,13 @@ mod tests {
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, SecretKind)],
+            ) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
         }
 
@@ -1393,8 +1445,20 @@ mod tests {
             fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
-            fn load_all(&self, _: u64, _: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
-                Box::pin(future::ready(Ok(Vec::new())))
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[crate::protocol::StateKey],
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn load_all(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKind,
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>>
+            {
+                Box::pin(std::future::ready(Ok(Vec::new())))
             }
         }
 
@@ -1450,6 +1514,9 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
+            fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn helpers(
                 &self,
                 _: u64,
@@ -1490,8 +1557,8 @@ mod tests {
                 _: u64,
                 _: &[ChannelId],
                 _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(future::ready(Ok(Vec::new())))
+            ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(future::ready(Ok(Vec::new())))
@@ -1512,6 +1579,13 @@ mod tests {
                 _: &[u32],
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn remove_versions_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, Vec<u32>)],
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn keep_version(&self, _: u64, _: u32) -> ShareStoreFuture<'_, u32> {
                 Box::pin(future::ready(Ok(0)))
@@ -1541,6 +1615,13 @@ mod tests {
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, SecretKind)],
+            ) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
         }
         struct NoopUserSecretStore;
@@ -1573,8 +1654,20 @@ mod tests {
             fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
-            fn load_all(&self, _: u64, _: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
-                Box::pin(future::ready(Ok(Vec::new())))
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[crate::protocol::StateKey],
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn load_all(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKind,
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>>
+            {
+                Box::pin(std::future::ready(Ok(Vec::new())))
             }
         }
 
@@ -1623,6 +1716,9 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
+            fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn helpers(
                 &self,
                 _: u64,
@@ -1663,8 +1759,8 @@ mod tests {
                 _: u64,
                 _: &[ChannelId],
                 _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(future::ready(Ok(Vec::new())))
+            ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(future::ready(Ok(Vec::new())))
@@ -1685,6 +1781,13 @@ mod tests {
                 _: &[u32],
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn remove_versions_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, Vec<u32>)],
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn keep_version(&self, _: u64, _: u32) -> ShareStoreFuture<'_, u32> {
                 Box::pin(future::ready(Ok(0)))
@@ -1714,6 +1817,13 @@ mod tests {
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, SecretKind)],
+            ) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
         }
         struct NoopUserSecretStore;
@@ -1746,8 +1856,20 @@ mod tests {
             fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
-            fn load_all(&self, _: u64, _: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
-                Box::pin(future::ready(Ok(Vec::new())))
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[crate::protocol::StateKey],
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn load_all(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKind,
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>>
+            {
+                Box::pin(std::future::ready(Ok(Vec::new())))
             }
         }
 
@@ -1800,6 +1922,9 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
+            fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn helpers(
                 &self,
                 _: u64,
@@ -1840,8 +1965,8 @@ mod tests {
                 _: u64,
                 _: &[ChannelId],
                 _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(future::ready(Ok(Vec::new())))
+            ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(future::ready(Ok(Vec::new())))
@@ -1862,6 +1987,13 @@ mod tests {
                 _: &[u32],
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn remove_versions_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, Vec<u32>)],
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn keep_version(&self, _: u64, _: u32) -> ShareStoreFuture<'_, u32> {
                 Box::pin(future::ready(Ok(0)))
@@ -1891,6 +2023,13 @@ mod tests {
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, SecretKind)],
+            ) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
         }
         struct NoopUserSecretStore;
@@ -1922,8 +2061,20 @@ mod tests {
             fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
-            fn load_all(&self, _: u64, _: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
-                Box::pin(future::ready(Ok(Vec::new())))
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[crate::protocol::StateKey],
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn load_all(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKind,
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>>
+            {
+                Box::pin(std::future::ready(Ok(Vec::new())))
             }
         }
 
@@ -1976,6 +2127,9 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
+            fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn helpers(
                 &self,
                 _: u64,
@@ -2016,8 +2170,8 @@ mod tests {
                 _: u64,
                 _: &[ChannelId],
                 _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
-                Box::pin(future::ready(Ok(Vec::new())))
+            ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(future::ready(Ok(Vec::new())))
@@ -2038,6 +2192,13 @@ mod tests {
                 _: &[u32],
             ) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn remove_versions_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, Vec<u32>)],
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn keep_version(&self, _: u64, _: u32) -> ShareStoreFuture<'_, u32> {
                 Box::pin(future::ready(Ok(0)))
@@ -2067,6 +2228,13 @@ mod tests {
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[(ChannelId, SecretKind)],
+            ) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
         }
         struct NoopUserSecretStore;
@@ -2098,8 +2266,20 @@ mod tests {
             fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
-            fn load_all(&self, _: u64, _: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
-                Box::pin(future::ready(Ok(Vec::new())))
+            fn remove_many(
+                &mut self,
+                _: u64,
+                _: &[crate::protocol::StateKey],
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn load_all(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKind,
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>>
+            {
+                Box::pin(std::future::ready(Ok(Vec::new())))
             }
         }
 
@@ -2580,6 +2760,7 @@ mod tests {
         unsafe_connection: Option<bool>,
         communication_info: HashMap<String, String>,
         auto_respond_on_failure: bool,
+        key_rotation: bool,
         unpair_ack: UnpairAck,
         auto_reply_to: bool,
         auto_accept: AutoAcceptPolicy,
@@ -2598,6 +2779,7 @@ mod tests {
             unsafe_connection: b.unsafe_connection,
             communication_info: b.communication_info.clone(),
             auto_respond_on_failure: b.auto_respond_on_failure,
+            key_rotation: b.key_rotation,
             unpair_ack: b.unpair_ack,
             auto_reply_to: b.auto_reply_to,
             auto_accept: b.auto_accept,
@@ -2634,6 +2816,7 @@ mod tests {
                 ..Default::default()
             }),
             auto_respond_on_failure: Some(true),
+            key_rotation: Some(true),
             auto_reply_to: Some(true),
             unpair_ack: Some(UnpairAck::NotRequired),
             unsafe_connection: Some(true),
@@ -2695,6 +2878,7 @@ mod tests {
                 ..Default::default()
             })
             .with_auto_respond_on_failure(true)
+            .with_key_rotation(true)
             .with_auto_reply_to(true)
             .with_unpair_ack(UnpairAck::NotRequired)
             .with_unsafe_connection(true)

@@ -232,6 +232,12 @@ member, while restoring next to live replicas makes a second device claim
 the lost device's role. See
 [Restore or join](https://derec-alliance.gitbook.io/docs/concepts/replicas/restore-or-join).
 
+`restore(secret, version, newestVersion)` takes the recovered `version` and
+`newestVersion`, the newest version any helper reported in Discovery
+(`version` itself when that is the newest). The recovered secrets are
+recorded at `newestVersion`, so the next publish is `newestVersion + 1`: a
+helper ignores a version older than the newest it stores (`'Superseded'`).
+
 Every channel message carries one timestamp, its send time, in both the
 envelope and the inner message. A message whose two timestamps differ, or
 where either or both are absent, is ignored as `MessageIgnored` with
@@ -262,6 +268,32 @@ reports a request on such a contact, or a request older than the lifetime, as
 involves both parties, so treat an expiry as a retry and ask the user to scan
 or share a fresh contact. Keep the scanner's `expired_channels` timeout at
 least `pairing_secs` plus the time a response takes to arrive.
+
+### Key rotation
+
+With `withKeyRotation(true)`, the owner advances each helper channel's key one epoch in every sharing round that reaches the threshold (a round below it advances none), and the replica group channel's key on every publish to replicas. Each step is K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" || be32(e+1)). Rotation is off by default, and off keeps the channel on its current key. The envelope's `sequence` carries the epoch, and peers follow on their own, so the setting is the owner's alone (`key_rotation` in a config). A message under an epoch whose key the device cannot obtain is ignored as `MessageIgnored` with `reason: 'KeyUnavailable'`. A device keeps its newest key and the key of every secret version it still stores, so any kept version restores. The key ring is stored as a secret of kind `3` (`KeyRing`): persist its bytes as given, with any length, beside the kind-`0` shared key. Forward secrecy covers a compromised helper device, or a key alone, plus recorded traffic, and only for epochs older than the oldest key held; the owner and replica devices hold the plaintext secret and the keys of every version they store. A 0.0.x peer cannot follow a rotated channel: it must upgrade and re-pair.
+
+#### Primitives on a rotated channel
+
+`DeRecProtocol` tracks epochs for you. A caller driving the protocol through
+`primitives.*` does it by hand:
+
+- Every channel-encrypted `produce` (discovery, recovery, sharing, unpairing
+  and verification, request and response) takes `epoch` right after
+  `shared_key`: the epoch of that key in the channel's key chain, stamped into
+  the envelope's `sequence`. It is `0` for a freshly paired channel. Pairing
+  envelopes are always epoch `0`.
+- `extract` takes the key alone. To receive, read the epoch with
+  `envelope.read_sequence(bytes)`, use the key you hold at that epoch or derive
+  it with `channel_key.derive(key, epoch, toEpoch)`, then `extract`.
+- `channel_key.derive` runs forward only and at most 512 epochs per call; a
+  `toEpoch` below `epoch` or more than 512 above it throws `invalid_input`.
+
+```ts
+const epoch = envelope.read_sequence(bytes);
+const key = channel_key.derive(k0, 0, epoch);
+const { request } = primitives.verification.request.extract(bytes, key);
+```
 
 ---
 
@@ -318,6 +350,12 @@ Resolve each token once. The library is stateless, so rejecting the same
 token twice, or rejecting an action already accepted, sends a second
 response.
 
+Hand the token back exactly as you received it. It is sealed to its channel,
+so `accept` and `reject` refuse one that was edited, rebuilt or moved to
+another channel with a `DeRecError` whose `code` is `"invalid_input"`, and
+nothing is stored or sent. A token raised under a channel key the device no longer holds, because the channel has moved on and no stored version keeps that key, is too late to answer and is refused the same way. A token issued by v0.0.10 does not decode
+(`"ffi_bad_proto"`).
+
 `withAutoRespondOnFailure` decides who answers. With it on, the library sends
 the response itself (a known failure keeps its specific status; anything else
 is `FAIL` with a generic memo). With it off (the default), nothing is sent and
@@ -367,26 +405,32 @@ directly. `DeRecProtocolBuilder` takes one implementation of each interface
 declared in `src/types.ts`:
 
 - **`ChannelStore`** — pairing state: helper channels and replica-group
-  membership, keyed by `(channelId, replicaId)`.
+  membership, keyed by `(channelId, replicaId)`. `removeMany` removes every
+  record its `[channelId, replicaId]` pairs address in one call, each
+  addressed the way `remove`'s arguments are, and skips entries that name no
+  record; delete them in one statement or transaction when your backend can.
 - **`ShareStore`** — versioned VSS shares this device holds as a helper.
-  On an owner, `keepVersion` chooses the one older version helpers keep
+  `loadMany` resolves to `[channelId, share]` pairs, each share paired with
+  the channel it is stored under. On an owner, `keepVersion` chooses the one older version helpers keep
   besides the one being shared (`0` keeps none); an answer equal to or
   greater than that version fails the round with `invalid_keep_version`; see
   [`DeRecShareStore::keep_version`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html#tymethod.keep_version).
 - **`SecretStore`** — small per-channel key material (shared keys, etc.),
-  distinct from share bytes.
+  distinct from share bytes. `removeMany` removes every secret its
+  `[channelId, kind]` pairs name in one call, each addressed the way
+  `remove`'s arguments are, and skips entries with nothing stored.
 - **`UserSecretStore`** — the most recent user-facing secret snapshot per
   `secretId`, used to auto-publish to newly paired peers.
 - **`StateStore`** — in-flight orchestrator bookkeeping (pending
   verifications, recoveries, unpairs, sharing rounds, replica discoveries) so a
-  multi-round flow survives an app restart.
+  multi-round flow survives an app restart. `removeMany` receives a JSON
+  array of the keys `remove` takes one at a time and skips keys with no row.
 - **`Transport`** — outbound delivery.
   `send(endpoints: ReadonlyArray<{ protocol: string; uri: string }>, message: Uint8Array): Promise<void>`
   posts a wire-format envelope to a peer. `endpoints` is every address that
   peer advertised, in its own order (`protocol` is `"https"` or `"grpc"`);
   deliver once, to the first one that accepts it, and reject only when none
-  did. `sequentialFailover` and `singleEndpointTransport` implement that
-  choice for you. It is a mailbox, not a request/response call, since not
+  did. It is a mailbox, not a request/response call, since not
   every peer (e.g. a phone behind NAT) can be dialed back. Recommended HTTP
   conventions (`POST`, `application/octet-stream` body, `202 Accepted`) and
   the same-connection pattern for unreachable peers are in
@@ -491,7 +535,7 @@ can take an unbounded amount of time (disk I/O, network requests). Those
 methods return a `Promise`.
 
 **Primitives are the exception.** The functions under `primitives.*` (and
-`envelope.*`) are pure byte transforms with no store or transport callbacks,
+`envelope.*` and `channel_key.*`) are pure byte transforms with no store or transport callbacks,
 so they run synchronously, in-line, on the calling JavaScript thread —
 including `primitives.sharing.request.split` (`protect_secret`), which does
 real cryptographic work: Shamir secret splitting, AES-GCM encryption, and
@@ -704,6 +748,7 @@ The canonical JSON, shared by every SDK, is:
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
   "auto_accept": { "pairing": true, "store_share": true },
   "auto_respond_on_failure": false,
+  "key_rotation": false,
   "auto_reply_to": false,
   "unpair_ack": "required",
   "unsafe_connection": false,

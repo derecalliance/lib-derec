@@ -22,11 +22,16 @@ public static partial class Recovery
             public required byte[] ResponseProtoBytes { get; init; }
         }
 
+        /// <summary>
+        /// <c>epoch</c> is the epoch of <c>sharedKey</c> in the channel's key chain,
+        /// stamped into the envelope's <c>sequence</c>; 0 for a freshly paired channel.
+        /// </summary>
         public static DeRecMessage Produce(
             ulong channelId,
             byte[] requestProtoBytes,
             byte[] storedShareProtoBytes,
-            byte[] sharedKey
+            byte[] sharedKey,
+            uint epoch
         )
         {
             Native.Recovery.ProduceGetShareResponseMessageResult nativeResult =
@@ -37,7 +42,8 @@ public static partial class Recovery
                     storedShareProtoBytes,
                     (UIntPtr)storedShareProtoBytes.Length,
                     sharedKey,
-                    (UIntPtr)sharedKey.Length
+                    (UIntPtr)sharedKey.Length,
+                    epoch
                 );
 
             try

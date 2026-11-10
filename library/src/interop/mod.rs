@@ -43,5 +43,8 @@ mod recovered_secret;
 #[cfg(any(target_arch = "wasm32", feature = "ffi"))]
 mod secret_batch;
 
+#[cfg(any(target_arch = "wasm32", feature = "ffi"))]
+mod secret_value;
+
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;

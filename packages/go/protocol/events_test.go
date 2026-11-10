@@ -1074,7 +1074,7 @@ func TestDecodeEvents_IDsAboveFloat64Precision_RoundTripToRestore(t *testing.T) 
 		t.Fatalf("ids lost precision: %+v", ev.Secret)
 	}
 
-	got, err := json.Marshal(restoreParamsWire{Version: 1, RecoveredSecret: *ev.Secret})
+	got, err := json.Marshal(restoreParamsWire{Version: 1, NewestVersion: 1, RecoveredSecret: *ev.Secret})
 	if err != nil {
 		t.Fatalf("marshal restore params: %v", err)
 	}
@@ -1115,12 +1115,59 @@ func TestDecodeEvents_SecretRecoveredHelperWeight_RoundTripsToRestore(t *testing
 	if ev.Secret.Helpers[0].Weight != 3 {
 		t.Fatalf("Weight = %d, want 3", ev.Secret.Helpers[0].Weight)
 	}
-	got, err := json.Marshal(restoreParamsWire{Version: 1, RecoveredSecret: *ev.Secret})
+	got, err := json.Marshal(restoreParamsWire{Version: 1, NewestVersion: 1, RecoveredSecret: *ev.Secret})
 	if err != nil {
 		t.Fatalf("marshal restore params: %v", err)
 	}
 	if !bytes.Contains(got, []byte(`"weight":3`)) {
 		t.Fatalf("restore params must carry the weight: %s", got)
+	}
+}
+
+// The recovered roster names each key's epoch, and Restore's params hand it
+// back so the restored channels continue at that epoch. A zero epoch is left
+// out.
+func TestDecodeEvents_SecretRecoveredKeyEpoch_RoundTripsToRestore(t *testing.T) {
+	ev := decodeOne(t, `{
+		"type": "SecretRecovered",
+		"secret": {
+			"helpers": [
+				{"channel_id": "1", "transports": [], "shared_key": [1], "weight": 1, "key_epoch": 16},
+				{"channel_id": "2", "transports": [], "shared_key": [2], "weight": 1}
+			],
+			"secrets": [],
+			"replicas": {"channel_id": "9", "members": [], "shared_key": [3], "key_epoch": 3}
+		}
+	}`)
+	if ev.Secret.Helpers[0].KeyEpoch != 16 || ev.Secret.Helpers[1].KeyEpoch != 0 {
+		t.Fatalf("helper KeyEpoch = %d, %d, want 16, 0",
+			ev.Secret.Helpers[0].KeyEpoch, ev.Secret.Helpers[1].KeyEpoch)
+	}
+	if ev.Secret.Replicas == nil || ev.Secret.Replicas.KeyEpoch != 3 {
+		t.Fatalf("replicas KeyEpoch = %+v, want 3", ev.Secret.Replicas)
+	}
+	got, err := json.Marshal(restoreParamsWire{Version: 1, NewestVersion: 1, RecoveredSecret: *ev.Secret})
+	if err != nil {
+		t.Fatalf("marshal restore params: %v", err)
+	}
+	var params struct {
+		RecoveredSecret struct {
+			Helpers  []map[string]json.RawMessage `json:"helpers"`
+			Replicas map[string]json.RawMessage   `json:"replicas"`
+		} `json:"recovered_secret"`
+	}
+	if err := json.Unmarshal(got, &params); err != nil {
+		t.Fatalf("unmarshal restore params: %v", err)
+	}
+	helpers := params.RecoveredSecret.Helpers
+	if len(helpers) != 2 || string(helpers[0]["key_epoch"]) != "16" {
+		t.Fatalf("restore params must carry the helper's key_epoch: %s", got)
+	}
+	if _, present := helpers[1]["key_epoch"]; present {
+		t.Fatalf("a zero key_epoch must be omitted: %s", got)
+	}
+	if string(params.RecoveredSecret.Replicas["key_epoch"]) != "3" {
+		t.Fatalf("restore params must carry the group's key_epoch: %s", got)
 	}
 }
 
@@ -1146,7 +1193,7 @@ func TestDecodeEvents_SecretRecoveredThreshold_RoundTripsToRestore(t *testing.T)
 	if ev.Secret.Threshold == nil || *ev.Secret.Threshold != 3 {
 		t.Fatalf("Threshold = %v, want 3", ev.Secret.Threshold)
 	}
-	got, err := json.Marshal(restoreParamsWire{Version: 1, RecoveredSecret: *ev.Secret})
+	got, err := json.Marshal(restoreParamsWire{Version: 1, NewestVersion: 1, RecoveredSecret: *ev.Secret})
 	if err != nil {
 		t.Fatalf("marshal restore params: %v", err)
 	}
@@ -1154,7 +1201,7 @@ func TestDecodeEvents_SecretRecoveredThreshold_RoundTripsToRestore(t *testing.T)
 		t.Fatalf("restore params must carry the threshold: %s", got)
 	}
 	ev = decodeOne(t, `{"type": "SecretRecovered", "secret": {"helpers": [], "secrets": []}}`)
-	got, err = json.Marshal(restoreParamsWire{Version: 1, RecoveredSecret: *ev.Secret})
+	got, err = json.Marshal(restoreParamsWire{Version: 1, NewestVersion: 1, RecoveredSecret: *ev.Secret})
 	if err != nil {
 		t.Fatalf("marshal restore params: %v", err)
 	}

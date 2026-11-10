@@ -17,7 +17,7 @@ use derec_library::primitives::verification::{
 };
 use derec_library::protocol_version::ProtocolVersion;
 use derec_library::transport::TransportPolicy;
-use derec_library::types::ChannelId;
+use derec_library::types::{ChannelId, ChannelKey, SharedKey};
 use derec_proto::{
     ContactMessage, ContactMode, DeRecMessage, PairResponseMessage, PrePairRequestMessage,
     PrePairResponseMessage, Protocol, SenderKind, TransportProtocol,
@@ -39,6 +39,7 @@ pub fn run_all() {
     run_recovery_flow_test();
     run_discovery_flow_test();
     run_envelope_trace_id_test();
+    run_rotated_channel_primitives_test();
     run_request_reply_to_test();
 }
 
@@ -135,8 +136,8 @@ fn run_pairing_flow_test() {
         "pair response envelope must not be empty"
     );
     assert!(
-        !pair_resp.shared_key.is_empty(),
-        "initiator shared key must not be empty"
+        pair_resp.shared_key.as_bytes().iter().any(|&b| b != 0),
+        "initiator shared key must not be all zeros"
     );
 
     let extracted_response =
@@ -152,8 +153,8 @@ fn run_pairing_flow_test() {
     .expect("pair_response::process failed");
 
     assert!(
-        !processed.shared_key.is_empty(),
-        "responder shared key must not be empty"
+        processed.shared_key.as_bytes().iter().any(|&b| b != 0),
+        "responder shared key must not be all zeros"
     );
     assert_eq!(
         pair_resp.shared_key, processed.shared_key,
@@ -350,7 +351,7 @@ fn inline_keys_handshake() -> (
     ContactMessage,
     PairResponseMessage,
     pair_request::ProduceResult,
-    [u8; 32],
+    SharedKey,
 ) {
     let channel_id = ChannelId(31);
     let contact = pair_request::create_contact(
@@ -575,7 +576,7 @@ fn run_sharing_flow_test() {
         );
     }
 
-    let shared_key = [42u8; 32];
+    let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
 
     for (channel, share) in &split_result.shares {
         assert!(
@@ -583,9 +584,17 @@ fn run_sharing_flow_test() {
             "empty commitment for channel {channel:?}"
         );
 
-        let store_result =
-            share_request::produce(*channel, version, secret_id, share, 0, "", &shared_key, &[])
-                .unwrap_or_else(|e| panic!("share_request::produce failed for {channel:?}: {e}"));
+        let store_result = share_request::produce(
+            *channel,
+            version,
+            secret_id,
+            share,
+            0,
+            "",
+            &ChannelKey::new(0, shared_key.clone()),
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("share_request::produce failed for {channel:?}: {e}"));
 
         assert!(
             !store_result.envelope.is_empty(),
@@ -595,8 +604,12 @@ fn run_sharing_flow_test() {
         let extracted_req = share_request::extract(&store_result.envelope, &shared_key)
             .unwrap_or_else(|e| panic!("share_request::extract failed for {channel:?}: {e}"));
 
-        let processed = share_response::produce(*channel, &extracted_req.request, &shared_key)
-            .unwrap_or_else(|e| panic!("share_response::produce failed for {channel:?}: {e}"));
+        let processed = share_response::produce(
+            *channel,
+            &extracted_req.request,
+            &ChannelKey::new(0, shared_key.clone()),
+        )
+        .unwrap_or_else(|e| panic!("share_response::produce failed for {channel:?}: {e}"));
 
         assert!(
             !processed.envelope.is_empty(),
@@ -654,7 +667,7 @@ fn run_verification_flow_test() {
         &sharing.shares[&channel_1],
         0,
         "",
-        shared_key_1,
+        &ChannelKey::new(0, shared_key_1.clone()),
         &[],
     )
     .expect("share_request::produce failed for channel 1")
@@ -667,7 +680,7 @@ fn run_verification_flow_test() {
         &sharing.shares[&channel_2],
         0,
         "",
-        shared_key_1,
+        &ChannelKey::new(0, shared_key_1.clone()),
         &[],
     )
     .expect("share_request::produce failed for channel 2")
@@ -683,8 +696,14 @@ fn run_verification_flow_test() {
         .request
         .share;
 
-    let produced = verif_request::produce(channel_1, secret_id, version, shared_key_1, &[])
-        .expect("verif_request::produce failed");
+    let produced = verif_request::produce(
+        channel_1,
+        secret_id,
+        version,
+        &ChannelKey::new(0, shared_key_1.clone()),
+        &[],
+    )
+    .expect("verif_request::produce failed");
 
     let request_envelope = DeRecMessage::decode(produced.envelope.as_slice())
         .expect("failed to decode request envelope");
@@ -706,9 +725,13 @@ fn run_verification_flow_test() {
     );
     assert_ne!(req_result.request.nonce, 0, "nonce must not be zero");
 
-    let resp_produced =
-        verif_response::produce(channel_1, &req_result.request, shared_key_1, &share_bytes_1)
-            .expect("verif_response::produce failed");
+    let resp_produced = verif_response::produce(
+        channel_1,
+        &req_result.request,
+        &ChannelKey::new(0, shared_key_1.clone()),
+        &share_bytes_1,
+    )
+    .expect("verif_response::produce failed");
 
     let resp_result = verif_response::extract(&resp_produced.envelope, shared_key_1)
         .expect("verif_response::extract failed");
@@ -717,9 +740,13 @@ fn run_verification_flow_test() {
         .expect("verif_response::process failed (valid case)");
     assert!(valid, "expected a valid verification response");
 
-    let resp_produced_2 =
-        verif_response::produce(channel_1, &req_result.request, shared_key_1, &share_bytes_1)
-            .expect("second verif_response::produce failed");
+    let resp_produced_2 = verif_response::produce(
+        channel_1,
+        &req_result.request,
+        &ChannelKey::new(0, shared_key_1.clone()),
+        &share_bytes_1,
+    )
+    .expect("second verif_response::produce failed");
     let resp_result_2 = verif_response::extract(&resp_produced_2.envelope, shared_key_1)
         .expect("second verif_response::extract failed");
     let valid_2 =
@@ -766,7 +793,7 @@ fn run_recovery_flow_test() {
             &sharing.shares[&channel_1],
             0,
             "",
-            shared_key_1,
+            &ChannelKey::new(0, shared_key_1.clone()),
             &[],
         )
         .expect("share_request::produce failed for channel 1")
@@ -784,7 +811,7 @@ fn run_recovery_flow_test() {
             &sharing.shares[&channel_2],
             0,
             "",
-            shared_key_2,
+            &ChannelKey::new(0, shared_key_2.clone()),
             &[],
         )
         .expect("share_request::produce failed for channel 2")
@@ -794,26 +821,46 @@ fn run_recovery_flow_test() {
     .expect("share_request::extract failed for channel 2")
     .request;
 
-    let share_req_1 = rec_request::produce(channel_1, secret_id, version, shared_key_1, &[])
-        .expect("rec_request::produce failed for channel 1");
+    let share_req_1 = rec_request::produce(
+        channel_1,
+        secret_id,
+        version,
+        &ChannelKey::new(0, shared_key_1.clone()),
+        &[],
+    )
+    .expect("rec_request::produce failed for channel 1");
     let get_request_1 = rec_request::extract(&share_req_1.envelope, shared_key_1)
         .expect("rec_request::extract failed for channel 1")
         .request;
-    let share_resp_1 =
-        rec_response::produce(channel_1, &get_request_1, &stored_request_1, shared_key_1)
-            .expect("rec_response::produce failed for channel 1");
+    let share_resp_1 = rec_response::produce(
+        channel_1,
+        &get_request_1,
+        &stored_request_1,
+        &ChannelKey::new(0, shared_key_1.clone()),
+    )
+    .expect("rec_response::produce failed for channel 1");
     let get_response_1 = rec_response::extract(&share_resp_1.envelope, shared_key_1)
         .expect("rec_response::extract failed for channel 1")
         .response;
 
-    let share_req_2 = rec_request::produce(channel_2, secret_id, version, shared_key_2, &[])
-        .expect("rec_request::produce failed for channel 2");
+    let share_req_2 = rec_request::produce(
+        channel_2,
+        secret_id,
+        version,
+        &ChannelKey::new(0, shared_key_2.clone()),
+        &[],
+    )
+    .expect("rec_request::produce failed for channel 2");
     let get_request_2 = rec_request::extract(&share_req_2.envelope, shared_key_2)
         .expect("rec_request::extract failed for channel 2")
         .request;
-    let share_resp_2 =
-        rec_response::produce(channel_2, &get_request_2, &stored_request_2, shared_key_2)
-            .expect("rec_response::produce failed for channel 2");
+    let share_resp_2 = rec_response::produce(
+        channel_2,
+        &get_request_2,
+        &stored_request_2,
+        &ChannelKey::new(0, shared_key_2.clone()),
+    )
+    .expect("rec_response::produce failed for channel 2");
     let get_response_2 = rec_response::extract(&share_resp_2.envelope, shared_key_2)
         .expect("rec_response::extract failed for channel 2")
         .response;
@@ -836,10 +883,10 @@ fn run_discovery_flow_test() {
     println!("=== Discovery flow test ===");
 
     let channel_id = ChannelId(7);
-    let shared_key = [11u8; 32];
+    let shared_key = derec_library::types::SharedKey::new([11u8; 32]);
 
-    let request =
-        disc_request::produce(channel_id, &shared_key, &[]).expect("disc_request::produce failed");
+    let request = disc_request::produce(channel_id, &ChannelKey::new(0, shared_key.clone()), &[])
+        .expect("disc_request::produce failed");
     assert!(
         !request.envelope.is_empty(),
         "discovery request envelope must not be empty"
@@ -863,8 +910,12 @@ fn run_discovery_flow_test() {
         ],
     }];
 
-    let response = disc_response::produce(channel_id, &secret_list, &shared_key)
-        .expect("disc_response::produce failed");
+    let response = disc_response::produce(
+        channel_id,
+        &secret_list,
+        &ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("disc_response::produce failed");
 
     let extracted_resp = disc_response::extract(&response.envelope, &shared_key)
         .expect("disc_response::extract failed");
@@ -884,10 +935,10 @@ fn run_envelope_trace_id_test() {
     println!("=== Envelope trace_id helpers test ===");
 
     let channel_id = ChannelId(42);
-    let shared_key = [9u8; 32];
+    let shared_key = derec_library::types::SharedKey::new([9u8; 32]);
 
-    let result =
-        disc_request::produce(channel_id, &shared_key, &[]).expect("disc_request::produce failed");
+    let result = disc_request::produce(channel_id, &ChannelKey::new(0, shared_key.clone()), &[])
+        .expect("disc_request::produce failed");
 
     let trace_before = read_trace_id(&result.envelope).expect("read failed");
     assert_eq!(trace_before, 0, "primitive default trace_id must be 0");
@@ -906,19 +957,68 @@ fn run_envelope_trace_id_test() {
     println!("Envelope trace_id helpers test passed.");
 }
 
+/// On a rotated channel a primitives caller reads the envelope's epoch,
+/// derives the key at that epoch from the one it holds, and extracts with it.
+fn run_rotated_channel_primitives_test() {
+    println!("=== Primitives on a rotated channel test ===");
+
+    let channel_id = ChannelId(43);
+    let k0 = ChannelKey::new(0, derec_library::types::SharedKey::new([12u8; 32]));
+
+    let k3 = k0.derive(3).expect("derive forward failed");
+    assert_ne!(
+        k3.key(),
+        k0.key(),
+        "a later epoch must have a different key"
+    );
+
+    let produced =
+        verif_request::produce(channel_id, 1, 1, &k3, &[]).expect("verif_request::produce failed");
+    let epoch = derec_library::derec_message::read_sequence(&produced.envelope)
+        .expect("read_sequence failed");
+    assert_eq!(epoch, 3, "the envelope must carry the key's epoch");
+
+    let opening = k0
+        .derive(epoch)
+        .expect("derive to the envelope epoch failed");
+    assert_eq!(opening, k3);
+    verif_request::extract(&produced.envelope, opening.key())
+        .expect("extract under the derived key failed");
+    assert!(
+        verif_request::extract(&produced.envelope, k0.key()).is_err(),
+        "the epoch-0 key must not open an epoch-3 envelope"
+    );
+
+    assert!(
+        matches!(k3.derive(2), Err(derec_library::Error::InvalidInput(_))),
+        "a key must not derive backward"
+    );
+    assert!(
+        matches!(k0.derive(513), Err(derec_library::Error::InvalidInput(_))),
+        "a derivation past 512 epochs must be refused"
+    );
+    k0.derive(512).expect("a 512-epoch derivation must succeed");
+
+    println!("Primitives on a rotated channel test passed.");
+}
+
 fn run_request_reply_to_test() {
     println!("=== Request reply_to round-trip test ===");
 
     let channel_id = ChannelId(7);
-    let shared_key = [11u8; 32];
+    let shared_key = derec_library::types::SharedKey::new([11u8; 32]);
 
     let reply_to = TransportProtocol {
         uri: "https://replica-a.example.com/derec".to_owned(),
         protocol: Protocol::Https as i32,
     };
 
-    let result = disc_request::produce(channel_id, &shared_key, slice::from_ref(&reply_to.clone()))
-        .expect("disc_request::produce failed");
+    let result = disc_request::produce(
+        channel_id,
+        &ChannelKey::new(0, shared_key.clone()),
+        slice::from_ref(&reply_to.clone()),
+    )
+    .expect("disc_request::produce failed");
 
     let extracted =
         disc_request::extract(&result.envelope, &shared_key).expect("disc_request::extract failed");
@@ -928,7 +1028,7 @@ fn run_request_reply_to_test() {
         "replyToTransports must round-trip on the inner request"
     );
 
-    let plain = disc_request::produce(channel_id, &shared_key, &[])
+    let plain = disc_request::produce(channel_id, &ChannelKey::new(0, shared_key.clone()), &[])
         .expect("disc_request::produce (no reply_to) failed");
     let plain_extracted =
         disc_request::extract(&plain.envelope, &shared_key).expect("disc_request::extract failed");
@@ -940,12 +1040,13 @@ fn run_request_reply_to_test() {
     println!("Request reply_to round-trip test passed.");
 }
 
-fn make_shared_keys(channels: &[ChannelId]) -> HashMap<ChannelId, [u8; 32]> {
+fn make_shared_keys(channels: &[ChannelId]) -> HashMap<ChannelId, derec_library::types::SharedKey> {
     let mut out = HashMap::with_capacity(channels.len());
     for (i, channel) in channels.iter().enumerate() {
-        let mut key = [0u8; 32];
-        key.fill((i + 1) as u8);
-        out.insert(*channel, key);
+        out.insert(
+            *channel,
+            derec_library::types::SharedKey::new([(i + 1) as u8; 32]),
+        );
     }
     out
 }

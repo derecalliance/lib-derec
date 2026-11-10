@@ -6,12 +6,13 @@
 //! The outer `DeRecMessage` envelope is plaintext, so a handful of metadata
 //! fields can be read or rewritten without touching the encrypted inner
 //! payload: `trace_id`, the opaque correlation token described on
-//! `DeRecMessage.traceId`, and the message identity the application's
-//! replay detection keys on.
+//! `DeRecMessage.traceId`, `sequence`, the epoch of the channel key that
+//! encrypted the payload, and the message identity the application's replay
+//! detection keys on.
 
 use std::slice;
 
-use crate::derec_message::{apply_trace_id, message_id, read_trace_id};
+use crate::derec_message::{apply_trace_id, message_id, read_sequence, read_trace_id};
 use crate::interop::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
 use crate::interop::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error,
@@ -31,6 +32,13 @@ pub struct ReadTraceIdResult {
     /// Trace id read off the envelope. Zero on error (also zero if the
     /// sender did not set one — the protobuf default is indistinguishable).
     pub trace_id: u64,
+}
+
+#[repr(C)]
+pub struct ReadSequenceResult {
+    pub error: DeRecError,
+    /// Epoch of the channel key that encrypted the payload. Zero on error.
+    pub sequence: u32,
 }
 
 #[repr(C)]
@@ -122,6 +130,49 @@ pub extern "C" fn read_trace_id_from_envelope(
                 "failed to decode DeRecMessage envelope",
             ),
             trace_id: 0,
+        },
+    }
+}
+
+/// Read `sequence` off an envelope without touching the encrypted inner
+/// payload: the epoch of the channel key that encrypted it.
+///
+/// Mirrors [`crate::derec_message::read_sequence`]. A caller using primitives
+/// directly reads it to pick the key to pass to an `extract_*` call, deriving
+/// it forward with `derive_channel_key` when the epoch is newer than the key
+/// it holds.
+///
+/// # Safety
+///
+/// `envelope_ptr` must point to a readable byte range of length `envelope_len`.
+#[unsafe(no_mangle)]
+pub extern "C" fn read_sequence_from_envelope(
+    envelope_ptr: *const u8,
+    envelope_len: usize,
+) -> ReadSequenceResult {
+    if envelope_ptr.is_null() && envelope_len > 0 {
+        return ReadSequenceResult {
+            error: ffi_error(DEREC_CODE_FFI_NULL_PTR, "envelope_ptr is null"),
+            sequence: 0,
+        };
+    }
+    let bytes = if envelope_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(envelope_ptr, envelope_len) }
+    };
+
+    match read_sequence(bytes) {
+        Ok(sequence) => ReadSequenceResult {
+            error: success(),
+            sequence,
+        },
+        Err(_) => ReadSequenceResult {
+            error: ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "failed to decode DeRecMessage envelope",
+            ),
+            sequence: 0,
         },
     }
 }

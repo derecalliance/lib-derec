@@ -77,6 +77,7 @@ internal static class Protocol
         RunProtectSecretPerTargetFailureTest();
         RunShareSubsharesTest();
         RunStickyThresholdTest();
+        RunKeyRotationTest();
         RunChannelStatusRequiredOnDecodeTest();
         RunOrchestratorMaxSubsharesTest();
         RunHelperKeepVersionPrunesShareStoreTest();
@@ -110,6 +111,9 @@ internal static class Protocol
         RunOrchestratorUnpairingFlowTest();
         RunOrchestratorUpdateChannelInfoFlowTest();
         RunOrchestratorReplyToFlowTest();
+        RunOrchestratorPairingBelowThresholdPublishesNothingFlowTest();
+        RunOrchestratorUnpairRepublishesFlowTest();
+        RunOrchestratorReplicaRemovalPublishesTheRosterFlowTest();
         RunOrchestratorReplicaIdWiringSadPathsTest();
         RunOrchestratorReplicaPairAndSecretSyncTest();
         RunReplicaMirrorThenVerifyTest();
@@ -1167,10 +1171,17 @@ internal static class Protocol
         if (recovered.Secret.Threshold != 3)
             throw new InvalidOperationException($"the recovered roster must carry t=3; got {recovered.Secret.Threshold}");
         using var restored = MakeNode("RestoredOwner", "https://restored.example.com", new NodeOptions(SecretId: secretId));
-        restored.Protocol.RestoreAsync(recovered.Secret, v3).GetAwaiter().GetResult();
-        uint? restoredThreshold = restored.UserSecretStore.LoadLatest(secretId)?.Threshold;
-        if (restoredThreshold != 3)
-            throw new InvalidOperationException($"restore must keep t=3; got {restoredThreshold}");
+        // The helpers may hold versions newer than the one recovered: the
+        // snapshot is recorded at the newest one, so the next publish numbers
+        // above it.
+        uint newest = v3 + 2;
+        restored.Protocol.RestoreAsync(recovered.Secret, v3, newest).GetAwaiter().GetResult();
+        var restoredSnapshot = restored.UserSecretStore.LoadLatest(secretId);
+        if (restoredSnapshot?.Threshold != 3)
+            throw new InvalidOperationException($"restore must keep t=3; got {restoredSnapshot?.Threshold}");
+        if (restoredSnapshot?.Version != newest)
+            throw new InvalidOperationException(
+                $"restore must record the snapshot at the newest v{newest}; got v{restoredSnapshot?.Version}");
         restored.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
         {
             Secrets = new[]
@@ -1180,7 +1191,7 @@ internal static class Protocol
         }).GetAwaiter().GetResult();
         foreach (ulong c in channels.Append(channelD))
         {
-            var rows = restored.ShareStore.Load(secretId, c, new[] { v3 + 1 }).ToList();
+            var rows = restored.ShareStore.Load(secretId, c, new[] { newest + 1 }).ToList();
             if (rows.Count != 1 || rows[0].Threshold != 3)
                 throw new InvalidOperationException(
                     $"the publish after restore must split at the restored t=3; got [{string.Join(", ", rows.Select(r => r.Threshold))}]");
@@ -1216,6 +1227,22 @@ internal static class Protocol
             throw new InvalidOperationException(
                 $"the recovered roster must carry t=3 and weight 2; got t={recoveredEvent.Secret.Threshold}, weight={recoveredEvent.Secret.Helpers[0].Weight}");
         Console.WriteLine("  SecretRecovered carries the roster's threshold and weights  ✓");
+
+        // A recovered roster hands each key's epoch back to restore unchanged.
+        var rotatedEvent = JsonSerializer.Deserialize<DeRecEvent>(
+            """{"type":"SecretRecovered","secret":{"helpers":[{"channel_id":"9","transports":[],"shared_key":[1],"weight":1,"key_epoch":16}],"secrets":[],"replicas":{"channel_id":"7","members":[],"shared_key":[2],"key_epoch":3}}}""")
+            as SecretRecoveredEvent
+            ?? throw new InvalidOperationException("SecretRecovered must decode");
+        if (rotatedEvent.Secret.Helpers[0].KeyEpoch != 16 || rotatedEvent.Secret.Replicas?.KeyEpoch != 3)
+            throw new InvalidOperationException(
+                $"the recovered roster must carry key epochs 16 and 3; got {rotatedEvent.Secret.Helpers[0].KeyEpoch} and {rotatedEvent.Secret.Replicas?.KeyEpoch}");
+        var restoreSecret = System.Text.Json.Nodes.JsonNode.Parse(
+            JsonSerializer.Serialize(rotatedEvent.Secret, DeRecJsonOptions.Wire))!;
+        if (restoreSecret["helpers"]![0]!["key_epoch"]!.GetValue<uint>() != 16
+            || restoreSecret["replicas"]!["key_epoch"]!.GetValue<uint>() != 3)
+            throw new InvalidOperationException(
+                $"the secret handed to restore must carry its key epochs; got {restoreSecret.ToJsonString()}");
+        Console.WriteLine("  SecretRecovered hands each key epoch back to restore  ✓");
 
         Console.WriteLine("Sticky threshold test passed.\n");
     }
@@ -2056,6 +2083,148 @@ internal static class Protocol
     }
 
     /// <summary>
+    /// The epoch of the key ring <paramref name="node"/> stores for
+    /// <paramref name="channelId"/>, read from its own secret store: the
+    /// ring's bytes are a version byte, 1 for the encoding
+    /// <c>KeyRing::as_bytes</c> documents, followed by the big-endian u32
+    /// epoch.
+    /// </summary>
+    private static uint StoredKeyEpoch(Node node, ulong secretId, ulong channelId)
+    {
+        var ring = node.SecretStore.Load(secretId, channelId, SecretKind.KeyRing)
+            ?? throw new InvalidOperationException($"channel {channelId} must store a KeyRing");
+        if (ring.Kind != SecretKind.KeyRing || ring.Bytes.Length < 5)
+            throw new InvalidOperationException($"channel {channelId} holds no KeyRing bytes");
+        if (ring.Bytes[0] != 1)
+            throw new InvalidOperationException($"channel {channelId} stores KeyRing encoding {ring.Bytes[0]}, this reader knows 1");
+        return System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(ring.Bytes.AsSpan(1, 4));
+    }
+
+    /// <summary>
+    /// With key rotation on, the owner advances each helper channel one epoch
+    /// per sharing round, and both ends store the new epoch in their key ring.
+    /// An envelope whose <c>sequence</c> is past the forward-jump limit is
+    /// ignored as <see cref="IgnoreReason.KeyUnavailable"/>. The recovered
+    /// secret names each channel's epoch, and a fresh device restored from it
+    /// publishes under the next one.
+    /// </summary>
+    private static void RunKeyRotationTest()
+    {
+        Console.WriteLine("=== Key rotation test ===");
+
+        const ulong secretId = 0x0E90C4UL;
+        const string ownerUri = "https://owner-rotation.example.com";
+        const string helperAUri = "https://helper-a-rotation.example.com";
+        const string helperBUri = "https://helper-b-rotation.example.com";
+        var owner = MakeNode("Owner", ownerUri, new NodeOptions(SecretId: secretId, KeyRotation: true));
+        using var helperA = MakeNode("HelperA", helperAUri, new NodeOptions(SecretId: secretId));
+        using var helperB = MakeNode("HelperB", helperBUri, new NodeOptions(SecretId: secretId));
+        ulong channelA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, 81UL);
+        ulong channelB = DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, 82UL);
+        var helpers = new[] { (Channel: channelA, Node: helperA), (Channel: channelB, Node: helperB) };
+        (Node, string)[] Scope(Node ownerNode) =>
+            new[] { (ownerNode, ownerUri), (helperA, helperAUri), (helperB, helperBUri) };
+
+        for (uint round = 1; round <= 2; round++)
+        {
+            owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+            {
+                Secrets = new[] { new UserSecret { Id = new byte[] { 21 }, Name = "rotating", Data = new[] { (byte)round } } },
+            }).GetAwaiter().GetResult();
+            var confirmed = PumpAll(Scope(owner)).OfType<ShareConfirmedEvent>().Count(e => e.Version == round);
+            if (confirmed != 2)
+                throw new InvalidOperationException($"both helpers must confirm v{round}, got {confirmed}");
+        }
+        foreach (var (channel, helper) in helpers)
+        {
+            uint ownerEpoch = StoredKeyEpoch(owner, secretId, channel);
+            uint helperEpoch = StoredKeyEpoch(helper, secretId, channel);
+            if (ownerEpoch != 2 || helperEpoch != 2)
+                throw new InvalidOperationException(
+                    $"channel {channel} must be at KeyRing epoch 2 on both ends, got owner {ownerEpoch}, helper {helperEpoch}");
+        }
+        Console.WriteLine("  two rounds → owner and helpers store KeyRing epoch 2 on both channels  ✓");
+
+        owner.Protocol.StartAsync(FlowKind.VerifyShares, new VerifySharesParams
+        {
+            SecretId = secretId,
+            Version = 2,
+            Target = Target.All,
+        }).GetAwaiter().GetResult();
+        var verified = PumpAll(Scope(owner)).OfType<ShareVerifiedEvent>()
+            .Where(e => e.Version == 2).Select(e => e.ChannelId).ToHashSet();
+        if (!verified.SetEquals(new[] { channelA, channelB }))
+            throw new InvalidOperationException(
+                $"both channels must verify v2 at epoch 2, got [{string.Join(", ", verified)}]");
+        Console.WriteLine("  verification of v2 at epoch 2 → ShareVerified on both channels  ✓");
+
+        owner.Protocol.StartAsync(FlowKind.VerifyShares, new VerifySharesParams
+        {
+            SecretId = secretId,
+            Version = 2,
+            Target = Target.One(channelA),
+        }).GetAwaiter().GetResult();
+        var envelope = Org.Derecalliance.Derec.Protobuf.DeRecMessage.Parser.ParseFrom(owner.Transport.DrainOne());
+        if (envelope.Sequence != 2)
+            throw new InvalidOperationException($"the challenge must be under K2, sequence {envelope.Sequence}");
+        envelope.Sequence = 2 + 513;
+        var ignored = helperA.Protocol.ProcessAsync(Google.Protobuf.MessageExtensions.ToByteArray(envelope))
+            .GetAwaiter().GetResult();
+        if (ignored.Count != 1 || ignored[0] is not MessageIgnoredEvent keyIgnored
+            || keyIgnored.Reason != IgnoreReason.KeyUnavailable || keyIgnored.ChannelId != channelA)
+            throw new InvalidOperationException(
+                $"a sequence past the forward-jump limit must be MessageIgnored(KeyUnavailable); got [{string.Join(", ", ignored)}]");
+        if (helperA.Transport.Outbox.Count != 0)
+            throw new InvalidOperationException("a message with no usable key must not be answered");
+        if (StoredKeyEpoch(helperA, secretId, channelA) != 2)
+            throw new InvalidOperationException("the ignored message must not move HelperA's ring");
+        Console.WriteLine("  sequence 515 → MessageIgnored(KeyUnavailable), nothing sent, ring unchanged  ✓");
+
+        owner.Protocol.StartAsync(FlowKind.RecoverSecret, new RecoverSecretParams
+        {
+            SecretId = secretId,
+            Version = 2,
+        }).GetAwaiter().GetResult();
+        var recovered = PumpAll(Scope(owner)).OfType<SecretRecoveredEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException("RecoverSecret must surface SecretRecovered");
+        if (recovered.Secret.Helpers.Count != 2 || recovered.Secret.Helpers.Any(h => h.KeyEpoch != 2))
+            throw new InvalidOperationException(
+                $"the roster must name key epoch 2 for both helpers, got [{string.Join(", ", recovered.Secret.Helpers.Select(h => h.KeyEpoch))}]");
+        Console.WriteLine("  SecretRecovered names key_epoch 2 for both helpers  ✓");
+        owner.Dispose();
+
+        using var device = MakeNode("Device", ownerUri, new NodeOptions(SecretId: secretId, KeyRotation: true));
+        device.Protocol.RestoreAsync(recovered.Secret, version: 2, newestVersion: 2).GetAwaiter().GetResult();
+        foreach (var (channel, _) in helpers)
+        {
+            uint restoredEpoch = StoredKeyEpoch(device, secretId, channel);
+            if (restoredEpoch != 2)
+                throw new InvalidOperationException(
+                    $"restore must rebuild channel {channel} at KeyRing epoch 2, got {restoredEpoch}");
+        }
+        Console.WriteLine("  restore on a fresh device → KeyRing epoch 2 on both channels  ✓");
+
+        device.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = recovered.Secret.Secrets.ToArray(),
+        }).GetAwaiter().GetResult();
+        int republished = PumpAll(Scope(device)).OfType<ShareConfirmedEvent>().Count(e => e.Version == 3);
+        if (republished != 2)
+            throw new InvalidOperationException($"both helpers must confirm v3 from the restored device, got {republished}");
+        foreach (var (channel, helper) in helpers)
+        {
+            uint deviceEpoch = StoredKeyEpoch(device, secretId, channel);
+            uint helperEpoch = StoredKeyEpoch(helper, secretId, channel);
+            if (deviceEpoch != 3 || helperEpoch != 3)
+                throw new InvalidOperationException(
+                    $"channel {channel} must be at KeyRing epoch 3 on both ends, got device {deviceEpoch}, helper {helperEpoch}");
+        }
+        Console.WriteLine("  the restored device publishes v3 → both helpers confirm, KeyRing epoch 3  ✓");
+
+        Console.WriteLine("Key rotation test passed.\n");
+    }
+
+    /// <summary>
     /// A builder that never calls <c>WithThreshold</c> must leave the Rust
     /// library's default (3) in force rather than a value restated here.
     /// </summary>
@@ -2188,19 +2357,22 @@ internal static class Protocol
         {
             Target = Target.Many(rekeyedA, rekeyedB),
         }).GetAwaiter().GetResult();
-        // The broadcast reads every target's SharedKey through one
-        // LoadMany call rather than one Load per channel.
-        if (owner.SecretStore.LoadManyCalls.Count != 1)
+        // The broadcast reads its channel keys in batches rather than one
+        // Load per channel: one LoadMany for every target's SharedKey, then
+        // one for every target's KeyRing.
+        var keyKinds = owner.SecretStore.LoadManyCalls.Select(c => c.Kind).ToArray();
+        if (!keyKinds.SequenceEqual(new[] { SecretKind.SharedKey, SecretKind.KeyRing }))
             throw new InvalidOperationException(
-                $"Discovery broadcast must call LoadMany once, got {owner.SecretStore.LoadManyCalls.Count}");
-        var keyCall = owner.SecretStore.LoadManyCalls[0];
-        if (keyCall.SecretId != secretId
-            || keyCall.Kind != SecretKind.SharedKey
-            || !keyCall.ChannelIds.OrderBy(c => c).SequenceEqual(new[] { rekeyedA, rekeyedB }.OrderBy(c => c)))
-            throw new InvalidOperationException(
-                $"LoadMany must receive both helper channels: secret={keyCall.SecretId} kind={keyCall.Kind} "
-                + $"ids=[{string.Join(", ", keyCall.ChannelIds)}]");
-        Console.WriteLine($"  Discovery broadcast → one LoadMany(SharedKey, [{string.Join(", ", keyCall.ChannelIds)}])  ✓");
+                $"Discovery broadcast must call LoadMany once per kind (SharedKey, KeyRing), got [{string.Join(", ", keyKinds)}]");
+        foreach (var keyCall in owner.SecretStore.LoadManyCalls)
+        {
+            if (keyCall.SecretId != secretId
+                || !keyCall.ChannelIds.OrderBy(c => c).SequenceEqual(new[] { rekeyedA, rekeyedB }.OrderBy(c => c)))
+                throw new InvalidOperationException(
+                    $"LoadMany must receive both helper channels: secret={keyCall.SecretId} kind={keyCall.Kind} "
+                    + $"ids=[{string.Join(", ", keyCall.ChannelIds)}]");
+        }
+        Console.WriteLine($"  Discovery broadcast → one LoadMany([{string.Join(", ", owner.SecretStore.LoadManyCalls[0].ChannelIds)}]) per kind (SharedKey, KeyRing)  ✓");
         var discoveryOut = owner.Transport.DrainAll();
         if (discoveryOut.Count != 2)
             throw new InvalidOperationException($"expected 2 Discovery requests, got {discoveryOut.Count}");
@@ -2242,9 +2414,11 @@ internal static class Protocol
         if (missingKey is null || missingKey.Code != DeRecCode.MissingSharedKey)
             throw new InvalidOperationException(
                 $"a null LoadMany entry must surface MissingSharedKey, got {(missingKey is null ? "no error" : $"{missingKey.Code}: {missingKey.Message}")}");
-        if (owner.SecretStore.LoadManyCalls.Count != 1 || !missingKey.Message.Contains(rekeyedB.ToString()))
+        if (owner.SecretStore.LoadManyCalls.Count != 1
+            || owner.SecretStore.LoadManyCalls[0].Kind != SecretKind.SharedKey
+            || !missingKey.Message.Contains(rekeyedB.ToString()))
             throw new InvalidOperationException(
-                $"MissingSharedKey must follow one LoadMany call and name channel {rekeyedB}: "
+                $"MissingSharedKey must follow one SharedKey LoadMany call and name channel {rekeyedB}: "
                 + $"calls={owner.SecretStore.LoadManyCalls.Count} message={missingKey.Message}");
         owner.SecretStore.Save(secretId, rekeyedB, removedKey);
         owner.Transport.DrainAll();
@@ -2314,7 +2488,7 @@ internal static class Protocol
         if (recovered.Secret.Threshold != DefaultThreshold)
             throw new InvalidOperationException(
                 $"the recovered roster must carry t={DefaultThreshold}; got {recovered.Secret.Threshold}");
-        var restoreEvents = restored.Protocol.RestoreAsync(recovered.Secret, version: 1).GetAwaiter().GetResult();
+        var restoreEvents = restored.Protocol.RestoreAsync(recovered.Secret, version: 1, newestVersion: 1).GetAwaiter().GetResult();
         Console.WriteLine($"  RestoreAsync returned {restoreEvents.Count} event(s)  ✓");
 
         var snapshot = restored.UserSecretStore.LoadLatest(secretId)
@@ -2354,7 +2528,7 @@ internal static class Protocol
         DeRecException? conflict = null;
         try
         {
-            conflicted.Protocol.RestoreAsync(recovered.Secret, version: 1).GetAwaiter().GetResult();
+            conflicted.Protocol.RestoreAsync(recovered.Secret, version: 1, newestVersion: 1).GetAwaiter().GetResult();
         }
         catch (DeRecException e)
         {
@@ -2693,7 +2867,7 @@ internal static class Protocol
         var recovered = PumpAll(recoveryScope).OfType<SecretRecoveredEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException("the device must recover its own secret");
 
-        var restoreEvents = device.Protocol.RestoreAsync(recovered.Secret, version).GetAwaiter().GetResult();
+        var restoreEvents = device.Protocol.RestoreAsync(recovered.Secret, version, version).GetAwaiter().GetResult();
         var touched = restoreEvents
             .Select(e => e switch
             {
@@ -3123,7 +3297,7 @@ internal static class Protocol
 
         const ulong secretId = 0x1D5UL;
         using var node = MakeNode("TypedIds", "https://typed-ids.example.com", new NodeOptions(SecretId: secretId));
-        node.Protocol.RestoreAsync(recovered.Secret, version: 3).GetAwaiter().GetResult();
+        node.Protocol.RestoreAsync(recovered.Secret, version: 3, newestVersion: 3).GetAwaiter().GetResult();
         if (node.ChannelStore.Load(secretId, max, 0) is null)
             throw new InvalidOperationException("restore must write the helper channel at u64::MAX");
         Console.WriteLine("  RestoreAsync accepted a helper channel at u64::MAX  ✓");
@@ -3203,7 +3377,7 @@ internal static class Protocol
 
         const ulong secretId = 0x5E1UL;
         using var node = MakeNode("NotRestored", "https://not-restored.example.com", new NodeOptions(SecretId: secretId));
-        var events = node.Protocol.RestoreAsync(secret, version: 2).GetAwaiter().GetResult();
+        var events = node.Protocol.RestoreAsync(secret, version: 2, newestVersion: 2).GetAwaiter().GetResult();
         var skipped = events.OfType<PeerNotRestoredEvent>().ToList();
         if (skipped.Count != 2
             || skipped[0].ChannelId != 12 || skipped[0].ReplicaId is not null
@@ -3439,6 +3613,7 @@ internal static class Protocol
             ?? throw new InvalidOperationException("DeRecProtocol.RestoreParamsDto not found: point this check at the type RestoreAsync serializes");
         object dto = Activator.CreateInstance(dtoType, nonPublic: true)!;
         dtoType.GetProperty("Version")!.SetValue(dto, 7u);
+        dtoType.GetProperty("NewestVersion")!.SetValue(dto, 9u);
         dtoType.GetProperty("RecoveredSecret")!.SetValue(dto, secret);
         AssertSection(fixture, "restore", JsonSerializer.Serialize(dto, dtoType, DeRecJsonOptions.Wire));
 
@@ -4485,7 +4660,7 @@ internal static class Protocol
         // recorded is answered there.
         const string phantomUri = "https://phantom-replica.example.com";
         byte[] crafted = Discovery.Request.Produce(
-            rekeyedId, sharedKey, new[] { new TransportProtocol(phantomUri) }).ToProtoBytes();
+            rekeyedId, sharedKey, 0, new[] { new TransportProtocol(phantomUri) }).ToProtoBytes();
         helper.Transport.DrainAll();
         helper.Protocol.ProcessAndAcceptAllAsync(crafted).GetAwaiter().GetResult();
         var replies = helper.Transport.DrainAll();
@@ -4515,6 +4690,228 @@ internal static class Protocol
         Console.WriteLine("  default envelope.reply_to is unset  ✓");
 
         Console.WriteLine("Orchestrator replyTo flow test passed.");
+    }
+
+    /// <summary>
+    /// The <c>ShareStored</c> events in <paramref name="events"/> as
+    /// <c>(channelId, version)</c> pairs, ordered by channel id.
+    /// </summary>
+    private static List<(ulong ChannelId, uint Version)> StoredVersions(IEnumerable<DeRecEvent> events) =>
+        events.OfType<ShareStoredEvent>()
+            .Select(e => (e.ChannelId, e.Version))
+            .OrderBy(s => s.ChannelId)
+            .ToList();
+
+    /// <summary>
+    /// A publish the library starts on its own runs only once the helpers
+    /// meet the threshold: with <c>threshold = 3</c>, pairing the second
+    /// helper after a below-threshold <c>ProtectSecret</c> publishes nothing
+    /// and consumes no version, and pairing the third publishes the stored
+    /// snapshot to all three. Mirrors the Rust binding's
+    /// <c>run_pairing_below_threshold_publishes_nothing_flow</c>.
+    /// </summary>
+    private static void RunOrchestratorPairingBelowThresholdPublishesNothingFlowTest()
+    {
+        Console.WriteLine("=== Orchestrator pairing below threshold publishes nothing flow test ===");
+
+        const string ownerUri = "https://owner.example.com";
+        const string helperAUri = "https://helper-a.example.com";
+        const string helperBUri = "https://helper-b.example.com";
+        const string helperCUri = "https://helper-c.example.com";
+
+        using var owner = MakeNode("Owner", ownerUri, new NodeOptions { Threshold = 3 });
+        using var helperA = MakeNode("HelperA", helperAUri);
+        using var helperB = MakeNode("HelperB", helperBUri);
+        using var helperC = MakeNode("HelperC", helperCUri);
+        ulong secretId = owner.Protocol.SecretId;
+
+        DoOrchestratorPair(owner, owner.Transport, helperA, helperA.Transport, 71UL, Pairing.SenderKind.Helper);
+        owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret
+                {
+                    Id = new byte[] { 7 },
+                    Name = "staged",
+                    Data = Encoding.UTF8.GetBytes("stored before the helpers meet the threshold"),
+                },
+            },
+        }).GetAwaiter().GetResult();
+        PumpAll(new[] { (owner, ownerUri), (helperA, helperAUri) });
+        AssertLatestVersion(owner, secretId, 1);
+
+        HelperStartPair(owner, helperB, 72UL);
+        var events = PumpAll(new[] { (owner, ownerUri), (helperA, helperAUri), (helperB, helperBUri) });
+        if (StoredVersions(events).Count != 0)
+            throw new InvalidOperationException(
+                "two helpers cannot meet a threshold of 3, so nothing is shared, got ["
+                + string.Join(", ", events.Select(e => e.EventType)) + "]");
+        AssertLatestVersion(owner, secretId, 1);
+        Console.WriteLine("  second helper paired below the threshold: nothing published  ✓");
+
+        HelperStartPair(owner, helperC, 73UL);
+        events = PumpAll(new[]
+        {
+            (owner, ownerUri), (helperA, helperAUri), (helperB, helperBUri), (helperC, helperCUri),
+        });
+        var stored = StoredVersions(events);
+        if (stored.Count != 3 || stored.Any(s => s.Version != 2u))
+            throw new InvalidOperationException(
+                "every helper stores the snapshot at v=2, got ["
+                + string.Join(", ", stored.Select(s => $"{s.ChannelId}@v{s.Version}")) + "]");
+        AssertLatestVersion(owner, secretId, 2);
+        Console.WriteLine("  third helper meets the threshold: v2 shared with all three  ✓");
+
+        Console.WriteLine("Orchestrator pairing below threshold publishes nothing flow test passed.");
+    }
+
+    /// <summary>
+    /// Removing a helper that holds a share republishes the latest snapshot
+    /// to the helpers that remain once the helper acknowledges, so the
+    /// removed helper's share belongs to a split nothing else is built on. A
+    /// removal that leaves the helpers below the threshold publishes
+    /// nothing. Mirrors the Rust binding's <c>run_unpair_republishes_flow</c>.
+    /// </summary>
+    private static void RunOrchestratorUnpairRepublishesFlowTest()
+    {
+        Console.WriteLine("=== Orchestrator unpair republishes flow test ===");
+
+        const string ownerUri = "https://owner.example.com";
+        const string helperAUri = "https://helper-a.example.com";
+        const string helperBUri = "https://helper-b.example.com";
+        const string helperCUri = "https://helper-c.example.com";
+
+        using var owner = MakeNode("Owner", ownerUri);
+        using var helperA = MakeNode("HelperA", helperAUri);
+        using var helperB = MakeNode("HelperB", helperBUri);
+        using var helperC = MakeNode("HelperC", helperCUri);
+        ulong secretId = owner.Protocol.SecretId;
+
+        ulong channelA = DoOrchestratorPair(owner, owner.Transport, helperA, helperA.Transport, 81UL, Pairing.SenderKind.Helper);
+        ulong channelB = DoOrchestratorPair(owner, owner.Transport, helperB, helperB.Transport, 82UL, Pairing.SenderKind.Helper);
+        ulong channelC = DoOrchestratorPair(owner, owner.Transport, helperC, helperC.Transport, 83UL, Pairing.SenderKind.Helper);
+        var allScope = new[]
+        {
+            (owner, ownerUri), (helperA, helperAUri), (helperB, helperBUri), (helperC, helperCUri),
+        };
+
+        owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret
+                {
+                    Id = new byte[] { 8 },
+                    Name = "republished",
+                    Data = Encoding.UTF8.GetBytes("split again when a helper leaves"),
+                },
+            },
+        }).GetAwaiter().GetResult();
+        PumpAll(allScope);
+        AssertLatestVersion(owner, secretId, 1);
+
+        var started = owner.Protocol.StartAsync(FlowKind.Unpair, new UnpairParams
+        {
+            ChannelId = channelC,
+        }).GetAwaiter().GetResult();
+        if (started.OfType<ProtectSecretStartedEvent>().Any())
+            throw new InvalidOperationException(
+                "nothing is published before the helper acknowledges, got ["
+                + string.Join(", ", started.Select(e => e.EventType)) + "]");
+        var events = PumpAll(allScope);
+        if (!events.OfType<UnpairedEvent>().Any(e => e.ChannelId == channelC))
+            throw new InvalidOperationException(
+                "expected Unpaired for helper-c, got ["
+                + string.Join(", ", events.Select(e => e.EventType)) + "]");
+        var stored = StoredVersions(events);
+        var expected = new List<(ulong, uint)> { (channelA, 2u), (channelB, 2u) }
+            .OrderBy(s => s.Item1)
+            .ToList();
+        if (!stored.SequenceEqual(expected))
+            throw new InvalidOperationException(
+                "the remaining helpers store v2 and the removed one nothing, got ["
+                + string.Join(", ", stored.Select(s => $"{s.ChannelId}@v{s.Version}")) + "]");
+        AssertLatestVersion(owner, secretId, 2);
+        Console.WriteLine("  helper-c acknowledged its removal: v2 republished to helper-a and helper-b  ✓");
+
+        owner.Protocol.StartAsync(FlowKind.Unpair, new UnpairParams
+        {
+            ChannelId = channelB,
+        }).GetAwaiter().GetResult();
+        events = PumpAll(new[] { (owner, ownerUri), (helperA, helperAUri), (helperB, helperBUri) });
+        if (StoredVersions(events).Count != 0)
+            throw new InvalidOperationException(
+                "one helper cannot meet a threshold of 2, so nothing is shared, got ["
+                + string.Join(", ", events.Select(e => e.EventType)) + "]");
+        AssertLatestVersion(owner, secretId, 2);
+        Console.WriteLine("  removal below the threshold: nothing published  ✓");
+
+        Console.WriteLine("Orchestrator unpair republishes flow test passed.");
+    }
+
+    /// <summary>
+    /// <c>start(UnpairReplica)</c> announces the removal and publishes the
+    /// roster that omits the member, so the removal completes with no
+    /// further call: the destination tears down and the source drops its
+    /// row. Mirrors the Rust binding's
+    /// <c>run_replica_removal_publishes_the_roster_flow</c>.
+    /// </summary>
+    private static void RunOrchestratorReplicaRemovalPublishesTheRosterFlowTest()
+    {
+        Console.WriteLine("=== Orchestrator replica removal publishes the roster flow test ===");
+
+        const string sourceUri = "https://source.example.com";
+        const string destinationUri = "https://destination.example.com";
+        const ulong destinationId = 0xD0D0_D0D0_D0D0_D0D0UL;
+
+        using var source = MakeNode("Source", sourceUri,
+            new NodeOptions { SecretId = 0xFADEUL, ReplicaId = 0x5050_5050_5050_5050UL });
+        using var destination = MakeNode("Destination", destinationUri,
+            new NodeOptions { ReplicaId = destinationId });
+        var scope = new[] { (source, sourceUri), (destination, destinationUri) };
+        ulong secretId = source.Protocol.SecretId;
+
+        ulong replicaChannel = PairReplicaHandshake(source, destination, 91UL);
+        CrossConfirmFingerprint(source, destination, replicaChannel);
+        PumpAll(scope);
+
+        source.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret
+                {
+                    Id = new byte[] { 9 },
+                    Name = "mirrored",
+                    Data = Encoding.UTF8.GetBytes("held by both devices"),
+                },
+            },
+        }).GetAwaiter().GetResult();
+        PumpAll(scope);
+        uint before = source.UserSecretStore.LoadLatest(secretId)?.Version
+            ?? throw new InvalidOperationException("the source has published");
+
+        source.Protocol.StartAsync(FlowKind.UnpairReplica, new UnpairReplicaParams
+        {
+            ReplicaId = destinationId,
+            Memo = "retired device",
+        }).GetAwaiter().GetResult();
+        // The removal publishes the next version itself.
+        AssertLatestVersion(source, secretId, before + 1);
+
+        var events = PumpAll(scope);
+        if (!events.OfType<SelfRemovedFromGroupEvent>().Any())
+            throw new InvalidOperationException(
+                "the destination must tear down on the roster that omits it, got ["
+                + string.Join(", ", events.Select(e => e.EventType)) + "]");
+        if (!events.OfType<ReplicaRemovedEvent>().Any(e => e.ReplicaId == destinationId))
+            throw new InvalidOperationException(
+                "the source must report the removal complete, got ["
+                + string.Join(", ", events.Select(e => e.EventType)) + "]");
+        Console.WriteLine("  removal completed with no ProtectSecret from the application  ✓");
+
+        Console.WriteLine("Orchestrator replica removal publishes the roster flow test passed.");
     }
 
     /// <summary>
@@ -5116,7 +5513,7 @@ internal static class Protocol
         // tracking shares restore does not write, so restore is refused.
         try
         {
-            bob.Protocol.RestoreAsync(joined.Secret, v2).GetAwaiter().GetResult();
+            bob.Protocol.RestoreAsync(joined.Secret, v2, v2).GetAwaiter().GetResult();
             throw new InvalidOperationException("a synced destination is already provisioned; restore must refuse it");
         }
         catch (DeRecException e) when (e.Code == DeRecCode.AlreadyRestored) { }
@@ -5823,7 +6220,8 @@ internal static class Protocol
         ParameterRange? ParameterRange = null,
         bool? AutoRespondOnFailure = null,
         Timeouts? Timeouts = null,
-        TransportProtocol[]? OwnTransports = null);
+        TransportProtocol[]? OwnTransports = null,
+        bool? KeyRotation = null);
 
     private const int DefaultThreshold = 2;
 
@@ -5987,6 +6385,8 @@ internal static class Protocol
             builder = builder.WithParameterRange(range);
         if (options.AutoRespondOnFailure is bool autoRespond)
             builder = builder.WithAutoRespondOnFailure(autoRespond);
+        if (options.KeyRotation is bool keyRotation)
+            builder = builder.WithKeyRotation(keyRotation);
         if (options.Timeouts is Timeouts timeouts)
             builder = builder.WithTimeouts(timeouts);
 
@@ -6459,6 +6859,7 @@ internal static class Protocol
             || full.ParameterRange?.MaxUnresponsiveDeletionTimeout != 9007199254740993L
             || full.AutoAccept is not { Pairing: true, PrePair: false, StoreShare: true, Unpair: true }
             || full.AutoRespondOnFailure != true
+            || full.KeyRotation != true
             || full.AutoReplyTo != true
             || full.UnpairAck != UnpairAck.NotRequired
             || full.UnsafeConnection != false

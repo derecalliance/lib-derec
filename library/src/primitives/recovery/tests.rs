@@ -2,6 +2,7 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use crate::extensions::derec_result::DeRecResultExt as _;
+use crate::types::SharedKey;
 use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp},
@@ -65,7 +66,7 @@ fn create_committed_share_bytes(secret_id: u64, version: u32) -> Vec<u8> {
 
 fn create_response_envelope(
     channel_id: ChannelId,
-    shared_key: &[u8; 32],
+    shared_key: &SharedKey,
     status: Option<i32>,
     committed_bytes: Vec<u8>,
 ) -> Vec<u8> {
@@ -88,7 +89,7 @@ fn create_response_envelope(
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::GetShareResponse(message))
-        .encrypt(shared_key)
+        .encrypt(&crate::types::ChannelKey::new(0, shared_key.clone()))
         .expect("failed to encrypt response")
         .build()
         .expect("failed to build response envelope")
@@ -97,7 +98,7 @@ fn create_response_envelope(
 
 fn create_response_envelope_with_mismatched_timestamp(
     channel_id: ChannelId,
-    shared_key: &[u8; 32],
+    shared_key: &SharedKey,
     committed_bytes: Vec<u8>,
 ) -> Vec<u8> {
     let message_timestamp = current_timestamp();
@@ -118,7 +119,7 @@ fn create_response_envelope_with_mismatched_timestamp(
         .channel_id(channel_id)
         .timestamp(envelope_timestamp)
         .message_body(MessageBody::GetShareResponse(message))
-        .encrypt(shared_key)
+        .encrypt(&crate::types::ChannelKey::new(0, shared_key.clone()))
         .expect("failed to encrypt response")
         .build()
         .expect("failed to build response envelope")
@@ -127,7 +128,7 @@ fn create_response_envelope_with_mismatched_timestamp(
 
 fn create_store_share_request_envelope(
     channel_id: ChannelId,
-    shared_key: &[u8; 32],
+    shared_key: &SharedKey,
     share_bytes: Vec<u8>,
 ) -> Vec<u8> {
     let timestamp = current_timestamp();
@@ -148,7 +149,7 @@ fn create_store_share_request_envelope(
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::StoreShareRequest(message))
-        .encrypt(shared_key)
+        .encrypt(&crate::types::ChannelKey::new(0, shared_key.clone()))
         .expect("failed to encrypt stored share")
         .build()
         .expect("failed to build stored share envelope")
@@ -164,8 +165,14 @@ fn test_produce_get_share_response_message_empty_committed_share() {
 
     let ProduceGetShareRequestMessageResult {
         envelope: request_envelope,
-    } = produce_get_share_request_message(channel_id, secret_id, version, &shared_key, &[])
-        .expect("request generation should succeed");
+    } = produce_get_share_request_message(
+        channel_id,
+        secret_id,
+        version,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+        &[],
+    )
+    .expect("request generation should succeed");
 
     let ExtractGetShareRequestResult { request } =
         extract_get_share_request(&request_envelope, &shared_key)
@@ -182,7 +189,7 @@ fn test_produce_get_share_response_message_empty_committed_share() {
         channel_id,
         &request,
         &stored_share_request,
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
     );
 
     assert!(matches!(
@@ -390,8 +397,14 @@ fn test_produce_rejects_a_stored_share_in_the_pre_0_0_9_layout() {
 
     let ProduceGetShareRequestMessageResult {
         envelope: request_envelope,
-    } = produce_get_share_request_message(channel_id, secret_id, version, &shared_key, &[])
-        .expect("request generation should succeed");
+    } = produce_get_share_request_message(
+        channel_id,
+        secret_id,
+        version,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+        &[],
+    )
+    .expect("request generation should succeed");
     let ExtractGetShareRequestResult { request } =
         extract_get_share_request(&request_envelope, &shared_key)
             .expect("extract_get_share_request should succeed");
@@ -402,7 +415,12 @@ fn test_produce_rejects_a_stored_share_in_the_pre_0_0_9_layout() {
         ..Default::default()
     };
 
-    let result = produce_get_share_response_message(channel_id, &request, &stored, &shared_key);
+    let result = produce_get_share_response_message(
+        channel_id,
+        &request,
+        &stored,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    );
 
     assert!(matches!(
         result,
@@ -533,7 +551,7 @@ fn test_produce_get_share_response_message_request_timestamp_mismatch() {
         .channel_id(channel_id)
         .timestamp(envelope_timestamp)
         .message_body(MessageBody::GetShareRequest(tampered_request_message))
-        .encrypt(&shared_key)
+        .encrypt(&crate::types::ChannelKey::new(0, shared_key.clone()))
         .expect("failed to encrypt tampered request")
         .build()
         .expect("failed to build tampered request")
@@ -558,8 +576,14 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
 
     let ProduceGetShareRequestMessageResult {
         envelope: request_envelope,
-    } = produce_get_share_request_message(channel_id, secret_id, version, &shared_key, &[])
-        .expect("request generation should succeed");
+    } = produce_get_share_request_message(
+        channel_id,
+        secret_id,
+        version,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+        &[],
+    )
+    .expect("request generation should succeed");
 
     let ExtractGetShareRequestResult { request } =
         extract_get_share_request(&request_envelope, &shared_key)
@@ -585,7 +609,7 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
         .channel_id(channel_id)
         .timestamp(envelope_timestamp)
         .message_body(MessageBody::StoreShareRequest(stored_share_message))
-        .encrypt(&shared_key)
+        .encrypt(&crate::types::ChannelKey::new(0, shared_key.clone()))
         .expect("failed to encrypt tampered stored share")
         .build()
         .expect("failed to build tampered stored share")
@@ -614,7 +638,7 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
         channel_id,
         &request,
         &stored_share_request,
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
     )
     .expect("produce_get_share_response_message should succeed with correct data");
 }
@@ -633,7 +657,7 @@ fn test_produce_get_share_response_message_secret_id_mismatch() {
         channel_id,
         requested_secret_id,
         version,
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         &[],
     )
     .expect("request generation should succeed");
@@ -656,7 +680,7 @@ fn test_produce_get_share_response_message_secret_id_mismatch() {
         channel_id,
         &request,
         &stored_share_request,
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
     );
 
     assert!(matches!(
@@ -679,7 +703,7 @@ fn test_produce_get_share_response_message_version_mismatch() {
         channel_id,
         secret_id,
         requested_version,
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         &[],
     )
     .expect("request generation should succeed");
@@ -702,7 +726,7 @@ fn test_produce_get_share_response_message_version_mismatch() {
         channel_id,
         &request,
         &stored_share_request,
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
     );
 
     assert!(matches!(
@@ -730,8 +754,14 @@ fn test_recovery_end_to_end() {
     for channel_id in &channel_ids {
         let ProduceGetShareRequestMessageResult {
             envelope: request_envelope,
-        } = produce_get_share_request_message(*channel_id, secret_id, version, &shared_key, &[])
-            .expect("produce_get_share_request_message should succeed");
+        } = produce_get_share_request_message(
+            *channel_id,
+            secret_id,
+            version,
+            &crate::types::ChannelKey::new(0, shared_key.clone()),
+            &[],
+        )
+        .expect("produce_get_share_request_message should succeed");
 
         let ExtractGetShareRequestResult { request } =
             extract_get_share_request(&request_envelope, &shared_key)
@@ -757,7 +787,7 @@ fn test_recovery_end_to_end() {
             .channel_id(*channel_id)
             .timestamp(timestamp)
             .message_body(MessageBody::StoreShareRequest(store_msg))
-            .encrypt(&shared_key)
+            .encrypt(&crate::types::ChannelKey::new(0, shared_key.clone()))
             .expect("encryption should succeed")
             .build()
             .expect("build should succeed")
@@ -774,7 +804,7 @@ fn test_recovery_end_to_end() {
             *channel_id,
             &request,
             &stored_share_request,
-            &shared_key,
+            &crate::types::ChannelKey::new(0, shared_key.clone()),
         )
         .expect("produce_get_share_response_message should succeed");
 
@@ -803,7 +833,7 @@ fn test_recovery_end_to_end() {
 #[test]
 fn test_extract_get_share_request_rejects_scheme_mismatched_reply_to() {
     let channel_id = ChannelId(13);
-    let shared_key = [97u8; 32];
+    let shared_key = SharedKey::new([97u8; 32]);
 
     let malicious_reply_to = TransportProtocol {
         uri: "ws://attacker.example/inbox".to_owned(),
@@ -814,7 +844,7 @@ fn test_extract_get_share_request_rejects_scheme_mismatched_reply_to() {
         channel_id,
         1,
         1,
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         slice::from_ref(&malicious_reply_to),
     )
     .expect("failed to produce get share request");

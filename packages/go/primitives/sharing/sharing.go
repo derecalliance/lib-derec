@@ -89,8 +89,11 @@ func (requestAPI) Split(secretID uint64, secretData []byte, channels []WeightedC
 //
 // replyTo lists the endpoints, in preference order, the peer should answer
 // on; nil or empty means answer on the endpoints recorded for the channel.
-func (requestAPI) Produce(channelID uint64, version uint32, secretID uint64, committedShare []byte, keepVersion uint32, description string, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
-	return native.ProduceStoreShareRequest(channelID, version, secretID, committedShare, keepVersion, description, sharedKey, replyTo)
+//
+// epoch is the epoch of sharedKey in the channel's key chain, stamped into
+// the envelope's sequence; 0 for a freshly paired channel.
+func (requestAPI) Produce(channelID uint64, version uint32, secretID uint64, committedShare []byte, keepVersion uint32, description string, sharedKey []byte, epoch uint32, replyTo []Endpoint) ([]byte, error) {
+	return native.ProduceStoreShareRequest(channelID, version, secretID, committedShare, keepVersion, description, sharedKey, epoch, replyTo)
 }
 
 // Extract decrypts a store-share request envelope and returns its channel id
@@ -113,8 +116,11 @@ var Response responseAPI
 // (the RequestProto returned by Request.Extract), encrypted under sharedKey,
 // and returns the committed share the helper should persist for later
 // recovery responses.
-func (responseAPI) Produce(channelID uint64, requestProto, sharedKey []byte) (ProducedResponse, error) {
-	wireBytes, committedShareBytes, secretID, version, err := native.ProduceStoreShareResponse(channelID, requestProto, sharedKey)
+//
+// epoch is the epoch of sharedKey in the channel's key chain, stamped into
+// the envelope's sequence; 0 for a freshly paired channel.
+func (responseAPI) Produce(channelID uint64, requestProto, sharedKey []byte, epoch uint32) (ProducedResponse, error) {
+	wireBytes, committedShareBytes, secretID, version, err := native.ProduceStoreShareResponse(channelID, requestProto, sharedKey, epoch)
 	if err != nil {
 		return ProducedResponse{}, err
 	}

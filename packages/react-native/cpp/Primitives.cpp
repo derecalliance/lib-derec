@@ -236,18 +236,22 @@ void requireArgs(jsi::Runtime& rt, const char* name, size_t count, size_t requir
 }
 
 /// `produce_get_secret_ids_versions_request_message(channelId: bigint,
-///   sharedKey: ArrayBuffer, replyTo: ArrayBuffer|null) -> ArrayBuffer`
+///   sharedKey: ArrayBuffer, epoch: number, replyTo: ArrayBuffer|null)
+///   -> ArrayBuffer`
 jsi::Value produceGetSecretIdsVersionsRequestMessage(jsi::Runtime& rt,
                                                      const jsi::Value&,
                                                      const jsi::Value* args,
                                                      size_t count) {
-  requireArgs(rt, "produce_get_secret_ids_versions_request_message", count, 3);
+  requireArgs(rt, "produce_get_secret_ids_versions_request_message", count, 4);
   uint64_t channelId = asU64(rt, args[0]);
   ByteView sharedKey = asBytes(rt, args[1]);
-  ByteView replyTo = asBytes(rt, args[2]);
+  auto epoch = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_get_secret_ids_versions_request_message", "epoch", args[2], std::numeric_limits<uint32_t>::max()));
+  ByteView replyTo = asBytes(rt, args[3]);
   ProduceGetSecretIdsVersionsRequestMessageResult result =
       produce_get_secret_ids_versions_request_message(
-          channelId, sharedKey.ptr, sharedKey.len, replyTo.ptr, replyTo.len);
+          channelId, sharedKey.ptr, sharedKey.len, epoch, replyTo.ptr,
+          replyTo.len);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
@@ -280,18 +284,22 @@ jsi::Value extractGetSecretIdsVersionsRequest(jsi::Runtime& rt,
 }
 
 /// `produce_get_secret_ids_versions_response_message(channelId: bigint,
-///   secretList: ArrayBuffer, sharedKey: ArrayBuffer) -> ArrayBuffer`
+///   secretList: ArrayBuffer, sharedKey: ArrayBuffer, epoch: number)
+///   -> ArrayBuffer`
 jsi::Value produceGetSecretIdsVersionsResponseMessage(jsi::Runtime& rt,
                                                       const jsi::Value&,
                                                       const jsi::Value* args,
                                                       size_t count) {
-  requireArgs(rt, "produce_get_secret_ids_versions_response_message", count, 3);
+  requireArgs(rt, "produce_get_secret_ids_versions_response_message", count, 4);
   uint64_t channelId = asU64(rt, args[0]);
   ByteView secretList = asBytes(rt, args[1]);
   ByteView sharedKey = asBytes(rt, args[2]);
+  auto epoch = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_get_secret_ids_versions_response_message", "epoch", args[3], std::numeric_limits<uint32_t>::max()));
   ProduceGetSecretIdsVersionsResponseMessageResult result =
       produce_get_secret_ids_versions_response_message(
-          channelId, secretList.ptr, secretList.len, sharedKey.ptr, sharedKey.len);
+          channelId, secretList.ptr, secretList.len, sharedKey.ptr, sharedKey.len,
+          epoch);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
@@ -393,6 +401,44 @@ jsi::Value messageId(jsi::Runtime& rt,
   payload.setProperty(rt, "timestamp",
                       jsi::BigInt::fromUint64(rt, result.timestamp));
   return payload;
+}
+
+/// `read_sequence_from_envelope(envelope: ArrayBuffer) -> number` — the epoch
+/// of the channel key that encrypted the envelope's payload.
+jsi::Value readSequence(jsi::Runtime& rt,
+                        const jsi::Value&,
+                        const jsi::Value* args,
+                        size_t count) {
+  requireArgs(rt, "read_sequence_from_envelope", count, 1);
+  ByteView envelope = asBytes(rt, args[0]);
+  ReadSequenceResult result =
+      read_sequence_from_envelope(envelope.ptr, envelope.len);
+  if (result.error.code != 0) {
+    throwDeRecError(rt, result.error);
+  }
+  return jsi::Value(static_cast<double>(result.sequence));
+}
+
+/// `derive_channel_key(key: ArrayBuffer, epoch: number, toEpoch: number)
+///   -> ArrayBuffer` — the channel key at `toEpoch`, derived forward from
+/// `key`, the key at `epoch`.
+jsi::Value deriveChannelKey(jsi::Runtime& rt,
+                            const jsi::Value&,
+                            const jsi::Value* args,
+                            size_t count) {
+  requireArgs(rt, "derive_channel_key", count, 3);
+  ByteView key = asBytes(rt, args[0]);
+  auto epoch = static_cast<uint32_t>(asScalarInteger(
+      rt, "derive_channel_key", "epoch", args[1], std::numeric_limits<uint32_t>::max()));
+  auto toEpoch = static_cast<uint32_t>(asScalarInteger(
+      rt, "derive_channel_key", "to_epoch", args[2], std::numeric_limits<uint32_t>::max()));
+  DeriveChannelKeyResult result =
+      derive_channel_key(key.ptr, key.len, epoch, toEpoch);
+  if (result.error.code != 0) {
+    throwDeRecError(rt, result.error);
+  }
+  std::vector<uint8_t> bytes = takeBuffer(result.key_bytes);
+  return toArrayBuffer(rt, bytes.data(), bytes.size());
 }
 
 /// `version() -> { major: number, minor: number }` — the protocol version the
@@ -888,22 +934,24 @@ jsi::Value pairingFingerprint(jsi::Runtime& rt,
 }
 
 /// `produce_get_share_request_message(channelId: bigint, secretId: bigint,
-///   version: number, sharedKey: ArrayBuffer, replyTo: ArrayBuffer|null)
-///   -> ArrayBuffer`
+///   version: number, sharedKey: ArrayBuffer, epoch: number, replyTo:
+///   ArrayBuffer|null) -> ArrayBuffer`
 jsi::Value produceGetShareRequestMessage(jsi::Runtime& rt,
                                          const jsi::Value&,
                                          const jsi::Value* args,
                                          size_t count) {
-  requireArgs(rt, "produce_get_share_request_message", count, 5);
+  requireArgs(rt, "produce_get_share_request_message", count, 6);
   uint64_t channelId = asU64(rt, args[0]);
   uint64_t secretId = asU64(rt, args[1]);
   auto version = static_cast<uint32_t>(asScalarInteger(
       rt, "produce_get_share_request_message", "version", args[2], std::numeric_limits<uint32_t>::max()));
   ByteView sharedKey = asBytes(rt, args[3]);
-  ByteView replyTo = asBytes(rt, args[4]);
+  auto epoch = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_get_share_request_message", "epoch", args[4], std::numeric_limits<uint32_t>::max()));
+  ByteView replyTo = asBytes(rt, args[5]);
   ProduceGetShareRequestMessageResult result = produce_get_share_request_message(
-      channelId, secretId, version, sharedKey.ptr, sharedKey.len, replyTo.ptr,
-      replyTo.len);
+      channelId, secretId, version, sharedKey.ptr, sharedKey.len, epoch,
+      replyTo.ptr, replyTo.len);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
@@ -935,20 +983,22 @@ jsi::Value extractGetShareRequest(jsi::Runtime& rt,
 }
 
 /// `produce_get_share_response_message(channelId: bigint, requestProto:
-///   ArrayBuffer, storedShareProto: ArrayBuffer, sharedKey: ArrayBuffer)
-///   -> ArrayBuffer`
+///   ArrayBuffer, storedShareProto: ArrayBuffer, sharedKey: ArrayBuffer,
+///   epoch: number) -> ArrayBuffer`
 jsi::Value produceGetShareResponseMessage(jsi::Runtime& rt,
                                           const jsi::Value&,
                                           const jsi::Value* args,
                                           size_t count) {
-  requireArgs(rt, "produce_get_share_response_message", count, 4);
+  requireArgs(rt, "produce_get_share_response_message", count, 5);
   uint64_t channelId = asU64(rt, args[0]);
   ByteView requestProto = asBytes(rt, args[1]);
   ByteView storedShareProto = asBytes(rt, args[2]);
   ByteView sharedKey = asBytes(rt, args[3]);
+  auto epoch = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_get_share_response_message", "epoch", args[4], std::numeric_limits<uint32_t>::max()));
   ProduceGetShareResponseMessageResult result = produce_get_share_response_message(
       channelId, requestProto.ptr, requestProto.len, storedShareProto.ptr,
-      storedShareProto.len, sharedKey.ptr, sharedKey.len);
+      storedShareProto.len, sharedKey.ptr, sharedKey.len, epoch);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
@@ -1032,13 +1082,13 @@ jsi::Value protectSecret(jsi::Runtime& rt,
 
 /// `produce_store_share_request_message(channelId: bigint, version: number,
 ///   secretId: bigint, committedShare: ArrayBuffer, keepVersion: number,
-///   description: ArrayBuffer, sharedKey: ArrayBuffer, replyTo:
-///   ArrayBuffer|null) -> ArrayBuffer`
+///   description: ArrayBuffer, sharedKey: ArrayBuffer, epoch: number,
+///   replyTo: ArrayBuffer|null) -> ArrayBuffer`
 jsi::Value produceStoreShareRequestMessage(jsi::Runtime& rt,
                                           const jsi::Value&,
                                           const jsi::Value* args,
                                           size_t count) {
-  requireArgs(rt, "produce_store_share_request_message", count, 8);
+  requireArgs(rt, "produce_store_share_request_message", count, 9);
   uint64_t channelId = asU64(rt, args[0]);
   auto version = static_cast<uint32_t>(asScalarInteger(
       rt, "produce_store_share_request_message", "version", args[1], std::numeric_limits<uint32_t>::max()));
@@ -1048,13 +1098,15 @@ jsi::Value produceStoreShareRequestMessage(jsi::Runtime& rt,
       rt, "produce_store_share_request_message", "keep_version", args[4], std::numeric_limits<uint32_t>::max()));
   ByteView description = asBytes(rt, args[5]);
   ByteView sharedKey = asBytes(rt, args[6]);
-  ByteView replyTo = asBytes(rt, args[7]);
+  auto epoch = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_store_share_request_message", "epoch", args[7], std::numeric_limits<uint32_t>::max()));
+  ByteView replyTo = asBytes(rt, args[8]);
   ProduceStoreShareRequestMessageResult result =
       produce_store_share_request_message(
           channelId, version, secretId, committedShare.ptr,
           committedShare.len, keepVersion,
           description.ptr, description.len, sharedKey.ptr, sharedKey.len,
-          replyTo.ptr, replyTo.len);
+          epoch, replyTo.ptr, replyTo.len);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
@@ -1086,20 +1138,22 @@ jsi::Value extractStoreShareRequest(jsi::Runtime& rt,
 }
 
 /// `produce_store_share_response_message(channelId: bigint, requestProto:
-///   ArrayBuffer, sharedKey: ArrayBuffer) -> { wire_bytes,
+///   ArrayBuffer, sharedKey: ArrayBuffer, epoch: number) -> { wire_bytes,
 ///   committed_share_bytes, secret_id, version }`
 jsi::Value produceStoreShareResponseMessage(jsi::Runtime& rt,
                                            const jsi::Value&,
                                            const jsi::Value* args,
                                            size_t count) {
-  requireArgs(rt, "produce_store_share_response_message", count, 3);
+  requireArgs(rt, "produce_store_share_response_message", count, 4);
   uint64_t channelId = asU64(rt, args[0]);
   ByteView requestProto = asBytes(rt, args[1]);
   ByteView sharedKey = asBytes(rt, args[2]);
+  auto epoch = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_store_share_response_message", "epoch", args[3], std::numeric_limits<uint32_t>::max()));
   ProduceStoreShareResponseMessageResult result =
       produce_store_share_response_message(channelId, requestProto.ptr,
                                             requestProto.len, sharedKey.ptr,
-                                            sharedKey.len);
+                                            sharedKey.len, epoch);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
@@ -1162,18 +1216,21 @@ jsi::Value processStoreShareResponseMessage(jsi::Runtime& rt,
 }
 
 /// `produce_unpair_request_message(channelId: bigint, memo: ArrayBuffer,
-///   sharedKey: ArrayBuffer, replyTo: ArrayBuffer|null) -> ArrayBuffer`
+///   sharedKey: ArrayBuffer, epoch: number, replyTo: ArrayBuffer|null)
+///   -> ArrayBuffer`
 jsi::Value produceUnpairRequestMessage(jsi::Runtime& rt,
                                        const jsi::Value&,
                                        const jsi::Value* args,
                                        size_t count) {
-  requireArgs(rt, "produce_unpair_request_message", count, 4);
+  requireArgs(rt, "produce_unpair_request_message", count, 5);
   uint64_t channelId = asU64(rt, args[0]);
   ByteView memo = asBytes(rt, args[1]);
   ByteView sharedKey = asBytes(rt, args[2]);
-  ByteView replyTo = asBytes(rt, args[3]);
+  auto epoch = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_unpair_request_message", "epoch", args[3], std::numeric_limits<uint32_t>::max()));
+  ByteView replyTo = asBytes(rt, args[4]);
   ProduceUnpairRequestMessageResult result = produce_unpair_request_message(
-      channelId, memo.ptr, memo.len, sharedKey.ptr, sharedKey.len,
+      channelId, memo.ptr, memo.len, sharedKey.ptr, sharedKey.len, epoch,
       replyTo.ptr, replyTo.len);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
@@ -1208,16 +1265,18 @@ jsi::Value extractUnpairRequest(jsi::Runtime& rt,
 }
 
 /// `produce_unpair_response_message(channelId: bigint, sharedKey:
-///   ArrayBuffer) -> ArrayBuffer`
+///   ArrayBuffer, epoch: number) -> ArrayBuffer`
 jsi::Value produceUnpairResponseMessage(jsi::Runtime& rt,
                                         const jsi::Value&,
                                         const jsi::Value* args,
                                         size_t count) {
-  requireArgs(rt, "produce_unpair_response_message", count, 2);
+  requireArgs(rt, "produce_unpair_response_message", count, 3);
   uint64_t channelId = asU64(rt, args[0]);
   ByteView sharedKey = asBytes(rt, args[1]);
-  ProduceUnpairResponseMessageResult result =
-      produce_unpair_response_message(channelId, sharedKey.ptr, sharedKey.len);
+  auto epoch = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_unpair_response_message", "epoch", args[2], std::numeric_limits<uint32_t>::max()));
+  ProduceUnpairResponseMessageResult result = produce_unpair_response_message(
+      channelId, sharedKey.ptr, sharedKey.len, epoch);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
@@ -1265,22 +1324,24 @@ jsi::Value processUnpairResponseMessage(jsi::Runtime& rt,
 }
 
 /// `produce_verify_share_request_message(channelId: bigint, secretId:
-///   bigint, version: number, sharedKey: ArrayBuffer, replyTo:
-///   ArrayBuffer|null) -> ArrayBuffer`
+///   bigint, version: number, sharedKey: ArrayBuffer, epoch: number,
+///   replyTo: ArrayBuffer|null) -> ArrayBuffer`
 jsi::Value produceVerifyShareRequestMessage(jsi::Runtime& rt,
                                            const jsi::Value&,
                                            const jsi::Value* args,
                                            size_t count) {
-  requireArgs(rt, "produce_verify_share_request_message", count, 5);
+  requireArgs(rt, "produce_verify_share_request_message", count, 6);
   uint64_t channelId = asU64(rt, args[0]);
   uint64_t secretId = asU64(rt, args[1]);
   auto version = static_cast<uint32_t>(asScalarInteger(
       rt, "produce_verify_share_request_message", "version", args[2], std::numeric_limits<uint32_t>::max()));
   ByteView sharedKey = asBytes(rt, args[3]);
-  ByteView replyTo = asBytes(rt, args[4]);
+  auto epoch = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_verify_share_request_message", "epoch", args[4], std::numeric_limits<uint32_t>::max()));
+  ByteView replyTo = asBytes(rt, args[5]);
   ProduceVerifyShareRequestMessageResult result =
       produce_verify_share_request_message(channelId, secretId, version,
-                                            sharedKey.ptr, sharedKey.len,
+                                            sharedKey.ptr, sharedKey.len, epoch,
                                             replyTo.ptr, replyTo.len);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
@@ -1313,21 +1374,23 @@ jsi::Value extractVerifyShareRequest(jsi::Runtime& rt,
 }
 
 /// `produce_verify_share_response_message(channelId: bigint, requestProto:
-///   ArrayBuffer, sharedKey: ArrayBuffer, shareContent: ArrayBuffer) ->
-///   ArrayBuffer`
+///   ArrayBuffer, sharedKey: ArrayBuffer, epoch: number, shareContent:
+///   ArrayBuffer) -> ArrayBuffer`
 jsi::Value produceVerifyShareResponseMessage(jsi::Runtime& rt,
                                             const jsi::Value&,
                                             const jsi::Value* args,
                                             size_t count) {
-  requireArgs(rt, "produce_verify_share_response_message", count, 4);
+  requireArgs(rt, "produce_verify_share_response_message", count, 5);
   uint64_t channelId = asU64(rt, args[0]);
   ByteView requestProto = asBytes(rt, args[1]);
   ByteView sharedKey = asBytes(rt, args[2]);
-  ByteView shareContent = asBytes(rt, args[3]);
+  auto epoch = static_cast<uint32_t>(asScalarInteger(
+      rt, "produce_verify_share_response_message", "epoch", args[3], std::numeric_limits<uint32_t>::max()));
+  ByteView shareContent = asBytes(rt, args[4]);
   ProduceVerifyShareResponseMessageResult result =
       produce_verify_share_response_message(
           channelId, requestProto.ptr, requestProto.len, sharedKey.ptr,
-          sharedKey.len, shareContent.ptr, shareContent.len);
+          sharedKey.len, epoch, shareContent.ptr, shareContent.len);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
@@ -1393,11 +1456,11 @@ void bind(jsi::Runtime& rt,
 void installPrimitives(jsi::Runtime& rt, jsi::Object& host) {
   bind(rt, host, "version", 0, protocolVersion);
   bind(rt, host, "generate_replica_id", 0, generateReplicaId);
-  bind(rt, host, "produce_get_secret_ids_versions_request_message", 3,
+  bind(rt, host, "produce_get_secret_ids_versions_request_message", 4,
        produceGetSecretIdsVersionsRequestMessage);
   bind(rt, host, "extract_get_secret_ids_versions_request", 2,
        extractGetSecretIdsVersionsRequest);
-  bind(rt, host, "produce_get_secret_ids_versions_response_message", 3,
+  bind(rt, host, "produce_get_secret_ids_versions_response_message", 4,
        produceGetSecretIdsVersionsResponseMessage);
   bind(rt, host, "extract_get_secret_ids_versions_response", 2,
        extractGetSecretIdsVersionsResponse);
@@ -1406,6 +1469,8 @@ void installPrimitives(jsi::Runtime& rt, jsi::Object& host) {
   bind(rt, host, "apply_trace_id_to_envelope", 2, applyTraceId);
   bind(rt, host, "read_trace_id_from_envelope", 1, readTraceId);
   bind(rt, host, "message_id_from_envelope", 1, messageId);
+  bind(rt, host, "read_sequence_from_envelope", 1, readSequence);
+  bind(rt, host, "derive_channel_key", 3, deriveChannelKey);
   bind(rt, host, "create_contact_message", 5, createContactMessage);
   bind(rt, host, "encode_contact_message", 1, encodeContactMessage);
   bind(rt, host, "decode_contact_message", 1, decodeContactMessage);
@@ -1431,34 +1496,34 @@ void installPrimitives(jsi::Runtime& rt, jsi::Object& host) {
   bind(rt, host, "process_pre_pair_no_keys_response_message", 2,
        processPrePairNoKeysResponseMessage);
   bind(rt, host, "pairing_fingerprint", 1, pairingFingerprint);
-  bind(rt, host, "produce_get_share_request_message", 5,
+  bind(rt, host, "produce_get_share_request_message", 6,
        produceGetShareRequestMessage);
   bind(rt, host, "extract_get_share_request", 2, extractGetShareRequest);
-  bind(rt, host, "produce_get_share_response_message", 4,
+  bind(rt, host, "produce_get_share_response_message", 5,
        produceGetShareResponseMessage);
   bind(rt, host, "extract_get_share_response", 2, extractGetShareResponse);
   bind(rt, host, "recover_from_share_responses", 3, recoverFromShareResponses);
   bind(rt, host, "protect_secret", 6, protectSecret);
-  bind(rt, host, "produce_store_share_request_message", 8,
+  bind(rt, host, "produce_store_share_request_message", 9,
        produceStoreShareRequestMessage);
   bind(rt, host, "extract_store_share_request", 2, extractStoreShareRequest);
-  bind(rt, host, "produce_store_share_response_message", 3,
+  bind(rt, host, "produce_store_share_response_message", 4,
        produceStoreShareResponseMessage);
   bind(rt, host, "extract_store_share_response", 2, extractStoreShareResponse);
   bind(rt, host, "process_store_share_response_message", 2,
        processStoreShareResponseMessage);
-  bind(rt, host, "produce_unpair_request_message", 4,
+  bind(rt, host, "produce_unpair_request_message", 5,
        produceUnpairRequestMessage);
   bind(rt, host, "extract_unpair_request", 2, extractUnpairRequest);
-  bind(rt, host, "produce_unpair_response_message", 2,
+  bind(rt, host, "produce_unpair_response_message", 3,
        produceUnpairResponseMessage);
   bind(rt, host, "extract_unpair_response", 2, extractUnpairResponse);
   bind(rt, host, "process_unpair_response_message", 1,
        processUnpairResponseMessage);
-  bind(rt, host, "produce_verify_share_request_message", 5,
+  bind(rt, host, "produce_verify_share_request_message", 6,
        produceVerifyShareRequestMessage);
   bind(rt, host, "extract_verify_share_request", 2, extractVerifyShareRequest);
-  bind(rt, host, "produce_verify_share_response_message", 4,
+  bind(rt, host, "produce_verify_share_response_message", 5,
        produceVerifyShareResponseMessage);
   bind(rt, host, "extract_verify_share_response", 2, extractVerifyShareResponse);
   bind(rt, host, "process_verify_share_response_message", 3,

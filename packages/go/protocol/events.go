@@ -430,7 +430,8 @@ const (
 	// IgnoreReasonSuperseded: a StoreShareRequest for a version older than
 	// the newest one this helper stores on the channel, and not stored
 	// itself. It is not stored and not answered.
-	IgnoreReasonSuperseded = "Superseded"
+	IgnoreReasonSuperseded     = "Superseded"
+	IgnoreReasonKeyUnavailable = "KeyUnavailable"
 )
 
 // The label vocabulary for Event.Reason on a PeerNotRestored event. Matches
@@ -551,6 +552,9 @@ type Replicas struct {
 	ChannelID uint64    `json:"channel_id,string"`
 	Members   []Replica `json:"members"`
 	SharedKey []byte    `json:"shared_key"`
+	// KeyEpoch is the epoch of SharedKey on the group channel. Zero is left
+	// out of the JSON, which restore reads as 0.
+	KeyEpoch uint32 `json:"key_epoch,omitempty"`
 }
 
 // MarshalJSON implements json.Marshaler, encoding SharedKey as the JSON
@@ -568,10 +572,12 @@ func (r Replicas) MarshalJSON() ([]byte, error) {
 		ChannelID uint64               `json:"channel_id,string"`
 		Members   []Replica            `json:"members"`
 		SharedKey native.JSONByteArray `json:"shared_key"`
+		KeyEpoch  uint32               `json:"key_epoch,omitempty"`
 	}{
 		ChannelID: r.ChannelID,
 		Members:   members,
 		SharedKey: native.JSONByteArray(r.SharedKey),
+		KeyEpoch:  r.KeyEpoch,
 	})
 }
 
@@ -628,6 +634,10 @@ type Helper struct {
 	SharedKey         []byte            `json:"shared_key"`
 	CommunicationInfo map[string]string `json:"communication_info"`
 	Weight            uint32            `json:"weight"`
+	// KeyEpoch is the epoch of SharedKey on the helper's channel. Restore
+	// rebuilds the channel's key at this epoch. Zero is left out of the
+	// JSON, which restore reads as 0.
+	KeyEpoch uint32 `json:"key_epoch,omitempty"`
 }
 
 // MarshalJSON implements json.Marshaler: SharedKey as a JSON number array
@@ -642,12 +652,14 @@ func (h Helper) MarshalJSON() ([]byte, error) {
 		SharedKey         native.JSONByteArray `json:"shared_key"`
 		CommunicationInfo map[string]string    `json:"communication_info,omitempty"`
 		Weight            uint32               `json:"weight,omitempty"`
+		KeyEpoch          uint32               `json:"key_epoch,omitempty"`
 	}{
 		ChannelID:         h.ChannelID,
 		Transports:        h.Transports,
 		SharedKey:         native.JSONByteArray(h.SharedKey),
 		CommunicationInfo: h.CommunicationInfo,
 		Weight:            h.Weight,
+		KeyEpoch:          h.KeyEpoch,
 	})
 }
 

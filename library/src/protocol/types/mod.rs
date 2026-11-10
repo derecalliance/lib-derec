@@ -1030,6 +1030,11 @@ pub enum SecretKind {
     /// which has no key material to store instead. Removed once the shared
     /// key is derived.
     PairingContact = 2,
+    /// The channel's [`KeyRing`](crate::protocol::KeyRing): its newest shared
+    /// key with the earlier keys and pins the rotation protocol keeps. The
+    /// bytes are opaque to a store. A channel's [`SecretKind::SharedKey`] row
+    /// mirrors the ring's newest key, but the ring is authoritative.
+    KeyRing = 3,
 }
 
 /// How [`crate::protocol::DeRecSecretStore::load_many`] handles channels
@@ -1189,6 +1194,10 @@ pub enum SecretValue {
     /// [`crate::primitives::pairing::response::process`] to derive the shared
     /// key. Ephemeral — removed after pairing completes.
     PairingContact(#[cfg_attr(feature = "serde", serde(with = "contact_serde"))] ContactMessage),
+    /// The channel's key ring: the newest shared key and the earlier keys and
+    /// pins of key rotation. Store it as the opaque bytes of
+    /// [`KeyRing::as_bytes`](crate::protocol::KeyRing::as_bytes).
+    KeyRing(crate::protocol::KeyRing),
 }
 
 /// Tag identifying which kind of in-flight orchestrator state an entry in
@@ -1793,12 +1802,15 @@ mod tests {
     #[test]
     fn secret_value_serde_round_trips_all_variants() {
         let cases = [
-            SecretValue::SharedKey([7u8; 32]),
+            SecretValue::SharedKey(crate::types::SharedKey::new([7u8; 32])),
             SecretValue::PairingSecret(PairingKeyMaterial::from_bytes(vec![1, 2, 3, 4, 5])),
             SecretValue::PairingContact(ContactMessage {
                 nonce: 42,
                 ..Default::default()
             }),
+            SecretValue::KeyRing(crate::protocol::KeyRing::fresh(
+                crate::types::SharedKey::new([5u8; 32]),
+            )),
         ];
 
         for value in cases {
@@ -1812,6 +1824,7 @@ mod tests {
                 (SecretValue::PairingContact(a), SecretValue::PairingContact(b)) => {
                     assert_eq!(a, b)
                 }
+                (SecretValue::KeyRing(a), SecretValue::KeyRing(b)) => assert_eq!(a, b),
                 _ => panic!("variant changed across serde round-trip"),
             }
         }
@@ -1855,6 +1868,7 @@ mod persisted_discriminant_tests {
         assert_eq!(SecretKind::SharedKey as u8, 0);
         assert_eq!(SecretKind::PairingSecret as u8, 1);
         assert_eq!(SecretKind::PairingContact as u8, 2);
+        assert_eq!(SecretKind::KeyRing as u8, 3);
     }
 
     #[test]

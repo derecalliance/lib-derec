@@ -285,6 +285,9 @@ const (
 	// SecretKindPairingContact is the initiator's ContactMessage, stored
 	// transiently between start and pairing completion.
 	SecretKindPairingContact SecretKind = 2
+	// SecretKindKeyRing is the channel key ring: the current channel key and
+	// epoch plus the older keys the secret versions' pins name.
+	SecretKindKeyRing SecretKind = 3
 )
 
 // SecretValue is the opaque secret payload stored alongside a channel id
@@ -293,6 +296,7 @@ const (
 //   - SharedKey: exactly 32 bytes, the symmetric channel key.
 //   - PairingSecret: opaque PairingKeyMaterial blob.
 //   - PairingContact: a prost-encoded ContactMessage.
+//   - KeyRing: the variable-length key-ring encoding.
 type SecretValue struct {
 	Kind  SecretKind
 	Bytes []byte
@@ -319,6 +323,20 @@ type Share struct {
 	Bytes     []byte
 	Subshares *uint32
 	Threshold *uint32
+}
+
+// ShareEntry is one ShareStore.LoadMany result: a share paired with the
+// channel it is stored under.
+type ShareEntry struct {
+	ChannelID uint64
+	Share     Share
+}
+
+// ShareVersionsEntry names the versions to drop under one channel, the way
+// ShareStore.RemoveVersions's channelID and versions arguments do.
+type ShareVersionsEntry struct {
+	ChannelID uint64
+	Versions  []uint32
 }
 
 // StateKind tags which category of in-flight orchestrator state a
@@ -474,6 +492,20 @@ type UserSecrets struct {
 	// recorded, or restored from a roster that carries none; the configured
 	// DeRecProtocolConfig.Threshold then applies. Store it as given.
 	Threshold *uint32
+}
+
+// SecretEntry names one secret the way SecretStore.Remove's arguments do.
+type SecretEntry struct {
+	ChannelID uint64
+	Kind      SecretKind
+}
+
+// ChannelQuery addresses one record the way ChannelStore.Remove's arguments
+// do: a ReplicaID of 0 is the helper channel at ChannelID, any other value is
+// that member of the replica group.
+type ChannelQuery struct {
+	ChannelID uint64
+	ReplicaID uint64
 }
 
 // ChannelFilter narrows a listing from ChannelStore.

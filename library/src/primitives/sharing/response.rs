@@ -9,7 +9,7 @@ use crate::primitives::sharing::request::validate_keep_version;
 use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
-    types::{ChannelId, SharedKey},
+    types::{ChannelId, ChannelKey, SharedKey},
     utils::verify_timestamps,
 };
 use derec_cryptography::vss;
@@ -58,8 +58,9 @@ pub struct ExtractResult {
 /// * `channel_id` - The channel this request arrived on. Used to build the response envelope.
 /// * `request` - The decoded [`derec_proto::StoreShareRequestMessage`] received from the Owner,
 ///   as extracted from the wire envelope.
-/// * `shared_key` - Previously established 32-byte symmetric channel key used to
-///   encrypt the inner response.
+/// * `channel_key` - The channel key and its epoch. The payload is encrypted
+///   under the key and the envelope's `sequence` carries the epoch, so the
+///   receiver can pick the key that opens it; see [`crate::types::ChannelKey`].
 ///
 /// # Returns
 ///
@@ -102,12 +103,13 @@ pub struct ExtractResult {
 ///         .expect("split failed");
 ///
 /// let channel_id = ChannelId(1);
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// // Owner: build the sharing request envelope.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
+///     request::produce(channel_id, 1, 1, committed_share, 0, "", &channel_key, &[])
 ///         .expect("produce request failed");
 ///
 /// // Helper: extract the request, then build the response.
@@ -115,7 +117,7 @@ pub struct ExtractResult {
 ///     request::extract(&req_envelope, &shared_key).expect("extract request failed");
 ///
 /// let response::ProduceResult { envelope, secret_id, version, .. } =
-///     response::produce(channel_id, &share_request, &shared_key)
+///     response::produce(channel_id, &share_request, &channel_key)
 ///         .expect("produce response failed");
 ///
 /// assert!(!envelope.is_empty());
@@ -129,7 +131,7 @@ pub struct ExtractResult {
 pub fn produce(
     channel_id: ChannelId,
     request: &StoreShareRequestMessage,
-    shared_key: &SharedKey,
+    channel_key: &ChannelKey,
 ) -> Result<ProduceResult, Error> {
     let (committed_share, secret_id) = validate_produce_inputs(request)?;
     let version = request.version;
@@ -148,7 +150,7 @@ pub fn produce(
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::StoreShareResponse(response))
-        .encrypt(shared_key)?
+        .encrypt(channel_key)?
         .build()?
         .encode_to_vec();
 
@@ -221,17 +223,18 @@ pub fn produce(
 ///         .expect("split failed");
 ///
 /// let channel_id = ChannelId(1);
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// // Owner → Helper → Owner roundtrip.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
+///     request::produce(channel_id, 1, 1, committed_share, 0, "", &channel_key, &[])
 ///         .expect("produce request failed");
 /// let request::ExtractResult { request: share_request } =
 ///     request::extract(&req_envelope, &shared_key).expect("extract request failed");
 /// let response::ProduceResult { envelope: resp_envelope, .. } =
-///     response::produce(channel_id, &share_request, &shared_key)
+///     response::produce(channel_id, &share_request, &channel_key)
 ///         .expect("produce response failed");
 ///
 /// let response::ExtractResult { response } =
@@ -309,18 +312,19 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractR
 ///         .expect("split failed");
 ///
 /// let channel_id = ChannelId(1);
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 /// let version = 1;
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// // Owner → Helper → Owner roundtrip.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, version, 1, committed_share, 0, "", &shared_key, &[])
+///     request::produce(channel_id, version, 1, committed_share, 0, "", &channel_key, &[])
 ///         .expect("produce request failed");
 /// let request::ExtractResult { request: share_request } =
 ///     request::extract(&req_envelope, &shared_key).expect("extract request failed");
 /// let response::ProduceResult { envelope: resp_envelope, .. } =
-///     response::produce(channel_id, &share_request, &shared_key)
+///     response::produce(channel_id, &share_request, &channel_key)
 ///         .expect("produce response failed");
 /// let response::ExtractResult { response: ack } =
 ///     response::extract(&resp_envelope, &shared_key).expect("extract response failed");

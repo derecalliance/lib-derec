@@ -56,18 +56,21 @@ const kindName = (k: SenderKind): string => {
 };
 
 
-// Keyed by `${secretId}:${channelId}:${kind}`.
+// kind 0 = SharedKey (32 raw bytes), kind 1 = PairingSecret (ephemeral),
+// kind 2 = PairingContact (ephemeral), kind 3 = KeyRing (variable-length). Keyed by `${secretId}:${channelId}:${kind}`.
 class InMemorySecretStore implements SecretStore {
   private readonly data = new Map<string, Uint8Array>();
+  // Every `loadMany` call, in order.
+  readonly loadManyCalls: { secretId: string; channelIds: string[]; kind: 0 | 1 | 2 | 3 }[] = [];
 
-  private key(secretId: string, channelId: string, kind: 0 | 1 | 2): string {
+  private key(secretId: string, channelId: string, kind: 0 | 1 | 2 | 3): string {
     return `${secretId}:${channelId}:${kind}`;
   }
 
   async load(
     secretId: string,
     channelId: string,
-    kind: 0 | 1 | 2,
+    kind: 0 | 1 | 2 | 3,
   ): Promise<Uint8Array | null> {
     return this.data.get(this.key(secretId, channelId, kind)) ?? null;
   }
@@ -75,8 +78,9 @@ class InMemorySecretStore implements SecretStore {
   async loadMany(
     secretId: string,
     channelIds: string[],
-    kind: 0 | 1 | 2,
+    kind: 0 | 1 | 2 | 3,
   ): Promise<Array<Uint8Array | null>> {
+    this.loadManyCalls.push({ secretId, channelIds: [...channelIds], kind });
     return channelIds.map(
       (id) => this.data.get(this.key(secretId, id, kind)) ?? null,
     );
@@ -85,14 +89,23 @@ class InMemorySecretStore implements SecretStore {
   async save(
     secretId: string,
     channelId: string,
-    kind: 0 | 1 | 2,
+    kind: 0 | 1 | 2 | 3,
     value: Uint8Array,
   ): Promise<void> {
     this.data.set(this.key(secretId, channelId, kind), value);
   }
 
-  async remove(secretId: string, channelId: string, kind: 0 | 1 | 2): Promise<void> {
+  async remove(secretId: string, channelId: string, kind: 0 | 1 | 2 | 3): Promise<void> {
     this.data.delete(this.key(secretId, channelId, kind));
+  }
+
+  async removeMany(
+    secretId: string,
+    entries: [channelId: string, kind: 0 | 1 | 2 | 3][],
+  ): Promise<void> {
+    for (const [channelId, kind] of entries) {
+      await this.remove(secretId, channelId, kind);
+    }
   }
 }
 
@@ -151,6 +164,15 @@ class InMemoryChannelStore implements ChannelStore {
     return this.mapFor(replicaId).delete(
       this.key(secretId, this.idFor(channelId, replicaId)),
     );
+  }
+
+  async removeMany(
+    secretId: string,
+    queries: [channelId: string, replicaId: string][],
+  ): Promise<void> {
+    for (const [channelId, replicaId] of queries) {
+      await this.remove(secretId, channelId, replicaId);
+    }
   }
 
   // The listing callbacks return a JSON array of the inner records.
@@ -270,15 +292,15 @@ class InMemoryShareStore implements ShareStore {
     secretId: string,
     channelIds: string[],
     versions: number[],
-  ): Promise<Share[]> {
+  ): Promise<[channelId: string, share: Share][]> {
     const filter = versions.length > 0 ? new Set(versions) : null;
-    const result: Share[] = [];
+    const result: [channelId: string, share: Share][] = [];
     for (const channelId of channelIds) {
       const byVersion = this.data.get(this.key(secretId, channelId));
       if (!byVersion) continue;
       for (const [v, share] of byVersion) {
         if (filter && !filter.has(v)) continue;
-        result.push(share);
+        result.push([channelId, share]);
       }
     }
     return result;
@@ -305,6 +327,15 @@ class InMemoryShareStore implements ShareStore {
     const byVersion = this.data.get(this.key(secretId, channelId));
     if (!byVersion) return;
     for (const v of versions) byVersion.delete(v);
+  }
+
+  async removeVersionsMany(secretId: string, entries: [string, number[]][]): Promise<void> {
+    for (const [channelId, versions] of entries) {
+      this.removeVersionsCalls.push({ secretId, channelId, versions: [...versions] });
+      const byVersion = this.data.get(this.key(secretId, channelId));
+      if (!byVersion) continue;
+      for (const v of versions) byVersion.delete(v);
+    }
   }
 
   keep: number | null = null;
@@ -405,6 +436,13 @@ class InMemoryStateStore implements StateStore {
     return this.data.delete(this.compositeKey(secretId, rec));
   }
 
+  async removeMany(secretId: string, keysJson: Uint8Array): Promise<void> {
+    const keys: StateRecord[] = JSON.parse(new TextDecoder().decode(keysJson));
+    for (const rec of keys) {
+      this.data.delete(this.compositeKey(secretId, rec));
+    }
+  }
+
   async loadAll(secretId: string, kind: 0 | 1 | 2 | 3): Promise<Uint8Array[]> {
     const prefix = `${secretId}:${kind}:`;
     const out: Uint8Array[] = [];
@@ -484,6 +522,7 @@ function makeNode(
     parameterRange?: Partial<ParameterRange>;
     channelStore?: InMemoryChannelStore;
     autoRespondOnFailure?: boolean;
+    keyRotation?: boolean;
     timeouts?: import("@derec-alliance/web").Timeouts;
   } = {},
 ): Node {
@@ -524,6 +563,9 @@ function makeNode(
   }
   if (options.autoRespondOnFailure !== undefined) {
     builder = builder.withAutoRespondOnFailure(options.autoRespondOnFailure);
+  }
+  if (options.keyRotation !== undefined) {
+    builder = builder.withKeyRotation(options.keyRotation);
   }
   if (options.timeouts !== undefined) {
     builder = builder.withTimeouts(options.timeouts);
@@ -1645,14 +1687,24 @@ async function runStickyThresholdFlow(): Promise<void> {
     throw new Error(`the recovered roster must carry t=3, got ${recovered.secret.threshold}`);
   }
   const restored = makeNode("RestoredOwner", "https://restored.example.com", { secretId, threshold: 2 });
-  await restored.protocol.restore(recovered.secret, v3);
-  if ((await restored.userSecretStore.loadLatest(secretId.toString()))?.threshold !== 3) {
+  // The helpers may hold versions newer than the one recovered: the snapshot
+  // is recorded at the newest one, so the next publish numbers above it.
+  const newest = v3 + 2;
+  await restored.protocol.restore(recovered.secret, v3, newest);
+  const restoredSnapshot = await restored.userSecretStore.loadLatest(secretId.toString());
+  if (restoredSnapshot?.threshold !== 3) {
     throw new Error("restore must keep t=3");
+  }
+  if (restoredSnapshot?.version !== newest) {
+    throw new Error(`restore must record the snapshot at the newest v${newest}, got v${restoredSnapshot?.version}`);
   }
   const after = await restored.protocol.start(FlowKind.ProtectSecret, {
     secrets: [{ id: new Uint8Array([7]), name: "sticky", data: new Uint8Array([7, 8, 9]) }],
   });
   const v4 = requireEvent(after, "ProtectSecretStarted", "RestoredOwner").version;
+  if (v4 !== newest + 1) {
+    throw new Error(`the first publish after restore must follow the newest v${newest}, got v${v4}`);
+  }
   for (const channelId of [...channels, channelD]) {
     const t = await stored(restored, channelId, v4);
     if (t !== 3) {
@@ -2135,9 +2187,24 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
 
   console.log("  -- Discovery: Owner asks each helper what it holds --\n");
 
+  owner.secretStore.loadManyCalls.length = 0;
   await owner.protocol.start(FlowKind.Discovery, {
     target: [rekRecovery(recoveryChannelA), rekRecovery(recoveryChannelB)],
   });
+  // The broadcast reads its channel keys in batches rather than one load per
+  // channel: one loadMany for every target's SharedKey, then one for every
+  // target's KeyRing.
+  const keyKinds = owner.secretStore.loadManyCalls.map((c) => c.kind);
+  if (keyKinds.join(",") !== "0,3") {
+    throw new Error(`Discovery broadcast must call loadMany once per kind (SharedKey, KeyRing), got [${keyKinds}]`);
+  }
+  const targets = [rekRecovery(recoveryChannelA), rekRecovery(recoveryChannelB)].map(String).sort();
+  for (const call of owner.secretStore.loadManyCalls) {
+    if (call.secretId !== ownerSidRecovery || [...call.channelIds].sort().join(",") !== targets.join(",")) {
+      throw new Error(`loadMany must receive both helper channels, got ${JSON.stringify(call)}`);
+    }
+  }
+  console.log(`  Discovery broadcast → one loadMany([${targets}]) per kind (SharedKey, KeyRing)  ✓`);
 
   const discRequests = owner.transport.drain();
   if (discRequests.length !== 2) {
@@ -2243,7 +2310,7 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   if (recovered.threshold !== THRESHOLD) {
     throw new Error(`the recovered roster must carry t=${THRESHOLD}, got ${recovered.threshold}`);
   }
-  await restored.protocol.restore(recovered, 1);
+  await restored.protocol.restore(recovered, 1, 1);
 
   const restoredSnapshot = await restored.userSecretStore.loadLatest(
     ownerSecretId.toString(),
@@ -2288,7 +2355,7 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   // and a conflict names the channels that block it.
   const restoreError = async (label: string): Promise<DeRecError> => {
     try {
-      await restored.protocol.restore(recovered, 1);
+      await restored.protocol.restore(recovered, 1, 1);
     } catch (e) {
       return e as DeRecError;
     }
@@ -2665,7 +2732,7 @@ async function runRestoreKeepsHelperDutiesFlow(): Promise<void> {
   const recovered = requireEvent(recoveryEvents, "SecretRecovered", "Device").secret;
   console.log("  [Device]  recovers its own secret over fresh recovery channels  ✓");
 
-  const restoreEvents = await device.node.protocol.restore(recovered, version);
+  const restoreEvents = await device.node.protocol.restore(recovered, version, version);
   const touched = restoreEvents.flatMap((e) =>
     e.type === "UnpairStarted" || e.type === "Unpaired" || e.type === "UnpairFailed" ? [e.channel_id] : [],
   );
@@ -3244,6 +3311,7 @@ async function runReplyToFlow(): Promise<void> {
   const crafted = primitives.discovery.request.produce(
     BigInt(longTermChannelId),
     sharedKey,
+    0,
     [{ uri: phantomUri, protocol: 0 }],
   );
   helper.transport.drain();
@@ -3261,6 +3329,218 @@ async function runReplyToFlow(): Promise<void> {
   console.log("\n✓ replyTo flow passed.\n");
 }
 
+
+/** The version of the node's latest user-secret snapshot, if any. */
+async function latestVersion(node: Node): Promise<number | undefined> {
+  const snapshot = await node.userSecretStore.loadLatest(String(node.protocol.secretId()));
+  return snapshot?.version;
+}
+
+/** Every `ShareStored` in `events` as `channel_id:version`, sorted. */
+function storedVersions(events: DeRecEvent[]): string[] {
+  return events
+    .flatMap((e) => (e.type === "ShareStored" ? [`${e.channel_id}:${e.version}`] : []))
+    .sort();
+}
+
+/** Pairs `helper` with `owner` and returns the long-term channel id. */
+async function pairHelperAt(
+  owner: AddressedNode,
+  helper: AddressedNode,
+  channelId: bigint,
+): Promise<string> {
+  await helperStartPairAt(owner, helper, channelId);
+  const events = await pumpAll([owner, helper]);
+  const completed = events.find(
+    (e) => e.type === "PairingCompleted" && BigInt(e.pairing_channel_id) === channelId,
+  );
+  if (!completed || completed.type !== "PairingCompleted") {
+    throw new Error(`pairHelperAt(cid=${channelId}): missing PairingCompleted`);
+  }
+  return completed.channel_id;
+}
+
+/**
+ * A publish the library starts on its own runs only once the helpers meet
+ * the threshold: with `threshold = 3`, pairing the second helper after a
+ * below-threshold `ProtectSecret` publishes nothing and consumes no version,
+ * and pairing the third publishes the stored snapshot to all three.
+ */
+async function runPairingBelowThresholdPublishesNothingFlow(): Promise<void> {
+  console.log("\n=== [Protocol] Pairing below threshold publishes nothing ===\n");
+
+  const owner = {
+    node: makeNode("Owner", "https://owner.example.com", { threshold: 3 }),
+    uri: "https://owner.example.com",
+  };
+  const helperA = { node: makeNode("HelperA", "https://helper-a.example.com"), uri: "https://helper-a.example.com" };
+  const helperB = { node: makeNode("HelperB", "https://helper-b.example.com"), uri: "https://helper-b.example.com" };
+  const helperC = { node: makeNode("HelperC", "https://helper-c.example.com"), uri: "https://helper-c.example.com" };
+
+  await pairHelperAt(owner, helperA, 71n);
+  await owner.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [
+      {
+        id: new Uint8Array([7]),
+        name: "staged",
+        data: new TextEncoder().encode("stored before the helpers meet the threshold"),
+      },
+    ],
+  });
+  await pumpAll([owner, helperA]);
+  if ((await latestVersion(owner.node)) !== 1) {
+    throw new Error(`expected v1 after ProtectSecret, got ${await latestVersion(owner.node)}`);
+  }
+
+  await helperStartPairAt(owner, helperB, 72n);
+  let events = await pumpAll([owner, helperA, helperB]);
+  if (storedVersions(events).length !== 0) {
+    throw new Error(
+      `two helpers cannot meet a threshold of 3, so nothing is shared: [${storedVersions(events).join(", ")}]`,
+    );
+  }
+  if ((await latestVersion(owner.node)) !== 1) {
+    throw new Error(`no version consumed: expected v1, got ${await latestVersion(owner.node)}`);
+  }
+  console.log("  second helper paired below the threshold: nothing published  ✓");
+
+  await helperStartPairAt(owner, helperC, 73n);
+  events = await pumpAll([owner, helperA, helperB, helperC]);
+  const stored = events.filter((e) => e.type === "ShareStored");
+  if (stored.length !== 3 || !stored.every((e) => e.version === 2)) {
+    throw new Error(`every helper stores v2: [${storedVersions(events).join(", ")}]`);
+  }
+  if ((await latestVersion(owner.node)) !== 2) {
+    throw new Error(`expected v2, got ${await latestVersion(owner.node)}`);
+  }
+  console.log("  third helper meets the threshold: v2 shared with all three  ✓");
+
+  console.log("\n✓ Pairing below threshold publishes nothing flow passed.\n");
+}
+
+/**
+ * Removing a helper that holds a share republishes the latest snapshot to
+ * the helpers that remain once the helper acknowledges, so the removed
+ * helper's share belongs to a split nothing else is built on. A removal
+ * that leaves the helpers below the threshold publishes nothing.
+ */
+async function runUnpairRepublishesFlow(): Promise<void> {
+  console.log("\n=== [Protocol] Unpair republishes ===\n");
+
+  const owner = { node: makeNode("Owner", "https://owner.example.com"), uri: "https://owner.example.com" };
+  const helperA = { node: makeNode("HelperA", "https://helper-a.example.com"), uri: "https://helper-a.example.com" };
+  const helperB = { node: makeNode("HelperB", "https://helper-b.example.com"), uri: "https://helper-b.example.com" };
+  const helperC = { node: makeNode("HelperC", "https://helper-c.example.com"), uri: "https://helper-c.example.com" };
+  const channelA = await pairHelperAt(owner, helperA, 81n);
+  const channelB = await pairHelperAt(owner, helperB, 82n);
+  const channelC = await pairHelperAt(owner, helperC, 83n);
+
+  await owner.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [
+      {
+        id: new Uint8Array([8]),
+        name: "republished",
+        data: new TextEncoder().encode("split again when a helper leaves"),
+      },
+    ],
+  });
+  await pumpAll([owner, helperA, helperB, helperC]);
+  if ((await latestVersion(owner.node)) !== 1) {
+    throw new Error(`expected v1 after ProtectSecret, got ${await latestVersion(owner.node)}`);
+  }
+
+  const started = await owner.node.protocol.start(FlowKind.Unpair, { channel_id: channelC });
+  if (started.some((e) => e.type === "ProtectSecretStarted")) {
+    throw new Error(
+      `nothing is published before the helper acknowledges: [${started.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  let events = await pumpAll([owner, helperA, helperB, helperC]);
+  if (!events.some((e) => e.type === "Unpaired" && e.channel_id === channelC)) {
+    throw new Error(`expected Unpaired for HelperC: [${events.map((e) => e.type).join(", ")}]`);
+  }
+  const expected = [`${channelA}:2`, `${channelB}:2`].sort();
+  if (storedVersions(events).join(",") !== expected.join(",")) {
+    throw new Error(
+      `the remaining helpers store v2 and the removed one nothing: [${storedVersions(events).join(", ")}]`,
+    );
+  }
+  if ((await latestVersion(owner.node)) !== 2) {
+    throw new Error(`expected v2, got ${await latestVersion(owner.node)}`);
+  }
+  console.log("  HelperC acknowledged its removal: v2 republished to HelperA and HelperB  ✓");
+
+  await owner.node.protocol.start(FlowKind.Unpair, { channel_id: channelB });
+  events = await pumpAll([owner, helperA, helperB]);
+  if (storedVersions(events).length !== 0) {
+    throw new Error(
+      `one helper cannot meet a threshold of 2, so nothing is shared: [${storedVersions(events).join(", ")}]`,
+    );
+  }
+  if ((await latestVersion(owner.node)) !== 2) {
+    throw new Error(`no version consumed: expected v2, got ${await latestVersion(owner.node)}`);
+  }
+  console.log("  removal below the threshold: nothing published  ✓");
+
+  console.log("\n✓ Unpair republishes flow passed.\n");
+}
+
+/**
+ * `start(UnpairReplica)` announces the removal and publishes the roster
+ * that omits the member, so the removal completes with no further call: the
+ * destination tears down and the source drops its row.
+ */
+async function runReplicaRemovalPublishesTheRosterFlow(): Promise<void> {
+  console.log("\n=== [Protocol] Replica removal publishes the roster ===\n");
+
+  const destinationId = 0xd0d0_d0d0_d0d0_d0d0n;
+  const source = {
+    node: makeNode("Source", "https://source.example.com", {
+      secretId: 0xfaden,
+      replicaId: 0x5050_5050_5050_5050n,
+    }),
+    uri: "https://source.example.com",
+  };
+  const destination = {
+    node: makeNode("Destination", "https://destination.example.com", { replicaId: destinationId }),
+    uri: "https://destination.example.com",
+  };
+  const { rekeyed } = await pairReplicaHandshake(source, destination, 91n);
+  await crossConfirmFingerprintAt(source, destination, rekeyed);
+  await pumpAll([source, destination]);
+
+  await source.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [
+      { id: new Uint8Array([9]), name: "mirrored", data: new TextEncoder().encode("held by both devices") },
+    ],
+  });
+  await pumpAll([source, destination]);
+  const before = await latestVersion(source.node);
+  if (before === undefined) throw new Error("the source has published");
+
+  await source.node.protocol.start(FlowKind.UnpairReplica, {
+    replica_id: destinationId.toString(),
+    memo: "retired device",
+  });
+  if ((await latestVersion(source.node)) !== before + 1) {
+    throw new Error(
+      `the removal publishes the next version itself: expected v${before + 1}, got ${await latestVersion(source.node)}`,
+    );
+  }
+
+  const events = await pumpAll([source, destination]);
+  if (!events.some((e) => e.type === "SelfRemovedFromGroup")) {
+    throw new Error(
+      `the destination must tear down on the roster that omits it: [${events.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  if (!events.some((e) => e.type === "ReplicaRemoved" && e.replica_id === destinationId.toString())) {
+    throw new Error(`the source must report the removal complete: [${events.map((e) => e.type).join(", ")}]`);
+  }
+  console.log("  removal completed with no ProtectSecret from the application  ✓");
+
+  console.log("\n✓ Replica removal publishes the roster flow passed.\n");
+}
 
 /**
  * Owner↔Destination replica pair, followed by a full ProtectSecret
@@ -4409,6 +4689,159 @@ async function runVerifyNoProofFlow(): Promise<void> {
 }
 
 /**
+ * The epoch of the key ring `node` stores for `channelId`, read from its own
+ * secret store: the ring's bytes are a version byte, 1 for the encoding
+ * `KeyRing::as_bytes` documents, followed by the big-endian u32 epoch.
+ */
+async function storedKeyEpoch(node: Node, secretId: bigint, channelId: string): Promise<number> {
+  const ring = await node.secretStore.load(secretId.toString(), channelId, 3);
+  if (!ring || ring.length < 5) {
+    throw new Error(`channel ${channelId} must store a KeyRing`);
+  }
+  if (ring[0] !== 1) {
+    throw new Error(`channel ${channelId} stores KeyRing encoding ${ring[0]}, this reader knows 1`);
+  }
+  return new DataView(ring.buffer, ring.byteOffset, ring.byteLength).getUint32(1);
+}
+
+/** `envelope` with its `sequence` (field 3) replaced by `sequence`. */
+function withSequence(envelope: Uint8Array, sequence: number): Uint8Array {
+  const { start, end } = protoField(envelope, 3);
+  const varint: number[] = [];
+  for (let v = sequence; ; v = Math.floor(v / 128)) {
+    if (v < 128) {
+      varint.push(v);
+      break;
+    }
+    varint.push((v % 128) | 0x80);
+  }
+  const out = new Uint8Array(envelope.length - (end - start) + varint.length);
+  out.set(envelope.subarray(0, start));
+  out.set(varint, start);
+  out.set(envelope.subarray(end), start + varint.length);
+  return out;
+}
+
+/**
+ * With key rotation on, the owner advances each helper channel one epoch per
+ * sharing round, and both ends store the new epoch in their key ring. An
+ * envelope whose `sequence` is past the forward-jump limit is ignored as
+ * `KeyUnavailable`. The recovered secret names each channel's epoch, and a
+ * fresh device restored from it publishes under the next one.
+ */
+async function runKeyRotationFlow(): Promise<void> {
+  console.log("=== [Protocol] Key rotation ===\n");
+
+  const secretId = 81n;
+  const ownerUri = "https://owner-rotation.example.com";
+  const helperAUri = "https://helper-a-rotation.example.com";
+  const helperBUri = "https://helper-b-rotation.example.com";
+  const owner = makeNode("Owner", ownerUri, { secretId, keyRotation: true });
+  const helperA = makeNode("HelperA", helperAUri, { secretId });
+  const helperB = makeNode("HelperB", helperBUri, { secretId });
+  const { longTermChannelId: channelA } = await doPair(helperA, owner, 91n, "Owner↔HelperA");
+  const { longTermChannelId: channelB } = await doPair(helperB, owner, 92n, "Owner↔HelperB");
+  const helpers: Array<[string, Node, string]> = [
+    [channelA, helperA, "HelperA"],
+    [channelB, helperB, "HelperB"],
+  ];
+  const scope = (ownerNode: Node): AddressedNode[] => [
+    { node: ownerNode, uri: ownerUri },
+    { node: helperA, uri: helperAUri },
+    { node: helperB, uri: helperBUri },
+  ];
+  const confirmed = (events: DeRecEvent[], version: number): number =>
+    events.filter((e) => e.type === "ShareConfirmed" && e.version === version).length;
+  const assertEpochs = async (ownerNode: Node, epoch: number, label: string): Promise<void> => {
+    for (const [channelId, helper, helperLabel] of helpers) {
+      const ownerEpoch = await storedKeyEpoch(ownerNode, secretId, channelId);
+      const helperEpoch = await storedKeyEpoch(helper, secretId, channelId);
+      if (ownerEpoch !== epoch || helperEpoch !== epoch) {
+        throw new Error(
+          `channel ${channelId} must be at KeyRing epoch ${epoch} on both ends, got ${label} ${ownerEpoch}, ${helperLabel} ${helperEpoch}`,
+        );
+      }
+    }
+  };
+
+  for (const round of [1, 2]) {
+    await owner.protocol.start(FlowKind.ProtectSecret, {
+      secrets: [{ id: new Uint8Array([21]), name: "rotating", data: new Uint8Array([round]) }],
+    });
+    const events = await pumpAll(scope(owner));
+    if (confirmed(events, round) !== 2) {
+      throw new Error(`both helpers must confirm v${round}, got ${JSON.stringify(events.map((e) => e.type))}`);
+    }
+  }
+  await assertEpochs(owner, 2, "Owner");
+  console.log("  two rounds → owner and helpers store KeyRing epoch 2 on both channels  ✓");
+
+  await owner.protocol.start(FlowKind.VerifyShares, { secretId, version: 2 });
+  const verified = new Set(
+    (await pumpAll(scope(owner)))
+      .filter((e) => e.type === "ShareVerified" && e.version === 2)
+      .map((e) => (e as Extract<DeRecEvent, { type: "ShareVerified" }>).channel_id),
+  );
+  if (!verified.has(channelA) || !verified.has(channelB)) {
+    throw new Error(`both channels must verify v2 at epoch 2, got ${JSON.stringify([...verified])}`);
+  }
+  console.log("  verification of v2 at epoch 2 → ShareVerified on both channels  ✓");
+
+  await owner.protocol.start(FlowKind.VerifyShares, { secretId, version: 2, target: BigInt(channelA) });
+  const challenge = drainOne(owner, "Owner");
+  if (envelope.read_sequence(challenge) !== 2) {
+    throw new Error(`the challenge must be under K2, sequence ${envelope.read_sequence(challenge)}`);
+  }
+  const ignored = await helperA.protocol.process(withSequence(challenge, 2 + 513));
+  const keyIgnored = ignored[0];
+  if (
+    ignored.length !== 1 ||
+    keyIgnored?.type !== "MessageIgnored" ||
+    keyIgnored.reason !== "KeyUnavailable" ||
+    keyIgnored.channel_id !== channelA
+  ) {
+    throw new Error(`a sequence past the forward-jump limit must be MessageIgnored(KeyUnavailable), got ${JSON.stringify(ignored)}`);
+  }
+  if (helperA.transport.drain().length !== 0) {
+    throw new Error("a message with no usable key must not be answered");
+  }
+  if ((await storedKeyEpoch(helperA, secretId, channelA)) !== 2) {
+    throw new Error("the ignored message must not move HelperA's ring");
+  }
+  console.log("  sequence 515 → MessageIgnored(KeyUnavailable), nothing sent, ring unchanged  ✓");
+
+  await owner.protocol.start(FlowKind.RecoverSecret, { secretId, version: 2 });
+  const recoveredEvent = requireEvent(await pumpAll(scope(owner)), "SecretRecovered", "Owner");
+  const recovered = recoveredEvent.secret;
+  if (recovered.helpers.length !== 2 || recovered.helpers.some((h) => h.key_epoch !== 2)) {
+    throw new Error(
+      `the roster must name key epoch 2 for both helpers, got ${JSON.stringify(recovered.helpers.map((h) => h.key_epoch))}`,
+    );
+  }
+  console.log("  SecretRecovered names key_epoch 2 for both helpers  ✓");
+
+  const device = makeNode("Device", ownerUri, { secretId, keyRotation: true });
+  await device.protocol.restore(recovered, 2, 2);
+  for (const [channelId] of helpers) {
+    const restoredEpoch = await storedKeyEpoch(device, secretId, channelId);
+    if (restoredEpoch !== 2) {
+      throw new Error(`restore must rebuild channel ${channelId} at KeyRing epoch 2, got ${restoredEpoch}`);
+    }
+  }
+  console.log("  restore on a fresh device → KeyRing epoch 2 on both channels  ✓");
+
+  await device.protocol.start(FlowKind.ProtectSecret, { secrets: recovered.secrets });
+  const republished = await pumpAll(scope(device));
+  if (confirmed(republished, 3) !== 2) {
+    throw new Error(`both helpers must confirm v3 from the restored device, got ${JSON.stringify(republished.map((e) => e.type))}`);
+  }
+  await assertEpochs(device, 3, "Device");
+  console.log("  the restored device publishes v3 → both helpers confirm, KeyRing epoch 3  ✓");
+
+  console.log("\n✓ Key rotation flow passed.\n");
+}
+
+/**
  * Verdicts on verification answers that do not prove the share: the answer
  * to a challenge a newer one replaced is ignored as `StaleResponse`, a proof
  * over bytes that differ from the owner's is `ShareVerifyInvalid`, and a
@@ -4895,7 +5328,7 @@ async function runReplicaVerifiesOnlySyncedVersionsFlow(): Promise<void> {
   if (v2 <= v1) throw new Error(`joining must publish a newer version (v1=${v1}, v2=${v2})`);
 
   await expectCode("restore on a synced destination", "already_restored", () =>
-    bob.node.protocol.restore(synced.secret, v2),
+    bob.node.protocol.restore(synced.secret, v2, v2),
   );
   console.log("  [Bob] restore on a synced destination → already_restored  ✓");
 
@@ -5388,6 +5821,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runStickyWeightsFlow();
   await runShareSubsharesFlow();
   await runStickyThresholdFlow();
+  await runKeyRotationFlow();
   await runMaxSubsharesFlow();
   await runShareStoreRefusalFlow();
   await runShareSizeRefusalFlow();
@@ -5416,6 +5850,9 @@ export async function runProtocolSmoke(): Promise<void> {
   await runUnpairingFlow();
   await runUpdateChannelInfoFlow();
   await runReplyToFlow();
+  await runPairingBelowThresholdPublishesNothingFlow();
+  await runUnpairRepublishesFlow();
+  await runReplicaRemovalPublishesTheRosterFlow();
   await runReplicaIdWiringSadPathsFlow();
   await runReplicaPairingAndSecretSyncFlow();
   await runReplicaMirrorThenVerifyFlow();
@@ -6032,7 +6469,7 @@ async function runOverlappingCallsFlow(): Promise<void> {
     override async save(
       secretId: string,
       channelId: string,
-      kind: 0 | 1 | 2,
+      kind: 0 | 1 | 2 | 3,
       value: Uint8Array,
     ): Promise<void> {
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -6669,7 +7106,7 @@ async function runBindingInputContractFlow(): Promise<void> {
   });
   for (const bad of ["", "-1", "abc"]) {
     await expectCode(`restore(channel_id="${bad}")`, "invalid_recovered_secret", () =>
-      protocol.restore(helper(bad) as never, 1),
+      protocol.restore(helper(bad) as never, 1, 1),
     );
   }
   console.log("  restore refuses an empty or non-decimal channel_id  ✓");
@@ -6705,7 +7142,7 @@ async function runBindingInputContractFlow(): Promise<void> {
       protocol.start(bad as FlowKind.Discovery, {}),
     );
     await expectCode(`restore(_, ${bad})`, "decode_error", () =>
-      protocol.restore({ helpers: [], secrets: [] } as never, bad),
+      protocol.restore({ helpers: [], secrets: [] } as never, bad, 1),
     );
   }
   const pairing = makeNode("ContractHelper", "https://contract-helper.example.com");
@@ -6808,21 +7245,58 @@ async function runStoreAnswerContractFlow(): Promise<void> {
       return 1 as unknown as boolean;
     }
   }
-  const leaving = makeNode("Helper", "https://leaving-helper.example.com", {
+  // A wrong fingerprint revokes the `Pending` pairing through
+  // `ChannelStore.remove`, whose answer must be a boolean.
+  const revoking = makeNode("Owner", "https://revoking-owner.example.com", {
     secretId,
     channelStore: new NumericRemoveChannelStore(),
   });
+  const pendingChannel = 5252n;
+  const pendingKey = new Uint8Array(32).map((_, i) => (i * 7 + 3) & 0xff);
+  await revoking.channelStore.save(
+    sid,
+    String(pendingChannel),
+    "51966",
+    new TextEncoder().encode(
+      JSON.stringify({
+        Replica: {
+          channel_id: Number(pendingChannel),
+          replica_id: 51966,
+          transports: [{ uri: "https://peer.example.com", protocol: 0 }],
+          communication_info: {},
+          role: "Destination",
+          status: "Pending",
+          created_at: 1700000000,
+        },
+      }),
+    ),
+  );
+  await revoking.secretStore.save(sid, String(pendingChannel), 0, pendingKey);
+  await expectCode("verifyFingerprint(wrong) over a non-boolean ChannelStore.remove", "store_error", () =>
+    revoking.protocol.verifyFingerprint(pendingChannel, "0000-0000-0000-0000"),
+  );
+  console.log("  ChannelStore.remove returning a number → store_error  ✓");
+
+  class RejectingRemoveManyChannelStore extends InMemoryChannelStore {
+    override async removeMany(): Promise<void> {
+      throw new Error("backend unavailable");
+    }
+  }
+  // The acknowledgement goes out before the helper drops its side, so a
+  // failing drop is reported after `Unpaired` as an answered store error.
+  const leaving = makeNode("Helper", "https://leaving-helper.example.com", {
+    secretId,
+    channelStore: new RejectingRemoveManyChannelStore(),
+  });
   const paired = await doPair(leaving, owner, 86n, "Owner↔LeavingHelper");
   await owner.protocol.start(FlowKind.Unpair, { channel_id: paired.longTermChannelId });
-  const removal = requireEvent(
-    await processAll(leaving, drainOne(owner, "Owner")),
-    "RequestFailed",
-    "LeavingHelper",
-  );
+  const leavingEvents = await processAll(leaving, drainOne(owner, "Owner"));
+  requireEvent(leavingEvents, "Unpaired", "LeavingHelper");
+  const removal = requireEvent(leavingEvents, "RequestFailed", "LeavingHelper");
   if (removal.action_kind !== "Unpair" || removal.error_code !== "store_error") {
-    throw new Error(`a non-boolean ChannelStore.remove must be a store error, got ${JSON.stringify(removal)}`);
+    throw new Error(`a rejecting ChannelStore.removeMany must be a store error, got ${JSON.stringify(removal)}`);
   }
-  console.log("  ChannelStore.remove returning a number → RequestFailed(store_error)  ✓");
+  console.log("  ChannelStore.removeMany rejecting on Unpair → Unpaired + RequestFailed(store_error)  ✓");
 
   console.log("\n✓ store answer contract passed.\n");
 }

@@ -280,13 +280,15 @@ public sealed record ReplicaDiscoveryParams;
 /// member is rejected, not silently ignored.
 /// </para>
 /// <para>
-/// <b>Starting this flow removes nothing on its own</b> and emits no
-/// <c>ReplicaRemovedEvent</c>. It tells every member and flags the target
-/// locally; the removal completes only once the application publishes a
-/// roster omitting that member — an ordinary
-/// <see cref="FlowKind.ProtectSecret"/> — at which point
-/// <c>ReplicaRemovedEvent</c> fires. A group with no secret to publish
-/// therefore cannot complete a removal.
+/// Starting this flow tells every member, flags the target locally, and then
+/// publishes the roster omitting that member as the next version — an
+/// ordinary <see cref="FlowKind.ProtectSecret"/> of the latest snapshot with
+/// the stored weights and threshold, or an empty payload when nothing has
+/// been published yet. Its events are returned with the announcement's.
+/// <c>ReplicaRemovedEvent</c> fires once that round completes, not from
+/// <c>StartAsync</c>. A publish that fails is thrown with the announcement
+/// already sent and the flag kept; the next
+/// <see cref="FlowKind.ProtectSecret"/> completes the removal.
 /// </para>
 /// <para>
 /// Any member may remove any member, the source included: a lost or stolen
@@ -857,12 +859,18 @@ public sealed record PairingRefusedEvent : DeRecEvent
 /// it the same count. A roster entry written before weights existed reads as
 /// <c>1</c>.
 /// </param>
+/// <param name="KeyEpoch">
+/// The epoch of <c>SharedKey</c> on the helper's channel.
+/// <see cref="DeRecProtocol.RestoreAsync"/> rebuilds the channel's key at this
+/// epoch. A roster entry written before epochs existed reads as <c>0</c>.
+/// </param>
 public sealed record HelperInfo(
     [property: JsonPropertyName("channel_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] ulong ChannelId,
     [property: JsonPropertyName("transports"), JsonConverter(typeof(TransportEndpointListJsonConverter))] IReadOnlyList<TransportProtocol> Transports,
     [property: JsonPropertyName("shared_key")] byte[] SharedKey,
     [property: JsonPropertyName("communication_info"), OmitWhenEmpty] Dictionary<string, string>? CommunicationInfo,
-    [property: JsonPropertyName("weight")] uint Weight = 1);
+    [property: JsonPropertyName("weight")] uint Weight = 1,
+    [property: JsonPropertyName("key_epoch"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] uint KeyEpoch = 0);
 
 /// <summary>
 /// One member of the replica group. Exactly one member of a group has
@@ -904,7 +912,8 @@ public sealed record Secret(
 public sealed record Replicas(
     [property: JsonPropertyName("channel_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] ulong ChannelId,
     [property: JsonPropertyName("members")] IReadOnlyList<ReplicaInfo> Members,
-    [property: JsonPropertyName("shared_key")] byte[] SharedKey);
+    [property: JsonPropertyName("shared_key")] byte[] SharedKey,
+    [property: JsonPropertyName("key_epoch"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] uint KeyEpoch = 0);
 
 public sealed record ChannelShare(
     [property: JsonPropertyName("channel_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] ulong ChannelId,
@@ -1196,6 +1205,7 @@ public static class IgnoreReason
     /// and not answered.
     /// </summary>
     public const string Superseded = "Superseded";
+    public const string KeyUnavailable = "KeyUnavailable";
 }
 
 /// <summary>
@@ -1925,7 +1935,8 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ReadEndpoints(h),
                 ReadByteArray(h.GetProperty("shared_key")),
                 h.TryGetProperty("communication_info", out var hci) ? ReadStringMap(hci) : new(),
-                h.GetProperty("weight").GetUInt32()));
+                h.GetProperty("weight").GetUInt32(),
+                h.TryGetProperty("key_epoch", out var hke) ? hke.GetUInt32() : 0));
         }
         var secrets = new List<UserSecret>();
         foreach (var s in secretEl.GetProperty("secrets").EnumerateArray())
@@ -1954,7 +1965,8 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             replicas = new Replicas(
                 ReadId(replicasEl.GetProperty("channel_id")),
                 members,
-                sharedKey);
+                sharedKey,
+                replicasEl.TryGetProperty("key_epoch", out var rke) ? rke.GetUInt32() : 0);
         }
         return new Secret(helpers, secrets)
         {

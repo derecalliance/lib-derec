@@ -19,6 +19,7 @@ import (
 
 	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/derecpb"
+	"github.com/derecalliance/lib-derec/packages/go/primitives/channelkey"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/discovery"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/envelope"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/pairing"
@@ -43,6 +44,7 @@ func runPrimitives() {
 	runRecoveryFlow()
 	runDiscoveryFlow()
 	runEnvelopeTraceID()
+	runRotatedChannelPrimitives()
 	runRequestReplyTo()
 }
 
@@ -53,7 +55,7 @@ func runProtocolVersion() {
 	version := derec.CurrentProtocolVersion()
 	fmt.Printf("protocol version = %d.%d\n", version.Major, version.Minor)
 
-	wire, err := unpairing.Request.Produce(1, "", sharedKeyFill(1), nil)
+	wire, err := unpairing.Request.Produce(1, "", sharedKeyFill(1), 0, nil)
 	must(err, "unpair request produce")
 	var msg derecpb.DeRecMessage
 	must(proto.Unmarshal(wire, &msg), "decode envelope")
@@ -73,7 +75,7 @@ func runRequestReplyTo() {
 		{URI: "https://owner.example/derec", Protocol: int32(derecpb.Protocol_HTTPS)},
 		{URI: "https://owner-backup.example/derec", Protocol: int32(derecpb.Protocol_HTTPS)},
 	}
-	wire, err := unpairing.Request.Produce(3, "bye", key, replyTo)
+	wire, err := unpairing.Request.Produce(3, "bye", key, 0, replyTo)
 	must(err, "unpair request produce with reply-to")
 	extracted, err := unpairing.Request.Extract(wire, key)
 	must(err, "unpair request extract")
@@ -257,14 +259,14 @@ func runSharingFlow() {
 		assertTrue(ok, "missing share for channel %d", channelID)
 		assertTrue(len(committedShare) != 0, "empty committed share for channel %d", channelID)
 
-		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, 0, "", sharedKey, nil)
+		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, 0, "", sharedKey, 0, nil)
 		must(err, fmt.Sprintf("sharing.Request.Produce channel %d", channelID))
 		assertTrue(len(requestWire) != 0, "empty store share request envelope for channel %d", channelID)
 
 		extractedReq, err := sharing.Request.Extract(requestWire, sharedKey)
 		must(err, fmt.Sprintf("sharing.Request.Extract channel %d", channelID))
 
-		respResult, err := sharing.Response.Produce(channelID, extractedReq.RequestProto, sharedKey)
+		respResult, err := sharing.Response.Produce(channelID, extractedReq.RequestProto, sharedKey, 0)
 		must(err, fmt.Sprintf("sharing.Response.Produce channel %d", channelID))
 		assertTrue(len(respResult.Envelope) != 0, "empty store share response envelope for channel %d", channelID)
 		assertTrue(len(respResult.CommittedShare) != 0, "empty committed_share for channel %d", channelID)
@@ -331,14 +333,14 @@ func runVerificationFlow() {
 	shareContent1 := shares[channel1]
 	shareContent2 := shares[channel2]
 
-	challengeEnvelope, err := verification.Request.Produce(channel1, secretID, version, sharedKey, nil)
+	challengeEnvelope, err := verification.Request.Produce(channel1, secretID, version, sharedKey, 0, nil)
 	must(err, "verification.Request.Produce")
 
 	extractedReq, err := verification.Request.Extract(challengeEnvelope, sharedKey)
 	must(err, "verification.Request.Extract")
 	assertTrue(extractedReq.ChannelID == channel1, "channel_id mismatch in verification request: got %d want %d", extractedReq.ChannelID, channel1)
 
-	respEnvelope, err := verification.Response.Produce(channel1, extractedReq.RequestProto, sharedKey, shareContent1)
+	respEnvelope, err := verification.Response.Produce(channel1, extractedReq.RequestProto, sharedKey, 0, shareContent1)
 	must(err, "verification.Response.Produce")
 	assertTrue(len(respEnvelope) != 0, "verification response envelope must not be empty")
 
@@ -350,7 +352,7 @@ func runVerificationFlow() {
 	must(err, "verification.Response.Process (valid case)")
 	assertTrue(valid, "expected a valid verification response")
 
-	respEnvelope2, err := verification.Response.Produce(channel1, extractedReq.RequestProto, sharedKey, shareContent1)
+	respEnvelope2, err := verification.Response.Produce(channel1, extractedReq.RequestProto, sharedKey, 0, shareContent1)
 	must(err, "second verification.Response.Produce")
 	extractedResp2, err := verification.Response.Extract(respEnvelope2, sharedKey)
 	must(err, "second verification.Response.Extract")
@@ -383,7 +385,7 @@ func runRecoveryFlow() {
 	for _, channelID := range []uint64{1, 2} {
 		key := keys[channelID]
 
-		requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], 0, "", key, nil)
+		requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], 0, "", key, 0, nil)
 		must(err, fmt.Sprintf("sharing.Request.Produce channel %d", channelID))
 
 		extracted, err := sharing.Request.Extract(requestWire, key)
@@ -396,14 +398,14 @@ func runRecoveryFlow() {
 	for _, channelID := range []uint64{1, 2} {
 		key := keys[channelID]
 
-		getRequestWire, err := recovery.Request.Produce(channelID, secretID, version, key, nil)
+		getRequestWire, err := recovery.Request.Produce(channelID, secretID, version, key, 0, nil)
 		must(err, fmt.Sprintf("recovery.Request.Produce channel %d", channelID))
 
 		extractedReq, err := recovery.Request.Extract(getRequestWire, key)
 		must(err, fmt.Sprintf("recovery.Request.Extract channel %d", channelID))
 		assertTrue(extractedReq.ChannelID == channelID, "recovery request channel_id mismatch for channel %d", channelID)
 
-		getResponseWire, err := recovery.Response.Produce(channelID, extractedReq.RequestProto, storedRequests[channelID], key)
+		getResponseWire, err := recovery.Response.Produce(channelID, extractedReq.RequestProto, storedRequests[channelID], key, 0)
 		must(err, fmt.Sprintf("recovery.Response.Produce channel %d", channelID))
 
 		extractedResp, err := recovery.Response.Extract(getResponseWire, key)
@@ -429,7 +431,7 @@ func runDiscoveryFlow() {
 	const channelID = uint64(7)
 	sharedKey := sharedKeyFill(11)
 
-	requestWire, err := discovery.Request.Produce(channelID, sharedKey, nil)
+	requestWire, err := discovery.Request.Produce(channelID, sharedKey, 0, nil)
 	must(err, "discovery.Request.Produce")
 	assertTrue(len(requestWire) != 0, "discovery request envelope must not be empty")
 
@@ -446,7 +448,7 @@ func runDiscoveryFlow() {
 		},
 	}
 
-	responseWire, err := discovery.Response.Produce(channelID, secretList, sharedKey)
+	responseWire, err := discovery.Response.Produce(channelID, secretList, sharedKey, 0)
 	must(err, "discovery.Response.Produce")
 
 	extractedResp, err := discovery.Response.Extract(responseWire, sharedKey)
@@ -476,7 +478,7 @@ func runEnvelopeTraceID() {
 	const channelID = uint64(42)
 	sharedKey := sharedKeyFill(9)
 
-	result, err := discovery.Request.Produce(channelID, sharedKey, nil)
+	result, err := discovery.Request.Produce(channelID, sharedKey, 0, nil)
 	must(err, "discovery.Request.Produce")
 
 	traceBefore, err := envelope.ReadTraceID(result)
@@ -495,6 +497,50 @@ func runEnvelopeTraceID() {
 	must(err, "discovery.Request.Extract on re-stamped envelope")
 
 	fmt.Println("Envelope trace_id helpers test passed.")
+}
+
+// runRotatedChannelPrimitives checks the primitives on a channel whose key has
+// advanced: the producer stamps the key's epoch into the envelope sequence,
+// the receiver reads it, derives the key at that epoch, and extracts.
+func runRotatedChannelPrimitives() {
+	fmt.Println("=== Primitives on a rotated channel test ===")
+
+	const channelID, secretID, version = uint64(42), uint64(7), uint32(1)
+	k0 := sharedKeyFill(9)
+
+	k3, err := channelkey.Derive(k0, 0, 3)
+	must(err, "channelkey.Derive(k0, 0, 3)")
+	assertTrue(len(k3) == 32 && !bytes.Equal(k3, k0), "derived key must be 32 bytes and differ from k0")
+
+	wire, err := verification.Request.Produce(channelID, secretID, version, k3, 3, nil)
+	must(err, "verification.Request.Produce at epoch 3")
+
+	seq, err := envelope.ReadSequence(wire)
+	must(err, "envelope.ReadSequence")
+	assertTrue(seq == 3, "envelope sequence must be 3, got %d", seq)
+
+	receiverKey, err := channelkey.Derive(k0, 0, seq)
+	must(err, "channelkey.Derive(k0, 0, seq)")
+	assertTrue(bytes.Equal(receiverKey, k3), "receiver-derived key must equal the sender's key at epoch 3")
+	_, err = verification.Request.Extract(wire, receiverKey)
+	must(err, "verification.Request.Extract with the derived key")
+
+	_, err = verification.Request.Extract(wire, k0)
+	assertTrue(err != nil, "Extract with the epoch-0 key must fail on an epoch-3 envelope")
+
+	assertInvalidInput := func(err error, context string) {
+		var derr *derec.Error
+		assertTrue(errors.As(err, &derr) && derr.Code == derec.CodeInvalidInput,
+			"%s: want invalid-input code %d, got %#v", context, derec.CodeInvalidInput, err)
+	}
+	_, err = channelkey.Derive(k3, 3, 2)
+	assertInvalidInput(err, "backward derive")
+	_, err = channelkey.Derive(k0, 0, 513)
+	assertInvalidInput(err, "derive beyond 512 steps")
+	_, err = channelkey.Derive(k0, 0, 512)
+	must(err, "channelkey.Derive(k0, 0, 512)")
+
+	fmt.Println("Primitives on a rotated channel test passed.  ✓")
 }
 
 // inlineKeysContact rewrites a HASHED_KEYS or NO_KEYS contact into the

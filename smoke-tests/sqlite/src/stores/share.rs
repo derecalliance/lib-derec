@@ -71,7 +71,7 @@ impl DeRecShareStore for SqliteShareStore {
         secret_id: u64,
         channel_ids: &[ChannelId],
         versions: &[u32],
-    ) -> ShareStoreFuture<'_, Vec<Share>> {
+    ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
         if channel_ids.is_empty() {
             return Box::pin(future::ready(Ok(Vec::new())));
         }
@@ -86,7 +86,7 @@ impl DeRecShareStore for SqliteShareStore {
             }
             (
                 format!(
-                    "SELECT share_secret_id, version, bytes, subshares, threshold FROM shares \
+                    "SELECT share_secret_id, version, bytes, subshares, threshold, channel_id FROM shares \
                      WHERE secret_id = ? AND channel_id IN ({cid_placeholders})"
                 ),
                 p,
@@ -103,7 +103,7 @@ impl DeRecShareStore for SqliteShareStore {
             }
             (
                 format!(
-                    "SELECT share_secret_id, version, bytes, subshares, threshold FROM shares \
+                    "SELECT share_secret_id, version, bytes, subshares, threshold, channel_id FROM shares \
                      WHERE secret_id = ? AND channel_id IN ({cid_placeholders}) \
                      AND version IN ({ver_placeholders})"
                 ),
@@ -117,9 +117,15 @@ impl DeRecShareStore for SqliteShareStore {
             .map(|p| p as &dyn rusqlite::ToSql)
             .collect();
         let rows = stmt
-            .query_map(bound.as_slice(), map_share_row)
+            .query_map(bound.as_slice(), |row| {
+                Ok((
+                    ChannelId(sql_to_u64(row.get::<_, i64>(5)?)),
+                    map_share_row(row)?,
+                ))
+            })
             .expect("load_many query failed");
-        Box::pin(future::ready(Ok(collect_shares(rows))))
+        let shares = rows.map(|r| r.expect("share row failed")).collect();
+        Box::pin(future::ready(Ok(shares)))
     }
 
     fn load_all(
@@ -235,6 +241,28 @@ impl DeRecShareStore for SqliteShareStore {
         conn.execute(&sql, bound.as_slice())
             .expect("share remove_versions failed");
         Box::pin(future::ready(Ok(())))
+    }
+
+    fn remove_versions_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, Vec<u32>)],
+    ) -> ShareStoreFuture<'_, ()> {
+        let conn = lock(&self.connection);
+        let tx = conn
+            .unchecked_transaction()
+            .expect("remove_versions_many transaction failed");
+        for (channel_id, versions) in entries {
+            for v in versions {
+                tx.execute(
+                    "DELETE FROM shares WHERE secret_id = ?1 AND channel_id = ?2 AND version = ?3",
+                    rusqlite::params![u64_to_sql(secret_id), u64_to_sql(channel_id.0), *v as i64],
+                )
+                .expect("share remove_versions failed");
+            }
+        }
+        tx.commit().expect("remove_versions_many commit failed");
+        Box::pin(std::future::ready(Ok(())))
     }
 
     fn keep_version(&self, _: u64, version: u32) -> ShareStoreFuture<'_, u32> {

@@ -2,8 +2,8 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecTransport, MissingPolicy, PendingAction,
-    SecretKind, SecretValue,
+    ChannelKey, ChannelRequest, DeRecChannelStore, DeRecEvent, DeRecTransport, KeyRing,
+    MissingPolicy, PendingAction,
 };
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
@@ -11,16 +11,13 @@ use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::communication_info::CommunicationInfoExt as _;
 use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::extensions::message_body::MessageBodyExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::protocol::context::{Exchange, Local};
 use crate::protocol::obligation::{deliver, reported};
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{ChannelQuery, ChannelRecord};
-use crate::{
-    Error, Result,
-    protocol::types::Target,
-    types::{ChannelId, SharedKey},
-};
+use crate::{Error, Result, protocol::types::Target, types::ChannelId};
 use derec_proto::{
     CommunicationInfo, DeRecResult, MessageBody, StatusEnum, TransportProtocol,
     UpdateChannelInfoRequestMessage, UpdateChannelInfoResponseMessage,
@@ -77,12 +74,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 
     let keys = stores
         .secrets
-        .load_many(
-            local.secret_id,
-            &channel_ids,
-            SecretKind::SharedKey,
-            MissingPolicy::Fail,
-        )
+        .key_rings_many(local.secret_id, &channel_ids, MissingPolicy::Fail)
         .await?;
 
     let comm_info_proto = communication_info.as_ref().map(CommunicationInfo::from_map);
@@ -177,7 +169,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .timestamp(timestamp)
         .message_body(MessageBody::UpdateChannelInfoResponse(response))
         .trace_id(exchange.trace_id)
-        .encrypt(exchange.shared_key)?
+        .encrypt(exchange.key)?
         .build()?
         .encode_to_vec();
 
@@ -229,7 +221,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         .timestamp(timestamp)
         .message_body(body)
         .trace_id(exchange.trace_id)
-        .encrypt(exchange.shared_key)?
+        .encrypt(exchange.key)?
         .build()?
         .encode_to_vec();
 
@@ -292,12 +284,12 @@ fn on_request(
 
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id: exchange.channel_id,
-        action: PendingAction::UpdateChannelInfo {
-            channel_id: exchange.channel_id,
-            request,
-            shared_key: *exchange.shared_key,
-            trace_id: exchange.trace_id,
-        },
+        action: PendingAction::request(
+            exchange.channel_id,
+            exchange.trace_id,
+            ChannelRequest::UpdateChannelInfo(request),
+        )
+        .sealed_with(exchange.key),
     }])
 }
 
@@ -346,26 +338,25 @@ fn on_response(
 async fn dispatch_all<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-    keys: Vec<(ChannelId, SecretValue)>,
+    keys: Vec<(ChannelId, Option<KeyRing>)>,
     comm_info_proto: Option<CommunicationInfo>,
     own_transports: Vec<TransportProtocol>,
     trace_id: u64,
 ) -> Vec<DeRecEvent> {
     let mut events = Vec::with_capacity(keys.len());
-    for (channel_id, value) in keys {
-        let SecretValue::SharedKey(shared_key) = value else {
+    for (channel_id, ring) in keys {
+        let Some(ring) = ring else {
             events.push(DeRecEvent::UpdateChannelInfoFailed {
                 channel_id,
-                error: "channel has no shared key".to_owned(),
+                error: super::NO_USABLE_KEY.to_owned(),
             });
             continue;
         };
-
         match dispatch_one(
             stores,
             local,
             channel_id,
-            &shared_key,
+            &ring.current(),
             comm_info_proto.clone(),
             own_transports.clone(),
             trace_id,
@@ -406,7 +397,7 @@ async fn dispatch_one<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     channel_id: ChannelId,
-    shared_key: &SharedKey,
+    key: &ChannelKey,
     communication_info: Option<CommunicationInfo>,
     own_transports: Vec<TransportProtocol>,
     trace_id: u64,
@@ -422,7 +413,7 @@ async fn dispatch_one<S: StoreSet>(
         .timestamp(timestamp)
         .message_body(MessageBody::UpdateChannelInfoRequest(request))
         .trace_id(trace_id)
-        .encrypt(shared_key)?
+        .encrypt(key)?
         .build()?
         .encode_to_vec();
 
@@ -441,6 +432,7 @@ mod tests {
     use crate::protocol::context::Exchange;
     use crate::protocol::types::ChannelQuery;
     use crate::transport::TransportValidationError;
+    use crate::types::SharedKey;
     use derec_proto::{Protocol, SenderKind, TransportProtocol};
 
     /// A peer-supplied `UpdateChannelInfoRequest.supported_transports` entry
@@ -454,7 +446,7 @@ mod tests {
     #[test]
     fn on_request_rejects_scheme_mismatched_transport_protocol() {
         let channel_id = ChannelId(31);
-        let shared_key = [11u8; 32];
+        let shared_key = SharedKey::new([11u8; 32]);
 
         let malicious_transport = TransportProtocol {
             uri: "ws://attacker.example/inbox".to_owned(),
@@ -470,7 +462,10 @@ mod tests {
         let result = on_request(
             &Exchange {
                 channel_id,
-                shared_key: &shared_key,
+                key: &crate::protocol::ChannelKey {
+                    epoch: 0,
+                    key: (shared_key).clone(),
+                },
                 trace_id: 0,
                 obligation: None,
             },
@@ -496,7 +491,7 @@ mod tests {
 
         run_async(async {
             let channel_id = ChannelId(41);
-            let shared_key = [7u8; 32];
+            let shared_key = SharedKey::new([7u8; 32]);
             let lf = LocalFixture {
                 own_transports: vec![TransportProtocol {
                     uri: "grpcs://me.example.com:443".to_owned(),
@@ -534,7 +529,10 @@ mod tests {
             };
             let exchange = Exchange {
                 channel_id,
-                shared_key: &shared_key,
+                key: &crate::protocol::ChannelKey {
+                    epoch: 0,
+                    key: (shared_key).clone(),
+                },
                 trace_id: 0,
                 obligation: None,
             };
@@ -550,10 +548,8 @@ mod tests {
             assert!(
                 matches!(
                     events.as_slice(),
-                    [DeRecEvent::ActionRequired {
-                        action: PendingAction::UpdateChannelInfo { .. },
-                        ..
-                    }]
+                    [DeRecEvent::ActionRequired { action, .. }]
+                        if action.kind() == crate::protocol::PendingActionKind::UpdateChannelInfo
                 ),
                 "the move must be surfaced for acceptance, not refused: {events:?}"
             );

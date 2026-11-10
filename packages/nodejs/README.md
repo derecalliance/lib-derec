@@ -78,7 +78,7 @@ const secretId = 42n;            // u64 → bigint
 const version = 1;               // u32 → number
 const sharedKey = new Uint8Array(32); // established during pairing
 
-const result = primitives.verification.request.produce(channelId, secretId, version, sharedKey);
+const result = primitives.verification.request.produce(channelId, secretId, version, sharedKey, 0);
 // result carries the encoded DeRecMessage envelope, ready to send over transport.
 ```
 
@@ -293,7 +293,7 @@ const { shares: weighted } = primitives.sharing.request.split(
 // Wrap each share into an encrypted delivery envelope.
 for (const [channelId, committedShare] of shares) {
   const envelope = primitives.sharing.request.produce(
-    channelId, version, secretId, committedShare, [], "", sharedKeys.get(channelId)!,
+    channelId, version, secretId, committedShare, [], "", sharedKeys.get(channelId)!, 0,
   );
 }
 ```
@@ -410,6 +410,7 @@ const shareRequest = primitives.recovery.request.produce(
   secretId,
   version,
   sharedKey,
+  0,                           // epoch of sharedKey
 );
 
 // Helper side: produce the response using the StoreShareRequest it persisted
@@ -420,6 +421,7 @@ const shareResponse = primitives.recovery.response.produce(
   storedShareEnvelope,
   shareRequest,
   sharedKey,
+  0,                           // epoch of sharedKey
 );
 
 // Owner side: collect at least `threshold` responses and reconstruct.
@@ -473,7 +475,7 @@ configures none is named by its channel alone.
 
 The recovering device receives a `SecretRecovered` event carrying the typed
 `secret`. Pass it
-to `protocol.restore(secret, version)` — on the same `DeRecProtocol`
+to `protocol.restore(secret, version, newestVersion)` — on the same `DeRecProtocol`
 instance that ran recovery, since it is the one holding the recovery-mode
 channels `restore` unpairs — to
 commit canonical helper / replica state and wipe the throwaway recovery-mode
@@ -481,7 +483,11 @@ channels — at that point the device resumes normal operation as if the secret
 had been protected here originally.
 A helper or member with no endpoint in the recovered roster gets no channel;
 `restore` returns a `PeerNotRestored` event for it (`reason: "NoTransports"`)
-and restores the rest.
+and restores the rest. `newestVersion` is the newest version any helper
+reported in Discovery (`version` itself when that is the newest): the
+recovered secrets are recorded at it, so the next publish is
+`newestVersion + 1`. A helper ignores a version older than the newest it
+stores (`"Superseded"`).
 
 **Restore or join.** `SecretRecovered` writes nothing, so decide first. When
 `secret.replicas?.members` names live members other than the lost device, do
@@ -501,7 +507,7 @@ the lost device's role. See
 const events = await protocol.process(responseBytes);
 for (const ev of events) {
   if (ev.type === "SecretRecovered") {
-    await protocol.restore(ev.secret, recoveredVersion);
+    await protocol.restore(ev.secret, recoveredVersion, newestVersion);
   }
 }
 ```
@@ -556,7 +562,7 @@ channel names it in `channel_id`: `channel_already_paired`,
 import { primitives } from "@derec-alliance/nodejs";
 
 // Owner side: produce the verification request.
-const requestEnvelope = primitives.verification.request.produce(channelId, secretId, version, sharedKey);
+const requestEnvelope = primitives.verification.request.produce(channelId, secretId, version, sharedKey, 0);
 
 // Helper side: decrypt and extract the challenge fields.
 const req = primitives.verification.request.extract(requestEnvelope, sharedKey);
@@ -569,6 +575,7 @@ const responseEnvelope = primitives.verification.response.produce(
   req.version,
   req.nonce,
   sharedKey,
+  0,                           // epoch of sharedKey
   storedShareEnvelope
 );
 
@@ -669,6 +676,32 @@ reports a request on such a contact, or a request older than the lifetime, as
 involves both parties, so treat an expiry as a retry and ask the user to scan
 or share a fresh contact. Keep the scanner's `expired_channels` timeout at
 least `pairing_secs` plus the time a response takes to arrive.
+
+### Key rotation
+
+With `withKeyRotation(true)`, the owner advances each helper channel's key one epoch in every sharing round that reaches the threshold (a round below it advances none), and the replica group channel's key on every publish to replicas. Each step is K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" || be32(e+1)). Rotation is off by default, and off keeps the channel on its current key. The envelope's `sequence` carries the epoch, and peers follow on their own, so the setting is the owner's alone (`key_rotation` in a config). A message under an epoch whose key the device cannot obtain is ignored as `MessageIgnored` with `reason: "KeyUnavailable"`. A device keeps its newest key and the key of every secret version it still stores, so any kept version restores. The key ring is stored as a secret of kind `3` (`KeyRing`): persist its bytes as given, with any length, beside the kind-`0` shared key. Forward secrecy covers a compromised helper device, or a key alone, plus recorded traffic, and only for epochs older than the oldest key held; the owner and replica devices hold the plaintext secret and the keys of every version they store. A 0.0.x peer cannot follow a rotated channel: it must upgrade and re-pair.
+
+#### Primitives on a rotated channel
+
+`DeRecProtocol` tracks epochs for you. A caller driving the protocol through
+`primitives.*` does it by hand:
+
+- Every channel-encrypted `produce` (discovery, recovery, sharing, unpairing
+  and verification, request and response) takes `epoch` right after
+  `shared_key`: the epoch of that key in the channel's key chain, stamped into
+  the envelope's `sequence`. It is `0` for a freshly paired channel. Pairing
+  envelopes are always epoch `0`.
+- `extract` takes the key alone. To receive, read the epoch with
+  `envelope.read_sequence(bytes)`, use the key you hold at that epoch or derive
+  it with `channel_key.derive(key, epoch, toEpoch)`, then `extract`.
+- `channel_key.derive` runs forward only and at most 512 epochs per call; a
+  `toEpoch` below `epoch` or more than 512 above it throws `invalid_input`.
+
+```ts
+const epoch = envelope.read_sequence(bytes);
+const key = channel_key.derive(k0, 0, epoch);
+const { request } = primitives.verification.request.extract(bytes, key);
+```
 
 ---
 
@@ -829,6 +862,12 @@ Resolve each token once. The library is stateless, so rejecting the same
 token twice, or rejecting an action already accepted, sends a second
 response.
 
+Hand the token back exactly as you received it. It is sealed to its channel,
+so `accept` and `reject` refuse one that was edited, rebuilt or moved to
+another channel with a `DeRecError` whose `code` is `"invalid_input"`, and
+nothing is stored or sent. A token raised under a channel key the device no longer holds, because the channel has moved on and no stored version keeps that key, is too late to answer and is refused the same way. A token issued by v0.0.10 does not decode
+(`"decode_error"`).
+
 `withAutoRespondOnFailure` decides who answers. With it on, the library sends
 the response itself (a known failure keeps its specific status; anything else
 is `FAIL` with a generic memo). With it off (the default), nothing is sent and
@@ -870,6 +909,9 @@ Two cross-cutting metadata fields appear on every channel-mode exchange:
   end-to-end (random token on every outbound request, echo on every
   response). Primitive-only callers can manipulate it directly via
   `envelope.apply_trace_id(bytes, traceId)` and `envelope.read_trace_id(bytes)`.
+- **`sequence`** — the epoch of the channel key that encrypted the envelope,
+  read with `envelope.read_sequence(bytes)`. See
+  [Primitives on a rotated channel](#primitives-on-a-rotated-channel).
 - **`replyTo`** — optional `TransportProtocol` list on request bodies, telling
   the responder to route this exchange's response to alternate endpoints.
   Set it per call (every `primitives.*.request.produce` takes a trailing
@@ -1021,6 +1063,7 @@ The canonical JSON, shared by every SDK, is:
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
   "auto_accept": { "pairing": true, "store_share": true },
   "auto_respond_on_failure": false,
+  "key_rotation": false,
   "auto_reply_to": false,
   "unpair_ack": "required",
   "unsafe_connection": false,

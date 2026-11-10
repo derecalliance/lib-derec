@@ -14,7 +14,6 @@ internal static class Program
     private static void Main()
     {
         Primitives.RunAll();
-        TransportAdapters.RunAll();
         ChannelFilterConformance.RunAll();
         EventGolden.RunAll();
         Protocol.RunAll();

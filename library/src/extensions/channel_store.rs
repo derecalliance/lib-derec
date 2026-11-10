@@ -22,7 +22,7 @@ use crate::{
         ChannelQuery, ChannelStatus, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember,
         Target,
     },
-    types::{ChannelId, ReplicaId, SharedKey},
+    types::{ChannelId, ReplicaId},
 };
 use derec_proto::{MessageBody, SenderKind, StatusEnum, TransportProtocol};
 use prost::Message;
@@ -94,6 +94,44 @@ pub(crate) trait ChannelStoreExt: DeRecChannelStore {
         }))
     }
 
+    /// The helper channel record stored under `channel_id`, if any.
+    ///
+    /// A record of another kind under that key reads as none: the protocol
+    /// acts on helper fields, and a store that answered a helper query with
+    /// a replica row must not be mistaken for one that holds the helper.
+    async fn load_helper(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> Result<Option<HelperChannel>> {
+        Ok(self
+            .load(secret_id, ChannelQuery::Helper { channel_id })
+            .await?
+            .and_then(|record| record.as_helper().cloned()))
+    }
+
+    /// The replica-group members recorded on `channel_id` that match
+    /// `filter`.
+    ///
+    /// Members of one `secret_id` are not all on one channel: a pairing mints
+    /// a fresh channel for the joiner, and its row stays there, under its own
+    /// key, until it joins the group's. So asking who is on a given channel
+    /// narrows by it after [`Self::replicas_matching`], which the store-facing
+    /// [`ReplicaFilter`] cannot express.
+    async fn replicas_on_channel(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        filter: ReplicaFilter,
+    ) -> Result<Vec<ReplicaMember>> {
+        Ok(self
+            .replicas_matching(secret_id, filter)
+            .await?
+            .into_iter()
+            .filter(|member| member.channel_id == channel_id)
+            .collect())
+    }
+
     /// Refuse a message whose sender does not hold `expected` on every one
     /// of `channel_ids`.
     ///
@@ -106,18 +144,12 @@ pub(crate) trait ChannelStoreExt: DeRecChannelStore {
         expected: SenderKind,
     ) -> Result<()> {
         for channel_id in channel_ids {
-            let channel = self
-                .load(
-                    secret_id,
-                    ChannelQuery::Helper {
-                        channel_id: *channel_id,
-                    },
-                )
-                .await?
-                .and_then(|r| r.as_helper().cloned())
-                .ok_or(Error::InvalidInput(
-                    "channel id not present in channel store",
-                ))?;
+            let channel =
+                self.load_helper(secret_id, *channel_id)
+                    .await?
+                    .ok_or(Error::InvalidInput(
+                        "channel id not present in channel store",
+                    ))?;
             if channel.peer_role != expected {
                 return Err(Error::RoleMismatch {
                     channel_id: *channel_id,
@@ -286,7 +318,7 @@ pub(crate) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
     secret_id: u64,
     channel_id: ChannelId,
     mut body: MessageBody,
-    shared_key: &SharedKey,
+    key: &crate::protocol::ChannelKey,
     inbound_trace_id: u64,
     policy: TransportPolicy,
     reply_to: &[TransportProtocol],
@@ -303,7 +335,7 @@ pub(crate) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
         .timestamp(timestamp)
         .message_body(body)
         .trace_id(inbound_trace_id)
-        .encrypt(shared_key)?
+        .encrypt(key)?
         .build()?;
 
     let wire_bytes = envelope.encode_to_vec();
@@ -378,6 +410,13 @@ mod defiant_store_tests {
         }
         fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
             self.0.remove(secret_id, query)
+        }
+        fn remove_many(
+            &mut self,
+            secret_id: u64,
+            queries: &[ChannelQuery],
+        ) -> ChannelStoreFuture<'_, ()> {
+            self.0.remove_many(secret_id, queries)
         }
         fn helpers(
             &self,
@@ -567,14 +606,16 @@ mod send_channel_message_tests {
     use crate::derec_message::extract_inner_message;
     use crate::extensions::derec_result::DeRecResultExt as _;
     use crate::extensions::message_body::MessageBodyExt as _;
+    use crate::protocol::ChannelKey;
     use crate::protocol::tests::{InMemChannelStore, RecordingTransport, run_async};
     use crate::protocol::types::{ChannelRecord, HelperChannel};
+    use crate::types::SharedKey;
     use derec_proto::{DeRecMessage, DeRecResult, Protocol, UpdateChannelInfoResponseMessage};
     use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0x5E4D;
     const CHANNEL: ChannelId = ChannelId(77);
-    const KEY: SharedKey = [3u8; 32];
+    const KEY: SharedKey = SharedKey::new([3u8; 32]);
 
     /// The body arrives here already carrying a timestamp of its own; the
     /// envelope and the body must leave with one value, the send time.
@@ -616,7 +657,7 @@ mod send_channel_message_tests {
                 SECRET_ID,
                 CHANNEL,
                 body,
-                &KEY,
+                &ChannelKey { epoch: 0, key: KEY },
                 0,
                 TransportPolicy::new(false),
                 &[],
@@ -633,6 +674,64 @@ mod send_channel_message_tests {
             let inner = extract_inner_message(&envelope.message, &KEY).expect("decrypt");
             assert!(envelope.timestamp.is_some());
             assert_eq!(envelope.timestamp.as_ref(), inner.timestamp());
+        });
+    }
+
+    /// The envelope's `sequence` is the epoch of the key the body is
+    /// encrypted under, and that key opens it.
+    #[test]
+    fn send_channel_message_stamps_the_key_epoch() {
+        run_async(async {
+            let mut channels = InMemChannelStore::default();
+            channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Helper(HelperChannel {
+                        channel_id: CHANNEL,
+                        transports: vec![TransportProtocol {
+                            uri: "https://peer.example".to_owned(),
+                            protocol: derec_proto::Protocol::Https as i32,
+                        }],
+                        communication_info: std::collections::HashMap::new(),
+                        peer_role: SenderKind::Owner,
+                        status: ChannelStatus::Paired,
+                        created_at: 0,
+                        weight: 1,
+                    }),
+                )
+                .await
+                .expect("seed channel");
+            let transport = RecordingTransport::default();
+            let key = ChannelKey { epoch: 3, key: KEY };
+            let body = MessageBody::UpdateChannelInfoResponse(
+                derec_proto::UpdateChannelInfoResponseMessage {
+                    result: Some(derec_proto::DeRecResult::ok()),
+                    timestamp: None,
+                },
+            );
+
+            send_channel_message(
+                &channels,
+                &transport,
+                SECRET_ID,
+                CHANNEL,
+                body,
+                &key,
+                0,
+                TransportPolicy::new(false),
+                &[],
+                None,
+                derec_proto::StatusEnum::Ok,
+                "",
+            )
+            .await
+            .expect("send");
+
+            let sent = transport.sent_envelopes();
+            let envelope = derec_proto::DeRecMessage::decode(sent[0].as_slice()).expect("decode");
+            assert_eq!(envelope.sequence, 3);
+            crate::derec_message::extract_inner_message(&envelope.message, &key.key)
+                .expect("the epoch-3 key opens the envelope");
         });
     }
 }

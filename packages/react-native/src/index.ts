@@ -3,5 +3,5 @@
 
 export * from './types';
 export * from './errors';
-export { primitives, envelope } from './primitives';
+export { primitives, envelope, channel_key } from './primitives';
 export { DeRecProtocol, DeRecProtocolBuilder } from './protocol';

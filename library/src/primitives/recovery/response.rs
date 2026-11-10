@@ -24,7 +24,7 @@ use crate::utils::verify_timestamps;
 use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
-    types::{ChannelId, SharedKey},
+    types::{ChannelId, ChannelKey, SharedKey},
 };
 use derec_cryptography::vss;
 use derec_proto::{
@@ -67,8 +67,9 @@ pub struct RecoverResult {
 ///   from the recovery request envelope.
 /// * `stored_request` - The decoded [`derec_proto::StoreShareRequestMessage`] previously
 ///   stored by this Helper during the sharing flow.
-/// * `shared_key` - Previously established 32-byte symmetric channel key used to encrypt
-///   the response.
+/// * `channel_key` - The channel key and its epoch. The payload is encrypted
+///   under the key and the envelope's `sequence` carries the epoch, so the
+///   receiver can pick the key that opens it; see [`crate::types::ChannelKey`].
 ///
 /// # Returns
 ///
@@ -99,7 +100,8 @@ pub struct RecoverResult {
 /// use derec_library::types::ChannelId;
 ///
 /// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 /// let channel_id = ChannelId(1);
 ///
 /// // Sharing flow: produce a stored share that the Helper retains for recovery.
@@ -108,20 +110,20 @@ pub struct RecoverResult {
 ///         .expect("split failed");
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 /// let sharing::request::ProduceResult { envelope: share_envelope } =
-///     sharing::request::produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
+///     sharing::request::produce(channel_id, 1, 1, committed_share, 0, "", &channel_key, &[])
 ///         .expect("share produce failed");
 /// let sharing::request::ExtractResult { request: stored_share_request } =
 ///     sharing::request::extract(&share_envelope, &shared_key).expect("share extract failed");
 ///
 /// // Recovery flow: Owner asks for the share back, Helper answers.
 /// let recovery::request::ProduceResult { envelope: req_envelope } =
-///     recovery::request::produce(channel_id, 1, 1, &shared_key, &[]).expect("recovery request failed");
+///     recovery::request::produce(channel_id, 1, 1, &channel_key, &[]).expect("recovery request failed");
 /// let recovery::request::ExtractResult { request: get_share_request } =
 ///     recovery::request::extract(&req_envelope, &shared_key)
 ///         .expect("recovery request extract failed");
 ///
 /// let recovery::response::ProduceResult { envelope } =
-///     recovery::response::produce(channel_id, &get_share_request, &stored_share_request, &shared_key)
+///     recovery::response::produce(channel_id, &get_share_request, &stored_share_request, &channel_key)
 ///         .expect("recovery response failed");
 ///
 /// assert!(!envelope.is_empty());
@@ -134,7 +136,7 @@ pub fn produce(
     channel_id: ChannelId,
     request: &GetShareRequestMessage,
     stored_request: &StoreShareRequestMessage,
-    shared_key: &SharedKey,
+    channel_key: &ChannelKey,
 ) -> Result<ProduceResult, Error> {
     let (_, derec_share) = read_committed_share(&stored_request.share)?;
     derec_share.validate(request.secret_id, request.version)?;
@@ -155,7 +157,7 @@ pub fn produce(
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::GetShareResponse(message))
-        .encrypt(shared_key)?
+        .encrypt(channel_key)?
         .build()?
         .encode_to_vec();
 
@@ -221,7 +223,8 @@ pub fn produce(
 /// use derec_library::types::ChannelId;
 ///
 /// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 /// let channel_id = ChannelId(1);
 ///
 /// // Sharing flow: produce a stored share that the Helper retains for recovery.
@@ -230,19 +233,19 @@ pub fn produce(
 ///         .expect("split failed");
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 /// let sharing::request::ProduceResult { envelope: share_envelope } =
-///     sharing::request::produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
+///     sharing::request::produce(channel_id, 1, 1, committed_share, 0, "", &channel_key, &[])
 ///         .expect("share produce failed");
 /// let sharing::request::ExtractResult { request: stored_share_request } =
 ///     sharing::request::extract(&share_envelope, &shared_key).expect("share extract failed");
 ///
 /// // Recovery flow: Owner asks for the share back, Helper answers, Owner extracts.
 /// let recovery::request::ProduceResult { envelope: req_envelope } =
-///     recovery::request::produce(channel_id, 1, 1, &shared_key, &[]).expect("recovery request failed");
+///     recovery::request::produce(channel_id, 1, 1, &channel_key, &[]).expect("recovery request failed");
 /// let recovery::request::ExtractResult { request: get_share_request } =
 ///     recovery::request::extract(&req_envelope, &shared_key)
 ///         .expect("recovery request extract failed");
 /// let recovery::response::ProduceResult { envelope: resp_envelope } =
-///     recovery::response::produce(channel_id, &get_share_request, &stored_share_request, &shared_key)
+///     recovery::response::produce(channel_id, &get_share_request, &stored_share_request, &channel_key)
 ///         .expect("recovery response failed");
 ///
 /// let recovery::response::ExtractResult { response } =
@@ -333,7 +336,8 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractR
 /// use derec_library::types::ChannelId;
 ///
 /// let channels = [(ChannelId(1), 1), (ChannelId(2), 1), (ChannelId(3), 1)];
-/// let shared_key = [42u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([42u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 /// let secret_data = b"super_secret_value";
 ///
 /// // Sharing flow: store one share per Helper for later recovery.
@@ -345,7 +349,7 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractR
 /// for &(channel_id, _) in &channels[..2] {
 ///     let committed_share = shares.get(&channel_id).expect("missing share");
 ///     let sharing::request::ProduceResult { envelope } =
-///         sharing::request::produce(channel_id, 1, 1, committed_share, 0, "", &shared_key, &[])
+///         sharing::request::produce(channel_id, 1, 1, committed_share, 0, "", &channel_key, &[])
 ///             .expect("share produce failed");
 ///     let sharing::request::ExtractResult { request } =
 ///         sharing::request::extract(&envelope, &shared_key).expect("share extract failed");
@@ -356,13 +360,13 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractR
 /// let mut responses = Vec::new();
 /// for (channel_id, stored_share_request) in &stored_shares {
 ///     let recovery::request::ProduceResult { envelope: req_env } =
-///         recovery::request::produce(*channel_id, 1, 1, &shared_key, &[])
+///         recovery::request::produce(*channel_id, 1, 1, &channel_key, &[])
 ///             .expect("recovery request failed");
 ///     let recovery::request::ExtractResult { request: get_share_req } =
 ///         recovery::request::extract(&req_env, &shared_key)
 ///             .expect("recovery request extract failed");
 ///     let recovery::response::ProduceResult { envelope: resp_env } =
-///         recovery::response::produce(*channel_id, &get_share_req, stored_share_request, &shared_key)
+///         recovery::response::produce(*channel_id, &get_share_req, stored_share_request, &channel_key)
 ///             .expect("recovery response failed");
 ///     let recovery::response::ExtractResult { response } =
 ///         recovery::response::extract(&resp_env, &shared_key)

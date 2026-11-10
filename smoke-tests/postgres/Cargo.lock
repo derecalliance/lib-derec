@@ -285,6 +285,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -507,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "derec-cryptography"
-version = "0.0.11"
+version = "1.0.0-alpha.1"
 dependencies = [
  "aead",
  "aes",
@@ -528,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "derec-library"
-version = "0.0.11"
+version = "1.0.0-alpha.1"
 dependencies = [
  "ark-serialize",
  "base64 0.22.1",
@@ -537,6 +538,7 @@ dependencies = [
  "derec-proto",
  "flate2",
  "getrandom",
+ "hmac",
  "js-sys",
  "prost",
  "prost-types",
@@ -569,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "derec-proto"
-version = "0.0.11"
+version = "1.0.0-alpha.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -596,6 +598,7 @@ dependencies = [
  "const-oid",
  "crypto-common 0.2.2",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]

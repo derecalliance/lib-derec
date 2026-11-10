@@ -57,6 +57,7 @@ internal static class Recovery
         uint version,
         byte[] sharedKey,
         UIntPtr sharedKeyLen,
+        uint epoch,
         byte[]? replyTo,
         UIntPtr replyToLen
     );
@@ -77,7 +78,8 @@ internal static class Recovery
         byte[] storedShareProtoBytes,
         UIntPtr storedShareProtoBytesLen,
         byte[] sharedKey,
-        UIntPtr sharedKeyLen
+        UIntPtr sharedKeyLen,
+        uint epoch
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

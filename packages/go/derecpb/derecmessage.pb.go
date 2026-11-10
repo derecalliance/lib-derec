@@ -52,7 +52,7 @@ const (
 // A DeRecMessage provides:
 //
 // - protocol versioning information for compatibility handling
-// - a per-channel sequence number for ordering and duplicate detection
+// - the epoch of the channel key the payload is encrypted under
 // - channel identification for routing and key selection
 // - a timestamp for replay protection and observability
 // - an encrypted payload containing exactly one protocol message
@@ -71,18 +71,16 @@ const (
 // which is push: a response is a separate delivery to the requester's own
 // endpoint, not a return value on the delivery that carried the request.
 //
-// The `sequence` field is intended to:
+// The `sequence` field carries the epoch of the channel key the payload is
+// encrypted under; it is not a message counter. A pairing envelope uses 0, and
+// so does every channel envelope until the channel's key rotates. The
+// receiver selects the key by this value, which is outside the encryption: a
+// tampered value selects the wrong key and the payload does not decrypt.
 //
-// - enforce message ordering
-// - detect duplicates or out-of-order delivery
-// - support replay protection
-//
-// These semantics are not implemented by this library: a sender may set
-// `sequence`, but it is not checked on receipt. An envelope older than the
-// receiver's configured inbound-message window is discarded. After
-// decryption the receiver also checks that `envelope.timestamp` equals the
-// inner message's `timestamp`, and discards the message if they differ or
-// either is absent.
+// An envelope older than the receiver's configured inbound-message window is
+// discarded. After decryption the receiver also checks that
+// `envelope.timestamp` equals the inner message's `timestamp`, and discards
+// the message if they differ or either is absent.
 //
 // Within the window, detecting a message delivered more than once is the
 // receiving application's transport layer's job. Both ends of a channel
@@ -105,10 +103,17 @@ const (
 //
 // # Key Rotation
 //
-// The sequence number is intended as a trigger for automatic key rotation:
-// when a configured threshold is reached, implementations MAY initiate a key
-// rotation flow to maintain forward secrecy. This library does not implement
-// sequence-triggered key rotation.
+// The channel key is a chain K0, K1, K2, ... where K0 is the key pairing
+// established and K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" ||
+// be32(e+1)). The Owner advances each Helper channel one epoch in every
+// sharing round that reaches the threshold (a round below it advances none),
+// and the replica group channel one epoch on every publish to replicas. The
+// Helper only follows, by deriving forward from a key it holds when a
+// message arrives under a newer epoch. A receiver derives at most 512 steps
+// from a key it holds, so a forged epoch cannot cause unbounded work, and a
+// message under an epoch it cannot reach is ignored. A party keeps its newest
+// key and the key of every epoch a stored secret version travelled under, and
+// nothing else.
 //
 // # Versioning
 //
@@ -138,21 +143,16 @@ type DeRecMessage struct {
 	// Incremented for backward-compatible changes such as adding new fields
 	// or message types.
 	ProtocolVersionMinor uint32 `protobuf:"varint,2,opt,name=protocolVersionMinor,proto3" json:"protocolVersionMinor,omitempty"`
-	// Monotonically increasing message sequence number.
+	// Epoch of the channel key the payload is encrypted under.
 	//
-	// This value is intended to increment by 1 for each message sent on a
-	// given channel, and to be used to:
+	// The channel key starts at epoch 0, the key pairing established, and
+	// advances one epoch each time the Owner rotates it. A pairing envelope
+	// carries 0. The receiver selects the decryption key by this value, so it
+	// is not a message counter and does not order, deduplicate or replay-protect
+	// messages; replay protection relies on `timestamp`.
 	//
-	// - enforce ordering
-	// - detect duplicates or missing messages
-	// - support replay protection
-	//
-	// Implementations MAY also use this value to trigger automatic key rotation
-	// once a predefined threshold is reached.
-	//
-	// Not yet implemented by this library: a sender may set this field, but it
-	// is not checked on receipt, and it does not trigger key rotation. Replay
-	// protection currently relies on `timestamp`.
+	// This field is outside the encryption. A tampered value selects the wrong
+	// key and the payload does not decrypt.
 	Sequence uint32 `protobuf:"varint,3,opt,name=sequence,proto3" json:"sequence,omitempty"`
 	// Channel identifier associated with this communication session.
 	//

@@ -47,6 +47,7 @@ func TestIgnoreReasonConstantsMatchTheFixture(t *testing.T) {
 		IgnoreReasonTimestampMismatch:   true,
 		IgnoreReasonStaleResponse:       true,
 		IgnoreReasonSuperseded:          true,
+		IgnoreReasonKeyUnavailable:      true,
 	}
 	variants := reasons.Variants
 	for _, v := range variants {

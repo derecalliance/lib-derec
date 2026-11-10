@@ -5,7 +5,7 @@ use crate::extensions::request_message::RequestMessageExt as _;
 use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
-    types::{ChannelId, SharedKey},
+    types::{ChannelId, ChannelKey, SharedKey},
     utils::{random_u64, verify_timestamps},
 };
 use derec_proto::{DeRecMessage, MessageBody, TransportProtocol, VerifyShareRequestMessage};
@@ -76,8 +76,9 @@ pub struct ExtractResult {
 ///   the request.
 /// * `version` - Distribution version to embed in the request. The responder is expected to
 ///   echo this value in the response.
-/// * `shared_key` - Previously established 32-byte symmetric channel key used to encrypt the
-///   inner verification request.
+/// * `channel_key` - The channel key and its epoch. The payload is encrypted
+///   under the key and the envelope's `sequence` carries the epoch, so the
+///   receiver can pick the key that opens it; see [`crate::types::ChannelKey`].
 ///
 /// # Returns
 ///
@@ -105,13 +106,14 @@ pub struct ExtractResult {
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key);
 ///
 /// let result = request::produce(
 ///     channel_id,
 ///     1,
 ///     7,
-///     &shared_key,
+///     &channel_key,
 ///     &[],
 /// )
 /// .expect("failed to build verification request");
@@ -126,7 +128,7 @@ pub fn produce(
     channel_id: ChannelId,
     secret_id: u64,
     version: u32,
-    shared_key: &SharedKey,
+    channel_key: &ChannelKey,
     reply_to: &[TransportProtocol],
 ) -> Result<ProduceResult, Error> {
     let timestamp = current_timestamp();
@@ -145,7 +147,7 @@ pub fn produce(
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::VerifyShareRequest(message))
-        .encrypt(shared_key)?
+        .encrypt(channel_key)?
         .build()?
         .encode_to_vec();
 
@@ -205,9 +207,10 @@ pub fn produce(
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 ///
-/// let request::ProduceResult { envelope, .. } = request::produce(channel_id, 1, 7, &shared_key, &[])
+/// let request::ProduceResult { envelope, .. } = request::produce(channel_id, 1, 7, &channel_key, &[])
 ///     .expect("failed to build verification request");
 ///
 /// let request::ExtractResult { request } = request::extract(&envelope, &shared_key)

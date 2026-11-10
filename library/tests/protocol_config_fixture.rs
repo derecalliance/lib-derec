@@ -42,6 +42,7 @@ fn full_fixture_sets_every_field() {
         parameter_range,
         auto_accept,
         auto_respond_on_failure,
+        key_rotation,
         auto_reply_to,
         unpair_ack,
         unsafe_connection,
@@ -86,6 +87,7 @@ fn full_fixture_sets_every_field() {
         })
     );
     assert_eq!(auto_respond_on_failure, Some(true));
+    assert_eq!(key_rotation, Some(true));
     assert_eq!(auto_reply_to, Some(true));
     assert_eq!(unpair_ack, Some(UnpairAck::NotRequired));
     assert_eq!(unsafe_connection, Some(false));

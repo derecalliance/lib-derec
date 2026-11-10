@@ -98,6 +98,7 @@ fn secret_kind_fixture_is_complete() {
         SecretKind::SharedKey,
         SecretKind::PairingSecret,
         SecretKind::PairingContact,
+        SecretKind::KeyRing,
     ];
     let names: Vec<&str> = all
         .iter()
@@ -105,6 +106,7 @@ fn secret_kind_fixture_is_complete() {
             SecretKind::SharedKey => "SharedKey",
             SecretKind::PairingSecret => "PairingSecret",
             SecretKind::PairingContact => "PairingContact",
+            SecretKind::KeyRing => "KeyRing",
         })
         .collect();
     assert_matches_fixture("SecretKind", &names);
@@ -172,6 +174,7 @@ fn ignore_reason_fixture_is_complete() {
         IgnoreReason::TimestampMismatch,
         IgnoreReason::StaleResponse,
         IgnoreReason::Superseded,
+        IgnoreReason::KeyUnavailable,
     ];
     let names: Vec<&str> = all
         .iter()
@@ -181,6 +184,7 @@ fn ignore_reason_fixture_is_complete() {
             IgnoreReason::TimestampMismatch => "TimestampMismatch",
             IgnoreReason::StaleResponse => "StaleResponse",
             IgnoreReason::Superseded => "Superseded",
+            IgnoreReason::KeyUnavailable => "KeyUnavailable",
         })
         .collect();
     assert_matches_fixture("IgnoreReason", &names);
@@ -331,6 +335,7 @@ fn numeric_discriminants_match_the_fixture() {
         ("SharedKey", SecretKind::SharedKey),
         ("PairingSecret", SecretKind::PairingSecret),
         ("PairingContact", SecretKind::PairingContact),
+        ("KeyRing", SecretKind::KeyRing),
     ] {
         assert_eq!(wire("SecretKind", name), kind as i64, "SecretKind::{name}");
     }

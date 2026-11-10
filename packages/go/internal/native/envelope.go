@@ -19,6 +19,11 @@ type readTraceIdResult struct {
 	TraceID uint64
 }
 
+type readSequenceResult struct {
+	Error    DeRecError
+	Sequence uint32
+}
+
 type messageIdResult struct {
 	Error     DeRecError
 	ID        DeRecBuffer
@@ -31,6 +36,9 @@ var (
 
 	readTraceIDOnce sync.Once
 	readTraceIDFn   func(envelope *byte, envelopeLen uintptr) readTraceIdResult
+
+	readSequenceOnce sync.Once
+	readSequenceFn   func(envelope *byte, envelopeLen uintptr) readSequenceResult
 
 	messageIDOnce sync.Once
 	messageIDFn   func(envelope *byte, envelopeLen uintptr) messageIdResult
@@ -56,6 +64,17 @@ func ReadTraceIDFromEnvelope(envelope []byte) (uint64, error) {
 		return 0, err
 	}
 	return res.TraceID, nil
+}
+
+func ReadSequenceFromEnvelope(envelope []byte) (uint32, error) {
+	readSequenceOnce.Do(func() {
+		purego.RegisterFunc(&readSequenceFn, symbol("read_sequence_from_envelope"))
+	})
+	res := readSequenceFn(bytePtr(envelope), uintptr(len(envelope)))
+	if err := errorFrom(res.Error); err != nil {
+		return 0, err
+	}
+	return res.Sequence, nil
 }
 
 func MessageIDFromEnvelope(envelope []byte) ([]byte, uint64, error) {

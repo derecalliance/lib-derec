@@ -11,8 +11,9 @@ namespace DeRec.Library;
 ///
 /// The outer <c>DeRecMessage</c> envelope is plaintext, so a handful of
 /// metadata fields can be read or rewritten in-place: <c>traceId</c>, the
-/// opaque correlation token described on <c>DeRecMessage.traceId</c>, and the
-/// message identity replay detection keys on.
+/// opaque correlation token described on <c>DeRecMessage.traceId</c>;
+/// <c>sequence</c>, the epoch of the channel key that encrypted the envelope;
+/// and the message identity replay detection keys on.
 /// </summary>
 public static class Envelope
 {
@@ -115,6 +116,40 @@ public static class Envelope
 
         Utils.ThrowIfError(nativeResult.Error);
         return nativeResult.TraceId;
+    }
+
+    /// <summary>
+    /// Read <c>sequence</c> off an envelope without touching the encrypted
+    /// inner payload: the epoch of the channel key that encrypted it. A caller
+    /// using primitives directly reads it to pick the key to extract with,
+    /// deriving it forward with <see cref="ChannelKey.Derive(byte[], uint, uint)"/>
+    /// when the epoch is newer than the key it holds.
+    /// </summary>
+    /// <param name="envelope">Wire bytes of a <c>DeRecMessage</c> envelope.</param>
+    /// <returns>The epoch of the channel key that encrypted the envelope.</returns>
+    /// <exception cref="DeRecException">Thrown if the envelope cannot be decoded.</exception>
+    public static uint ReadSequence(byte[] envelope)
+    {
+        ArgumentNullException.ThrowIfNull(envelope);
+
+        Native.Envelope.ReadSequenceResult nativeResult =
+            Native.Envelope.read_sequence_from_envelope(
+                envelope,
+                (UIntPtr)envelope.Length
+            );
+
+        Utils.ThrowIfError(nativeResult.Error);
+        return nativeResult.Sequence;
+    }
+
+    /// <summary>
+    /// Convenience overload of <see cref="ReadSequence(byte[])"/> that accepts
+    /// a typed <see cref="DeRecMessage"/>.
+    /// </summary>
+    public static uint ReadSequence(DeRecMessage envelope)
+    {
+        ArgumentNullException.ThrowIfNull(envelope);
+        return ReadSequence(envelope.ToProtoBytes());
     }
 
     /// <summary>

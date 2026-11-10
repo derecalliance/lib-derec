@@ -6,7 +6,7 @@ use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     primitives::discovery::DiscoveryError,
-    types::{ChannelId, SharedKey},
+    types::{ChannelId, ChannelKey, SharedKey},
     utils::verify_timestamps,
 };
 use derec_proto::{
@@ -123,8 +123,9 @@ pub struct ProcessResult {
 ///   [`SecretVersionEntry`] carries a `secret_id` and a list of [`VersionEntry`]
 ///   values where each entry pairs a version number with its human-readable
 ///   description.
-/// * `shared_key` - Previously established 32-byte symmetric channel key used to
-///   encrypt the response.
+/// * `channel_key` - The channel key and its epoch. The payload is encrypted
+///   under the key and the envelope's `sequence` carries the epoch, so the
+///   receiver can pick the key that opens it; see [`crate::types::ChannelKey`].
 ///
 /// # Returns
 ///
@@ -156,7 +157,8 @@ pub struct ProcessResult {
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 ///
 /// let secret_list = vec![
 ///     SecretVersionEntry {
@@ -165,7 +167,7 @@ pub struct ProcessResult {
 ///     },
 /// ];
 ///
-/// let result = response::produce(channel_id, &secret_list, &shared_key)
+/// let result = response::produce(channel_id, &secret_list, &channel_key)
 ///     .expect("failed to build discovery response");
 ///
 /// assert!(!result.envelope.is_empty());
@@ -177,7 +179,7 @@ pub struct ProcessResult {
 pub fn produce(
     channel_id: ChannelId,
     secret_list: &[SecretVersionEntry],
-    shared_key: &SharedKey,
+    channel_key: &ChannelKey,
 ) -> Result<ProduceResult, Error> {
     let timestamp = current_timestamp();
 
@@ -194,7 +196,7 @@ pub fn produce(
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::GetSecretIdsVersionsResponse(message))
-        .encrypt(shared_key)?
+        .encrypt(channel_key)?
         .build()?
         .encode_to_vec();
 
@@ -259,7 +261,8 @@ pub fn produce(
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 ///
 /// let secret_list = vec![SecretVersionEntry {
 ///     secret_id: 1,
@@ -267,7 +270,7 @@ pub fn produce(
 /// }];
 ///
 /// let response::ProduceResult { envelope } =
-///     response::produce(channel_id, &secret_list, &shared_key)
+///     response::produce(channel_id, &secret_list, &channel_key)
 ///         .expect("failed to build discovery response");
 ///
 /// let response::ExtractResult { response } =
@@ -344,7 +347,8 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractR
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 ///
 /// let secret_list = vec![SecretVersionEntry {
 ///     secret_id: 1,
@@ -353,7 +357,7 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractR
 ///
 /// // Helper → Owner roundtrip.
 /// let response::ProduceResult { envelope } =
-///     response::produce(channel_id, &secret_list, &shared_key).expect("produce failed");
+///     response::produce(channel_id, &secret_list, &channel_key).expect("produce failed");
 /// let response::ExtractResult { response: resp } =
 ///     response::extract(&envelope, &shared_key).expect("extract failed");
 ///

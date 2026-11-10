@@ -375,12 +375,25 @@ foreach (var (channelId, committedShare) in shares)
         committedShare,
         keepVersion: 0,
         description: string.Empty,
-        sharedKey: sharedKeys[channelId]);
+        sharedKey: sharedKeys[channelId],
+        epoch: 0);
 
     // Send envelope.Envelope over your transport. The helper extracts and
     // produces an acknowledgement; the owner extracts and processes it.
 }
 ```
+
+Every channel `Produce` (sharing, verification, recovery, discovery, unpairing; request and response) takes `epoch` right after the shared key: the epoch of that key in the channel's key chain, stamped into the envelope's `sequence`. Pass `0` for a freshly paired channel.
+
+To receive on a channel that may have rotated, read the sequence, hold or derive the key at that epoch, then extract:
+
+```csharp
+uint sequence = Envelope.ReadSequence(envelope);              // epoch of the key that encrypted it
+byte[] key = ChannelKey.Derive(heldKey, heldEpoch, sequence); // skip when you already hold the key at sequence
+var req = Verification.Request.Extract(envelope, key);
+```
+
+`ChannelKey.Derive` only moves forward and is bounded at 512 steps per call; a target below `epoch` or further than 512 above it throws a `DeRecException` with `DeRecCode.InvalidInput`. `Extract` always takes the bare 32-byte key.
 
 ---
 
@@ -398,7 +411,7 @@ uint version = 1;
 
 // Owner side: produce the verification request.
 DeRecMessage requestEnvelope =
-    Verification.Request.Produce(channelId, secretId, version, sharedKey);
+    Verification.Request.Produce(channelId, secretId, version, sharedKey, epoch: 0);
 
 // Helper side: extract and produce the proof response.
 var req = Verification.Request.Extract(requestEnvelope, sharedKey);
@@ -406,6 +419,7 @@ DeRecMessage responseEnvelope = Verification.Response.Produce(
     channelId,
     req.RequestProtoBytes,
     sharedKey,
+    epoch: 0,
     shareContent: storedShare);
 
 // Owner side: extract and verify the SHA-384 proof.
@@ -428,7 +442,7 @@ ulong secretId = 42;
 uint version = 1;
 
 // Owner side: produce one GetShareRequest per paired helper channel.
-DeRecMessage shareRequest = Recovery.Request.Produce(channelId, secretId, version, sharedKey);
+DeRecMessage shareRequest = Recovery.Request.Produce(channelId, secretId, version, sharedKey, epoch: 0);
 
 // Helper side: extract, then produce the response using the StoreShareRequest
 // proto bytes the helper persisted at sharing time (see `extract_store_share_request`).
@@ -437,7 +451,8 @@ DeRecMessage shareResponse = Recovery.Response.Produce(
     channelId,
     helperReq.RequestProtoBytes,
     storedShareProtoBytes,
-    sharedKey);
+    sharedKey,
+    epoch: 0);
 
 // Owner side: extract each response, then reconstruct the secret from a
 // threshold-sized set.
@@ -517,15 +532,21 @@ configures none is named by its channel alone.
 
 The recovering device receives a `SecretRecoveredEvent` carrying the typed
 `Secret`. Pass it
-to `protocol.RestoreAsync(secret, version)` — on the same `DeRecProtocol`
+to `protocol.RestoreAsync(secret, version, newestVersion)` — on the same `DeRecProtocol`
 that ran recovery, since it is the one holding the recovery-mode channels
 `RestoreAsync` unpairs — to
 commit canonical helper / replica state and wipe the throwaway recovery-mode
 channels. A helper or member with no endpoint in the recovered roster gets no
 channel; `RestoreAsync` returns a `PeerNotRestoredEvent` for it (`Reason` is
-`NotRestoredReason.NoTransports`) and restores the rest. Errors throw
+`NotRestoredReason.NoTransports`) and restores the rest. `newestVersion` is
+the newest version any helper reported in Discovery (`version` itself when
+that is the newest): the recovered secrets are recorded at it, so the next
+publish is `newestVersion + 1`, since a helper ignores a version older than
+the newest it stores (`IgnoreReason.Superseded`). Errors throw
 `DeRecException` with `Code` in
-{`AlreadyRestored`, `RestoreConflict`, `Invariant`, store-category code}.
+{`AlreadyRestored`, `RestoreConflict`, `Invariant`, `InvalidInput`,
+store-category code}; `InvalidInput` means `newestVersion` is below
+`version`.
 On `RestoreConflict`, `DeRecException.ConflictingChannelIds`
 (`IReadOnlyList<ulong>`, empty for every other code) lists the existing
 channels that collide with ids in the recovered `Secret` — clear exactly
@@ -534,7 +555,7 @@ those and retry:
 ```csharp
 try
 {
-    await protocol.RestoreAsync(recovered.Secret, version);
+    await protocol.RestoreAsync(recovered.Secret, version, newestVersion);
 }
 catch (DeRecException e) when (e.Code == DeRecCode.RestoreConflict)
 {
@@ -616,6 +637,8 @@ using DeRec.Library;
 using DeRec.Library.Orchestrator;
 using DeRec.Library.Primitives;
 
+// Your store implementations; smoke-tests/dotnet/InMemoryStores.cs has
+// in-memory ones to copy.
 var channelStore = new InMemoryChannelStore();
 var shareStore   = new InMemoryShareStore();
 var secretStore  = new InMemorySecretStore();
@@ -848,6 +871,10 @@ expiry as a retry and ask the user to scan or share a fresh contact. Keep the
 scanner's `ExpiredChannels` timeout at least `Pairing` plus the time a response
 takes to arrive.
 
+### Key rotation
+
+With `WithKeyRotation(true)`, the owner advances each helper channel's key one epoch in every sharing round that reaches the threshold (a round below it advances none), and the replica group channel's key on every publish to replicas. Each step is K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" || be32(e+1)). Rotation is off by default, and off keeps the channel on its current key. The envelope's `sequence` carries the epoch, and peers follow on their own, so the setting is the owner's alone (`KeyRotation` in a config). A message under an epoch whose key the device cannot obtain is ignored as `MessageIgnoredEvent` with `IgnoreReason.KeyUnavailable`. A device keeps its newest key and the key of every secret version it still stores, so any kept version restores. The key ring is stored as a secret of kind `SecretKind.KeyRing` (`3`): persist its bytes as given, with any length, beside the kind-`0` shared key. Forward secrecy covers a compromised helper device, or a key alone, plus recorded traffic, and only for epochs older than the oldest key held; the owner and replica devices hold the plaintext secret and the keys of every version they store. A 0.0.x peer cannot follow a rotated channel: it must upgrade and re-pair.
+
 #### Filtered listings
 
 `ListHelpers` and `ListReplicas` take a filter — `ids`, `status`, `role` and
@@ -873,8 +900,8 @@ filter faithfully is still your job.
 App-side responsibilities (mirrors the other SDKs):
 
 - Implement `IChannelStore`, `IShareStore`, `ISecretStore`, `ITransport`
-  with persistent backends. `InMemoryChannelStore` / `InMemoryShareStore`
-  / `InMemorySecretStore` / `RecordingTransport` ship for tests.
+  with persistent backends. The library ships none: the in-memory stores
+  in `smoke-tests/dotnet/InMemoryStores.cs` are a starting point to copy.
 - Run a reachable endpoint. Delivery is push-only: a reply produced by
   `ProcessAsync` goes out through `ITransport`, addressed to the peer, and
   is never returned to the caller. Recommended HTTP conventions (not
@@ -950,6 +977,7 @@ The record reads and writes the canonical JSON shared by every SDK
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
   "auto_accept": { "pairing": true, "store_share": true },
   "auto_respond_on_failure": false,
+  "key_rotation": false,
   "auto_reply_to": false,
   "unpair_ack": "required",
   "unsafe_connection": false,
@@ -1024,6 +1052,12 @@ response, even when handling it fails. Such a failure does not make
 Resolve each token once. The library is stateless, so rejecting the same
 token twice, or rejecting an action already accepted, sends a second
 response.
+
+Hand the token back exactly as you received it. It is sealed to its channel,
+so `AcceptAsync` and `RejectAsync` refuse one that was edited, rebuilt or
+moved to another channel with a `DeRecException` whose `Code` is
+`DeRecCode.InvalidInput`, and nothing is stored or sent. A token raised under a channel key the device no longer holds, because the channel has moved on and no stored version keeps that key, is too late to answer and is refused the same way. A token issued by
+v0.0.10 does not decode (`DeRecCode.FfiBadProto`).
 
 `WithAutoRespondOnFailure` decides who answers. With it on, the library sends
 the response itself (a known failure keeps its specific status; anything else

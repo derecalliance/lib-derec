@@ -120,14 +120,16 @@ impl<
                 .await
             }
             DeRecFlow::UnpairReplica { replica_id, memo } => {
-                handlers::replicas::unpairing::start(
+                let mut events = handlers::replicas::unpairing::start(
                     &mut borrow_stores!(self),
                     &local!(self),
                     replica_id,
                     memo,
                     trace_id,
                 )
-                .await
+                .await?;
+                events.extend(self.auto_publish_after_replica_removal().await?);
+                Ok(events)
             }
             DeRecFlow::Unpair { channel_id, memo } => {
                 self.start_unpair(channel_id, memo, round).await
@@ -188,8 +190,17 @@ impl<
     /// re-pair with helpers on a fresh channel-id namespace
     ///   → start(RecoverSecret { secret_id, version })
     ///   → SecretRecovered { secret } event arrives
-    ///   → DeRecProtocol::restore(&secret, version)
+    ///   → DeRecProtocol::restore(&secret, version, newest_version)
     /// ```
+    ///
+    /// `newest_version` is the newest version any helper reported for
+    /// `secret_id` in [`DeRecFlow::Discovery`], or `recovered_version` when
+    /// that is the newest. The next publish is `newest_version + 1`: a helper
+    /// refuses a version older than the newest it stores
+    /// ([`IgnoreReason::Superseded`](crate::protocol::IgnoreReason::Superseded)),
+    /// so a device that restores an older kept version and numbers its next
+    /// publish from it would reach no helper. A `newest_version` below
+    /// `recovered_version` is [`crate::Error::InvalidInput`].
     ///
     /// What `restore` actually requires is a `secret_id` namespace with
     /// no user-secret snapshot and no channels at the roster ids it is
@@ -200,8 +211,8 @@ impl<
     /// On success: canonical helper channels are persisted with their
     /// `SharedKey`; canonical replica channels are persisted
     /// with the group key from `secret.replicas.shared_key`;
-    /// the user-secret snapshot is committed at `recovered_version`
-    /// with the roster's threshold
+    /// the user-secret snapshot of the recovered secrets is committed at
+    /// `newest_version` with the roster's threshold
     /// ([`Secret::threshold`](crate::protocol::types::Secret::threshold));
     /// every channel under `self.secret_id` at no roster id (i.e. the
     /// recovery-mode channels) is unpaired as `start(`[`DeRecFlow::Unpair`]`)`
@@ -211,7 +222,7 @@ impl<
     /// `UnpairAck::Required` its `Unpaired` arrives later, from `process`
     /// on the helper's answer or from the timeout sweep. The protocol
     /// resumes normal operation immediately — the next
-    /// `start(ProtectSecret)` publishes `recovered_version + 1` to the
+    /// `start(ProtectSecret)` publishes `newest_version + 1` to the
     /// restored helpers only, since a channel still being unpaired is
     /// never a publish target.
     ///
@@ -238,7 +249,7 @@ impl<
     /// and recovery cannot attribute a collected share to a canonical
     /// Helper channel, so this device has no reference bytes for that
     /// version. Run `start(`[`DeRecFlow::ProtectSecret`]`)` once —
-    /// it publishes `recovered_version + 1` and writes the tracking
+    /// it publishes `newest_version + 1` and writes the tracking
     /// shares that make verification work from then on.
     ///
     /// Pass that publish the stored weights unchanged: restore has written
@@ -294,12 +305,14 @@ impl<
         &mut self,
         secret: &Secret,
         recovered_version: u32,
+        newest_version: u32,
     ) -> Result<Vec<DeRecEvent>> {
         handlers::restore::restore(
             &mut borrow_stores!(self),
             &local!(self),
             secret,
             recovered_version,
+            newest_version,
             self.unpair_ack,
         )
         .await
@@ -550,7 +563,8 @@ impl<
                 SenderKind::Helper,
             )
             .await?;
-        handlers::unpairing::start(
+        let share_holders = self.share_holders([channel_id]).await?;
+        let mut events = handlers::unpairing::start(
             &mut borrow_stores!(self),
             &local!(self),
             channel_id,
@@ -559,7 +573,9 @@ impl<
             now_secs(),
             round,
         )
-        .await
+        .await?;
+        events.extend(self.maybe_auto_publish(&events, &share_holders).await?);
+        Ok(events)
     }
 
     async fn start_update_channel_info(
@@ -625,7 +641,7 @@ mod tests {
             .save(
                 SECRET_ID,
                 channel_id,
-                SecretValue::SharedKey([key_byte; 32]),
+                SecretValue::SharedKey(crate::types::SharedKey::new([key_byte; 32])),
             )
             .await
             .expect("seed key");

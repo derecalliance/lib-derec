@@ -2,9 +2,9 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
-    CollectedShare, CorruptionReason, DeRecChannelStore, DeRecEvent, DeRecSecretStore,
-    DeRecShareStore, DeRecStateStore, DeRecTransport, MissingPolicy, PendingAction,
-    RecoveryCandidate, RecoveryHelper, SecretKind, SecretValue, now_secs,
+    ChannelKey, ChannelRequest, CollectedShare, CorruptionReason, DeRecChannelStore, DeRecEvent,
+    DeRecShareStore, DeRecStateStore, DeRecTransport, KeyRing, MissingPolicy, PendingAction,
+    RecoveryCandidate, RecoveryHelper, now_secs,
 };
 use super::NO_SHARE_FOR_VERSION;
 use super::replicas::recovery as replica;
@@ -13,6 +13,7 @@ use crate::extensions::advertised_endpoints::reply_to_owned;
 use crate::extensions::channel_store::{ChannelStoreExt as _, send_channel_message};
 use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
+use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::protocol::context::{Exchange, Local, Round};
 use crate::protocol::obligation;
 use crate::protocol::stores::{StoreSet, Stores};
@@ -22,7 +23,7 @@ use crate::{
     derec_message::current_timestamp,
     primitives::recovery::{RecoveryError, request, response},
     protocol::types::{StateItem, StateKey},
-    types::{ChannelId, SharedKey},
+    types::ChannelId,
 };
 use derec_cryptography::vss;
 use derec_proto::{
@@ -167,20 +168,11 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         .await?;
 
     let channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.channel_id).collect();
-    let keys: HashMap<ChannelId, SharedKey> = stores
+    let keys: HashMap<ChannelId, Option<KeyRing>> = stores
         .secrets
-        .load_many(
-            local.secret_id,
-            &channel_ids,
-            SecretKind::SharedKey,
-            MissingPolicy::Fail,
-        )
+        .key_rings_many(local.secret_id, &channel_ids, MissingPolicy::Fail)
         .await?
         .into_iter()
-        .filter_map(|(cid, v)| match v {
-            SecretValue::SharedKey(k) => Some((cid, k)),
-            _ => None,
-        })
         .collect();
 
     let (mut events, asked) =
@@ -279,8 +271,8 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .load_many(local.secret_id, &linked_ids, &[request.version])
         .await?
         .into_iter()
-        .find(|s| s.secret_id == request.secret_id)
-        .map(|s| s.bytes)
+        .find(|(_, s)| s.secret_id == request.secret_id)
+        .map(|(_, s)| s.bytes)
     else {
         #[cfg(feature = "logging")]
         tracing::info!(
@@ -310,7 +302,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     let stored =
         StoreShareRequestMessage::decode(encoded.as_slice()).map_err(Error::ProtobufDecode)?;
 
-    let resp = response::produce(exchange.channel_id, request, &stored, exchange.shared_key)?;
+    let resp = response::produce(exchange.channel_id, request, &stored, exchange.key)?;
 
     let envelope = apply_trace_id(&resp.envelope, exchange.trace_id)?;
     let endpoints = stores
@@ -368,7 +360,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         local.secret_id,
         exchange.channel_id,
         failure_response(local, request, status, memo),
-        exchange.shared_key,
+        exchange.key,
         exchange.trace_id,
         local.policy,
         &reply_to_owned(request),
@@ -417,12 +409,12 @@ pub(in crate::protocol) fn failure_response(
 fn on_request(exchange: &Exchange<'_>, request: GetShareRequestMessage) -> Result<Vec<DeRecEvent>> {
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id: exchange.channel_id,
-        action: PendingAction::GetShare {
-            channel_id: exchange.channel_id,
-            request,
-            shared_key: *exchange.shared_key,
-            trace_id: exchange.trace_id,
-        },
+        action: PendingAction::request(
+            exchange.channel_id,
+            exchange.trace_id,
+            ChannelRequest::GetShare(request),
+        )
+        .sealed_with(exchange.key),
     }])
 }
 
@@ -765,7 +757,7 @@ fn decode_recovered_secret(outer_bytes: &[u8]) -> Result<Secret> {
 async fn dispatch_all<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     all_channels: Vec<HelperChannel>,
-    mut keys: HashMap<ChannelId, SharedKey>,
+    mut keys: HashMap<ChannelId, Option<KeyRing>>,
     target_secret_id: u64,
     version: u32,
     round: &Round<'_>,
@@ -773,9 +765,15 @@ async fn dispatch_all<S: StoreSet>(
     let mut events = Vec::with_capacity(all_channels.len());
     let mut asked = HashSet::with_capacity(all_channels.len());
     for channel in all_channels {
-        let shared_key = keys
-            .remove(&channel.channel_id)
-            .expect("load_many(MissingPolicy::Fail) guarantees an entry per id");
+        let Some(key) = keys.remove(&channel.channel_id).flatten() else {
+            events.push(DeRecEvent::RecoverSecretFailed {
+                channel_id: channel.channel_id,
+                version,
+                error: super::NO_USABLE_KEY.to_owned(),
+            });
+            continue;
+        };
+        let key = key.current();
 
         match dispatch_one(
             stores,
@@ -783,7 +781,7 @@ async fn dispatch_all<S: StoreSet>(
             &channel.transports,
             target_secret_id,
             version,
-            &shared_key,
+            &key,
             round,
         )
         .await
@@ -829,10 +827,10 @@ async fn dispatch_one<S: StoreSet>(
     endpoints: &[TransportProtocol],
     secret_id: u64,
     version: u32,
-    shared_key: &SharedKey,
+    key: &ChannelKey,
     round: &Round<'_>,
 ) -> Result<()> {
-    let msg = request::produce(channel_id, secret_id, version, shared_key, round.reply_to)?;
+    let msg = request::produce(channel_id, secret_id, version, key, round.reply_to)?;
     let envelope = apply_trace_id(&msg.envelope, round.trace_id)?;
     stores.transport.send(endpoints, envelope).await?;
     Ok(())
@@ -1051,6 +1049,7 @@ mod recovery_ids_tests {
     use super::*;
     use crate::derec_message::extract_inner_message;
     use crate::primitives::sharing::request;
+    use crate::protocol::DeRecSecretStore;
     use crate::protocol::context::{Exchange, Round};
     use crate::protocol::tests::LocalFixture;
     use crate::protocol::tests::{
@@ -1060,6 +1059,7 @@ mod recovery_ids_tests {
     use crate::protocol::types::{
         ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole, SecretValue,
     };
+    use crate::types::SharedKey;
     use crate::types::{ChannelId, ReplicaId};
     use crate::utils::now_secs;
     use derec_proto::{DeRecMessage, Protocol, SenderKind, TransportProtocol};
@@ -1139,7 +1139,11 @@ mod recovery_ids_tests {
         };
         channels.save(sid, record).await.expect("channel saved");
         secrets
-            .save(sid, ChannelId(cid), SecretValue::SharedKey([key_byte; 32]))
+            .save(
+                sid,
+                ChannelId(cid),
+                SecretValue::SharedKey(SharedKey::new([key_byte; 32])),
+            )
             .await
             .expect("shared key saved");
     }
@@ -1148,8 +1152,8 @@ mod recovery_ids_tests {
     /// a helper would actually see.
     fn decode_request(envelope: &[u8], key_byte: u8) -> GetShareRequestMessage {
         let msg = DeRecMessage::decode(envelope).expect("outbound envelope decodes");
-        let inner =
-            extract_inner_message(&msg.message, &[key_byte; 32]).expect("inner message decrypts");
+        let inner = extract_inner_message(&msg.message, &SharedKey::new([key_byte; 32]))
+            .expect("inner message decrypts");
         match inner {
             MessageBody::GetShareRequest(r) => r,
             other => panic!("expected GetShareRequest, got {other:?}"),
@@ -2273,7 +2277,10 @@ mod recovery_ids_tests {
                     timestamp: Some(timestamp),
                     ..Default::default()
                 }))
-                .encrypt(&[KEY_BYTE; 32])
+                .encrypt(&crate::types::ChannelKey::new(
+                    0,
+                    crate::types::SharedKey::new([KEY_BYTE; 32]),
+                ))
                 .expect("encrypts")
                 .build()
                 .expect("builds")
@@ -2284,7 +2291,7 @@ mod recovery_ids_tests {
             let envelopes = transport.sent_envelopes();
             assert_eq!(envelopes.len(), 1, "exactly one answer must be sent");
             let msg = DeRecMessage::decode(envelopes[0].as_slice()).expect("envelope decodes");
-            match extract_inner_message(&msg.message, &[KEY_BYTE; 32])
+            match extract_inner_message(&msg.message, &SharedKey::new([KEY_BYTE; 32]))
                 .expect("inner message decrypts")
             {
                 MessageBody::GetShareResponse(r) => r,
@@ -2537,7 +2544,10 @@ mod recovery_ids_tests {
                 .channel_id(ChannelId(channel_id))
                 .timestamp(response.timestamp.expect("response timestamp"))
                 .message_body(MessageBody::GetShareResponse(response.clone()))
-                .encrypt(&[key_byte; 32])
+                .encrypt(&crate::types::ChannelKey::new(
+                    0,
+                    crate::types::SharedKey::new([key_byte; 32]),
+                ))
                 .expect("encrypts")
                 .build()
                 .expect("builds")
@@ -2739,7 +2749,10 @@ mod recovery_ids_tests {
                     &lf.local(),
                     &Exchange {
                         channel_id: ChannelId(WANTED_CHANNEL),
-                        shared_key: &[0xB2; 32],
+                        key: &crate::protocol::ChannelKey {
+                            epoch: 0,
+                            key: (crate::types::SharedKey::new([0xB2; 32])).clone(),
+                        },
                         trace_id: 0,
                         obligation: None,
                     },
@@ -2788,6 +2801,7 @@ mod tests {
                 shared_key: vec![0xAA; 32],
                 communication_info: HashMap::from([("name".to_owned(), "Helper".to_owned())]),
                 weight: 1,
+                key_epoch: 0,
             }],
             secrets: vec![
                 UserSecret {
@@ -2824,6 +2838,7 @@ mod tests {
                     },
                 ],
                 shared_key: vec![0x55; 32],
+                key_epoch: 0,
             }),
             threshold: None,
         }

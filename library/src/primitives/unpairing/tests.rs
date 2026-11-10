@@ -30,9 +30,14 @@ fn test_produce_unpair_request_produces_non_empty_envelope() {
     let channel_id = ChannelId(7);
     let shared_key = make_shared_key(11);
 
-    let result =
-        produce_unpair_request_message(channel_id, "no longer needed", &shared_key, &[], None)
-            .expect("failed to produce unpair request");
+    let result = produce_unpair_request_message(
+        channel_id,
+        "no longer needed",
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+        &[],
+        None,
+    )
+    .expect("failed to produce unpair request");
 
     assert!(!result.envelope.is_empty());
     let decoded = DeRecMessage::decode(result.envelope.as_slice()).unwrap();
@@ -44,8 +49,14 @@ fn test_produce_unpair_request_accepts_empty_memo() {
     let channel_id = ChannelId(7);
     let shared_key = make_shared_key(11);
 
-    let result = produce_unpair_request_message(channel_id, "", &shared_key, &[], None)
-        .expect("failed to produce unpair request with empty memo");
+    let result = produce_unpair_request_message(
+        channel_id,
+        "",
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+        &[],
+        None,
+    )
+    .expect("failed to produce unpair request with empty memo");
 
     let extracted = extract_unpair_request(&result.envelope, &shared_key)
         .expect("failed to extract unpair request");
@@ -58,8 +69,14 @@ fn test_extract_unpair_request_returns_original_memo() {
     let shared_key = make_shared_key(29);
     let memo = "explicit user choice";
 
-    let produced = produce_unpair_request_message(channel_id, memo, &shared_key, &[], None)
-        .expect("failed to produce unpair request");
+    let produced = produce_unpair_request_message(
+        channel_id,
+        memo,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+        &[],
+        None,
+    )
+    .expect("failed to produce unpair request");
 
     let result = extract_unpair_request(&produced.envelope, &shared_key)
         .expect("failed to extract unpair request");
@@ -74,8 +91,14 @@ fn test_extract_unpair_request_rejects_wrong_make_shared_key() {
     let producing_key = make_shared_key(1);
     let other_key = make_shared_key(2);
 
-    let produced = produce_unpair_request_message(channel_id, "x", &producing_key, &[], None)
-        .expect("failed to produce unpair request");
+    let produced = produce_unpair_request_message(
+        channel_id,
+        "x",
+        &crate::types::ChannelKey::new(0, producing_key.clone()),
+        &[],
+        None,
+    )
+    .expect("failed to produce unpair request");
 
     let result = extract_unpair_request(&produced.envelope, &other_key);
     assert!(result.is_err());
@@ -86,8 +109,14 @@ fn test_extract_unpair_request_rejects_tampered_timestamp() {
     let channel_id = ChannelId(5);
     let shared_key = make_shared_key(7);
 
-    let produced = produce_unpair_request_message(channel_id, "m", &shared_key, &[], None)
-        .expect("failed to produce unpair request");
+    let produced = produce_unpair_request_message(
+        channel_id,
+        "m",
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+        &[],
+        None,
+    )
+    .expect("failed to produce unpair request");
 
     // Mutate the outer envelope timestamp so the invariant
     // `envelope.timestamp == request.timestamp` is broken.
@@ -106,8 +135,11 @@ fn test_produce_unpair_response_carries_ok_status() {
     let channel_id = ChannelId(9);
     let shared_key = make_shared_key(31);
 
-    let response = produce_unpair_response_message(channel_id, &shared_key)
-        .expect("failed to produce unpair response");
+    let response = produce_unpair_response_message(
+        channel_id,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("failed to produce unpair response");
 
     let extracted = extract_unpair_response(&response.envelope, &shared_key)
         .expect("failed to extract unpair response");
@@ -122,8 +154,11 @@ fn test_process_unpair_response_accepts_ok() {
     let channel_id = ChannelId(11);
     let shared_key = make_shared_key(7);
 
-    let response = produce_unpair_response_message(channel_id, &shared_key)
-        .expect("failed to produce unpair response");
+    let response = produce_unpair_response_message(
+        channel_id,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("failed to produce unpair response");
     let extracted = extract_unpair_response(&response.envelope, &shared_key)
         .expect("failed to extract unpair response");
 
@@ -150,16 +185,25 @@ fn test_full_unpair_round_trip_ok() {
     let shared_key = make_shared_key(99);
     let memo = "device decommissioned";
 
-    let request = produce_unpair_request_message(channel_id, memo, &shared_key, &[], None)
-        .expect("failed to produce unpair request");
+    let request = produce_unpair_request_message(
+        channel_id,
+        memo,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+        &[],
+        None,
+    )
+    .expect("failed to produce unpair request");
 
     // Responder extracts the request, validates memo round-trip, sends Ok.
     let extracted_req = extract_unpair_request(&request.envelope, &shared_key)
         .expect("failed to extract unpair request");
     assert_eq!(extracted_req.request.memo, memo);
 
-    let response = produce_unpair_response_message(channel_id, &shared_key)
-        .expect("failed to produce unpair response");
+    let response = produce_unpair_response_message(
+        channel_id,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("failed to produce unpair response");
 
     // Initiator extracts response and processes outcome.
     let extracted_resp = extract_unpair_response(&response.envelope, &shared_key)
@@ -174,7 +218,14 @@ fn test_inner_request_decodable_via_extract_inner_message() {
     let channel_id = ChannelId(8);
     let shared_key = make_shared_key(5);
 
-    let produced = produce_unpair_request_message(channel_id, "x", &shared_key, &[], None).unwrap();
+    let produced = produce_unpair_request_message(
+        channel_id,
+        "x",
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+        &[],
+        None,
+    )
+    .unwrap();
     let envelope = DeRecMessage::decode(produced.envelope.as_slice()).unwrap();
     let inner = extract_inner_message(&envelope.message, &shared_key).unwrap();
     assert!(matches!(inner, MessageBody::UnpairRequest(_)));
@@ -199,7 +250,7 @@ fn test_extract_unpair_request_rejects_scheme_mismatched_reply_to() {
     let produced = produce_unpair_request_message(
         channel_id,
         "bye",
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         slice::from_ref(&malicious_reply_to),
         None,
     )

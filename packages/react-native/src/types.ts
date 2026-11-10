@@ -8,7 +8,7 @@ export interface SecretStore {
   load(
     secretId: string,
     channelId: string,
-    kind: 0 | 1 | 2,
+    kind: 0 | 1 | 2 | 3,
   ): Promise<Uint8Array | null | undefined>;
   /**
    * Load secrets of the same `kind` for several channels in one call,
@@ -20,15 +20,26 @@ export interface SecretStore {
   loadMany(
     secretId: string,
     channelIds: string[],
-    kind: 0 | 1 | 2,
+    kind: 0 | 1 | 2 | 3,
   ): Promise<Array<Uint8Array | null | undefined>>;
   save(
     secretId: string,
     channelId: string,
-    kind: 0 | 1 | 2,
+    kind: 0 | 1 | 2 | 3,
     value: Uint8Array,
   ): Promise<void>;
-  remove(secretId: string, channelId: string, kind: 0 | 1 | 2): Promise<void>;
+  remove(secretId: string, channelId: string, kind: 0 | 1 | 2 | 3): Promise<void>;
+  /**
+   * Remove every secret `entries` names, in one call. Each entry is a
+   * `[channelId, kind]` pair addressed the way `remove`'s arguments are.
+   * Idempotent: an entry with nothing stored is skipped, not an error. The
+   * library calls it when it removes several secrets at once, so a backend
+   * that can delete them in one statement or transaction should.
+   */
+  removeMany(
+    secretId: string,
+    entries: [channelId: string, kind: 0 | 1 | 2 | 3][],
+  ): Promise<void>;
 }
 
 
@@ -205,6 +216,19 @@ export interface ChannelStore {
   ): Promise<void>;
   remove(secretId: string, channelId: string, replicaId: string): Promise<boolean>;
   /**
+   * Remove every record `queries` addresses, in one call. Each entry is a
+   * `[channelId, replicaId]` pair addressed the way `remove`'s arguments are:
+   * `replicaId` `"0"` is the helper channel at `channelId`, any other value
+   * removes that member only. Idempotent: an entry that names no record is
+   * skipped, not an error. The library calls it when it removes several
+   * records at once, so a backend that can delete them in one statement or
+   * transaction should.
+   */
+  removeMany(
+    secretId: string,
+    queries: [channelId: string, replicaId: string][],
+  ): Promise<void>;
+  /**
    * JSON array of the helper channels stored under `secretId` that `filter`
    * selects.
    *
@@ -280,11 +304,16 @@ export interface Share {
  */
 export interface ShareStore {
   load(secretId: string, channelId: string, versions: number[]): Promise<Share[]>;
+  /**
+   * Load shares across several channels in one call, scoped to `secretId`.
+   * Each share is paired with the channel it is stored under, as a
+   * `[channelId, share]` tuple. An empty `versions` selects every version.
+   */
   loadMany(
     secretId: string,
     channelIds: string[],
     versions: number[],
-  ): Promise<Share[]>;
+  ): Promise<[channelId: string, share: Share][]>;
   loadAll(secretId: string, channelIds: string[]): Promise<Share[]>;
   /**
    * Reject, or throw, a {@link shareStoreRefusal} `Error` to refuse a share
@@ -308,6 +337,18 @@ export interface ShareStore {
     secretId: string,
     channelId: string,
     versions: number[],
+  ): Promise<void>;
+  /**
+   * `removeVersions` for several channels in one call. Each entry is a
+   * `[channelId, versions]` pair addressed the way `removeVersions`'s
+   * arguments are. Idempotent: a version that is not stored is skipped, not
+   * an error. The library calls it when it removes versions across several
+   * channels at once, so a backend that can delete them in one statement or
+   * transaction should.
+   */
+  removeVersionsMany(
+    secretId: string,
+    entries: [channelId: string, versions: number[]][],
   ): Promise<void>;
   /**
    * Owner only: the one older version every helper keeps after the owner
@@ -405,6 +446,14 @@ export interface StateStore {
     keyJson: Uint8Array,
   ): Promise<Uint8Array | null | undefined>;
   remove(secretId: string, keyJson: Uint8Array): Promise<boolean>;
+  /**
+   * Remove every row `keysJson` names, in one call. `keysJson` is a JSON
+   * array of the key objects `remove` receives one at a time as `keyJson`.
+   * Idempotent: a key with no row is skipped, not an error. The library calls
+   * it when it removes several rows at once, so a backend that can delete
+   * them in one statement or transaction should.
+   */
+  removeMany(secretId: string, keysJson: Uint8Array): Promise<void>;
   loadAll(secretId: string, kind: 0 | 1 | 2 | 3 | 4): Promise<Uint8Array[]>;
 }
 
@@ -467,39 +516,12 @@ export interface Transport {
    * first success. The protocol's handlers are idempotent, so a duplicate
    * does not corrupt state, but it is still a duplicate to anything counting
    * messages, and a peer entitled to treat re-delivery as a replay will.
-   *
-   * **Prefer an adapter to writing this by hand.** Choosing which endpoint to
-   * dial is yours and stays here; the bookkeeping around it is the same
-   * everywhere and is already written and tested. Write a {@link SendOne} and
-   * wrap it in {@link sequentialFailover}. Taking `endpoints[0]` type-checks,
-   * passes every test, and silently gives up the failover the list exists to
-   * provide — if that is genuinely wanted, say so with
-   * {@link singleEndpointTransport} rather than by indexing.
    */
   send(
     endpoints: ReadonlyArray<Endpoint>,
     message: Uint8Array,
   ): Promise<void>;
 }
-
-/**
- * Delivers one message to one endpoint.
- *
- * The narrow half of a transport: everything genuinely about dialing, and
- * nothing about which endpoint to dial. Pass one of these to
- * {@link sequentialFailover} or {@link singleEndpointTransport} to get a
- * {@link Transport}.
- *
- * Rejecting means the endpoint did not receive the message. The rejection
- * reason need not distinguish "unreachable" from "rejected":
- * {@link sequentialFailover} treats both as a reason to try the next endpoint,
- * which is the safe reading. Trying an endpoint that would have refused costs
- * a round trip; skipping one that would have worked costs the delivery.
- */
-export type SendOne = (
-  endpoint: Endpoint,
-  message: Uint8Array,
-) => Promise<void>;
 
 /**
  * The DeRec protocol version this build speaks — the `protocolVersionMajor` /
@@ -545,61 +567,6 @@ export function shareStoreRefusal(reason: ShareStoreRefusalReason): Error {
   const error = new Error(`share store refused: ${reason}`);
   (error as Error & { refusal: ShareStoreRefusalReason }).refusal = reason;
   return error;
-}
-
-/**
- * Builds a {@link Transport} that tries each endpoint in the order the peer
- * offered it and stops at the first success.
- *
- * An error is thrown only when every endpoint failed. The message is delivered
- * at most once.
- *
- * This is the right default. A peer advertising several endpoints is saying it
- * can be reached at any of them, and the reason 0.0.3 records the whole list is
- * so one being down does not end the conversation.
- */
-export function sequentialFailover(dialer: SendOne): Transport {
-  return {
-    async send(endpoints, message) {
-      let last: unknown;
-      for (const endpoint of endpoints) {
-        try {
-          await dialer(endpoint, message);
-          return;
-        } catch (e) {
-          last = e;
-        }
-      }
-      // `endpoints` is never empty — the library refuses to record a peer
-      // whose endpoints were all filtered away — so reaching here means at
-      // least one attempt was made and `last` is populated.
-      throw last ?? new Error('send was called with no endpoints');
-    },
-  };
-}
-
-/**
- * Builds a {@link Transport} that uses the first endpoint only.
- *
- * Reproduces the pre-0.0.3 behaviour exactly, for an application that genuinely
- * serves one endpoint or has a reason not to fail over.
- *
- * It exists so that choosing it is visible. `endpoints[0]` written inline looks
- * like an implementation detail and reads as finished; naming this records that
- * failover was considered and declined, which is a claim a reviewer can
- * disagree with. If the peers this application talks to advertise more than one
- * endpoint, prefer {@link sequentialFailover} — every endpoint after the first
- * is reachability being thrown away.
- */
-export function singleEndpointTransport(dialer: SendOne): Transport {
-  return {
-    async send(endpoints, message) {
-      if (endpoints.length === 0) {
-        throw new Error('send was called with no endpoints');
-      }
-      await dialer(endpoints[0]!, message);
-    },
-  };
 }
 
 export enum SenderKind {
@@ -1105,6 +1072,9 @@ export type DeRecEvent =
            *  next publish gives it the same count. Every event carries it;
            *  `restore` reads an absent value as 1. */
           weight?: number;
+          /** The epoch of `shared_key` on the helper's channel. Absent means
+           *  0. `restore` rebuilds the channel's key at this epoch. */
+          key_epoch?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -1129,6 +1099,8 @@ export type DeRecEvent =
             communication_info?: Record<string, string> | null;
           }>;
           shared_key: Uint8Array;
+          /** The epoch of `shared_key` on the group channel. Absent means 0. */
+          key_epoch?: number;
         };
         /** The threshold the secret was split with. Absent when the roster
          *  records none. `restore` writes it into the snapshot, so the next
@@ -1251,6 +1223,9 @@ export type DeRecEvent =
            *  next publish gives it the same count. Every event carries it;
            *  `restore` reads an absent value as 1. */
           weight?: number;
+          /** The epoch of `shared_key` on the helper's channel. Absent means
+           *  0. `restore` rebuilds the channel's key at this epoch. */
+          key_epoch?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -1273,6 +1248,8 @@ export type DeRecEvent =
             communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
+          /** The epoch of `shared_key` on the group channel. Absent means 0. */
+          key_epoch?: number;
         };
         /** The threshold the secret was split with. Absent when the roster
          *  records none. `restore` writes it into the snapshot, so the next
@@ -1313,6 +1290,9 @@ export type DeRecEvent =
            *  next publish gives it the same count. Every event carries it;
            *  `restore` reads an absent value as 1. */
           weight?: number;
+          /** The epoch of `shared_key` on the helper's channel. Absent means
+           *  0. `restore` rebuilds the channel's key at this epoch. */
+          key_epoch?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -1335,6 +1315,8 @@ export type DeRecEvent =
             communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
+          /** The epoch of `shared_key` on the group channel. Absent means 0. */
+          key_epoch?: number;
         };
         /** The threshold the secret was split with. Absent when the roster
          *  records none. `restore` writes it into the snapshot, so the next
@@ -1381,6 +1363,9 @@ export type DeRecEvent =
            *  next publish gives it the same count. Every event carries it;
            *  `restore` reads an absent value as 1. */
           weight?: number;
+          /** The epoch of `shared_key` on the helper's channel. Absent means
+           *  0. `restore` rebuilds the channel's key at this epoch. */
+          key_epoch?: number;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -1402,6 +1387,8 @@ export type DeRecEvent =
             communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
+          /** The epoch of `shared_key` on the group channel. Absent means 0. */
+          key_epoch?: number;
         };
         /** The threshold the secret was split with. Absent when the roster
          *  records none. `restore` writes it into the snapshot, so the next
@@ -1509,7 +1496,8 @@ export type DeRecEvent =
    *  outstanding challenge is kept. `"Superseded"` means a
    *  `StoreShareRequest` for a version older than the newest one this
    *  helper stores on the channel, and not stored itself; it is not stored
-   *  and not answered. `trace_id` matches the peer's
+   *  and not answered. `"KeyUnavailable"` means the envelope names an
+   *  epoch whose key this device cannot obtain. `trace_id` matches the peer's
    *  `*Started` event for the same round (`"0"` when the sender set none). */
   | {
       type: "MessageIgnored";
@@ -1711,7 +1699,7 @@ export interface CommunicationInfo {
 
 /** Why a `MessageIgnored` event dropped a message. Matches the Rust
  *  `IgnoreReason` discriminants one-for-one. */
-export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse" | "Superseded";
+export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse" | "Superseded" | "KeyUnavailable";
 
 /** Why a `PeerNotRestored` event left a roster entry without a channel.
  *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */
@@ -1825,6 +1813,7 @@ export interface DeRecAutoAcceptConfig {
  *   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
  *   "auto_accept": { "pairing": true, "store_share": true },
  *   "auto_respond_on_failure": false,
+ *   "key_rotation": false,
  *   "auto_reply_to": false,
  *   "unpair_ack": "required",
  *   "unsafe_connection": false,
@@ -1843,6 +1832,7 @@ export interface DeRecProtocolConfig {
   parameter_range?: DeRecParameterRangeConfig;
   auto_accept?: DeRecAutoAcceptConfig;
   auto_respond_on_failure?: boolean;
+  key_rotation?: boolean;
   auto_reply_to?: boolean;
   /** Its name, or the discriminant `0` (`"required"`) / `1`
    *  (`"not_required"`). */

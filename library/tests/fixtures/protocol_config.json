@@ -33,6 +33,7 @@
       "update_channel_info": false
     },
     "auto_respond_on_failure": true,
+    "key_rotation": true,
     "auto_reply_to": true,
     "unpair_ack": "not_required",
     "unsafe_connection": false,

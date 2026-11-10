@@ -125,11 +125,13 @@ fn generated() -> serde_json::Value {
         },
         ApplyTraceIdResult { error, wire_bytes },
         ReadTraceIdResult { error, trace_id },
+        super::envelope::ReadSequenceResult { error, sequence },
         MessageIdResult {
             error,
             id,
             timestamp
         },
+        super::channel_key::DeriveChannelKeyResult { error, key_bytes },
         DeRecError {
             category,
             code,
@@ -235,6 +237,7 @@ fn generated() -> serde_json::Value {
             load,
             save,
             remove,
+            remove_many,
             list_helpers,
             list_replicas,
             link_channel,
@@ -247,6 +250,7 @@ fn generated() -> serde_json::Value {
             load_many,
             save,
             remove,
+            remove_many,
             free_buffer
         },
         ShareStoreCallbacks {
@@ -258,6 +262,7 @@ fn generated() -> serde_json::Value {
             save,
             remove_channel,
             remove_versions,
+            remove_versions_many,
             keep_version,
             record_verification,
             free_buffer
@@ -274,6 +279,7 @@ fn generated() -> serde_json::Value {
             save,
             load,
             remove,
+            remove_many,
             load_all,
             free_buffer
         },

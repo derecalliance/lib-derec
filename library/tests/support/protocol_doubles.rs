@@ -98,6 +98,21 @@ impl DeRecChannelStore for InMemChannelStore {
         };
         Box::pin(future::ready(Ok(removed)))
     }
+    fn remove_many(&mut self, sid: u64, queries: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+        let mut helpers = self.helper_rows.lock().unwrap();
+        let mut members = self.member_rows.lock().unwrap();
+        for query in queries {
+            match *query {
+                ChannelQuery::Helper { channel_id } => {
+                    helpers.remove(&(sid, channel_id.0));
+                }
+                ChannelQuery::Replica { replica_id, .. } => {
+                    members.remove(&(sid, replica_id.0));
+                }
+            }
+        }
+        Box::pin(std::future::ready(Ok(())))
+    }
 
     fn helpers(
         &self,
@@ -232,6 +247,12 @@ impl DeRecChannelStore for FlakyChannelStore {
         }
         self.inner.remove(sid, query)
     }
+    fn remove_many(&mut self, sid: u64, queries: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+        if *self.fail_remove.lock().unwrap() {
+            return channel_backend_error();
+        }
+        self.inner.remove_many(sid, queries)
+    }
     fn helpers(
         &self,
         sid: u64,
@@ -261,9 +282,15 @@ pub struct InMemSecretStore {
     /// A kind whose removal fails, for exercising a backend failure after a
     /// response was sent.
     fail_remove: Arc<Mutex<Option<SecretKind>>>,
+    /// A kind whose save fails.
+    fail_save: Arc<Mutex<Option<SecretKind>>>,
 }
 
 impl InMemSecretStore {
+    pub fn set_fail_save(&self, kind: Option<SecretKind>) {
+        *self.fail_save.lock().unwrap() = kind;
+    }
+
     pub fn set_fail_remove(&self, kind: Option<SecretKind>) {
         *self.fail_remove.lock().unwrap() = kind;
     }
@@ -310,11 +337,18 @@ impl DeRecSecretStore for InMemSecretStore {
         Box::pin(future::ready(Ok(out)))
     }
     fn save(&mut self, sid: u64, cid: ChannelId, value: SecretValue) -> SecretStoreFuture<'_, ()> {
-        let k = match &value {
-            SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
-            SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
-            SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
+        let kind = match &value {
+            SecretValue::SharedKey(_) => SecretKind::SharedKey,
+            SecretValue::PairingSecret(_) => SecretKind::PairingSecret,
+            SecretValue::PairingContact(_) => SecretKind::PairingContact,
+            SecretValue::KeyRing(_) => SecretKind::KeyRing,
         };
+        if *self.fail_save.lock().unwrap() == Some(kind) {
+            return Box::pin(std::future::ready(Err(SecretStoreError::Backend(
+                "secret store unavailable".into(),
+            ))));
+        }
+        let k = kind as u8;
         self.data.lock().unwrap().insert((sid, cid.0, k), value);
         Box::pin(future::ready(Ok(())))
     }
@@ -327,6 +361,23 @@ impl DeRecSecretStore for InMemSecretStore {
         self.data.lock().unwrap().remove(&(sid, cid.0, kind as u8));
         Box::pin(future::ready(Ok(())))
     }
+    fn remove_many(
+        &mut self,
+        sid: u64,
+        entries: &[(ChannelId, SecretKind)],
+    ) -> SecretStoreFuture<'_, ()> {
+        let failing = *self.fail_remove.lock().unwrap();
+        if entries.iter().any(|&(_, kind)| Some(kind) == failing) {
+            return Box::pin(std::future::ready(Err(SecretStoreError::Backend(
+                "secret store unavailable".into(),
+            ))));
+        }
+        let mut data = self.data.lock().unwrap();
+        for &(cid, kind) in entries {
+            data.remove(&(sid, cid.0, kind as u8));
+        }
+        Box::pin(std::future::ready(Ok(())))
+    }
 }
 
 #[derive(Default, Clone)]
@@ -336,6 +387,31 @@ pub struct InMemShareStore {
     /// What [`DeRecShareStore::keep_version`] answers on every call; when
     /// unset it answers `version - 1`, the version distributed before.
     pub keep: Arc<Mutex<Option<u32>>>,
+    /// When set, every `save` fails with a backend error and stores nothing.
+    fail_save: Arc<Mutex<bool>>,
+}
+
+impl InMemShareStore {
+    /// Fail every `save` with a backend error.
+    pub fn set_fail_save(&self, fail: bool) {
+        *self.fail_save.lock().unwrap() = fail;
+    }
+
+    /// The shares under `sid` on `cids` at `versions` (every version when
+    /// empty), with their channels, ordered by version then channel.
+    fn select(&self, sid: u64, cids: &[ChannelId], versions: &[u32]) -> Vec<(ChannelId, Share)> {
+        let wanted: Vec<u64> = cids.iter().map(|c| c.0).collect();
+        let lock = self.data.lock().unwrap();
+        let mut out: Vec<(ChannelId, Share)> = lock
+            .iter()
+            .filter(|((s, c, v), _)| {
+                *s == sid && wanted.contains(c) && (versions.is_empty() || versions.contains(v))
+            })
+            .map(|((_, c, _), share)| (ChannelId(*c), share.clone()))
+            .collect();
+        out.sort_by_key(|(c, share)| (share.version, c.0));
+        out
+    }
 }
 
 impl DeRecShareStore for InMemShareStore {
@@ -357,29 +433,25 @@ impl DeRecShareStore for InMemShareStore {
         sid: u64,
         cids: &[ChannelId],
         versions: &[u32],
-    ) -> ShareStoreFuture<'_, Vec<Share>> {
-        let wanted: Vec<u64> = cids.iter().map(|c| c.0).collect();
-        let lock = self.data.lock().unwrap();
-        let mut out: Vec<(u64, Share)> = lock
-            .iter()
-            .filter(|((s, c, v), _)| {
-                *s == sid && wanted.contains(c) && (versions.is_empty() || versions.contains(v))
-            })
-            .map(|((_, c, _), share)| (*c, share.clone()))
-            .collect();
-        out.sort_by_key(|(c, share)| (share.version, *c));
-        Box::pin(future::ready(Ok(out
+    ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
+        Box::pin(std::future::ready(Ok(self.select(sid, cids, versions))))
+    }
+    fn load_all(&self, sid: u64, cids: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
+        Box::pin(std::future::ready(Ok(self
+            .select(sid, cids, &[])
             .into_iter()
             .map(|(_, share)| share)
             .collect())))
-    }
-    fn load_all(&self, sid: u64, cids: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
-        self.load_many(sid, cids, &[])
     }
     fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
         Box::pin(future::ready(Ok(None)))
     }
     fn save(&mut self, sid: u64, cid: ChannelId, share: Share) -> ShareStoreFuture<'_, ()> {
+        if *self.fail_save.lock().unwrap() {
+            return Box::pin(std::future::ready(Err(ShareStoreError::Backend(
+                "share store backend unavailable".to_owned().into(),
+            ))));
+        }
         let v = share.version;
         self.data.lock().unwrap().insert((sid, cid.0, v), share);
         Box::pin(future::ready(Ok(())))
@@ -398,6 +470,19 @@ impl DeRecShareStore for InMemShareStore {
             .unwrap()
             .retain(|(s, c, v), _| !(*s == sid && *c == cid.0 && versions.contains(v)));
         Box::pin(future::ready(Ok(())))
+    }
+    fn remove_versions_many(
+        &mut self,
+        sid: u64,
+        entries: &[(ChannelId, Vec<u32>)],
+    ) -> ShareStoreFuture<'_, ()> {
+        self.data.lock().unwrap().retain(|(s, c, v), _| {
+            !(*s == sid
+                && entries
+                    .iter()
+                    .any(|(cid, versions)| *c == cid.0 && versions.contains(v)))
+        });
+        Box::pin(std::future::ready(Ok(())))
     }
     fn keep_version(&self, _: u64, version: u32) -> ShareStoreFuture<'_, u32> {
         let keep = self
@@ -465,7 +550,7 @@ impl DeRecShareStore for RefusingShareStore {
         secret_id: u64,
         channel_ids: &[ChannelId],
         versions: &[u32],
-    ) -> ShareStoreFuture<'_, Vec<Share>> {
+    ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
         if *self.load_backend_error.lock().unwrap() {
             return Self::backend_error();
         }
@@ -512,6 +597,13 @@ impl DeRecShareStore for RefusingShareStore {
         versions: &[u32],
     ) -> ShareStoreFuture<'_, ()> {
         self.inner.remove_versions(secret_id, channel_id, versions)
+    }
+    fn remove_versions_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, Vec<u32>)],
+    ) -> ShareStoreFuture<'_, ()> {
+        self.inner.remove_versions_many(secret_id, entries)
     }
     fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32> {
         self.inner.keep_version(secret_id, version)
@@ -599,6 +691,9 @@ impl DeRecStateStore for InMemStateStore {
     fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
         Box::pin(future::ready(Ok(false)))
     }
+    fn remove_many(&mut self, _: u64, _: &[StateKey]) -> StateStoreFuture<'_, ()> {
+        Box::pin(std::future::ready(Ok(())))
+    }
     fn load_all(&self, _: u64, _: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
         Box::pin(future::ready(Ok(Vec::new())))
     }
@@ -625,6 +720,13 @@ impl DeRecStateStore for InMemPersistedStateStore {
     fn remove(&mut self, sid: u64, key: StateKey) -> StateStoreFuture<'_, bool> {
         let removed = self.data.lock().unwrap().remove(&(sid, key)).is_some();
         Box::pin(future::ready(Ok(removed)))
+    }
+    fn remove_many(&mut self, sid: u64, keys: &[StateKey]) -> StateStoreFuture<'_, ()> {
+        let mut data = self.data.lock().unwrap();
+        for key in keys {
+            data.remove(&(sid, key.clone()));
+        }
+        Box::pin(std::future::ready(Ok(())))
     }
     fn load_all(&self, sid: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
         let v: Vec<StateItem> = self

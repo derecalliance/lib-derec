@@ -4,6 +4,8 @@
 package native
 
 import (
+	"encoding/json"
+	"strconv"
 	"sync"
 	"unsafe"
 
@@ -17,6 +19,7 @@ type secretStore interface {
 	LoadMany(secretID uint64, channelIDs []uint64, kind SecretKind) ([]*SecretValue, error)
 	Save(secretID, channelID uint64, value SecretValue) error
 	Remove(secretID, channelID uint64, kind SecretKind) error
+	RemoveMany(secretID uint64, entries []SecretEntry) error
 }
 
 // SecretStoreCallbacks mirrors #[repr(C)] struct SecretStoreCallbacks in
@@ -27,6 +30,7 @@ type SecretStoreCallbacks struct {
 	LoadMany   uintptr
 	Save       uintptr
 	Remove     uintptr
+	RemoveMany uintptr
 	FreeBuffer uintptr
 }
 
@@ -85,6 +89,46 @@ func dispatchSecretRemove(s *storeSet, secretID, channelID uint64, kind uint32) 
 	return ffiStatusOK
 }
 
+func dispatchSecretRemoveMany(s *storeSet, secretID uint64, entriesJSON []byte) (status int32) {
+	defer recoverInto(&status)
+	entries, err := decodeSecretEntries(entriesJSON)
+	if err != nil {
+		return ffiStatusFailure
+	}
+	if err := s.secret.RemoveMany(secretID, entries); err != nil {
+		return ffiStatusFailure
+	}
+	return ffiStatusOK
+}
+
+// decodeSecretEntries parses the core's JSON array of [channel_id, kind]
+// pairs, the channel id a decimal string and the kind a number.
+func decodeSecretEntries(data []byte) ([]SecretEntry, error) {
+	var pairs [][2]json.RawMessage
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &pairs); err != nil {
+			return nil, err
+		}
+	}
+	entries := make([]SecretEntry, 0, len(pairs))
+	for _, p := range pairs {
+		var channelStr string
+		if err := json.Unmarshal(p[0], &channelStr); err != nil {
+			return nil, err
+		}
+		var kind uint32
+		if err := json.Unmarshal(p[1], &kind); err != nil {
+			return nil, err
+		}
+		channelID, err := strconv.ParseUint(channelStr, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, SecretEntry{ChannelID: channelID, Kind: SecretKind(kind)})
+	}
+	return entries, nil
+}
+
 // --- C-facing callbacks ------------------------------------------------------
 
 func secretLoadCallback(userData uintptr, secretID, channelID uint64, kind uint32, outPtr, outLen *uintptr) (status int32) {
@@ -133,16 +177,25 @@ func secretRemoveCallback(userData uintptr, secretID, channelID uint64, kind uin
 	return dispatchSecretRemove(s, secretID, channelID, kind)
 }
 
+func secretRemoveManyCallback(userData uintptr, secretID uint64, entriesPtr *byte, entriesLen uintptr) (status int32) {
+	defer recoverInto(&status)
+	s, ok := lookupStores(storeHandle(userData))
+	if !ok {
+		return ffiStatusFailure
+	}
+	return dispatchSecretRemoveMany(s, secretID, readFilterBytes(entriesPtr, entriesLen))
+}
+
 // secretCallbackPtrs holds the purego.NewCallback address for every
 // SecretStoreCallbacks fn-pointer field except FreeBuffer (shared package-
-// wide via sharedFreeBufferCallback). These four functions are stateless
+// wide via sharedFreeBufferCallback). These five functions are stateless
 // package-level funcs, so each needs exactly one registration total — see
 // registerChannelCallbacks in callbacks_channel.go for why per-call
 // registration would exhaust purego's 2000-slot callback table.
 var (
 	secretCallbacksOnce sync.Once
 	secretCallbackPtrs  struct {
-		load, loadMany, save, remove uintptr
+		load, loadMany, save, remove, removeMany uintptr
 	}
 )
 
@@ -152,6 +205,7 @@ func registerSecretCallbacks() {
 		secretCallbackPtrs.loadMany = purego.NewCallback(secretLoadManyCallback)
 		secretCallbackPtrs.save = purego.NewCallback(secretSaveCallback)
 		secretCallbackPtrs.remove = purego.NewCallback(secretRemoveCallback)
+		secretCallbackPtrs.removeMany = purego.NewCallback(secretRemoveManyCallback)
 	})
 }
 
@@ -166,6 +220,7 @@ func buildSecretStoreCallbacks(h storeHandle) SecretStoreCallbacks {
 		LoadMany:   secretCallbackPtrs.loadMany,
 		Save:       secretCallbackPtrs.save,
 		Remove:     secretCallbackPtrs.remove,
+		RemoveMany: secretCallbackPtrs.removeMany,
 		FreeBuffer: sharedFreeBufferCallback(),
 	}
 }

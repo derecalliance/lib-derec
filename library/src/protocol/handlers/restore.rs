@@ -42,22 +42,23 @@
 //! precondition on that publish.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecUserSecretStore, NotRestoredReason,
-    SecretValue, UnpairAck,
+    DeRecChannelStore, DeRecEvent, DeRecUserSecretStore, NotRestoredReason, UnpairAck,
     types::{
         ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole, Secret,
         UserSecrets,
     },
 };
+use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::protocol::context::{Local, Round};
 use crate::protocol::stores::{StoreSet, Stores};
+use crate::protocol::{ChannelKey, KeyRing};
 use crate::{
-    Result,
+    Error, Result,
     types::{ChannelId, SharedKey},
 };
 use std::collections::HashSet;
 
-use super::unpairing::{self, drop_channel_state};
+use super::unpairing::{self, drop_channels_state};
 use crate::derec_message::fresh_trace_id;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 #[cfg(target_arch = "wasm32")]
@@ -97,7 +98,7 @@ pub enum RestoreError {
 }
 
 /// Run the restore flow. On success: canonical helper channels are
-/// persisted with their `SharedKey`; canonical replica channels are
+/// persisted with their key; canonical replica channels are
 /// persisted with the group key from `secret.replicas.shared_key`; the
 /// user-secret snapshot is committed at `recovered_version`; every
 /// recovery-mode channel under `secret_id` is unpaired under the
@@ -155,7 +156,8 @@ pub enum RestoreError {
 /// # Sequence
 ///
 /// 1. **Preconditions.** Validate the protocol can restore and plan
-///    every write the rest of the flow makes.
+///    every write the rest of the flow makes. [`crate::Error::InvalidInput`]
+///    when `newest_version` is below `recovered_version`.
 ///    [`RestoreError::AlreadyRestored`] when a snapshot is already
 ///    committed, [`RestoreError::Invariant`] when a key is mis-sized, a
 ///    member's role is unknown or the threshold is below `2`, [`crate::Error::InvalidInput`] when a
@@ -165,11 +167,12 @@ pub enum RestoreError {
 ///    mutation. Channels at no roster id whose peer is a Helper are
 ///    recovery channels — wiped in step 5, never flagged as collisions.
 /// 2. **Helper channels.** Persist each reachable helper's canonical
-///    channel record and its `SharedKey`. No tracking share — see
+///    channel record and its key ring: the roster's key at its `key_epoch`,
+///    with `recovered_version` pinned to that epoch. No tracking share — see
 ///    *Verification after a restore* above.
 /// 3. **Replica members.** Persist every reachable member of the roster
-///    against the one group channel, with the group key as that channel's
-///    `SharedKey`. Each member's `role` is taken verbatim from the roster:
+///    against the one group channel, with that channel's key ring built
+///    from the group key the same way. Each member's `role` is taken verbatim from the roster:
 ///    it is a property of the group, not of the reader.
 ///
 ///    The device's own `replica_id` is **not** adopted from the recovered
@@ -178,12 +181,16 @@ pub enum RestoreError {
 ///    with its own convergence rules. A device that was built without a
 ///    `replica_id` still has none after restore and cannot publish as a
 ///    replica until the application configures one.
-/// 4. **Commit.** Write the user-secret snapshot at
-///    `recovered_version`, carrying the roster's threshold, so the next
-///    publish splits at the `t` the secret was shared under. To change it,
-///    pass `threshold` on `start(ProtectSecret)`. This write is the commit
-///    point — nothing is removed before it succeeds, so any earlier failure
-///    is fully retryable.
+/// 4. **Commit.** Write the user-secret snapshot at `newest_version`,
+///    carrying the recovered secrets and the roster's threshold, so the next
+///    publish is `newest_version + 1` and splits at the `t` the secret was
+///    shared under. A Helper refuses a version older than the newest it
+///    stores ([`IgnoreReason::Superseded`](crate::protocol::IgnoreReason::Superseded)),
+///    so a publish numbered from an older `recovered_version` would reach
+///    none of them. To change the threshold, pass `threshold` on
+///    `start(ProtectSecret)`. This write is the commit point — nothing is
+///    removed before it succeeds, so any earlier failure is fully
+///    retryable.
 /// 5. **Wipe.** Unpair every channel at no roster id whose peer is a
 ///    Helper — the recovery-mode channels minted to drive
 ///    `start(RecoverSecret)` — under the
@@ -216,18 +223,24 @@ pub(in crate::protocol) async fn restore<S: StoreSet>(
     local: &Local<'_>,
     secret: &Secret,
     recovered_version: u32,
+    newest_version: u32,
     unpair_ack: UnpairAck,
 ) -> Result<Vec<DeRecEvent>> {
+    if newest_version < recovered_version {
+        return Err(Error::InvalidInput(
+            "newest_version is below recovered_version",
+        ));
+    }
     let plan = plan_restore(secret)?;
     let existing_channels = check_preconditions(stores, local, &plan).await?;
 
-    write_helper_channels(stores, local, &plan.helpers).await?;
+    write_helper_channels(stores, local, &plan.helpers, recovered_version).await?;
 
     if let Some(group) = &plan.replicas {
-        write_replica_channels(stores, local, group).await?;
+        write_replica_channels(stores, local, group, recovered_version).await?;
     }
 
-    commit_snapshot(stores, local, secret, recovered_version).await?;
+    commit_snapshot(stores, local, secret, newest_version).await?;
 
     let mut events = plan.not_restored;
     events.extend(
@@ -256,7 +269,7 @@ pub(in crate::protocol) async fn restore<S: StoreSet>(
 /// Every write restore makes, derived from the recovered [`Secret`] alone
 /// and fully validated before any store is touched.
 struct RestorePlan {
-    helpers: Vec<(HelperChannel, SharedKey)>,
+    helpers: Vec<(HelperChannel, ChannelKey)>,
     replicas: Option<GroupPlan>,
     /// One [`DeRecEvent::PeerNotRestored`] per roster entry that gets no
     /// channel, in roster order.
@@ -272,7 +285,7 @@ struct RestorePlan {
 struct GroupPlan {
     channel_id: ChannelId,
     members: Vec<ReplicaMember>,
-    group_key: SharedKey,
+    group_key: ChannelKey,
 }
 
 fn plan_restore(secret: &Secret) -> Result<RestorePlan> {
@@ -311,7 +324,10 @@ fn plan_restore(secret: &Secret) -> Result<RestorePlan> {
                 peer_role: SenderKind::Helper,
                 weight: h.effective_weight(),
             },
-            shared_key,
+            ChannelKey {
+                epoch: h.key_epoch,
+                key: shared_key,
+            },
         ));
     }
 
@@ -355,7 +371,10 @@ fn plan_restore(secret: &Secret) -> Result<RestorePlan> {
                 Some(GroupPlan {
                     channel_id,
                     members,
-                    group_key,
+                    group_key: ChannelKey {
+                        epoch: group.key_epoch,
+                        key: group_key,
+                    },
                 })
             }
         }
@@ -411,10 +430,11 @@ async fn check_preconditions<S: StoreSet>(
 async fn write_helper_channels<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
-    helpers: &[(HelperChannel, SharedKey)],
+    helpers: &[(HelperChannel, ChannelKey)],
+    version: u32,
 ) -> Result<()> {
     let secret_id = local.secret_id;
-    for (channel, shared_key) in helpers {
+    for (channel, key) in helpers {
         let cid = channel.channel_id;
         stores
             .channels
@@ -422,7 +442,7 @@ async fn write_helper_channels<S: StoreSet>(
             .await?;
         stores
             .secrets
-            .save(secret_id, cid, SecretValue::SharedKey(*shared_key))
+            .save_key_ring(secret_id, cid, &KeyRing::restored(key, version))
             .await?;
     }
     Ok(())
@@ -432,6 +452,7 @@ async fn write_replica_channels<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     group: &GroupPlan,
+    version: u32,
 ) -> Result<()> {
     for member in &group.members {
         stores
@@ -442,10 +463,10 @@ async fn write_replica_channels<S: StoreSet>(
     // One key at the one channel every member is addressed on.
     stores
         .secrets
-        .save(
+        .save_key_ring(
             local.secret_id,
             group.channel_id,
-            SecretValue::SharedKey(group.group_key),
+            &KeyRing::restored(&group.group_key, version),
         )
         .await?;
     Ok(())
@@ -455,14 +476,14 @@ async fn commit_snapshot<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     secret: &Secret,
-    recovered_version: u32,
+    version: u32,
 ) -> Result<()> {
     stores
         .user_secrets
         .save_latest(
             local.secret_id,
             UserSecrets {
-                version: recovered_version,
+                version,
                 secrets: secret.secrets.clone(),
                 description: None,
                 author_replica_id: None,
@@ -502,7 +523,10 @@ async fn unpair_recovery_channels<S: StoreSet>(
                     channel_id,
                     error: e.to_string(),
                 });
-                if drop_channel_state(stores, local, channel_id).await.is_ok() {
+                if drop_channels_state(stores, local, &[channel_id])
+                    .await
+                    .is_ok()
+                {
                     events.push(DeRecEvent::Unpaired { channel_id });
                 }
             }
@@ -594,6 +618,7 @@ mod tests {
                     shared_key: vec![0xAA; 32],
                     communication_info: HashMap::from([("name".to_owned(), "HelperA".to_owned())]),
                     weight: 1,
+                    key_epoch: 0,
                 },
                 HelperInfo {
                     channel_id: 12,
@@ -604,6 +629,7 @@ mod tests {
                     shared_key: vec![0xBB; 32],
                     communication_info: HashMap::new(),
                     weight: 1,
+                    key_epoch: 0,
                 },
             ],
             secrets: vec![
@@ -641,6 +667,7 @@ mod tests {
                     },
                 ],
                 shared_key: vec![0xCC; 32],
+                key_epoch: 0,
             }),
             threshold: None,
         }
@@ -661,7 +688,7 @@ mod tests {
             secret.helpers[1].weight = 0;
 
             rig.protocol
-                .restore(&secret, 7)
+                .restore(&secret, 7, 7)
                 .await
                 .expect("restore succeeds");
 
@@ -683,6 +710,58 @@ mod tests {
         });
     }
 
+    /// A helper refuses a version older than the newest it stores, so the
+    /// snapshot of an older recovered version is committed at the newest
+    /// version the helpers reported: the next publish numbers above it.
+    #[test]
+    fn restore_commits_the_snapshot_at_the_newest_version() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2F0;
+            let mut rig = build_rig(secret_id);
+
+            rig.protocol
+                .restore(&fixture_secret(), 7, 12)
+                .await
+                .expect("restore succeeds");
+
+            let snapshot = rig
+                .user_secret_store
+                .load_latest(secret_id)
+                .await
+                .unwrap()
+                .expect("snapshot must exist");
+            assert_eq!(snapshot.version, 12);
+            assert_eq!(snapshot.secrets[0].name, "wallet");
+        });
+    }
+
+    #[test]
+    fn restore_refuses_a_newest_version_below_the_recovered_one() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2F1;
+            let mut rig = build_rig(secret_id);
+
+            let err = rig
+                .protocol
+                .restore(&fixture_secret(), 7, 6)
+                .await
+                .expect_err("a newest version below the recovered one is refused");
+
+            assert!(
+                matches!(err, Error::InvalidInput(_)),
+                "expected InvalidInput, got {err:?}"
+            );
+            assert!(
+                rig.user_secret_store
+                    .load_latest(secret_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "nothing is committed"
+            );
+        });
+    }
+
     #[test]
     fn restore_happy_path_persists_canonical_state() {
         run_async(async {
@@ -690,7 +769,7 @@ mod tests {
             let mut rig = build_rig(secret_id);
 
             rig.protocol
-                .restore(&fixture_secret(), 7)
+                .restore(&fixture_secret(), 7, 7)
                 .await
                 .expect("happy path must succeed");
 
@@ -761,7 +840,7 @@ mod tests {
                 .unwrap()
                 .expect("replica group key must be persisted");
             match rep_sk {
-                SecretValue::SharedKey(k) => assert_eq!(k.to_vec(), vec![0xCC; 32]),
+                SecretValue::SharedKey(k) => assert_eq!(k.as_bytes().to_vec(), vec![0xCC; 32]),
                 _ => panic!("expected SharedKey"),
             }
 
@@ -818,7 +897,7 @@ mod tests {
             }];
 
             rig.protocol
-                .restore(&secret, 7)
+                .restore(&secret, 7, 7)
                 .await
                 .expect("a grpc roster must restore");
 
@@ -957,7 +1036,7 @@ mod tests {
 
             let events = rig
                 .protocol
-                .restore(&secret, 7)
+                .restore(&secret, 7, 7)
                 .await
                 .expect("an unreachable helper must not block the restore");
 
@@ -1004,7 +1083,7 @@ mod tests {
 
             let events = rig
                 .protocol
-                .restore(&secret, 7)
+                .restore(&secret, 7, 7)
                 .await
                 .expect("an unreachable member must not block the restore");
 
@@ -1021,7 +1100,7 @@ mod tests {
             assert!(
                 matches!(
                     shared_key_at(&rig, secret_id, 21).await,
-                    Some(SecretValue::SharedKey(k)) if k == [0xCC; 32]
+                    Some(SecretValue::SharedKey(k)) if k == crate::types::SharedKey::new([0xCC; 32])
                 ),
                 "the group key is written for the members that remain"
             );
@@ -1043,7 +1122,7 @@ mod tests {
                 m.transports = Vec::new();
             }
 
-            let events = rig.protocol.restore(&secret, 7).await.expect("restores");
+            let events = rig.protocol.restore(&secret, 7, 7).await.expect("restores");
 
             assert_eq!(
                 not_restored(&events),
@@ -1088,7 +1167,7 @@ mod tests {
             );
             rig.secret_store.data.lock().unwrap().insert(
                 (secret_id, 12, SecretKind::SharedKey as u8),
-                SecretValue::SharedKey([0x77; 32]),
+                SecretValue::SharedKey(SharedKey::new([0x77; 32])),
             );
 
             let mut secret = fixture_secret();
@@ -1096,7 +1175,7 @@ mod tests {
 
             let events = rig
                 .protocol
-                .restore(&secret, 7)
+                .restore(&secret, 7, 7)
                 .await
                 .expect("a skipped helper's id must not be reported as a conflict");
 
@@ -1121,7 +1200,7 @@ mod tests {
             assert!(
                 matches!(
                     shared_key_at(&rig, secret_id, 12).await,
-                    Some(SecretValue::SharedKey(k)) if k == [0x77; 32]
+                    Some(SecretValue::SharedKey(k)) if k == crate::types::SharedKey::new([0x77; 32])
                 ),
                 "its key is left as it was"
             );
@@ -1140,7 +1219,7 @@ mod tests {
             secret.helpers[1].transports = Vec::new();
             secret.helpers[1].shared_key = vec![0xBB; 31];
 
-            let err = rig.protocol.restore(&secret, 7).await.unwrap_err();
+            let err = rig.protocol.restore(&secret, 7, 7).await.unwrap_err();
             assert!(
                 matches!(err, Error::Restore(RestoreError::Invariant(_))),
                 "got {err:?}"
@@ -1170,7 +1249,7 @@ mod tests {
             let mut secret = fixture_secret();
             secret.helpers[1].shared_key = vec![0xBB; 31];
 
-            let err = rig.protocol.restore(&secret, 7).await.unwrap_err();
+            let err = rig.protocol.restore(&secret, 7, 7).await.unwrap_err();
             assert!(matches!(err, Error::Restore(RestoreError::Invariant(_))));
             assert!(helper_record(&rig, secret_id, 11).await.is_none());
             assert!(shared_key_at(&rig, secret_id, 11).await.is_none());
@@ -1222,7 +1301,7 @@ mod tests {
 
             let events = rig
                 .protocol
-                .restore(&secret, 3)
+                .restore(&secret, 3, 3)
                 .await
                 .expect("one unusable URI must not refuse the whole secret");
 
@@ -1269,7 +1348,7 @@ mod tests {
             );
             rig.secret_store.data.lock().unwrap().insert(
                 (secret_id, rcid, SecretKind::SharedKey as u8),
-                SecretValue::SharedKey([0x77; 32]),
+                SecretValue::SharedKey(SharedKey::new([0x77; 32])),
             );
         }
     }
@@ -1288,7 +1367,7 @@ mod tests {
 
             let events = rig
                 .protocol
-                .restore(&fixture_secret(), 7)
+                .restore(&fixture_secret(), 7, 7)
                 .await
                 .expect("restore must succeed despite recovery channels");
 
@@ -1336,7 +1415,7 @@ mod tests {
             seed_recovery_channels(&rig, secret_id);
 
             rig.protocol
-                .restore(&fixture_secret(), 7)
+                .restore(&fixture_secret(), 7, 7)
                 .await
                 .expect("restore must succeed despite recovery channels");
 
@@ -1409,7 +1488,7 @@ mod tests {
                 );
                 rig.secret_store.data.lock().unwrap().insert(
                     (secret_id, OWNER_CHANNEL, SecretKind::SharedKey as u8),
-                    SecretValue::SharedKey([0x55; 32]),
+                    SecretValue::SharedKey(SharedKey::new([0x55; 32])),
                 );
                 rig.share_store
                     .save(
@@ -1428,7 +1507,7 @@ mod tests {
 
                 let events = rig
                     .protocol
-                    .restore(&fixture_secret(), 7)
+                    .restore(&fixture_secret(), 7, 7)
                     .await
                     .expect("restore succeeds");
 
@@ -1522,11 +1601,11 @@ mod tests {
             );
             rig.secrets.data.lock().unwrap().insert(
                 (secret_id, 99, SecretKind::SharedKey as u8),
-                SecretValue::SharedKey([0x77; 32]),
+                SecretValue::SharedKey(SharedKey::new([0x77; 32])),
             );
 
             let events = protocol
-                .restore(&fixture_secret(), 7)
+                .restore(&fixture_secret(), 7, 7)
                 .await
                 .expect("an unreachable peer must not fail the restore");
 
@@ -1606,7 +1685,7 @@ mod tests {
             };
 
             rig.protocol
-                .restore(&secret, 4)
+                .restore(&secret, 4, 4)
                 .await
                 .expect("restore must succeed");
 
@@ -1673,7 +1752,7 @@ mod tests {
             .save(
                 secret_id,
                 ChannelId(channel),
-                SecretValue::SharedKey([channel as u8; 32]),
+                SecretValue::SharedKey(SharedKey::new([channel as u8; 32])),
             )
             .await
             .expect("seed key");
@@ -1681,12 +1760,15 @@ mod tests {
 
     async fn publish_after_pairing(rig: &mut TestRig, channel: u64) {
         rig.protocol
-            .maybe_auto_publish_after_pair(&[DeRecEvent::PairingCompleted {
-                channel_id: ChannelId(channel),
-                pairing_channel_id: ChannelId(channel),
-                kind: SenderKind::Owner,
-                peer_communication_info: HashMap::new(),
-            }])
+            .maybe_auto_publish(
+                &[DeRecEvent::PairingCompleted {
+                    channel_id: ChannelId(channel),
+                    pairing_channel_id: ChannelId(channel),
+                    kind: SenderKind::Owner,
+                    peer_communication_info: HashMap::new(),
+                }],
+                &std::collections::HashSet::new(),
+            )
             .await
             .expect("the pairing publish runs");
     }
@@ -1731,7 +1813,7 @@ mod tests {
             };
 
             rig.protocol
-                .restore(&secret, 4)
+                .restore(&secret, 4, 4)
                 .await
                 .expect("restore succeeds");
             assert_eq!(stored_threshold(&rig, secret_id).await, Some(3));
@@ -1775,7 +1857,7 @@ mod tests {
             };
 
             rig.protocol
-                .restore(&secret, 4)
+                .restore(&secret, 4, 4)
                 .await
                 .expect("restore succeeds");
             assert_eq!(stored_threshold(&rig, secret_id).await, None);
@@ -1801,7 +1883,7 @@ mod tests {
 
             let err = rig
                 .protocol
-                .restore(&secret, 4)
+                .restore(&secret, 4, 4)
                 .await
                 .expect_err("a threshold of 1 is malformed");
             assert!(
@@ -1836,7 +1918,7 @@ mod tests {
 
             let err = rig
                 .protocol
-                .restore(&fixture_secret(), 7)
+                .restore(&fixture_secret(), 7, 7)
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::Restore(RestoreError::AlreadyRestored)));
@@ -1881,7 +1963,7 @@ mod tests {
 
             let err = rig
                 .protocol
-                .restore(&fixture_secret(), 7)
+                .restore(&fixture_secret(), 7, 7)
                 .await
                 .unwrap_err();
             let Error::Restore(RestoreError::Conflict(ids)) = err else {
@@ -1910,7 +1992,7 @@ mod tests {
                 group.shared_key = Vec::new();
             }
 
-            let err = rig.protocol.restore(&secret, 7).await.unwrap_err();
+            let err = rig.protocol.restore(&secret, 7, 7).await.unwrap_err();
             assert!(matches!(err, Error::Restore(RestoreError::Invariant(_))));
 
             // No mutation.
@@ -1950,7 +2032,7 @@ mod tests {
                 .build()
                 .expect("build");
 
-            protocol.restore(&fixture_secret(), 7).await.unwrap();
+            protocol.restore(&fixture_secret(), 7, 7).await.unwrap();
             assert_eq!(protocol.replica_id, Some(0x1234));
         });
     }

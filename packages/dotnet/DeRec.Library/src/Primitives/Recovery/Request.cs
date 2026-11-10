@@ -30,11 +30,16 @@ public static partial class Recovery
                 Array.Empty<TransportProtocol>();
         }
 
+        /// <summary>
+        /// <c>epoch</c> is the epoch of <c>sharedKey</c> in the channel's key chain,
+        /// stamped into the envelope's <c>sequence</c>; 0 for a freshly paired channel.
+        /// </summary>
         public static DeRecMessage Produce(
             ulong channelId,
             ulong secretId,
             uint version,
             byte[] sharedKey,
+            uint epoch,
             IReadOnlyList<TransportProtocol>? replyTo = null
         )
         {
@@ -50,6 +55,7 @@ public static partial class Recovery
                     version,
                     sharedKey,
                     (UIntPtr)sharedKey.Length,
+                    epoch,
                     replyToBytes,
                     replyToLen
                 );

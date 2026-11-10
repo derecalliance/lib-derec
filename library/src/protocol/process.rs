@@ -11,6 +11,7 @@
 use super::context::{local, pairing_config};
 use super::error::ProcessError;
 use super::events::DeRecEvent;
+use super::keychain::{KeyRing, Lookup};
 use super::stores::borrow_stores;
 use super::traits::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport,
@@ -18,18 +19,20 @@ use super::traits::{
 };
 use super::types::{SecretKind, SecretValue};
 use super::{DeRecProtocol, handlers};
-use crate::extensions::channel_store::ChannelStoreExt as _;
-use crate::{Error, Result, types::ChannelId};
-use derec_proto::DeRecMessage;
-use prost::Message;
-
 use crate::derec_message;
+use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::extensions::derec_message::DeRecMessageExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
 use crate::protocol::IgnoreReason;
+use crate::protocol::types::{ChannelQuery, ChannelStatus, ReplicaFilter};
+use crate::types::{ChannelId, ChannelKey};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
-use std::result;
+use crate::{Error, Result};
+use derec_proto::{DeRecMessage, PrePairRequestMessage, PrePairResponseMessage};
+use prost::Message;
 
 impl<
     Ch: DeRecChannelStore,
@@ -89,7 +92,8 @@ impl<
     /// does not decode, a channel with no key, a message that does not
     /// decrypt, any other failure of the pairing handshake or of a response
     /// this device received, and a store failure before the message could be
-    /// authenticated.
+    /// authenticated, or while the message's answers were recorded on the
+    /// open sharing rounds.
     ///
     /// # Event ordering
     ///
@@ -99,8 +103,15 @@ impl<
     ///
     /// A failed call still reports what it produced before failing, in
     /// [`ProcessError::events`]: the timeout events at least, and every
-    /// event of the message when only the follow-up auto-publish failed.
-    /// Those deadlines are already settled and are never reported again.
+    /// event of the message when only the follow-up auto-publish or the
+    /// recording of the message's answers failed. Those deadlines are
+    /// already settled and are never reported again.
+    ///
+    /// When the state store fails while the message's answers are recorded
+    /// on the open sharing rounds, the message itself was handled but no
+    /// round has taken its answers yet. Processing the same bytes again,
+    /// within the inbound message timeout, records them; that call repeats
+    /// the message's own events, never a round's.
     ///
     /// # Security: replay and reflection
     ///
@@ -180,7 +191,8 @@ impl<
     pub async fn process(
         &mut self,
         message: &[u8],
-    ) -> result::Result<Vec<DeRecEvent>, ProcessError> {
+    ) -> std::result::Result<Vec<DeRecEvent>, ProcessError> {
+        let share_holders = self.pending_unpair_share_holders().await;
         let mut events = self.run_timeout_sweeps().await;
 
         let handled = self.handle_message(message).await;
@@ -190,7 +202,13 @@ impl<
                 channel_id
             }
             Err((channel_id, source)) => {
-                self.update_sharing_round(&mut events).await;
+                if let Err(_error) = self.update_sharing_round(&mut events).await {
+                    #[cfg(feature = "logging")]
+                    tracing::warn!(
+                        error = %_error,
+                        "sharing rounds could not be settled after a failed message"
+                    );
+                }
                 return Err(ProcessError {
                     channel_id,
                     source,
@@ -199,25 +217,39 @@ impl<
             }
         };
 
-        self.update_sharing_round(&mut events).await;
+        let settled = self.update_sharing_round(&mut events).await;
 
-        match self.maybe_auto_publish_after_pair(&events).await {
+        let published = match self.maybe_auto_publish(&events, &share_holders).await {
             Ok(auto_publish_events) => {
                 events.extend(auto_publish_events);
-                Ok(events)
+                Ok(())
             }
-            Err(source) => Err(ProcessError {
-                channel_id: Some(channel_id),
-                source,
-                events,
-            }),
-        }
+            Err(source) => Err(source),
+        };
+
+        let failure = match (settled, published) {
+            (Ok(()), Ok(())) => return Ok(events),
+            (Err(source), Ok(())) | (Ok(()), Err(source)) => source,
+            (Err(source), Err(_publish_error)) => {
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    error = %_publish_error,
+                    "publish after an unpair failed; the remaining helpers keep the previous version"
+                );
+                source
+            }
+        };
+        Err(ProcessError {
+            channel_id: Some(channel_id),
+            source: failure,
+            events,
+        })
     }
 
     async fn handle_message(
         &mut self,
         message: &[u8],
-    ) -> result::Result<(ChannelId, Vec<DeRecEvent>), (Option<ChannelId>, Error)> {
+    ) -> std::result::Result<(ChannelId, Vec<DeRecEvent>), (Option<ChannelId>, Error)> {
         let envelope =
             DeRecMessage::decode(message).map_err(|e| (None, Error::ProtobufDecode(e)))?;
         let channel_id = ChannelId(envelope.channel_id);
@@ -235,62 +267,18 @@ impl<
         Ok((channel_id, events))
     }
 
-    async fn is_pending_verification(&self, channel_id: ChannelId) -> Result<bool> {
-        use crate::protocol::types::{ChannelQuery, ChannelStatus, ReplicaFilter};
-
-        if let Some(record) = self
-            .channel_store
-            .load(self.secret_id, ChannelQuery::Helper { channel_id })
-            .await?
-            && record.status() == ChannelStatus::Pending
-        {
-            return Ok(true);
-        }
-
-        Ok(self
-            .channel_store
-            .replicas_matching(
-                self.secret_id,
-                ReplicaFilter {
-                    status: vec![ChannelStatus::Pending],
-                    ..Default::default()
-                },
-            )
-            .await?
-            .iter()
-            .any(|member| member.channel_id == channel_id))
-    }
-
-    pub(super) fn is_message_expired(
-        &self,
-        envelope: &DeRecMessage,
-        #[cfg_attr(not(feature = "logging"), allow(unused))] channel_id: ChannelId,
-    ) -> bool {
-        let Some(ts) = &envelope.timestamp else {
-            return false;
-        };
-        let msg_secs = ts.seconds as u64;
-        let now = now_secs();
-        let age = now.saturating_sub(msg_secs);
-        if age > self.timeouts.inbound_message.as_secs() {
-            #[cfg(feature = "logging")]
-            tracing::warn!(
-                channel_id = channel_id.0,
-                message_age_secs = age,
-                timeout_secs = self.timeouts.inbound_message.as_secs(),
-                "message discarded — older than configured timeout"
-            );
-            return true;
-        }
-        false
-    }
-
     async fn process_inner(
         &mut self,
         message: &DeRecMessage,
         channel_id: ChannelId,
     ) -> Result<Vec<DeRecEvent>> {
-        if self.is_message_expired(message, channel_id) {
+        if message.is_expired(now_secs(), self.timeouts.inbound_message) {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                channel_id = channel_id.0,
+                timeout_secs = self.timeouts.inbound_message.as_secs(),
+                "message discarded — older than configured timeout"
+            );
             return Ok(vec![DeRecEvent::MessageIgnored {
                 channel_id,
                 reason: IgnoreReason::Expired,
@@ -314,43 +302,97 @@ impl<
         ))
     }
 
+    /// Open and handle a message that arrived on a paired channel, or return
+    /// `None` when the channel has no key ring here.
+    ///
+    /// The key is chosen by the envelope's `sequence`, the epoch of the key
+    /// the payload is under. An epoch the ring cannot give a key for is
+    /// ignored as
+    /// [`IgnoreReason::KeyUnavailable`](crate::protocol::IgnoreReason::KeyUnavailable).
+    /// An epoch ahead of the newest is opened by deriving forward, within the
+    /// forward-jump limit; once the payload decrypts, the new epoch is
+    /// persisted before the message is handled, so a failure in handling does
+    /// not undo the move. An epoch below the newest is opened with the key the
+    /// ring holds or derives, and the ring does not move.
+    ///
+    /// A message that does not decrypt has no authenticated sender: it fails
+    /// with `Err`, nothing is sent, and no state changes.
     async fn process_channel_message(
         &mut self,
         message: &DeRecMessage,
         channel_id: ChannelId,
     ) -> Result<Option<Vec<DeRecEvent>>> {
-        let Some(SecretValue::SharedKey(shared_key)) = self
+        let Some(ring) = self
             .secret_store
-            .load(self.secret_id, channel_id, SecretKind::SharedKey)
+            .key_ring(self.secret_id, channel_id)
             .await?
         else {
             return Ok(None);
         };
 
-        if self.is_pending_verification(channel_id).await? {
+        if let Some(events) = self
+            .ignore_if_pending_verification(message, channel_id)
+            .await?
+        {
+            return Ok(Some(events));
+        }
+
+        let Some((key, inner_message)) = self.open(&ring, message, channel_id).await? else {
             #[cfg(feature = "logging")]
             tracing::warn!(
                 channel_id = channel_id.0,
-                "message ignored — channel is pending fingerprint verification"
+                sequence = message.sequence,
+                "message ignored — no key for its epoch"
             );
             return Ok(Some(vec![DeRecEvent::MessageIgnored {
                 channel_id,
-                reason: IgnoreReason::PendingVerification,
+                reason: IgnoreReason::KeyUnavailable,
                 trace_id: message.trace_id,
             }]));
-        }
+        };
 
         let events = handlers::handle(
             &mut borrow_stores!(self),
             &local!(self),
             message,
             channel_id,
-            &shared_key,
+            &inner_message,
+            &key,
             self.auto_respond_on_failure,
         )
         .await?;
 
         Ok(Some(events))
+    }
+
+    /// Decrypt `message` under the key `ring` holds for its `sequence`, and
+    /// store the ring moved forward when that epoch is ahead of the newest.
+    /// Returns the key and the decrypted payload, or `None` when the ring
+    /// has no key for the epoch.
+    ///
+    /// The sender holds the newer key, so the move is kept even if handling
+    /// then fails. A save failure leaves the ring where it was, and
+    /// processing the same bytes again retries it.
+    async fn open(
+        &mut self,
+        ring: &KeyRing,
+        message: &DeRecMessage,
+        channel_id: ChannelId,
+    ) -> Result<Option<(ChannelKey, Vec<u8>)>> {
+        let (key, advanced) = match ring.lookup(message.sequence) {
+            Lookup::Unavailable => return Ok(None),
+            Lookup::Held(key) | Lookup::Behind(key) => (key, None),
+            Lookup::Ahead { key, advanced } => (key, Some(advanced)),
+        };
+
+        let inner_message = derec_message::decrypt_inner_message(&message.message, &key.key)?;
+
+        if let Some(advanced) = advanced {
+            self.secret_store
+                .save_key_ring(self.secret_id, channel_id, &advanced)
+                .await?;
+        }
+        Ok(Some((key, inner_message)))
     }
 
     /// Dispatch a pairing message, trying the plaintext leg before the
@@ -381,58 +423,12 @@ impl<
         if let Ok(inner) = derec_message::extract_inner_plaintext_message(&message.message) {
             match inner {
                 MessageBody::PrePairRequest(request) => {
-                    let has_pairing_secret = matches!(
-                        self.secret_store
-                            .load(self.secret_id, channel_id, SecretKind::PairingSecret)
-                            .await?,
-                        Some(SecretValue::PairingSecret(_))
-                    );
-                    let has_pairing_contact = matches!(
-                        self.secret_store
-                            .load(self.secret_id, channel_id, SecretKind::PairingContact)
-                            .await?,
-                        Some(SecretValue::PairingContact(_))
-                    );
-                    if !has_pairing_secret && !has_pairing_contact {
-                        return Ok(None);
-                    }
-                    if let Some(events) = handlers::pairing::ignored_if_expired(
-                        &mut borrow_stores!(self),
-                        &local!(self),
-                        &pairing_config!(self),
-                        channel_id,
-                        request.timestamp.as_ref(),
-                        message.trace_id,
-                    )
-                    .await?
-                    {
-                        return Ok(Some(events));
-                    }
-                    let events = handlers::pairing::pre_pair::on_request(
-                        channel_id,
-                        &request,
-                        message.trace_id,
-                    )?;
-                    return Ok(Some(events));
+                    return self
+                        .process_pre_pair_request(message, channel_id, &request)
+                        .await;
                 }
-                MessageBody::PrePairResponse(resp) => {
-                    let Some(SecretValue::PairingContact(contact)) = self
-                        .secret_store
-                        .load(self.secret_id, channel_id, SecretKind::PairingContact)
-                        .await?
-                    else {
-                        return Ok(None);
-                    };
-                    let events = handlers::pairing::pre_pair::on_response(
-                        &mut borrow_stores!(self),
-                        &local!(self),
-                        &pairing_config!(self),
-                        channel_id,
-                        &contact,
-                        &resp,
-                    )
-                    .await?;
-                    return Ok(Some(events));
+                MessageBody::PrePairResponse(response) => {
+                    return self.process_pre_pair_response(channel_id, &response).await;
                 }
                 _ => {} // Fall through to the encrypted Pair path.
             }
@@ -458,6 +454,111 @@ impl<
         .await?;
         Ok(Some(events))
     }
+
+    /// Handle a `PrePairRequest` on a channel this device holds a
+    /// correlation record for, or return `None` when it holds neither kind.
+    async fn process_pre_pair_request(
+        &mut self,
+        message: &DeRecMessage,
+        channel_id: ChannelId,
+        request: &PrePairRequestMessage,
+    ) -> Result<Option<Vec<DeRecEvent>>> {
+        let has_pairing_secret = matches!(
+            self.secret_store
+                .load(self.secret_id, channel_id, SecretKind::PairingSecret)
+                .await?,
+            Some(SecretValue::PairingSecret(_))
+        );
+        let has_pairing_contact = matches!(
+            self.secret_store
+                .load(self.secret_id, channel_id, SecretKind::PairingContact)
+                .await?,
+            Some(SecretValue::PairingContact(_))
+        );
+        if !has_pairing_secret && !has_pairing_contact {
+            return Ok(None);
+        }
+        if let Some(events) = handlers::pairing::ignored_if_expired(
+            &mut borrow_stores!(self),
+            &local!(self),
+            &pairing_config!(self),
+            channel_id,
+            request.timestamp.as_ref(),
+            message.trace_id,
+        )
+        .await?
+        {
+            return Ok(Some(events));
+        }
+        let events =
+            handlers::pairing::pre_pair::on_request(channel_id, request, message.trace_id)?;
+        Ok(Some(events))
+    }
+
+    /// Handle a `PrePairResponse` against the contact this device stored,
+    /// or return `None` when it stored none for the channel.
+    async fn process_pre_pair_response(
+        &mut self,
+        channel_id: ChannelId,
+        response: &PrePairResponseMessage,
+    ) -> Result<Option<Vec<DeRecEvent>>> {
+        let Some(SecretValue::PairingContact(contact)) = self
+            .secret_store
+            .load(self.secret_id, channel_id, SecretKind::PairingContact)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let events = handlers::pairing::pre_pair::on_response(
+            &mut borrow_stores!(self),
+            &local!(self),
+            &pairing_config!(self),
+            channel_id,
+            &contact,
+            response,
+        )
+        .await?;
+        Ok(Some(events))
+    }
+
+    async fn ignore_if_pending_verification(
+        &self,
+        message: &DeRecMessage,
+        channel_id: ChannelId,
+    ) -> Result<Option<Vec<DeRecEvent>>> {
+        let helper_pending = self
+            .channel_store
+            .load(self.secret_id, ChannelQuery::Helper { channel_id })
+            .await?
+            .is_some_and(|record| record.status() == ChannelStatus::Pending);
+        let pending = helper_pending
+            || !self
+                .channel_store
+                .replicas_on_channel(
+                    self.secret_id,
+                    channel_id,
+                    ReplicaFilter {
+                        status: vec![ChannelStatus::Pending],
+                        ..Default::default()
+                    },
+                )
+                .await?
+                .is_empty();
+        if !pending {
+            return Ok(None);
+        }
+
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            channel_id = channel_id.0,
+            "message ignored — channel is pending fingerprint verification"
+        );
+        Ok(Some(vec![DeRecEvent::MessageIgnored {
+            channel_id,
+            reason: IgnoreReason::PendingVerification,
+            trace_id: message.trace_id,
+        }]))
+    }
 }
 
 #[cfg(test)]
@@ -473,19 +574,19 @@ mod tests {
     use crate::protocol::types::ReplicaRole;
     use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, SecretValue};
     use crate::types::ReplicaId;
-    use crate::types::SharedKey;
+
     use derec_proto::MessageBody;
     use derec_proto::Protocol;
     use derec_proto::SenderKind;
     use derec_proto::StatusEnum;
-    use derec_proto::StoreShareRequestMessage;
+
     use derec_proto::TransportProtocol;
-    use derec_proto::VerifyShareRequestMessage;
+
     use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0xAF;
     const CHANNEL: ChannelId = ChannelId(808);
-    const SHARED_KEY: SharedKey = [9u8; 32];
+    const SHARED_KEY: crate::types::SharedKey = crate::types::SharedKey::new([9u8; 32]);
 
     fn endpoint() -> TransportProtocol {
         TransportProtocol {
@@ -554,14 +655,16 @@ mod tests {
         DeRecMessageBuilder::channel()
             .channel_id(CHANNEL)
             .timestamp(timestamp)
-            .message_body(MessageBody::VerifyShareRequest(VerifyShareRequestMessage {
-                secret_id: SECRET_ID,
-                version: 1,
-                nonce: 7,
-                timestamp: Some(timestamp),
-                reply_to_transports: Vec::new(),
-            }))
-            .encrypt(&SHARED_KEY)
+            .message_body(derec_proto::MessageBody::VerifyShareRequest(
+                derec_proto::VerifyShareRequestMessage {
+                    secret_id: SECRET_ID,
+                    version: 1,
+                    nonce: 7,
+                    timestamp: Some(timestamp),
+                    reply_to_transports: Vec::new(),
+                },
+            ))
+            .encrypt(&crate::types::ChannelKey::new(0, SHARED_KEY.clone()))
             .expect("encrypt")
             .build()
             .expect("build")
@@ -671,14 +774,19 @@ mod tests {
             let envelope = DeRecMessageBuilder::channel()
                 .channel_id(CHANNEL)
                 .timestamp(timestamp)
-                .message_body(MessageBody::VerifyShareRequest(VerifyShareRequestMessage {
-                    secret_id: SECRET_ID,
-                    version: 1,
-                    nonce: 7,
-                    timestamp: Some(timestamp),
-                    reply_to_transports: Vec::new(),
-                }))
-                .encrypt(&[1u8; 32])
+                .message_body(derec_proto::MessageBody::VerifyShareRequest(
+                    derec_proto::VerifyShareRequestMessage {
+                        secret_id: SECRET_ID,
+                        version: 1,
+                        nonce: 7,
+                        timestamp: Some(timestamp),
+                        reply_to_transports: Vec::new(),
+                    },
+                ))
+                .encrypt(&crate::types::ChannelKey::new(
+                    0,
+                    crate::types::SharedKey::new([1u8; 32]),
+                ))
                 .expect("encrypt")
                 .build()
                 .expect("build")
@@ -761,14 +869,16 @@ mod tests {
             .channel_id(channel_id)
             .timestamp(sent_at)
             .trace_id(TRACE)
-            .message_body(MessageBody::StoreShareRequest(StoreShareRequestMessage {
-                secret_id: SECRET_ID,
-                version: 1,
-                timestamp: Some(sent_at),
-                replica_id: Some(SOURCE_ID),
-                ..Default::default()
-            }))
-            .encrypt(&SHARED_KEY)
+            .message_body(derec_proto::MessageBody::StoreShareRequest(
+                derec_proto::StoreShareRequestMessage {
+                    secret_id: SECRET_ID,
+                    version: 1,
+                    timestamp: Some(sent_at),
+                    replica_id: Some(SOURCE_ID),
+                    ..Default::default()
+                },
+            ))
+            .encrypt(&crate::types::ChannelKey::new(0, SHARED_KEY.clone()))
             .expect("encrypt")
             .build()
             .expect("build")

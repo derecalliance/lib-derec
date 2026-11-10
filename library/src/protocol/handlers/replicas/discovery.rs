@@ -9,11 +9,12 @@
 //! of catch-up. The owner↔helper side lives in
 //! [`handlers::discovery`](super::super::discovery), which routes here when
 //! the payload names an author.
-use super::{load_channel_key, load_member_keys};
+use super::load_member_keys;
 use crate::derec_message::{DeRecMessageBuilder, apply_trace_id, current_timestamp};
 use crate::extensions::advertised_endpoints::reply_to_owned;
 use crate::extensions::channel_store::{ChannelStoreExt as _, filter_reply_to};
 use crate::extensions::derec_result::DeRecResultExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
 use crate::protocol::context::{Exchange, Local};
@@ -21,9 +22,10 @@ use crate::protocol::obligation::{Obligation, deliver};
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{ChannelStatus, ReplicaFilter, ReplicaMember, ReplicaRole};
 use crate::protocol::{
-    DeRecEvent, DeRecStateStore, DeRecTransport, DeRecUserSecretStore, StateItem, StateKey,
+    ChannelKey, DeRecEvent, DeRecStateStore, DeRecTransport, DeRecUserSecretStore, StateItem,
+    StateKey,
 };
-use crate::types::{ReplicaId, SharedKey};
+use crate::types::ReplicaId;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
 use crate::{Error, Result};
@@ -64,7 +66,7 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
                 local,
                 &member,
                 &request,
-                *exchange.shared_key,
+                exchange.key,
                 exchange.trace_id,
                 exchange.obligation,
             )
@@ -79,7 +81,12 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
     }
 }
 
-/// Ask every other member which version it holds.
+/// Ask every other `Paired` member which version it holds.
+///
+/// Only `Paired` members are asked, because the check waits for every member
+/// it reached and has no timeout. A `Pending` member may never confirm and is
+/// removed when its pairing expires; an `Unpairing` one may be a lost device
+/// that never answers. Waiting on either would leave the check open forever.
 ///
 /// Returns `Ok(None)` when there is nobody to ask — a device with no peers is
 /// trivially current, and starting a round that can never complete would
@@ -185,7 +192,7 @@ async fn on_request<S: StoreSet>(
     local: &Local<'_>,
     member: &ReplicaMember,
     request: &GetSecretIdsVersionsRequestMessage,
-    shared_key: SharedKey,
+    key: &ChannelKey,
     inbound_trace_id: u64,
     obligation: Option<&Obligation>,
 ) -> Result<Vec<DeRecEvent>> {
@@ -218,7 +225,7 @@ async fn on_request<S: StoreSet>(
         .channel_id(member.channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::GetSecretIdsVersionsResponse(response))
-        .encrypt(&shared_key)?
+        .encrypt(key)?
         .build()?
         .encode_to_vec();
     let envelope = apply_trace_id(&envelope, inbound_trace_id)?;
@@ -401,7 +408,10 @@ async fn finish<S: StoreSet>(
             "the member holding the newest state is no longer in the roster",
         ))?;
 
-    let key = load_channel_key(stores, local, member.channel_id).await?;
+    let key = stores
+        .secrets
+        .current_key(local.secret_id, member.channel_id)
+        .await?;
     let timestamp = current_timestamp();
     let reply_to_transports = slice::from_ref(local.primary()).to_vec();
     let request = GetShareRequestMessage {
@@ -447,6 +457,7 @@ mod tests {
     };
     use crate::protocol::types::{ChannelRecord, ReplicaRole, SecretValue, UserSecrets};
     use crate::types::ChannelId;
+    use crate::types::SharedKey;
     use std::collections::HashSet;
 
     const SECRET_ID: u64 = 0xCA7C4;
@@ -492,7 +503,11 @@ mod tests {
 
     async fn seed_key(secrets: &mut InMemSecretStore) {
         secrets
-            .save(SECRET_ID, GROUP, SecretValue::SharedKey([0x11; 32]))
+            .save(
+                SECRET_ID,
+                GROUP,
+                SecretValue::SharedKey(SharedKey::new([0x11; 32])),
+            )
             .await
             .expect("seed key");
     }
@@ -809,8 +824,8 @@ mod tests {
     fn each_question_is_sealed_under_its_own_channel_key() {
         run_async(async {
             const PAIRING: ChannelId = ChannelId(5002);
-            const GROUP_KEY: SharedKey = [0x11; 32];
-            const PAIRING_KEY: SharedKey = [0x22; 32];
+            const GROUP_KEY: SharedKey = SharedKey::new([0x11; 32]);
+            const PAIRING_KEY: SharedKey = SharedKey::new([0x22; 32]);
 
             let lf = LocalFixture::with_replica(SECRET_ID, 1001);
             let mut rig = StoreRig::new();
@@ -949,7 +964,11 @@ mod tests {
             .await
             .expect("seed joiner");
         rig.secrets
-            .save(SECRET_ID, PAIRING, SecretValue::SharedKey([0x22; 32]))
+            .save(
+                SECRET_ID,
+                PAIRING,
+                SecretValue::SharedKey(SharedKey::new([0x22; 32])),
+            )
             .await
             .expect("seed pairing key");
     }

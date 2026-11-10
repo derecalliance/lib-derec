@@ -248,6 +248,9 @@ mod handshake_tests {
         fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
             Box::pin(future::ready(Ok(false)))
         }
+        fn remove_many(&mut self, _: u64, _: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+            Box::pin(std::future::ready(Ok(())))
+        }
         fn helpers(&self, _: u64, _: HelperFilter) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
             Box::pin(future::ready(Ok(Vec::new())))
         }
@@ -724,7 +727,11 @@ mod replica_id_conflict_tests {
             let mut rig = StoreRig::new();
             seed_member(&mut rig.channels, 1001, PAIRING).await;
             rig.secrets
-                .save(SECRET_ID, PAIRING, SecretValue::SharedKey([0x22; 32]))
+                .save(
+                    SECRET_ID,
+                    PAIRING,
+                    SecretValue::SharedKey(crate::types::SharedKey::new([0x22; 32])),
+                )
                 .await
                 .expect("seed key");
 
@@ -1261,7 +1268,11 @@ mod channel_in_use_tests {
 
     async fn seed_key(rig: &mut StoreRig) {
         rig.secrets
-            .save(SECRET_ID, GROUP, SecretValue::SharedKey([3u8; 32]))
+            .save(
+                SECRET_ID,
+                GROUP,
+                SecretValue::SharedKey(crate::types::SharedKey::new([3u8; 32])),
+            )
             .await
             .expect("seed group key");
     }
@@ -1489,11 +1500,24 @@ mod pairing_expiry_tests {
 
             scan(&mut scanner, contact.clone()).await.expect("scan");
             let events = creator.process(&last_sent(&scanner)).await.expect("prompt");
-            let mut action = pairing_action(&events);
-            let PendingAction::Pairing { request, .. } = &mut action else {
+            let action = pairing_action(&events);
+            let crate::protocol::Action::Pairing {
+                request,
+                kind,
+                peer_communication_info,
+            } = action.action()
+            else {
                 panic!("expected a pairing action, got {action:?}");
             };
+            let mut request = request.clone();
             request.timestamp = aged(WINDOW + 1);
+            let action = PendingAction::pairing(
+                action.channel_id(),
+                action.trace_id(),
+                request,
+                *kind,
+                peer_communication_info.clone(),
+            );
 
             let error = creator.accept(action).await.expect_err("too late");
 
@@ -1614,11 +1638,14 @@ mod pairing_expiry_tests {
                 let contact = new_contact(&mut creator, mode).await;
                 scan(&mut scanner, contact).await.expect("scan");
                 let events = creator.process(&last_sent(&scanner)).await.expect("prompt");
-                let mut action = pairing_action(&events);
-                let PendingAction::PrePair { request, .. } = &mut action else {
+                let action = pairing_action(&events);
+                let crate::protocol::Action::PrePair(request) = action.action() else {
                     panic!("{mode:?}: expected a pre-pair action, got {action:?}");
                 };
+                let mut request = request.clone();
                 request.timestamp = aged(WINDOW + 1);
+                let action =
+                    PendingAction::pre_pair(action.channel_id(), action.trace_id(), request);
                 let error = creator.accept(action).await.expect_err("too late");
                 assert!(is_expired(&error), "{mode:?}: got {error:?}");
                 assert!(creator.transport.sent_envelopes().is_empty(), "{mode:?}");

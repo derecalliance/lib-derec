@@ -88,6 +88,7 @@ impl<
             unsafe_connection: false,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
+            key_rotation: false,
             auto_reply_to: false,
             auto_accept: AutoAcceptPolicy::default(),
             replica_id: None,
@@ -100,6 +101,16 @@ impl<
     /// Returns the secret identifier this protocol instance was configured with.
     pub fn secret_id(&self) -> u64 {
         self.secret_id
+    }
+
+    /// This device's own row, as a
+    /// [`ReplicaFilter::exclude`](crate::protocol::types::ChannelFilter::exclude)
+    /// list. See [`Local::exclude_self`](crate::protocol::context::Local::exclude_self).
+    pub(super) fn exclude_self(&self) -> Vec<crate::types::ReplicaId> {
+        self.replica_id
+            .map(crate::types::ReplicaId)
+            .into_iter()
+            .collect()
     }
 
     /// Generate an out-of-band contact message (QR code payload, deep link, …).

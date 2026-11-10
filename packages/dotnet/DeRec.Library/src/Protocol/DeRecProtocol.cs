@@ -33,6 +33,7 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.ChannelStoreLoadDelegate _channelLoad;
     private readonly NP.ChannelStoreSaveDelegate _channelSave;
     private readonly NP.ChannelStoreRemoveDelegate _channelRemove;
+    private readonly NP.ChannelStoreRemoveManyDelegate _channelRemoveMany;
     private readonly NP.ChannelStoreListDelegate _channelListHelpers;
     private readonly NP.ChannelStoreListDelegate _channelListReplicas;
     private readonly NP.ChannelStoreLinkDelegate _channelLink;
@@ -42,6 +43,7 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.SecretStoreLoadManyDelegate _secretLoadMany;
     private readonly NP.SecretStoreSaveDelegate _secretSave;
     private readonly NP.SecretStoreRemoveDelegate _secretRemove;
+    private readonly NP.SecretStoreRemoveManyDelegate _secretRemoveMany;
     private readonly NP.FreeBufferDelegate _secretFreeBuffer;
     private readonly NP.ShareStoreLoadDelegate _shareLoad;
     private readonly NP.ShareStoreLoadManyDelegate _shareLoadMany;
@@ -50,6 +52,7 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.ShareStoreSaveDelegate _shareSave;
     private readonly NP.ShareStoreRemoveChannelDelegate _shareRemoveChannel;
     private readonly NP.ShareStoreRemoveVersionsDelegate _shareRemoveVersions;
+    private readonly NP.ShareStoreRemoveVersionsManyDelegate _shareRemoveVersionsMany;
     private readonly NP.ShareStoreKeepVersionDelegate _shareKeepVersion;
     private readonly NP.ShareStoreRecordVerificationDelegate _shareRecordVerification;
     private readonly NP.FreeBufferDelegate _shareFreeBuffer;
@@ -60,6 +63,7 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.StateStoreSaveDelegate _stateSave;
     private readonly NP.StateStoreLoadDelegate _stateLoad;
     private readonly NP.StateStoreRemoveDelegate _stateRemove;
+    private readonly NP.StateStoreRemoveManyDelegate _stateRemoveMany;
     private readonly NP.StateStoreLoadAllDelegate _stateLoadAll;
     private readonly NP.FreeBufferDelegate _stateFreeBuffer;
     private readonly NP.TransportSendDelegate _transportSend;
@@ -109,6 +113,7 @@ public sealed class DeRecProtocol : IDisposable
         _channelLoad = ChannelLoadImpl;
         _channelSave = ChannelSaveImpl;
         _channelRemove = ChannelRemoveImpl;
+        _channelRemoveMany = ChannelRemoveManyImpl;
         _channelListHelpers = ChannelListHelpersImpl;
         _channelListReplicas = ChannelListReplicasImpl;
         _channelLink = ChannelLinkImpl;
@@ -119,6 +124,7 @@ public sealed class DeRecProtocol : IDisposable
         _secretLoadMany = SecretLoadManyImpl;
         _secretSave = SecretSaveImpl;
         _secretRemove = SecretRemoveImpl;
+        _secretRemoveMany = SecretRemoveManyImpl;
         _secretFreeBuffer = FreeBufferImpl;
 
         _shareLoad = ShareLoadImpl;
@@ -128,6 +134,7 @@ public sealed class DeRecProtocol : IDisposable
         _shareSave = ShareSaveImpl;
         _shareRemoveChannel = ShareRemoveChannelImpl;
         _shareRemoveVersions = ShareRemoveVersionsImpl;
+        _shareRemoveVersionsMany = ShareRemoveVersionsManyImpl;
         _shareKeepVersion = ShareKeepVersionImpl;
         _shareRecordVerification = ShareRecordVerificationImpl;
         _shareFreeBuffer = FreeBufferImpl;
@@ -140,6 +147,7 @@ public sealed class DeRecProtocol : IDisposable
         _stateSave = StateSaveImpl;
         _stateLoad = StateLoadImpl;
         _stateRemove = StateRemoveImpl;
+        _stateRemoveMany = StateRemoveManyImpl;
         _stateLoadAll = StateLoadAllImpl;
         _stateFreeBuffer = FreeBufferImpl;
 
@@ -151,6 +159,7 @@ public sealed class DeRecProtocol : IDisposable
             Load = Marshal.GetFunctionPointerForDelegate(_channelLoad),
             Save = Marshal.GetFunctionPointerForDelegate(_channelSave),
             Remove = Marshal.GetFunctionPointerForDelegate(_channelRemove),
+            RemoveMany = Marshal.GetFunctionPointerForDelegate(_channelRemoveMany),
             ListHelpers = Marshal.GetFunctionPointerForDelegate(_channelListHelpers),
             ListReplicas = Marshal.GetFunctionPointerForDelegate(_channelListReplicas),
             LinkChannel = Marshal.GetFunctionPointerForDelegate(_channelLink),
@@ -164,6 +173,7 @@ public sealed class DeRecProtocol : IDisposable
             LoadMany = Marshal.GetFunctionPointerForDelegate(_secretLoadMany),
             Save = Marshal.GetFunctionPointerForDelegate(_secretSave),
             Remove = Marshal.GetFunctionPointerForDelegate(_secretRemove),
+            RemoveMany = Marshal.GetFunctionPointerForDelegate(_secretRemoveMany),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_secretFreeBuffer),
         };
         var shareCb = new NP.ShareStoreCallbacks
@@ -176,6 +186,7 @@ public sealed class DeRecProtocol : IDisposable
             Save = Marshal.GetFunctionPointerForDelegate(_shareSave),
             RemoveChannel = Marshal.GetFunctionPointerForDelegate(_shareRemoveChannel),
             RemoveVersions = Marshal.GetFunctionPointerForDelegate(_shareRemoveVersions),
+            RemoveVersionsMany = Marshal.GetFunctionPointerForDelegate(_shareRemoveVersionsMany),
             KeepVersion = Marshal.GetFunctionPointerForDelegate(_shareKeepVersion),
             RecordVerification = Marshal.GetFunctionPointerForDelegate(_shareRecordVerification),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_shareFreeBuffer),
@@ -194,6 +205,7 @@ public sealed class DeRecProtocol : IDisposable
             Save = Marshal.GetFunctionPointerForDelegate(_stateSave),
             Load = Marshal.GetFunctionPointerForDelegate(_stateLoad),
             Remove = Marshal.GetFunctionPointerForDelegate(_stateRemove),
+            RemoveMany = Marshal.GetFunctionPointerForDelegate(_stateRemoveMany),
             LoadAll = Marshal.GetFunctionPointerForDelegate(_stateLoadAll),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_stateFreeBuffer),
         };
@@ -543,6 +555,16 @@ public sealed class DeRecProtocol : IDisposable
     /// was recovered, or ask them, before calling this, which commits it to
     /// this device.
     /// </para>
+    /// <para>
+    /// <paramref name="version"/> is the version that was recovered and
+    /// <paramref name="newestVersion"/> the newest one any helper reported in
+    /// Discovery (<paramref name="version"/> itself when that is the newest).
+    /// The next publish is <c>newestVersion + 1</c>: a helper ignores a
+    /// version older than the newest it stores
+    /// (<see cref="IgnoreReason.Superseded"/>). A
+    /// <paramref name="newestVersion"/> below <paramref name="version"/> is
+    /// <see cref="DeRecCode.InvalidInput"/>.
+    /// </para>
     /// </summary>
     /// <exception cref="DeRecException">
     /// Thrown with <see cref="DeRecCode.AlreadyRestored"/>,
@@ -553,10 +575,15 @@ public sealed class DeRecProtocol : IDisposable
     /// channels at ids restore is about to write; clear exactly those and
     /// retry.
     /// </exception>
-    public Task<IReadOnlyList<DeRecEvent>> RestoreAsync(Secret recoveredSecret, uint version)
+    public Task<IReadOnlyList<DeRecEvent>> RestoreAsync(Secret recoveredSecret, uint version, uint newestVersion)
     {
         EnsureNotDisposed();
-        var dto = new RestoreParamsDto { Version = version, RecoveredSecret = recoveredSecret };
+        var dto = new RestoreParamsDto
+        {
+            Version = version,
+            NewestVersion = newestVersion,
+            RecoveredSecret = recoveredSecret,
+        };
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
         return Task.Run<IReadOnlyList<DeRecEvent>>(() =>
         {
@@ -581,6 +608,7 @@ public sealed class DeRecProtocol : IDisposable
     private sealed record RestoreParamsDto
     {
         [JsonPropertyName("version")] public required uint Version { get; init; }
+        [JsonPropertyName("newest_version")] public required uint NewestVersion { get; init; }
         [JsonPropertyName("recovered_secret")] public required Secret RecoveredSecret { get; init; }
     }
 
@@ -762,6 +790,26 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
+    private int ChannelRemoveManyImpl(IntPtr userData, ulong secretId, IntPtr queries, UIntPtr queriesLen)
+    {
+        try
+        {
+            var bytes = new byte[(int)queriesLen];
+            if (bytes.Length > 0)
+                Marshal.Copy(queries, bytes, 0, bytes.Length);
+            var pairs = JsonSerializer.Deserialize<List<string[]>>(bytes, JsonOpts)
+                        ?? new List<string[]>();
+            var parsed = pairs
+                .Select(p => (
+                    ChannelId: ulong.Parse(p[0], System.Globalization.CultureInfo.InvariantCulture),
+                    ReplicaId: ulong.Parse(p[1], System.Globalization.CultureInfo.InvariantCulture)))
+                .ToList();
+            _channelStore.RemoveMany(secretId, parsed);
+            return 0;
+        }
+        catch { return -1; }
+    }
+
     private int ChannelListHelpersImpl(
         IntPtr userData, ulong secretId, IntPtr filter, UIntPtr filterLen,
         out IntPtr outPtr, out UIntPtr outLen)
@@ -934,6 +982,30 @@ public sealed class DeRecProtocol : IDisposable
         catch { return -1; }
     }
 
+    private int SecretRemoveManyImpl(IntPtr userData, ulong secretId, IntPtr entries, UIntPtr entriesLen)
+    {
+        try
+        {
+            var bytes = new byte[(int)entriesLen];
+            if (bytes.Length > 0)
+                Marshal.Copy(entries, bytes, 0, bytes.Length);
+            var pairs = bytes.Length == 0
+                ? new List<JsonElement[]>()
+                : JsonSerializer.Deserialize<List<JsonElement[]>>(bytes, JsonOpts)
+                  ?? new List<JsonElement[]>();
+            var parsed = pairs
+                .Select(p => (
+                    ChannelId: ulong.Parse(
+                        p[0].GetString() ?? throw new InvalidOperationException("null channel id"),
+                        System.Globalization.CultureInfo.InvariantCulture),
+                    Kind: (SecretKind)p[1].GetUInt32()))
+                .ToList();
+            _secretStore.RemoveMany(secretId, parsed);
+            return 0;
+        }
+        catch { return -1; }
+    }
+
     private int ShareLoadImpl(
         IntPtr userData, ulong secretId, ulong channelId,
         IntPtr versionsJsonPtr, UIntPtr versionsJsonLen,
@@ -967,7 +1039,11 @@ public sealed class DeRecProtocol : IDisposable
             ulong[] channelIds = DeserializeJsonArray<ulong>(channelIdsJsonPtr, channelIdsJsonLen) ?? Array.Empty<ulong>();
             uint[] versions = DeserializeJsonArray<uint>(versionsJsonPtr, versionsJsonLen) ?? Array.Empty<uint>();
             var records = _shareStore.LoadMany(secretId, channelIds, versions)
-                .Select(s => new ShareRecordDto(s.SecretId.ToString(), s.Version, s.Bytes, s.Subshares, s.Threshold))
+                .Select(e => new object[]
+                {
+                    e.ChannelId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    new ShareRecordDto(e.Share.SecretId.ToString(), e.Share.Version, e.Share.Bytes, e.Share.Subshares, e.Share.Threshold),
+                })
                 .ToList();
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(records, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
@@ -1071,6 +1147,30 @@ public sealed class DeRecProtocol : IDisposable
         {
             uint[] versions = DeserializeJsonArray<uint>(versionsJsonPtr, versionsJsonLen) ?? Array.Empty<uint>();
             _shareStore.RemoveVersions(secretId, channelId, versions);
+            return 0;
+        }
+        catch { return -1; }
+    }
+
+    private int ShareRemoveVersionsManyImpl(IntPtr userData, ulong secretId, IntPtr entries, UIntPtr entriesLen)
+    {
+        try
+        {
+            var bytes = new byte[(int)entriesLen];
+            if (bytes.Length > 0)
+                Marshal.Copy(entries, bytes, 0, bytes.Length);
+            var pairs = bytes.Length == 0
+                ? new List<JsonElement[]>()
+                : JsonSerializer.Deserialize<List<JsonElement[]>>(bytes, JsonOpts)
+                  ?? new List<JsonElement[]>();
+            var parsed = pairs
+                .Select(p => (
+                    ChannelId: ulong.Parse(
+                        p[0].GetString() ?? throw new InvalidOperationException("null channel id"),
+                        System.Globalization.CultureInfo.InvariantCulture),
+                    Versions: p[1].EnumerateArray().Select(v => v.GetUInt32()).ToArray()))
+                .ToList();
+            _shareStore.RemoveVersionsMany(secretId, parsed);
             return 0;
         }
         catch { return -1; }
@@ -1255,6 +1355,24 @@ public sealed class DeRecProtocol : IDisposable
         Marshal.Copy(ptr, buf, 0, buf.Length);
         var dto = JsonSerializer.Deserialize<StateKeyDto>(buf, JsonOpts)
             ?? throw new InvalidOperationException("null StateKey");
+        return FromKeyDto(dto);
+    }
+
+    private static List<StateKey> ParseKeyListBuffer(IntPtr ptr, UIntPtr len)
+    {
+        byte[] buf = new byte[(int)len];
+        if (buf.Length == 0)
+            return new List<StateKey>();
+        Marshal.Copy(ptr, buf, 0, buf.Length);
+        var dtos = JsonSerializer.Deserialize<List<StateKeyDto>>(buf, JsonOpts)
+            ?? throw new InvalidOperationException("null StateKey list");
+        return dtos
+            .Select(d => FromKeyDto(d ?? throw new InvalidOperationException("null StateKey")))
+            .ToList();
+    }
+
+    private static StateKey FromKeyDto(StateKeyDto dto)
+    {
         var kind = (StateKind)dto.kind;
         return kind switch
         {
@@ -1337,6 +1455,18 @@ public sealed class DeRecProtocol : IDisposable
             outRemoved = 0;
             return -1;
         }
+    }
+
+    private int StateRemoveManyImpl(
+        IntPtr userData, ulong secretId,
+        IntPtr keysJsonPtr, UIntPtr keysJsonLen)
+    {
+        try
+        {
+            _stateStore.RemoveMany(secretId, ParseKeyListBuffer(keysJsonPtr, keysJsonLen));
+            return 0;
+        }
+        catch { return -1; }
     }
 
     private int StateLoadAllImpl(

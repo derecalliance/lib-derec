@@ -7,7 +7,7 @@ use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     primitives::verification::VerificationError,
-    types::{ChannelId, SharedKey},
+    types::{ChannelId, ChannelKey, SharedKey},
     utils::verify_timestamps,
 };
 use derec_proto::{
@@ -49,8 +49,9 @@ pub struct ExtractResult {
 /// * `channel_id` - Channel identifier for the previously paired Helper.
 /// * `request` - The decrypted [`derec_proto::VerifyShareRequestMessage`] previously
 ///   returned by [`super::request::extract`].
-/// * `shared_key` - Previously established 32-byte symmetric channel key used to encrypt
-///   the response.
+/// * `channel_key` - The channel key and its epoch. The payload is encrypted
+///   under the key and the envelope's `sequence` carries the epoch, so the
+///   receiver can pick the key that opens it; see [`crate::types::ChannelKey`].
 /// * `share_content` - The share bytes whose possession is being proven.
 ///
 /// # Returns
@@ -79,17 +80,18 @@ pub struct ExtractResult {
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 ///
 /// // Owner: issue a verification challenge.
 /// let request::ProduceResult { envelope: req_envelope, .. } =
-///     request::produce(channel_id, 1, 1, &shared_key, &[]).expect("produce request failed");
+///     request::produce(channel_id, 1, 1, &channel_key, &[]).expect("produce request failed");
 ///
 /// // Helper: extract the challenge and answer it with the share bytes.
 /// let request::ExtractResult { request: challenge } =
 ///     request::extract(&req_envelope, &shared_key).expect("extract request failed");
 /// let response::ProduceResult { envelope } =
-///     response::produce(channel_id, &challenge, &shared_key, b"example_share")
+///     response::produce(channel_id, &challenge, &channel_key, b"example_share")
 ///         .expect("produce response failed");
 ///
 /// assert!(!envelope.is_empty());
@@ -104,7 +106,7 @@ pub struct ExtractResult {
 pub fn produce(
     channel_id: ChannelId,
     request: &VerifyShareRequestMessage,
-    shared_key: &SharedKey,
+    channel_key: &ChannelKey,
     share_content: impl AsRef<[u8]>,
 ) -> Result<ProduceResult, Error> {
     let hash = hash_content(share_content, request.nonce);
@@ -123,7 +125,7 @@ pub fn produce(
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::VerifyShareResponse(message))
-        .encrypt(shared_key)?
+        .encrypt(channel_key)?
         .build()?
         .encode_to_vec();
 
@@ -186,18 +188,19 @@ pub fn produce(
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 /// let share_content = b"the share bytes the Helper stores";
 ///
 /// // Owner: issue a verification challenge.
 /// let request::ProduceResult { envelope: req_envelope, .. } =
-///     request::produce(channel_id, 1, 1, &shared_key, &[]).expect("produce request failed");
+///     request::produce(channel_id, 1, 1, &channel_key, &[]).expect("produce request failed");
 ///
 /// // Helper: extract the challenge and answer it.
 /// let request::ExtractResult { request: challenge } =
 ///     request::extract(&req_envelope, &shared_key).expect("extract request failed");
 /// let response::ProduceResult { envelope: resp_envelope } =
-///     response::produce(channel_id, &challenge, &shared_key, share_content)
+///     response::produce(channel_id, &challenge, &channel_key, share_content)
 ///         .expect("produce response failed");
 ///
 /// // Owner: extract the response.
@@ -304,19 +307,20 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractR
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
-/// let shared_key = [7u8; 32];
+/// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
+/// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 /// let share_content = b"example_share";
 ///
 /// // Owner: issue a verification challenge and remember the request body
 /// // so we can bind the eventual response back to this specific challenge.
 /// let request::ProduceResult { envelope: req_envelope, nonce: _expected_nonce } =
-///     request::produce(channel_id, 1, 1, &shared_key, &[]).expect("produce request failed");
+///     request::produce(channel_id, 1, 1, &channel_key, &[]).expect("produce request failed");
 ///
 /// // Helper: answer the challenge with the share bytes.
 /// let request::ExtractResult { request: challenge } =
 ///     request::extract(&req_envelope, &shared_key).expect("extract request failed");
 /// let response::ProduceResult { envelope: resp_envelope } =
-///     response::produce(channel_id, &challenge, &shared_key, share_content)
+///     response::produce(channel_id, &challenge, &channel_key, share_content)
 ///         .expect("produce response failed");
 ///
 /// // Owner: extract the response and verify the proof against the original

@@ -39,7 +39,7 @@ type verifyShareResponseResult struct {
 var (
 	produceVerifyReqOnce sync.Once
 	produceVerifyReqFn   func(channelID, secretID uint64, version uint32,
-		sharedKey *byte, sharedKeyLen uintptr,
+		sharedKey *byte, sharedKeyLen uintptr, epoch uint32,
 		replyTo *byte, replyToLen uintptr) produceVerifyRequestResult
 
 	extractVerifyReqOnce sync.Once
@@ -49,7 +49,7 @@ var (
 	produceVerifyRespOnce sync.Once
 	produceVerifyRespFn   func(channelID uint64,
 		requestProto *byte, requestProtoLen uintptr,
-		sharedKey *byte, sharedKeyLen uintptr,
+		sharedKey *byte, sharedKeyLen uintptr, epoch uint32,
 		shareContent *byte, shareContentLen uintptr) produceVerifyShareResponseMessageResult
 
 	extractVerifyRespOnce sync.Once
@@ -72,7 +72,7 @@ func bytePtr(s []byte) *byte {
 	return &s[0]
 }
 
-func ProduceVerifyShareRequest(channelID, secretID uint64, version uint32, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
+func ProduceVerifyShareRequest(channelID, secretID uint64, version uint32, sharedKey []byte, epoch uint32, replyTo []Endpoint) ([]byte, error) {
 	produceVerifyReqOnce.Do(func() {
 		purego.RegisterFunc(&produceVerifyReqFn, symbol("produce_verify_share_request_message"))
 	})
@@ -81,7 +81,7 @@ func ProduceVerifyShareRequest(channelID, secretID uint64, version uint32, share
 		return nil, err
 	}
 	res := produceVerifyReqFn(channelID, secretID, version,
-		bytePtr(sharedKey), uintptr(len(sharedKey)),
+		bytePtr(sharedKey), uintptr(len(sharedKey)), epoch,
 		bytePtr(replyToBytes), uintptr(len(replyToBytes)))
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err
@@ -105,13 +105,13 @@ func ExtractVerifyShareRequest(request, sharedKey []byte) (uint64, []byte, error
 // possession of shareContent in answer to requestProto (the inner
 // VerifyShareRequestMessage proto bytes returned by ExtractVerifyShareRequest),
 // encrypted under sharedKey.
-func ProduceVerifyShareResponse(channelID uint64, requestProto, sharedKey, shareContent []byte) ([]byte, error) {
+func ProduceVerifyShareResponse(channelID uint64, requestProto, sharedKey []byte, epoch uint32, shareContent []byte) ([]byte, error) {
 	produceVerifyRespOnce.Do(func() {
 		purego.RegisterFunc(&produceVerifyRespFn, symbol("produce_verify_share_response_message"))
 	})
 	res := produceVerifyRespFn(channelID,
 		bytePtr(requestProto), uintptr(len(requestProto)),
-		bytePtr(sharedKey), uintptr(len(sharedKey)),
+		bytePtr(sharedKey), uintptr(len(sharedKey)), epoch,
 		bytePtr(shareContent), uintptr(len(shareContent)))
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err

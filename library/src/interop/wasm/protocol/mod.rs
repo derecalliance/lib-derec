@@ -385,6 +385,15 @@ impl DeRecProtocolBuilderWasm {
         self
     }
 
+    /// Whether the owner advances channel keys: each helper channel one epoch
+    /// in every sharing round that reaches the threshold, and the replica
+    /// group channel one epoch on every publish to replicas. Default: false.
+    #[wasm_bindgen(js_name = withKeyRotation)]
+    pub fn with_key_rotation(mut self, enabled: bool) -> DeRecProtocolBuilderWasm {
+        self.config.key_rotation = Some(enabled);
+        self
+    }
+
     /// `ack` is exactly `"required"` (default) or `"not_required"`, naming
     /// [`crate::protocol::UnpairAck::Required`] and
     /// [`crate::protocol::UnpairAck::NotRequired`].
@@ -936,7 +945,9 @@ impl DeRecProtocolWasm {
     /// see that method for the full contract.
     ///
     /// `recoveredSecret` is the typed `Secret` object carried by the
-    /// `SecretRecovered` event; pass it verbatim. A helper or member whose
+    /// `SecretRecovered` event; pass it verbatim. `version` is the recovered
+    /// version and `newestVersion` the newest one any helper reported; the
+    /// next publish is `newestVersion + 1`. A helper or member whose
     /// `transports` is empty, `null` or absent gets no channel; it is
     /// reported as a `PeerNotRestored` event in the returned array and the
     /// rest of the roster is restored. An absent or `null`
@@ -951,6 +962,7 @@ impl DeRecProtocolWasm {
     /// | `restore_conflict` | Channels live at ids restore is about to write. The error        |
     /// |                    | carries `channel_ids: string[]` listing the collisions.          |
     /// | `invariant`        | The recovered `Secret` is internally inconsistent.               |
+    /// | `invalid_input`    | `newestVersion` is below `version`.                              |
     /// | `invalid_recovered_secret` | `recoveredSecret` is malformed — e.g. a missing or       |
     /// |                    | non-decimal `channel_id` / `replica_id`.                         |
     /// | `store_error`      | A store call failed mid-restore; `category` names the store.     |
@@ -959,14 +971,16 @@ impl DeRecProtocolWasm {
         &self,
         recovered_secret: JsValue,
         version: JsValue,
+        newest_version: JsValue,
     ) -> Result<JsValue, JsValue> {
         let version = js_number_to_u32(&version, "version")?;
+        let newest_version = js_number_to_u32(&newest_version, "newest_version")?;
         let secret = parse_recovered_secret(recovered_secret)?;
         let rust_events = self
             .inner
             .lock()
             .await
-            .restore(&secret, version)
+            .restore(&secret, version, newest_version)
             .await
             .map_err(js_error_from_lib)?;
         let js_events = Array::new();

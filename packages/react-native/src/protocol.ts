@@ -134,6 +134,14 @@ function communicationInfoOrOmit(
   return info != null && Object.keys(info).length > 0 ? info : undefined;
 }
 
+/** The `replicas` object of the restore params, as the core reads it. */
+interface RestoreReplicasParams {
+  channel_id: string;
+  members: Array<Record<string, unknown>>;
+  shared_key: number[];
+  key_epoch?: number;
+}
+
 /**
  * `RestoreParamsJson` (`library/src/interop/ffi/protocol/handle/flow.rs`). Mirrors
  * `SecretWire`'s own shape: `channel_id`/`replica_id` are the decimal `u64`
@@ -142,7 +150,8 @@ function communicationInfoOrOmit(
  * helper or replica member has none — `undefined`, `null`, or an empty map
  * are all treated the same — matching the Go SDK's `omitempty` and the
  * shared golden fixture byte-for-byte; `weight` is forwarded as given
- * whenever a helper carries one; `replicas` is omitted entirely when the
+ * whenever a helper carries one, and `key_epoch` whenever a helper or the
+ * replica group carries one; `replicas` is omitted entirely when the
  * recovered secret has no replica group, and `threshold` when the roster
  * records none.
  *
@@ -152,6 +161,7 @@ function communicationInfoOrOmit(
 export function buildRestoreParams(
   recoveredSecret: Extract<DeRecEvent, { type: 'SecretRecovered' }>['secret'],
   version: number,
+  newestVersion: number,
 ): Record<string, unknown> {
   const recovered: Record<string, unknown> = {
     helpers: recoveredSecret.helpers.map((helper) => {
@@ -167,6 +177,9 @@ export function buildRestoreParams(
       if (helper.weight !== undefined) {
         out.weight = helper.weight;
       }
+      if (helper.key_epoch !== undefined) {
+        out.key_epoch = helper.key_epoch;
+      }
       return out;
     }),
     secrets: recoveredSecret.secrets.map((secret) => ({
@@ -176,7 +189,7 @@ export function buildRestoreParams(
     })),
   };
   if (recoveredSecret.replicas !== undefined) {
-    recovered.replicas = {
+    const replicas: RestoreReplicasParams = {
       channel_id: recoveredSecret.replicas.channel_id,
       members: recoveredSecret.replicas.members.map((member) => {
         const out: Record<string, unknown> = {
@@ -192,11 +205,15 @@ export function buildRestoreParams(
       }),
       shared_key: Array.from(recoveredSecret.replicas.shared_key),
     };
+    if (recoveredSecret.replicas.key_epoch !== undefined) {
+      replicas.key_epoch = recoveredSecret.replicas.key_epoch;
+    }
+    recovered.replicas = replicas;
   }
   if (recoveredSecret.threshold != null) {
     recovered.threshold = recoveredSecret.threshold;
   }
-  return { version, recovered_secret: recovered };
+  return { version, newest_version: newestVersion, recovered_secret: recovered };
 }
 
 /**
@@ -301,8 +318,8 @@ function toBigInt(id: bigint | number): bigint {
  *
  * Every value the caller supplies is forwarded verbatim — defaults, clamping
  * and the meaning of a disabled cleanup policy are library decisions.
- * `threshold`, `auto_respond_on_failure`, `unpair_ack`, `auto_reply_to`
- * and `auto_accept` are omitted entirely from the emitted config unless
+ * `threshold`, `auto_respond_on_failure`, `key_rotation`, `unpair_ack`,
+ * `auto_reply_to` and `auto_accept` are omitted entirely from the emitted config unless
  * their setter was called: `ProtocolConfig` has a
  * `#[serde(default = "...")]` on each of them, reading the same constants
  * `DeRecProtocolBuilder::new` uses, so an absent key resolves to the
@@ -440,6 +457,17 @@ export class DeRecProtocolBuilder {
    */
   withAutoRespondOnFailure(enabled: boolean): this {
     this.config.auto_respond_on_failure = enabled;
+    return this;
+  }
+
+  /**
+   * Whether the owner advances channel keys: each helper channel one epoch
+   * in every sharing round that reaches the threshold, and the replica
+   * group channel one epoch on every publish to replicas. `false` keeps the
+   * current key. Default: false.
+   */
+  withKeyRotation(enabled: boolean): this {
+    this.config.key_rotation = enabled;
     return this;
   }
 
@@ -795,6 +823,12 @@ export class DeRecProtocol {
    * A helper's or member's `communication_info` may be absent or `null`;
    * both mean the same thing — no entries.
    *
+   * `version` is the version that was recovered and `newestVersion` the
+   * newest one any helper reported in Discovery (`version` itself when that
+   * is the newest). The next publish is `newestVersion + 1`: a helper ignores
+   * a version older than the newest it stores (`'Superseded'`). A
+   * `newestVersion` below `version` rejects with `invalid_input`.
+   *
    * Rejects with a `DeRecError`; among its codes:
    *
    * | code               | meaning                                                     |
@@ -806,8 +840,9 @@ export class DeRecProtocol {
   async restore(
     recoveredSecret: Extract<DeRecEvent, { type: 'SecretRecovered' }>['secret'],
     version: number,
+    newestVersion: number,
   ): Promise<DeRecEvent[]> {
-    const params = buildRestoreParams(recoveredSecret, version);
+    const params = buildRestoreParams(recoveredSecret, version, newestVersion);
     const buffer = (await this.host.restore(jsonToBytes(params))) as ArrayBuffer;
     return decodeEvents(buffer);
   }

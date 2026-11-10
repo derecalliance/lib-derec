@@ -8,6 +8,7 @@
 // one-for-one.
 
 import {
+  channel_key,
   ContactMode,
   envelope,
   primitives,
@@ -72,7 +73,7 @@ export function runPrimitivesSmoke(): void {
     if (!committedShare) throw new Error(`no committed share for channel ${id}`);
 
     const requestEnvelope = primitives.sharing.request.produce(
-      id, version, secretId, committedShare, 0, "", key,
+      id, version, secretId, committedShare, 0, "", key, 0,
     );
     console.log(`  [request.produce] channel=${id} envelope=${requestEnvelope.envelope.length}B`);
 
@@ -85,7 +86,7 @@ export function runPrimitivesSmoke(): void {
     }
     storedShareRequests.set(id, request);
 
-    const responseResult = primitives.sharing.response.produce(id, request, key);
+    const responseResult = primitives.sharing.response.produce(id, request, key, 0);
     if (responseResult.secret_id !== secretId) {
       throw new Error(`secret_id mismatch on channel ${id}`);
     }
@@ -142,7 +143,7 @@ export function runPrimitivesSmoke(): void {
     const key = weightedKeys.get(id)!;
     const committedShare = weightedShares.get(id)!;
     const requestEnvelope = primitives.sharing.request.produce(
-      id, weightedVersion, weightedSecretId, committedShare, 0, "", key,
+      id, weightedVersion, weightedSecretId, committedShare, 0, "", key, 0,
     );
     const { request } = primitives.sharing.request.extract(requestEnvelope.envelope, key);
     weightedStoredRequests.set(id, request);
@@ -154,9 +155,9 @@ export function runPrimitivesSmoke(): void {
     for (const id of ids) {
       const key = weightedKeys.get(id)!;
       const stored = weightedStoredRequests.get(id)!;
-      const reqEnvelope = primitives.recovery.request.produce(id, weightedSecretId, weightedVersion, key);
+      const reqEnvelope = primitives.recovery.request.produce(id, weightedSecretId, weightedVersion, key, 0);
       const { request } = primitives.recovery.request.extract(reqEnvelope.envelope, key);
-      const respEnvelope = primitives.recovery.response.produce(id, request, stored, key);
+      const respEnvelope = primitives.recovery.response.produce(id, request, stored, key, 0);
       const { response } = primitives.recovery.response.extract(respEnvelope.envelope, key);
       responses.push(response);
     }
@@ -202,7 +203,7 @@ export function runPrimitivesSmoke(): void {
 
   // Owner side: produce request.
   const verifyReqEnvelope = primitives.verification.request.produce(
-    verifyChannel, secretId, version, verifyKey,
+    verifyChannel, secretId, version, verifyKey, 0,
   );
 
   // Helper side: extract + produce response (the share content is the inner
@@ -214,7 +215,7 @@ export function runPrimitivesSmoke(): void {
     throw new Error("verification request secret_id mismatch");
   }
   const verifyRespEnvelope = primitives.verification.response.produce(
-    verifyChannel, verifyRequest, verifyKey, storedFor1.share,
+    verifyChannel, verifyRequest, verifyKey, 0, storedFor1.share,
   );
 
   // Owner side: extract + process against the correct and wrong share.
@@ -235,7 +236,7 @@ export function runPrimitivesSmoke(): void {
   const discChannel = 1n;
   const discKey = keyFor(discChannel);
 
-  const discReqEnvelope = primitives.discovery.request.produce(discChannel, discKey);
+  const discReqEnvelope = primitives.discovery.request.produce(discChannel, discKey, 0);
   const _discRequest = primitives.discovery.request.extract(discReqEnvelope.envelope, discKey);
 
   const helperSecretList: SecretVersionEntry[] = [
@@ -245,7 +246,7 @@ export function runPrimitivesSmoke(): void {
     },
   ];
   const discRespEnvelope = primitives.discovery.response.produce(
-    discChannel, helperSecretList, discKey,
+    discChannel, helperSecretList, discKey, 0,
   );
 
   const { response: discResponse } = primitives.discovery.response.extract(
@@ -268,7 +269,7 @@ export function runPrimitivesSmoke(): void {
   console.log("=== [Primitives] Envelope trace_id helpers ===");
 
   const traceKey = sharedKey(9);
-  const traced = primitives.discovery.request.produce(42n, traceKey);
+  const traced = primitives.discovery.request.produce(42n, traceKey, 0);
   const traceBefore = envelope.read_trace_id(traced.envelope);
   if (traceBefore !== 0n) {
     throw new Error(`a primitive envelope's default trace_id must be 0, got ${traceBefore}`);
@@ -295,10 +296,10 @@ export function runPrimitivesSmoke(): void {
     const stored = storedShareRequests.get(id);
     if (!stored) throw new Error(`missing stored share for channel ${id}`);
 
-    const reqEnvelope = primitives.recovery.request.produce(id, secretId, version, key);
+    const reqEnvelope = primitives.recovery.request.produce(id, secretId, version, key, 0);
     const { request } = primitives.recovery.request.extract(reqEnvelope.envelope, key);
 
-    const respEnvelope = primitives.recovery.response.produce(id, request, stored, key);
+    const respEnvelope = primitives.recovery.response.produce(id, request, stored, key, 0);
     const { response } = primitives.recovery.response.extract(respEnvelope.envelope, key);
     collectedResponses.push(response);
   }
@@ -313,6 +314,59 @@ export function runPrimitivesSmoke(): void {
   console.log(`  [response.recover] recovered ${recovered.secret_data.length}B — matches original ✓`);
 
   console.log("✓ Recovery flow passed.\n");
+
+
+  console.log("=== [Primitives] Rotated Channel ===");
+
+  // A channel whose key has moved to epoch 3: the sender stamps the epoch
+  // into the envelope's `sequence`, and the receiver, holding only K0,
+  // reads it and derives the key at that epoch before extracting.
+  const k0 = keyFor(1n);
+  const k3 = channel_key.derive(k0, 0, 3);
+  if (k3.length !== 32) throw new Error(`derive: expected 32 bytes, got ${k3.length}`);
+  if (k3.every((b, i) => b === k0[i])) throw new Error("derive: k3 must differ from K0");
+
+  const rotatedEnvelope = primitives.verification.request.produce(1n, secretId, version, k3, 3);
+  const sequence = envelope.read_sequence(rotatedEnvelope.envelope);
+  if (sequence !== 3) throw new Error(`read_sequence: expected 3, got ${sequence}`);
+
+  const receiverKey = channel_key.derive(k0, 0, sequence);
+  if (!receiverKey.every((b, i) => b === k3[i])) {
+    throw new Error("derive: the receiver's key at the envelope's epoch must equal k3");
+  }
+  const { request: rotatedRequest } = primitives.verification.request.extract(
+    rotatedEnvelope.envelope, receiverKey,
+  );
+  if (rotatedRequest.secret_id !== secretId) {
+    throw new Error("rotated verification request secret_id mismatch");
+  }
+  let staleKeyRefused = false;
+  try {
+    primitives.verification.request.extract(rotatedEnvelope.envelope, k0);
+  } catch {
+    staleKeyRefused = true;
+  }
+  if (!staleKeyRefused) throw new Error("extract with K0 must fail on an epoch-3 envelope");
+  console.log("  [read_sequence] 3 → derived key opens the envelope, K0 does not  ✓");
+
+  const expectInvalidInput = (what: string, f: () => unknown): void => {
+    try {
+      f();
+    } catch (e) {
+      const got = String((e as { code: unknown }).code);
+      if (got !== "invalid_input") throw new Error(`${what}: expected invalid_input, got ${got}`);
+      return;
+    }
+    throw new Error(`${what}: expected invalid_input, nothing was thrown`);
+  };
+  expectInvalidInput("derive(k3, 3, 2)", () => channel_key.derive(k3, 3, 2));
+  expectInvalidInput("derive(K0, 0, 513)", () => channel_key.derive(k0, 0, 513));
+  if (channel_key.derive(k0, 0, 512).length !== 32) {
+    throw new Error("derive(K0, 0, 512): expected a 32-byte key");
+  }
+  console.log("  [derive] backward and >512 refused (invalid_input), 512 accepted  ✓");
+
+  console.log("✓ Rotated channel passed.\n");
 
 
   console.log("=== [Primitives] Pairing Flow (INLINE_KEYS) ===");

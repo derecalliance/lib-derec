@@ -21,5 +21,5 @@ mod tests;
 /// [`ContactMode::NoKeys`](derec_proto::ContactMode::NoKeys) pairing MUST be confirmed this way before the
 /// channel is used: nothing else binds the keys it exchanged to the contact.
 pub fn fingerprint(shared_key: &SharedKey) -> String {
-    replica::fingerprint(shared_key)
+    replica::fingerprint(shared_key.as_bytes())
 }

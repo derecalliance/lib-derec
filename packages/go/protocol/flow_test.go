@@ -294,7 +294,7 @@ func TestRestore_HappyPath_PersistsHelperChannel(t *testing.T) {
 	p := newTestProtocol(t)
 	secret := fixtureRestoreSecret(11)
 
-	events, err := p.Restore(secret, 7)
+	events, err := p.Restore(secret, 7, 7)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestRestore_HelperWithoutTransports_IsReportedNotRestored(t *testing.T) {
 	unreachable.Transports = nil
 	secret.Helpers = append(secret.Helpers, unreachable)
 
-	events, err := p.Restore(secret, 7)
+	events, err := p.Restore(secret, 7, 7)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -349,10 +349,10 @@ func TestRestore_AlreadyRestored_ReturnsCleanError(t *testing.T) {
 	p := newTestProtocol(t)
 	secret := fixtureRestoreSecret(11)
 
-	if _, err := p.Restore(secret, 7); err != nil {
+	if _, err := p.Restore(secret, 7, 7); err != nil {
 		t.Fatalf("first Restore: %v", err)
 	}
-	_, err := p.Restore(secret, 7)
+	_, err := p.Restore(secret, 7, 7)
 	if err == nil {
 		t.Fatal("expected an error on the second Restore")
 	}
@@ -369,7 +369,7 @@ func TestRestore_ClosedProtocol(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if _, err := p.Restore(fixtureRestoreSecret(11), 7); err == nil {
+	if _, err := p.Restore(fixtureRestoreSecret(11), 7, 7); err == nil {
 		t.Fatal("expected an error on a closed protocol")
 	}
 }
@@ -416,7 +416,7 @@ func TestRestore_Conflict_ReportsConflictingChannelIDs(t *testing.T) {
 		secret.Helpers = append(secret.Helpers, h)
 	}
 
-	_, err = p.Restore(secret, 7)
+	_, err = p.Restore(secret, 7, 7)
 	if err == nil {
 		t.Fatal("expected a restore conflict")
 	}
@@ -440,7 +440,7 @@ func TestRestore_Conflict_ReportsConflictingChannelIDs(t *testing.T) {
 			t.Fatalf("remove channel %d: %v", id, err)
 		}
 	}
-	events, err := p.Restore(secret, 7)
+	events, err := p.Restore(secret, 7, 7)
 	if err != nil {
 		t.Fatalf("Restore after clearing conflicts: %v", err)
 	}
@@ -454,10 +454,10 @@ func TestRestore_Conflict_ReportsConflictingChannelIDs(t *testing.T) {
 func TestRestore_NonConflictError_HasNoConflictingChannelIDs(t *testing.T) {
 	p := newTestProtocol(t)
 	secret := fixtureRestoreSecret(11)
-	if _, err := p.Restore(secret, 7); err != nil {
+	if _, err := p.Restore(secret, 7, 7); err != nil {
 		t.Fatalf("first Restore: %v", err)
 	}
-	_, err := p.Restore(secret, 7)
+	_, err := p.Restore(secret, 7, 7)
 	var derecErr *derec.Error
 	if !errors.As(err, &derecErr) {
 		t.Fatalf("expected a *derec.Error, got %T: %v", err, err)

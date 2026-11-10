@@ -51,7 +51,7 @@ var stores = {
     load: function () { return null; },
     loadMany: function (secretId, channelIds, kind) {
       loadManyCalls.push({ secretId: secretId, channelIds: channelIds.slice(), kind: kind });
-      return loadManyAnswer(channelIds);
+      return loadManyAnswer(channelIds, kind);
     },
     save: function () {},
     remove: function () {},
@@ -87,6 +87,7 @@ int32_t chRemove(void*, uint64_t, uint64_t, uint64_t, uint32_t* existed) {
   *existed = 0;
   return 0;
 }
+int32_t chRemoveMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t chListHelpers(void*, uint64_t, const uint8_t*, size_t, uint8_t** p, size_t* l) {
   return giveBytes(kHelpers, p, l);
 }
@@ -112,6 +113,7 @@ int32_t shLatest(void*, uint64_t, uint32_t* has, uint32_t* version) {
 int32_t shSave(void*, uint64_t, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t shRemove(void*, uint64_t, uint64_t) { return 0; }
 int32_t shRemoveVersions(void*, uint64_t, uint64_t, const uint8_t*, size_t) { return 0; }
+int32_t shRemoveVersionsMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t shKeepVersion(void*, uint64_t, uint32_t, uint32_t*) { return 1; }
 int32_t shRecordVerification(void*, uint64_t, uint64_t, uint32_t) { return 0; }
 
@@ -125,17 +127,18 @@ int32_t stRemove(void*, uint64_t, const uint8_t*, size_t, uint32_t* removed) {
   *removed = 0;
   return 0;
 }
+int32_t stRemoveMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t stLoadAll(void*, uint64_t, uint32_t, uint8_t** p, size_t* l) { return giveBytes("[]", p, l); }
 
 int32_t trSend(void*, const uint8_t*, size_t, const uint8_t*, size_t) { return 0; }
 
-ChannelStoreCallbacks channelStore{nullptr, chLoad, chSave, chRemove, chListHelpers,
+ChannelStoreCallbacks channelStore{nullptr, chLoad, chSave, chRemove, chRemoveMany, chListHelpers,
                                    chListReplicas, chLink, chLinked, freeBytes};
 ShareStoreCallbacks shareStore{nullptr, shLoad,   shLoadMany,       shLoadAll,  shLatest,
-                               shSave,  shRemove, shRemoveVersions, shKeepVersion,
+                               shSave,  shRemove, shRemoveVersions, shRemoveVersionsMany, shKeepVersion,
                                shRecordVerification, freeBytes};
 UserSecretStoreCallbacks userSecretStore{nullptr, usLoad, usSave, usRemove, freeBytes};
-StateStoreCallbacks stateStore{nullptr, stSave, stLoad, stRemove, stLoadAll, freeBytes};
+StateStoreCallbacks stateStore{nullptr, stSave, stLoad, stRemove, stRemoveMany, stLoadAll, freeBytes};
 TransportCallbacks transport{nullptr, trSend};
 
 /// A Hermes runtime holding `kStoresJs`, plus the `StoreBindings` built over
@@ -238,24 +241,28 @@ static void nonArrayIsBackendFailure() {
   expect(json.empty(), "a failure carries no payload");
 }
 
-static void broadcastCallsLoadManyOnce() {
+static void broadcastCallsLoadManyOncePerKind() {
   Harness h;
+  // Every channel has a SharedKey (kind 0) and no KeyRing (kind 3) yet.
   h.answer(
-      "function (ids) { return ids.map(function () { return new Uint8Array(32).fill(7); }); }");
+      "function (ids, kind) { return ids.map(function () {"
+      " return kind === 0 ? new Uint8Array(32).fill(7) : null; }); }");
   DeRecProtocolEventsResult result = startDiscovery(h);
   expect(result.error.code == DEREC_CODE_OK,
          std::string("discovery with every key present succeeds: ") +
              (result.error.message == nullptr ? "" : result.error.message));
-  expect(h.calls() == R"([{"secretId":"1","channelIds":["11","22"],"kind":0}])",
-         "the broadcast reads both keys through one loadMany call: " + h.calls());
+  expect(h.calls() ==
+             R"([{"secretId":"1","channelIds":["11","22"],"kind":0},{"secretId":"1","channelIds":["11","22"],"kind":3}])",
+         "the broadcast reads both SharedKeys, then both KeyRings, one loadMany call each: " +
+             h.calls());
   release(result);
 }
 
 static void nullEntryFollowsTheLibraryPolicy() {
   Harness h;
   h.answer(
-      "function (ids) { return ids.map(function (id) {"
-      " return id === '22' ? null : new Uint8Array(32).fill(7); }); }");
+      "function (ids, kind) { return ids.map(function (id) {"
+      " return id === '22' || kind !== 0 ? null : new Uint8Array(32).fill(7); }); }");
   DeRecProtocolEventsResult result = startDiscovery(h);
   std::string message = result.error.message == nullptr ? "" : result.error.message;
   expect(result.error.code == DEREC_CODE_MISSING_SHARED_KEY,
@@ -263,7 +270,7 @@ static void nullEntryFollowsTheLibraryPolicy() {
              std::to_string(result.error.code) + ": " + message + ")");
   expect(message.find("22") != std::string::npos, "the error names channel 22: " + message);
   expect(h.calls() == R"([{"secretId":"1","channelIds":["11","22"],"kind":0}])",
-         "still one loadMany call: " + h.calls());
+         "the failing broadcast stops at its one SharedKey loadMany call: " + h.calls());
   release(result);
 }
 
@@ -271,7 +278,7 @@ int main() {
   derec::testing::run("entriesKeepRequestOrderAndNulls", entriesKeepRequestOrderAndNulls);
   derec::testing::run("answerIsNotReshaped", answerIsNotReshaped);
   derec::testing::run("nonArrayIsBackendFailure", nonArrayIsBackendFailure);
-  derec::testing::run("broadcastCallsLoadManyOnce", broadcastCallsLoadManyOnce);
+  derec::testing::run("broadcastCallsLoadManyOncePerKind", broadcastCallsLoadManyOncePerKind);
   derec::testing::run("nullEntryFollowsTheLibraryPolicy", nullEntryFollowsTheLibraryPolicy);
   return derec::testing::summary();
 }

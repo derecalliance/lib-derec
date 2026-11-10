@@ -78,8 +78,10 @@ pub(crate) fn decrypt_inner_message(
     message_bytes: &[u8],
     shared_key: &SharedKey,
 ) -> Result<Vec<u8>, Error> {
-    Ok(channel::decrypt_message(message_bytes, shared_key)
-        .map_err(DeRecMessageBuilderError::Encryption)?)
+    Ok(
+        channel::decrypt_message(message_bytes, shared_key.as_bytes())
+            .map_err(DeRecMessageBuilderError::Encryption)?,
+    )
 }
 
 /// Re-stamp the `trace_id` field on an already-produced DeRecMessage envelope.
@@ -118,6 +120,20 @@ pub(crate) fn fresh_trace_id() -> u64 {
 pub fn read_trace_id(envelope_bytes: &[u8]) -> Result<u64, Error> {
     let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
     Ok(envelope.trace_id)
+}
+
+/// Read the `sequence` field off an inbound DeRecMessage envelope without
+/// touching the encrypted inner payload.
+///
+/// On a channel envelope, `sequence` is the epoch of the channel key that
+/// encrypted the payload. A caller driving the protocol through primitives
+/// reads it to pick the key that opens the message: the key it holds at that
+/// epoch, or one derived forward with [`crate::types::ChannelKey::derive`].
+/// The field is not authenticated; a forged value only selects a key that
+/// fails to decrypt.
+pub fn read_sequence(envelope_bytes: &[u8]) -> Result<u32, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
+    Ok(envelope.sequence)
 }
 
 /// The identity of one delivered message, read off its envelope without the

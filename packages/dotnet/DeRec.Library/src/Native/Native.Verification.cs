@@ -59,6 +59,7 @@ internal static class Verification
         uint version,
         byte[] sharedKey,
         UIntPtr sharedKeyLen,
+        uint epoch,
         byte[]? replyTo,
         UIntPtr replyToLen
     );
@@ -78,6 +79,7 @@ internal static class Verification
         UIntPtr requestProtoBytesLen,
         byte[] sharedKey,
         UIntPtr sharedKeyLen,
+        uint epoch,
         byte[] shareContent,
         UIntPtr shareContentLen
     );

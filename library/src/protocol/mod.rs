@@ -71,17 +71,18 @@
 pub mod error;
 pub mod events;
 pub mod traits;
-pub mod transport_adapters;
 pub mod types;
 pub mod utils;
 
 pub(crate) mod actions;
+pub(crate) mod auto_publish;
 pub(crate) mod builder;
 pub(crate) mod config;
 pub(crate) mod context;
 pub(crate) mod fingerprint;
 pub(crate) mod flows;
 mod handlers;
+pub(crate) mod keychain;
 pub(crate) mod obligation;
 pub(crate) mod process;
 pub(crate) mod protocol_config;
@@ -95,12 +96,15 @@ pub(crate) mod sweeps;
 #[cfg(test)]
 pub(crate) mod tests;
 
+pub(crate) use crate::types::ChannelKey;
 pub use builder::{DEFAULT_THRESHOLD, DeRecProtocolBuilder, DeRecStores};
 use derec_proto::ParameterRange;
 use derec_proto::TransportProtocol;
 pub use error::{
     ChannelStoreError, ProcessError, Refusal, SecretStoreError, ShareStoreError, StateStoreError,
 };
+pub use keychain::KeyRing;
+pub(crate) use keychain::{FORWARD_JUMP_LIMIT, derive as derive_key};
 pub use protocol_config::{DeRecProtocolConfig, ExpiredChannelsConfig, TimeoutsConfig};
 use std::collections::HashMap;
 pub use traits::{
@@ -108,7 +112,6 @@ pub use traits::{
     DeRecTransport, DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture, StateStoreFuture,
     TransportFuture,
 };
-pub use transport_adapters::{SendOne, SequentialFailover, SingleEndpointTransport};
 pub use types::{
     ChannelQuery, ChannelRecord, ChannelShare, ChannelStatus, CollectedShare,
     ExpiredChannelCleanup, HelperChannel, HelperInfo, MissingPolicy, PairingKeyMaterial,
@@ -117,9 +120,9 @@ pub use types::{
 };
 
 pub use events::{
-    AutoAcceptPolicy, CorruptionReason, DeRecEvent, DeRecFlow, FailedRequest, IgnoreReason,
-    NotRestoredReason, PendingAction, PendingActionKind, RecoveryCandidate, RecoveryHelper,
-    ReplyTarget, UnpairAck, VerifyFailureReason,
+    Action, AutoAcceptPolicy, ChannelRequest, CorruptionReason, DeRecEvent, DeRecFlow,
+    FailedRequest, IgnoreReason, NotRestoredReason, PendingAction, PendingActionKind,
+    RecoveryCandidate, RecoveryHelper, ReplyTarget, UnpairAck, VerifyFailureReason,
 };
 pub use handlers::restore::RestoreError;
 
@@ -213,6 +216,12 @@ pub struct DeRecProtocol<
     pub(crate) communication_info: HashMap<String, String>,
     /// Configured via [`DeRecProtocolBuilder::with_auto_respond_on_failure`](crate::protocol::DeRecProtocolBuilder::with_auto_respond_on_failure).
     pub(crate) auto_respond_on_failure: bool,
+    /// Whether the owner advances channel keys: helper channels in each
+    /// sharing round that reaches the threshold, the group channel on each
+    /// publish to replicas.
+    ///
+    /// Configured via [`DeRecProtocolBuilder::with_key_rotation`](crate::protocol::DeRecProtocolBuilder::with_key_rotation).
+    pub(crate) key_rotation: bool,
     /// Configured via [`DeRecProtocolBuilder::with_auto_reply_to`](crate::protocol::DeRecProtocolBuilder::with_auto_reply_to).
     ///
     /// When `true`, every outbound request envelope carries

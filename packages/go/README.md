@@ -81,7 +81,7 @@ func main() {
 		sharedKey        = make([]byte, 32) // established during pairing
 	)
 
-	envelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey, nil)
+	envelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey, 0, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -253,10 +253,22 @@ weighted := []sharing.WeightedChannel{
 shares, err := sharing.Request.Split(secretID, secretData, weighted, threshold, version)
 
 for channelID, committedShare := range shares {
-	envelope, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", sharedKeys[channelID], nil)
+	envelope, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", sharedKeys[channelID], 0, nil)
 	// send envelope over your transport
 }
 ```
+
+Every channel `Produce` (sharing, verification, recovery, discovery, unpairing; request and response) takes `epoch uint32` right after the shared key: the epoch of that key in the channel's key chain, stamped into the envelope's `sequence`. Pass `0` for a freshly paired channel.
+
+To receive on a channel that may have rotated, read the sequence, hold or derive the key at that epoch, then extract:
+
+```go
+seq, err := envelope.ReadSequence(wire)                 // epoch of the key that encrypted it
+key, err := channelkey.Derive(heldKey, heldEpoch, seq)  // skip when you already hold the key at seq
+req, err := verification.Request.Extract(wire, key)
+```
+
+`channelkey.Derive` only moves forward and is bounded at 512 steps per call; a target below `epoch` or further than 512 above it fails with `derec.CodeInvalidInput`. `Extract` always takes the bare 32-byte key.
 
 The last argument of every request `Produce` (sharing, verification, recovery, discovery, unpairing) is `replyTo []Endpoint`: the endpoints, in preference order, the peer should answer on. `nil` means answer on the endpoints recorded for the channel.
 
@@ -270,11 +282,11 @@ The helper side extracts with `sharing.Request.Extract`, persists the request, a
 import "github.com/derecalliance/lib-derec/packages/go/primitives/verification"
 
 // Owner side: produce the challenge.
-requestEnvelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey, nil)
+requestEnvelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey, 0, nil)
 
 // Helper side: decrypt and answer with proof of possession.
 req, err := verification.Request.Extract(requestEnvelope, sharedKey)
-responseEnvelope, err := verification.Response.Produce(channelID, req.RequestProto, sharedKey, storedShareContent)
+responseEnvelope, err := verification.Response.Produce(channelID, req.RequestProto, sharedKey, 0, storedShareContent)
 
 // Owner side: decrypt and verify the proof.
 resp, err := verification.Response.Extract(responseEnvelope, sharedKey)
@@ -289,11 +301,11 @@ valid, err := verification.Response.Process(req.RequestProto, resp.ResponseProto
 import "github.com/derecalliance/lib-derec/packages/go/primitives/recovery"
 
 // Owner side: request the stored share from each paired helper.
-requestEnvelope, err := recovery.Request.Produce(channelID, secretID, version, sharedKey, nil)
+requestEnvelope, err := recovery.Request.Produce(channelID, secretID, version, sharedKey, 0, nil)
 
 // Helper side: answer using the StoreShareRequest proto it persisted at sharing time.
 req, err := recovery.Request.Extract(requestEnvelope, sharedKey)
-responseEnvelope, err := recovery.Response.Produce(channelID, req.RequestProto, storedShareProto, sharedKey)
+responseEnvelope, err := recovery.Response.Produce(channelID, req.RequestProto, storedShareProto, sharedKey, 0)
 
 // Owner side: collect at least `threshold` responses and reconstruct.
 recovered, err := recovery.Response.Recover([]recovery.ShareResponse{
@@ -345,7 +357,7 @@ recovered, err := recovery.Response.Recover([]recovery.ShareResponse{
 import "github.com/derecalliance/lib-derec/packages/go/primitives/discovery"
 
 // Owner side: ask a helper which secret ids/versions it holds.
-requestEnvelope, err := discovery.Request.Produce(channelID, sharedKey, nil)
+requestEnvelope, err := discovery.Request.Produce(channelID, sharedKey, 0, nil)
 
 // Helper side: decrypt and advertise its stored versions.
 _, err = discovery.Request.Extract(requestEnvelope, sharedKey)
@@ -353,7 +365,7 @@ responseEnvelope, err := discovery.Response.Produce(channelID, []discovery.Secre
 	{SecretID: 0xABCD, Versions: []discovery.VersionEntry{
 		{Version: 1, Description: "wallet seed"},
 	}},
-}, sharedKey)
+}, sharedKey, 0)
 
 // Owner side: decrypt and read the advertised list.
 resp, err := discovery.Response.Extract(responseEnvelope, sharedKey)
@@ -370,12 +382,12 @@ For applications that don't want to drive the primitive produce/extract/process 
 
 `protocol.New` takes six application-supplied interfaces backing all persistence and transport — the five stores bundled in a `protocol.Stores`, plus the transport:
 
-- `protocol.ChannelStore` — channel records, keyed by `(secretID, channelID, replicaID)`. A `replicaID` of `0` addresses the helper channel; any other value addresses that member of the replica group
-- `protocol.SecretStore` — pairing/session secret material
-- `protocol.ShareStore` — stored shares. On an owner, `KeepVersion` chooses the one older version helpers keep besides the version being shared (`0` keeps none); every other version is deleted, and an answer equal to or greater than the shared version fails the round with `derec.CodeInvalidKeepVersion` before anything is sent; see [the owner's keep version](https://github.com/derecalliance/lib-derec/tree/main/library#share-store-the-owners-keep-version)
+- `protocol.ChannelStore` — channel records, keyed by `(secretID, channelID, replicaID)`. A `replicaID` of `0` addresses the helper channel; any other value addresses that member of the replica group. `RemoveMany` removes every record its `[]protocol.ChannelQuery` addresses in one call, each addressed the same way, and skips entries that name no record; delete them in one statement or transaction when your backend can
+- `protocol.SecretStore` — pairing/session secret material. `RemoveMany` removes every secret its `[]protocol.SecretEntry` names in one call, each addressed the way `Remove`'s arguments are, and skips entries with nothing stored
+- `protocol.ShareStore` — stored shares. `LoadMany` returns `[]protocol.ShareEntry`, each share paired with the channel it is stored under. `RemoveVersionsMany` drops the versions each `[]protocol.ShareVersionsEntry` names under its channel in one call, skipping versions not stored. On an owner, `KeepVersion` chooses the one older version helpers keep besides the version being shared (`0` keeps none); every other version is deleted, and an answer equal to or greater than the shared version fails the round with `derec.CodeInvalidKeepVersion` before anything is sent; see [the owner's keep version](https://github.com/derecalliance/lib-derec/tree/main/library#share-store-the-owners-keep-version)
 - `protocol.UserSecretStore` — the latest user-facing secret snapshot per `secretID`
-- `protocol.StateStore` — in-flight orchestrator state (pending verification/recovery/unpair/sharing rounds)
-- `protocol.Transport` — outbound delivery (`Send(endpoints []protocol.Endpoint, message []byte) error`). Implement `protocol.SendOne` for a single endpoint and wrap it in `protocol.SequentialFailover` (or `protocol.SingleEndpointTransport`); when every endpoint fails, the adapter returns the last dialer error unchanged, so `errors.Is` / `errors.As` against your own dialer errors keep working
+- `protocol.StateStore` — in-flight orchestrator state (pending verification/recovery/unpair/sharing rounds). `RemoveMany` removes every row its `[]protocol.StateKey` names in one call and skips keys with no row
+- `protocol.Transport` — outbound delivery (`Send(endpoints []protocol.Endpoint, message []byte) error`). Try the endpoints in the peer's order, stop at the first success, and return an error only when none worked
 
 Delivery is push-only: a reply produced by `Process` is handed to `Transport.Send`, addressed to the peer's endpoint, and is never returned by `Process`, so every participant needs a reachable endpoint. Recommended HTTP conventions (not protocol requirements) are `POST`, an `application/octet-stream` body, `202 Accepted`, and `200 OK` with the reply body when answering an unreachable peer on the same connection. Only that `200 OK` same-connection answer needs matching: pick the reply that echoes the request's trace id with `envelope.ReadTraceID`. See [Transports](https://derec-alliance.gitbook.io/docs/protocol-specification/transports).
 
@@ -512,6 +524,7 @@ The canonical JSON (`library/tests/fixtures/protocol_config.json` holds a full e
   "parameter_range": { "min_share_size": 1, "max_share_size": 4096 },
   "auto_accept": { "pairing": true, "store_share": true },
   "auto_respond_on_failure": false,
+  "key_rotation": false,
   "auto_reply_to": false,
   "unpair_ack": "required",
   "unsafe_connection": false,
@@ -566,6 +579,8 @@ Every request that arrives on an authenticated channel gets exactly one response
 - `Action`, when `Responded` is `false`, is the token that answers the request. Pass it to `Reject`, which sends the one response; `Accept` refuses it. The library never expires it. It is `nil` only when `Reject` could never answer it: a request on a replica group channel that names no member and carries no `reply_to`, which has no reply target, or, with `AutoRespondOnFailure` off, a replica copy that hands this device the group key and fails before that key is stored.
 
 Resolve each token once. The library is stateless, so rejecting the same token twice, or rejecting an action already accepted, sends a second response.
+
+Hand the token back exactly as you received it. It is sealed to its channel, so `Accept` and `Reject` refuse one that was edited, rebuilt or moved to another channel with a `*derec.Error` whose `Code` is `derec.CodeInvalidInput`, and nothing is stored or sent. A token raised under a channel key the device no longer holds, because the channel has moved on and no stored version keeps that key, is too late to answer and is refused the same way. A token issued by v0.0.10 does not decode (`derec.CodeFFIBadProto`).
 
 `Config.AutoRespondOnFailure` decides who answers. With it on, the library sends the response itself (a known failure keeps its specific status; anything else is `FAIL` with a generic memo). With it off (the default), nothing is sent and the event carries the token:
 
@@ -658,6 +673,10 @@ Every channel message carries one timestamp, its send time, in both the envelope
 
 Within the inbound window `Process` handles every copy of a message it is given, including one of this device's own messages delivered back to it. Detecting both is the app's transport's job: `envelope.ReadMessageID(bytes)` returns an `ID` that is the same for every copy of one message, whatever its unauthenticated fields (sequence, trace id, protocol version) say, and a `Timestamp`. Keep the `ID` of every envelope you send and of every envelope `Process` accepted (no error and no `EventTypeMessageIgnored`) until `max(received or sent at, Timestamp) + Timeouts.InboundMessageSecs`, drop an inbound envelope whose `ID` you kept, and keep the record across restarts. Never key on a hash of the raw bytes. A helper ignores a `StoreShareRequest` for a version older than the newest it stores on the channel, and not stored itself, as `EventTypeMessageIgnored` with `IgnoreReasonSuperseded`, unanswered. Reject a contact update older than the last one you accepted on the channel, using the `Timestamp` of the envelope that raised it; that needs auto-accept off for `UpdateChannelInfo`.
 
+### Key rotation
+
+With `KeyRotation: proto.Bool(true)` in the config, the owner advances each helper channel's key one epoch in every sharing round that reaches the threshold (a round below it advances none), and the replica group channel's key on every publish to replicas. Each step is K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" || be32(e+1)). Rotation is off by default, and off keeps the channel on its current key. The envelope's `sequence` carries the epoch, and peers follow on their own, so the setting is the owner's alone (`KeyRotation` in `DeRecProtocolConfig`). A message under an epoch whose key the device cannot obtain is ignored as `EventTypeMessageIgnored` with `IgnoreReasonKeyUnavailable`. A device keeps its newest key and the key of every secret version it still stores, so any kept version restores. The key ring is stored as a secret of kind `protocol.SecretKindKeyRing` (`3`): persist its bytes as given, with any length, beside the kind-`0` shared key. Forward secrecy covers a compromised helper device, or a key alone, plus recorded traffic, and only for epochs older than the oldest key held; the owner and replica devices hold the plaintext secret and the keys of every version they store. A 0.0.x peer cannot follow a rotated channel: it must upgrade and re-pair.
+
 A pairing has a lifetime, `Timeouts.PairingSecs` (default 30). Both sides enforce it and nothing is sent on expiry: `Start(FlowKindPairing, …)` refuses a contact older than it with `derec.CodePairingExpired`; the contact's creator reports a request on such a contact, or a request older than the lifetime, as `EventTypeMessageIgnored` with `IgnoreReasonExpired` before any `ActionRequired`, and `Accept` refuses a request that outlived it with `derec.CodePairingExpired`. Pairing involves both parties, so treat an expiry as a retry and ask the user to scan or share a fresh contact. Keep the scanner's `ExpiredChannels` timeout at least `PairingSecs` plus the time a response takes to arrive.
 
 During recovery, each collected share is reported as `EventTypeRecoveryShareReceived` (`ChannelID`, `SharesReceived`). A recovery reconstructs nothing until every helper it asked has answered, or `Timeouts.GetShareResponseSecs` has passed since the requests went out (each silent helper is then reported by `Tick` as `EventTypeRecoverSecretFailed` with `Error == "timeout"`). It then decides exactly once:
@@ -673,7 +692,7 @@ Shares that are each valid can still disagree, carrying different commitment roo
 
 A helper that answers with a non-OK status is reported as `EventTypeRecoveryShareRefused` (`Status`, `Memo`); it is not collected, but it is that helper's answer. A helper that answers with a share that cannot be part of the secret is reported as an event with `Type == EventTypeRecoveryShareCorrupted` and `Reason` one of `CorruptionReasonMalformed` or `CorruptionReasonInvalidProof` (judged as the share arrives), or `CorruptionReasonForged` (its group reconstructs under one key, but not to a secret, or a single share reconstructs alone — neither happens with an honest split; reported with the recovery's decision); the share is set aside and never blocks the recovery from the others. An honest helper never sends one, so treat it as a sign of a damaged or compromised helper — for example, offer to unpair it. A share that only disagrees with the others is never reported this way: it is a dispute, not evidence against its helper.
 
-After recovery, pass the typed `Secret` from a `SecretRecovered` event (or, once the owner confirms it, a `RecoveryDisputed` event's or a `RecoveryConflict` candidate's) to `p.Restore(secret, version)` on the same `*protocol.DeRecProtocol` that ran recovery — it is the one holding the recovery-mode channels `Restore` unpairs — to commit canonical helper state and wipe the throwaway recovery-mode channels. A helper or member with no endpoint in the recovered roster gets no channel; `Restore` returns an event with `Type == EventTypePeerNotRestored` and `Reason == NotRestoredReasonNoTransports` for it (`ReplicaID` is set for a replica member) and restores the rest. If channels already exist at ids `Restore` is about to write, `Restore` fails with a `*derec.Error` whose `Code` is `derec.CodeRestoreConflict` and whose `ConflictingChannelIDs` (`[]uint64`) lists exactly those ids — clear them and retry. Do not pass the `Secret` of a `ReplicaSecretReceived` event: the device that received it has already hydrated it, so `Restore` fails with `derec.CodeAlreadyRestored`.
+After recovery, pass the typed `Secret` from a `SecretRecovered` event (or, once the owner confirms it, a `RecoveryDisputed` event's or a `RecoveryConflict` candidate's) to `p.Restore(secret, version, newestVersion)` on the same `*protocol.DeRecProtocol` that ran recovery — it is the one holding the recovery-mode channels `Restore` unpairs — to commit canonical helper state and wipe the throwaway recovery-mode channels. `newestVersion` is the newest version any helper reported in Discovery (`version` itself when that is the newest): the recovered secrets are recorded at it, so the next publish is `newestVersion+1`, since a helper ignores a version older than the newest it stores (`IgnoreReasonSuperseded`). A helper or member with no endpoint in the recovered roster gets no channel; `Restore` returns an event with `Type == EventTypePeerNotRestored` and `Reason == NotRestoredReasonNoTransports` for it (`ReplicaID` is set for a replica member) and restores the rest. If channels already exist at ids `Restore` is about to write, `Restore` fails with a `*derec.Error` whose `Code` is `derec.CodeRestoreConflict` and whose `ConflictingChannelIDs` (`[]uint64`) lists exactly those ids — clear them and retry. Do not pass the `Secret` of a `ReplicaSecretReceived` event: the device that received it has already hydrated it, so `Restore` fails with `derec.CodeAlreadyRestored`.
 
 **Restore or join.** `SecretRecovered` writes nothing, so decide first. When `Secret.Replicas.Members` names live members other than the lost device, do not restore: tell the user and offer to join that group as a new replica — pair with a live member, confirm the fingerprint, then run `Start(protocol.FlowKindReplicaDiscovery, nil)`. With no live member, restore. Neither path gives this device the proofs of earlier versions, so it cannot verify them: restore writes none, and a joining device gets only the share map of the single version each push or catch-up carries. The live members keep the proofs they hold. A restored device also cannot publish, or answer a member's catch-up, until the app configures a `ReplicaID` the roster names. Joining adds the device as a new member, while restoring next to live replicas makes a second device claim the lost device's role. See [Restore or join](https://derec-alliance.gitbook.io/docs/concepts/replicas/restore-or-join).
 
