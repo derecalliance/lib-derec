@@ -230,12 +230,33 @@ public sealed record RecoverSecretParams
 }
 
 /// <summary>Params for <see cref="FlowKind.Unpair"/>.</summary>
+/// <remarks>
+/// With <see cref="LinkedChannelId"/> set, the request still travels on
+/// <see cref="ChannelId"/> but asks the helper to unpair that older channel
+/// instead, keeping <see cref="ChannelId"/>. This is how a restored owner that
+/// kept its recovery channel retires the channel it used before: the helper
+/// accepts only when the older channel is linked to <see cref="ChannelId"/>
+/// and a share is already stored on <see cref="ChannelId"/>, so publish on the
+/// kept channel first. Every event of the flow —
+/// <see cref="UnpairStartedEvent"/>, <see cref="UnpairedEvent"/>,
+/// <see cref="UnpairRejectedEvent"/> — names the older channel, and
+/// <see cref="ChannelId"/> is never set to <c>Unpairing</c>.
+/// </remarks>
 public sealed record UnpairParams
 {
+    /// <summary>The channel the request travels on.</summary>
     [JsonPropertyName("channel_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] public required ulong ChannelId { get; init; }
     [JsonPropertyName("memo")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Memo { get; init; }
+    /// <summary>
+    /// The older channel to unpair instead of <see cref="ChannelId"/>, or
+    /// <c>null</c> to unpair <see cref="ChannelId"/> itself. Naming
+    /// <see cref="ChannelId"/> here is <see cref="DeRecCode.InvalidInput"/>.
+    /// </summary>
+    [JsonPropertyName("linked_channel_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ulong? LinkedChannelId { get; init; }
 }
 
 /// <summary>Params for <see cref="FlowKind.UpdateChannelInfo"/>.</summary>
@@ -589,7 +610,12 @@ public sealed record ShareVerifyRejectedEvent : DeRecEvent
     public required string Memo { get; init; }
 }
 
-public sealed record DiscoveredSecretVersion(uint Version, string Description);
+/// <summary>
+/// One version a helper reported. <c>ChannelId</c> is the channel its share
+/// is stored on: after recovery, the roster channel a recovery channel
+/// replaces (see <see cref="KeepRecoveryChannel"/>).
+/// </summary>
+public sealed record DiscoveredSecretVersion(uint Version, string Description, ulong ChannelId);
 
 public sealed record DiscoveredSecret(ulong SecretId, IReadOnlyList<DiscoveredSecretVersion> Versions);
 
@@ -890,9 +916,10 @@ public sealed record Secret(
     /// <summary>
     /// The replica group: every member (including the writer), the one
     /// channel they share, and the 32-byte group key. <c>null</c> when this
-    /// <c>secret_id</c> has no replica setup. Required by
-    /// <see cref="DeRecProtocol.RestoreAsync"/> to rebuild replica state
-    /// without re-pairing.
+    /// <c>secret_id</c> has no replica setup.
+    /// <see cref="DeRecProtocol.RestoreAsync"/> never carries the group
+    /// forward: it reports each member as a <see cref="PeerNotRestoredEvent"/>
+    /// with <see cref="NotRestoredReason.ReplicaGroupDropped"/>.
     /// </summary>
     [JsonPropertyName("replicas")]
     public Replicas? Replicas { get; init; }
@@ -914,6 +941,27 @@ public sealed record Replicas(
     [property: JsonPropertyName("members")] IReadOnlyList<ReplicaInfo> Members,
     [property: JsonPropertyName("shared_key")] byte[] SharedKey,
     [property: JsonPropertyName("key_epoch"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] uint KeyEpoch = 0);
+
+/// <summary>
+/// A helper reached on two channels after recovery, both holding its share:
+/// the old one named in the recovered roster, whose key every lost device
+/// still holds, and the recovery channel it paired on, whose key only this
+/// device holds. Naming the pair in <see cref="DeRecProtocol.RestoreAsync"/>
+/// keeps the recovery channel for that helper instead of writing the old one
+/// back. The old channel is then retired with a linked unpair
+/// (<see cref="UnpairParams.LinkedChannelId"/>) once a round is stored on the
+/// kept one.
+/// </summary>
+/// <remarks>
+/// Discovery tells the application which old channel each recovery channel
+/// replaces: every version a helper reports names the channel its share is
+/// stored on (<see cref="DiscoveredSecretVersion.ChannelId"/>).
+/// </remarks>
+/// <param name="RosterChannelId">The helper's channel in the recovered roster.</param>
+/// <param name="RecoveryChannelId">The recovery channel paired with the same helper, kept in its place.</param>
+public sealed record KeepRecoveryChannel(
+    [property: JsonPropertyName("roster_channel_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] ulong RosterChannelId,
+    [property: JsonPropertyName("recovery_channel_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] ulong RecoveryChannelId);
 
 public sealed record ChannelShare(
     [property: JsonPropertyName("channel_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] ulong ChannelId,
@@ -1237,6 +1285,16 @@ public static class NotRestoredReason
 {
     /// <summary>The recovered roster names no endpoint for the peer.</summary>
     public const string NoTransports = "NoTransports";
+    /// <summary>
+    /// The entry is a member of the recovered replica group, and restore
+    /// never carries a group forward. Restoring means the owner lost its
+    /// devices; any it still has join this one again by pairing, and the
+    /// rest are cut off from the helpers when the old helper channels are
+    /// retired. The member's name and role are in the recovered
+    /// <see cref="Secret"/>'s replicas, from the communication info it
+    /// advertised when it paired.
+    /// </summary>
+    public const string ReplicaGroupDropped = "ReplicaGroupDropped";
 }
 
 /// <summary>
@@ -1900,7 +1958,8 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                     {
                         versions.Add(new DiscoveredSecretVersion(
                             v.GetProperty("version").GetUInt32(),
-                            v.GetProperty("description").GetString() ?? string.Empty));
+                            v.GetProperty("description").GetString() ?? string.Empty,
+                            ReadId(v.GetProperty("channel_id"))));
                     }
                 }
                 secrets.Add(new DiscoveredSecret(

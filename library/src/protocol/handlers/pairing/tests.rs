@@ -245,6 +245,9 @@ mod handshake_tests {
         fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
             Box::pin(future::ready(Ok(())))
         }
+        fn save_many(&mut self, _: u64, _: Vec<ChannelRecord>) -> ChannelStoreFuture<'_, ()> {
+            Box::pin(std::future::ready(Ok(())))
+        }
         fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
             Box::pin(future::ready(Ok(false)))
         }
@@ -1697,6 +1700,119 @@ mod pairing_expiry_tests {
                 "got {error:?}"
             );
             assert!(scanner.transport.sent_envelopes().is_empty());
+        });
+    }
+
+    /// Both pieces of pairing material the scanner keeps for one channel.
+    async fn holds_both_pairing_materials(device: &Device) -> bool {
+        let secret = device
+            .secret_store
+            .load(SECRET_ID, CONTACT_CHANNEL, SecretKind::PairingSecret)
+            .await
+            .expect("load");
+        let contact = device
+            .secret_store
+            .load(SECRET_ID, CONTACT_CHANNEL, SecretKind::PairingContact)
+            .await
+            .expect("load");
+        secret.is_some() && contact.is_some()
+    }
+
+    /// Scanning an `InlineKeys` contact stores the pairing secret and the
+    /// contact in one secret-store call.
+    #[test]
+    fn scanning_stores_the_pairing_material_in_one_call() {
+        run_async(async {
+            let mut creator = new_creator(true);
+            let mut scanner = new_scanner();
+            let contact = new_contact(&mut creator, ContactMode::InlineKeys).await;
+
+            scan(&mut scanner, contact).await.expect("scan");
+
+            assert_eq!(*scanner.secret_store.save_calls.lock().unwrap(), 0);
+            assert_eq!(*scanner.secret_store.save_many_calls.lock().unwrap(), 1);
+            assert!(holds_both_pairing_materials(&scanner).await);
+        });
+    }
+
+    /// The pre-pair response stores the pairing secret and the filled-in
+    /// contact in one secret-store call.
+    #[test]
+    fn the_pre_pair_response_stores_the_pairing_material_in_one_call() {
+        run_async(async {
+            let mut creator = new_creator(true);
+            let mut scanner = new_scanner();
+            let contact = new_contact(&mut creator, ContactMode::HashedKeys).await;
+            scan(&mut scanner, contact).await.expect("scan");
+            creator
+                .process(&last_sent(&scanner))
+                .await
+                .expect("pre-pair request answered");
+            let singles = *scanner.secret_store.save_calls.lock().unwrap();
+
+            scanner
+                .process(&last_sent(&creator))
+                .await
+                .expect("pre-pair response processed");
+
+            assert_eq!(*scanner.secret_store.save_calls.lock().unwrap(), singles);
+            assert_eq!(*scanner.secret_store.save_many_calls.lock().unwrap(), 1);
+            assert!(holds_both_pairing_materials(&scanner).await);
+        });
+    }
+
+    /// How many single and bulk secret removes `device` has made.
+    fn secret_removes(device: &Device) -> (usize, usize) {
+        (
+            *device.secret_store.remove_calls.lock().unwrap(),
+            *device.secret_store.remove_many_calls.lock().unwrap(),
+        )
+    }
+
+    /// Once the pairing completes, each side drops its pairing secret and
+    /// contact in one secret-store call.
+    #[test]
+    fn a_completed_pairing_drops_the_pairing_material_in_one_call() {
+        run_async(async {
+            let mut creator = new_creator(true);
+            let mut scanner = new_scanner();
+            let contact = new_contact(&mut creator, ContactMode::InlineKeys).await;
+            scan(&mut scanner, contact).await.expect("scan");
+
+            creator
+                .process(&last_sent(&scanner))
+                .await
+                .expect("request answered");
+            scanner
+                .process(&last_sent(&creator))
+                .await
+                .expect("response processed");
+
+            for device in [&creator, &scanner] {
+                assert_eq!(secret_removes(device), (0, 1));
+                assert!(!holds_pairing_material(device).await);
+            }
+        });
+    }
+
+    /// An expired contact's pairing secret and contact are dropped in one
+    /// secret-store call.
+    #[test]
+    fn an_expired_contact_drops_its_material_in_one_call() {
+        run_async(async {
+            let mut creator = new_creator(true);
+            let mut scanner = new_scanner();
+            let contact = new_contact(&mut creator, ContactMode::InlineKeys).await;
+            age_stored_contact(&mut creator, WINDOW + 1).await;
+            scan(&mut scanner, contact).await.expect("scan");
+
+            creator
+                .process(&last_sent(&scanner))
+                .await
+                .expect("ignored, not an error");
+
+            assert_eq!(secret_removes(&creator), (0, 1));
+            assert!(!holds_pairing_material(&creator).await);
         });
     }
 

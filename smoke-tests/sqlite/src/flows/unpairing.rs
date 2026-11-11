@@ -79,6 +79,7 @@ pub async fn run() {
         .start(DeRecFlow::Unpair {
             channel_id: cid,
             memo: Some("decommissioning".to_owned()),
+            linked_channel_id: None,
         })
         .await
         .expect("owner.start(Unpair) failed");

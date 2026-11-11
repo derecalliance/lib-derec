@@ -612,6 +612,13 @@ impl DeRecSecretStore for RefusingRemoveSecretStore {
     ) -> crate::protocol::SecretStoreFuture<'_, ()> {
         self.0.save(secret_id, channel_id, value)
     }
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, SecretValue)>,
+    ) -> crate::protocol::SecretStoreFuture<'_, ()> {
+        self.0.save_many(secret_id, entries)
+    }
     fn remove(
         &mut self,
         _: u64,

@@ -23,9 +23,9 @@ namespace {
 // binding targets; a mismatch means `derec_ffi.h` grew or shrank a field
 // this file has not been updated to match.
 
-static_assert(sizeof(ChannelStoreCallbacks) == 10 * sizeof(void*),
+static_assert(sizeof(ChannelStoreCallbacks) == 11 * sizeof(void*),
               "ChannelStoreCallbacks layout changed; update the bindings");
-static_assert(sizeof(SecretStoreCallbacks) == 7 * sizeof(void*),
+static_assert(sizeof(SecretStoreCallbacks) == 8 * sizeof(void*),
               "SecretStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(ShareStoreCallbacks) == 12 * sizeof(void*),
               "ShareStoreCallbacks layout changed; update the bindings");
@@ -505,6 +505,49 @@ extern "C" int32_t channelStoreSave(void* userData, uint64_t secretId, uint64_t 
   return result.code;
 }
 
+/// `ChannelStore.saveMany(secretId, records) -> void`
+///
+/// `records` arrives as a JSON array of `[channelId, replicaId, record]`
+/// triples and is handed to JavaScript as `[channelId, replicaId, bytes]`,
+/// where `bytes` is the text of `record` exactly as `save` receives it. The
+/// buffer is owned by the core and valid only for this call, so it is copied
+/// before the promise is awaited.
+extern "C" int32_t channelStoreSaveMany(void* userData, uint64_t secretId, const uint8_t* records,
+                                         size_t recordsLen) {
+  auto* self = static_cast<StoreBindings*>(userData);
+  // Kept alive past this call so the lambda handed to `callSync` — which the
+  // JavaScript CallInvoker's queue may still be holding after this object's
+  // owner has released its own reference — has somewhere safe to run.
+  auto keepAlive = self->shared_from_this();
+  std::vector<uint8_t> recordsJson(records, records + recordsLen);
+  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId, recordsJson](std::function<void(CallResult)> settle) {
+    jsi::Runtime& rt = keepAlive->runtime();
+    auto store = keepAlive->channelStore();
+    auto method = store->getPropertyAsFunction(rt, "saveMany");
+    // Ids arrive as decimal strings — the core encodes them that way because
+    // `JSON.parse` cannot hold a u64.
+    jsi::Array triples = recordsJson.empty()
+                             ? jsi::Array(rt, 0)
+                             : jsonParseUtf8(rt, recordsJson.data(), recordsJson.size()).asObject(rt).asArray(rt);
+    size_t count = triples.size(rt);
+    jsi::Array recordsVal(rt, count);
+    for (size_t i = 0; i < count; ++i) {
+      jsi::Array triple = triples.getValueAtIndex(rt, i).asObject(rt).asArray(rt);
+      std::string record = triple.getValueAtIndex(rt, 2).asString(rt).utf8(rt);
+      std::vector<uint8_t> bytes(record.begin(), record.end());
+      jsi::Array entry(rt, 3);
+      entry.setValueAtIndex(rt, 0, triple.getValueAtIndex(rt, 0));
+      entry.setValueAtIndex(rt, 1, triple.getValueAtIndex(rt, 1));
+      entry.setValueAtIndex(rt, 2, toUint8ArrayVal(rt, bytes));
+      recordsVal.setValueAtIndex(rt, i, std::move(entry));
+    }
+    jsi::Value promise =
+        method.callWithThis(rt, *store, idVal(rt, secretId), jsi::Value(rt, recordsVal));
+    keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
+  });
+  return result.code;
+}
+
 /// `ChannelStore.remove(secretId, channelId, replicaId) -> boolean`
 extern "C" int32_t channelStoreRemove(void* userData, uint64_t secretId, uint64_t channelId,
                                        uint64_t replicaId, uint32_t* outExisted) {
@@ -756,6 +799,51 @@ extern "C" int32_t secretStoreSave(void* userData, uint64_t secretId, uint64_t c
     jsi::Value promise =
         method.callWithThis(rt, *store, idVal(rt, secretId), idVal(rt, channelId),
                              jsi::Value(static_cast<int>(kind)), toUint8ArrayVal(rt, payload));
+    keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
+  });
+  return result.code;
+}
+
+/// `SecretStore.saveMany(secretId, entries) -> void`
+///
+/// `entries` arrives as a JSON array of `[channelId, kind, record]` triples
+/// and is handed to JavaScript as `[channelId, kind, value]`, where `value` is
+/// read out of `record` exactly as `save` reads its bytes. The buffer is
+/// owned by the core and valid only for this call, so it is copied before the
+/// promise is awaited.
+extern "C" int32_t secretStoreSaveMany(void* userData, uint64_t secretId, const uint8_t* entries,
+                                        size_t entriesLen) {
+  auto* self = static_cast<StoreBindings*>(userData);
+  // Kept alive past this call so the lambda handed to `callSync` — which the
+  // JavaScript CallInvoker's queue may still be holding after this object's
+  // owner has released its own reference — has somewhere safe to run.
+  auto keepAlive = self->shared_from_this();
+  std::vector<uint8_t> entriesJson(entries, entries + entriesLen);
+  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId, entriesJson](std::function<void(CallResult)> settle) {
+    jsi::Runtime& rt = keepAlive->runtime();
+    auto store = keepAlive->secretStore();
+    auto method = store->getPropertyAsFunction(rt, "saveMany");
+    // Channel ids arrive as decimal strings — the core encodes them that way
+    // because `JSON.parse` cannot hold a u64 — and kinds as the numbers
+    // `save` takes.
+    jsi::Array triples = entriesJson.empty()
+                             ? jsi::Array(rt, 0)
+                             : jsonParseUtf8(rt, entriesJson.data(), entriesJson.size()).asObject(rt).asArray(rt);
+    size_t count = triples.size(rt);
+    jsi::Array entriesVal(rt, count);
+    for (size_t i = 0; i < count; ++i) {
+      jsi::Array triple = triples.getValueAtIndex(rt, i).asObject(rt).asArray(rt);
+      std::string record = triple.getValueAtIndex(rt, 2).asString(rt).utf8(rt);
+      std::vector<uint8_t> value =
+          decodeSecretValueBytes(reinterpret_cast<const uint8_t*>(record.data()), record.size());
+      jsi::Array entry(rt, 3);
+      entry.setValueAtIndex(rt, 0, triple.getValueAtIndex(rt, 0));
+      entry.setValueAtIndex(rt, 1, triple.getValueAtIndex(rt, 1));
+      entry.setValueAtIndex(rt, 2, toUint8ArrayVal(rt, value));
+      entriesVal.setValueAtIndex(rt, i, std::move(entry));
+    }
+    jsi::Value promise =
+        method.callWithThis(rt, *store, idVal(rt, secretId), jsi::Value(rt, entriesVal));
     keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
   });
   return result.code;
@@ -1426,6 +1514,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
       self,                        // user_data
       channelStoreLoad,            // load
       channelStoreSave,            // save
+      channelStoreSaveMany,        // save_many
       channelStoreRemove,          // remove
       channelStoreRemoveMany,      // remove_many
       channelStoreListHelpers,     // list_helpers
@@ -1439,6 +1528,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
       secretStoreLoad,     // load
       secretStoreLoadMany, // load_many
       secretStoreSave,     // save
+      secretStoreSaveMany, // save_many
       secretStoreRemove,   // remove
       secretStoreRemoveMany, // remove_many
       storeFreeBuffer,     // free_buffer
@@ -1481,6 +1571,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
   requireField(rt, bindings->channelCallbacks_.user_data, "ChannelStoreCallbacks.user_data");
   requireField(rt, bindings->channelCallbacks_.load, "ChannelStoreCallbacks.load");
   requireField(rt, bindings->channelCallbacks_.save, "ChannelStoreCallbacks.save");
+  requireField(rt, bindings->channelCallbacks_.save_many, "ChannelStoreCallbacks.save_many");
   requireField(rt, bindings->channelCallbacks_.remove, "ChannelStoreCallbacks.remove");
   requireField(rt, bindings->channelCallbacks_.remove_many, "ChannelStoreCallbacks.remove_many");
   requireField(rt, bindings->channelCallbacks_.list_helpers, "ChannelStoreCallbacks.list_helpers");
@@ -1493,6 +1584,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
   requireField(rt, bindings->secretCallbacks_.load, "SecretStoreCallbacks.load");
   requireField(rt, bindings->secretCallbacks_.load_many, "SecretStoreCallbacks.load_many");
   requireField(rt, bindings->secretCallbacks_.save, "SecretStoreCallbacks.save");
+  requireField(rt, bindings->secretCallbacks_.save_many, "SecretStoreCallbacks.save_many");
   requireField(rt, bindings->secretCallbacks_.remove, "SecretStoreCallbacks.remove");
   requireField(rt, bindings->secretCallbacks_.remove_many, "SecretStoreCallbacks.remove_many");
   requireField(rt, bindings->secretCallbacks_.free_buffer, "SecretStoreCallbacks.free_buffer");

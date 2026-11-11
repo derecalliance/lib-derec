@@ -219,24 +219,33 @@ That is the helper's own configured communication info, not the
 configures none is named by its channel alone.
 
 **After recovery: restore or join.** `SecretRecovered` writes nothing, so
-decide before calling `restore`. When `secret.replicas?.members` names live
-members other than the lost device, do not restore: tell the user and offer
-to join that group as a new replica — pair with a live member, confirm the
-fingerprint, then run `start(FlowKind.ReplicaDiscovery)`. With no live member, restore. Neither path gives this device the proofs of
-earlier versions, so it cannot verify them: restore writes none, and a
-joining device gets only the share map of the single version each push or
-catch-up carries. The live members keep the proofs they hold. A restored
-device also cannot publish, or answer a member's catch-up, until the app
-configures a `replica_id` the roster names. Joining adds the device as a new
-member, while restoring next to live replicas makes a second device claim
-the lost device's role. See
+decide before calling `restore`. Restore is for an owner that lost access to
+its other devices. When the user still has one, do not restore: pair the new
+device with it as a replica — pair, confirm the fingerprint, run
+`start(FlowKind.ReplicaDiscovery)`.
+
+`restore` never carries the recovered replica group forward. Each member is
+reported as `PeerNotRestored` with `reason: "ReplicaGroupDropped"` (the group's
+`channel_id` and the member's `replica_id`), in roster order, and the restored
+device publishes as a lone owner. Tell the user which devices the group had —
+`secret.replicas` names each member with the `communication_info` it
+advertised when it paired — and that any of them still in reach joins this
+device again by pairing. No message is sent to the old members; they lose
+access to the helpers once the old helper channels are retired (see
+[Retire the old channels](#retire-the-old-channels)). See
 [Restore or join](https://derec-alliance.gitbook.io/docs/concepts/replicas/restore-or-join).
 
-`restore(secret, version, newestVersion)` takes the recovered `version` and
-`newestVersion`, the newest version any helper reported in Discovery
-(`version` itself when that is the newest). The recovered secrets are
-recorded at `newestVersion`, so the next publish is `newestVersion + 1`: a
-helper ignores a version older than the newest it stores (`'Superseded'`).
+`restore(secret, version, newestVersion, keepRecoveryChannels)` takes the
+recovered `version` and `newestVersion`, the newest version any helper
+reported in Discovery (`version` itself when that is the newest). The
+recovered secrets are recorded at `newestVersion`, so the next publish is
+`newestVersion + 1`: a helper ignores a version older than the newest it
+stores (`'Superseded'`). `keepRecoveryChannels` is a `KeepRecoveryChannel[]`
+(`{ roster_channel_id, recovery_channel_id }`, decimal strings); pass `[]` to
+restore every helper on its old channel. A pair that names a roster id that is
+not a roster helper, a recovery id that is not a `"Paired"` helper channel
+outside the roster, or an id another pair names rejects with `invalid_input`
+before anything is written.
 
 Every channel message carries one timestamp, its send time, in both the
 envelope and the inner message. A message whose two timestamps differ, or
@@ -268,6 +277,49 @@ reports a request on such a contact, or a request older than the lifetime, as
 involves both parties, so treat an expiry as a retry and ask the user to scan
 or share a fresh contact. Keep the scanner's `expired_channels` timeout at
 least `pairing_secs` plus the time a response takes to arrive.
+
+### Retire the old channels
+
+After recovering, the device holds two channels to every helper that served a
+share: the old one in the recovered roster, whose key every lost device still
+holds, and the recovery channel it paired on, whose key only this device
+holds. Keep the recovery channel and retire the old one, so the lost devices
+are cut off from the helpers:
+
+1. **Map the channels.** Every version a helper reports in Discovery
+   (`SecretsDiscovered`) carries a `channel_id`: the channel its share is
+   stored on. On a recovery channel that is the old roster channel it
+   replaces. Use only an id that names a helper in the recovered roster.
+2. **Restore keeping the recovery channels.** Pass one
+   `{ roster_channel_id, recovery_channel_id }` per helper. Restore does not
+   write the old channel, keeps the recovery channel with the roster weight,
+   and does not unpair it. A helper that served no share has no recovery
+   channel: it is restored on its old channel, and the app may unpair it
+   before publishing.
+3. **Publish.** `start(FlowKind.ProtectSecret, …)` stores a fresh version on
+   every kept channel. Key `weights` by the kept recovery channel ids.
+4. **Unpair the old channels.** Once a helper has confirmed the new version,
+   `start(FlowKind.Unpair, { channel_id: recovery, linked_channel_id: old })`
+   asks it to drop the old channel. The request travels on the recovery
+   channel; the helper refuses it while no share is stored there, and while
+   the old channel is not linked to it. The flow's events (`UnpairStarted`,
+   `Unpaired`, `UnpairRejected`) name the old channel, and the recovery
+   channel is never set to `"Unpairing"`. A `linked_channel_id` equal to
+   `channel_id` rejects with `invalid_input`.
+
+```ts
+const keep = [{ roster_channel_id: oldChannelId, recovery_channel_id: recoveryChannelId }];
+const restoreEvents = await protocol.restore(secret, version, newestVersion, keep);
+// ... start(FlowKind.ProtectSecret, …) and wait for the helper's ShareConfirmed.
+await protocol.start(FlowKind.Unpair, {
+  channel_id: recoveryChannelId,
+  linked_channel_id: oldChannelId,
+});
+```
+
+A lost device that is still running gets no answer from a helper afterwards:
+the helper holds no key for the old channel, so it cannot reply, and the
+device's rounds time out.
 
 ### Key rotation
 
@@ -405,10 +457,14 @@ directly. `DeRecProtocolBuilder` takes one implementation of each interface
 declared in `src/types.ts`:
 
 - **`ChannelStore`** — pairing state: helper channels and replica-group
-  membership, keyed by `(channelId, replicaId)`. `removeMany` removes every
+  membership, keyed by `(channelId, replicaId)`. `saveMany` saves every
+  `[channelId, replicaId, bytes]` triple in one call, each addressed and
+  encoded the way `save`'s arguments are and replacing whatever is stored
+  under the same key; an empty list writes nothing. `removeMany` removes every
   record its `[channelId, replicaId]` pairs address in one call, each
   addressed the way `remove`'s arguments are, and skips entries that name no
-  record; delete them in one statement or transaction when your backend can.
+  record. Write or delete them in one statement or transaction when your
+  backend can.
 - **`ShareStore`** — versioned VSS shares this device holds as a helper.
   `loadMany` resolves to `[channelId, share]` pairs, each share paired with
   the channel it is stored under. On an owner, `keepVersion` chooses the one older version helpers keep
@@ -416,7 +472,10 @@ declared in `src/types.ts`:
   greater than that version fails the round with `invalid_keep_version`; see
   [`DeRecShareStore::keep_version`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html#tymethod.keep_version).
 - **`SecretStore`** — small per-channel key material (shared keys, etc.),
-  distinct from share bytes. `removeMany` removes every secret its
+  distinct from share bytes. `saveMany` saves every `[channelId, kind, value]`
+  triple in one call, each addressed and encoded the way `save`'s arguments
+  are and replacing whatever is stored under the same `(channelId, kind)`; an
+  empty list writes nothing. `removeMany` removes every secret its
   `[channelId, kind]` pairs name in one call, each addressed the way
   `remove`'s arguments are, and skips entries with nothing stored.
 - **`UserSecretStore`** — the most recent user-facing secret snapshot per

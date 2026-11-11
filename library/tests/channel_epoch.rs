@@ -199,6 +199,7 @@ fn flows() -> Vec<(&'static str, DeRecFlow)> {
             DeRecFlow::Unpair {
                 channel_id: A,
                 memo: None,
+                linked_channel_id: None,
             },
         ),
     ]

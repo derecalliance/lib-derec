@@ -6,6 +6,7 @@ use derec_library::protocol::types::{
 };
 use derec_library::protocol::{ChannelStoreFuture, DeRecChannelStore};
 use derec_library::types::ChannelId;
+use rusqlite::Connection;
 use std::collections::{HashSet, VecDeque};
 use std::future;
 
@@ -58,48 +59,23 @@ impl DeRecChannelStore for SqliteChannelStore {
 
     fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
         let conn = lock(&self.connection);
-        let bytes = encode_channel(&record);
-        match &record {
-            ChannelRecord::Helper(h) => {
-                conn.execute(
-                    "INSERT INTO channels (secret_id, channel_id, status, peer_role, data)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(secret_id, channel_id) DO UPDATE SET
-                         status = excluded.status,
-                         peer_role = excluded.peer_role,
-                         data = excluded.data",
-                    rusqlite::params![
-                        u64_to_sql(secret_id),
-                        u64_to_sql(h.channel_id.0),
-                        channel_status_tag(h.status),
-                        sender_kind_tag(h.peer_role),
-                        bytes
-                    ],
-                )
-                .expect("helper channel save failed");
-            }
-            ChannelRecord::Replica(m) => {
-                conn.execute(
-                    "INSERT INTO replica_members
-                         (secret_id, replica_id, channel_id, status, role, data)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(secret_id, replica_id) DO UPDATE SET
-                         channel_id = excluded.channel_id,
-                         status = excluded.status,
-                         role = excluded.role,
-                         data = excluded.data",
-                    rusqlite::params![
-                        u64_to_sql(secret_id),
-                        u64_to_sql(m.replica_id.0),
-                        u64_to_sql(m.channel_id.0),
-                        channel_status_tag(m.status),
-                        replica_role_tag(m.role),
-                        bytes
-                    ],
-                )
-                .expect("replica member save failed");
-            }
+        upsert(&conn, secret_id, &record);
+        Box::pin(future::ready(Ok(())))
+    }
+
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        records: Vec<ChannelRecord>,
+    ) -> ChannelStoreFuture<'_, ()> {
+        let conn = lock(&self.connection);
+        let tx = conn
+            .unchecked_transaction()
+            .expect("save_many transaction failed");
+        for record in &records {
+            upsert(&tx, secret_id, record);
         }
+        tx.commit().expect("save_many commit failed");
         Box::pin(future::ready(Ok(())))
     }
 
@@ -370,4 +346,50 @@ fn bind_all(
             format!("?{}", params.len())
         })
         .collect()
+}
+
+/// Insert or replace `record` at its own key.
+fn upsert(conn: &Connection, secret_id: u64, record: &ChannelRecord) {
+    let bytes = encode_channel(record);
+    match record {
+        ChannelRecord::Helper(h) => {
+            conn.execute(
+                "INSERT INTO channels (secret_id, channel_id, status, peer_role, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(secret_id, channel_id) DO UPDATE SET
+                     status = excluded.status,
+                     peer_role = excluded.peer_role,
+                     data = excluded.data",
+                rusqlite::params![
+                    u64_to_sql(secret_id),
+                    u64_to_sql(h.channel_id.0),
+                    channel_status_tag(h.status),
+                    sender_kind_tag(h.peer_role),
+                    bytes
+                ],
+            )
+            .expect("helper channel save failed");
+        }
+        ChannelRecord::Replica(m) => {
+            conn.execute(
+                "INSERT INTO replica_members
+                     (secret_id, replica_id, channel_id, status, role, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(secret_id, replica_id) DO UPDATE SET
+                     channel_id = excluded.channel_id,
+                     status = excluded.status,
+                     role = excluded.role,
+                     data = excluded.data",
+                rusqlite::params![
+                    u64_to_sql(secret_id),
+                    u64_to_sql(m.replica_id.0),
+                    u64_to_sql(m.channel_id.0),
+                    channel_status_tag(m.status),
+                    replica_role_tag(m.role),
+                    bytes
+                ],
+            )
+            .expect("replica member save failed");
+        }
+    }
 }

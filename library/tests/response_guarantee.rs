@@ -421,6 +421,7 @@ impl Req {
             Req::Unpair => MessageBody::UnpairRequest(UnpairRequestMessage {
                 memo: "leaving".to_owned(),
                 reply_to_transports: vec![endpoint(OWNER_URI)],
+                channel_id: CHANNEL.0,
                 ..Default::default()
             }),
             Req::UpdateChannelInfo => {
@@ -677,7 +678,10 @@ fn an_unresolvable_target_yields_a_token_even_when_on() {
         let rig = Rig::default();
         rig.seed_helper_channel(SenderKind::Owner).await;
         let mut protocol = rig.build(true, AutoAcceptPolicy::default(), false);
-        let body = MessageBody::UnpairRequest(UnpairRequestMessage::default());
+        let body = MessageBody::UnpairRequest(UnpairRequestMessage {
+            channel_id: CHANNEL.0,
+            ..Default::default()
+        });
         let raised = protocol
             .process(&wire(CHANNEL, &KEY, body))
             .await
@@ -1192,6 +1196,7 @@ fn exempt_messages_are_never_answered() {
             let mut protocol = rig.build(respond, policy, true);
             let body = MessageBody::UnpairRequest(UnpairRequestMessage {
                 replica_id: Some(0xBAD),
+                channel_id: GROUP.0,
                 ..Default::default()
             });
             let _ = protocol.process(&wire(GROUP, &GROUP_KEY, body)).await;

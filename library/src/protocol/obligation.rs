@@ -640,7 +640,7 @@ fn failure_body(
             handlers::discovery::failure_response(local, r, status, memo)
         }
         FailedRequest::GetShare(r) => handlers::recovery::failure_response(local, r, status, memo),
-        FailedRequest::Unpair(_) => handlers::unpairing::failure_response(status, memo),
+        FailedRequest::Unpair(r) => handlers::unpairing::failure_response(r, status, memo),
         FailedRequest::UpdateChannelInfo(_) => {
             handlers::update_channel_info::failure_response(status, memo)
         }

@@ -118,6 +118,7 @@ export function encodeSecretList(entries: SecretVersionEntry[]): Uint8Array {
       const description = utf8Encode(version.description);
       writer.u32(description.length);
       writer.bytes(description);
+      writer.u64(version.channel_id);
     }
   }
   return writer.finish();
@@ -134,10 +135,8 @@ export function decodeSecretList(buffer: Uint8Array | ArrayBuffer): SecretVersio
     for (let v = 0; v < versionCount; v++) {
       const version = reader.u32();
       const descriptionLength = reader.u32();
-      versions.push({
-        version,
-        description: utf8Decode(reader.bytes(descriptionLength)),
-      });
+      const description = utf8Decode(reader.bytes(descriptionLength));
+      versions.push({ version, description, channel_id: reader.u64() });
     }
     entries.push({ secret_id: secretId, versions });
   }

@@ -114,9 +114,10 @@ pub use traits::{
 };
 pub use types::{
     ChannelQuery, ChannelRecord, ChannelShare, ChannelStatus, CollectedShare,
-    ExpiredChannelCleanup, HelperChannel, HelperInfo, MissingPolicy, PairingKeyMaterial,
-    ReplicaInfo, ReplicaMember, ReplicaRole, ReplicaSecretPayload, Secret, SecretKind, SecretValue,
-    Share, StateItem, StateKey, StateKind, Target, UserSecret, UserSecrets,
+    ExpiredChannelCleanup, HelperChannel, HelperInfo, KeepRecoveryChannel, MissingPolicy,
+    PairingKeyMaterial, ReplicaInfo, ReplicaMember, ReplicaRole, ReplicaSecretPayload, Secret,
+    SecretKind, SecretValue, Share, StateItem, StateKey, StateKind, Target, UserSecret,
+    UserSecrets,
 };
 
 pub use events::{

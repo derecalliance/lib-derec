@@ -270,7 +270,7 @@ export function runPrimitivesSmoke(): void {
   const helperSecretList: SecretVersionEntry[] = [
     {
       secret_id: secretId,
-      versions: [{ version, description: "smoke-test secret" }],
+      versions: [{ version, description: "smoke-test secret", channel_id: discChannel }],
     },
   ];
   const discRespEnvelope = primitives.discovery.response.produce(
@@ -287,6 +287,9 @@ export function runPrimitivesSmoke(): void {
   const entry = discResult.secret_list[0]!;
   if (entry.secret_id !== secretId) {
     throw new Error(`discovery: secret_id mismatch (${entry.secret_id} vs ${secretId})`);
+  }
+  if (entry.versions[0]?.channel_id !== discChannel) {
+    throw new Error(`discovery: a version names the channel its share is stored on (${entry.versions[0]?.channel_id} vs ${discChannel})`);
   }
   console.log(`  [response.process] ${discResult.secret_list.length} secret(s) discovered`);
 

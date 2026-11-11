@@ -1083,8 +1083,8 @@ internal static class Primitives
                 SecretId = 0xAABBCCDDUL,
                 Versions = new List<Discovery.VersionEntry>
                 {
-                    new Discovery.VersionEntry { Version = 1, Description = "first" },
-                    new Discovery.VersionEntry { Version = 2, Description = "second" },
+                    new Discovery.VersionEntry { Version = 1, Description = "first", ChannelId = channelId },
+                    new Discovery.VersionEntry { Version = 2, Description = "second", ChannelId = channelId },
                 },
             },
             new Discovery.SecretVersionEntry
@@ -1092,7 +1092,7 @@ internal static class Primitives
                 SecretId = 0x11223344UL,
                 Versions = new List<Discovery.VersionEntry>
                 {
-                    new Discovery.VersionEntry { Version = 5, Description = "fifth" },
+                    new Discovery.VersionEntry { Version = 5, Description = "fifth", ChannelId = ulong.MaxValue },
                 },
             },
         };
@@ -1113,6 +1113,10 @@ internal static class Primitives
             throw new InvalidOperationException("Discovery test failed: first entry descriptions mismatch.");
         if (parsed[1].SecretId != 0x11223344UL || parsed[1].Versions.Count != 1 || parsed[1].Versions[0].Version != 5)
             throw new InvalidOperationException("Discovery test failed: second entry mismatch.");
+        if (parsed[0].Versions[0].ChannelId != channelId
+            || parsed[0].Versions[1].ChannelId != channelId
+            || parsed[1].Versions[0].ChannelId != ulong.MaxValue)
+            throw new InvalidOperationException("Discovery test failed: version channel_id mismatch.");
 
         Console.WriteLine("Discovery flow test passed.");
     }

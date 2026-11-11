@@ -192,11 +192,15 @@ fn ignore_reason_fixture_is_complete() {
 
 #[test]
 fn not_restored_reason_fixture_is_complete() {
-    let all = [NotRestoredReason::NoTransports];
+    let all = [
+        NotRestoredReason::NoTransports,
+        NotRestoredReason::ReplicaGroupDropped,
+    ];
     let names: Vec<&str> = all
         .iter()
         .map(|r| match r {
             NotRestoredReason::NoTransports => "NoTransports",
+            NotRestoredReason::ReplicaGroupDropped => "ReplicaGroupDropped",
         })
         .collect();
     assert_matches_fixture("NotRestoredReason", &names);

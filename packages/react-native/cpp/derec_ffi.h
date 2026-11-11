@@ -852,6 +852,12 @@ typedef struct DeRecProtocolNewResult {
  * returning fewer rows than it selects is wrong, and undetectable. The buffer is owned
  * by the caller and valid only for the duration of the call.
  *
+ * `save_many` receives a JSON array of `[channel_id, replica_id, record]`
+ * triples, one per record to save: the ids as decimal strings, addressed
+ * the way `save`'s arguments are, and `record` the JSON text `save` receives
+ * as its bytes, as a string. The buffer is owned by the caller and valid
+ * only for the duration of the call.
+ *
  * `remove_many` receives a JSON array of `[channel_id, replica_id]` pairs,
  * the ids as decimal strings, each addressing one record the way `remove`'s
  * arguments do (`replica_id` `"0"` for a helper channel). An entry
@@ -876,6 +882,10 @@ typedef struct ChannelStoreCallbacks {
                   uint64_t replica_id,
                   const uint8_t *bytes,
                   size_t len);
+  int32_t (*save_many)(void *user_data,
+                       uint64_t secret_id,
+                       const uint8_t *records,
+                       size_t records_len);
   int32_t (*remove)(void *user_data,
                     uint64_t secret_id,
                     uint64_t channel_id,
@@ -915,6 +925,12 @@ typedef struct ChannelStoreCallbacks {
  * `null` when nothing of `kind` is stored for that channel. Whether a
  * missing entry is an error is decided by the library, not the callback.
  *
+ * `save_many` receives a JSON array of `[channel_id, kind, record]`
+ * triples, one per secret to save: the channel id as a decimal string, the
+ * kind as the number `save` takes, and `record` the JSON text `save`
+ * receives as its bytes, as a string. The buffer is owned by the caller and
+ * valid only for the duration of the call.
+ *
  * `remove_many` receives a JSON array of `[channel_id, kind]` pairs, the
  * channel id as a decimal string and the kind as the number `remove` takes,
  * each naming one secret to remove. An entry with nothing stored is skipped.
@@ -942,6 +958,10 @@ typedef struct SecretStoreCallbacks {
                   uint32_t kind,
                   const uint8_t *bytes,
                   size_t len);
+  int32_t (*save_many)(void *user_data,
+                       uint64_t secret_id,
+                       const uint8_t *entries,
+                       size_t entries_len);
   int32_t (*remove)(void *user_data, uint64_t secret_id, uint64_t channel_id, uint32_t kind);
   int32_t (*remove_many)(void *user_data,
                          uint64_t secret_id,

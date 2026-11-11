@@ -756,6 +756,7 @@ describe('event byte fields', () => {
       },
       1,
       1,
+      [],
     )) as Array<Extract<DeRecEvent, {type: 'PeerNotRestored'}>>;
 
     // An empty endpoint list is Rust's to judge; the shim forwards it as is.
@@ -766,5 +767,74 @@ describe('event byte fields', () => {
     expect(decoded[1].channel_id).toBe('21');
     expect(decoded[1].replica_id).toBe('18446744073709551615');
     expect(decoded[1].reason).toBe('NoTransports');
+  });
+
+  it('passes a ReplicaGroupDropped PeerNotRestored per member through unchanged', async () => {
+    const events = [
+      {type: 'PeerNotRestored', channel_id: '33', replica_id: '44', reason: 'ReplicaGroupDropped'},
+      {type: 'PeerNotRestored', channel_id: '33', replica_id: '66', reason: 'ReplicaGroupDropped'},
+    ];
+    host.restore = () => Promise.resolve(utf8(JSON.stringify(events)).buffer);
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    const decoded = await protocol.restore({helpers: [], secrets: []}, 1, 1, []);
+
+    expect(decoded).toEqual(events);
+  });
+
+  it('forwards the kept recovery channels to restore verbatim', async () => {
+    let sent: unknown;
+    host.restore = (params: Uint8Array) => {
+      sent = JSON.parse(String.fromCharCode(...Array.from(params)));
+      return Promise.resolve(utf8('[]').buffer);
+    };
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    await protocol.restore({helpers: [], secrets: []}, 1, 1, [
+      {roster_channel_id: '18446744073709551615', recovery_channel_id: '0'},
+    ]);
+
+    // A recovery id of 0 is Rust's to refuse; the shim forwards it as is.
+    expect((sent as {keep_recovery_channels: unknown}).keep_recovery_channels).toEqual([
+      {roster_channel_id: '18446744073709551615', recovery_channel_id: '0'},
+    ]);
+  });
+
+  it('sends an empty keep list as [] rather than omitting it', async () => {
+    let sent: unknown;
+    host.restore = (params: Uint8Array) => {
+      sent = JSON.parse(String.fromCharCode(...Array.from(params)));
+      return Promise.resolve(utf8('[]').buffer);
+    };
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    await protocol.restore({helpers: [], secrets: []}, 1, 1, []);
+
+    expect((sent as {keep_recovery_channels: unknown}).keep_recovery_channels).toEqual([]);
+  });
+
+  it('forwards an Unpair linked_channel_id verbatim and omits it when absent', async () => {
+    const sent: unknown[] = [];
+    host.start = (_kind: number, params: Uint8Array) => {
+      sent.push(JSON.parse(String.fromCharCode(...Array.from(params))));
+      return Promise.resolve(utf8('[]').buffer);
+    };
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    await protocol.start(FlowKind.Unpair, {
+      channel_id: '9',
+      memo: 'retire',
+      linked_channel_id: '18446744073709551615',
+    });
+    await protocol.start(FlowKind.Unpair, {channel_id: '9'});
+
+    expect(sent).toEqual([
+      {channel_id: '9', memo: 'retire', linked_channel_id: '18446744073709551615'},
+      {channel_id: '9'},
+    ]);
   });
 });

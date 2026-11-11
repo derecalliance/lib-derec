@@ -27,6 +27,7 @@ import type {
   DeRecEvent,
   DeRecProtocolConfig,
   HelperFilter,
+  KeepRecoveryChannel,
   ParameterRange,
   ReplicaFilter,
   ReplicaRoleName,
@@ -108,6 +109,15 @@ class InMemorySecretStore implements SecretStore {
     this.data.set(this.key(secretId, channelId, kind), value);
   }
 
+  async saveMany(
+    secretId: string,
+    entries: [channelId: string, kind: 0 | 1 | 2 | 3, value: Uint8Array][],
+  ): Promise<void> {
+    for (const [channelId, kind, value] of entries) {
+      await this.save(secretId, channelId, kind, value);
+    }
+  }
+
   async remove(secretId: string, channelId: string, kind: 0 | 1 | 2 | 3): Promise<void> {
     this.data.delete(this.key(secretId, channelId, kind));
   }
@@ -167,6 +177,15 @@ class InMemoryChannelStore implements ChannelStore {
       this.key(secretId, this.idFor(channelId, replicaId)),
       bytes,
     );
+  }
+
+  async saveMany(
+    secretId: string,
+    records: [channelId: string, replicaId: string, bytes: Uint8Array][],
+  ): Promise<void> {
+    for (const [channelId, replicaId, bytes] of records) {
+      await this.save(secretId, channelId, replicaId, bytes);
+    }
   }
 
   async remove(
@@ -1732,7 +1751,7 @@ async function runStickyThresholdFlow(): Promise<void> {
   // The helpers may hold versions newer than the one recovered: the snapshot
   // is recorded at the newest one, so the next publish numbers above it.
   const newest = v3 + 2;
-  await restored.protocol.restore(recovered.secret, v3, newest);
+  await restored.protocol.restore(recovered.secret, v3, newest, []);
   const restoredSnapshot = await restored.userSecretStore.loadLatest(secretId.toString());
   if (restoredSnapshot?.threshold !== 3) {
     throw new Error("restore must keep t=3");
@@ -2546,7 +2565,7 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   if (recovered.threshold !== THRESHOLD) {
     throw new Error(`the recovered roster must carry t=${THRESHOLD}, got ${recovered.threshold}`);
   }
-  await restored.protocol.restore(recovered, 1, 1);
+  await restored.protocol.restore(recovered, 1, 1, []);
 
   const restoredSnapshot = await restored.userSecretStore.loadLatest(
     ownerSecretId.toString(),
@@ -2595,7 +2614,7 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   });
   let conflict: DeRecError | undefined;
   try {
-    await conflicting.protocol.restore(recovered, 1, 1);
+    await conflicting.protocol.restore(recovered, 1, 1, []);
   } catch (e) {
     conflict = e as DeRecError;
   }
@@ -2966,7 +2985,7 @@ async function runRestoreKeepsHelperDutiesFlow(): Promise<void> {
   const recovered = requireEvent(recoveryEvents, "SecretRecovered", "Device").secret;
   console.log("  [Device]  recovers its own secret over fresh recovery channels  ✓");
 
-  const restoreEvents = await device.node.protocol.restore(recovered, version, version);
+  const restoreEvents = await device.node.protocol.restore(recovered, version, version, []);
   const touched = restoreEvents.flatMap((e) =>
     e.type === "UnpairStarted" || e.type === "Unpaired" || e.type === "UnpairFailed" ? [e.channel_id] : [],
   );
@@ -3008,6 +3027,239 @@ async function runRestoreKeepsHelperDutiesFlow(): Promise<void> {
   console.log("  [Other]   VerifyShares → ShareVerified on the duty channel  ✓");
 
   console.log("\n✓ Restore keeps helper duties flow passed.\n");
+}
+
+/**
+ * Recover on a new device, restore keeping the recovery channels, publish,
+ * then retire the old channels with a linked unpair. Every version Discovery
+ * reports names the old channel it is stored on, which maps each recovery
+ * channel to the roster helper it replaces. The recovered replica group is
+ * dropped, and the old devices — which still hold the old channels' keys —
+ * reach no helper afterwards. Mirrors `run_restore_on_recovery_channels_flow`
+ * in `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runRestoreOnRecoveryChannelsFlow(): Promise<void> {
+  console.log("=== [Protocol] Restore On Recovery Channels Flow ===\n");
+
+  const secretId = 0x2E6n;
+  const source: AddressedNode = {
+    node: makeNode("lost-source", "https://lost-source.example.com", { secretId, replicaId: 0x5011n }),
+    uri: "https://lost-source.example.com",
+  };
+  const replica: AddressedNode = {
+    node: makeNode("lost-replica", "https://lost-replica.example.com", { secretId, replicaId: 0x5012n }),
+    uri: "https://lost-replica.example.com",
+  };
+  const helperA: AddressedNode = {
+    node: makeNode("helper-a", "https://helper-a-keep.example.com"),
+    uri: "https://helper-a-keep.example.com",
+  };
+  const helperB: AddressedNode = {
+    node: makeNode("helper-b", "https://helper-b-keep.example.com"),
+    uri: "https://helper-b-keep.example.com",
+  };
+  const { longTermChannelId: oldA } = await doPair(helperA.node, source.node, 1n, "Lost↔HelperA");
+  const { longTermChannelId: oldB } = await doPair(helperB.node, source.node, 2n, "Lost↔HelperB");
+  const { rekeyed: group } = await pairReplicaHandshake(source, replica, 3n);
+  await crossConfirmFingerprint(source.node, replica.node, group);
+  await pumpAll([source, replica, helperA, helperB]);
+  const version = await protectAcross(source, [replica, helperA, helperB], "kept secret");
+
+  // Both devices are lost. A new one pairs with each helper afresh, and
+  // each helper links the owner's old channel to the new one.
+  const device: AddressedNode = {
+    node: makeNode("device", "https://device-keep.example.com", { secretId }),
+    uri: "https://device-keep.example.com",
+  };
+  const deviceSid = secretId.toString();
+  const { longTermChannelId: recoveryA } = await doPair(helperA.node, device.node, 100n, "Device↔HelperA");
+  const { longTermChannelId: recoveryB } = await doPair(helperB.node, device.node, 101n, "Device↔HelperB");
+  for (const [helper, old, recovery] of [
+    [helperA, oldA, recoveryA],
+    [helperB, oldB, recoveryB],
+  ] as const) {
+    await helper.node.channelStore.linkChannel(String(helper.node.protocol.secretId()), old, recovery);
+  }
+
+  await device.node.protocol.start(FlowKind.Discovery, { target: [BigInt(recoveryA), BigInt(recoveryB)] });
+  const owning = new Map<string, string>();
+  for (const event of await pumpAll([device, helperA, helperB])) {
+    if (event.type !== "SecretsDiscovered") continue;
+    const entry = event.secrets.find((s) => s.secret_id === secretId.toString());
+    if (!entry) throw new Error(`the helper on ${event.channel_id} reports the owner's secret`);
+    const held = entry.versions.find((v) => v.version === version);
+    if (!held) throw new Error(`the helper on ${event.channel_id} reports v${version}`);
+    owning.set(event.channel_id, held.channel_id);
+  }
+  expectSame(
+    "each version names the old channel its share is stored on",
+    [...owning.entries()].sort(),
+    [[recoveryA, oldA], [recoveryB, oldB]].sort(),
+  );
+  console.log("  Discovery maps each recovery channel to the old channel it replaces  ✓");
+
+  await device.node.protocol.start(FlowKind.RecoverSecret, { secretId, version });
+  const recovered = requireEvent(await pumpAll([device, helperA, helperB]), "SecretRecovered", "device").secret;
+  if (!recovered.replicas) throw new Error("the recovered roster carries the replica group");
+
+  const keep: KeepRecoveryChannel[] = [...owning.entries()].map(([recovery, old]) => ({
+    roster_channel_id: old,
+    recovery_channel_id: recovery,
+  }));
+  const restoreEvents = await device.node.protocol.restore(recovered, version, version, keep);
+  const dropped = restoreEvents
+    .flatMap((e) =>
+      e.type === "PeerNotRestored" && e.reason === "ReplicaGroupDropped" && e.replica_id !== undefined
+        ? [BigInt(e.replica_id)]
+        : [],
+    )
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  expectSame("every member of the recovered group is reported as dropped", dropped.map(String), ["20497", "20498"]);
+  if (restoreEvents.some((e) => e.type === "UnpairStarted")) {
+    throw new Error(`the kept recovery channels are not unpaired, got [${restoreEvents.map((e) => e.type).join(", ")}]`);
+  }
+  for (const [recovery, old] of [
+    [recoveryA, oldA],
+    [recoveryB, oldB],
+  ] as const) {
+    const kept = await device.node.channelStore.load(deviceSid, recovery, "0");
+    if (!kept) throw new Error(`the recovery channel ${recovery} is kept`);
+    const status = JSON.parse(utf8Decode(kept)).Helper.status;
+    if (status !== "Paired") throw new Error(`the kept channel ${recovery} is Paired, got ${status}`);
+    if (await device.node.channelStore.load(deviceSid, old, "0")) {
+      throw new Error(`the old channel ${old} is not written`);
+    }
+  }
+  const members = utf8Decode(await device.node.channelStore.listReplicas(deviceSid, { ids: [], status: [], role: null, exclude: [] }));
+  if (members !== "[]") throw new Error(`no replica group is written, got ${members}`);
+  console.log("  restore keeps both recovery channels and drops the replica group  ✓");
+
+  const published = await protectAcross(device, [helperA, helperB], "kept secret");
+  for (const channelId of [recoveryA, recoveryB]) {
+    const rows = await device.node.shareStore.load(deviceSid, channelId, [published]);
+    if (rows.length !== 1) throw new Error(`the publish reached ${channelId}: got ${rows.length} share(s)`);
+  }
+  console.log(`  the restored device publishes v${published} on the kept channels as a lone owner  ✓`);
+
+  const unpairEvents: DeRecEvent[] = [];
+  for (const [recovery, old] of [
+    [recoveryA, oldA],
+    [recoveryB, oldB],
+  ] as const) {
+    unpairEvents.push(
+      ...(await device.node.protocol.start(FlowKind.Unpair, { channel_id: recovery, linked_channel_id: old })),
+    );
+  }
+  unpairEvents.push(...(await pumpAll([device, helperA, helperB])));
+  const unpaired = new Set(unpairEvents.flatMap((e) => (e.type === "Unpaired" ? [e.channel_id] : [])));
+  expectSame("the linked unpairs drop only the old channels", [...unpaired].sort(), [oldA, oldB].sort());
+  for (const [helper, label, old, recovery] of [
+    [helperA, "HelperA", oldA, recoveryA],
+    [helperB, "HelperB", oldB, recoveryB],
+  ] as const) {
+    const helperSid = String(helper.node.protocol.secretId());
+    if (await helper.node.channelStore.load(helperSid, old, "0")) {
+      throw new Error(`${label}: the old channel is gone`);
+    }
+    if (!(await helper.node.channelStore.load(helperSid, recovery, "0"))) {
+      throw new Error(`${label}: the kept channel stays`);
+    }
+  }
+  console.log("  linked unpairs retire both old channels at the helpers  ✓");
+
+  // The lost source still runs and publishes; no helper holds a key for its
+  // channels any more, so nothing it sends is accepted.
+  await source.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([10]), name: "stale", data: utf8Encode("stale") }],
+  });
+  let refused = 0;
+  for (const { endpoint, message } of source.node.transport.drain()) {
+    const helper = [helperA, helperB].find((h) => h.uri === endpoint.uri);
+    if (!helper) continue;
+    let rejected = false;
+    try {
+      await helper.node.protocol.process(message);
+    } catch {
+      rejected = true;
+    }
+    if (!rejected) throw new Error(`${helper.uri} must not accept a message on a retired channel`);
+    if (helper.node.transport.drain().length !== 0) throw new Error(`${helper.uri} answers nothing`);
+    refused += 1;
+  }
+  if (refused !== 2) throw new Error(`the lost source reached both helpers and was refused by both, got ${refused}`);
+  console.log("  the lost source's round reaches no helper  ✓");
+
+  await device.node.protocol.start(FlowKind.VerifyShares, { secretId, version: published });
+  const verified = verifiedChannels(await pumpAll([device, helperA, helperB]));
+  expectSame("both kept channels still verify", [...verified].sort(), [recoveryA, recoveryB].sort());
+  console.log("  both kept channels verify after the old ones are retired  ✓");
+
+  console.log("\n✓ Restore on recovery channels flow passed.\n");
+}
+
+/**
+ * A helper refuses a linked unpair until a share is stored on the channel it
+ * arrives on: before the restored device publishes, the old channel may hold
+ * that helper's only share for the owner. Mirrors
+ * `run_linked_unpair_before_reshare_is_refused_flow` in
+ * `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runLinkedUnpairBeforeReshareIsRefusedFlow(): Promise<void> {
+  console.log("=== [Protocol] Linked Unpair Before Reshare Is Refused Flow ===\n");
+
+  const secretId = 0x2E7n;
+  const lost: AddressedNode = {
+    node: makeNode("lost", "https://lost-early.example.com", { secretId }),
+    uri: "https://lost-early.example.com",
+  };
+  const helperA: AddressedNode = {
+    node: makeNode("helper-a", "https://helper-a-early.example.com"),
+    uri: "https://helper-a-early.example.com",
+  };
+  const helperB: AddressedNode = {
+    node: makeNode("helper-b", "https://helper-b-early.example.com"),
+    uri: "https://helper-b-early.example.com",
+  };
+  const { longTermChannelId: oldA } = await doPair(helperA.node, lost.node, 1n, "Lost↔HelperA");
+  const { longTermChannelId: oldB } = await doPair(helperB.node, lost.node, 2n, "Lost↔HelperB");
+  const version = await protectAcross(lost, [helperA, helperB], "early");
+
+  const device: AddressedNode = {
+    node: makeNode("device", "https://device-early.example.com", { secretId }),
+    uri: "https://device-early.example.com",
+  };
+  const { longTermChannelId: recoveryA } = await doPair(helperA.node, device.node, 100n, "Device↔HelperA");
+  const { longTermChannelId: recoveryB } = await doPair(helperB.node, device.node, 101n, "Device↔HelperB");
+  for (const [helper, old, recovery] of [
+    [helperA, oldA, recoveryA],
+    [helperB, oldB, recoveryB],
+  ] as const) {
+    await helper.node.channelStore.linkChannel(String(helper.node.protocol.secretId()), old, recovery);
+  }
+  await device.node.protocol.start(FlowKind.RecoverSecret, { secretId, version });
+  const recovered = requireEvent(await pumpAll([device, helperA, helperB]), "SecretRecovered", "device").secret;
+  await device.node.protocol.restore(recovered, version, version, [
+    { roster_channel_id: oldA, recovery_channel_id: recoveryA },
+    { roster_channel_id: oldB, recovery_channel_id: recoveryB },
+  ]);
+
+  const events = [
+    ...(await device.node.protocol.start(FlowKind.Unpair, { channel_id: recoveryA, linked_channel_id: oldA })),
+    ...(await pumpAll([device, helperA, helperB])),
+  ];
+  const refused = events.some(
+    (e) => e.type === "UnpairRejected" && e.channel_id === oldA && e.status === StatusEnum.Fail,
+  );
+  if (!refused) {
+    throw new Error(
+      `the helper refuses the linked unpair before a share is stored on the kept channel, got ${JSON.stringify(events)}`,
+    );
+  }
+  const held = await helperA.node.shareStore.load(String(helperA.node.protocol.secretId()), oldA, []);
+  if (held.length === 0) throw new Error("the old channel keeps its share");
+  console.log("  a linked unpair before the reshare → UnpairRejected(FAIL), old share kept  ✓");
+
+  console.log("\n✓ Linked unpair before reshare is refused flow passed.\n");
 }
 
 /**
@@ -4914,7 +5166,7 @@ async function runKeyRotationFlow(): Promise<void> {
   console.log("  SecretRecovered names key_epoch 2 for both helpers  ✓");
 
   const device = makeNode("Device", ownerUri, { secretId, keyRotation: true });
-  await device.protocol.restore(recovered, 2, 2);
+  await device.protocol.restore(recovered, 2, 2, []);
   for (const [channelId] of helpers) {
     const restoredEpoch = await storedKeyEpoch(device, secretId, channelId);
     if (restoredEpoch !== 2) {
@@ -5251,7 +5503,7 @@ async function runReplicaVerifiesOnlySyncedVersionsFlow(): Promise<void> {
   if (v2 <= v1) throw new Error(`joining must publish a newer version (v1=${v1}, v2=${v2})`);
 
   await expectCode("restore on a synced destination", "already_restored", () =>
-    bob.node.protocol.restore(synced.secret, v2, v2),
+    bob.node.protocol.restore(synced.secret, v2, v2, []),
   );
   console.log("  [Bob] restore on a synced destination → already_restored  ✓");
 
@@ -5764,6 +6016,8 @@ export async function runProtocolSmoke(): Promise<void> {
   await runDisputedRecoveryFlow();
   await runConflictingRecoveryFlow();
   await runRestoreKeepsHelperDutiesFlow();
+  await runRestoreOnRecoveryChannelsFlow();
+  await runLinkedUnpairBeforeReshareIsRefusedFlow();
   await runAbandonedReplicaPairingFlow();
   await runContactOnTheGroupChannelFlow();
   await runPairingExpiryFlow();

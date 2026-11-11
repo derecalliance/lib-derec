@@ -53,6 +53,7 @@ use crate::error_codes::classify;
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::contact_message::ContactMessageExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::extensions::sender_kind::SenderKindExt as _;
 use crate::primitives::pairing::request::check_parameter_range;
 use crate::protocol::context::{Local, PairingConfig};
@@ -200,11 +201,7 @@ pub(in crate::protocol) async fn expiry<S: StoreSet>(
     if outlived(contact_timestamp.as_ref(), pairing.lifetime) {
         stores
             .secrets
-            .remove(local.secret_id, channel_id, SecretKind::PairingSecret)
-            .await?;
-        stores
-            .secrets
-            .remove(local.secret_id, channel_id, SecretKind::PairingContact)
+            .remove_pairing_material(local.secret_id, channel_id)
             .await?;
         return Ok(Some(PairingError::Expired(
             "the contact is older than the pairing lifetime",

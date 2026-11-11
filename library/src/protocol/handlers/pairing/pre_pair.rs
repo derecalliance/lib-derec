@@ -368,18 +368,15 @@ pub(in crate::protocol) async fn on_response<S: StoreSet>(
 
     stores
         .secrets
-        .save(
+        .save_many(
             secret_id,
-            channel_id,
-            SecretValue::PairingSecret(PairingKeyMaterial::from_secret(&result.secret_key)),
-        )
-        .await?;
-    stores
-        .secrets
-        .save(
-            secret_id,
-            channel_id,
-            SecretValue::PairingContact(stored_contact),
+            vec![
+                (
+                    channel_id,
+                    SecretValue::PairingSecret(PairingKeyMaterial::from_secret(&result.secret_key)),
+                ),
+                (channel_id, SecretValue::PairingContact(stored_contact)),
+            ],
         )
         .await?;
 

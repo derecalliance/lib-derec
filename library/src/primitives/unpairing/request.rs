@@ -77,7 +77,7 @@ pub struct ExtractResult {
 /// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
 /// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 ///
-/// let result = request::produce(channel_id, "no longer needed", &channel_key, &[], None)
+/// let result = request::produce(channel_id, "no longer needed", &channel_key, &[], None, channel_id)
 ///     .expect("failed to build unpair request");
 ///
 /// assert!(!result.envelope.is_empty());
@@ -91,12 +91,18 @@ pub struct ExtractResult {
 /// which operation this is. A helper channel serves one peer, so unpairing it
 /// deletes the channel; a replica group shares one channel, so removal edits a
 /// member row and this says which.
+///
+/// `unpair_channel_id` is the channel to unpair. Pass `channel_id` for an
+/// ordinary unpair of the channel the request travels on; pass an older
+/// channel the Helper has linked to it for a linked unpair, which drops that
+/// older channel and keeps this one.
 pub fn produce(
     channel_id: ChannelId,
     memo: &str,
     channel_key: &ChannelKey,
     reply_to: &[TransportProtocol],
     replica_id: Option<u64>,
+    unpair_channel_id: ChannelId,
 ) -> Result<ProduceResult, Error> {
     let timestamp = current_timestamp();
 
@@ -106,6 +112,7 @@ pub fn produce(
         timestamp: Some(timestamp),
         reply_to_transports,
         replica_id,
+        channel_id: unpair_channel_id.0,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -181,7 +188,7 @@ pub fn produce(
 /// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 ///
 /// let request::ProduceResult { envelope } =
-///     request::produce(channel_id, "no longer needed", &channel_key, &[], None)
+///     request::produce(channel_id, "no longer needed", &channel_key, &[], None, channel_id)
 ///         .expect("failed to build unpair request");
 ///
 /// let request::ExtractResult { request } =

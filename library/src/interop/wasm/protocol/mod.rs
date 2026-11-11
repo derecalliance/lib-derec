@@ -64,7 +64,7 @@ use crate::{
     protocol::{
         AutoAcceptPolicy, DeRecFlow, DeRecProtocol, DeRecProtocolBuilder, DeRecProtocolConfig,
         TimeoutsConfig,
-        types::{Secret, Target, UserSecret},
+        types::{KeepRecoveryChannel, Secret, Target, UserSecret},
     },
     transport,
     types::{ChannelId, WeightedChannel},
@@ -947,7 +947,11 @@ impl DeRecProtocolWasm {
     /// `recoveredSecret` is the typed `Secret` object carried by the
     /// `SecretRecovered` event; pass it verbatim. `version` is the recovered
     /// version and `newestVersion` the newest one any helper reported; the
-    /// next publish is `newestVersion + 1`. A helper or member whose
+    /// next publish is `newestVersion + 1`. `keepRecoveryChannels` is an
+    /// array of `{ roster_channel_id, recovery_channel_id }`, both decimal
+    /// strings: each keeps that recovery channel in place of the roster
+    /// helper's old channel. Pass `[]` to restore every helper on its old
+    /// channel. A helper or member whose
     /// `transports` is empty, `null` or absent gets no channel; it is
     /// reported as a `PeerNotRestored` event in the returned array and the
     /// rest of the roster is restored. An absent or `null`
@@ -962,7 +966,7 @@ impl DeRecProtocolWasm {
     /// | `restore_conflict` | Channels live at ids restore is about to write. The error        |
     /// |                    | carries `channel_ids: string[]` listing the collisions.          |
     /// | `invariant`        | The recovered `Secret` is internally inconsistent.               |
-    /// | `invalid_input`    | `newestVersion` is below `version`.                              |
+    /// | `invalid_input`    | `newestVersion` is below `version`, or a kept pair is invalid.   |
     /// | `invalid_recovered_secret` | `recoveredSecret` is malformed — e.g. a missing or       |
     /// |                    | non-decimal `channel_id` / `replica_id`.                         |
     /// | `store_error`      | A store call failed mid-restore; `category` names the store.     |
@@ -972,15 +976,17 @@ impl DeRecProtocolWasm {
         recovered_secret: JsValue,
         version: JsValue,
         newest_version: JsValue,
+        keep_recovery_channels: JsValue,
     ) -> Result<JsValue, JsValue> {
         let version = js_number_to_u32(&version, "version")?;
         let newest_version = js_number_to_u32(&newest_version, "newest_version")?;
         let secret = parse_recovered_secret(recovered_secret)?;
+        let keep = parse_keep_recovery_channels(keep_recovery_channels)?;
         let rust_events = self
             .inner
             .lock()
             .await
-            .restore(&secret, version, newest_version)
+            .restore(&secret, version, newest_version, &keep)
             .await
             .map_err(js_error_from_lib)?;
         let js_events = Array::new();
@@ -989,6 +995,14 @@ impl DeRecProtocolWasm {
         }
         Ok(js_events.into())
     }
+}
+
+fn parse_keep_recovery_channels(value: JsValue) -> Result<Vec<KeepRecoveryChannel>, JsValue> {
+    serde_wasm_bindgen::from_value::<Vec<recovered_secret::KeepRecoveryChannelIn>>(value)
+        .map_err(|e| js_error("decode_error", format!("keep_recovery_channels: {e}")))?
+        .into_iter()
+        .map(|keep| keep.into_keep().map_err(|e| js_error("decode_error", e)))
+        .collect()
 }
 
 fn parse_recovered_secret(value: JsValue) -> Result<Secret, JsValue> {
@@ -1316,7 +1330,19 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
                 .map_err(|e| js_error("decode_error", format!("missing channel_id: {e:?}")))?;
             let channel_id = ChannelId(js_value_to_u64(channel_id_val)?);
             let memo = optional_string(&params, "memo")?;
-            Ok(DeRecFlow::Unpair { channel_id, memo })
+            let linked_channel_id = Reflect::get(&params, &JsValue::from_str("linked_channel_id"))
+                .unwrap_or(JsValue::UNDEFINED);
+            let linked_channel_id =
+                if linked_channel_id.is_undefined() || linked_channel_id.is_null() {
+                    None
+                } else {
+                    Some(ChannelId(js_value_to_u64(linked_channel_id)?))
+                };
+            Ok(DeRecFlow::Unpair {
+                channel_id,
+                memo,
+                linked_channel_id,
+            })
         }
         6 => {
             // UpdateChannelInfo

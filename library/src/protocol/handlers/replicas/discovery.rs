@@ -213,6 +213,7 @@ async fn on_request<S: StoreSet>(
                 versions: vec![VersionEntry {
                     version,
                     version_description: String::new(),
+                    channel_id: member.channel_id.0,
                 }],
             })
             .into_iter()
@@ -537,6 +538,7 @@ mod tests {
                     versions: vec![VersionEntry {
                         version,
                         version_description: String::new(),
+                        channel_id: GROUP.0,
                     }],
                 })
                 .into_iter()
@@ -879,6 +881,53 @@ mod tests {
                     ),
                 }
             }
+        });
+    }
+
+    /// A member's answer names the channel its version is held on: the group
+    /// channel it shares with the asker.
+    #[test]
+    fn an_answer_names_the_group_channel() {
+        run_async(async {
+            const GROUP_KEY: SharedKey = SharedKey::new([0x11; 32]);
+
+            let lf = LocalFixture::with_replica(SECRET_ID, 1001);
+            let mut rig = StoreRig::new();
+            seed(
+                &mut rig.channels,
+                1002,
+                ReplicaRole::Destination,
+                "https://alice-2",
+            )
+            .await;
+            seed_version(&mut rig.user_secrets, 5).await;
+            let asker = rig
+                .channels
+                .replicas_matching(SECRET_ID, Default::default())
+                .await
+                .expect("roster loads")
+                .remove(0);
+
+            super::on_request(
+                &mut rig.stores(),
+                &lf.local(),
+                &asker,
+                &GetSecretIdsVersionsRequestMessage::default(),
+                &ChannelKey::new(0, GROUP_KEY),
+                TRACE_ID,
+                None,
+            )
+            .await
+            .expect("answer is sent");
+
+            let sent = rig.transport.sent_envelopes();
+            let envelope = DeRecMessage::decode(sent[0].as_slice()).expect("envelope decodes");
+            let Ok(MessageBody::GetSecretIdsVersionsResponse(response)) =
+                extract_inner_message(&envelope.message, &GROUP_KEY)
+            else {
+                panic!("the answer must be a versions response");
+            };
+            assert_eq!(response.secret_list[0].versions[0].channel_id, GROUP.0);
         });
     }
 

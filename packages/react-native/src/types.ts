@@ -28,6 +28,18 @@ export interface SecretStore {
     kind: 0 | 1 | 2 | 3,
     value: Uint8Array,
   ): Promise<void>;
+  /**
+   * Save every secret `entries` carries, in one call. Each entry is a
+   * `[channelId, kind, value]` triple addressed and encoded the way `save`'s
+   * arguments are, and replaces whatever is stored under the same
+   * `(channelId, kind)`. An empty list writes nothing. The library calls it
+   * when it writes several secrets at once, so a backend that can write them
+   * in one statement or transaction should.
+   */
+  saveMany(
+    secretId: string,
+    entries: [channelId: string, kind: 0 | 1 | 2 | 3, value: Uint8Array][],
+  ): Promise<void>;
   remove(secretId: string, channelId: string, kind: 0 | 1 | 2 | 3): Promise<void>;
   /**
    * Remove every secret `entries` names, in one call. Each entry is a
@@ -213,6 +225,19 @@ export interface ChannelStore {
     channelId: string,
     replicaId: string,
     bytes: Uint8Array,
+  ): Promise<void>;
+  /**
+   * Save every record `records` carries, in one call. Each entry is a
+   * `[channelId, replicaId, bytes]` triple addressed and encoded the way
+   * `save`'s arguments are: `replicaId` `"0"` is the helper channel at
+   * `channelId`, any other value is that member only. Each entry replaces
+   * whatever is stored under the same key. An empty list writes nothing. The
+   * library calls it when it writes several records at once, so a backend
+   * that can write them in one statement or transaction should.
+   */
+  saveMany(
+    secretId: string,
+    records: [channelId: string, replicaId: string, bytes: Uint8Array][],
   ): Promise<void>;
   remove(secretId: string, channelId: string, replicaId: string): Promise<boolean>;
   /**
@@ -765,9 +790,45 @@ export interface RecoverSecretParams {
   version: number;
 }
 export interface UnpairParams {
+  /** The channel the request travels on. */
   channel_id: string;
 
   memo?: string;
+  /**
+   * The older channel to unpair instead of `channel_id`, as a decimal
+   * string; absent unpairs `channel_id` itself. The request still travels on
+   * `channel_id` and the helper keeps it. This is how a restored owner that
+   * kept a recovery channel retires the channel it used before: the helper
+   * accepts only when this channel is linked to `channel_id` and a share is
+   * already stored on `channel_id`, so publish on the kept channel first.
+   * Every event of the flow (`UnpairStarted`, `Unpaired`, `UnpairRejected`)
+   * names this channel, and `channel_id` is never set to `"Unpairing"`.
+   * Naming `channel_id` itself rejects with `invalid_input`.
+   */
+  linked_channel_id?: string;
+}
+
+/**
+ * A recovery channel `restore` keeps in place of a roster helper's channel.
+ * Both ids are decimal strings, as events carry them.
+ *
+ * After recovering, the owner holds two channels to each helper that served
+ * a share: the old one named in the recovered roster, whose key every lost
+ * device still holds, and the recovery channel it paired on, whose key only
+ * this device holds. Naming the pair makes `restore` keep the recovery
+ * channel for that helper instead of writing the old one back. The old
+ * channel is then retired with a linked `start(FlowKind.Unpair)`
+ * (`linked_channel_id`) once a round is stored on the kept one.
+ *
+ * Discovery tells the application which old channel each recovery channel
+ * replaces: every version a helper reports in `SecretsDiscovered` names the
+ * channel its share is stored on.
+ */
+export interface KeepRecoveryChannel {
+  /** The helper's channel in the recovered roster. */
+  roster_channel_id: string;
+  /** The recovery channel paired with the same helper, kept in its place. */
+  recovery_channel_id: string;
 }
 export interface UpdateChannelInfoParams {
   target?: Target;
@@ -1021,7 +1082,13 @@ export type DeRecEvent =
       type: "SecretsDiscovered";
       channel_id: string;
 
-      secrets: Array<{ secret_id: string; versions: Array<{ version: number; description: string }> }>;
+      secrets: Array<{
+        secret_id: string;
+        /** `channel_id` is the decimal id of the channel the version's share
+         *  is stored on; on a recovery channel it names the old channel that
+         *  recovery channel replaces (see `KeepRecoveryChannel`). */
+        versions: Array<{ version: number; description: string; channel_id: string }>;
+      }>;
     }
   /** A helper's share was collected for a recovery. Nothing is
    *  reconstructed until every helper asked has answered or
@@ -1083,8 +1150,9 @@ export type DeRecEvent =
         }>;
         /** Replica composite. Absent when this `secret_id` has no
          *  replica setup. Carries the full member roster, the one channel
-         *  they share, and the 32-byte group key. Required by `restore` to
-         *  rebuild replica state without re-pairing. */
+         *  they share, and the 32-byte group key. `restore` never writes the
+         *  group back: it reports each member as `PeerNotRestored` with
+         *  reason `"ReplicaGroupDropped"`. */
         replicas?: {
           /** The one channel every member is addressed on. */
           channel_id: string;
@@ -1509,6 +1577,11 @@ export type DeRecEvent =
    *  cannot reach that peer. Every other entry and the user-secret snapshot
    *  were restored; `reason` says why this one was not. `"NoTransports"`
    *  means the recovered roster names no endpoint for it.
+   *  `"ReplicaGroupDropped"` means the entry is a member of the recovered
+   *  replica group, which restore never carries forward: one such event is
+   *  returned per member, in roster order. The member's name and role are in
+   *  the recovered secret's `replicas`; devices the owner still has join
+   *  again by pairing.
    *
    *  For a helper, `channel_id` is its channel and `replica_id` is absent.
    *  For a replica group member, `channel_id` is the group's channel and
@@ -1658,6 +1731,8 @@ export interface VersionList {
 export interface VersionListEntry {
   version: number;
   version_description: string;
+  /** The channel this version's share is stored on. */
+  channel_id: bigint;
 }
 
 export interface GetSecretIdsVersionsResponseMessage {
@@ -1671,6 +1746,8 @@ export interface GetSecretIdsVersionsResponseMessage {
 export interface VersionEntry {
   version: number;
   description: string;
+  /** The channel this version's share is stored on. `0` is malformed. */
+  channel_id: bigint;
 }
 
 export interface SecretVersionEntry {
@@ -1703,7 +1780,7 @@ export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatc
 
 /** Why a `PeerNotRestored` event left a roster entry without a channel.
  *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */
-export type NotRestoredReason = "NoTransports";
+export type NotRestoredReason = "NoTransports" | "ReplicaGroupDropped";
 
 /** Why a `VerifySharesFailed` event reached no verdict for a channel.
  *  Matches the Rust `VerifyFailureReason` discriminants
@@ -1988,11 +2065,16 @@ export interface UnpairRequestMessage {
   reply_to?: TransportProtocol[];
   /** Replica-group member that sent this; see `replicaId` semantics. */
   replica_id?: bigint;
+  /** The channel to unpair: the one the request travels on for an ordinary
+   *  unpair, an older linked one for a linked unpair. */
+  channel_id: bigint;
 }
 
 export interface UnpairResponseMessage {
   result?: DeRecResult;
   timestamp?: Timestamp;
+  /** The channel the request named, echoed. */
+  channel_id: bigint;
 }
 
 export interface VerifyShareRequestMessage {

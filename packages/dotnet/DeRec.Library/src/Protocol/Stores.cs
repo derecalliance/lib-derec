@@ -302,6 +302,19 @@ public interface IChannelStore
 {
     ChannelRecord? Load(ulong secretId, ulong channelId, ulong replicaId);
     void Save(ulong secretId, ChannelRecord record);
+
+    /// <summary>
+    /// Save every record in <paramref name="records"/>, in one call.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Save"/> applied to each entry: each record replaces
+    /// whatever is stored under the same key, and an empty list writes
+    /// nothing. The library calls it when it saves several records at once,
+    /// so a backend that can write them in one statement or transaction
+    /// should.
+    /// </remarks>
+    void SaveMany(ulong secretId, IReadOnlyList<ChannelRecord> records);
+
     bool Remove(ulong secretId, ulong channelId, ulong replicaId);
 
     /// <summary>
@@ -377,6 +390,19 @@ public interface ISecretStore
     /// </summary>
     IReadOnlyList<SecretValue?> LoadMany(ulong secretId, ulong[] channelIds, SecretKind kind);
     void Save(ulong secretId, ulong channelId, SecretValue value);
+
+    /// <summary>
+    /// Save every secret in <paramref name="entries"/>, in one call.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Save"/> applied to each entry: each value replaces whatever
+    /// is stored for the same channel and kind, and an empty list writes
+    /// nothing. The library calls it when it saves several secrets at once,
+    /// so a backend that can write them in one statement or transaction
+    /// should.
+    /// </remarks>
+    void SaveMany(ulong secretId, IReadOnlyList<(ulong ChannelId, SecretValue Value)> entries);
+
     void Remove(ulong secretId, ulong channelId, SecretKind kind);
 
     /// <summary>

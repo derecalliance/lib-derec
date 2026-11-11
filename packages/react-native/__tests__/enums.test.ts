@@ -69,7 +69,7 @@ const NAME_UNIONS: Record<string, Record<string, true>> = {
     Superseded: true,
     KeyUnavailable: true,
   } satisfies Record<IgnoreReason, true>,
-  NotRestoredReason: { NoTransports: true } satisfies Record<NotRestoredReason, true>,
+  NotRestoredReason: { NoTransports: true, ReplicaGroupDropped: true } satisfies Record<NotRestoredReason, true>,
   VerifyFailureReason: { NoSharedKey: true, NoProof: true, DispatchFailed: true } satisfies Record<
     VerifyFailureReason,
     true

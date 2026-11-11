@@ -116,7 +116,11 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 /// holds only by assumption: links are expected to be one-to-one (see
 /// [`DeRecChannelStore::link_channel`](crate::protocol::DeRecChannelStore::link_channel)),
 /// and a `(secret_id, version)` found on more than one linked channel is
-/// reported once.
+/// reported once, naming the lowest of those channels.
+///
+/// Each version names the channel its share is stored on. A recovering
+/// owner reads it to learn which of its old channels a recovery channel
+/// replaces.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
@@ -134,7 +138,12 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         .channels
         .linked_channels(secret_id, channel_id)
         .await?;
-    let all_shares = stores.shares.load_all(secret_id, &linked_ids).await?;
+    // One channel at a time, so each share keeps the channel it is stored on.
+    let mut all_shares = Vec::new();
+    for &linked_id in &linked_ids {
+        let shares = stores.shares.load_all(secret_id, &[linked_id]).await?;
+        all_shares.extend(shares.into_iter().map(|share| (linked_id, share)));
+    }
 
     let secret_list = catalog(all_shares);
 
@@ -269,20 +278,24 @@ fn on_response(
 /// A version's description is read from the request that stored it. A share
 /// whose bytes do not decode contributes an empty description rather than
 /// failing the catalog: the version is still held, and refusing to report it
-/// would hide state the peer needs to see. The first description wins, so a
-/// re-store under the same version does not rewrite what was already reported.
-fn catalog(all_shares: Vec<Share>) -> Vec<SecretVersionEntry> {
-    let mut secret_map: HashMap<u64, BTreeMap<u32, String>> = HashMap::new();
+/// would hide state the peer needs to see. Within a channel the first
+/// description wins, so a re-store under the same version does not rewrite
+/// what was already reported. Across linked channels the version names the
+/// lowest channel, with that channel's description.
+fn catalog(all_shares: Vec<(ChannelId, Share)>) -> Vec<SecretVersionEntry> {
+    let mut secret_map: HashMap<u64, BTreeMap<u32, (ChannelId, String)>> = HashMap::new();
 
-    for share in all_shares {
+    for (channel_id, share) in all_shares {
         let description = StoreShareRequestMessage::decode(share.bytes.as_slice())
             .map(|msg| msg.version_description)
             .unwrap_or_default();
-        secret_map
-            .entry(share.secret_id)
-            .or_default()
-            .entry(share.version)
-            .or_insert(description);
+        let versions = secret_map.entry(share.secret_id).or_default();
+        match versions.get(&share.version) {
+            Some((held, _)) if *held <= channel_id => {}
+            _ => {
+                versions.insert(share.version, (channel_id, description));
+            }
+        }
     }
 
     secret_map
@@ -291,9 +304,10 @@ fn catalog(all_shares: Vec<Share>) -> Vec<SecretVersionEntry> {
             secret_id,
             versions: versions
                 .into_iter()
-                .map(|(version, description)| VersionEntry {
+                .map(|(version, (channel_id, description))| VersionEntry {
                     version,
                     description,
+                    channel_id,
                 })
                 .collect(),
         })
@@ -385,9 +399,9 @@ mod tests {
     #[test]
     fn versions_are_reported_in_order() {
         let catalog = catalog(vec![
-            share(1, 3, "third"),
-            share(1, 1, "first"),
-            share(1, 2, "second"),
+            (ChannelId(10), share(1, 3, "third")),
+            (ChannelId(10), share(1, 1, "first")),
+            (ChannelId(10), share(1, 2, "second")),
         ]);
 
         let versions: Vec<u32> = catalog[0].versions.iter().map(|v| v.version).collect();
@@ -397,7 +411,11 @@ mod tests {
     /// One entry per secret, each carrying only its own versions.
     #[test]
     fn each_secret_gets_its_own_entry() {
-        let mut catalog = catalog(vec![share(1, 1, ""), share(2, 7, ""), share(1, 2, "")]);
+        let mut catalog = catalog(vec![
+            (ChannelId(10), share(1, 1, "")),
+            (ChannelId(10), share(2, 7, "")),
+            (ChannelId(10), share(1, 2, "")),
+        ]);
         catalog.sort_by_key(|e| e.secret_id);
 
         assert_eq!(catalog.len(), 2);
@@ -412,13 +430,16 @@ mod tests {
     /// it would hide a version the peer needs to know about.
     #[test]
     fn an_undecodable_share_is_still_catalogued() {
-        let catalog = catalog(vec![Share {
-            secret_id: 1,
-            version: 4,
-            bytes: vec![0xFF, 0xFF, 0xFF],
-            subshares: None,
-            threshold: None,
-        }]);
+        let catalog = catalog(vec![(
+            ChannelId(10),
+            Share {
+                secret_id: 1,
+                version: 4,
+                bytes: vec![0xFF, 0xFF, 0xFF],
+                subshares: None,
+                threshold: None,
+            },
+        )]);
 
         assert_eq!(catalog[0].versions[0].version, 4);
         assert_eq!(catalog[0].versions[0].description, "");
@@ -428,9 +449,44 @@ mod tests {
     /// description, so the catalog does not flip between reports.
     #[test]
     fn the_first_description_for_a_version_wins() {
-        let catalog = catalog(vec![share(1, 1, "original"), share(1, 1, "later")]);
+        let catalog = catalog(vec![
+            (ChannelId(10), share(1, 1, "original")),
+            (ChannelId(10), share(1, 1, "later")),
+        ]);
 
         assert_eq!(catalog[0].versions.len(), 1);
         assert_eq!(catalog[0].versions[0].description, "original");
+    }
+
+    /// Each version names the channel its share is stored on, which across a
+    /// linked set may be an older channel than the one the request arrived
+    /// on. That is how a recovering owner maps a recovery channel to the
+    /// roster channel it replaces.
+    #[test]
+    fn each_version_names_the_channel_that_stores_it() {
+        let catalog = catalog(vec![
+            (ChannelId(10), share(1, 3, "")),
+            (ChannelId(20), share(1, 4, "")),
+        ]);
+
+        let channels: Vec<(u32, ChannelId)> = catalog[0]
+            .versions
+            .iter()
+            .map(|v| (v.version, v.channel_id))
+            .collect();
+        assert_eq!(channels, vec![(3, ChannelId(10)), (4, ChannelId(20))]);
+    }
+
+    /// A version stored on several linked channels is reported once, naming
+    /// the lowest channel id, whatever order the store returned them in.
+    #[test]
+    fn a_version_on_two_linked_channels_names_the_lowest_channel() {
+        let catalog = catalog(vec![
+            (ChannelId(20), share(1, 3, "")),
+            (ChannelId(10), share(1, 3, "")),
+        ]);
+
+        assert_eq!(catalog[0].versions.len(), 1);
+        assert_eq!(catalog[0].versions[0].channel_id, ChannelId(10));
     }
 }

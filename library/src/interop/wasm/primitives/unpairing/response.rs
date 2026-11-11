@@ -43,6 +43,7 @@ pub fn produce(
     let result = response::produce(
         channel_id.into(),
         &crate::types::ChannelKey::new(epoch, shared_key),
+        channel_id.into(),
     )
     .map_err(js_error_from_lib)?;
     to_js(&ProduceResult {

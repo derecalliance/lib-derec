@@ -41,6 +41,15 @@ func (m *mockChannelStore) Save(secretID uint64, record ChannelRecord) error {
 	return nil
 }
 
+func (m *mockChannelStore) SaveMany(secretID uint64, records []ChannelRecord) error {
+	for _, r := range records {
+		if err := m.Save(secretID, r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (m *mockChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, error) {
 	k := channelKey{channelID, replicaID}
 	_, ok := m.data[secretID][k]
@@ -107,6 +116,10 @@ func (m *mockSecretStore) LoadMany(secretID uint64, channelIDs []uint64, kind Se
 }
 
 func (m *mockSecretStore) Save(secretID, channelID uint64, value SecretValue) error {
+	return nil
+}
+
+func (m *mockSecretStore) SaveMany(secretID uint64, entries []SecretValueEntry) error {
 	return nil
 }
 

@@ -18,7 +18,7 @@ use crate::interop::ffi::error::{
 };
 use crate::interop::ffi::protocol::events::encode_events;
 use crate::interop::ffi::protocol::flow as flow_params;
-use crate::interop::recovered_secret::RecoveredSecretIn;
+use crate::interop::recovered_secret::{KeepRecoveryChannelIn, RecoveredSecretIn};
 use crate::protocol::RestoreError;
 use crate::protocol::utils::pending_action_wire;
 
@@ -436,12 +436,21 @@ pub unsafe extern "C" fn derec_protocol_restore(
         Ok(s) => s,
         Err(e) => return ffi_error(DEREC_CODE_FFI_BAD_PROTO, e).into(),
     };
+    let keep = match params
+        .keep_recovery_channels
+        .into_iter()
+        .map(KeepRecoveryChannelIn::into_keep)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(k) => k,
+        Err(e) => return ffi_error(DEREC_CODE_FFI_BAD_PROTO, e).into(),
+    };
 
     let h = unsafe { &*handle };
     let mut inner = h.lock_inner();
     match h
         .runtime
-        .block_on(inner.restore(&secret, params.version, params.newest_version))
+        .block_on(inner.restore(&secret, params.version, params.newest_version, &keep))
     {
         Ok(events) => {
             let json = encode_events(events);
@@ -473,4 +482,5 @@ struct RestoreParamsJson {
     version: u32,
     newest_version: u32,
     recovered_secret: RecoveredSecretIn,
+    keep_recovery_channels: Vec<KeepRecoveryChannelIn>,
 }

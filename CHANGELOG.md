@@ -9,6 +9,108 @@ all of them unless it names a specific binding.
 
 ### 1.0.0-alpha.1 (unreleased)
 
+- **Changed: `restore` keeps chosen recovery channels and drops the replica
+  group.** *(breaking; every SDK)*
+
+  Restore is for an owner that lost access to its other devices. It used to
+  write every helper back on the channel named in the recovered roster —
+  whose key every lost device still holds — and to rewrite the recovered
+  replica group, which left a restored device unable to publish until it
+  claimed a lost device's identity.
+
+  - `restore` takes a fourth argument, the recovery channels to keep:
+    `KeepRecoveryChannel { roster_channel_id, recovery_channel_id }`. For each
+    pair the roster helper's old channel is not written; the recovery channel
+    stays `Paired` with its own endpoint and key, takes the roster weight, and
+    is not unpaired. Helpers not named restore on their old channel as before.
+    An invalid pair is `RestoreError::InvalidKeptChannel` (code
+    `invalid_input`), reported before any write.
+  - The recovered replica group is never written. Each member is reported as
+    `PeerNotRestored { reason: NotRestoredReason::ReplicaGroupDropped }`, and
+    the restored device publishes as a lone owner. Devices the owner still
+    has join again by pairing.
+  - FFI: `derec_protocol_restore` params JSON gains a required
+    `keep_recovery_channels` array of `{ roster_channel_id,
+    recovery_channel_id }` (decimal strings). WASM: `restore` takes a fourth
+    argument of the same shape. .NET, Go, Node, web and React Native gain a
+    `KeepRecoveryChannel` type and a fourth `restore` parameter.
+
+  **Migration:** pass an empty list to keep the previous helper behaviour.
+  Code that read the restored replica group after `restore` must pair the
+  devices again instead.
+
+- **Added: linked unpair.** *(breaking on the wire; every SDK)*
+
+  A restored owner retires its old helper channels from the recovery channel
+  that replaces each one. `DeRecFlow::Unpair` gains `linked_channel_id`: the
+  request travels on `channel_id` and asks the helper to unpair that older,
+  linked channel, keeping `channel_id`. The helper accepts only when the
+  older channel is linked to `channel_id` and a share is already stored on
+  `channel_id`, and refuses with `FAIL` otherwise, whatever its auto-accept
+  settings. Every event of the flow names the older channel, and
+  `channel_id` is never set to `Unpairing`. Once the old channel is gone a
+  lost device that still holds its key reaches no helper: the helper has no
+  key to answer with, so the lost device only sees its rounds time out.
+
+  - Wire: `UnpairRequestMessage.channelId` (field 6) names the channel to
+    unpair and `UnpairResponseMessage.channelId` (field 3) echoes it, so the
+    owner matches each answer to its own request. Both are always set; `0`
+    is malformed.
+  - FFI flow params and the WASM `Unpair` flow accept an optional
+    `linked_channel_id`; every SDK's `Unpair` params gain `linkedChannelId`.
+
+  **Migration:** none for ordinary unpairs. Peers on an older version send no
+  `channelId`, which a 1.0.0 peer refuses as malformed.
+
+- **Added: Discovery names the channel that stores each version.**
+  *(breaking on the wire; every SDK)*
+
+  `GetSecretIdsVersionsResponseMessage.VersionList.VersionEntry.channelId`
+  (field 3, always set) names the channel the version's share is stored on.
+  A helper answers across every channel linked to the recovery channel, so
+  this is how a recovering owner learns which old roster channel each
+  recovery channel replaces — the mapping `restore` and the linked unpair
+  need. A version stored on several linked channels names the lowest id.
+  `SecretsDiscovered` version entries carry it as `channel_id`, and the
+  discovery primitives' `VersionEntry` gains it. The FFI secret-list binary
+  layout appends `[channel_id: u64 LE]` to every version.
+
+  **Migration:** an application recovering an owner should keep the
+  recovery channel for each roster helper Discovery maps, publish once, then
+  unpair the old channels with a linked unpair. The library README's "Retire
+  the old channels" walks through it.
+
+- **Added: `save_many` on the channel and secret stores.**
+  *(breaking; every SDK)*
+
+  `DeRecChannelStore::save_many(secret_id, Vec<ChannelRecord>)` and
+  `DeRecSecretStore::save_many(secret_id, Vec<(ChannelId, SecretValue)>)`
+  save every entry in one call, with `save`'s semantics per entry; an empty
+  list writes nothing. The library uses them when it writes several records
+  at once, so a backend can write them in one statement or transaction:
+  `restore` now writes every key ring in one secret-store call and every
+  channel record in one channel-store call, and a sharing round that moves
+  channels to a new epoch stores all the moved key rings in one call.
+  `restore` writes the key rings first, so a failure between the two calls
+  leaves no channel record behind and the restore can be retried.
+
+  Over FFI `ChannelStoreCallbacks` and `SecretStoreCallbacks` each gain a
+  `save_many` slot right after `save`. The channel slot takes a JSON array
+  of `[channel_id, replica_id, record]` triples, the secret slot
+  `[channel_id, kind, record]` triples: ids as decimal strings, `kind` as
+  the number `save` takes, and `record` the JSON text `save` receives as
+  its bytes, as a string. In Node, web and React Native they are
+  `ChannelStore.saveMany(secretId, records)` with
+  `[channelId, replicaId, bytes]` triples and
+  `SecretStore.saveMany(secretId, entries)` with `[channelId, kind, value]`
+  triples; in .NET
+  `IChannelStore.SaveMany(secretId, IReadOnlyList<ChannelRecord>)` and
+  `ISecretStore.SaveMany(secretId, IReadOnlyList<(ulong ChannelId, SecretValue Value)>)`;
+  in Go `ChannelStore.SaveMany(secretID, []protocol.ChannelRecord)` and
+  `SecretStore.SaveMany(secretID, []protocol.SecretValueEntry)`.
+
+  Migration: implement both on every channel and secret store.
+
 - **Changed: `restore` takes the newest version the helpers hold.**
   *(breaking; every SDK)*
 

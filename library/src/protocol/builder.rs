@@ -1298,6 +1298,9 @@ mod tests {
             fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
+            fn save_many(&mut self, _: u64, _: Vec<ChannelRecord>) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
@@ -1401,6 +1404,13 @@ mod tests {
             }
             fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn save_many(
+                &mut self,
+                _: u64,
+                _: Vec<(ChannelId, SecretValue)>,
+            ) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
@@ -1511,6 +1521,9 @@ mod tests {
             fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
+            fn save_many(&mut self, _: u64, _: Vec<ChannelRecord>) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
@@ -1612,6 +1625,13 @@ mod tests {
             }
             fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn save_many(
+                &mut self,
+                _: u64,
+                _: Vec<(ChannelId, SecretValue)>,
+            ) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
@@ -1713,6 +1733,9 @@ mod tests {
             fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
+            fn save_many(&mut self, _: u64, _: Vec<ChannelRecord>) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
@@ -1814,6 +1837,13 @@ mod tests {
             }
             fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn save_many(
+                &mut self,
+                _: u64,
+                _: Vec<(ChannelId, SecretValue)>,
+            ) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
@@ -1919,6 +1949,9 @@ mod tests {
             fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
+            fn save_many(&mut self, _: u64, _: Vec<ChannelRecord>) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
@@ -2020,6 +2053,13 @@ mod tests {
             }
             fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn save_many(
+                &mut self,
+                _: u64,
+                _: Vec<(ChannelId, SecretValue)>,
+            ) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
@@ -2124,6 +2164,9 @@ mod tests {
             fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
+            fn save_many(&mut self, _: u64, _: Vec<ChannelRecord>) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(future::ready(Ok(false)))
             }
@@ -2225,6 +2268,13 @@ mod tests {
             }
             fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
+            }
+            fn save_many(
+                &mut self,
+                _: u64,
+                _: Vec<(ChannelId, SecretValue)>,
+            ) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
             }
             fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))

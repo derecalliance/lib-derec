@@ -37,6 +37,8 @@ func main() {
 	runSupersededShareRequest()
 	runReplayDetection()
 	runRecoverRestoreRepublish()
+	runRestoreOnRecoveryChannels()
+	runLinkedUnpairBeforeReshareIsRefused()
 	runKeyRotation()
 	runPairingBelowThresholdPublishesNothing()
 	runUnpairRepublishes()

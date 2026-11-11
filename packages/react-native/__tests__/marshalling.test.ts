@@ -121,8 +121,8 @@ describe('FFI container formats', () => {
       {
         secret_id: 18446744073709551615n,
         versions: [
-          { version: 1, description: 'first' },
-          { version: 2, description: '' },
+          { version: 1, description: 'first', channel_id: 18446744073709551615n },
+          { version: 2, description: '', channel_id: 3n },
         ],
       },
       { secret_id: 7n, versions: [] },
@@ -139,6 +139,32 @@ describe('FFI container formats', () => {
       1, 0, 0, 0, 0, 0, 0, 0, //
       0, 0, 0, 0,
     ]);
+  });
+
+  it('writes each version as version, description, then channel_id', () => {
+    const packed = encodeSecretList([
+      { secret_id: 1n, versions: [{ version: 2, description: 'a', channel_id: 258n }] },
+    ]);
+    // [count u32][secret_id u64][versions u32]
+    // [version u32][description_len u32][description][channel_id u64]
+    expect(Array.from(packed)).toEqual([
+      1, 0, 0, 0, //
+      1, 0, 0, 0, 0, 0, 0, 0, //
+      1, 0, 0, 0, //
+      2, 0, 0, 0, //
+      1, 0, 0, 0, //
+      0x61, //
+      2, 1, 0, 0, 0, 0, 0, 0,
+    ]);
+  });
+
+  it('rejects a version entry cut off before its channel_id', () => {
+    const packed = encodeSecretList([
+      { secret_id: 1n, versions: [{ version: 2, description: '', channel_id: 3n }] },
+    ]);
+    expect(() => decodeSecretList(packed.subarray(0, packed.length - 1))).toThrow(
+      /malformed FFI container/,
+    );
   });
 
   it('length-prefixes each recovery response', () => {

@@ -21,6 +21,9 @@ use prost::Message;
 pub struct VersionEntry {
     pub version: u32,
     pub description: String,
+    /// The channel this version's share is stored on. Across a linked set it
+    /// may be an older channel than the one the response travels on.
+    pub channel_id: ChannelId,
 }
 
 impl From<&VersionEntry> for ProtoVersionEntry {
@@ -28,6 +31,7 @@ impl From<&VersionEntry> for ProtoVersionEntry {
         ProtoVersionEntry {
             version: version.version,
             version_description: version.description.to_owned(),
+            channel_id: version.channel_id.0,
         }
     }
 }
@@ -49,6 +53,7 @@ impl From<&ProtoVersionEntry> for VersionEntry {
         Self {
             version: entry.version,
             description: entry.version_description.to_owned(),
+            channel_id: ChannelId(entry.channel_id),
         }
     }
 }
@@ -163,7 +168,7 @@ pub struct ProcessResult {
 /// let secret_list = vec![
 ///     SecretVersionEntry {
 ///         secret_id: 1,
-///         versions: vec![VersionEntry { version: 1, description: "wallet seed".to_owned() }],
+///         versions: vec![VersionEntry { version: 1, description: "wallet seed".to_owned(), channel_id }],
 ///     },
 /// ];
 ///
@@ -266,7 +271,7 @@ pub fn produce(
 ///
 /// let secret_list = vec![SecretVersionEntry {
 ///     secret_id: 1,
-///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned() }],
+///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned(), channel_id }],
 /// }];
 ///
 /// let response::ProduceResult { envelope } =
@@ -335,6 +340,8 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractR
 /// Returns [`crate::Error`] (specifically `Error::Discovery(...)`) in the following cases:
 ///
 /// - the response does not contain a `result` field (returned as `crate::Error::Invariant`)
+/// - a version entry names channel `0`, which is never a channel id (returned as
+///   `crate::Error::Invariant`)
 /// - [`DiscoveryError::NonOkStatus`] if `result.status != Ok`, carrying the Helper's
 ///   status code and memo string
 ///
@@ -352,7 +359,7 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractR
 ///
 /// let secret_list = vec![SecretVersionEntry {
 ///     secret_id: 1,
-///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned() }],
+///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned(), channel_id }],
 /// }];
 ///
 /// // Helper → Owner roundtrip.
@@ -378,6 +385,17 @@ pub fn process(response: &GetSecretIdsVersionsResponseMessage) -> Result<Process
     ))?;
 
     result.validate(|status, memo| DiscoveryError::NonOkStatus { status, memo })?;
+
+    if response
+        .secret_list
+        .iter()
+        .flat_map(|list| &list.versions)
+        .any(|entry| entry.channel_id == 0)
+    {
+        return Err(Error::Invariant(
+            "GetSecretIdsVersionsResponseMessage names channel 0 for a version",
+        ));
+    }
 
     let secret_list: Vec<SecretVersionEntry> = response
         .secret_list

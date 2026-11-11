@@ -408,6 +408,13 @@ mod defiant_store_tests {
         fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
             self.0.save(secret_id, record)
         }
+        fn save_many(
+            &mut self,
+            secret_id: u64,
+            records: Vec<ChannelRecord>,
+        ) -> ChannelStoreFuture<'_, ()> {
+            self.0.save_many(secret_id, records)
+        }
         fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
             self.0.remove(secret_id, query)
         }

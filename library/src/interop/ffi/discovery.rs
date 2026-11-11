@@ -22,6 +22,7 @@
 //!     [version: u32 LE]
 //!     [description_len: u32 LE]
 //!     [description: UTF-8 bytes]
+//!     [channel_id: u64 LE]   the channel the version's share is stored on
 //! ```
 
 use std::slice;
@@ -36,6 +37,7 @@ use crate::interop::ffi::error::{
 };
 use crate::primitives::discovery::request;
 use crate::primitives::discovery::response::{self, SecretVersionEntry, VersionEntry};
+use crate::types::ChannelId;
 use derec_proto::{DeRecMessage, GetSecretIdsVersionsResponseMessage};
 use prost::Message as _;
 
@@ -338,6 +340,7 @@ fn serialize_secret_list(entries: &[SecretVersionEntry]) -> Vec<u8> {
             let desc_bytes = v.description.as_bytes();
             write_u32_le(&mut out, desc_bytes.len() as u32);
             out.extend_from_slice(desc_bytes);
+            write_u64_le(&mut out, v.channel_id.0);
         }
     }
     out
@@ -362,9 +365,13 @@ fn deserialize_secret_list(bytes: &[u8]) -> Result<Vec<SecretVersionEntry>, Stri
             let desc_bytes = read_exact(&mut input, desc_len)?;
             let description = String::from_utf8(desc_bytes.to_vec())
                 .map_err(|e| format!("invalid UTF-8 in description: {e}"))?;
+            let channel_id_arr: [u8; 8] = read_exact(&mut input, 8)?
+                .try_into()
+                .map_err(|_| "failed to read channel_id".to_string())?;
             versions.push(VersionEntry {
                 version,
                 description,
+                channel_id: ChannelId(u64::from_le_bytes(channel_id_arr)),
             });
         }
         entries.push(SecretVersionEntry {

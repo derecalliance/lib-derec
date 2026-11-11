@@ -45,8 +45,8 @@
 
 use super::super::{
     ChannelRequest, DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore,
-    DeRecStateStore, DeRecTransport, PendingAction, SecretKind, StateItem, StateKey,
-    events::UnpairAck,
+    DeRecStateStore, DeRecTransport, PendingAction, PendingActionKind, SecretKind, StateItem,
+    StateKey, events::UnpairAck,
 };
 use super::replicas::unpairing as replica;
 use crate::derec_message::{apply_trace_id, current_timestamp};
@@ -58,7 +58,7 @@ use crate::primitives::unpairing::UnpairingError;
 use crate::protocol::context::{Exchange, Local, Round};
 use crate::protocol::obligation;
 use crate::protocol::stores::{StoreSet, Stores};
-use crate::protocol::types::{ChannelQuery, ChannelRecord, ChannelStatus};
+use crate::protocol::types::{ChannelQuery, ChannelRecord, ChannelStatus, Share};
 use crate::{
     Error, Result,
     primitives::unpairing::{
@@ -99,6 +99,9 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
                 .channels
                 .require_role(local.secret_id, &[exchange.channel_id], SenderKind::Owner)
                 .await?;
+            if let Some((status, memo)) = refusal(stores, local, exchange, &request).await? {
+                return refuse(stores, local, exchange, &request, status, memo).await;
+            }
             on_request(exchange, request)
         }
         (_, MessageBody::UnpairResponse(response)) => {
@@ -111,10 +114,16 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 }
 
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(trace_id = round.trace_id)))]
+/// Send an unpair request on `channel_id` naming `unpaired`: the same channel
+/// for an ordinary unpair, an older linked one for a linked unpair. The
+/// pending entry, the status change and every event are keyed by `unpaired`,
+/// so `channel_id` stays usable while a linked unpair is in flight.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn start<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     channel_id: ChannelId,
+    unpaired: ChannelId,
     memo: Option<String>,
     unpair_ack: UnpairAck,
     now: u64,
@@ -123,7 +132,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     let secret_id = local.secret_id;
     let memo_str = memo.unwrap_or_default();
     let mut events = vec![DeRecEvent::UnpairStarted {
-        channel_id,
+        channel_id: unpaired,
         trace_id: round.trace_id,
     }];
 
@@ -131,7 +140,8 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 
     // Helper unpair: no member is named, which is what marks this the
     // owner ↔ helper path rather than a replica-group removal.
-    let request = produce_unpair_request(channel_id, &memo_str, &key, round.reply_to, None)?;
+    let request =
+        produce_unpair_request(channel_id, &memo_str, &key, round.reply_to, None, unpaired)?;
     let envelope = apply_trace_id(&request.envelope, round.trace_id)?;
     let endpoint = stores
         .channels
@@ -141,8 +151,10 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 
     match unpair_ack {
         UnpairAck::NotRequired => {
-            drop_channels_state(stores, local, &[channel_id]).await?;
-            events.push(DeRecEvent::Unpaired { channel_id });
+            drop_channels_state(stores, local, &[unpaired]).await?;
+            events.push(DeRecEvent::Unpaired {
+                channel_id: unpaired,
+            });
         }
         UnpairAck::Required => {
             stores
@@ -150,7 +162,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
                 .save(
                     secret_id,
                     StateItem::PendingUnpair {
-                        channel_id,
+                        channel_id: unpaired,
                         started_at: now,
                     },
                 )
@@ -160,7 +172,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
             set_status(
                 stores,
                 local,
-                channel_id,
+                unpaired,
                 ChannelStatus::Paired,
                 ChannelStatus::Unpairing,
             )
@@ -171,6 +183,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     #[cfg(feature = "logging")]
     tracing::debug!(
         channel_id = channel_id.0,
+        unpaired = unpaired.0,
         ack = ?unpair_ack,
         "unpair request sent"
     );
@@ -189,7 +202,10 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     request: &UnpairRequestMessage,
 ) -> Result<Vec<DeRecEvent>> {
     let channel_id = exchange.channel_id;
-    let resp = unpairing_response::produce(channel_id, exchange.key)?;
+    // The channel to drop: the arrival channel itself, or an older channel
+    // linked to it, which `refusal` already checked before this was raised.
+    let unpaired = ChannelId(request.channel_id);
+    let resp = unpairing_response::produce(channel_id, exchange.key, unpaired)?;
     let envelope = apply_trace_id(&resp.envelope, exchange.trace_id)?;
     let endpoint = stores
         .channels
@@ -216,14 +232,19 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     // The acknowledgement is out, so the peer may already have dropped its
     // side: the local state goes too, and a failure from here on is
     // reported after `Unpaired`, never answered a second time.
-    let dropped = drop_channels_state(stores, local, &[channel_id]).await;
+    let dropped = drop_channels_state(stores, local, &[unpaired]).await;
 
     #[cfg(feature = "logging")]
-    tracing::info!("unpair accepted; local state dropped");
+    tracing::info!(
+        unpaired = unpaired.0,
+        "unpair accepted; local state dropped"
+    );
 
     obligation::reported(
         exchange.obligation,
-        vec![DeRecEvent::Unpaired { channel_id }],
+        vec![DeRecEvent::Unpaired {
+            channel_id: unpaired,
+        }],
         sent.and(dropped),
     )
 }
@@ -245,7 +266,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         stores.transport,
         local.secret_id,
         exchange.channel_id,
-        failure_response(status, memo),
+        failure_response(request, status, memo),
         exchange.key,
         exchange.trace_id,
         local.policy,
@@ -257,16 +278,115 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
     .await
 }
 
-/// The `UnpairResponse` that answers an unpair request with a non-`Ok`
-/// `status`; the channel is kept.
-pub(in crate::protocol) fn failure_response(status: StatusEnum, memo: &str) -> MessageBody {
+/// The `UnpairResponse` that answers `request` with a non-`Ok` `status`,
+/// echoing the channel it named; no channel is dropped.
+pub(in crate::protocol) fn failure_response(
+    request: &UnpairRequestMessage,
+    status: StatusEnum,
+    memo: &str,
+) -> MessageBody {
     MessageBody::UnpairResponse(UnpairResponseMessage {
         result: Some(DeRecResult {
             status: status as i32,
             memo: memo.to_owned(),
         }),
         timestamp: Some(current_timestamp()),
+        channel_id: request.channel_id,
     })
+}
+
+/// Why an inbound unpair request is refused before the application sees it,
+/// or `None` when it may go ahead.
+///
+/// A request naming the channel it arrived on is an ordinary unpair. One
+/// naming another channel is a linked unpair: the owner recovered on this
+/// channel and wants the older one dropped. It goes ahead only when that
+/// older channel is linked to this one, so an owner can never name another
+/// owner's channel; only once a share is stored on this channel, so
+/// dropping the older one never leaves this helper holding nothing for the
+/// owner; and only when the named channel holds no newer version than this
+/// one, so a device left with the old channel's key cannot retire the
+/// channel the owner recovered on. A named channel that is neither linked
+/// nor held was dropped by an earlier linked unpair, and a retry goes ahead.
+/// These are protocol rules, refused whatever the application's settings.
+async fn refusal<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    exchange: &Exchange<'_>,
+    request: &UnpairRequestMessage,
+) -> Result<Option<(StatusEnum, &'static str)>> {
+    let arrival = exchange.channel_id;
+    if request.channel_id == 0 {
+        return Ok(Some((
+            StatusEnum::FormatError,
+            "the unpair request names no channel",
+        )));
+    }
+    if request.channel_id == arrival.0 {
+        return Ok(None);
+    }
+    let target = ChannelId(request.channel_id);
+    let linked = stores
+        .channels
+        .linked_channels(local.secret_id, arrival)
+        .await?;
+    // A store may drop a channel's links along with the channel. A target
+    // that is neither linked nor held is one an earlier linked unpair
+    // already dropped, so a retry is answered as the first one was.
+    if !linked.contains(&target)
+        && stores
+            .channels
+            .load_helper(local.secret_id, target)
+            .await?
+            .is_some()
+    {
+        return Ok(Some((
+            StatusEnum::Fail,
+            "the named channel is not linked to this one",
+        )));
+    }
+    let newest_on = |shares: Vec<Share>| shares.iter().map(|share| share.version).max();
+    let Some(arrival_newest) = newest_on(stores.shares.load(local.secret_id, arrival, &[]).await?)
+    else {
+        return Ok(Some((
+            StatusEnum::Fail,
+            "no share is stored on this channel yet",
+        )));
+    };
+    // Only an older channel is retired: one holding a newer version than
+    // this one is the channel the owner recovered on, not the one it left.
+    if newest_on(stores.shares.load(local.secret_id, target, &[]).await?)
+        .is_some_and(|target_newest| target_newest > arrival_newest)
+    {
+        return Ok(Some((
+            StatusEnum::Fail,
+            "the named channel holds a newer version than this one",
+        )));
+    }
+    Ok(None)
+}
+
+/// Answer `request` with `status` and report it as a failed request the
+/// library has already answered.
+async fn refuse<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    exchange: &Exchange<'_>,
+    request: &UnpairRequestMessage,
+    status: StatusEnum,
+    memo: &'static str,
+) -> Result<Vec<DeRecEvent>> {
+    let sent = reject(stores, local, exchange, request, status, memo).await;
+    let event = obligation::request_failed(
+        exchange.channel_id,
+        PendingActionKind::Unpair,
+        sent.is_ok(),
+        status as i32,
+        memo,
+        &Error::InvalidInput(memo),
+        None,
+    );
+    obligation::refused(exchange.obligation, event, status, memo, sent)
 }
 
 /// Drop everything this device holds for `channel_ids`: their shares, their
@@ -329,7 +449,7 @@ fn on_request(exchange: &Exchange<'_>, request: UnpairRequestMessage) -> Result<
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
+    tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0, unpaired = response.channel_id))
 )]
 async fn on_response<S: StoreSet>(
     stores: &mut Stores<'_, S>,
@@ -337,8 +457,23 @@ async fn on_response<S: StoreSet>(
     exchange: &Exchange<'_>,
     response: &UnpairResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
+    // The answer names the channel the request named, which for a linked
+    // unpair is not the channel it travels on. A linked unpair only ever
+    // names a channel this device no longer holds, so an answer naming a
+    // held channel settles nothing unless it arrived on that channel:
+    // another helper cannot complete or refuse it.
+    let unpaired = ChannelId(response.channel_id);
+    if unpaired != exchange.channel_id
+        && stores
+            .channels
+            .load_helper(local.secret_id, unpaired)
+            .await?
+            .is_some()
+    {
+        return Ok(vec![DeRecEvent::NoOp]);
+    }
     let pending = StateKey::PendingUnpair {
-        channel_id: exchange.channel_id,
+        channel_id: unpaired,
     };
     if stores
         .state
@@ -351,22 +486,22 @@ async fn on_response<S: StoreSet>(
 
     let events = match process_unpair_response(response) {
         Ok(_) => {
-            drop_channels_state(stores, local, &[exchange.channel_id]).await?;
+            drop_channels_state(stores, local, &[unpaired]).await?;
             vec![DeRecEvent::Unpaired {
-                channel_id: exchange.channel_id,
+                channel_id: unpaired,
             }]
         }
         Err(Error::Unpairing(UnpairingError::NonOkStatus { status, memo })) => {
             set_status(
                 stores,
                 local,
-                exchange.channel_id,
+                unpaired,
                 ChannelStatus::Unpairing,
                 ChannelStatus::Paired,
             )
             .await?;
             vec![DeRecEvent::UnpairRejected {
-                channel_id: exchange.channel_id,
+                channel_id: unpaired,
                 status,
                 memo,
             }]
@@ -406,3 +541,6 @@ async fn set_status<S: StoreSet>(
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

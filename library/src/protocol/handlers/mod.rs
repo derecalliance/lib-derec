@@ -834,6 +834,7 @@ mod replica_channel_binding_tests {
                     timestamp: Some(ts),
                     reply_to_transports: Vec::new(),
                     replica_id: Some(MEMBER),
+                    channel_id: HELPER_CHANNEL.0,
                 })
             });
             let _ = rig.protocol.process(&message).await;

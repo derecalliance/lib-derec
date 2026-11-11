@@ -4,6 +4,7 @@
 package native
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -21,6 +22,7 @@ import (
 type mockChannelStore struct {
 	loadFn         func(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error)
 	saveFn         func(secretID uint64, record ChannelRecord) error
+	saveManyFn     func(secretID uint64, records []ChannelRecord) error
 	removeFn       func(secretID, channelID, replicaID uint64) (bool, error)
 	removeManyFn   func(secretID uint64, queries []ChannelQuery) error
 	listHelpersFn  func(secretID uint64) ([]HelperChannel, error)
@@ -34,6 +36,9 @@ func (m *mockChannelStore) Load(secretID, channelID, replicaID uint64) (ChannelR
 }
 func (m *mockChannelStore) Save(secretID uint64, record ChannelRecord) error {
 	return m.saveFn(secretID, record)
+}
+func (m *mockChannelStore) SaveMany(secretID uint64, records []ChannelRecord) error {
+	return m.saveManyFn(secretID, records)
 }
 func (m *mockChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, error) {
 	return m.removeFn(secretID, channelID, replicaID)
@@ -60,6 +65,7 @@ type mockSecretStore struct {
 	loadFn       func(secretID, channelID uint64, kind SecretKind) (SecretValue, bool, error)
 	loadManyFn   func(secretID uint64, channelIDs []uint64, kind SecretKind) ([]*SecretValue, error)
 	saveFn       func(secretID, channelID uint64, value SecretValue) error
+	saveManyFn   func(secretID uint64, entries []SecretValueEntry) error
 	removeFn     func(secretID, channelID uint64, kind SecretKind) error
 	removeManyFn func(secretID uint64, entries []SecretEntry) error
 }
@@ -72,6 +78,9 @@ func (m *mockSecretStore) LoadMany(secretID uint64, channelIDs []uint64, kind Se
 }
 func (m *mockSecretStore) Save(secretID, channelID uint64, value SecretValue) error {
 	return m.saveFn(secretID, channelID, value)
+}
+func (m *mockSecretStore) SaveMany(secretID uint64, entries []SecretValueEntry) error {
+	return m.saveManyFn(secretID, entries)
 }
 func (m *mockSecretStore) Remove(secretID, channelID uint64, kind SecretKind) error {
 	return m.removeFn(secretID, channelID, kind)
@@ -330,6 +339,117 @@ func TestDispatchChannelRemove_ExistedTransitions(t *testing.T) {
 	status, got = dispatchChannelRemove(s, 1, 2, 0)
 	if status != ffiStatusOK || got {
 		t.Fatalf("second remove: status=%d existed=%v, want ok/false", status, got)
+	}
+}
+
+func TestDispatchChannelSaveMany_DecodesTriples(t *testing.T) {
+	var got []ChannelRecord
+	var gotSecretID uint64
+	calls := 0
+	s := &storeSet{channel: &mockChannelStore{
+		saveManyFn: func(secretID uint64, records []ChannelRecord) error {
+			calls++
+			gotSecretID = secretID
+			got = records
+			return nil
+		},
+	}}
+	helper := HelperChannel{ChannelID: 11, Status: ChannelStatusPaired, PeerRole: SenderKindHelper, CommunicationInfo: map[string]string{}}
+	member := ReplicaMember{ReplicaID: 18446744073709551615, ChannelID: 7, Role: ReplicaRoleDestination, Status: ChannelStatusPending, CommunicationInfo: map[string]string{}}
+	helperJSON, err := EncodeChannelRecord(ChannelRecord{Helper: &helper})
+	if err != nil {
+		t.Fatalf("EncodeChannelRecord(helper): %v", err)
+	}
+	memberJSON, err := EncodeChannelRecord(ChannelRecord{Replica: &member})
+	if err != nil {
+		t.Fatalf("EncodeChannelRecord(member): %v", err)
+	}
+	payload, err := json.Marshal([][3]string{
+		{"11", "0", string(helperJSON)},
+		{"7", "18446744073709551615", string(memberJSON)},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if status := dispatchChannelSaveMany(s, 55, payload); status != ffiStatusOK {
+		t.Fatalf("status = %d, want ffiStatusOK", status)
+	}
+	if gotSecretID != 55 || len(got) != 2 {
+		t.Fatalf("secretID = %d records = %+v, want 55 and two records", gotSecretID, got)
+	}
+	if got[0].Helper == nil || got[0].Helper.ChannelID != 11 || got[0].Helper.Status != ChannelStatusPaired {
+		t.Fatalf("records[0] = %+v, want helper channel 11", got[0])
+	}
+	if got[1].Replica == nil || got[1].Replica.ReplicaID != 18446744073709551615 || got[1].Replica.ChannelID != 7 {
+		t.Fatalf("records[1] = %+v, want replica member on channel 7", got[1])
+	}
+	if status := dispatchChannelSaveMany(s, 1, nil); status != ffiStatusOK || len(got) != 0 {
+		t.Fatalf("empty buffer: status = %d records = %v, want ok and none", status, got)
+	}
+	calls = 0
+	badIDs := [][3]string{{"x", "0", string(helperJSON)}, {"11", "y", string(helperJSON)}, {"11", "-1", string(helperJSON)}}
+	malformed := []string{`[["11","0","not json"]]`, `[["11","0"]]`, `[["11","0",{}]]`, `not json`}
+	for _, triple := range badIDs {
+		encoded, err := json.Marshal([][3]string{triple})
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+		malformed = append(malformed, string(encoded))
+	}
+	for _, bad := range malformed {
+		if status := dispatchChannelSaveMany(s, 1, []byte(bad)); status != ffiStatusFailure {
+			t.Fatalf("%s: status = %d, want ffiStatusFailure", bad, status)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("malformed input reached the store %d times", calls)
+	}
+}
+
+func TestDispatchSecretSaveMany_DecodesTriples(t *testing.T) {
+	var got []SecretValueEntry
+	calls := 0
+	s := &storeSet{secret: &mockSecretStore{
+		saveManyFn: func(secretID uint64, entries []SecretValueEntry) error {
+			calls++
+			got = entries
+			return nil
+		},
+	}}
+	keyJSON, err := EncodeSecretValue(SecretValue{Kind: SecretKindSharedKey, Bytes: []byte{1, 2, 3}})
+	if err != nil {
+		t.Fatalf("EncodeSecretValue(key): %v", err)
+	}
+	ringJSON, err := EncodeSecretValue(SecretValue{Kind: SecretKindKeyRing, Bytes: []byte{4, 5}})
+	if err != nil {
+		t.Fatalf("EncodeSecretValue(ring): %v", err)
+	}
+	payload, err := json.Marshal([][3]any{
+		{"12", 0, string(keyJSON)},
+		{"18446744073709551615", 3, string(ringJSON)},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if status := dispatchSecretSaveMany(s, 1, payload); status != ffiStatusOK {
+		t.Fatalf("status = %d, want ffiStatusOK", status)
+	}
+	if len(got) != 2 ||
+		got[0].ChannelID != 12 || got[0].Value.Kind != SecretKindSharedKey || !bytes.Equal(got[0].Value.Bytes, []byte{1, 2, 3}) ||
+		got[1].ChannelID != 18446744073709551615 || got[1].Value.Kind != SecretKindKeyRing || !bytes.Equal(got[1].Value.Bytes, []byte{4, 5}) {
+		t.Fatalf("entries = %+v, want the two encoded values", got)
+	}
+	if status := dispatchSecretSaveMany(s, 1, nil); status != ffiStatusOK || len(got) != 0 {
+		t.Fatalf("empty buffer: status = %d entries = %v, want ok and none", status, got)
+	}
+	calls = 0
+	for _, bad := range []string{`[["x",0,"{}"]]`, `[[12,0,"{}"]]`, `[["12",0]]`, `[["12",0,"not json"]]`, `[["12",0,{}]]`} {
+		if status := dispatchSecretSaveMany(s, 1, []byte(bad)); status != ffiStatusFailure {
+			t.Fatalf("%s: status = %d, want ffiStatusFailure", bad, status)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("malformed input reached the store %d times", calls)
 	}
 }
 

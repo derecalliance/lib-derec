@@ -361,8 +361,17 @@ type GetSecretIdsVersionsResponseMessage_VersionList_VersionEntry struct {
 	//
 	// May be empty if no description was provided.
 	VersionDescription string `protobuf:"bytes,2,opt,name=versionDescription,proto3" json:"versionDescription,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// The channel this version's share is stored on. Always set; `0` is
+	// malformed.
+	//
+	// A Helper answers across every channel linked to the one the request
+	// arrived on, so this may differ from the envelope's channel. It is
+	// how a recovering Owner learns which of its old channels a recovery
+	// channel replaces. A version stored on several linked channels names
+	// the one with the lowest id.
+	ChannelId     uint64 `protobuf:"varint,3,opt,name=channelId,proto3" json:"channelId,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetSecretIdsVersionsResponseMessage_VersionList_VersionEntry) Reset() {
@@ -409,6 +418,13 @@ func (x *GetSecretIdsVersionsResponseMessage_VersionList_VersionEntry) GetVersio
 	return ""
 }
 
+func (x *GetSecretIdsVersionsResponseMessage_VersionList_VersionEntry) GetChannelId() uint64 {
+	if x != nil {
+		return x.ChannelId
+	}
+	return 0
+}
+
 var File_secretidsversions_proto protoreflect.FileDescriptor
 
 const file_secretidsversions_proto_rawDesc = "" +
@@ -419,20 +435,21 @@ const file_secretidsversions_proto_rawDesc = "" +
 	"\x11replyToTransports\x18\x04 \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x11replyToTransports\x12!\n" +
 	"\treplicaId\x18\x03 \x01(\x04H\x00R\treplicaId\x88\x01\x01B\f\n" +
 	"\n" +
-	"_replicaIdJ\x04\b\x02\x10\x03R\areplyTo\"\xcc\x04\n" +
+	"_replicaIdJ\x04\b\x02\x10\x03R\areplyTo\"\xea\x04\n" +
 	"#GetSecretIdsVersionsResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x12q\n" +
 	"\n" +
 	"secretList\x18\x02 \x03(\v2Q.org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.VersionListR\n" +
 	"secretList\x128\n" +
 	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12!\n" +
-	"\treplicaId\x18\x04 \x01(\x04H\x00R\treplicaId\x88\x01\x01\x1a\xff\x01\n" +
+	"\treplicaId\x18\x04 \x01(\x04H\x00R\treplicaId\x88\x01\x01\x1a\x9d\x02\n" +
 	"\vVersionList\x12\x1a\n" +
 	"\bsecretId\x18\x01 \x01(\x04R\bsecretId\x12z\n" +
-	"\bversions\x18\x02 \x03(\v2^.org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.VersionList.VersionEntryR\bversions\x1aX\n" +
+	"\bversions\x18\x02 \x03(\v2^.org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.VersionList.VersionEntryR\bversions\x1av\n" +
 	"\fVersionEntry\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x12.\n" +
-	"\x12versionDescription\x18\x02 \x01(\tR\x12versionDescriptionB\f\n" +
+	"\x12versionDescription\x18\x02 \x01(\tR\x12versionDescription\x12\x1c\n" +
+	"\tchannelId\x18\x03 \x01(\x04R\tchannelIdB\f\n" +
 	"\n" +
 	"_replicaIdb\x06proto3"
 

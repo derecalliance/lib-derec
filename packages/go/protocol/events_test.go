@@ -398,7 +398,7 @@ func TestDecodeEvents_SecretsDiscovered(t *testing.T) {
 		"type": "SecretsDiscovered",
 		"channel_id": "11",
 		"secrets": [
-			{"secret_id": "42", "versions": [{"version": 1, "description": "first"}, {"version": 2, "description": ""}]}
+			{"secret_id": "42", "versions": [{"version": 1, "description": "first", "channel_id": "18446744073709551615"}, {"version": 2, "description": "", "channel_id": "11"}]}
 		]
 	}`)
 	if ev.Type != EventTypeSecretsDiscovered {
@@ -409,7 +409,9 @@ func TestDecodeEvents_SecretsDiscovered(t *testing.T) {
 	}
 	if len(ev.Secrets[0].Versions) != 2 ||
 		ev.Secrets[0].Versions[0].Version != 1 || ev.Secrets[0].Versions[0].Description != "first" ||
-		ev.Secrets[0].Versions[1].Version != 2 || ev.Secrets[0].Versions[1].Description != "" {
+		ev.Secrets[0].Versions[0].ChannelID != 18446744073709551615 ||
+		ev.Secrets[0].Versions[1].Version != 2 || ev.Secrets[0].Versions[1].Description != "" ||
+		ev.Secrets[0].Versions[1].ChannelID != 11 {
 		t.Fatalf("Versions: got %+v", ev.Secrets[0].Versions)
 	}
 }
@@ -1074,7 +1076,7 @@ func TestDecodeEvents_IDsAboveFloat64Precision_RoundTripToRestore(t *testing.T) 
 		t.Fatalf("ids lost precision: %+v", ev.Secret)
 	}
 
-	got, err := json.Marshal(restoreParamsWire{Version: 1, NewestVersion: 1, RecoveredSecret: *ev.Secret})
+	got, err := marshalRestoreParams(*ev.Secret, 1, 1, nil)
 	if err != nil {
 		t.Fatalf("marshal restore params: %v", err)
 	}
@@ -1115,7 +1117,7 @@ func TestDecodeEvents_SecretRecoveredHelperWeight_RoundTripsToRestore(t *testing
 	if ev.Secret.Helpers[0].Weight != 3 {
 		t.Fatalf("Weight = %d, want 3", ev.Secret.Helpers[0].Weight)
 	}
-	got, err := json.Marshal(restoreParamsWire{Version: 1, NewestVersion: 1, RecoveredSecret: *ev.Secret})
+	got, err := marshalRestoreParams(*ev.Secret, 1, 1, nil)
 	if err != nil {
 		t.Fatalf("marshal restore params: %v", err)
 	}
@@ -1146,7 +1148,7 @@ func TestDecodeEvents_SecretRecoveredKeyEpoch_RoundTripsToRestore(t *testing.T) 
 	if ev.Secret.Replicas == nil || ev.Secret.Replicas.KeyEpoch != 3 {
 		t.Fatalf("replicas KeyEpoch = %+v, want 3", ev.Secret.Replicas)
 	}
-	got, err := json.Marshal(restoreParamsWire{Version: 1, NewestVersion: 1, RecoveredSecret: *ev.Secret})
+	got, err := marshalRestoreParams(*ev.Secret, 1, 1, nil)
 	if err != nil {
 		t.Fatalf("marshal restore params: %v", err)
 	}
@@ -1193,7 +1195,7 @@ func TestDecodeEvents_SecretRecoveredThreshold_RoundTripsToRestore(t *testing.T)
 	if ev.Secret.Threshold == nil || *ev.Secret.Threshold != 3 {
 		t.Fatalf("Threshold = %v, want 3", ev.Secret.Threshold)
 	}
-	got, err := json.Marshal(restoreParamsWire{Version: 1, NewestVersion: 1, RecoveredSecret: *ev.Secret})
+	got, err := marshalRestoreParams(*ev.Secret, 1, 1, nil)
 	if err != nil {
 		t.Fatalf("marshal restore params: %v", err)
 	}
@@ -1201,7 +1203,7 @@ func TestDecodeEvents_SecretRecoveredThreshold_RoundTripsToRestore(t *testing.T)
 		t.Fatalf("restore params must carry the threshold: %s", got)
 	}
 	ev = decodeOne(t, `{"type": "SecretRecovered", "secret": {"helpers": [], "secrets": []}}`)
-	got, err = json.Marshal(restoreParamsWire{Version: 1, NewestVersion: 1, RecoveredSecret: *ev.Secret})
+	got, err = marshalRestoreParams(*ev.Secret, 1, 1, nil)
 	if err != nil {
 		t.Fatalf("marshal restore params: %v", err)
 	}
@@ -1321,11 +1323,11 @@ func TestDecodeEvents_PeerNotRestored(t *testing.T) {
 		t.Fatalf("helper entry: got %+v", helper)
 	}
 
-	member := decodeOne(t, `{"type": "PeerNotRestored", "channel_id": "21", "replica_id": "18446744073709551615", "reason": "NoTransports"}`)
+	member := decodeOne(t, `{"type": "PeerNotRestored", "channel_id": "21", "replica_id": "18446744073709551615", "reason": "ReplicaGroupDropped"}`)
 	if member.Type != EventTypePeerNotRestored ||
 		member.ChannelID != 21 ||
 		member.ReplicaID == nil || *member.ReplicaID != 18446744073709551615 ||
-		member.Reason != NotRestoredReasonNoTransports {
+		member.Reason != NotRestoredReasonReplicaGroupDropped {
 		t.Fatalf("member entry: got %+v", member)
 	}
 }

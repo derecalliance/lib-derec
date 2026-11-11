@@ -113,6 +113,8 @@ pub extern "C" fn produce_unpair_request_message(
         // Helper path. Replica-group removal is orchestrated through the
         // `UnpairReplica` flow, which names the departing member itself.
         None,
+        // An ordinary unpair names the channel it travels on.
+        channel_id.into(),
     ) {
         Ok(r) => ProduceUnpairRequestMessageResult {
             error: success(),
@@ -206,6 +208,7 @@ pub extern "C" fn produce_unpair_response_message(
     match response::produce(
         channel_id.into(),
         &crate::types::ChannelKey::new(epoch, shared_key),
+        channel_id.into(),
     ) {
         Ok(r) => ProduceUnpairResponseMessageResult {
             error: success(),

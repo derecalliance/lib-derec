@@ -87,6 +87,7 @@ int32_t chRemove(void*, uint64_t, uint64_t, uint64_t, uint32_t* existed) {
   *existed = 0;
   return 0;
 }
+int32_t chSaveMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t chRemoveMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t chListHelpers(void*, uint64_t, const uint8_t*, size_t, uint8_t** p, size_t* l) {
   return giveBytes(kHelpers, p, l);
@@ -132,8 +133,9 @@ int32_t stLoadAll(void*, uint64_t, uint32_t, uint8_t** p, size_t* l) { return gi
 
 int32_t trSend(void*, const uint8_t*, size_t, const uint8_t*, size_t) { return 0; }
 
-ChannelStoreCallbacks channelStore{nullptr, chLoad, chSave, chRemove, chRemoveMany, chListHelpers,
-                                   chListReplicas, chLink, chLinked, freeBytes};
+ChannelStoreCallbacks channelStore{nullptr,       chLoad,         chSave, chSaveMany, chRemove,
+                                   chRemoveMany,  chListHelpers,  chListReplicas, chLink, chLinked,
+                                   freeBytes};
 ShareStoreCallbacks shareStore{nullptr, shLoad,   shLoadMany,       shLoadAll,  shLatest,
                                shSave,  shRemove, shRemoveVersions, shRemoveVersionsMany, shKeepVersion,
                                shRecordVerification, freeBytes};

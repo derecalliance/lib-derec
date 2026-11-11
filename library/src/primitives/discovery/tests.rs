@@ -25,7 +25,10 @@ use crate::{
 };
 use derec_proto::{
     DeRecResult, GetSecretIdsVersionsResponseMessage, MessageBody, Protocol, StatusEnum,
-    TransportProtocol, get_secret_ids_versions_response_message::VersionList,
+    TransportProtocol,
+    get_secret_ids_versions_response_message::{
+        VersionList, version_list::VersionEntry as ProtoVersionEntry,
+    },
 };
 use prost::Message;
 use std::slice;
@@ -38,6 +41,7 @@ fn entry(id: u64, versions: &[(u32, &str)]) -> SecretVersionEntry {
             .map(|(v, desc)| VersionEntry {
                 version: *v,
                 description: desc.to_string(),
+                channel_id: ChannelId(7),
             })
             .collect(),
     }
@@ -421,6 +425,60 @@ fn test_process_discovery_response_missing_result_fails() {
     assert!(matches!(result, Err(Error::Invariant(_))));
 }
 
+/// Each version names the channel its share is stored on, and that survives
+/// the wire unchanged, including when it differs from the envelope's channel.
+#[test]
+fn test_owning_channel_survives_roundtrip() {
+    let shared_key = make_shared_key(1);
+    let secret_list = vec![SecretVersionEntry {
+        secret_id: 1,
+        versions: vec![VersionEntry {
+            version: 3,
+            description: String::new(),
+            channel_id: ChannelId(10),
+        }],
+    }];
+
+    let ProduceResponseResult { envelope } = produce_discovery_response(
+        ChannelId(20),
+        &secret_list,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("produce should succeed");
+    let ExtractResponseResult { response } =
+        extract_discovery_response(&envelope, &shared_key).expect("extract should succeed");
+    let ProcessResult {
+        secret_list: parsed,
+    } = process_discovery_response(&response).expect("process should succeed");
+
+    assert_eq!(parsed[0].versions[0].channel_id, ChannelId(10));
+}
+
+/// `0` is never a channel id, so an entry carrying it (or omitting the field,
+/// which decodes the same) is malformed.
+#[test]
+fn test_process_discovery_response_rejects_channel_zero() {
+    let envelope = build_response_envelope(
+        ChannelId(1),
+        &make_shared_key(1),
+        Some(DeRecResult::ok()),
+        vec![VersionList {
+            secret_id: 1,
+            versions: vec![ProtoVersionEntry {
+                version: 1,
+                version_description: String::new(),
+                channel_id: 0,
+            }],
+        }],
+    );
+    let ExtractResponseResult { response } =
+        extract_discovery_response(&envelope, &make_shared_key(1)).expect("extract should succeed");
+
+    let result = process_discovery_response(&response);
+
+    assert!(matches!(result, Err(Error::Invariant(_))));
+}
+
 #[test]
 fn test_process_discovery_response_non_ok_status_fails() {
     let envelope = build_response_envelope(
@@ -519,14 +577,17 @@ fn test_version_descriptions_are_preserved_through_roundtrip() {
             VersionEntry {
                 version: 1,
                 description: "Draft".to_owned(),
+                channel_id: ChannelId(7),
             },
             VersionEntry {
                 version: 2,
                 description: "Final".to_owned(),
+                channel_id: ChannelId(7),
             },
             VersionEntry {
                 version: 3,
                 description: String::new(),
+                channel_id: ChannelId(7),
             },
         ],
     }];

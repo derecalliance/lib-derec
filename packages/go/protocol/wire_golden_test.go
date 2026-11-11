@@ -109,15 +109,11 @@ func goldenRestoreSecret() Secret {
 }
 
 // TestWireGolden_Restore asserts Restore's params marshal (via
-// restoreParamsWire, whose RecoveredSecret field is now a plain Secret —
-// see flow.go) matches the shared golden fixture that every SDK's params
-// builder is checked against.
+// marshalRestoreParams, whose RecoveredSecret field is a plain Secret — see
+// flow.go) matches the shared golden fixture that every SDK's params builder
+// is checked against.
 func TestWireGolden_Restore(t *testing.T) {
-	got, err := json.Marshal(restoreParamsWire{
-		Version:         7,
-		NewestVersion:   9,
-		RecoveredSecret: goldenRestoreSecret(),
-	})
+	got, err := marshalRestoreParams(goldenRestoreSecret(), 7, 9, nil)
 	if err != nil {
 		t.Fatalf("marshal restore params: %v", err)
 	}
@@ -218,7 +214,7 @@ func TestWireGolden_Restore_NilReplicasOmitsField(t *testing.T) {
 		},
 		Secrets: []UserSecret{{ID: []byte{0x01}, Name: "n", Data: []byte{0x02}}},
 	}
-	got, err := json.Marshal(restoreParamsWire{Version: 1, NewestVersion: 1, RecoveredSecret: secret})
+	got, err := marshalRestoreParams(secret, 1, 1, nil)
 	if err != nil {
 		t.Fatalf("marshal restore params: %v", err)
 	}

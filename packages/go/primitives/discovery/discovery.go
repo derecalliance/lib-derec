@@ -16,6 +16,10 @@ import (
 type VersionEntry struct {
 	Version     uint32
 	Description string
+	// ChannelID is the channel this version's share is stored on. On a
+	// recovery channel it names the old channel the recovery channel
+	// replaces.
+	ChannelID uint64
 }
 
 // SecretVersionEntry is the set of versions a helper advertises for one
@@ -119,6 +123,7 @@ func (responseAPI) Process(responseProto []byte) ([]SecretVersionEntry, error) {
 //	    [version: u32 LE]
 //	    [description_len: u32 LE]
 //	    [description: UTF-8 bytes]
+//	    [channel_id: u64 LE]
 func encodeSecretList(entries []SecretVersionEntry) []byte {
 	out := make([]byte, 0)
 	out = appendUint32(out, uint32(len(entries)))
@@ -130,6 +135,7 @@ func encodeSecretList(entries []SecretVersionEntry) []byte {
 			descBytes := []byte(v.Description)
 			out = appendUint32(out, uint32(len(descBytes)))
 			out = append(out, descBytes...)
+			out = appendUint64(out, v.ChannelID)
 		}
 	}
 	return out
@@ -168,10 +174,16 @@ func decodeSecretList(wire []byte) ([]SecretVersionEntry, error) {
 			}
 			description := string(wire[offset : offset+descLen])
 			offset += descLen
+			if offset+8 > len(wire) {
+				return nil, fmt.Errorf("discovery: unexpected end of secret list wire bytes reading entry %d version %d channel_id", i, j)
+			}
+			channelID := binary.LittleEndian.Uint64(wire[offset:])
+			offset += 8
 
 			versions = append(versions, VersionEntry{
 				Version:     version,
 				Description: description,
+				ChannelID:   channelID,
 			})
 		}
 

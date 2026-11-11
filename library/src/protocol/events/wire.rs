@@ -361,7 +361,8 @@ pub(crate) enum Event {
         /// helper.
         #[serde(skip_serializing_if = "Option::is_none")]
         replica_id: Option<String>,
-        /// [`not_restored_reason_label`] — `"NoTransports"`.
+        /// [`not_restored_reason_label`] — `"NoTransports"` or
+        /// `"ReplicaGroupDropped"`.
         reason: String,
     },
     PairingStarted {
@@ -440,6 +441,9 @@ pub struct DiscoveredSecret {
 pub struct DiscoveredVersion {
     pub version: u32,
     pub description: String,
+    /// Decimal id of the channel this version's share is stored on, which
+    /// on a recovery channel names the old channel it replaces.
+    pub channel_id: String,
 }
 
 #[derive(Serialize)]
@@ -491,8 +495,8 @@ pub struct ReplicasWire {
     /// Every member of the group, including the source and the writer. The
     /// source is the member whose `role` is `Source`.
     pub members: Vec<Replica>,
-    /// 32-byte replica group key. Required by `DeRecProtocol::restore`
-    /// to rebuild replica channel state.
+    /// 32-byte replica group key. `DeRecProtocol::restore` checks its size
+    /// but never writes the group back.
     #[serde(with = "serde_bytes")]
     pub shared_key: Vec<u8>,
     /// The epoch of `shared_key` on the group channel, omitted when `0`.
@@ -862,6 +866,7 @@ impl Event {
                             .map(|v| DiscoveredVersion {
                                 version: v.version,
                                 description: v.description,
+                                channel_id: v.channel_id.0.to_string(),
                             })
                             .collect(),
                     })
@@ -1220,6 +1225,7 @@ pub(crate) fn verify_failure_reason_label(reason: VerifyFailureReason) -> &'stat
 pub(crate) fn not_restored_reason_label(reason: NotRestoredReason) -> &'static str {
     match reason {
         NotRestoredReason::NoTransports => "NoTransports",
+        NotRestoredReason::ReplicaGroupDropped => "ReplicaGroupDropped",
     }
 }
 
@@ -1736,14 +1742,14 @@ mod tests {
             Event::from_event(DeRecEvent::PeerNotRestored {
                 channel_id: ChannelId(21),
                 replica_id: Some(u64::MAX),
-                reason: NotRestoredReason::NoTransports,
+                reason: NotRestoredReason::ReplicaGroupDropped,
             })
             .expect("PeerNotRestored must map"),
         )
         .expect("serializes");
         assert_eq!(member["channel_id"], "21");
         assert_eq!(member["replica_id"], u64::MAX.to_string());
-        assert_eq!(member["reason"], "NoTransports");
+        assert_eq!(member["reason"], "ReplicaGroupDropped");
     }
 
     /// An unanswered failure carries the token the application passes to

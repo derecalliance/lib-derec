@@ -19,7 +19,10 @@ use std::collections::HashMap;
 
 use derec_proto::TransportProtocol;
 
-use crate::protocol::types::{HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret};
+use crate::protocol::types::{
+    HelperInfo, KeepRecoveryChannel, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret,
+};
+use crate::types::ChannelId;
 
 /// One advertised endpoint: a URI plus the protocol name (`"https"`,
 /// `"grpc"`), the same shape `SecretRecovered` carries, so no protocol is
@@ -125,6 +128,29 @@ pub(crate) fn parse_decimal_u64(s: &str, field: &str) -> Result<u64, String> {
     }
     s.parse::<u64>()
         .map_err(|e| format!("{field} must be a decimal u64 string, got {s:?}: {e}"))
+}
+
+/// A [`KeepRecoveryChannel`] as a binding passes it to `restore`: both ids
+/// decimal strings, parsed strictly like every other id here.
+#[derive(serde::Deserialize)]
+pub(crate) struct KeepRecoveryChannelIn {
+    roster_channel_id: String,
+    recovery_channel_id: String,
+}
+
+impl KeepRecoveryChannelIn {
+    pub(crate) fn into_keep(self) -> Result<KeepRecoveryChannel, String> {
+        Ok(KeepRecoveryChannel {
+            roster_channel_id: ChannelId(parse_decimal_u64(
+                &self.roster_channel_id,
+                "roster_channel_id",
+            )?),
+            recovery_channel_id: ChannelId(parse_decimal_u64(
+                &self.recovery_channel_id,
+                "recovery_channel_id",
+            )?),
+        })
+    }
 }
 
 impl RecoveredSecretIn {

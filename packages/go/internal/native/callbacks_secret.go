@@ -18,6 +18,7 @@ type secretStore interface {
 	Load(secretID, channelID uint64, kind SecretKind) (SecretValue, bool, error)
 	LoadMany(secretID uint64, channelIDs []uint64, kind SecretKind) ([]*SecretValue, error)
 	Save(secretID, channelID uint64, value SecretValue) error
+	SaveMany(secretID uint64, entries []SecretValueEntry) error
 	Remove(secretID, channelID uint64, kind SecretKind) error
 	RemoveMany(secretID uint64, entries []SecretEntry) error
 }
@@ -29,6 +30,7 @@ type SecretStoreCallbacks struct {
 	Load       uintptr
 	LoadMany   uintptr
 	Save       uintptr
+	SaveMany   uintptr
 	Remove     uintptr
 	RemoveMany uintptr
 	FreeBuffer uintptr
@@ -79,6 +81,56 @@ func dispatchSecretSave(s *storeSet, secretID, channelID uint64, valueJSON []byt
 		return ffiStatusFailure
 	}
 	return ffiStatusOK
+}
+
+func dispatchSecretSaveMany(s *storeSet, secretID uint64, entriesJSON []byte) (status int32) {
+	defer recoverInto(&status)
+	entries, err := decodeSecretValueEntries(entriesJSON)
+	if err != nil {
+		return ffiStatusFailure
+	}
+	if err := s.secret.SaveMany(secretID, entries); err != nil {
+		return ffiStatusFailure
+	}
+	return ffiStatusOK
+}
+
+// decodeSecretValueEntries parses the core's JSON array of [channel_id,
+// kind, record] triples: the channel id a decimal string, the kind the
+// number save takes, and record the JSON text save receives as its bytes, as
+// a string. The kind repeats the record's own, as save's argument does.
+func decodeSecretValueEntries(data []byte) ([]SecretValueEntry, error) {
+	var triples [][3]json.RawMessage
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &triples); err != nil {
+			return nil, err
+		}
+	}
+	entries := make([]SecretValueEntry, 0, len(triples))
+	for _, t := range triples {
+		var channelStr string
+		if err := json.Unmarshal(t[0], &channelStr); err != nil {
+			return nil, err
+		}
+		var kind uint32
+		if err := json.Unmarshal(t[1], &kind); err != nil {
+			return nil, err
+		}
+		var record string
+		if err := json.Unmarshal(t[2], &record); err != nil {
+			return nil, err
+		}
+		channelID, err := strconv.ParseUint(channelStr, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		value, err := DecodeSecretValue([]byte(record))
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, SecretValueEntry{ChannelID: channelID, Value: value})
+	}
+	return entries, nil
 }
 
 func dispatchSecretRemove(s *storeSet, secretID, channelID uint64, kind uint32) (status int32) {
@@ -168,6 +220,15 @@ func secretSaveCallback(userData uintptr, secretID, channelID uint64, kind uint3
 	return dispatchSecretSave(s, secretID, channelID, unsafe.Slice(bytesPtr, length))
 }
 
+func secretSaveManyCallback(userData uintptr, secretID uint64, entriesPtr *byte, entriesLen uintptr) (status int32) {
+	defer recoverInto(&status)
+	s, ok := lookupStores(storeHandle(userData))
+	if !ok {
+		return ffiStatusFailure
+	}
+	return dispatchSecretSaveMany(s, secretID, readFilterBytes(entriesPtr, entriesLen))
+}
+
 func secretRemoveCallback(userData uintptr, secretID, channelID uint64, kind uint32) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
@@ -188,14 +249,14 @@ func secretRemoveManyCallback(userData uintptr, secretID uint64, entriesPtr *byt
 
 // secretCallbackPtrs holds the purego.NewCallback address for every
 // SecretStoreCallbacks fn-pointer field except FreeBuffer (shared package-
-// wide via sharedFreeBufferCallback). These five functions are stateless
+// wide via sharedFreeBufferCallback). These six functions are stateless
 // package-level funcs, so each needs exactly one registration total — see
 // registerChannelCallbacks in callbacks_channel.go for why per-call
 // registration would exhaust purego's 2000-slot callback table.
 var (
 	secretCallbacksOnce sync.Once
 	secretCallbackPtrs  struct {
-		load, loadMany, save, remove, removeMany uintptr
+		load, loadMany, save, saveMany, remove, removeMany uintptr
 	}
 )
 
@@ -204,6 +265,7 @@ func registerSecretCallbacks() {
 		secretCallbackPtrs.load = purego.NewCallback(secretLoadCallback)
 		secretCallbackPtrs.loadMany = purego.NewCallback(secretLoadManyCallback)
 		secretCallbackPtrs.save = purego.NewCallback(secretSaveCallback)
+		secretCallbackPtrs.saveMany = purego.NewCallback(secretSaveManyCallback)
 		secretCallbackPtrs.remove = purego.NewCallback(secretRemoveCallback)
 		secretCallbackPtrs.removeMany = purego.NewCallback(secretRemoveManyCallback)
 	})
@@ -219,6 +281,7 @@ func buildSecretStoreCallbacks(h storeHandle) SecretStoreCallbacks {
 		Load:       secretCallbackPtrs.load,
 		LoadMany:   secretCallbackPtrs.loadMany,
 		Save:       secretCallbackPtrs.save,
+		SaveMany:   secretCallbackPtrs.saveMany,
 		Remove:     secretCallbackPtrs.remove,
 		RemoveMany: secretCallbackPtrs.removeMany,
 		FreeBuffer: sharedFreeBufferCallback(),

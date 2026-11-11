@@ -40,6 +40,7 @@ use derec_proto::{
 use serde::{Deserialize, Serialize};
 
 use crate::primitives::discovery::response;
+use crate::types::ChannelId;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Timestamp {
@@ -476,6 +477,9 @@ impl From<PrePairResponseMessage> for derec_proto::PrePairResponseMessage {
 pub struct VersionListEntry {
     pub version: u32,
     pub version_description: String,
+    /// The channel this version's share is stored on; see `channelId` on the
+    /// proto.
+    pub channel_id: u64,
 }
 
 impl From<version_list::VersionEntry> for VersionListEntry {
@@ -483,6 +487,7 @@ impl From<version_list::VersionEntry> for VersionListEntry {
         Self {
             version: value.version,
             version_description: value.version_description,
+            channel_id: value.channel_id,
         }
     }
 }
@@ -492,6 +497,7 @@ impl From<VersionListEntry> for version_list::VersionEntry {
         Self {
             version: value.version,
             version_description: value.version_description,
+            channel_id: value.channel_id,
         }
     }
 }
@@ -606,6 +612,8 @@ impl From<GetSecretIdsVersionsResponseMessage>
 pub struct VersionEntry {
     pub version: u32,
     pub description: String,
+    /// The channel this version's share is stored on.
+    pub channel_id: u64,
 }
 
 impl From<response::VersionEntry> for VersionEntry {
@@ -613,6 +621,7 @@ impl From<response::VersionEntry> for VersionEntry {
         Self {
             version: value.version,
             description: value.description,
+            channel_id: value.channel_id.0,
         }
     }
 }
@@ -622,6 +631,7 @@ impl From<VersionEntry> for response::VersionEntry {
         Self {
             version: value.version,
             description: value.description,
+            channel_id: ChannelId(value.channel_id),
         }
     }
 }
@@ -906,6 +916,9 @@ pub struct UnpairRequestMessage {
     /// decode/encode round trip rather than being dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica_id: Option<u64>,
+    /// The channel to unpair: the one the request travels on for an
+    /// ordinary unpair, an older linked one for a linked unpair.
+    pub channel_id: u64,
 }
 
 impl From<derec_proto::UnpairRequestMessage> for UnpairRequestMessage {
@@ -919,6 +932,7 @@ impl From<derec_proto::UnpairRequestMessage> for UnpairRequestMessage {
                 .map(Into::into)
                 .collect(),
             replica_id: value.replica_id,
+            channel_id: value.channel_id,
         }
     }
 }
@@ -931,6 +945,7 @@ impl From<UnpairRequestMessage> for derec_proto::UnpairRequestMessage {
             timestamp: value.timestamp.map(Into::into),
             reply_to_transports,
             replica_id: value.replica_id,
+            channel_id: value.channel_id,
         }
     }
 }
@@ -939,6 +954,8 @@ impl From<UnpairRequestMessage> for derec_proto::UnpairRequestMessage {
 pub struct UnpairResponseMessage {
     pub result: Option<DeRecResult>,
     pub timestamp: Option<Timestamp>,
+    /// The channel the request named, echoed.
+    pub channel_id: u64,
 }
 
 impl From<derec_proto::UnpairResponseMessage> for UnpairResponseMessage {
@@ -946,6 +963,7 @@ impl From<derec_proto::UnpairResponseMessage> for UnpairResponseMessage {
         Self {
             result: value.result.map(Into::into),
             timestamp: value.timestamp.map(Into::into),
+            channel_id: value.channel_id,
         }
     }
 }
@@ -955,6 +973,7 @@ impl From<UnpairResponseMessage> for derec_proto::UnpairResponseMessage {
         Self {
             result: value.result.map(Into::into),
             timestamp: value.timestamp.map(Into::into),
+            channel_id: value.channel_id,
         }
     }
 }

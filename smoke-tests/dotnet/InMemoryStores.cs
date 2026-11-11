@@ -42,6 +42,12 @@ internal sealed class InMemoryChannelStore : IChannelStore
         if (record.Replica is { } m) _members[(secretId, m.ReplicaId)] = m;
     }
 
+    public void SaveMany(ulong secretId, IReadOnlyList<ChannelRecord> records)
+    {
+        foreach (var record in records)
+            Save(secretId, record);
+    }
+
     public bool Remove(ulong secretId, ulong channelId, ulong replicaId) =>
         replicaId == 0
             ? _helpers.Remove((secretId, channelId))
@@ -113,6 +119,12 @@ internal sealed class InMemorySecretStore : ISecretStore
 
     public void Save(ulong secretId, ulong channelId, SecretValue value) =>
         _data[(secretId, channelId, value.Kind)] = value;
+
+    public void SaveMany(ulong secretId, IReadOnlyList<(ulong ChannelId, SecretValue Value)> entries)
+    {
+        foreach (var (channelId, value) in entries)
+            Save(secretId, channelId, value);
+    }
 
     public void Remove(ulong secretId, ulong channelId, SecretKind kind) =>
         _data.Remove((secretId, channelId, kind));

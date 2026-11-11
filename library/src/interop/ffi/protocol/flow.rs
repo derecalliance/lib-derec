@@ -129,6 +129,12 @@ fn parse_unpair_flow(params_json: &[u8]) -> Result<DeRecFlow, String> {
     Ok(DeRecFlow::Unpair {
         channel_id: ChannelId(parse_u64_string(&raw.channel_id)?),
         memo: raw.memo,
+        linked_channel_id: raw
+            .linked_channel_id
+            .as_deref()
+            .map(parse_u64_string)
+            .transpose()?
+            .map(ChannelId),
     })
 }
 
@@ -252,6 +258,9 @@ struct UnpairParamsJson {
     channel_id: String,
     #[serde(default)]
     memo: Option<String>,
+    /// The older linked channel to unpair instead of `channel_id`.
+    #[serde(default)]
+    linked_channel_id: Option<String>,
 }
 
 #[derive(Deserialize)]

@@ -5,6 +5,7 @@ use derec_library::protocol::{
     DeRecSecretStore, MissingPolicy, SecretKind, SecretStoreError, SecretStoreFuture, SecretValue,
 };
 use derec_library::types::ChannelId;
+use rusqlite::Connection;
 use std::collections::HashMap;
 use std::future;
 
@@ -109,25 +110,24 @@ impl DeRecSecretStore for SqliteSecretStore {
         channel_id: ChannelId,
         value: SecretValue,
     ) -> SecretStoreFuture<'_, ()> {
-        let kind = match &value {
-            SecretValue::SharedKey(_) => SecretKind::SharedKey,
-            SecretValue::PairingSecret(_) => SecretKind::PairingSecret,
-            SecretValue::PairingContact(_) => SecretKind::PairingContact,
-            SecretValue::KeyRing(_) => SecretKind::KeyRing,
-        };
-        let bytes = encode_secret_value(&value);
         let conn = lock(&self.connection);
-        conn.execute(
-            "INSERT INTO secrets (secret_id, channel_id, kind, data) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(secret_id, channel_id, kind) DO UPDATE SET data = excluded.data",
-            rusqlite::params![
-                u64_to_sql(secret_id),
-                u64_to_sql(channel_id.0),
-                secret_kind_tag(kind),
-                bytes,
-            ],
-        )
-        .expect("secret save failed");
+        upsert(&conn, secret_id, channel_id, &value);
+        Box::pin(future::ready(Ok(())))
+    }
+
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, SecretValue)>,
+    ) -> SecretStoreFuture<'_, ()> {
+        let conn = lock(&self.connection);
+        let tx = conn
+            .unchecked_transaction()
+            .expect("save_many transaction failed");
+        for (channel_id, value) in &entries {
+            upsert(&tx, secret_id, *channel_id, value);
+        }
+        tx.commit().expect("save_many commit failed");
         Box::pin(future::ready(Ok(())))
     }
 
@@ -173,4 +173,25 @@ impl DeRecSecretStore for SqliteSecretStore {
         tx.commit().expect("remove_many commit failed");
         Box::pin(std::future::ready(Ok(())))
     }
+}
+
+/// Insert or replace `value` at `(secret_id, channel_id, kind)`.
+fn upsert(conn: &Connection, secret_id: u64, channel_id: ChannelId, value: &SecretValue) {
+    let kind = match value {
+        SecretValue::SharedKey(_) => SecretKind::SharedKey,
+        SecretValue::PairingSecret(_) => SecretKind::PairingSecret,
+        SecretValue::PairingContact(_) => SecretKind::PairingContact,
+        SecretValue::KeyRing(_) => SecretKind::KeyRing,
+    };
+    conn.execute(
+        "INSERT INTO secrets (secret_id, channel_id, kind, data) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(secret_id, channel_id, kind) DO UPDATE SET data = excluded.data",
+        rusqlite::params![
+            u64_to_sql(secret_id),
+            u64_to_sql(channel_id.0),
+            secret_kind_tag(kind),
+            encode_secret_value(value),
+        ],
+    )
+    .expect("secret save failed");
 }

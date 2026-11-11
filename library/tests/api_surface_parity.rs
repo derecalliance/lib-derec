@@ -2068,7 +2068,7 @@ fn error_variants() -> BTreeMap<String, BTreeSet<String>> {
         "library/src/transport/mod.rs",
         "library/src/protocol/error.rs",
         "library/src/protocol/types/secret/codec.rs",
-        "library/src/protocol/handlers/restore.rs",
+        "library/src/protocol/handlers/restore/error.rs",
         "library/src/primitives/pairing/error.rs",
         "library/src/primitives/recovery/error.rs",
         "library/src/primitives/sharing/error.rs",

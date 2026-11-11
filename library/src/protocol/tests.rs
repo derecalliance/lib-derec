@@ -48,6 +48,28 @@ pub(crate) struct InMemChannelStore {
     pub(crate) links: Arc<Mutex<HashMap<(u64, u64), Vec<u64>>>>,
     /// When set, `remove_many` fails and removes nothing.
     pub(crate) fail_remove_many: Arc<Mutex<bool>>,
+    /// How many times `save` and `save_many` were called.
+    pub(crate) save_calls: Arc<Mutex<usize>>,
+    pub(crate) save_many_calls: Arc<Mutex<usize>>,
+}
+
+impl InMemChannelStore {
+    fn insert(&self, sid: u64, record: ChannelRecord) {
+        match record {
+            ChannelRecord::Helper(h) => {
+                self.helper_rows
+                    .lock()
+                    .unwrap()
+                    .insert((sid, h.channel_id.0), h);
+            }
+            ChannelRecord::Replica(r) => {
+                self.member_rows
+                    .lock()
+                    .unwrap()
+                    .insert((sid, r.replica_id.0), r);
+            }
+        }
+    }
 }
 
 impl DeRecChannelStore for InMemChannelStore {
@@ -72,19 +94,15 @@ impl DeRecChannelStore for InMemChannelStore {
     }
 
     fn save(&mut self, sid: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
-        match record {
-            ChannelRecord::Helper(h) => {
-                self.helper_rows
-                    .lock()
-                    .unwrap()
-                    .insert((sid, h.channel_id.0), h);
-            }
-            ChannelRecord::Replica(r) => {
-                self.member_rows
-                    .lock()
-                    .unwrap()
-                    .insert((sid, r.replica_id.0), r);
-            }
+        *self.save_calls.lock().unwrap() += 1;
+        self.insert(sid, record);
+        Box::pin(future::ready(Ok(())))
+    }
+
+    fn save_many(&mut self, sid: u64, records: Vec<ChannelRecord>) -> ChannelStoreFuture<'_, ()> {
+        *self.save_many_calls.lock().unwrap() += 1;
+        for record in records {
+            self.insert(sid, record);
         }
         Box::pin(future::ready(Ok(())))
     }
@@ -197,6 +215,26 @@ impl DeRecChannelStore for InMemChannelStore {
 pub(crate) struct InMemSecretStore {
     #[allow(clippy::type_complexity)]
     pub(crate) data: Arc<Mutex<HashMap<(u64, u64, u8), SecretValue>>>,
+    /// How many times `save` and `save_many` were called.
+    pub(crate) save_calls: Arc<Mutex<usize>>,
+    pub(crate) save_many_calls: Arc<Mutex<usize>>,
+    /// When set, `save_many` fails and writes nothing.
+    pub(crate) fail_save_many: Arc<Mutex<bool>>,
+    /// How many times `remove` and `remove_many` were called.
+    pub(crate) remove_calls: Arc<Mutex<usize>>,
+    pub(crate) remove_many_calls: Arc<Mutex<usize>>,
+}
+
+impl InMemSecretStore {
+    fn insert(&self, sid: u64, cid: ChannelId, value: SecretValue) {
+        let k = match &value {
+            SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
+            SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
+            SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
+            SecretValue::KeyRing(_) => SecretKind::KeyRing as u8,
+        };
+        self.data.lock().unwrap().insert((sid, cid.0, k), value);
+    }
 }
 
 impl DeRecSecretStore for InMemSecretStore {
@@ -240,16 +278,28 @@ impl DeRecSecretStore for InMemSecretStore {
         Box::pin(future::ready(Ok(out)))
     }
     fn save(&mut self, sid: u64, cid: ChannelId, value: SecretValue) -> SecretStoreFuture<'_, ()> {
-        let k = match &value {
-            SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
-            SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
-            SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
-            SecretValue::KeyRing(_) => SecretKind::KeyRing as u8,
-        };
-        self.data.lock().unwrap().insert((sid, cid.0, k), value);
+        *self.save_calls.lock().unwrap() += 1;
+        self.insert(sid, cid, value);
+        Box::pin(future::ready(Ok(())))
+    }
+    fn save_many(
+        &mut self,
+        sid: u64,
+        entries: Vec<(ChannelId, SecretValue)>,
+    ) -> SecretStoreFuture<'_, ()> {
+        *self.save_many_calls.lock().unwrap() += 1;
+        if *self.fail_save_many.lock().unwrap() {
+            return Box::pin(future::ready(Err(SecretStoreError::Backend(
+                "secret store unavailable".into(),
+            ))));
+        }
+        for (cid, value) in entries {
+            self.insert(sid, cid, value);
+        }
         Box::pin(future::ready(Ok(())))
     }
     fn remove(&mut self, sid: u64, cid: ChannelId, kind: SecretKind) -> SecretStoreFuture<'_, ()> {
+        *self.remove_calls.lock().unwrap() += 1;
         self.data.lock().unwrap().remove(&(sid, cid.0, kind as u8));
         Box::pin(future::ready(Ok(())))
     }
@@ -258,6 +308,7 @@ impl DeRecSecretStore for InMemSecretStore {
         sid: u64,
         entries: &[(ChannelId, SecretKind)],
     ) -> SecretStoreFuture<'_, ()> {
+        *self.remove_many_calls.lock().unwrap() += 1;
         let mut data = self.data.lock().unwrap();
         for &(cid, kind) in entries {
             data.remove(&(sid, cid.0, kind as u8));
@@ -355,7 +406,11 @@ impl DeRecShareStore for InMemShareStore {
         self.data.lock().unwrap().insert((sid, cid.0, v), share);
         Box::pin(future::ready(Ok(())))
     }
-    fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
+    fn remove_channel(&mut self, sid: u64, cid: ChannelId) -> ShareStoreFuture<'_, ()> {
+        self.data
+            .lock()
+            .unwrap()
+            .retain(|(s, c, _), _| !(*s == sid && *c == cid.0));
         Box::pin(future::ready(Ok(())))
     }
     fn remove_versions(

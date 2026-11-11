@@ -33,36 +33,40 @@
           "offset": 16
         },
         {
-          "name": "remove",
+          "name": "save_many",
           "offset": 24
         },
         {
-          "name": "remove_many",
+          "name": "remove",
           "offset": 32
         },
         {
-          "name": "list_helpers",
+          "name": "remove_many",
           "offset": 40
         },
         {
-          "name": "list_replicas",
+          "name": "list_helpers",
           "offset": 48
         },
         {
-          "name": "link_channel",
+          "name": "list_replicas",
           "offset": 56
         },
         {
-          "name": "linked_channels",
+          "name": "link_channel",
           "offset": 64
         },
         {
-          "name": "free_buffer",
+          "name": "linked_channels",
           "offset": 72
+        },
+        {
+          "name": "free_buffer",
+          "offset": 80
         }
       ],
       "name": "ChannelStoreCallbacks",
-      "size": 80
+      "size": 88
     },
     {
       "align": 8,
@@ -1061,20 +1065,24 @@
           "offset": 24
         },
         {
-          "name": "remove",
+          "name": "save_many",
           "offset": 32
         },
         {
-          "name": "remove_many",
+          "name": "remove",
           "offset": 40
         },
         {
-          "name": "free_buffer",
+          "name": "remove_many",
           "offset": 48
+        },
+        {
+          "name": "free_buffer",
+          "offset": 56
         }
       ],
       "name": "SecretStoreCallbacks",
-      "size": 56
+      "size": 64
     },
     {
       "align": 8,

@@ -128,6 +128,7 @@ impl<
             return Err(Error::FingerprintMismatch { channel_id });
         }
 
+        let mut confirmed = Vec::new();
         let mut transitioned_helper = false;
         if let Some(record) = self
             .channel_store
@@ -138,9 +139,7 @@ impl<
         {
             let mut helper = helper.clone();
             helper.status = ChannelStatus::Paired;
-            self.channel_store
-                .save(self.secret_id, ChannelRecord::Helper(helper))
-                .await?;
+            confirmed.push(ChannelRecord::Helper(helper));
             transitioned_helper = true;
         }
 
@@ -165,8 +164,11 @@ impl<
                 }
             }
             member.status = ChannelStatus::Paired;
+            confirmed.push(ChannelRecord::Replica(member));
+        }
+        if !confirmed.is_empty() {
             self.channel_store
-                .save(self.secret_id, ChannelRecord::Replica(member))
+                .save_many(self.secret_id, confirmed)
                 .await?;
         }
 
@@ -414,6 +416,68 @@ mod tests {
             );
             assert!(channels.helper_rows.lock().unwrap().is_empty());
             assert!(!has_key(&secrets, CHANNEL));
+        });
+    }
+
+    /// A matching fingerprint confirms every `Pending` member on the channel
+    /// in one channel-store call.
+    #[test]
+    fn a_matching_fingerprint_confirms_the_members_in_one_call() {
+        run_async(async {
+            use crate::protocol::types::{ReplicaMember, ReplicaRole};
+            const OWN: u64 = 9;
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let mut seeded = channels.clone();
+            for (id, role) in [(7, ReplicaRole::Source), (OWN, ReplicaRole::Destination)] {
+                seeded
+                    .save(
+                        SECRET_ID,
+                        ChannelRecord::Replica(ReplicaMember {
+                            channel_id: CHANNEL,
+                            replica_id: ReplicaId(id),
+                            transports: vec![endpoint()],
+                            communication_info: HashMap::new(),
+                            role,
+                            status: ChannelStatus::Pending,
+                            created_at: now_secs(),
+                        }),
+                    )
+                    .await
+                    .expect("seed member");
+            }
+            secrets
+                .clone()
+                .save(
+                    SECRET_ID,
+                    CHANNEL,
+                    SecretValue::SharedKey(crate::types::SharedKey::new([7u8; 32])),
+                )
+                .await
+                .expect("seed shared key");
+            let singles = *channels.save_calls.lock().unwrap();
+
+            let mut protocol = build(channels.clone(), secrets.clone());
+            protocol.replica_id = Some(OWN);
+            let fingerprint = protocol
+                .get_fingerprint(CHANNEL)
+                .await
+                .expect("fingerprint");
+            protocol
+                .verify_fingerprint(CHANNEL, &fingerprint)
+                .await
+                .expect("a matching fingerprint must verify");
+
+            assert_eq!(*channels.save_calls.lock().unwrap(), singles);
+            assert_eq!(*channels.save_many_calls.lock().unwrap(), 1);
+            assert!(
+                channels
+                    .member_rows
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .all(|m| m.status == ChannelStatus::Paired)
+            );
         });
     }
 

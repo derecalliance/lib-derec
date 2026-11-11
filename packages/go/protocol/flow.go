@@ -211,15 +211,30 @@ type recoverSecretParamsWire struct {
 }
 
 // UnpairParams are the parameters for FlowKindUnpair.
+//
+// With LinkedChannelID set, the request still travels on ChannelID but asks
+// the helper to unpair that older channel instead, keeping ChannelID. This is
+// how a restored owner that kept its recovery channel retires the channel it
+// used before: the helper accepts only when the older channel is linked to
+// ChannelID and a share is already stored on ChannelID, so publish on the
+// kept channel first. Every event of the flow — UnpairStarted, Unpaired,
+// UnpairRejected — names the older channel, and ChannelID is never set to
+// Unpairing.
 type UnpairParams struct {
+	// ChannelID is the channel the request travels on.
 	ChannelID uint64
 	// Memo is optional; nil omits it.
 	Memo *string
+	// LinkedChannelID is the older channel to unpair instead of ChannelID;
+	// nil unpairs ChannelID itself. Naming ChannelID here fails with
+	// derec.CodeInvalidInput.
+	LinkedChannelID *uint64
 }
 
 type unpairParamsWire struct {
-	ChannelID string  `json:"channel_id"`
-	Memo      *string `json:"memo,omitempty"`
+	ChannelID       string  `json:"channel_id"`
+	Memo            *string `json:"memo,omitempty"`
+	LinkedChannelID *string `json:"linked_channel_id,omitempty"`
 }
 
 // TransportProtocolParam is a transport endpoint: an entry of
@@ -364,10 +379,15 @@ func marshalFlowParams(flowKind FlowKind, params any) ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("protocol: Start: FlowKindUnpair requires UnpairParams, got %T", params)
 		}
-		return json.Marshal(unpairParamsWire{
+		w := unpairParamsWire{
 			ChannelID: strconv.FormatUint(up.ChannelID, 10),
 			Memo:      up.Memo,
-		})
+		}
+		if up.LinkedChannelID != nil {
+			linked := strconv.FormatUint(*up.LinkedChannelID, 10)
+			w.LinkedChannelID = &linked
+		}
+		return json.Marshal(w)
 	case FlowKindUpdateChannelInfo:
 		ucip, ok := params.(UpdateChannelInfoParams)
 		if !ok {
@@ -477,7 +497,7 @@ func (p *DeRecProtocol) Reject(action []byte, status derecpb.StatusEnum, memo st
 // event writes nothing. Show the user what was recovered, or ask them, before
 // calling Restore, which commits it to this device.
 //
-// A helper or member whose Transports is empty (or nil) gets no channel: it
+// A helper whose Transports is empty (or nil) gets no channel: it
 // is reported as an EventTypePeerNotRestored event in the returned slice and
 // the rest of the roster is restored.
 //
@@ -485,15 +505,32 @@ func (p *DeRecProtocol) Reject(action []byte, status derecpb.StatusEnum, memo st
 // fails with a *derec.Error whose Code is derec.CodeRestoreConflict and
 // whose ConflictingChannelIDs lists exactly those ids, so the application
 // can clear them and retry.
-func (p *DeRecProtocol) Restore(secret Secret, version, newestVersion uint32) ([]Event, error) {
+//
+// Restore never carries a recovered replica group forward: each member is
+// reported as an EventTypePeerNotRestored event with
+// NotRestoredReasonReplicaGroupDropped, and the follow-up publish goes out
+// as a lone owner's. Devices the owner still has join again by pairing.
+//
+// Each pair in keepRecoveryChannels makes Restore keep a recovery channel in
+// place of its roster helper's old channel: the old channel is not written,
+// and the recovery channel stays Paired with its own endpoint and key, takes
+// the roster entry's weight, and is not unpaired. Only this device holds a
+// recovery channel's key, while every lost device still holds the old one,
+// so keeping it is what lets the owner cut the lost devices off: publish
+// once on the kept channels, then retire each old channel with
+// Start(FlowKindUnpair) and UnpairParams.LinkedChannelID. The ChannelID of
+// each DiscoveredVersion names the channel its share is stored on, which is
+// how the application learns which old channel a recovery channel replaces.
+// Helpers not named in any pair are restored on their old channel; pass an
+// empty (or nil) slice to keep none. A pair naming a roster id that is not a
+// helper in the roster, a recovery id that is not a Paired channel to a
+// Helper outside the roster, or an id another pair names fails with
+// derec.CodeInvalidInput.
+func (p *DeRecProtocol) Restore(secret Secret, version, newestVersion uint32, keepRecoveryChannels []KeepRecoveryChannel) ([]Event, error) {
 	if p.closed {
 		return nil, errors.New("protocol: Restore: protocol is closed")
 	}
-	paramsJSON, err := json.Marshal(restoreParamsWire{
-		Version:         version,
-		NewestVersion:   newestVersion,
-		RecoveredSecret: secret,
-	})
+	paramsJSON, err := marshalRestoreParams(secret, version, newestVersion, keepRecoveryChannels)
 	if err != nil {
 		return nil, fmt.Errorf("protocol: Restore: marshal params: %w", err)
 	}
@@ -504,12 +541,54 @@ func (p *DeRecProtocol) Restore(secret Secret, version, newestVersion uint32) ([
 	return decodeEvents(eventsJSON)
 }
 
+// marshalRestoreParams builds Restore's FFI params JSON. The kept pairs
+// always cross as an array, empty when none are kept.
+func marshalRestoreParams(secret Secret, version, newestVersion uint32, keepRecoveryChannels []KeepRecoveryChannel) ([]byte, error) {
+	keep := make([]keepRecoveryChannelWire, 0, len(keepRecoveryChannels))
+	for _, k := range keepRecoveryChannels {
+		keep = append(keep, keepRecoveryChannelWire{
+			RosterChannelID:   strconv.FormatUint(k.RosterChannelID, 10),
+			RecoveryChannelID: strconv.FormatUint(k.RecoveryChannelID, 10),
+		})
+	}
+	return json.Marshal(restoreParamsWire{
+		Version:              version,
+		NewestVersion:        newestVersion,
+		RecoveredSecret:      secret,
+		KeepRecoveryChannels: keep,
+	})
+}
+
 // restoreParamsWire carries the versions alongside Secret's own MarshalJSON
 // output (see events.go) — no separate wire mirror is needed since Secret
 // already encodes to the byte-array-as-number-array shape Restore's FFI
 // params require.
 type restoreParamsWire struct {
-	Version         uint32 `json:"version"`
-	NewestVersion   uint32 `json:"newest_version"`
-	RecoveredSecret Secret `json:"recovered_secret"`
+	Version              uint32                    `json:"version"`
+	NewestVersion        uint32                    `json:"newest_version"`
+	RecoveredSecret      Secret                    `json:"recovered_secret"`
+	KeepRecoveryChannels []keepRecoveryChannelWire `json:"keep_recovery_channels"`
+}
+
+// KeepRecoveryChannel is a recovery channel a Restore keeps in place of a
+// roster helper's channel.
+//
+// After recovering, an owner holds two channels to each helper that served a
+// share: the old one named in the recovered roster, whose key every lost
+// device still holds, and the recovery channel it paired on, whose key only
+// this device holds. Naming the pair makes Restore keep the recovery channel
+// for that helper instead of writing the old one back. The old channel is
+// then retired with a linked unpair (UnpairParams.LinkedChannelID) once a
+// round is stored on the kept one.
+type KeepRecoveryChannel struct {
+	// RosterChannelID is the helper's channel in the recovered roster.
+	RosterChannelID uint64
+	// RecoveryChannelID is the recovery channel paired with the same
+	// helper, kept in its place.
+	RecoveryChannelID uint64
+}
+
+type keepRecoveryChannelWire struct {
+	RosterChannelID   string `json:"roster_channel_id"`
+	RecoveryChannelID string `json:"recovery_channel_id"`
 }

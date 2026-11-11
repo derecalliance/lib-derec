@@ -77,6 +77,8 @@ type (
 	SecretKind = native.SecretKind
 	// SecretEntry names one secret for SecretStore.RemoveMany.
 	SecretEntry = native.SecretEntry
+	// SecretValueEntry names one secret for SecretStore.SaveMany.
+	SecretValueEntry = native.SecretValueEntry
 	// SecretValue is the opaque secret payload stored alongside a
 	// channel id and SecretKind.
 	SecretValue = native.SecretValue
@@ -153,6 +155,12 @@ type ChannelStore interface {
 	// the key from the record is what keeps a record from being stored
 	// under the wrong one.
 	Save(secretID uint64, record ChannelRecord) error
+	// SaveMany persists every record in records, in one call, the same as
+	// Save applied to each: each replaces any entry at its own address, and
+	// an empty slice writes nothing. The library calls it when it writes
+	// several records at once, so a backend that can write them in one
+	// statement or transaction should.
+	SaveMany(secretID uint64, records []ChannelRecord) error
 	// Remove deletes the record at (secretID, channelID, replicaID).
 	// Returns whether an entry actually existed; removing a missing
 	// entry is not an error.
@@ -217,6 +225,12 @@ type SecretStore interface {
 	// Save inserts or replaces the value at (secretID, channelID,
 	// value.Kind).
 	Save(secretID, channelID uint64, value SecretValue) error
+	// SaveMany persists every entry in entries, in one call, the same as
+	// Save applied to each: an existing value of the same kind under the
+	// same channel is overwritten, and an empty slice writes nothing. The
+	// library calls it when it writes several secrets at once, so a backend
+	// that can write them in one statement or transaction should.
+	SaveMany(secretID uint64, entries []SecretValueEntry) error
 	// Remove deletes the value at (secretID, channelID, kind).
 	// Idempotent.
 	Remove(secretID, channelID uint64, kind SecretKind) error

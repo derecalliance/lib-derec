@@ -6,6 +6,7 @@ use derec_library::protocol::{
 };
 use derec_library::types::ChannelId;
 use std::collections::HashMap;
+use tokio_postgres::Client;
 use tokio_postgres::types::ToSql;
 
 use crate::codec::{decode_secret_value, encode_secret_value, secret_kind_tag};
@@ -102,26 +103,31 @@ impl DeRecSecretStore for PostgresSecretStore {
         channel_id: ChannelId,
         value: SecretValue,
     ) -> SecretStoreFuture<'_, ()> {
-        let kind = match &value {
-            SecretValue::SharedKey(_) => SecretKind::SharedKey,
-            SecretValue::PairingSecret(_) => SecretKind::PairingSecret,
-            SecretValue::PairingContact(_) => SecretKind::PairingContact,
-            SecretValue::KeyRing(_) => SecretKind::KeyRing,
-        };
-        let bytes = encode_secret_value(&value);
         let client = self.client.clone();
-        let secret_id = u64_to_sql(secret_id);
-        let channel_id = u64_to_sql(channel_id.0);
-        let kind_i32 = secret_kind_tag(kind);
+        Box::pin(async move {
+            upsert(&client, secret_id, channel_id, &value).await;
+            Ok(())
+        })
+    }
+
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, SecretValue)>,
+    ) -> SecretStoreFuture<'_, ()> {
+        let client = self.client.clone();
         Box::pin(async move {
             client
-                .execute(
-                    "INSERT INTO secrets (secret_id, channel_id, kind, data) VALUES ($1, $2, $3, $4)
-                     ON CONFLICT (secret_id, channel_id, kind) DO UPDATE SET data = EXCLUDED.data",
-                    &[&secret_id, &channel_id, &kind_i32, &bytes],
-                )
+                .batch_execute("BEGIN")
                 .await
-                .expect("secret save failed");
+                .expect("save_many transaction failed");
+            for (channel_id, value) in &entries {
+                upsert(&client, secret_id, *channel_id, value).await;
+            }
+            client
+                .batch_execute("COMMIT")
+                .await
+                .expect("save_many commit failed");
             Ok(())
         })
     }
@@ -169,4 +175,27 @@ impl DeRecSecretStore for PostgresSecretStore {
             Ok(())
         })
     }
+}
+
+/// Insert or replace `value` at `(secret_id, channel_id, kind)`.
+async fn upsert(client: &Client, secret_id: u64, channel_id: ChannelId, value: &SecretValue) {
+    let kind = match value {
+        SecretValue::SharedKey(_) => SecretKind::SharedKey,
+        SecretValue::PairingSecret(_) => SecretKind::PairingSecret,
+        SecretValue::PairingContact(_) => SecretKind::PairingContact,
+        SecretValue::KeyRing(_) => SecretKind::KeyRing,
+    };
+    client
+        .execute(
+            "INSERT INTO secrets (secret_id, channel_id, kind, data) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (secret_id, channel_id, kind) DO UPDATE SET data = EXCLUDED.data",
+            &[
+                &u64_to_sql(secret_id),
+                &u64_to_sql(channel_id.0),
+                &secret_kind_tag(kind),
+                &encode_secret_value(value),
+            ],
+        )
+        .await
+        .expect("secret save failed");
 }

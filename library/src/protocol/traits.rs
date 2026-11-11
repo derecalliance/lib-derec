@@ -170,6 +170,19 @@ pub trait DeRecSecretStore {
         value: SecretValue,
     ) -> SecretStoreFuture<'_, ()>;
 
+    /// Persist every `(channel_id, value)` in `entries`, in one call.
+    ///
+    /// The same as [`save`](DeRecSecretStore::save) applied to each entry:
+    /// an existing entry of the same kind under the same partition is
+    /// overwritten, and an empty list writes nothing. The library calls it
+    /// when it writes several secrets at once, so a backend that can write
+    /// them in one statement or transaction should.
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, SecretValue)>,
+    ) -> SecretStoreFuture<'_, ()>;
+
     /// Remove a secret for the given `(secret_id, channel_id)` pair.
     /// Idempotent: removing a non-existent entry is `Ok(())`.
     fn remove(
@@ -228,6 +241,19 @@ pub trait DeRecChannelStore {
 
     /// Persist a record, replacing any entry with the same key.
     fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()>;
+
+    /// Persist every record in `records`, in one call.
+    ///
+    /// The same as [`save`](DeRecChannelStore::save) applied to each record:
+    /// each replaces any entry with the same key, and an empty list writes
+    /// nothing. The library calls it when it writes several records at once,
+    /// so a backend that can write them in one statement or transaction
+    /// should.
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        records: Vec<ChannelRecord>,
+    ) -> ChannelStoreFuture<'_, ()>;
 
     /// Remove the record addressed by `query`.
     ///
@@ -342,8 +368,12 @@ pub trait DeRecChannelStore {
     /// **The library never writes links.** It is the helper-side application
     /// that recognises a returning owner — an out-of-band judgement the
     /// protocol cannot make — and records the link. The library only reads
-    /// the graph, in exactly two places, both helper-side responders:
-    /// answering `GetSecretIdsVersions` and answering `GetShare`.
+    /// the graph, in three places, all helper-side responders: answering
+    /// `GetSecretIdsVersions`, answering `GetShare`, and checking a linked
+    /// unpair, which may only name a channel linked to the one it arrives
+    /// on. A store may drop a channel's links when the channel is removed;
+    /// a retried linked unpair of a channel already dropped is still
+    /// answered.
     ///
     /// **Replica groups do not use it.** Members share one `channel_id` and
     /// are identified by [`crate::types::ReplicaId`], so there is nothing to link: a member
@@ -978,6 +1008,13 @@ impl<T: DeRecSecretStore + ?Sized> DeRecSecretStore for Box<T> {
     ) -> SecretStoreFuture<'_, ()> {
         (**self).save(secret_id, channel_id, value)
     }
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, SecretValue)>,
+    ) -> SecretStoreFuture<'_, ()> {
+        (**self).save_many(secret_id, entries)
+    }
     fn remove(
         &mut self,
         secret_id: u64,
@@ -1005,6 +1042,13 @@ impl<T: DeRecChannelStore + ?Sized> DeRecChannelStore for Box<T> {
     }
     fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
         (**self).save(secret_id, record)
+    }
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        records: Vec<ChannelRecord>,
+    ) -> ChannelStoreFuture<'_, ()> {
+        (**self).save_many(secret_id, records)
     }
     fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
         (**self).remove(secret_id, query)
@@ -1179,6 +1223,13 @@ impl<T: DeRecSecretStore + ?Sized> DeRecSecretStore for &mut T {
     ) -> SecretStoreFuture<'_, ()> {
         (**self).save(secret_id, channel_id, value)
     }
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, SecretValue)>,
+    ) -> SecretStoreFuture<'_, ()> {
+        (**self).save_many(secret_id, entries)
+    }
     fn remove(
         &mut self,
         secret_id: u64,
@@ -1206,6 +1257,13 @@ impl<T: DeRecChannelStore + ?Sized> DeRecChannelStore for &mut T {
     }
     fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
         (**self).save(secret_id, record)
+    }
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        records: Vec<ChannelRecord>,
+    ) -> ChannelStoreFuture<'_, ()> {
+        (**self).save_many(secret_id, records)
     }
     fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
         (**self).remove(secret_id, query)

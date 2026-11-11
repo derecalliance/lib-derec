@@ -68,6 +68,15 @@ func (s *inMemoryChannelStore) Save(secretID uint64, record ChannelRecord) error
 	return nil
 }
 
+func (s *inMemoryChannelStore) SaveMany(secretID uint64, records []ChannelRecord) error {
+	for _, r := range records {
+		if err := s.Save(secretID, r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *inMemoryChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -202,6 +211,15 @@ func (s *inMemorySecretStore) Save(secretID, channelID uint64, value SecretValue
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[secretStoreKey{secretID, channelID, value.Kind}] = value
+	return nil
+}
+
+func (s *inMemorySecretStore) SaveMany(secretID uint64, entries []SecretValueEntry) error {
+	for _, e := range entries {
+		if err := s.Save(secretID, e.ChannelID, e.Value); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

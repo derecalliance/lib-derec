@@ -197,6 +197,7 @@ pub(crate) fn classify(err: &Error) -> (Category, Code) {
                 RestoreError::AlreadyRestored => (Category::InvalidInput, Code::AlreadyRestored),
                 RestoreError::Conflict(_) => (Category::InvalidInput, Code::RestoreConflict),
                 RestoreError::Invariant(_) => (Category::Invariant, Code::Invariant),
+                RestoreError::InvalidKeptChannel(_) => (Category::InvalidInput, Code::InvalidInput),
             }
         }
     }

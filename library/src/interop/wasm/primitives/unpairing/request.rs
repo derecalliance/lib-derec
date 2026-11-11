@@ -47,6 +47,8 @@ pub fn produce(
         &crate::types::ChannelKey::new(epoch, shared_key),
         &reply_to_proto,
         None,
+        // An ordinary unpair names the channel it travels on.
+        channel_id.into(),
     )
     .map_err(js_error_from_lib)?;
     to_js(&ProduceResult {

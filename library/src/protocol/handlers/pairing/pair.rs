@@ -13,6 +13,7 @@
 use crate::derec_message::apply_trace_id;
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::extensions::sender_kind::SenderKindExt as _;
 use crate::protocol::context::{Local, PairingConfig};
 use crate::protocol::stores::{StoreSet, Stores};
@@ -176,11 +177,7 @@ async fn drop_transient_material<S: StoreSet>(
     let secret_id = local.secret_id;
     stores
         .secrets
-        .remove(secret_id, channel_id, SecretKind::PairingSecret)
-        .await?;
-    stores
-        .secrets
-        .remove(secret_id, channel_id, SecretKind::PairingContact)
+        .remove_pairing_material(secret_id, channel_id)
         .await?;
     stores
         .channels
@@ -412,11 +409,7 @@ pub(super) async fn on_response<S: StoreSet>(
         .await?;
     stores
         .secrets
-        .remove(secret_id, channel_id, SecretKind::PairingSecret)
-        .await?;
-    stores
-        .secrets
-        .remove(secret_id, channel_id, SecretKind::PairingContact)
+        .remove_pairing_material(secret_id, channel_id)
         .await?;
 
     #[cfg(feature = "logging")]
@@ -461,18 +454,18 @@ pub(super) async fn start<S: StoreSet>(
 
     stores
         .secrets
-        .save(
+        .save_many(
             local.secret_id,
-            channel_id,
-            SecretValue::PairingSecret(PairingKeyMaterial::from_secret(&result.secret_key)),
-        )
-        .await?;
-    stores
-        .secrets
-        .save(
-            local.secret_id,
-            channel_id,
-            SecretValue::PairingContact(result.initiator_contact_message),
+            vec![
+                (
+                    channel_id,
+                    SecretValue::PairingSecret(PairingKeyMaterial::from_secret(&result.secret_key)),
+                ),
+                (
+                    channel_id,
+                    SecretValue::PairingContact(result.initiator_contact_message),
+                ),
+            ],
         )
         .await?;
 
@@ -534,11 +527,7 @@ pub(super) async fn abandon_pairing<S: StoreSet>(
 
     let _ = stores
         .secrets
-        .remove(secret_id, channel_id, SecretKind::PairingSecret)
-        .await;
-    let _ = stores
-        .secrets
-        .remove(secret_id, channel_id, SecretKind::PairingContact)
+        .remove_pairing_material(secret_id, channel_id)
         .await;
     stores
         .channels

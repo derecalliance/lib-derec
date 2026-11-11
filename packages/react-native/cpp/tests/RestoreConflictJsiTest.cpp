@@ -35,6 +35,7 @@ int32_t chRemove(void*, uint64_t, uint64_t, uint64_t, uint32_t* existed) {
   *existed = 0;
   return 0;
 }
+int32_t chSaveMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t chRemoveMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t chListHelpers(void*, uint64_t, const uint8_t*, size_t, uint8_t** p, size_t* l) {
   return giveBytes(helpersJson, p, l);
@@ -52,6 +53,7 @@ int32_t seLoadMany(void*, uint64_t, const uint8_t*, size_t, uint32_t, uint8_t** 
   return giveBytes("[]", p, l);
 }
 int32_t seSave(void*, uint64_t, uint64_t, uint32_t, const uint8_t*, size_t) { return 0; }
+int32_t seSaveMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t seRemove(void*, uint64_t, uint64_t, uint32_t) { return 0; }
 int32_t seRemoveMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 
@@ -94,9 +96,11 @@ int32_t stLoadAll(void*, uint64_t, uint32_t, uint8_t** p, size_t* l) {
 
 int32_t trSend(void*, const uint8_t*, size_t, const uint8_t*, size_t) { return 0; }
 
-ChannelStoreCallbacks channelStore{nullptr, chLoad, chSave, chRemove, chRemoveMany, chListHelpers,
-                                   chListReplicas, chLink, chLinked, freeBytes};
-SecretStoreCallbacks secretStore{nullptr, seLoad, seLoadMany, seSave, seRemove, seRemoveMany, freeBytes};
+ChannelStoreCallbacks channelStore{nullptr,       chLoad,         chSave, chSaveMany, chRemove,
+                                   chRemoveMany,  chListHelpers,  chListReplicas, chLink, chLinked,
+                                   freeBytes};
+SecretStoreCallbacks secretStore{nullptr,  seLoad,       seLoadMany, seSave, seSaveMany,
+                                 seRemove, seRemoveMany, freeBytes};
 ShareStoreCallbacks shareStore{nullptr, shLoad,   shLoadMany,       shLoadAll,  shLatest,
                                shSave,  shRemove, shRemoveVersions, shRemoveVersionsMany, shKeepVersion,
                                shRecordVerification, freeBytes};
@@ -127,7 +131,7 @@ const std::string kRestoreParams =
     R"("shared_key":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]},)"
     R"({"channel_id":"22","transports":[{"uri":"https://helper-b.example.com","protocol":"https"}],)"
     R"("shared_key":[31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0]}],)"
-    R"("secrets":[{"id":[1],"name":"wallet","data":[1,2,3]}]}})";
+    R"("secrets":[{"id":[1],"name":"wallet","data":[1,2,3]}]},"keep_recovery_channels":[]})";
 
 std::string helperRow(const char* channelId) {
   return std::string(R"({"channel_id":)") + channelId +

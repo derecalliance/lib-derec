@@ -28,6 +28,7 @@ import type {
   Timeouts,
   Transport,
   UnpairAck,
+  KeepRecoveryChannel,
   UnpairParams,
   UpdateChannelInfoParams,
   UserSecretStore,
@@ -153,7 +154,8 @@ interface RestoreReplicasParams {
  * whenever a helper carries one, and `key_epoch` whenever a helper or the
  * replica group carries one; `replicas` is omitted entirely when the
  * recovered secret has no replica group, and `threshold` when the roster
- * records none.
+ * records none. `keep_recovery_channels` is always sent, `[]` when none is
+ * kept.
  *
  * Exported so it can be golden-tested against the shared wire fixture
  * without a native module.
@@ -162,6 +164,7 @@ export function buildRestoreParams(
   recoveredSecret: Extract<DeRecEvent, { type: 'SecretRecovered' }>['secret'],
   version: number,
   newestVersion: number,
+  keepRecoveryChannels: KeepRecoveryChannel[],
 ): Record<string, unknown> {
   const recovered: Record<string, unknown> = {
     helpers: recoveredSecret.helpers.map((helper) => {
@@ -213,7 +216,15 @@ export function buildRestoreParams(
   if (recoveredSecret.threshold != null) {
     recovered.threshold = recoveredSecret.threshold;
   }
-  return { version, newest_version: newestVersion, recovered_secret: recovered };
+  return {
+    version,
+    newest_version: newestVersion,
+    keep_recovery_channels: keepRecoveryChannels.map((keep) => ({
+      roster_channel_id: keep.roster_channel_id,
+      recovery_channel_id: keep.recovery_channel_id,
+    })),
+    recovered_secret: recovered,
+  };
 }
 
 /**
@@ -270,6 +281,9 @@ function buildStartParams(flowKind: FlowKind, params: unknown): Uint8Array {
       const out: Record<string, unknown> = { channel_id: p.channel_id };
       if (p.memo !== undefined) {
         out.memo = p.memo;
+      }
+      if (p.linked_channel_id !== undefined) {
+        out.linked_channel_id = p.linked_channel_id;
       }
       return jsonToBytes(out);
     }
@@ -816,9 +830,27 @@ export class DeRecProtocol {
    * Recovery and restore are separate steps on purpose: `SecretRecovered`
    * writes nothing. Show the user what was recovered, or ask them, before
    * calling `restore`, which commits it to this device.
-   * A helper or member whose `transports` is empty gets no channel: it is
-   * reported as a `PeerNotRestored` event in the returned array and the rest
-   * of the roster is restored.
+   * A helper whose `transports` is empty gets no channel: it is reported as
+   * a `PeerNotRestored` event in the returned array and the rest of the
+   * roster is restored.
+   *
+   * Restore never carries a recovered replica group forward: each member is
+   * reported as `PeerNotRestored` with reason `"ReplicaGroupDropped"`, in
+   * roster order, and the next publish goes out as a lone owner's. Devices
+   * the owner still has join again by pairing.
+   *
+   * Each `KeepRecoveryChannel` in `keepRecoveryChannels` keeps a recovery
+   * channel in place of its roster helper's old channel: the old channel is
+   * not written, and the recovery channel stays `"Paired"` with its own
+   * endpoint and key, takes the roster entry's weight, and is not unpaired.
+   * Only this device holds a recovery channel's key, while every lost device
+   * still holds the old one, so keeping it is what lets the owner cut the
+   * lost devices off: publish once on the kept channels, then retire each
+   * old channel with `start(FlowKind.Unpair, { channel_id, linked_channel_id })`.
+   * The `channel_id` each `SecretsDiscovered` version names is how the
+   * application learns which old channel a recovery channel replaces.
+   * Helpers not named in any pair are restored on their old channel; pass
+   * `[]` to keep none.
    *
    * A helper's or member's `communication_info` may be absent or `null`;
    * both mean the same thing — no entries.
@@ -836,13 +868,18 @@ export class DeRecProtocol {
    * | `already_restored` | A user-secret snapshot already exists for this `secret_id`. |
    * | `restore_conflict` | Channels live at ids restore is about to write. The error   |
    * |                    | carries `channel_ids: string[]` listing the collisions.     |
+   * | `invalid_input`    | `newestVersion` is below `version`, or a kept pair names a  |
+   * |                    | roster id that is not a roster helper, a recovery id that   |
+   * |                    | is not a `"Paired"` helper channel outside the roster, or   |
+   * |                    | an id another pair names.                                   |
    */
   async restore(
     recoveredSecret: Extract<DeRecEvent, { type: 'SecretRecovered' }>['secret'],
     version: number,
     newestVersion: number,
+    keepRecoveryChannels: KeepRecoveryChannel[],
   ): Promise<DeRecEvent[]> {
-    const params = buildRestoreParams(recoveredSecret, version, newestVersion);
+    const params = buildRestoreParams(recoveredSecret, version, newestVersion, keepRecoveryChannels);
     const buffer = (await this.host.restore(jsonToBytes(params))) as ArrayBuffer;
     return decodeEvents(buffer);
   }

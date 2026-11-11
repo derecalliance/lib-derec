@@ -367,6 +367,12 @@ fn state_kind_to_u32(kind: StateKind) -> u32 {
 /// returning fewer rows than it selects is wrong, and undetectable. The buffer is owned
 /// by the caller and valid only for the duration of the call.
 ///
+/// `save_many` receives a JSON array of `[channel_id, replica_id, record]`
+/// triples, one per record to save: the ids as decimal strings, addressed
+/// the way `save`'s arguments are, and `record` the JSON text `save` receives
+/// as its bytes, as a string. The buffer is owned by the caller and valid
+/// only for the duration of the call.
+///
 /// `remove_many` receives a JSON array of `[channel_id, replica_id]` pairs,
 /// the ids as decimal strings, each addressing one record the way `remove`'s
 /// arguments do (`replica_id` `"0"` for a helper channel). An entry
@@ -394,6 +400,12 @@ pub struct ChannelStoreCallbacks {
         replica_id: u64,
         bytes: *const u8,
         len: usize,
+    ) -> i32,
+    pub save_many: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        records: *const u8,
+        records_len: usize,
     ) -> i32,
     pub remove: extern "C" fn(
         user_data: *mut c_void,
@@ -443,6 +455,12 @@ pub struct ChannelStoreCallbacks {
 /// `null` when nothing of `kind` is stored for that channel. Whether a
 /// missing entry is an error is decided by the library, not the callback.
 ///
+/// `save_many` receives a JSON array of `[channel_id, kind, record]`
+/// triples, one per secret to save: the channel id as a decimal string, the
+/// kind as the number `save` takes, and `record` the JSON text `save`
+/// receives as its bytes, as a string. The buffer is owned by the caller and
+/// valid only for the duration of the call.
+///
 /// `remove_many` receives a JSON array of `[channel_id, kind]` pairs, the
 /// channel id as a decimal string and the kind as the number `remove` takes,
 /// each naming one secret to remove. An entry with nothing stored is skipped.
@@ -475,6 +493,12 @@ pub struct SecretStoreCallbacks {
         kind: u32,
         bytes: *const u8,
         len: usize,
+    ) -> i32,
+    pub save_many: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        entries: *const u8,
+        entries_len: usize,
     ) -> i32,
     pub remove:
         extern "C" fn(user_data: *mut c_void, secret_id: u64, channel_id: u64, kind: u32) -> i32,
@@ -928,6 +952,36 @@ impl DeRecChannelStore for DotnetChannelStore {
         Box::pin(async move { res })
     }
 
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        records: Vec<ChannelRecord>,
+    ) -> ChannelStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let res = (|| -> Result<(), ChannelStoreError> {
+            let wire = records
+                .iter()
+                .map(|record| {
+                    let (channel_id, replica_id) = record_key(record);
+                    let json = serde_json::to_string(record).map_err(|e| {
+                        ChannelStoreError::Backend(format!("ChannelRecord JSON: {e}").into())
+                    })?;
+                    Ok((channel_id.to_string(), replica_id.to_string(), json))
+                })
+                .collect::<Result<Vec<_>, ChannelStoreError>>()?;
+            let bytes = serde_json::to_vec(&wire)
+                .map_err(|e| ChannelStoreError::Backend(format!("save_many JSON: {e}").into()))?;
+            let rc = (cb.save_many)(cb.user_data, secret_id, bytes.as_ptr(), bytes.len());
+            if rc != 0 {
+                return Err(ChannelStoreError::Backend(
+                    format!("channel store save_many failed (rc={rc})").into(),
+                ));
+            }
+            Ok(())
+        })();
+        Box::pin(async move { res })
+    }
+
     fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
         let (channel_id, replica_id) = query_key(query);
         let cb = &self.cb;
@@ -1185,6 +1239,37 @@ impl DeRecSecretStore for DotnetSecretStore {
                 return Err(SecretStoreError::Backend(boxed_err(format!(
                     "secret store save failed (rc={rc})"
                 ))));
+            }
+            Ok(())
+        })();
+        Box::pin(async move { res })
+    }
+
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, SecretValue)>,
+    ) -> SecretStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let res = (|| -> Result<(), SecretStoreError> {
+            let wire = entries
+                .iter()
+                .map(|(channel_id, value)| {
+                    let record = SecretValueRecord::try_from(value)
+                        .map_err(|e| SecretStoreError::Backend(boxed_err(e)))?;
+                    let json = serde_json::to_string(&record).map_err(|e| {
+                        SecretStoreError::Backend(boxed_err(format!("SecretValue JSON: {e}")))
+                    })?;
+                    Ok((channel_id.0.to_string(), record.kind, json))
+                })
+                .collect::<Result<Vec<_>, SecretStoreError>>()?;
+            let bytes = serde_json::to_vec(&wire)
+                .map_err(|e| SecretStoreError::Backend(format!("save_many JSON: {e}").into()))?;
+            let rc = (cb.save_many)(cb.user_data, secret_id, bytes.as_ptr(), bytes.len());
+            if rc != 0 {
+                return Err(SecretStoreError::Backend(
+                    format!("secret store save_many failed (rc={rc})").into(),
+                ));
             }
             Ok(())
         })();

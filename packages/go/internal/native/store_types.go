@@ -500,6 +500,13 @@ type SecretEntry struct {
 	Kind      SecretKind
 }
 
+// SecretValueEntry is one secret to save the way SecretStore.Save's
+// arguments name it: the value under ChannelID, at Value.Kind.
+type SecretValueEntry struct {
+	ChannelID uint64
+	Value     SecretValue
+}
+
 // ChannelQuery addresses one record the way ChannelStore.Remove's arguments
 // do: a ReplicaID of 0 is the helper channel at ChannelID, any other value is
 // that member of the replica group.

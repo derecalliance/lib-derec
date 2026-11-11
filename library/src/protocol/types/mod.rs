@@ -383,6 +383,28 @@ impl ReplicaRole {
     }
 }
 
+/// A recovery channel a restore keeps in place of a roster helper's channel.
+///
+/// After recovering, an owner holds two channels to each helper that served a
+/// share: the old one named in the recovered roster, whose key every lost
+/// device still holds, and the recovery channel it paired on, whose key only
+/// this device holds. Naming the pair here makes restore keep the recovery
+/// channel for that helper instead of writing the old one back. The old
+/// channel is then retired with a linked
+/// [`DeRecFlow::Unpair`](crate::protocol::DeRecFlow::Unpair) once a round is
+/// stored on the kept one.
+///
+/// Discovery tells the application which old channel each recovery channel
+/// replaces: every version a helper reports names the channel its share is
+/// stored on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeepRecoveryChannel {
+    /// The helper's channel in the recovered roster.
+    pub roster_channel_id: ChannelId,
+    /// The recovery channel paired with the same helper, kept in its place.
+    pub recovery_channel_id: ChannelId,
+}
+
 /// A channel to a single helper, or to the owner from a helper's side.
 ///
 /// Keyed by `(secret_id, channel_id)`. Also the record written while an

@@ -196,7 +196,7 @@ fn a_restore_after_rotations_talks_to_helpers() {
         let restored = fresh_owner();
         restored
             .build()
-            .restore(&secret, 3, 3)
+            .restore(&secret, 3, 3, &[])
             .await
             .expect("restore succeeds");
         for (channel_id, _) in &helpers {
@@ -237,7 +237,7 @@ fn a_restore_after_rotations_brings_a_helper_that_missed_a_round_forward() {
         let restored = fresh_owner();
         restored
             .build()
-            .restore(&secret, 3, 3)
+            .restore(&secret, 3, 3, &[])
             .await
             .expect("restore succeeds");
         assert_eq!(restored.ring(C).epoch, 3);
@@ -277,7 +277,7 @@ async fn restored_at_v1_while_helpers_are_at_16() -> (Party, Vec<(ChannelId, Par
     let restored = fresh_owner();
     restored
         .build()
-        .restore(&secret, 1, 16)
+        .restore(&secret, 1, 16, &[])
         .await
         .expect("restore succeeds");
     for (channel_id, _) in &helpers {
@@ -821,7 +821,7 @@ fn a_secret_without_epoch_fields_restores_at_epoch_zero() {
         let restored = fresh_owner();
         restored
             .build()
-            .restore(&secret, 1, 1)
+            .restore(&secret, 1, 1, &[])
             .await
             .expect("restore succeeds");
         for (channel_id, _) in &helpers {

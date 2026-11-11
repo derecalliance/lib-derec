@@ -15,6 +15,8 @@ public static partial class Discovery
     {
         public required uint Version { get; init; }
         public required string Description { get; init; }
+        /// <summary>The channel this version's share is stored on.</summary>
+        public required ulong ChannelId { get; init; }
     }
 
     public sealed class SecretVersionEntry
@@ -47,6 +49,7 @@ public static partial class Discovery
                     byte[] descBytes = Encoding.UTF8.GetBytes(v.Description ?? string.Empty);
                     writer.Write((uint)descBytes.Length);
                     writer.Write(descBytes);
+                    writer.Write(v.ChannelId);
                 }
             }
 
@@ -58,10 +61,8 @@ public static partial class Discovery
         // secret_id + u32 versions_count + zero versions = 12 bytes.
         private const int MinSecretVersionEntryBytes = 12;
         // Minimum on-wire size of a `VersionEntry` body: u32 version
-        // + u32 desc_len + zero-length description = 8 bytes.
-        // 4 (version) + 4 (desc_len) + 1 (has_replica_id flag) bytes
-        // minimum per version entry.
-        private const int MinVersionEntryBytes = 9;
+        // + u32 desc_len + zero-length description + u64 channel_id = 16 bytes.
+        private const int MinVersionEntryBytes = 16;
 
         internal static List<SecretVersionEntry> Deserialize(byte[] bytes)
         {
@@ -111,10 +112,12 @@ public static partial class Discovery
                     }
                     string description = Encoding.UTF8.GetString(bytes, offset, (int)descLen);
                     offset += (int)descLen;
+                    ulong channelId = ReadU64(bytes, ref offset);
                     versions.Add(new VersionEntry
                     {
                         Version = version,
                         Description = description,
+                        ChannelId = channelId,
                     });
                 }
 

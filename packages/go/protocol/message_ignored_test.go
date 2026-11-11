@@ -81,7 +81,10 @@ func TestNotRestoredReasonConstantsMatchTheFixture(t *testing.T) {
 		t.Fatalf("parsing NotRestoredReason: %v", err)
 	}
 
-	constants := map[string]bool{NotRestoredReasonNoTransports: true}
+	constants := map[string]bool{
+		NotRestoredReasonNoTransports:        true,
+		NotRestoredReasonReplicaGroupDropped: true,
+	}
 	variants := reasons.Variants
 	for _, v := range variants {
 		if !constants[v.Wire] {

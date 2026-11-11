@@ -268,6 +268,21 @@ fn decode_secret_value(kind: SecretKind, bytes: &[u8]) -> Result<SecretValue, Se
 /// Adapter wrapping a JS `SecretStore` object.
 pub struct JsSecretStore(pub JsValue);
 
+/// The `kind` number and bytes a [`SecretValue`] crosses to the JS store as.
+fn encode_secret_value(value: &SecretValue) -> Result<(u32, Vec<u8>), SecretStoreError> {
+    Ok(match value {
+        SecretValue::SharedKey(key) => (0u32, key.as_bytes().to_vec()),
+        SecretValue::PairingSecret(material) => (1u32, material.as_bytes().to_vec()),
+        SecretValue::PairingContact(contact) => (2u32, contact.encode_to_vec()),
+        SecretValue::KeyRing(ring) => (
+            3u32,
+            ring.as_bytes().map_err(|e| {
+                SecretStoreError::Backend(box_err(format!("failed to encode KeyRing: {e}")))
+            })?,
+        ),
+    })
+}
+
 impl DeRecSecretStore for JsSecretStore {
     fn load(
         &self,
@@ -345,17 +360,7 @@ impl DeRecSecretStore for JsSecretStore {
         let secret_str = secret_id.to_string();
         let channel_str = channel_id.0.to_string();
         Box::pin(async move {
-            let (kind_num, bytes) = match &value {
-                SecretValue::SharedKey(key) => (0u32, key.as_bytes().to_vec()),
-                SecretValue::PairingSecret(material) => (1u32, material.as_bytes().to_vec()),
-                SecretValue::PairingContact(contact) => (2u32, contact.encode_to_vec()),
-                SecretValue::KeyRing(ring) => (
-                    3u32,
-                    ring.as_bytes().map_err(|e| {
-                        SecretStoreError::Backend(box_err(format!("failed to encode KeyRing: {e}")))
-                    })?,
-                ),
-            };
+            let (kind_num, bytes) = encode_secret_value(&value)?;
             let js_bytes = Uint8Array::from(bytes.as_slice());
             let args = Array::new();
             args.push(&JsValue::from_str(&secret_str));
@@ -363,6 +368,35 @@ impl DeRecSecretStore for JsSecretStore {
             args.push(&JsValue::from_f64(kind_num as f64));
             args.push(&js_bytes);
             let promise_val = call_method(&obj, "save", &args)
+                .map_err(|e| SecretStoreError::Backend(box_err(e)))?;
+            resolve_promise(promise_val)
+                .await
+                .map_err(|e| SecretStoreError::Backend(box_err(e)))?;
+            Ok(())
+        })
+    }
+
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, SecretValue)>,
+    ) -> SecretStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        Box::pin(async move {
+            let triples = Array::new();
+            for (channel_id, value) in &entries {
+                let (kind_num, bytes) = encode_secret_value(value)?;
+                let triple = Array::new();
+                triple.push(&JsValue::from_str(&channel_id.0.to_string()));
+                triple.push(&JsValue::from_f64(kind_num as f64));
+                triple.push(&Uint8Array::from(bytes.as_slice()));
+                triples.push(&triple);
+            }
+            let args = Array::new();
+            args.push(&JsValue::from_str(&secret_str));
+            args.push(&triples);
+            let promise_val = call_method(&obj, "saveMany", &args)
                 .map_err(|e| SecretStoreError::Backend(box_err(e)))?;
             resolve_promise(promise_val)
                 .await
@@ -588,6 +622,37 @@ impl DeRecChannelStore for JsChannelStore {
             args.push(&JsValue::from_str(&replica_str));
             args.push(&js_bytes);
             let promise_val = call_method(&obj, "save", &args)
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+            resolve_promise(promise_val)
+                .await
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+            Ok(())
+        })
+    }
+
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        records: Vec<ChannelRecord>,
+    ) -> ChannelStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        Box::pin(async move {
+            let triples = Array::new();
+            for record in &records {
+                let (channel_str, replica_str) = record_key(record);
+                let bytes = serde_json::to_vec(record)
+                    .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
+                let triple = Array::new();
+                triple.push(&JsValue::from_str(&channel_str));
+                triple.push(&JsValue::from_str(&replica_str));
+                triple.push(&Uint8Array::from(bytes.as_slice()));
+                triples.push(&triple);
+            }
+            let args = Array::new();
+            args.push(&JsValue::from_str(&secret_str));
+            args.push(&triples);
+            let promise_val = call_method(&obj, "saveMany", &args)
                 .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
             resolve_promise(promise_val)
                 .await

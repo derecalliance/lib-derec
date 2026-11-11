@@ -305,6 +305,20 @@
           ]
         },
         {
+          "rust": "save_many",
+          "dotnet": "SaveMany",
+          "go": "SaveMany",
+          "ts": "saveMany",
+          "rust_params": [
+            "secret_id",
+            "records"
+          ],
+          "params": [
+            "secret_id",
+            "records"
+          ]
+        },
+        {
           "rust": "remove",
           "dotnet": "Remove",
           "go": "Remove",
@@ -446,6 +460,20 @@
             "secret_id",
             "channel_id",
             "value"
+          ]
+        },
+        {
+          "rust": "save_many",
+          "dotnet": "SaveMany",
+          "go": "SaveMany",
+          "ts": "saveMany",
+          "rust_params": [
+            "secret_id",
+            "entries"
+          ],
+          "params": [
+            "secret_id",
+            "entries"
           ]
         },
         {

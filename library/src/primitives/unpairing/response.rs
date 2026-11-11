@@ -39,6 +39,9 @@ pub struct ProcessResult {
 /// # Arguments
 ///
 /// * `channel_id` - Channel identifier for the requesting peer.
+/// * `unpair_channel_id` - The channel the request named, echoed so the
+///   requester can match this response to its request. It differs from
+///   `channel_id` for a linked unpair.
 /// * `channel_key` - The channel key and its epoch. The payload is encrypted
 ///   under the key and the envelope's `sequence` carries the epoch, so the
 ///   receiver can pick the key that opens it; see [`crate::types::ChannelKey`].
@@ -57,7 +60,7 @@ pub struct ProcessResult {
 /// let shared_key = derec_library::types::SharedKey::new([7u8; 32]);
 /// let channel_key = derec_library::types::ChannelKey::new(0, shared_key.clone());
 ///
-/// let response::ProduceResult { envelope } = response::produce(channel_id, &channel_key)
+/// let response::ProduceResult { envelope } = response::produce(channel_id, &channel_key, channel_id)
 ///     .expect("failed to build unpair response");
 ///
 /// assert!(!envelope.is_empty());
@@ -66,8 +69,18 @@ pub struct ProcessResult {
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
-pub fn produce(channel_id: ChannelId, channel_key: &ChannelKey) -> Result<ProduceResult, Error> {
-    let envelope = build_response(channel_id, StatusEnum::Ok, "", channel_key)?;
+pub fn produce(
+    channel_id: ChannelId,
+    channel_key: &ChannelKey,
+    unpair_channel_id: ChannelId,
+) -> Result<ProduceResult, Error> {
+    let envelope = build_response(
+        channel_id,
+        StatusEnum::Ok,
+        "",
+        channel_key,
+        unpair_channel_id,
+    )?;
 
     #[cfg(feature = "logging")]
     tracing::info!("unpair response (ok) envelope produced");
@@ -118,13 +131,13 @@ pub fn produce(channel_id: ChannelId, channel_key: &ChannelKey) -> Result<Produc
 ///
 /// // Initiator: send an unpair request.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, "no longer needed", &channel_key, &[], None)
+///     request::produce(channel_id, "no longer needed", &channel_key, &[], None, channel_id)
 ///         .expect("produce request failed");
 ///
 /// // Responder: extract and ack with a successful response.
 /// let _ = request::extract(&req_envelope, &shared_key).expect("extract request failed");
 /// let response::ProduceResult { envelope: resp_envelope } =
-///     response::produce(channel_id, &channel_key).expect("produce response failed");
+///     response::produce(channel_id, &channel_key, channel_id).expect("produce response failed");
 ///
 /// // Initiator: extract the response.
 /// let response::ExtractResult { response: ack } =
@@ -165,7 +178,8 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractR
 ///   success (`result.status == StatusEnum::Ok`).
 /// - `Err(UnpairingError::NonOkStatus { … })` — the responder rejected the
 ///   unpair; carries the peer's status code and memo.
-/// - `Err(crate::Error::Invariant(_))` — the response carried no result.
+/// - `Err(crate::Error::Invariant(_))` — the response carried no result, or
+///   named channel `0`, which is never a channel id.
 ///
 /// The initiator's [`crate::protocol`] orchestrator uses the outcome to
 /// decide whether to delete its own local state (success) or surface a
@@ -183,11 +197,11 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractR
 ///
 /// // Initiator → Responder → Initiator roundtrip.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, "no longer needed", &channel_key, &[], None)
+///     request::produce(channel_id, "no longer needed", &channel_key, &[], None, channel_id)
 ///         .expect("produce request failed");
 /// let _ = request::extract(&req_envelope, &shared_key).expect("extract request failed");
 /// let response::ProduceResult { envelope: resp_envelope } =
-///     response::produce(channel_id, &channel_key).expect("produce response failed");
+///     response::produce(channel_id, &channel_key, channel_id).expect("produce response failed");
 /// let response::ExtractResult { response: ack } =
 ///     response::extract(&resp_envelope, &shared_key).expect("extract response failed");
 ///
@@ -201,6 +215,9 @@ pub fn process(response: &UnpairResponseMessage) -> Result<ProcessResult, Error>
     let result = response.result.as_ref().ok_or(Error::Invariant(
         "UnpairResponseMessage is missing result field",
     ))?;
+    if response.channel_id == 0 {
+        return Err(Error::Invariant("UnpairResponseMessage names channel 0"));
+    }
 
     result.validate(|status, memo| UnpairingError::NonOkStatus { status, memo })?;
 
@@ -215,6 +232,7 @@ fn build_response(
     status: StatusEnum,
     memo: &str,
     channel_key: &ChannelKey,
+    unpair_channel_id: ChannelId,
 ) -> Result<Vec<u8>, Error> {
     let timestamp = current_timestamp();
 
@@ -224,6 +242,7 @@ fn build_response(
             memo: memo.to_owned(),
         }),
         timestamp: Some(timestamp),
+        channel_id: unpair_channel_id.0,
     };
 
     let envelope = DeRecMessageBuilder::channel()

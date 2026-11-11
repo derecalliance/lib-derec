@@ -3,6 +3,7 @@
   "restore": {
     "version": 7,
     "newest_version": 9,
+    "keep_recovery_channels": [],
     "recovered_secret": {
       "helpers": [
         {

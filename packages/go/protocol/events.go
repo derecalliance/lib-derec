@@ -440,6 +440,14 @@ const (
 	// NotRestoredReasonNoTransports: the recovered roster names no endpoint
 	// for the peer.
 	NotRestoredReasonNoTransports = "NoTransports"
+	// NotRestoredReasonReplicaGroupDropped: the entry is a member of the
+	// recovered replica group, and Restore never carries a group forward.
+	// Restoring means the owner lost its devices; any it still has join this
+	// one again by pairing, and the rest are cut off from the helpers when
+	// the old helper channels are retired. The member's name and role are in
+	// the recovered Secret's Replicas, from the communication info it
+	// advertised when it paired.
+	NotRestoredReasonReplicaGroupDropped = "ReplicaGroupDropped"
 )
 
 // The label vocabulary for Event.Reason on a RecoveryShareCorrupted event.
@@ -712,6 +720,9 @@ type DiscoveredSecret struct {
 type DiscoveredVersion struct {
 	Version     uint32 `json:"version"`
 	Description string `json:"description"`
+	// ChannelID is the channel this version's share is stored on, which on
+	// a recovery channel names the old channel it replaces.
+	ChannelID uint64 `json:"channel_id,string"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler. Every field decodes through

@@ -521,13 +521,14 @@ configures none is named by its channel alone.
 
 The recovering device receives a `SecretRecovered` event carrying the typed
 `secret`. Pass it
-to `protocol.restore(secret, version, newestVersion)` — on the same `DeRecProtocol`
-instance that ran recovery, since it is the one holding the recovery-mode
-channels `restore` unpairs — to
-commit canonical helper / replica state and wipe the throwaway recovery-mode
-channels — at that point the device resumes normal operation as if the secret
-had been protected here originally.
-A helper or member with no endpoint in the recovered roster gets no channel;
+to `protocol.restore(secret, version, newestVersion, keepRecoveryChannels)` —
+on the same `DeRecProtocol` instance that ran recovery, since it is the one
+holding the recovery-mode channels — to commit canonical helper state, keep
+the recovery channels named in `keepRecoveryChannels` in place of their
+helpers' old channels (see "Retire the old channels" below; pass `[]` to keep
+none) and wipe the other recovery-mode channels — at that point the device
+resumes normal operation as if the secret had been protected here originally.
+A helper with no endpoint in the recovered roster gets no channel;
 `restore` returns a `PeerNotRestored` event for it (`reason: "NoTransports"`)
 and restores the rest. `newestVersion` is the newest version any helper
 reported in Discovery (`version` itself when that is the newest): the
@@ -535,31 +536,35 @@ recovered secrets are recorded at it, so the next publish is
 `newestVersion + 1`. A helper ignores a version older than the newest it
 stores (`"Superseded"`).
 
-**Restore or join.** `SecretRecovered` writes nothing, so decide first. When
-`secret.replicas?.members` names live members other than the lost device, do
-not restore: tell the user and offer to join that group as a new replica —
-pair with a live member, confirm the fingerprint, then run
-`start(FlowKind.ReplicaDiscovery)`. With no live member, restore. Neither path gives this device the proofs of
-earlier versions, so it cannot verify them: restore writes none, and a
-joining device gets only the share map of the single version each push or
-catch-up carries. The live members keep the proofs they hold. A restored
-device also cannot publish, or answer a member's catch-up, until the app
-configures a `replica_id` the roster names. Joining adds the device as a new
-member, while restoring next to live replicas makes a second device claim
-the lost device's role. See
+**Restore or join.** `SecretRecovered` writes nothing, so decide first.
+Restore is for an owner that lost access to its other devices. When the user
+still has one, do not restore: pair the new device with it as a replica —
+pair, confirm the fingerprint, then run `start(FlowKind.ReplicaDiscovery)`.
+
+`restore` never carries the recovered replica group forward. Each member is
+reported as a `PeerNotRestored` event with `reason: "ReplicaGroupDropped"`
+(`channel_id` is the group's channel, `replica_id` names the member), and the
+restored device publishes as a lone owner. Tell the user which devices the
+group had — `secret.replicas` names each member with the `communication_info`
+it advertised when it paired — and that any of them still in reach joins this
+device again by pairing. No message is sent to the old members; they lose
+access to the helpers once the old helper channels are retired. See
 [Restore or join](https://derec-alliance.gitbook.io/docs/concepts/replicas/restore-or-join).
 
 ```ts
 const events = await protocol.process(responseBytes);
 for (const ev of events) {
   if (ev.type === "SecretRecovered") {
-    await protocol.restore(ev.secret, recoveredVersion, newestVersion);
+    // `keep` pairs each roster helper with the recovery channel kept in its
+    // place (see "Retire the old channels").
+    await protocol.restore(ev.secret, recoveredVersion, newestVersion, keep);
   }
 }
 ```
 
 Errors surface as a `DeRecError` with a `category` and `code` —
 `already_restored`, `restore_conflict` (with `channel_ids`), `invariant`,
+`invalid_input` (`newestVersion` below `version`, or an invalid kept pair),
 `invalid_recovered_secret` (a malformed `secret`), or `store_error` (a store call failed; `category`
 names the store). `code` is typed `DeRecErrorCode`, the full union of every
 code the library can report plus the WASM-marshalling codes this binding
@@ -573,6 +578,61 @@ channel names it in `channel_id`: `channel_already_paired`,
 > base64 with padding (RFC 4648 §4)** and `u64` fields as decimal strings.
 > See the `derec-library` `protocol::types::secret` reference documentation
 > for the full field schema.
+
+### Retire the old channels
+
+After recovering, the device holds two channels to every helper that served a
+share: the old one in the recovered roster, whose key every lost device still
+holds, and the recovery channel it paired on, whose key only this device
+holds. Keep the recovery channel and retire the old one, so the lost devices
+are cut off from the helpers:
+
+1. **Map the channels.** Every version a helper reports in Discovery
+   (`SecretsDiscovered`) names the channel its share is stored on
+   (`versions[].channel_id`, a decimal string). On a recovery channel that is
+   the old roster channel it replaces. Use only an id that names a helper in
+   the recovered roster.
+2. **Restore keeping the recovery channels.** Pass one
+   `{ roster_channel_id, recovery_channel_id }` (`KeepRecoveryChannel`, both
+   decimal strings) per helper. Restore does not write the old channel, keeps
+   the recovery channel with the roster weight, and does not unpair it. A
+   helper that served no share has no recovery channel: it is restored on its
+   old channel, and the application may unpair it before publishing. A pair
+   naming a roster id that is not a roster helper, a recovery id that is not a
+   `"Paired"` helper channel outside the roster, or an id another pair names
+   fails with `invalid_input`.
+3. **Publish.** `start(FlowKind.ProtectSecret, …)` stores a fresh version on
+   every kept channel. Key `weights` by the kept recovery channel ids.
+4. **Unpair the old channels.** Once a helper has confirmed the new version,
+   `start(FlowKind.Unpair, { channel_id: recovery, linked_channel_id: old })`
+   asks it to drop the old channel. The request travels on the recovery
+   channel; the helper refuses it (`UnpairRejected` with status `Fail`) while
+   no share is stored there, and while the old channel is not linked to it.
+   The flow's events (`UnpairStarted`, `Unpaired`, `UnpairRejected`) name the
+   old channel.
+
+```ts
+const keep: KeepRecoveryChannel[] = [];
+for (const ev of discoveryEvents) {
+  if (ev.type !== "SecretsDiscovered") continue;
+  const held = ev.secrets
+    .find((s) => s.secret_id === secretId.toString())
+    ?.versions.find((v) => v.version === recoveredVersion);
+  if (held) keep.push({ roster_channel_id: held.channel_id, recovery_channel_id: ev.channel_id });
+}
+await protocol.restore(secret, recoveredVersion, newestVersion, keep);
+// Publish on the kept channels, then once each helper has stored it:
+for (const { roster_channel_id, recovery_channel_id } of keep) {
+  await protocol.start(FlowKind.Unpair, {
+    channel_id: recovery_channel_id,
+    linked_channel_id: roster_channel_id,
+  });
+}
+```
+
+A lost device that is still running gets no answer from a helper afterwards:
+the helper holds no key for the old channel, so it cannot reply, and the
+device's rounds time out.
 
 ### Helpers and shares
 

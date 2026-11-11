@@ -159,6 +159,7 @@ fn unpair_answer(channel_id: ChannelId, status: StatusEnum) -> Vec<u8> {
                 memo: String::new(),
             }),
             timestamp: Some(timestamp),
+            channel_id: channel_id.0,
         }))
         .encrypt(&derec_library::types::ChannelKey::new(
             0,
@@ -174,6 +175,7 @@ fn unpair(channel_id: ChannelId) -> DeRecFlow {
     DeRecFlow::Unpair {
         channel_id,
         memo: None,
+        linked_channel_id: None,
     }
 }
 
@@ -370,7 +372,7 @@ fn the_recovery_helpers_answers_end_their_channels_after_restore() {
             threshold: Some(2),
         };
         let events = owner
-            .restore(&secret, 1, 1)
+            .restore(&secret, 1, 1, &[])
             .await
             .expect("restore succeeds");
         assert!(

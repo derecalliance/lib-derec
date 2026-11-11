@@ -294,7 +294,7 @@ func TestRestore_HappyPath_PersistsHelperChannel(t *testing.T) {
 	p := newTestProtocol(t)
 	secret := fixtureRestoreSecret(11)
 
-	events, err := p.Restore(secret, 7, 7)
+	events, err := p.Restore(secret, 7, 7, nil)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestRestore_HelperWithoutTransports_IsReportedNotRestored(t *testing.T) {
 	unreachable.Transports = nil
 	secret.Helpers = append(secret.Helpers, unreachable)
 
-	events, err := p.Restore(secret, 7, 7)
+	events, err := p.Restore(secret, 7, 7, nil)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -349,10 +349,10 @@ func TestRestore_AlreadyRestored_ReturnsCleanError(t *testing.T) {
 	p := newTestProtocol(t)
 	secret := fixtureRestoreSecret(11)
 
-	if _, err := p.Restore(secret, 7, 7); err != nil {
+	if _, err := p.Restore(secret, 7, 7, nil); err != nil {
 		t.Fatalf("first Restore: %v", err)
 	}
-	_, err := p.Restore(secret, 7, 7)
+	_, err := p.Restore(secret, 7, 7, nil)
 	if err == nil {
 		t.Fatal("expected an error on the second Restore")
 	}
@@ -369,7 +369,7 @@ func TestRestore_ClosedProtocol(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if _, err := p.Restore(fixtureRestoreSecret(11), 7, 7); err == nil {
+	if _, err := p.Restore(fixtureRestoreSecret(11), 7, 7, nil); err == nil {
 		t.Fatal("expected an error on a closed protocol")
 	}
 }
@@ -416,7 +416,7 @@ func TestRestore_Conflict_ReportsConflictingChannelIDs(t *testing.T) {
 		secret.Helpers = append(secret.Helpers, h)
 	}
 
-	_, err = p.Restore(secret, 7, 7)
+	_, err = p.Restore(secret, 7, 7, nil)
 	if err == nil {
 		t.Fatal("expected a restore conflict")
 	}
@@ -440,7 +440,7 @@ func TestRestore_Conflict_ReportsConflictingChannelIDs(t *testing.T) {
 			t.Fatalf("remove channel %d: %v", id, err)
 		}
 	}
-	events, err := p.Restore(secret, 7, 7)
+	events, err := p.Restore(secret, 7, 7, nil)
 	if err != nil {
 		t.Fatalf("Restore after clearing conflicts: %v", err)
 	}
@@ -454,10 +454,10 @@ func TestRestore_Conflict_ReportsConflictingChannelIDs(t *testing.T) {
 func TestRestore_NonConflictError_HasNoConflictingChannelIDs(t *testing.T) {
 	p := newTestProtocol(t)
 	secret := fixtureRestoreSecret(11)
-	if _, err := p.Restore(secret, 7, 7); err != nil {
+	if _, err := p.Restore(secret, 7, 7, nil); err != nil {
 		t.Fatalf("first Restore: %v", err)
 	}
-	_, err := p.Restore(secret, 7, 7)
+	_, err := p.Restore(secret, 7, 7, nil)
 	var derecErr *derec.Error
 	if !errors.As(err, &derecErr) {
 		t.Fatalf("expected a *derec.Error, got %T: %v", err, err)
@@ -483,5 +483,64 @@ func TestMarshalFlowParams_PairingKindIsNumeric(t *testing.T) {
 		if !strings.Contains(string(got), want) {
 			t.Fatalf("marshalFlowParams(%v) = %s, want it to contain %s", kind, got, want)
 		}
+	}
+}
+
+// UnpairParams.LinkedChannelID crosses as a decimal string under
+// linked_channel_id and is omitted when nil.
+func TestMarshalFlowParams_UnpairLinkedChannelID(t *testing.T) {
+	linked := uint64(18446744073709551615)
+	got, err := marshalFlowParams(FlowKindUnpair, UnpairParams{ChannelID: 11, LinkedChannelID: &linked})
+	if err != nil {
+		t.Fatalf("marshalFlowParams: %v", err)
+	}
+	if string(got) != `{"channel_id":"11","linked_channel_id":"18446744073709551615"}` {
+		t.Fatalf("linked unpair params = %s", got)
+	}
+	got, err = marshalFlowParams(FlowKindUnpair, UnpairParams{ChannelID: 11})
+	if err != nil {
+		t.Fatalf("marshalFlowParams: %v", err)
+	}
+	if string(got) != `{"channel_id":"11"}` {
+		t.Fatalf("ordinary unpair params = %s", got)
+	}
+}
+
+// A kept pair whose roster id is not a helper in the roster reaches Rust
+// and is refused there with CodeInvalidInput, proving the
+// keep_recovery_channels wire decodes.
+func TestRestore_InvalidKeptChannel_ReturnsInvalidInput(t *testing.T) {
+	p := newTestProtocol(t)
+	_, err := p.Restore(fixtureRestoreSecret(11), 7, 7, []KeepRecoveryChannel{
+		{RosterChannelID: 99, RecoveryChannelID: 12},
+	})
+	var derecErr *derec.Error
+	if !errors.As(err, &derecErr) {
+		t.Fatalf("expected *derec.Error, got %T: %v", err, err)
+	}
+	if derecErr.Code != derec.CodeInvalidInput {
+		t.Fatalf("expected CodeInvalidInput, got code=%d (%v)", derecErr.Code, err)
+	}
+}
+
+// Each KeepRecoveryChannel crosses as a pair of decimal strings, and no
+// kept pairs cross as an empty array rather than null.
+func TestMarshalRestoreParams_KeepRecoveryChannels(t *testing.T) {
+	got, err := marshalRestoreParams(fixtureRestoreSecret(11), 7, 7, []KeepRecoveryChannel{
+		{RosterChannelID: 11, RecoveryChannelID: 18446744073709551615},
+	})
+	if err != nil {
+		t.Fatalf("marshalRestoreParams: %v", err)
+	}
+	want := `"keep_recovery_channels":[{"roster_channel_id":"11","recovery_channel_id":"18446744073709551615"}]`
+	if !strings.Contains(string(got), want) {
+		t.Fatalf("restore params = %s, want it to contain %s", got, want)
+	}
+	got, err = marshalRestoreParams(fixtureRestoreSecret(11), 7, 7, nil)
+	if err != nil {
+		t.Fatalf("marshalRestoreParams: %v", err)
+	}
+	if !strings.Contains(string(got), `"keep_recovery_channels":[]`) {
+		t.Fatalf("restore params = %s, want an empty keep_recovery_channels array", got)
 	}
 }

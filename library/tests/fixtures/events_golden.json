@@ -358,6 +358,7 @@
           "secret_id": "1038",
           "versions": [
             {
+              "channel_id": "1036",
               "description": "first",
               "version": 23
             }

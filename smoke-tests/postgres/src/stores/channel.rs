@@ -7,6 +7,7 @@ use derec_library::protocol::types::{
 use derec_library::protocol::{ChannelStoreFuture, DeRecChannelStore};
 use derec_library::types::ChannelId;
 use std::collections::{HashSet, VecDeque};
+use tokio_postgres::Client;
 
 use crate::codec::{
     channel_status_tag, decode_helper, decode_member, encode_channel, replica_role_tag,
@@ -61,54 +62,30 @@ impl DeRecChannelStore for PostgresChannelStore {
 
     fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
         let client = self.client.clone();
-        let secret_id = u64_to_sql(secret_id);
-        let bytes = encode_channel(&record);
         Box::pin(async move {
-            match &record {
-                ChannelRecord::Helper(h) => {
-                    client
-                        .execute(
-                            "INSERT INTO channels (secret_id, channel_id, status, peer_role, data)
-                             VALUES ($1, $2, $3, $4, $5)
-                             ON CONFLICT (secret_id, channel_id) DO UPDATE SET
-                                 status = EXCLUDED.status,
-                                 peer_role = EXCLUDED.peer_role,
-                                 data = EXCLUDED.data",
-                            &[
-                                &secret_id,
-                                &u64_to_sql(h.channel_id.0),
-                                &(channel_status_tag(h.status) as i16),
-                                &(sender_kind_tag(h.peer_role) as i16),
-                                &bytes,
-                            ],
-                        )
-                        .await
-                        .expect("helper channel save failed");
-                }
-                ChannelRecord::Replica(m) => {
-                    client
-                        .execute(
-                            "INSERT INTO replica_members
-                                 (secret_id, replica_id, channel_id, status, role, data)
-                             VALUES ($1, $2, $3, $4, $5, $6)
-                             ON CONFLICT (secret_id, replica_id) DO UPDATE SET
-                                 channel_id = EXCLUDED.channel_id,
-                                 status = EXCLUDED.status,
-                                 role = EXCLUDED.role,
-                                 data = EXCLUDED.data",
-                            &[
-                                &secret_id,
-                                &u64_to_sql(m.replica_id.0),
-                                &u64_to_sql(m.channel_id.0),
-                                &(channel_status_tag(m.status) as i16),
-                                &(replica_role_tag(m.role) as i16),
-                                &bytes,
-                            ],
-                        )
-                        .await
-                        .expect("replica member save failed");
-                }
+            upsert(&client, secret_id, &record).await;
+            Ok(())
+        })
+    }
+
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        records: Vec<ChannelRecord>,
+    ) -> ChannelStoreFuture<'_, ()> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .batch_execute("BEGIN")
+                .await
+                .expect("save_many transaction failed");
+            for record in &records {
+                upsert(&client, secret_id, record).await;
             }
+            client
+                .batch_execute("COMMIT")
+                .await
+                .expect("save_many commit failed");
             Ok(())
         })
     }
@@ -342,4 +319,55 @@ fn split_queries(queries: &[ChannelQuery]) -> (Vec<i64>, Vec<i64>) {
         }
     }
     (helpers, members)
+}
+
+/// Insert or replace `record` at its own key.
+async fn upsert(client: &Client, secret_id: u64, record: &ChannelRecord) {
+    let secret_id = u64_to_sql(secret_id);
+    let bytes = encode_channel(record);
+    match record {
+        ChannelRecord::Helper(h) => {
+            client
+                .execute(
+                    "INSERT INTO channels (secret_id, channel_id, status, peer_role, data)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT (secret_id, channel_id) DO UPDATE SET
+                         status = EXCLUDED.status,
+                         peer_role = EXCLUDED.peer_role,
+                         data = EXCLUDED.data",
+                    &[
+                        &secret_id,
+                        &u64_to_sql(h.channel_id.0),
+                        &(channel_status_tag(h.status) as i16),
+                        &(sender_kind_tag(h.peer_role) as i16),
+                        &bytes,
+                    ],
+                )
+                .await
+                .expect("helper channel save failed");
+        }
+        ChannelRecord::Replica(m) => {
+            client
+                .execute(
+                    "INSERT INTO replica_members
+                         (secret_id, replica_id, channel_id, status, role, data)
+                     VALUES ($1, $2, $3, $4, $5, $6)
+                     ON CONFLICT (secret_id, replica_id) DO UPDATE SET
+                         channel_id = EXCLUDED.channel_id,
+                         status = EXCLUDED.status,
+                         role = EXCLUDED.role,
+                         data = EXCLUDED.data",
+                    &[
+                        &secret_id,
+                        &u64_to_sql(m.replica_id.0),
+                        &u64_to_sql(m.channel_id.0),
+                        &(channel_status_tag(m.status) as i16),
+                        &(replica_role_tag(m.role) as i16),
+                        &bytes,
+                    ],
+                )
+                .await
+                .expect("replica member save failed");
+        }
+    }
 }

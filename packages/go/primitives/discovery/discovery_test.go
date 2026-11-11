@@ -47,8 +47,8 @@ func TestDiscoveryResponseRoundTrip(t *testing.T) {
 		{
 			SecretID: 0xABCD,
 			Versions: []discovery.VersionEntry{
-				{Version: 1, Description: "wallet seed"},
-				{Version: 2, Description: "wallet seed v2"},
+				{Version: 1, Description: "wallet seed", ChannelID: 3},
+				{Version: 2, Description: "wallet seed v2", ChannelID: channelID},
 			},
 		},
 	}

@@ -93,6 +93,24 @@ message UnpairRequestMessage {
   // the whole group — replica removal edits a member row instead, and this
   // field says which row.
   optional uint64 replicaId = 4;
+
+  // The channel to unpair. Always set; `0` is never a channel id, so a
+  // request carrying it is malformed.
+  //
+  // Equal to the channel the request travels on, it is an ordinary unpair of
+  // that channel. Different, it is a **linked unpair**: the Owner asks the
+  // Helper to unpair an older channel linked to this one, typically the
+  // channel it used before losing its devices and recovering on a new one.
+  // The Helper then drops the named channel and keeps the one the request
+  // arrived on.
+  //
+  // A linked unpair is owner-originated only and MUST NOT carry `replicaId`.
+  // The Helper MUST refuse it when the named channel is not linked to the
+  // arrival channel, or when the arrival channel holds no share yet:
+  // dropping the old channel before a round is stored on the new one could
+  // leave this Helper holding no share for the Owner. A replica-originated
+  // unpair names the group channel it travels on.
+  uint64 channelId = 6;
 }
 
 // UnpairResponseMessage is the response to an UnpairRequestMessage.
@@ -129,4 +147,12 @@ message UnpairResponseMessage {
   // - replay detection (in combination with sequence numbers)
   // - timeout handling
   google.protobuf.Timestamp timestamp = 2;
+
+  // The channel the request named, echoed. Always set; `0` is malformed.
+  //
+  // The response travels on the channel the request arrived on, which for a
+  // linked unpair is not the channel being unpaired. Echoing the named
+  // channel lets the requester match the response to its own request even
+  // when several unpairs are in flight on one channel.
+  uint64 channelId = 3;
 }

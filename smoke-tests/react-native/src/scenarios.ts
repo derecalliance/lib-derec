@@ -57,6 +57,10 @@ class SlowChannelStore implements ChannelStore {
     await delay(this.delayMs);
   }
 
+  async saveMany(): Promise<void> {
+    await delay(this.delayMs);
+  }
+
   async remove(): Promise<boolean> {
     await delay(this.delayMs);
     return false;
@@ -94,6 +98,7 @@ class EmptySecretStore implements SecretStore {
     return channelIds.map(() => null);
   }
   async save(): Promise<void> {}
+  async saveMany(): Promise<void> {}
   async remove(): Promise<void> {}
   async removeMany(): Promise<void> {}
 }

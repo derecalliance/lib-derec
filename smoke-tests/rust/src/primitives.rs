@@ -902,10 +902,12 @@ fn run_discovery_flow_test() {
             VersionEntry {
                 version: 1,
                 description: "wallet seed".to_owned(),
+                channel_id,
             },
             VersionEntry {
                 version: 2,
                 description: "wallet seed v2".to_owned(),
+                channel_id,
             },
         ],
     }];

@@ -185,14 +185,15 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         return Ok(None);
     }
 
+    let mut reweighted = Vec::new();
     for ((channel, _), &(_, weight)) in helpers.iter_mut().zip(&weighted_channels) {
         if channel.weight != weight {
             channel.weight = weight;
-            stores
-                .channels
-                .save(secret_id, ChannelRecord::Helper(channel.clone()))
-                .await?;
+            reweighted.push(ChannelRecord::Helper(channel.clone()));
         }
+    }
+    if !reweighted.is_empty() {
+        stores.channels.save_many(secret_id, reweighted).await?;
     }
 
     let snapshot_secrets = secrets.clone();
@@ -309,12 +310,10 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         None
     };
 
-    for (channel_id, ring) in &moved_rings {
-        stores
-            .secrets
-            .save_key_ring(secret_id, *channel_id, ring)
-            .await?;
-    }
+    stores
+        .secrets
+        .save_key_rings(secret_id, &moved_rings)
+        .await?;
 
     let mut outcomes: Vec<(ChannelId, Result<()>)> = Vec::new();
     let mut replica_outcomes: Vec<(ReplicaId, Result<()>)> = Vec::new();
@@ -5020,6 +5019,105 @@ mod weighted_round_tests {
             .map(|s| s.version)
     }
 
+    /// A round that changes several helpers' weights stores every changed
+    /// channel record in one channel-store call.
+    #[test]
+    fn changed_weights_are_saved_in_one_call() {
+        run_async(async {
+            let mut rig = StoreRig::new();
+            for ch in [41, 42, 43] {
+                seed_helper(&mut rig.channels, &mut rig.secrets, ch).await;
+            }
+            let lf = LocalFixture::new(SECRET_ID);
+            let singles = *rig.channels.save_calls.lock().unwrap();
+            let weights = HashMap::from([(ChannelId(41), 2), (ChannelId(42), 3)]);
+
+            super::start(
+                &mut rig.stores(),
+                &lf.local(),
+                secrets(),
+                None,
+                Some(&weights),
+                None,
+                4,
+                None,
+                &Round {
+                    reply_to: &[],
+                    trace_id: 1,
+                },
+            )
+            .await
+            .expect("round starts");
+
+            assert_eq!(*rig.channels.save_calls.lock().unwrap(), singles);
+            assert_eq!(*rig.channels.save_many_calls.lock().unwrap(), 1);
+            for (ch, weight) in [(41, 2), (42, 3), (43, 1)] {
+                let helper = rig
+                    .channels
+                    .load(
+                        SECRET_ID,
+                        ChannelQuery::Helper {
+                            channel_id: ChannelId(ch),
+                        },
+                    )
+                    .await
+                    .expect("load")
+                    .and_then(|r| r.as_helper().cloned())
+                    .expect("a helper");
+                assert_eq!(helper.weight, weight, "channel {ch}");
+            }
+        });
+    }
+
+    /// With key rotation on, a round moves every helper channel to its next
+    /// epoch and stores all the moved key rings in one secret-store call.
+    #[test]
+    fn a_rotating_round_saves_every_moved_ring_in_one_call() {
+        run_async(async {
+            let mut rig = StoreRig::new();
+            for ch in [41, 42, 43] {
+                seed_helper(&mut rig.channels, &mut rig.secrets, ch).await;
+            }
+            let lf = LocalFixture::new(SECRET_ID);
+            let local = crate::protocol::context::Local {
+                key_rotation: true,
+                ..lf.local()
+            };
+            let singles = *rig.secrets.save_calls.lock().unwrap();
+
+            super::start(
+                &mut rig.stores(),
+                &local,
+                secrets(),
+                None,
+                None,
+                None,
+                2,
+                None,
+                &Round {
+                    reply_to: &[],
+                    trace_id: 1,
+                },
+            )
+            .await
+            .expect("round starts");
+
+            assert_eq!(*rig.secrets.save_calls.lock().unwrap(), singles);
+            assert_eq!(*rig.secrets.save_many_calls.lock().unwrap(), 1);
+            for ch in [41, 42, 43] {
+                let ring = {
+                    use crate::extensions::secret_store::SecretStoreExt as _;
+                    rig.secrets
+                        .key_ring(SECRET_ID, ChannelId(ch))
+                        .await
+                        .expect("read")
+                        .expect("a ring")
+                };
+                assert_eq!(ring.current().epoch, 1, "channel {ch} moved");
+            }
+        });
+    }
+
     #[test]
     fn protect_secret_rejects_invalid_weights_even_below_threshold() {
         run_async(async {
@@ -6112,7 +6210,7 @@ mod weighted_round_tests {
             let mut restored = device(None, "https://restored").await;
             restored
                 .protocol
-                .restore(&recovered, 1, 1)
+                .restore(&recovered, 1, 1, &[])
                 .await
                 .expect("restore succeeds");
             assert_eq!(stored_weight(&restored.channels, 51).await, 2);

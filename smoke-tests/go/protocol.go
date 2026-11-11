@@ -86,6 +86,15 @@ func (s *memChannelStore) Save(secretID uint64, record protocol.ChannelRecord) e
 	return nil
 }
 
+func (s *memChannelStore) SaveMany(secretID uint64, records []protocol.ChannelRecord) error {
+	for _, r := range records {
+		if err := s.Save(secretID, r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *memChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -220,6 +229,15 @@ func (s *memSecretStore) Save(secretID, channelID uint64, value protocol.SecretV
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[secretStoreKey{secretID, channelID, value.Kind}] = value
+	return nil
+}
+
+func (s *memSecretStore) SaveMany(secretID uint64, entries []protocol.SecretValueEntry) error {
+	for _, e := range entries {
+		if err := s.Save(secretID, e.ChannelID, e.Value); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -2756,7 +2774,7 @@ func runRecoverRestoreRepublish() {
 		"the recovered secret must carry weights A=2, B=1, got %v", recoveredWeights)
 	fmt.Println("  SecretRecovered carries t=3 and weights A=2, B=1  ✓")
 
-	restoreEvents, err := device.proto.Restore(*recovered, v1, newest)
+	restoreEvents, err := device.proto.Restore(*recovered, v1, newest, nil)
 	must(err, "device.Restore")
 	started := map[uint64]bool{}
 	for _, ev := range restoreEvents {
@@ -2853,6 +2871,246 @@ func runRecoverRestoreRepublish() {
 	fmt.Printf("  verifying the recovered v%d → VerifySharesFailed(NoProof) on both helpers, nothing sent  ✓\n", v1)
 
 	fmt.Println("Protocol recover → restore → republish test passed.")
+}
+
+// runRestoreOnRecoveryChannels recovers on a new device, restores keeping
+// the recovery channels, publishes, then retires the old channels with a
+// linked unpair — mirroring `run_restore_on_recovery_channels_flow` in
+// smoke-tests/rust/src/protocol.rs. Every version Discovery reports names the
+// old channel it is stored on, which maps each recovery channel to the roster
+// helper it replaces. The recovered replica group is dropped, and the old
+// devices — which still hold the old channels' keys — reach no helper
+// afterwards.
+func runRestoreOnRecoveryChannels() {
+	fmt.Println("=== Protocol restore on recovery channels flow test ===")
+
+	const secretID uint64 = 0x2E6
+	source := newReplicaPeer("lost-source", "https://lost-source.example.com", secretID, 0x5011, 2)
+	replica := newReplicaPeer("lost-replica", "https://lost-replica.example.com", secretID, 0x5012, 2)
+	helperA := newPeer("helper-a", "https://helper-a-keep.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-keep.example.com", 2)
+	oldA := pairPeers(source, helperA, 1)
+	oldB := pairPeers(source, helperB, 2)
+	group := pairReplicaHandshake(source, replica, 3)
+	crossConfirmFingerprint(source, replica, group)
+	pumpMany([]*peer{source, replica, helperA, helperB})
+	version := protectAcross(source, []*peer{replica, helperA, helperB}, "kept secret")
+
+	// Both devices are lost. A new one pairs with each helper afresh, and
+	// each helper links the owner's old channel to the new one.
+	device := newPeerWithSecretID("device", "https://device-keep.example.com", secretID, 2)
+	for _, p := range []*peer{source, replica, helperA, helperB, device} {
+		defer p.proto.Close()
+	}
+	recoveryA := pairPeers(device, helperA, 100)
+	recoveryB := pairPeers(device, helperB, 101)
+	for _, link := range []struct {
+		helper        *peer
+		old, recovery uint64
+	}{{helperA, oldA, recoveryA}, {helperB, oldB, recoveryB}} {
+		must(link.helper.channelStore.LinkChannel(link.helper.proto.SecretID(), link.old, link.recovery),
+			"link the recovery channel to the old one")
+	}
+
+	_, err := device.proto.Start(protocol.FlowKindDiscovery, protocol.DiscoveryParams{Target: protocol.TargetMany(recoveryA, recoveryB)})
+	must(err, "device.Start(Discovery)")
+	owning := map[uint64]uint64{}
+	for _, ev := range pumpMany([]*peer{device, helperA, helperB}) {
+		if ev.Type != protocol.EventTypeSecretsDiscovered {
+			continue
+		}
+		var held *protocol.DiscoveredVersion
+		for _, s := range ev.Secrets {
+			if s.SecretID != secretID {
+				continue
+			}
+			for i := range s.Versions {
+				if s.Versions[i].Version == version {
+					held = &s.Versions[i]
+				}
+			}
+		}
+		assertTrue(held != nil, "the helper on %d must report the published version, got %+v", ev.ChannelID, ev.Secrets)
+		owning[ev.ChannelID] = held.ChannelID
+	}
+	assertTrue(len(owning) == 2 && owning[recoveryA] == oldA && owning[recoveryB] == oldB,
+		"each version names the old channel its share is stored on, got %v", owning)
+	fmt.Println("  Discovery maps each recovery channel to the old channel it replaces  ✓")
+
+	_, err = device.proto.Start(protocol.FlowKindRecoverSecret, protocol.RecoverSecretParams{SecretID: secretID, Version: version})
+	must(err, "device.Start(RecoverSecret)")
+	var recovered *protocol.Secret
+	for _, ev := range pumpMany([]*peer{device, helperA, helperB}) {
+		if ev.Type == protocol.EventTypeSecretRecovered && ev.Secret != nil {
+			recovered = ev.Secret
+		}
+	}
+	assertTrue(recovered != nil, "RecoverSecret must surface SecretRecovered")
+	assertTrue(recovered.Replicas != nil, "the recovered roster carries the replica group")
+
+	keep := make([]protocol.KeepRecoveryChannel, 0, len(owning))
+	for recovery, old := range owning {
+		keep = append(keep, protocol.KeepRecoveryChannel{RosterChannelID: old, RecoveryChannelID: recovery})
+	}
+	restoreEvents, err := device.proto.Restore(*recovered, version, version, keep)
+	must(err, "restore keeping the recovery channels")
+	var dropped []uint64
+	for _, ev := range restoreEvents {
+		assertTrue(ev.Type != protocol.EventTypeUnpairStarted, "the kept recovery channels are not unpaired, got %+v", restoreEvents)
+		if ev.Type == protocol.EventTypePeerNotRestored && ev.ReplicaID != nil &&
+			ev.Reason == protocol.NotRestoredReasonReplicaGroupDropped {
+			dropped = append(dropped, *ev.ReplicaID)
+		}
+	}
+	slices.Sort(dropped)
+	assertTrue(slices.Equal(dropped, []uint64{0x5011, 0x5012}),
+		"every member of the recovered group is reported as dropped, got %v", dropped)
+	deviceSID := device.proto.SecretID()
+	for _, pair := range [][2]uint64{{recoveryA, oldA}, {recoveryB, oldB}} {
+		record, ok, err := device.channelStore.Load(deviceSID, pair[0], 0)
+		must(err, "device.channelStore.Load")
+		assertTrue(ok && record.Helper != nil && record.Helper.Status == protocol.ChannelStatusPaired,
+			"the recovery channel %d is kept Paired, got ok=%v %+v", pair[0], ok, record)
+		_, ok, err = device.channelStore.Load(deviceSID, pair[1], 0)
+		must(err, "device.channelStore.Load")
+		assertTrue(!ok, "the old channel %d is not written", pair[1])
+	}
+	members, err := device.channelStore.ListReplicas(deviceSID, protocol.ReplicaFilter{})
+	must(err, "device.channelStore.ListReplicas")
+	assertTrue(len(members) == 0, "no replica group is written, got %+v", members)
+	fmt.Println("  restore keeps both recovery channels and drops the replica group  ✓")
+
+	published := protectAcross(device, []*peer{helperA, helperB}, "kept secret")
+	for _, channelID := range []uint64{recoveryA, recoveryB} {
+		rows, err := device.shareStore.Load(deviceSID, channelID, []uint32{published})
+		must(err, "device.shareStore.Load")
+		assertTrue(len(rows) == 1, "the publish reached %d", channelID)
+	}
+	fmt.Printf("  the restored device publishes v%d on the kept channels as a lone owner  ✓\n", published)
+
+	for _, pair := range [][2]uint64{{recoveryA, oldA}, {recoveryB, oldB}} {
+		old := pair[1]
+		_, err := device.proto.Start(protocol.FlowKindUnpair, protocol.UnpairParams{ChannelID: pair[0], LinkedChannelID: &old})
+		must(err, "device.Start(Unpair) of the old channel")
+	}
+	unpaired := map[uint64]bool{}
+	for _, ev := range pumpMany([]*peer{device, helperA, helperB}) {
+		if ev.Type == protocol.EventTypeUnpaired {
+			unpaired[ev.ChannelID] = true
+		}
+	}
+	assertTrue(len(unpaired) == 2 && unpaired[oldA] && unpaired[oldB],
+		"the linked unpairs drop only the old channels, got %v", unpaired)
+	for _, c := range []struct {
+		helper        *peer
+		old, recovery uint64
+	}{{helperA, oldA, recoveryA}, {helperB, oldB, recoveryB}} {
+		assertTrue(!hasChannelRecord(c.helper, c.old, 0), "%s: the old channel is gone", c.helper.label)
+		assertTrue(hasChannelRecord(c.helper, c.recovery, 0), "%s: the kept channel stays", c.helper.label)
+	}
+	fmt.Println("  linked unpairs retire both old channels at the helpers  ✓")
+
+	// The lost source still runs and publishes; no helper holds a key for
+	// its channels any more, so nothing it sends is accepted.
+	_, err = source.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{10}, Name: "stale", Data: []byte("stale")}},
+	})
+	must(err, "the lost source still starts a round")
+	refused := 0
+	for _, entry := range source.drain() {
+		var helper *peer
+		switch entry.uri {
+		case helperA.uri:
+			helper = helperA
+		case helperB.uri:
+			helper = helperB
+		default:
+			continue
+		}
+		_, err := helper.proto.Process(entry.message)
+		assertTrue(err != nil, "%s must not accept a message on a retired channel", helper.label)
+		assertTrue(len(helper.drain()) == 0, "%s answers nothing", helper.label)
+		refused++
+	}
+	assertTrue(refused == 2, "the lost source reached both helpers and was refused by both, got %d", refused)
+	fmt.Println("  the lost source's round reaches no helper  ✓")
+
+	_, err = device.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+		SecretID: secretID,
+		Version:  published,
+		Target:   protocol.TargetAll(),
+	})
+	must(err, "device.Start(VerifyShares)")
+	verified := verifiedChannels(pumpMany([]*peer{device, helperA, helperB}))
+	assertTrue(len(verified) == 2 && verified[recoveryA] && verified[recoveryB],
+		"both kept channels still verify, got %v", verified)
+	fmt.Println("  both kept channels verify after the old ones are retired  ✓")
+
+	fmt.Println("Protocol restore on recovery channels flow test passed.")
+}
+
+// runLinkedUnpairBeforeReshareIsRefused: a helper refuses a linked unpair
+// until a share is stored on the channel it arrives on, since before the
+// restored device publishes, the old channel may hold that helper's only
+// share for the owner — mirroring
+// `run_linked_unpair_before_reshare_is_refused_flow` in
+// smoke-tests/rust/src/protocol.rs.
+func runLinkedUnpairBeforeReshareIsRefused() {
+	fmt.Println("=== Protocol linked unpair before reshare is refused flow test ===")
+
+	const secretID uint64 = 0x2E7
+	lost := newPeerWithSecretID("lost", "https://lost-early.example.com", secretID, 2)
+	helperA := newPeer("helper-a", "https://helper-a-early.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-early.example.com", 2)
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+	oldA := pairPeers(lost, helperA, 1)
+	oldB := pairPeers(lost, helperB, 2)
+	version := protectAcross(lost, []*peer{helperA, helperB}, "early")
+	must(lost.proto.Close(), "lost.Close")
+
+	device := newPeerWithSecretID("device", "https://device-early.example.com", secretID, 2)
+	defer device.proto.Close()
+	recoveryA := pairPeers(device, helperA, 100)
+	recoveryB := pairPeers(device, helperB, 101)
+	for _, link := range []struct {
+		helper        *peer
+		old, recovery uint64
+	}{{helperA, oldA, recoveryA}, {helperB, oldB, recoveryB}} {
+		must(link.helper.channelStore.LinkChannel(link.helper.proto.SecretID(), link.old, link.recovery),
+			"link the recovery channel to the old one")
+	}
+	_, err := device.proto.Start(protocol.FlowKindRecoverSecret, protocol.RecoverSecretParams{SecretID: secretID, Version: version})
+	must(err, "device.Start(RecoverSecret)")
+	var recovered *protocol.Secret
+	for _, ev := range pumpMany([]*peer{device, helperA, helperB}) {
+		if ev.Type == protocol.EventTypeSecretRecovered && ev.Secret != nil {
+			recovered = ev.Secret
+		}
+	}
+	assertTrue(recovered != nil, "RecoverSecret must surface SecretRecovered")
+	_, err = device.proto.Restore(*recovered, version, version, []protocol.KeepRecoveryChannel{
+		{RosterChannelID: oldA, RecoveryChannelID: recoveryA},
+		{RosterChannelID: oldB, RecoveryChannelID: recoveryB},
+	})
+	must(err, "restore keeping the recovery channels")
+
+	_, err = device.proto.Start(protocol.FlowKindUnpair, protocol.UnpairParams{ChannelID: recoveryA, LinkedChannelID: &oldA})
+	must(err, "device.Start(Unpair) of the old channel")
+	events := pumpMany([]*peer{device, helperA, helperB})
+	rejected := false
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeUnpairRejected && ev.ChannelID == oldA && ev.Status == derecpb.StatusEnum_FAIL {
+			rejected = true
+		}
+	}
+	assertTrue(rejected, "the helper refuses the linked unpair before a share is stored on the kept channel, got %+v", events)
+	held, err := helperA.shareStore.Load(helperA.proto.SecretID(), oldA, nil)
+	must(err, "helper-a shareStore.Load")
+	assertTrue(len(held) > 0, "the old channel keeps its share")
+	fmt.Println("  a linked unpair before the reshare → UnpairRejected(FAIL), old share kept  ✓")
+
+	fmt.Println("Protocol linked unpair before reshare is refused flow test passed.")
 }
 
 // runSilentHelperRecovery recovers with three helpers while one never
@@ -3205,7 +3463,7 @@ func runRestoreKeepsHelperDuties() {
 	}
 	assertTrue(recovered != nil, "the device must recover its own secret")
 
-	restoreEvents, err := device.proto.Restore(*recovered, version, version)
+	restoreEvents, err := device.proto.Restore(*recovered, version, version, nil)
 	must(err, "device.Restore")
 	touched := map[uint64]bool{}
 	for _, ev := range restoreEvents {
@@ -3976,7 +4234,7 @@ func runReplicaVerifiesOnlySyncedVersions() {
 	v2 := *synced.Version
 	assertTrue(v2 > v1, "joining must publish a newer version (v1=%d, v2=%d)", v1, v2)
 
-	_, err = bob.proto.Restore(*synced.Secret, v2, v2)
+	_, err = bob.proto.Restore(*synced.Secret, v2, v2, nil)
 	var restoreErr *derec.Error
 	assertTrue(errors.As(err, &restoreErr) && restoreErr.Code == derec.CodeAlreadyRestored,
 		"a synced destination is already provisioned; Restore must refuse it with CodeAlreadyRestored, got %v", err)
@@ -4151,7 +4409,7 @@ func runDiscoveryAndRecovery() {
 
 	restored := newPeerWithSecretID("restored-owner", "https://restored-discovery.example.com", protectedSecretID, 2)
 	defer restored.proto.Close()
-	_, err = restored.proto.Restore(*recovered, recoverVersion, recoverVersion)
+	_, err = restored.proto.Restore(*recovered, recoverVersion, recoverVersion, nil)
 	must(err, "Restore on a fresh peer")
 	snapshot, ok, err := restored.userSecrets.LoadLatest(protectedSecretID)
 	must(err, "restored userSecrets.LoadLatest")
@@ -5529,7 +5787,7 @@ func runKeyRotation() {
 
 	device := rotating("device")
 	defer device.proto.Close()
-	_, err = device.proto.Restore(*recovered, 2, 2)
+	_, err = device.proto.Restore(*recovered, 2, 2, nil)
 	must(err, "device.Restore")
 	for channelID := range helpers {
 		assertTrue(storedKeyEpoch(device, channelID) == 2,

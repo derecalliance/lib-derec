@@ -130,6 +130,14 @@ pub enum NotRestoredReason {
     /// it would have nothing to send to. A legacy roster whose single URI had
     /// a scheme this library does not serve decodes this way.
     NoTransports,
+    /// The entry is a member of the recovered replica group, and restore
+    /// never carries a group forward. Restoring means the owner lost its
+    /// devices; any it still has join this one again by pairing, and the
+    /// rest are cut off from the helpers when the old helper channels are
+    /// retired. The member's name and role are in the recovered
+    /// [`Secret`]'s `replicas`, from the
+    /// `communication_info` it advertised when it paired.
+    ReplicaGroupDropped,
 }
 
 /// Why [`DeRecEvent::RecoveryShareCorrupted`] set a helper's share aside.
@@ -1140,11 +1148,28 @@ pub enum DeRecFlow {
     /// dropped; `tick` has no error to return, so there the failure is logged
     /// and the remaining Helpers keep the previous version until the next
     /// [`DeRecFlow::ProtectSecret`].
+    ///
+    /// # Linked unpair
+    ///
+    /// With `linked_channel_id` set, the request still travels on
+    /// `channel_id` but asks the helper to unpair that older channel instead,
+    /// keeping `channel_id`. This is how a restored owner that kept its
+    /// recovery channel retires the channel it used before: the helper
+    /// accepts only when the older channel is linked to `channel_id` and a
+    /// share is already stored on `channel_id`, so publish on the kept
+    /// channel first. Every event of the flow — [`DeRecEvent::UnpairStarted`],
+    /// [`DeRecEvent::Unpaired`], [`DeRecEvent::UnpairRejected`] — names the
+    /// older channel, and `channel_id` is never set to `Unpairing`.
     Unpair {
+        /// The channel the request travels on.
         channel_id: ChannelId,
         /// Optional human-readable reason embedded into the wire request.
         /// Pass `None` (or an empty string) to omit.
         memo: Option<String>,
+        /// The older channel to unpair instead of `channel_id`, or `None` to
+        /// unpair `channel_id` itself. Naming `channel_id` here is
+        /// [`crate::Error::InvalidInput`].
+        linked_channel_id: Option<ChannelId>,
     },
     /// Broadcast updated communication info and/or transport endpoints to one
     /// or more paired helper channels.

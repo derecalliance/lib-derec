@@ -459,6 +459,7 @@ mod golden {
                     versions: vec![DiscoveredVersion {
                         version: 23,
                         description: "first".into(),
+                        channel_id: "1036".into(),
                     }],
                 }],
             },

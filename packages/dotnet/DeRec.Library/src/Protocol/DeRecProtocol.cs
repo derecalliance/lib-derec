@@ -32,6 +32,7 @@ public sealed class DeRecProtocol : IDisposable
     // ReSharper disable NotAccessedField.Local
     private readonly NP.ChannelStoreLoadDelegate _channelLoad;
     private readonly NP.ChannelStoreSaveDelegate _channelSave;
+    private readonly NP.ChannelStoreSaveManyDelegate _channelSaveMany;
     private readonly NP.ChannelStoreRemoveDelegate _channelRemove;
     private readonly NP.ChannelStoreRemoveManyDelegate _channelRemoveMany;
     private readonly NP.ChannelStoreListDelegate _channelListHelpers;
@@ -42,6 +43,7 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.SecretStoreLoadDelegate _secretLoad;
     private readonly NP.SecretStoreLoadManyDelegate _secretLoadMany;
     private readonly NP.SecretStoreSaveDelegate _secretSave;
+    private readonly NP.SecretStoreSaveManyDelegate _secretSaveMany;
     private readonly NP.SecretStoreRemoveDelegate _secretRemove;
     private readonly NP.SecretStoreRemoveManyDelegate _secretRemoveMany;
     private readonly NP.FreeBufferDelegate _secretFreeBuffer;
@@ -112,6 +114,7 @@ public sealed class DeRecProtocol : IDisposable
 
         _channelLoad = ChannelLoadImpl;
         _channelSave = ChannelSaveImpl;
+        _channelSaveMany = ChannelSaveManyImpl;
         _channelRemove = ChannelRemoveImpl;
         _channelRemoveMany = ChannelRemoveManyImpl;
         _channelListHelpers = ChannelListHelpersImpl;
@@ -123,6 +126,7 @@ public sealed class DeRecProtocol : IDisposable
         _secretLoad = SecretLoadImpl;
         _secretLoadMany = SecretLoadManyImpl;
         _secretSave = SecretSaveImpl;
+        _secretSaveMany = SecretSaveManyImpl;
         _secretRemove = SecretRemoveImpl;
         _secretRemoveMany = SecretRemoveManyImpl;
         _secretFreeBuffer = FreeBufferImpl;
@@ -158,6 +162,7 @@ public sealed class DeRecProtocol : IDisposable
             UserData = IntPtr.Zero,
             Load = Marshal.GetFunctionPointerForDelegate(_channelLoad),
             Save = Marshal.GetFunctionPointerForDelegate(_channelSave),
+            SaveMany = Marshal.GetFunctionPointerForDelegate(_channelSaveMany),
             Remove = Marshal.GetFunctionPointerForDelegate(_channelRemove),
             RemoveMany = Marshal.GetFunctionPointerForDelegate(_channelRemoveMany),
             ListHelpers = Marshal.GetFunctionPointerForDelegate(_channelListHelpers),
@@ -172,6 +177,7 @@ public sealed class DeRecProtocol : IDisposable
             Load = Marshal.GetFunctionPointerForDelegate(_secretLoad),
             LoadMany = Marshal.GetFunctionPointerForDelegate(_secretLoadMany),
             Save = Marshal.GetFunctionPointerForDelegate(_secretSave),
+            SaveMany = Marshal.GetFunctionPointerForDelegate(_secretSaveMany),
             Remove = Marshal.GetFunctionPointerForDelegate(_secretRemove),
             RemoveMany = Marshal.GetFunctionPointerForDelegate(_secretRemoveMany),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_secretFreeBuffer),
@@ -550,6 +556,26 @@ public sealed class DeRecProtocol : IDisposable
     /// <see cref="ReplicaInfo.CommunicationInfo"/> may be <c>null</c> or
     /// absent; both mean the same thing — no entries.
     /// <para>
+    /// Restore never carries a recovered replica group forward: each member
+    /// is reported as a <see cref="PeerNotRestoredEvent"/> with
+    /// <see cref="NotRestoredReason.ReplicaGroupDropped"/>, in roster order,
+    /// and the next publish goes out as a lone owner's. Devices the owner
+    /// still has join again by pairing.
+    /// </para>
+    /// <para>
+    /// Each pair in <paramref name="keepRecoveryChannels"/> keeps a recovery
+    /// channel in place of its roster helper's old channel: the old channel
+    /// is not written, and the recovery channel stays paired with its own
+    /// endpoint and key, takes the roster entry's weight, and is not
+    /// unpaired. Only this device holds a recovery channel's key, while every
+    /// lost device still holds the old one, so keeping it is what lets the
+    /// owner cut the lost devices off: publish once on the kept channels,
+    /// then retire each old channel with a linked unpair
+    /// (<see cref="UnpairParams.LinkedChannelId"/>). Helpers not named in any
+    /// pair are restored on their old channel; pass an empty list to keep
+    /// none.
+    /// </para>
+    /// <para>
     /// Recovery and restore are separate steps on purpose:
     /// <see cref="SecretRecoveredEvent"/> writes nothing. Show the user what
     /// was recovered, or ask them, before calling this, which commits it to
@@ -569,13 +595,22 @@ public sealed class DeRecProtocol : IDisposable
     /// <exception cref="DeRecException">
     /// Thrown with <see cref="DeRecCode.AlreadyRestored"/>,
     /// <see cref="DeRecCode.RestoreConflict"/>, <see cref="DeRecCode.Invariant"/>,
+    /// <see cref="DeRecCode.InvalidInput"/> (a <paramref name="newestVersion"/>
+    /// below <paramref name="version"/>, or a pair in
+    /// <paramref name="keepRecoveryChannels"/> naming a roster id that is not
+    /// a helper in the roster, a recovery id that is not a paired channel to a
+    /// helper outside the roster, or an id another pair names),
     /// or a store-category code on failure. On
     /// <see cref="DeRecCode.RestoreConflict"/>,
     /// <see cref="DeRecException.ConflictingChannelIds"/> lists the existing
     /// channels at ids restore is about to write; clear exactly those and
     /// retry.
     /// </exception>
-    public Task<IReadOnlyList<DeRecEvent>> RestoreAsync(Secret recoveredSecret, uint version, uint newestVersion)
+    public Task<IReadOnlyList<DeRecEvent>> RestoreAsync(
+        Secret recoveredSecret,
+        uint version,
+        uint newestVersion,
+        IReadOnlyList<KeepRecoveryChannel> keepRecoveryChannels)
     {
         EnsureNotDisposed();
         var dto = new RestoreParamsDto
@@ -583,6 +618,7 @@ public sealed class DeRecProtocol : IDisposable
             Version = version,
             NewestVersion = newestVersion,
             RecoveredSecret = recoveredSecret,
+            KeepRecoveryChannels = keepRecoveryChannels,
         };
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
         return Task.Run<IReadOnlyList<DeRecEvent>>(() =>
@@ -610,6 +646,7 @@ public sealed class DeRecProtocol : IDisposable
         [JsonPropertyName("version")] public required uint Version { get; init; }
         [JsonPropertyName("newest_version")] public required uint NewestVersion { get; init; }
         [JsonPropertyName("recovered_secret")] public required Secret RecoveredSecret { get; init; }
+        [JsonPropertyName("keep_recovery_channels")] public required IReadOnlyList<KeepRecoveryChannel> KeepRecoveryChannels { get; init; }
     }
 
     /// <summary>
@@ -763,14 +800,40 @@ public sealed class DeRecProtocol : IDisposable
             Marshal.Copy(bytes, buf, 0, buf.Length);
             var dto = JsonSerializer.Deserialize<ChannelRecordDto>(buf, JsonOpts)
                 ?? throw new InvalidOperationException("null ChannelRecord JSON");
-            var record = (dto.Helper, dto.Replica) switch
-            {
-                ({ } h, null) => ChannelRecord.Of(FromDto(h)),
-                (null, { } r) => ChannelRecord.Of(FromDto(r)),
-                _ => throw new InvalidOperationException(
-                    "ChannelRecord JSON must carry exactly one of Helper / Replica"),
-            };
-            _channelStore.Save(secretId, record);
+            _channelStore.Save(secretId, FromDto(dto));
+            return 0;
+        }
+        catch { return -1; }
+    }
+
+    private static ChannelRecord FromDto(ChannelRecordDto dto) => (dto.Helper, dto.Replica) switch
+    {
+        ({ } h, null) => ChannelRecord.Of(FromDto(h)),
+        (null, { } r) => ChannelRecord.Of(FromDto(r)),
+        _ => throw new InvalidOperationException(
+            "ChannelRecord JSON must carry exactly one of Helper / Replica"),
+    };
+
+    private int ChannelSaveManyImpl(IntPtr userData, ulong secretId, IntPtr records, UIntPtr recordsLen)
+    {
+        try
+        {
+            var bytes = new byte[(int)recordsLen];
+            if (bytes.Length > 0)
+                Marshal.Copy(records, bytes, 0, bytes.Length);
+            var triples = JsonSerializer.Deserialize<List<string[]>>(bytes, JsonOpts)
+                          ?? new List<string[]>();
+            var parsed = triples
+                .Select(t =>
+                {
+                    ulong.Parse(t[0], System.Globalization.CultureInfo.InvariantCulture);
+                    ulong.Parse(t[1], System.Globalization.CultureInfo.InvariantCulture);
+                    return FromDto(
+                        JsonSerializer.Deserialize<ChannelRecordDto>(t[2], JsonOpts)
+                        ?? throw new InvalidOperationException("null ChannelRecord JSON"));
+                })
+                .ToList();
+            _channelStore.SaveMany(secretId, parsed);
             return 0;
         }
         catch { return -1; }
@@ -971,6 +1034,37 @@ public sealed class DeRecProtocol : IDisposable
             var rec = JsonSerializer.Deserialize<SecretValueDto>(buf, JsonOpts)
                 ?? throw new InvalidOperationException("null SecretValue");
             _secretStore.Save(secretId, channelId, new SecretValue((SecretKind)rec.kind, rec.bytes));
+            return 0;
+        }
+        catch { return -1; }
+    }
+
+    private int SecretSaveManyImpl(IntPtr userData, ulong secretId, IntPtr entries, UIntPtr entriesLen)
+    {
+        try
+        {
+            var bytes = new byte[(int)entriesLen];
+            if (bytes.Length > 0)
+                Marshal.Copy(entries, bytes, 0, bytes.Length);
+            var triples = bytes.Length == 0
+                ? new List<JsonElement[]>()
+                : JsonSerializer.Deserialize<List<JsonElement[]>>(bytes, JsonOpts)
+                  ?? new List<JsonElement[]>();
+            var parsed = triples
+                .Select(t =>
+                {
+                    var rec = JsonSerializer.Deserialize<SecretValueDto>(
+                                  t[2].GetString() ?? throw new InvalidOperationException("null SecretValue"),
+                                  JsonOpts)
+                              ?? throw new InvalidOperationException("null SecretValue");
+                    return (
+                        ChannelId: ulong.Parse(
+                            t[0].GetString() ?? throw new InvalidOperationException("null channel id"),
+                            System.Globalization.CultureInfo.InvariantCulture),
+                        Value: new SecretValue((SecretKind)rec.kind, rec.bytes));
+                })
+                .ToList();
+            _secretStore.SaveMany(secretId, parsed);
             return 0;
         }
         catch { return -1; }

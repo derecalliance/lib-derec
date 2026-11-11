@@ -548,6 +548,7 @@ mod tests {
                 versions: vec![version_list::VersionEntry {
                     version: 3,
                     version_description: "v3".to_owned(),
+                    channel_id: u64::MAX,
                 }],
             }],
             timestamp: None,
@@ -562,10 +563,15 @@ mod tests {
             json["secret_list"][0]["secret_id"],
             serde_json::json!("18446744073709551615")
         );
+        assert_eq!(
+            json["secret_list"][0]["versions"][0]["channel_id"],
+            serde_json::json!("18446744073709551615")
+        );
 
         let reencoded = encode(DEREC_MESSAGE_KIND_GET_SECRET_IDS_VERSIONS_RESPONSE, &json);
         let decoded = GetSecretIdsVersionsResponseMessage::decode(&reencoded[..]).unwrap();
         assert_eq!(decoded.secret_list[0].secret_id, u64::MAX);
+        assert_eq!(decoded.secret_list[0].versions[0].channel_id, u64::MAX);
     }
 
     /// `ParameterRange`'s bounds are `i64` and are surfaced as `bigint` by
@@ -658,6 +664,7 @@ mod tests {
             timestamp: None,
             reply_to_transports: Vec::new(),
             replica_id: Some(u64::MAX),
+            channel_id: 1,
         };
         let json = decode(DEREC_MESSAGE_KIND_UNPAIR_REQUEST, &message.encode_to_vec());
         assert_eq!(

@@ -116,12 +116,22 @@ impl DeRecChannelStore for InMemoryChannelStore {
     }
 
     fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
-        match record {
-            ChannelRecord::Helper(h) => {
-                self.helper_rows.insert((secret_id, h.channel_id.0), h);
-            }
-            ChannelRecord::Replica(r) => {
-                self.member_rows.insert((secret_id, r.replica_id.0), r);
+        self.save_many(secret_id, vec![record])
+    }
+
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        records: Vec<ChannelRecord>,
+    ) -> ChannelStoreFuture<'_, ()> {
+        for record in records {
+            match record {
+                ChannelRecord::Helper(h) => {
+                    self.helper_rows.insert((secret_id, h.channel_id.0), h);
+                }
+                ChannelRecord::Replica(r) => {
+                    self.member_rows.insert((secret_id, r.replica_id.0), r);
+                }
             }
         }
         Box::pin(std::future::ready(Ok(())))
@@ -279,13 +289,23 @@ impl DeRecSecretStore for InMemorySecretStore {
         channel_id: ChannelId,
         value: SecretValue,
     ) -> SecretStoreFuture<'_, ()> {
-        let kind = match &value {
-            SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
-            SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
-            SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
-            SecretValue::KeyRing(_) => SecretKind::KeyRing as u8,
-        };
-        self.data.insert((secret_id, channel_id.0, kind), value);
+        self.save_many(secret_id, vec![(channel_id, value)])
+    }
+
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, SecretValue)>,
+    ) -> SecretStoreFuture<'_, ()> {
+        for (channel_id, value) in entries {
+            let kind = match &value {
+                SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
+                SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
+                SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
+                SecretValue::KeyRing(_) => SecretKind::KeyRing as u8,
+            };
+            self.data.insert((secret_id, channel_id.0, kind), value);
+        }
         Box::pin(std::future::ready(Ok(())))
     }
 
@@ -1206,7 +1226,7 @@ async fn restore_on_a_fresh_device(owner: &Node, recovered: &Secret, version: u3
         true,
     );
     device
-        .restore(recovered, version, version)
+        .restore(recovered, version, version, &[])
         .await
         .expect("restore on a fresh device must succeed");
     *owner.protocol.lock().await = device;

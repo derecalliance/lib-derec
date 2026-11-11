@@ -236,6 +236,7 @@ fn generated() -> serde_json::Value {
             user_data,
             load,
             save,
+            save_many,
             remove,
             remove_many,
             list_helpers,
@@ -249,6 +250,7 @@ fn generated() -> serde_json::Value {
             load,
             load_many,
             save,
+            save_many,
             remove,
             remove_many,
             free_buffer

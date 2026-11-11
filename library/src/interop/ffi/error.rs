@@ -303,7 +303,7 @@ pub(crate) fn from_restore_error(err: RestoreError) -> DeRecError {
             format!("restore conflict: channel(s) [{}]", id_list.join(", "))
         }
         RestoreError::Invariant(msg) => msg.to_string(),
-        RestoreError::AlreadyRestored => err.to_string(),
+        RestoreError::AlreadyRestored | RestoreError::InvalidKeptChannel(_) => err.to_string(),
     };
     let (category, code) = categorize(&Error::Restore(err));
     DeRecError {

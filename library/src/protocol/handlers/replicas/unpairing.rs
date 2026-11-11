@@ -17,7 +17,7 @@
 //! arrives that both omits it and post-dates the flag. [`reconcile`] and
 //! [`tear_down`] are the second half, driven from the sharing flow as each new
 //! roster lands.
-use super::{flag_unpairing, load_member_keys};
+use super::{flagged_unpairing, load_member_keys};
 use crate::derec_message::apply_trace_id;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::primitives::unpairing::request;
@@ -109,7 +109,14 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     let mut notified = Vec::new();
     for peer in &peers {
         let key = &keys[&peer.channel_id];
-        let request = request::produce(peer.channel_id, &memo, key, &[], Some(target.0))?;
+        let request = request::produce(
+            peer.channel_id,
+            &memo,
+            key,
+            &[],
+            Some(target.0),
+            peer.channel_id,
+        )?;
         let envelope = apply_trace_id(&request.envelope, trace_id)?;
         if stores
             .transport
@@ -121,27 +128,21 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         }
     }
 
-    flag_unpairing(stores, local, &member).await?;
-
-    // Promoted before the roster is built, so the completing publish carries the
-    // new source. The flagged row and the promoted row are distinct members, so
-    // the two writes cannot collide.
+    // The successor is promoted before the roster is built, so the completing
+    // publish carries the new source. The flagged row and the promoted row are
+    // distinct members, so the two records cannot collide.
+    let mut records = vec![flagged_unpairing(&member)];
     let mut events = Vec::new();
     if let Some(successor) = successor {
-        stores
-            .channels
-            .save(
-                secret_id,
-                ChannelRecord::Replica(ReplicaMember {
-                    role: ReplicaRole::Source,
-                    ..successor.clone()
-                }),
-            )
-            .await?;
+        records.push(ChannelRecord::Replica(ReplicaMember {
+            role: ReplicaRole::Source,
+            ..successor.clone()
+        }));
         events.push(DeRecEvent::ReplicaSourceChanged {
             replica_id: successor.replica_id.0,
         });
     }
+    stores.channels.save_many(secret_id, records).await?;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -329,7 +330,10 @@ async fn on_request<S: StoreSet>(
             "unpair names a member that is not in the group",
         ))?;
 
-    flag_unpairing(stores, local, &member).await?;
+    stores
+        .channels
+        .save(local.secret_id, flagged_unpairing(&member))
+        .await?;
 
     // No event yet: nothing has been removed. The row is flagged, and the
     // removal is reported when the completing roster arrives.
@@ -731,6 +735,40 @@ mod tests {
                 ReplicaRole::Source,
                 "the departing row is untouched; its absence from the next roster is what removes it"
             );
+        });
+    }
+
+    /// Flagging the departing source and promoting its successor are written
+    /// in one channel-store call.
+    #[test]
+    fn the_flag_and_the_promotion_are_saved_in_one_call() {
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, 1002);
+            let mut rig = StoreRig::with_transport(NoopTransport);
+            seed_group_key(&mut rig.secrets).await;
+            seed_member(
+                &mut rig.channels,
+                1001,
+                ReplicaRole::Source,
+                ChannelStatus::Paired,
+            )
+            .await;
+            seed_member(
+                &mut rig.channels,
+                1002,
+                ReplicaRole::Destination,
+                ChannelStatus::Paired,
+            )
+            .await;
+            let singles = *rig.channels.save_calls.lock().unwrap();
+
+            super::start(&mut rig.stores(), &lf.local(), 1001, None, TRACE_ID)
+                .await
+                .expect("removing the source succeeds");
+
+            assert_eq!(*rig.channels.save_calls.lock().unwrap(), singles);
+            assert_eq!(*rig.channels.save_many_calls.lock().unwrap(), 1);
+            assert_eq!(role_of(&rig.channels, 1002).await, ReplicaRole::Source);
         });
     }
 

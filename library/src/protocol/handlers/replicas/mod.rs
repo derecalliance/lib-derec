@@ -27,7 +27,6 @@ pub(in crate::protocol) mod unpairing;
 use crate::Error;
 use crate::Result;
 use crate::extensions::secret_store::SecretStoreExt as _;
-use crate::protocol::DeRecChannelStore;
 use crate::protocol::context::Local;
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{ChannelRecord, ChannelStatus, ReplicaMember};
@@ -67,21 +66,11 @@ async fn load_member_keys<S: StoreSet>(
         .collect()
 }
 
-/// Mark a member as told-to-leave, preserving everything else about the row.
-async fn flag_unpairing<S: StoreSet>(
-    stores: &mut Stores<'_, S>,
-    local: &Local<'_>,
-    member: &ReplicaMember,
-) -> Result<()> {
-    stores
-        .channels
-        .save(
-            local.secret_id,
-            ChannelRecord::Replica(ReplicaMember {
-                status: ChannelStatus::Unpairing,
-                ..member.clone()
-            }),
-        )
-        .await?;
-    Ok(())
+/// The member's row marked as told-to-leave, everything else about it
+/// preserved.
+fn flagged_unpairing(member: &ReplicaMember) -> ChannelRecord {
+    ChannelRecord::Replica(ReplicaMember {
+        status: ChannelStatus::Unpairing,
+        ..member.clone()
+    })
 }

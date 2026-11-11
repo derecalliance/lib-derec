@@ -225,18 +225,20 @@ loop {
                     println!("recovered {} ({}B)", entry.name, entry.data.len());
                 }
                 // Nothing has been written yet: show the user what was
-                // recovered, or ask them, before committing it. If
-                // `secret.replicas` names live members, join that group
-                // instead (see "Recover, then restore or join"). Call
-                // `restore` on this same `protocol` — the one that ran
-                // recovery and still holds the recovery-mode channels it
-                // unpairs. `restore` commits the recovered Secret into this
-                // `secret_id`'s stores, wipes the throwaway recovery-mode
-                // channels and reseats canonical helper / replica state at
-                // the recovered version. `newest_version` is the newest
-                // version any helper reported in Discovery. See
-                // `DeRecProtocol::restore`.
-                protocol.restore(&secret, recovered_version, newest_version).await?;
+                // recovered, or ask them, before committing it. If the user
+                // still has another device, pair it as a replica instead
+                // (see "Recover, then restore or join"). Call `restore` on
+                // this same `protocol` — the one that ran recovery and
+                // still holds the recovery-mode channels. `restore` commits
+                // the recovered Secret into this `secret_id`'s stores,
+                // keeps the recovery channels named in `keep` in place of
+                // their helpers' old channels, wipes the other recovery
+                // channels and reseats helper state at the recovered
+                // version. `newest_version` is the newest version any
+                // helper reported in Discovery. See `DeRecProtocol::restore`.
+                protocol
+                    .restore(&secret, recovered_version, newest_version, &keep)
+                    .await?;
             }
             // ... handle other events the application cares about.
             _ => {}
@@ -251,20 +253,19 @@ A complete working example lives in the repository's end-to-end tests; see
 ### Recover, then restore or join
 
 `SecretRecovered` writes nothing, so the application decides between restore
-and join before committing. When `secret.replicas` names a group with live
-members other than the lost device, do not restore: tell the user and offer to
-join the group as a new replica — pair with a live member, confirm the
-fingerprint, run `start(DeRecFlow::ReplicaDiscovery)`. With no live member,
-restore. The reasons:
+and join before committing. Restore is for an owner that lost access to its
+other devices. When the user still has one, do not restore: pair the new
+device with it as a replica — pair, confirm the fingerprint, run
+`start(DeRecFlow::ReplicaDiscovery)`.
 
-- Neither path gives this device the proofs of earlier versions, so it cannot
-  verify them. Restore writes none. A joining device gets only the share map
-  of the single version each push or catch-up carries. The live members keep
-  the proofs they hold.
-- A restored device cannot publish, or answer a member's catch-up, until the
-  application configures a `replica_id` the roster names.
-- Joining adds the device to the group as a new member. Restoring next to
-  live replicas makes a second device claim the lost device's role.
+`restore` never carries the recovered replica group forward. Each member is
+reported as `PeerNotRestored { reason: NotRestoredReason::ReplicaGroupDropped,
+.. }`, and the restored device publishes as a lone owner. Tell the user which
+devices the group had — `secret.replicas` names each member with the
+`communication_info` it advertised when it paired — and that any of them
+still in reach joins this device again by pairing. No message is sent to the
+old members; they lose access to the helpers once the old helper channels are
+retired (see "Retire the old channels").
 
 See
 [Restore or join](https://derec-alliance.gitbook.io/docs/concepts/replicas/restore-or-join).
@@ -308,19 +309,31 @@ on `start(ProtectSecret)`. A roster written before the threshold was recorded
 carries none, and `with_threshold` applies:
 
 ```rust,ignore
+// `keep` pairs each roster helper with the recovery channel kept in its
+// place (see "Retire the old channels").
 let restore_events = protocol
-    .restore(&secret, recovered_version, newest_version)
+    .restore(&secret, recovered_version, newest_version, &keep)
     .await?;
 // A roster helper with no endpoint gets no channel and is reported here
 // instead; naming it in `weights` below would fail the publish with
-// `InvalidWeight`.
+// `InvalidWeight`. Replica group members are reported here too.
 let not_restored: std::collections::HashSet<ChannelId> = restore_events
     .iter()
     .filter_map(|e| match e {
-        DeRecEvent::PeerNotRestored { channel_id, .. } => Some(*channel_id),
+        DeRecEvent::PeerNotRestored {
+            channel_id,
+            replica_id: None,
+            ..
+        } => Some(*channel_id),
         _ => None,
     })
     .collect();
+// The channel each roster helper is now paired on.
+let paired_on = |roster: u64| {
+    keep.iter()
+        .find(|k| k.roster_channel_id == ChannelId(roster))
+        .map_or(ChannelId(roster), |k| k.recovery_channel_id)
+};
 // Re-publish so this device holds tracking shares of its own.
 protocol.start(DeRecFlow::ProtectSecret {
     secrets: secret.secrets.clone(),
@@ -331,7 +344,7 @@ protocol.start(DeRecFlow::ProtectSecret {
         .helpers
         .iter()
         .filter(|h| !not_restored.contains(&ChannelId(h.channel_id)))
-        .map(|h| (ChannelId(h.channel_id), h.weight.max(1)))
+        .map(|h| (paired_on(h.channel_id), h.weight.max(1)))
         .collect(),
     // Keep the restored threshold.
     threshold: None,
@@ -339,11 +352,36 @@ protocol.start(DeRecFlow::ProtectSecret {
 // Now verifiable, at recovered_version + 1.
 ```
 
-If the recovered roster carries a replica group, that publish additionally
-needs a `replica_id` the roster names — `restore` does not adopt one,
-since claiming the lost device's identity is a takeover with its own
-convergence rules. Without it the publish fails with
-`Error::ReplicaIdNotConfigured` and no share reaches any helper.
+### Retire the old channels
+
+After recovering, the device holds two channels to every helper that served a
+share: the old one in the recovered roster, whose key every lost device still
+holds, and the recovery channel it paired on, whose key only this device
+holds. Keep the recovery channel and retire the old one, so the lost devices
+are cut off from the helpers:
+
+1. **Map the channels.** Every version a helper reports in Discovery
+   (`SecretsDiscovered`) names the channel its share is stored on. On a
+   recovery channel that is the old roster channel it replaces. Use only an id
+   that names a helper in the recovered roster.
+2. **Restore keeping the recovery channels.** Pass one `KeepRecoveryChannel {
+   roster_channel_id, recovery_channel_id }` per helper. Restore does not
+   write the old channel, keeps the recovery channel with the roster weight,
+   and does not unpair it. A helper that served no share has no recovery
+   channel: it is restored on its old channel, and the application may unpair
+   it before publishing.
+3. **Publish.** `start(ProtectSecret)` stores a fresh version on every kept
+   channel. Key `weights` by the kept recovery channel ids.
+4. **Unpair the old channels.** Once a helper has confirmed the new version,
+   `start(DeRecFlow::Unpair { channel_id: recovery, linked_channel_id:
+   Some(old), .. })` asks it to drop the old channel. The request travels on
+   the recovery channel; the helper refuses it while no share is stored there,
+   and while the old channel is not linked to it. The flow's events name the
+   old channel.
+
+A lost device that is still running gets no answer from a helper afterwards:
+the helper holds no key for the old channel, so it cannot reply, and the
+device's rounds time out.
 
 ---
 

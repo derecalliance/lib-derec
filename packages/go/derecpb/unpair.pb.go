@@ -100,7 +100,24 @@ type UnpairRequestMessage struct {
 	// member of a replica group shares one channel, so deleting it would sever
 	// the whole group — replica removal edits a member row instead, and this
 	// field says which row.
-	ReplicaId     *uint64 `protobuf:"varint,4,opt,name=replicaId,proto3,oneof" json:"replicaId,omitempty"`
+	ReplicaId *uint64 `protobuf:"varint,4,opt,name=replicaId,proto3,oneof" json:"replicaId,omitempty"`
+	// The channel to unpair. Always set; `0` is never a channel id, so a
+	// request carrying it is malformed.
+	//
+	// Equal to the channel the request travels on, it is an ordinary unpair of
+	// that channel. Different, it is a **linked unpair**: the Owner asks the
+	// Helper to unpair an older channel linked to this one, typically the
+	// channel it used before losing its devices and recovering on a new one.
+	// The Helper then drops the named channel and keeps the one the request
+	// arrived on.
+	//
+	// A linked unpair is owner-originated only and MUST NOT carry `replicaId`.
+	// The Helper MUST refuse it when the named channel is not linked to the
+	// arrival channel, or when the arrival channel holds no share yet:
+	// dropping the old channel before a round is stored on the new one could
+	// leave this Helper holding no share for the Owner. A replica-originated
+	// unpair names the group channel it travels on.
+	ChannelId     uint64 `protobuf:"varint,6,opt,name=channelId,proto3" json:"channelId,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -163,6 +180,13 @@ func (x *UnpairRequestMessage) GetReplicaId() uint64 {
 	return 0
 }
 
+func (x *UnpairRequestMessage) GetChannelId() uint64 {
+	if x != nil {
+		return x.ChannelId
+	}
+	return 0
+}
+
 // UnpairResponseMessage is the response to an UnpairRequestMessage.
 //
 // # Semantics
@@ -196,7 +220,14 @@ type UnpairResponseMessage struct {
 	// - observability and logging
 	// - replay detection (in combination with sequence numbers)
 	// - timeout handling
-	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	Timestamp *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// The channel the request named, echoed. Always set; `0` is malformed.
+	//
+	// The response travels on the channel the request arrived on, which for a
+	// linked unpair is not the channel being unpaired. Echoing the named
+	// channel lets the requester match the response to its own request even
+	// when several unpairs are in flight on one channel.
+	ChannelId     uint64 `protobuf:"varint,3,opt,name=channelId,proto3" json:"channelId,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -245,21 +276,30 @@ func (x *UnpairResponseMessage) GetTimestamp() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *UnpairResponseMessage) GetChannelId() uint64 {
+	if x != nil {
+		return x.ChannelId
+	}
+	return 0
+}
+
 var File_unpair_proto protoreflect.FileDescriptor
 
 const file_unpair_proto_rawDesc = "" +
 	"\n" +
-	"\funpair.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\x87\x02\n" +
+	"\funpair.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xa5\x02\n" +
 	"\x14UnpairRequestMessage\x12\x12\n" +
 	"\x04memo\x18\x01 \x01(\tR\x04memo\x128\n" +
 	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12a\n" +
 	"\x11replyToTransports\x18\x05 \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x11replyToTransports\x12!\n" +
-	"\treplicaId\x18\x04 \x01(\x04H\x00R\treplicaId\x88\x01\x01B\f\n" +
+	"\treplicaId\x18\x04 \x01(\x04H\x00R\treplicaId\x88\x01\x01\x12\x1c\n" +
+	"\tchannelId\x18\x06 \x01(\x04R\tchannelIdB\f\n" +
 	"\n" +
-	"_replicaIdJ\x04\b\x03\x10\x04R\areplyTo\"\x98\x01\n" +
+	"_replicaIdJ\x04\b\x03\x10\x04R\areplyTo\"\xb6\x01\n" +
 	"\x15UnpairResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x128\n" +
-	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestampb\x06proto3"
+	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x1c\n" +
+	"\tchannelId\x18\x03 \x01(\x04R\tchannelIdb\x06proto3"
 
 var (
 	file_unpair_proto_rawDescOnce sync.Once

@@ -148,6 +148,51 @@ pub(crate) trait SecretStoreExt: DeRecSecretStore {
         Ok(())
     }
 
+    /// Store each ring in `rings`, in one store call: as
+    /// [`save_key_ring`](Self::save_key_ring) does for each, with every
+    /// channel's ring ahead of its `SharedKey` mirror. An empty slice makes
+    /// no call.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invariant`], before anything is written, when any ring holds
+    /// more entries than [`KeyRing::as_bytes`] can encode.
+    async fn save_key_rings(
+        &mut self,
+        secret_id: u64,
+        rings: &[(ChannelId, KeyRing)],
+    ) -> Result<()> {
+        if rings.is_empty() {
+            return Ok(());
+        }
+        let mut entries = Vec::with_capacity(rings.len() * 2);
+        for (channel_id, ring) in rings {
+            ring.counts()?;
+            entries.push((*channel_id, SecretValue::KeyRing(ring.clone())));
+            entries.push((*channel_id, SecretValue::SharedKey(ring.current().key)));
+        }
+        self.save_many(secret_id, entries).await?;
+        Ok(())
+    }
+
+    /// Remove the pairing secret and the contact of `channel_id`, in one
+    /// store call: the material only its handshake needed.
+    async fn remove_pairing_material(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> Result<()> {
+        self.remove_many(
+            secret_id,
+            &[
+                (channel_id, SecretKind::PairingSecret),
+                (channel_id, SecretKind::PairingContact),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Rewrite the pins of `channel_id` with `edit`, saving the ring only
     /// when it changes. A channel with no key holds no pins, and is left as
     /// it is.

@@ -361,3 +361,125 @@ fn repin_saves_a_changed_ring() {
         );
     });
 }
+
+/// Several rings are stored in one store call, each readable afterwards
+/// with its shared-key mirror.
+#[test]
+fn save_key_rings_writes_every_ring_in_one_call() {
+    run_async(async {
+        let mut secrets = InMemSecretStore::default();
+        let rings = [
+            (ChannelId(1), KeyRing::fresh(key(1))),
+            (ChannelId(2), KeyRing::fresh(key(2))),
+        ];
+
+        secrets
+            .save_key_rings(SECRET_ID, &rings)
+            .await
+            .expect("save");
+
+        assert_eq!(*secrets.save_many_calls.lock().unwrap(), 1);
+        assert_eq!(*secrets.save_calls.lock().unwrap(), 0);
+        for (channel_id, ring) in &rings {
+            assert_eq!(
+                secrets
+                    .key_ring(SECRET_ID, *channel_id)
+                    .await
+                    .expect("read"),
+                Some(ring.clone())
+            );
+            assert_eq!(
+                secrets
+                    .shared_key(SECRET_ID, *channel_id)
+                    .await
+                    .expect("read"),
+                Some(ring.current().key)
+            );
+        }
+    });
+}
+
+/// One ring the encoding cannot count refuses the whole batch before
+/// anything is written.
+#[test]
+fn save_key_rings_refuses_a_batch_with_a_ring_it_cannot_encode() {
+    run_async(async {
+        let mut secrets = InMemSecretStore::default();
+        let unencodable = KeyRing::unchecked(
+            0,
+            key(2),
+            (0..=u32::from(u16::MAX))
+                .map(|version| (version, 0))
+                .collect(),
+            Vec::new(),
+        );
+        let rings = [
+            (ChannelId(1), KeyRing::fresh(key(1))),
+            (ChannelId(2), unencodable),
+        ];
+
+        assert!(matches!(
+            secrets.save_key_rings(SECRET_ID, &rings).await,
+            Err(crate::Error::Invariant(_))
+        ));
+        assert!(
+            secrets.data.lock().unwrap().is_empty(),
+            "nothing is written"
+        );
+    });
+}
+
+/// An empty batch makes no store call.
+#[test]
+fn save_key_rings_with_nothing_to_save_calls_no_store() {
+    run_async(async {
+        let mut secrets = InMemSecretStore::default();
+
+        secrets.save_key_rings(SECRET_ID, &[]).await.expect("save");
+
+        assert_eq!(*secrets.save_many_calls.lock().unwrap(), 0);
+    });
+}
+
+/// A channel's pairing secret and contact are removed in one store call,
+/// and its other material stays.
+#[test]
+fn remove_pairing_material_drops_both_in_one_call() {
+    run_async(async {
+        let mut secrets = InMemSecretStore::default();
+        secrets
+            .save_many(
+                SECRET_ID,
+                vec![
+                    (
+                        CHANNEL,
+                        SecretValue::PairingSecret(PairingKeyMaterial::from_bytes(vec![1; 8])),
+                    ),
+                    (CHANNEL, SecretValue::SharedKey(key(3))),
+                ],
+            )
+            .await
+            .expect("save");
+
+        secrets
+            .remove_pairing_material(SECRET_ID, CHANNEL)
+            .await
+            .expect("remove");
+
+        assert_eq!(*secrets.remove_many_calls.lock().unwrap(), 1);
+        assert_eq!(*secrets.remove_calls.lock().unwrap(), 0);
+        for kind in [SecretKind::PairingSecret, SecretKind::PairingContact] {
+            assert!(
+                secrets
+                    .load(SECRET_ID, CHANNEL, kind)
+                    .await
+                    .expect("load")
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            secrets.shared_key(SECRET_ID, CHANNEL).await.expect("read"),
+            Some(key(3))
+        );
+    });
+}

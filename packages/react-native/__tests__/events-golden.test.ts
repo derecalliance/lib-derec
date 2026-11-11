@@ -89,7 +89,7 @@ const SHARE = { fields: { channel_id: 'required', committed_share: 'bytes' } } a
 
 const DISCOVERED_SECRET = {
   fields: { secret_id: 'required', versions: 'required' },
-  nested: { versions: { fields: { version: 'required', description: 'required' } } },
+  nested: { versions: { fields: { version: 'required', description: 'required', channel_id: 'required' } } },
 } as const;
 
 const REPLICA_COPY = {

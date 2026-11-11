@@ -205,7 +205,7 @@ pub async fn run() {
         &mut owner,
         &mut owner_db,
         &mut helpers,
-        &replicas[..1],
+        &mut replicas[..1],
         &secrets,
     )
     .await;
@@ -252,6 +252,7 @@ async fn step_4_rotate_helpers(
             .start(DeRecFlow::Unpair {
                 channel_id: channel,
                 memo: Some("rotating this helper out".to_owned()),
+                linked_channel_id: None,
             })
             .await
             .unwrap_or_else(|e| panic!("[{}] start(Unpair) failed: {e}", helper.peer.label));
@@ -432,14 +433,15 @@ async fn step_5_admit_first_replica(
 /// Lose the owner device again, now that the protected secret carries a
 /// replica roster.
 ///
-/// The roster travels *inside* the secret, so recovering the secret must
-/// restore group membership too — otherwise a recovered device would silently
-/// forget its own other devices.
+/// The roster travels inside the secret, but restore does not carry the group
+/// forward: restoring means the owner lost its devices. Each member is
+/// reported as dropped, and a device the owner still has joins again by
+/// pairing — here the surviving replica, reinstalled clean.
 async fn step_6_recover_with_a_replica_in_the_roster(
     owner: &mut StatelessPeer,
     owner_db: &mut Database,
     helpers: &mut [HelperDevice],
-    replicas: &[ReplicaDevice],
+    replicas: &mut [ReplicaDevice],
     expected: &[UserSecret],
 ) {
     let before = replica_ids(&owner.client(), SECRET_ID).await;
@@ -454,42 +456,44 @@ async fn step_6_recover_with_a_replica_in_the_roster(
     assert_eq!(
         recovered.replicas.as_ref().map(|g| g.members.len()),
         Some(2),
-        "the recovered secret carries the roster, which is how membership survives"
+        "the recovered secret still names the group's members"
     );
-
-    assert_eq!(
-        replica_ids(&owner.client(), SECRET_ID).await,
-        before,
-        "recovery must restore the replica roster, not just the user secrets"
+    assert!(
+        replica_ids(&owner.client(), SECRET_ID).await.is_empty(),
+        "restore drops the recovered group"
     );
     assert_eq!(
         snapshot_version(&owner.client(), SECRET_ID).await,
         Some(version),
         "the recovered version becomes the owner's snapshot"
     );
-    // Recovery leaves the owner with no share rows, exactly as in step 3 — but
-    // the roster came back with it, so this is still a two-member group.
-    assert_tables(
-        &owner.client(),
-        SECRET_ID,
-        "owner",
-        "step 6",
-        Tables {
-            channels: 5,
-            replica_members: 2,
-            secrets: 12,
-            shares: 0,
-            user_secrets: 1,
-            ..Default::default()
-        },
+
+    let replica = &mut replicas[0];
+    let clean_db = Database::open_isolated().await;
+    replica.peer.reinstall(clean_db.client());
+    replica.db = clean_db;
+    admit_replica(
+        owner,
+        helpers,
+        &[],
+        replica,
+        ChannelId(5500),
+        REPLICA_CONTACT_MODES[0],
     )
     .await;
+    assert_eq!(
+        replica_ids(&owner.client(), SECRET_ID).await,
+        before,
+        "the surviving device pairs again into a group of two"
+    );
+    assert_eq!(
+        replica_ids(&replica.peer.client(), SECRET_ID).await,
+        before,
+        "the re-paired device holds the same roster"
+    );
     assert_helpers(helpers, "step 6").await;
-    for replica in replicas.iter() {
-        assert_replica(replica, "step 6", 2, 5).await;
-    }
     println!(
-        "  step 6: owner recovered v{version} again — replica roster restored from the secret  ✓"
+        "  step 6: owner recovered v{version} again — group dropped, surviving replica re-paired  ✓"
     );
 }
 
@@ -1358,7 +1362,7 @@ async fn recover_from_helpers(
 
     let restore_events = owner
         .session()
-        .restore(&recovered, version, version)
+        .restore(&recovered, version, version, &[])
         .await
         .expect("owner.restore() failed");
     let recovery_channels: Vec<ChannelId> = restore_events

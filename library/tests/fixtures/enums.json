@@ -112,6 +112,10 @@
         {
           "name": "NoTransports",
           "wire": "NoTransports"
+        },
+        {
+          "name": "ReplicaGroupDropped",
+          "wire": "ReplicaGroupDropped"
         }
       ]
     },

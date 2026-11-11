@@ -442,8 +442,8 @@ func runDiscoveryFlow() {
 		{
 			SecretID: 0xABCD,
 			Versions: []discovery.VersionEntry{
-				{Version: 1, Description: "wallet seed"},
-				{Version: 2, Description: "wallet seed v2"},
+				{Version: 1, Description: "wallet seed", ChannelID: channelID},
+				{Version: 2, Description: "wallet seed v2", ChannelID: channelID},
 			},
 		},
 	}
@@ -463,6 +463,7 @@ func runDiscoveryFlow() {
 	for i := range secretList[0].Versions {
 		assertTrue(processed[0].Versions[i].Version == secretList[0].Versions[i].Version, "version mismatch at index %d", i)
 		assertTrue(processed[0].Versions[i].Description == secretList[0].Versions[i].Description, "description mismatch at index %d", i)
+		assertTrue(processed[0].Versions[i].ChannelID == secretList[0].Versions[i].ChannelID, "channel_id mismatch at index %d", i)
 	}
 
 	fmt.Println("Discovery flow test passed.")

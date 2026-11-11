@@ -336,24 +336,48 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
     let secret = checked.secret;
     use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, UserSecrets};
 
+    let group = checked.group.as_ref().zip(secret.replicas.as_ref());
+    let mut records = Vec::new();
+    let mut rings = Vec::new();
     for (helper, key) in secret.helpers.iter().zip(&checked.helper_keys) {
         let channel_id = ChannelId(helper.channel_id);
-        stores
-            .channels
-            .save(
-                secret_id,
-                ChannelRecord::Helper(HelperChannel {
-                    channel_id,
-                    transports: helper.transports.clone(),
-                    communication_info: helper.communication_info.clone(),
-                    peer_role: SenderKind::Helper,
-                    status: ChannelStatus::Paired,
-                    created_at: now_secs(),
-                    weight: helper.effective_weight(),
-                }),
-            )
-            .await?;
-        seat_ring(stores, secret_id, channel_id, key, version).await?;
+        records.push(ChannelRecord::Helper(HelperChannel {
+            channel_id,
+            transports: helper.transports.clone(),
+            communication_info: helper.communication_info.clone(),
+            peer_role: SenderKind::Helper,
+            status: ChannelStatus::Paired,
+            created_at: now_secs(),
+            weight: helper.effective_weight(),
+        }));
+        rings.push((
+            channel_id,
+            seated_ring(stores, secret_id, channel_id, key, version).await?,
+        ));
+    }
+    if let Some((group, roster)) = group {
+        for (member, (replica_id, role)) in roster.members.iter().zip(&group.members) {
+            records.push(ChannelRecord::Replica(ReplicaMember {
+                channel_id: group.channel_id,
+                replica_id: *replica_id,
+                transports: member.transports.clone(),
+                communication_info: member.communication_info.clone(),
+                // The roster is authoritative, including for this device's
+                // own row: a joiner's provisional role from pairing is
+                // corrected here.
+                role: *role,
+                status: ChannelStatus::Paired,
+                created_at: now_secs(),
+            }));
+        }
+        rings.push((
+            group.channel_id,
+            seated_ring(stores, secret_id, group.channel_id, &group.key, version).await?,
+        ));
+    }
+    stores.secrets.save_key_rings(secret_id, &rings).await?;
+    if !records.is_empty() {
+        stores.channels.save_many(secret_id, records).await?;
     }
 
     // Owner-side tracking shares, keyed exactly as the source keyed them so
@@ -380,32 +404,9 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
             .await?;
     }
 
-    let (Some(group), Some(roster)) = (checked.group.as_ref(), secret.replicas.as_ref()) else {
+    let Some((group, _)) = group else {
         return Ok(None);
     };
-
-    for (member, (replica_id, role)) in roster.members.iter().zip(&group.members) {
-        stores
-            .channels
-            .save(
-                secret_id,
-                ChannelRecord::Replica(ReplicaMember {
-                    channel_id: group.channel_id,
-                    replica_id: *replica_id,
-                    transports: member.transports.clone(),
-                    communication_info: member.communication_info.clone(),
-                    // The roster is authoritative, including for this device's
-                    // own row: a joiner's provisional role from pairing is
-                    // corrected here.
-                    role: *role,
-                    status: ChannelStatus::Paired,
-                    created_at: now_secs(),
-                }),
-            )
-            .await?;
-    }
-
-    seat_ring(stores, secret_id, group.channel_id, &group.key, version).await?;
 
     // Members present in this roster are up to date. Anything flagged as
     // leaving and now absent has completed its departure — reconciled by the
@@ -427,25 +428,25 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
     Ok(Some((group.channel_id, group.key.key.clone())))
 }
 
-/// Write `key` as the newest key of `channel_id`, with `version` pinned to
-/// its epoch and no other pin: this device holds only the copy it applies.
-/// A ring already past that epoch keeps its newer key and holds `key` as the
-/// pinned older one.
-async fn seat_ring<S: StoreSet>(
+/// The ring that makes `key` the newest key of `channel_id`, with `version`
+/// pinned to its epoch and no other pin: this device holds only the copy it
+/// applies. A ring already past that epoch keeps its newer key and holds
+/// `key` as the pinned older one.
+async fn seated_ring<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     secret_id: u64,
     channel_id: ChannelId,
     key: &ChannelKey,
     version: u32,
-) -> Result<()> {
-    let ring = match stores.secrets.key_ring(secret_id, channel_id).await? {
-        Some(held) if held.epoch() > key.epoch => held.retain_pins(|_| false).pinned(version, key),
-        _ => crate::protocol::KeyRing::restored(key, version),
-    };
-    stores
-        .secrets
-        .save_key_ring(secret_id, channel_id, &ring)
-        .await
+) -> Result<crate::protocol::KeyRing> {
+    Ok(
+        match stores.secrets.key_ring(secret_id, channel_id).await? {
+            Some(held) if held.epoch() > key.epoch => {
+                held.retain_pins(|_| false).pinned(version, key)
+            }
+            _ => crate::protocol::KeyRing::restored(key, version),
+        },
+    )
 }
 
 /// Inbound `StoreShareRequest` on a **replica** channel. The payload
@@ -1188,6 +1189,71 @@ mod tests {
                 panic!("a replica query must never return a helper record");
             };
             assert_eq!(member.transports[0].protocol, Protocol::Grpc as i32);
+        });
+    }
+
+    /// Hydrating a roster writes every channel record, helpers and members
+    /// alike, in one channel-store call, and every key ring, the group's
+    /// included, in one secret-store call.
+    #[test]
+    fn hydrate_writes_channels_and_key_rings_in_one_call_per_store() {
+        run_async(async {
+            use crate::extensions::secret_store::SecretStoreExt as _;
+            use crate::protocol::types::{HelperInfo, ReplicaInfo, Replicas};
+            let lf = LocalFixture::new(SECRET_ID);
+            let helper = |channel_id: u64| HelperInfo {
+                channel_id,
+                transports: vec![endpoint("https://helper.example")],
+                shared_key: vec![channel_id as u8; 32],
+                communication_info: HashMap::new(),
+                weight: 1,
+                key_epoch: 0,
+            };
+            let secret = Secret {
+                helpers: vec![helper(11), helper(12)],
+                secrets: Vec::new(),
+                replicas: Some(Replicas {
+                    channel_id: 21,
+                    members: vec![ReplicaInfo {
+                        replica_id: 0xCAFE,
+                        transports: vec![endpoint("https://replica.example")],
+                        role: ReplicaRole::Destination as i32,
+                        communication_info: HashMap::new(),
+                    }],
+                    shared_key: vec![0xCC; 32],
+                    key_epoch: 0,
+                }),
+                threshold: None,
+            };
+            let mut rig = StoreRig::new();
+
+            super::hydrate(
+                &mut rig.stores(),
+                &lf.local(),
+                4,
+                &super::check(&secret, &[]).expect("a well-formed roster"),
+                String::new(),
+                None,
+            )
+            .await
+            .expect("hydrates");
+
+            assert_eq!(*rig.channels.save_calls.lock().unwrap(), 0);
+            assert_eq!(*rig.channels.save_many_calls.lock().unwrap(), 1);
+            assert_eq!(*rig.secrets.save_calls.lock().unwrap(), 0);
+            assert_eq!(*rig.secrets.save_many_calls.lock().unwrap(), 1);
+            assert_eq!(rig.channels.helper_rows.lock().unwrap().len(), 2);
+            assert_eq!(rig.channels.member_rows.lock().unwrap().len(), 1);
+            for channel_id in [11, 12, 21] {
+                assert!(
+                    rig.secrets
+                        .key_ring(SECRET_ID, ChannelId(channel_id))
+                        .await
+                        .expect("read")
+                        .is_some(),
+                    "ring of {channel_id}"
+                );
+            }
         });
     }
 

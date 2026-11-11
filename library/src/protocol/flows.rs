@@ -25,6 +25,7 @@ use crate::Error;
 use crate::derec_message;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
+use crate::protocol::types::KeepRecoveryChannel;
 use crate::protocol::types::Secret;
 use crate::protocol::types::SharingRoundState;
 use crate::protocol::types::Target;
@@ -131,8 +132,13 @@ impl<
                 events.extend(self.auto_publish_after_replica_removal().await?);
                 Ok(events)
             }
-            DeRecFlow::Unpair { channel_id, memo } => {
-                self.start_unpair(channel_id, memo, round).await
+            DeRecFlow::Unpair {
+                channel_id,
+                memo,
+                linked_channel_id,
+            } => {
+                self.start_unpair(channel_id, memo, linked_channel_id, round)
+                    .await
             }
             DeRecFlow::UpdateChannelInfo {
                 target,
@@ -190,7 +196,7 @@ impl<
     /// re-pair with helpers on a fresh channel-id namespace
     ///   → start(RecoverSecret { secret_id, version })
     ///   → SecretRecovered { secret } event arrives
-    ///   → DeRecProtocol::restore(&secret, version, newest_version)
+    ///   → DeRecProtocol::restore(&secret, version, newest_version, &keep)
     /// ```
     ///
     /// `newest_version` is the newest version any helper reported for
@@ -209,13 +215,13 @@ impl<
     /// errors below for exactly what is checked.
     ///
     /// On success: canonical helper channels are persisted with their
-    /// `SharedKey`; canonical replica channels are persisted
-    /// with the group key from `secret.replicas.shared_key`;
+    /// `SharedKey`, except those `keep_recovery_channels` replaces with a
+    /// recovery channel; no replica group is written;
     /// the user-secret snapshot of the recovered secrets is committed at
     /// `newest_version` with the roster's threshold
     /// ([`Secret::threshold`](crate::protocol::types::Secret::threshold));
-    /// every channel under `self.secret_id` at no roster id (i.e. the
-    /// recovery-mode channels) is unpaired as `start(`[`DeRecFlow::Unpair`]`)`
+    /// every other channel under `self.secret_id` at no roster id (i.e. the
+    /// recovery-mode channels not kept) is unpaired as `start(`[`DeRecFlow::Unpair`]`)`
     /// would, under the configured
     /// [`with_unpair_ack`](crate::protocol::DeRecProtocolBuilder::with_unpair_ack):
     /// the returned events carry an `UnpairStarted` per channel, and under
@@ -226,7 +232,7 @@ impl<
     /// restored helpers only, since a channel still being unpaired is
     /// never a publish target.
     ///
-    /// A helper or replica member whose `transports` is empty gets no
+    /// A helper whose `transports` is empty gets no
     /// channel — there would be nothing to send to. It is reported as
     /// [`DeRecEvent::PeerNotRestored`] in the returned events and the rest
     /// of the roster is restored; it is neither a conflict nor wiped. See
@@ -273,12 +279,27 @@ impl<
     /// latest, without sending any Helper a share; see
     /// [`DeRecFlow::ProtectSecret`] for that case.
     ///
-    /// When `secret.replicas` carries a group, that publish additionally
-    /// requires a configured `replica_id` the roster names: restore
-    /// deliberately does not adopt the roster's identity, since claiming
-    /// it is a takeover with its own convergence rules. Without one the
-    /// publish fails with [`crate::Error::ReplicaIdNotConfigured`] and
-    /// no share reaches any Helper.
+    /// Restore never carries a recovered replica group forward: each member
+    /// is reported as [`DeRecEvent::PeerNotRestored`] with
+    /// [`NotRestoredReason::ReplicaGroupDropped`](crate::protocol::NotRestoredReason::ReplicaGroupDropped),
+    /// and that publish goes out as a lone owner's. Devices the owner still
+    /// has join again by pairing.
+    ///
+    /// # Keeping recovery channels
+    ///
+    /// Each pair in `keep_recovery_channels` makes restore keep a recovery
+    /// channel in place of its roster helper's old channel: the old channel
+    /// is not written, and the recovery channel stays `Paired` with its own
+    /// endpoint and key, takes the roster entry's weight, and is not
+    /// unpaired. Only this device holds a recovery channel's key, while every
+    /// lost device still holds the old one, so keeping it is what lets the
+    /// owner cut the lost devices off: publish once on the kept channels,
+    /// then retire each old channel with a linked
+    /// `start(`[`DeRecFlow::Unpair`]`)`. The version entries Discovery
+    /// reports name the channel each share is stored on, which is how the
+    /// application learns which old channel a recovery channel replaces.
+    /// Helpers not named in any pair are restored on their old channel, as
+    /// with an empty slice.
     ///
     /// # Errors
     ///
@@ -288,12 +309,16 @@ impl<
     /// - [`RestoreError::AlreadyRestored`](crate::protocol::RestoreError::AlreadyRestored) when a user-secret
     ///   snapshot exists for this `secret_id`.
     /// - [`RestoreError::Conflict`](crate::protocol::RestoreError::Conflict) when one or more channels live
-    ///   at the helper / replica ids restore is about to write.
+    ///   at the helper ids restore is about to write.
     /// - [`RestoreError::Invariant`](crate::protocol::RestoreError::Invariant) when the recovered `Secret`
     ///   is internally inconsistent (e.g. non-empty `replicas` with
     ///   empty `replicas.shared_key`, a helper key that is not 32
     ///   bytes, or a threshold below `2`). Every roster entry is checked,
     ///   including one skipped for having no endpoint.
+    /// - [`RestoreError::InvalidKeptChannel`](crate::protocol::RestoreError::InvalidKeptChannel)
+    ///   when a pair in `keep_recovery_channels` names a roster id that is
+    ///   not a helper in the roster, a recovery id that is not a `Paired`
+    ///   channel to a Helper outside the roster, or an id another pair names.
     ///
     /// Store I/O failures mid-restore propagate as the underlying
     /// [`crate::Error::ChannelStore`] or [`crate::Error::SecretStore`]
@@ -306,6 +331,7 @@ impl<
         secret: &Secret,
         recovered_version: u32,
         newest_version: u32,
+        keep_recovery_channels: &[KeepRecoveryChannel],
     ) -> Result<Vec<DeRecEvent>> {
         handlers::restore::restore(
             &mut borrow_stores!(self),
@@ -313,6 +339,7 @@ impl<
             secret,
             recovered_version,
             newest_version,
+            keep_recovery_channels,
             self.unpair_ack,
         )
         .await
@@ -554,8 +581,30 @@ impl<
         &mut self,
         channel_id: ChannelId,
         memo: Option<String>,
+        linked_channel_id: Option<ChannelId>,
         round: &Round<'_>,
     ) -> Result<Vec<DeRecEvent>> {
+        if let Some(target) = linked_channel_id {
+            if target == channel_id || target.0 == 0 {
+                return Err(Error::InvalidInput(
+                    "a linked unpair names a channel other than the one it travels on",
+                ));
+            }
+            // It retires a channel this device no longer holds. Naming one
+            // still in use would take that helper out of every flow on the
+            // strength of another helper's answer.
+            if self
+                .channel_store
+                .load_helper(self.secret_id, target)
+                .await?
+                .is_some()
+            {
+                return Err(Error::InvalidInput(
+                    "a linked unpair names a channel this device still holds",
+                ));
+            }
+        }
+        let unpaired = linked_channel_id.unwrap_or(channel_id);
         self.channel_store
             .require_role(
                 self.secret_id,
@@ -563,11 +612,12 @@ impl<
                 SenderKind::Helper,
             )
             .await?;
-        let share_holders = self.share_holders([channel_id]).await?;
+        let share_holders = self.share_holders([unpaired]).await?;
         let mut events = handlers::unpairing::start(
             &mut borrow_stores!(self),
             &local!(self),
             channel_id,
+            unpaired,
             memo,
             self.unpair_ack,
             now_secs(),

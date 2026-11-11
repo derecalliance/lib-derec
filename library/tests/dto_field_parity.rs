@@ -134,13 +134,13 @@ fn typescript_surfaces_declare_every_dto_field() {
             result, mlkem_encapsulation_key, ecies_public_key, nonce, timestamp,
             fingerprint_commitment,
         }
-        VersionListEntry { version, version_description }
+        VersionListEntry { version, version_description, channel_id }
         VersionList { secret_id, versions }
         GetSecretIdsVersionsRequestMessage {
             timestamp, reply_to, replica_id,
         }
         GetSecretIdsVersionsResponseMessage { result, secret_list, timestamp, replica_id }
-        VersionEntry { version, description }
+        VersionEntry { version, description, channel_id }
         SecretVersionEntry { secret_id, versions }
         SiblingHash { is_left, hash }
         CommittedDeRecShare { de_rec_share, commitment, merkle_path }
@@ -156,8 +156,8 @@ fn typescript_surfaces_declare_every_dto_field() {
             share_algorithm, committed_de_rec_share, result, timestamp, secret_id, version,
             replica_id,
         }
-        UnpairRequestMessage { memo, timestamp, reply_to, replica_id }
-        UnpairResponseMessage { result, timestamp }
+        UnpairRequestMessage { memo, timestamp, reply_to, replica_id, channel_id }
+        UnpairResponseMessage { result, timestamp, channel_id }
         VerifyShareRequestMessage {
             secret_id, version, nonce, timestamp, reply_to,
         }

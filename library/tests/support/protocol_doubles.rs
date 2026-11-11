@@ -64,18 +64,23 @@ impl DeRecChannelStore for InMemChannelStore {
     }
 
     fn save(&mut self, sid: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
-        match record {
-            ChannelRecord::Helper(h) => {
-                self.helper_rows
-                    .lock()
-                    .unwrap()
-                    .insert((sid, h.channel_id.0), h);
-            }
-            ChannelRecord::Replica(r) => {
-                self.member_rows
-                    .lock()
-                    .unwrap()
-                    .insert((sid, r.replica_id.0), r);
+        self.save_many(sid, vec![record])
+    }
+    fn save_many(&mut self, sid: u64, records: Vec<ChannelRecord>) -> ChannelStoreFuture<'_, ()> {
+        for record in records {
+            match record {
+                ChannelRecord::Helper(h) => {
+                    self.helper_rows
+                        .lock()
+                        .unwrap()
+                        .insert((sid, h.channel_id.0), h);
+                }
+                ChannelRecord::Replica(r) => {
+                    self.member_rows
+                        .lock()
+                        .unwrap()
+                        .insert((sid, r.replica_id.0), r);
+                }
             }
         }
         Box::pin(future::ready(Ok(())))
@@ -241,6 +246,12 @@ impl DeRecChannelStore for FlakyChannelStore {
         }
         self.inner.save(sid, record)
     }
+    fn save_many(&mut self, sid: u64, records: Vec<ChannelRecord>) -> ChannelStoreFuture<'_, ()> {
+        if *self.fail_save.lock().unwrap() {
+            return channel_backend_error();
+        }
+        self.inner.save_many(sid, records)
+    }
     fn remove(&mut self, sid: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
         if *self.fail_remove.lock().unwrap() {
             return channel_backend_error();
@@ -337,19 +348,32 @@ impl DeRecSecretStore for InMemSecretStore {
         Box::pin(future::ready(Ok(out)))
     }
     fn save(&mut self, sid: u64, cid: ChannelId, value: SecretValue) -> SecretStoreFuture<'_, ()> {
-        let kind = match &value {
+        self.save_many(sid, vec![(cid, value)])
+    }
+    fn save_many(
+        &mut self,
+        sid: u64,
+        entries: Vec<(ChannelId, SecretValue)>,
+    ) -> SecretStoreFuture<'_, ()> {
+        let fail = *self.fail_save.lock().unwrap();
+        let kind_of = |value: &SecretValue| match value {
             SecretValue::SharedKey(_) => SecretKind::SharedKey,
             SecretValue::PairingSecret(_) => SecretKind::PairingSecret,
             SecretValue::PairingContact(_) => SecretKind::PairingContact,
             SecretValue::KeyRing(_) => SecretKind::KeyRing,
         };
-        if *self.fail_save.lock().unwrap() == Some(kind) {
+        if entries
+            .iter()
+            .any(|(_, value)| fail == Some(kind_of(value)))
+        {
             return Box::pin(std::future::ready(Err(SecretStoreError::Backend(
                 "secret store unavailable".into(),
             ))));
         }
-        let k = kind as u8;
-        self.data.lock().unwrap().insert((sid, cid.0, k), value);
+        let mut data = self.data.lock().unwrap();
+        for (cid, value) in entries {
+            data.insert((sid, cid.0, kind_of(&value) as u8), value);
+        }
         Box::pin(future::ready(Ok(())))
     }
     fn remove(&mut self, sid: u64, cid: ChannelId, kind: SecretKind) -> SecretStoreFuture<'_, ()> {

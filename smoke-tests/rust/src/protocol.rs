@@ -18,16 +18,17 @@ use derec_library::primitives::pairing::PairingError;
 use derec_library::primitives::sharing::SharingError;
 use derec_library::protocol::types::{
     ChannelQuery, ChannelRecord, ChannelShare, ChannelStatus, HelperChannel, HelperFilter,
-    ReplicaFilter, ReplicaInfo, ReplicaMember, ReplicaRole, Secret, Target, Timeouts, UserSecret,
-    UserSecrets,
+    KeepRecoveryChannel, ReplicaFilter, ReplicaInfo, ReplicaMember, ReplicaRole, Secret, Target,
+    Timeouts, UserSecret, UserSecrets,
 };
 use derec_library::protocol::{
     AutoAcceptPolicy, ChannelStoreFuture, CorruptionReason, DeRecChannelStore, DeRecEvent,
     DeRecFlow, DeRecProtocol, DeRecProtocolBuilder, DeRecSecretStore, DeRecShareStore,
     DeRecStateStore, DeRecStores, DeRecTransport, DeRecUserSecretStore, ExpiredChannelCleanup,
-    IgnoreReason, MissingPolicy, PendingActionKind, RecoveryHelper, Refusal, RestoreError,
-    SecretKind, SecretStoreError, SecretStoreFuture, SecretValue, Share, ShareStoreError,
-    ShareStoreFuture, StateItem, StateKey, StateStoreFuture, TransportFuture, VerifyFailureReason,
+    IgnoreReason, MissingPolicy, NotRestoredReason, PendingActionKind, RecoveryHelper, Refusal,
+    RestoreError, SecretKind, SecretStoreError, SecretStoreFuture, SecretValue, Share,
+    ShareStoreError, ShareStoreFuture, StateItem, StateKey, StateStoreFuture, TransportFuture,
+    VerifyFailureReason,
 };
 use derec_library::transport::TransportValidationError;
 use derec_library::types::{ChannelId, ReplicaId};
@@ -77,6 +78,8 @@ pub async fn run_all() {
     run_invalid_weight_flow().await;
     run_sticky_weights_flow().await;
     run_recover_restore_republish_flow().await;
+    run_restore_on_recovery_channels_flow().await;
+    run_linked_unpair_before_reshare_is_refused_flow().await;
     run_replica_secret_refused_flow().await;
     run_corrupted_share_flow().await;
     run_silent_helper_recovery_flow().await;
@@ -144,12 +147,22 @@ impl DeRecChannelStore for InMemoryChannelStore {
     }
 
     fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
-        match record {
-            ChannelRecord::Helper(h) => {
-                self.helper_rows.insert((secret_id, h.channel_id.0), h);
-            }
-            ChannelRecord::Replica(r) => {
-                self.member_rows.insert((secret_id, r.replica_id.0), r);
+        self.save_many(secret_id, vec![record])
+    }
+
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        records: Vec<ChannelRecord>,
+    ) -> ChannelStoreFuture<'_, ()> {
+        for record in records {
+            match record {
+                ChannelRecord::Helper(h) => {
+                    self.helper_rows.insert((secret_id, h.channel_id.0), h);
+                }
+                ChannelRecord::Replica(r) => {
+                    self.member_rows.insert((secret_id, r.replica_id.0), r);
+                }
             }
         }
         Box::pin(future::ready(Ok(())))
@@ -307,13 +320,23 @@ impl DeRecSecretStore for InMemorySecretStore {
         channel_id: ChannelId,
         value: SecretValue,
     ) -> SecretStoreFuture<'_, ()> {
-        let kind = match &value {
-            SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
-            SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
-            SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
-            SecretValue::KeyRing(_) => SecretKind::KeyRing as u8,
-        };
-        self.data.insert((secret_id, channel_id.0, kind), value);
+        self.save_many(secret_id, vec![(channel_id, value)])
+    }
+
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, SecretValue)>,
+    ) -> SecretStoreFuture<'_, ()> {
+        for (channel_id, value) in entries {
+            let kind = match &value {
+                SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
+                SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
+                SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
+                SecretValue::KeyRing(_) => SecretKind::KeyRing as u8,
+            };
+            self.data.insert((secret_id, channel_id.0, kind), value);
+        }
         Box::pin(future::ready(Ok(())))
     }
 
@@ -3342,7 +3365,7 @@ async fn run_replica_verifies_only_synced_versions_flow() {
     // destroys the share map the sync just wrote, and restore does not put it
     // back. The destination then cannot verify a version it could verify a
     // moment earlier.
-    let restored = bob.protocol.restore(&synced_secret, v2, v2).await;
+    let restored = bob.protocol.restore(&synced_secret, v2, v2, &[]).await;
     assert!(
         matches!(restored, Err(Error::Restore(RestoreError::AlreadyRestored))),
         "a synced destination is already provisioned; restore must refuse it, got {restored:?}"
@@ -3700,7 +3723,7 @@ async fn run_discovery_and_recovery_flow() {
     );
     restored_owner
         .protocol
-        .restore(&recovered, recover_version, recover_version)
+        .restore(&recovered, recover_version, recover_version, &[])
         .await
         .expect("restore on a fresh peer must succeed");
 
@@ -4334,7 +4357,7 @@ async fn run_sticky_threshold_flow() {
         Peer::with_secret_id("restored-owner", "https://restored.example.com", owner_sid);
     restored
         .protocol
-        .restore(&recovered, 3, 3)
+        .restore(&recovered, 3, 3, &[])
         .await
         .expect("restore on a fresh peer must succeed");
     let snapshot = restored
@@ -4525,7 +4548,7 @@ async fn run_key_rotation_flow() {
     let mut device = Peer::rotating("device", OWNER_URI);
     device
         .protocol
-        .restore(&recovered, 2, 2)
+        .restore(&recovered, 2, 2, &[])
         .await
         .expect("restore on a fresh device must succeed");
     for channel_id in channels {
@@ -5584,7 +5607,7 @@ async fn run_recover_restore_republish_flow() {
 
     let restore_events = device
         .protocol
-        .restore(&recovered, v1, newest)
+        .restore(&recovered, v1, newest, &[])
         .await
         .expect("restore succeeds");
     assert!(
@@ -5761,6 +5784,426 @@ async fn run_recover_restore_republish_flow() {
     );
 
     println!("Protocol recover → restore → republish flow test passed.");
+}
+
+/// Recover on a new device, restore keeping the recovery channels, publish,
+/// then retire the old channels with a linked unpair. Every version Discovery
+/// reports names the old channel it is stored on, which maps each recovery
+/// channel to the roster helper it replaces. The recovered replica group is
+/// dropped, and the old devices — which still hold the old channels' keys —
+/// reach no helper afterwards.
+async fn run_restore_on_recovery_channels_flow() {
+    println!("=== Protocol restore on recovery channels flow test ===");
+
+    const SECRET_ID: u64 = 0x2E6;
+    let mut source = Peer::with_secret_id_and_replica_id(
+        "lost-source",
+        "https://lost-source.example.com",
+        SECRET_ID,
+        0x5011,
+    );
+    let mut replica = Peer::with_secret_id_and_replica_id(
+        "lost-replica",
+        "https://lost-replica.example.com",
+        SECRET_ID,
+        0x5012,
+    );
+    let mut helper_a = Peer::new("helper-a", "https://helper-a-keep.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b-keep.example.com");
+    let old_a = pair(&mut source, &mut helper_a, ChannelId(1)).await;
+    let old_b = pair(&mut source, &mut helper_b, ChannelId(2)).await;
+    let group = pair_replica_handshake(&mut source, &mut replica, ChannelId(3)).await;
+    cross_confirm_fingerprint(&mut source, &mut replica, group).await;
+    pump_many(&mut [&mut source, &mut replica, &mut helper_a, &mut helper_b]).await;
+    let version = protect_across(
+        &mut source,
+        &mut [&mut replica, &mut helper_a, &mut helper_b],
+        "kept secret",
+    )
+    .await;
+
+    // Both devices are lost. A new one pairs with each helper afresh, and
+    // each helper links the owner's old channel to the new one.
+    let mut device = Peer::with_secret_id("device", "https://device-keep.example.com", SECRET_ID);
+    let recovery_a = pair(&mut device, &mut helper_a, ChannelId(100)).await;
+    let recovery_b = pair(&mut device, &mut helper_b, ChannelId(101)).await;
+    for (helper, old, recovery) in [
+        (&mut helper_a, old_a, recovery_a),
+        (&mut helper_b, old_b, recovery_b),
+    ] {
+        let helper_sid = helper.protocol.secret_id();
+        helper
+            .protocol
+            .channel_store
+            .link_channel(helper_sid, old, recovery)
+            .await
+            .expect("link the recovery channel to the old one");
+    }
+
+    device
+        .protocol
+        .start(DeRecFlow::Discovery {
+            target: Target::Many(vec![recovery_a, recovery_b]),
+        })
+        .await
+        .expect("device start(Discovery) failed");
+    let mut owning: HashMap<ChannelId, ChannelId> = HashMap::new();
+    for event in pump_many(&mut [&mut device, &mut helper_a, &mut helper_b]).await {
+        if let DeRecEvent::SecretsDiscovered {
+            channel_id,
+            secrets,
+        } = event
+        {
+            let entry = secrets
+                .iter()
+                .find(|s| s.secret_id == SECRET_ID)
+                .expect("the helper reports the owner's secret");
+            let held = entry
+                .versions
+                .iter()
+                .find(|v| v.version == version)
+                .expect("the helper reports the published version");
+            owning.insert(channel_id, held.channel_id);
+        }
+    }
+    assert_eq!(
+        owning,
+        HashMap::from([(recovery_a, old_a), (recovery_b, old_b)]),
+        "each version names the old channel its share is stored on"
+    );
+    println!("  Discovery maps each recovery channel to the old channel it replaces  ✓");
+
+    device
+        .protocol
+        .start(DeRecFlow::RecoverSecret {
+            secret_id: SECRET_ID,
+            version,
+        })
+        .await
+        .expect("device start(RecoverSecret) failed");
+    let recovered = pump_many(&mut [&mut device, &mut helper_a, &mut helper_b])
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            DeRecEvent::SecretRecovered { secret } => Some(secret),
+            _ => None,
+        })
+        .expect("RecoverSecret must surface SecretRecovered");
+    assert!(
+        recovered.replicas.is_some(),
+        "the recovered roster carries the replica group"
+    );
+
+    let keep: Vec<KeepRecoveryChannel> = owning
+        .iter()
+        .map(|(&recovery, &old)| KeepRecoveryChannel {
+            roster_channel_id: old,
+            recovery_channel_id: recovery,
+        })
+        .collect();
+    let restore_events = device
+        .protocol
+        .restore(&recovered, version, version, &keep)
+        .await
+        .expect("restore keeping the recovery channels succeeds");
+    let mut dropped: Vec<u64> = restore_events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::PeerNotRestored {
+                replica_id: Some(id),
+                reason: NotRestoredReason::ReplicaGroupDropped,
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    dropped.sort_unstable();
+    assert_eq!(
+        dropped,
+        vec![0x5011, 0x5012],
+        "every member of the recovered group is reported as dropped"
+    );
+    assert!(
+        !restore_events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::UnpairStarted { .. })),
+        "the kept recovery channels are not unpaired, got {restore_events:?}"
+    );
+    for (recovery, old) in [(recovery_a, old_a), (recovery_b, old_b)] {
+        let kept = device
+            .protocol
+            .channel_store
+            .load(
+                SECRET_ID,
+                ChannelQuery::Helper {
+                    channel_id: recovery,
+                },
+            )
+            .await
+            .expect("device channel load failed")
+            .and_then(|record| record.as_helper().cloned())
+            .expect("the recovery channel is kept");
+        assert_eq!(kept.status, ChannelStatus::Paired);
+        assert!(
+            device
+                .protocol
+                .channel_store
+                .load(SECRET_ID, ChannelQuery::Helper { channel_id: old })
+                .await
+                .expect("device channel load failed")
+                .is_none(),
+            "the old channel {old:?} is not written"
+        );
+    }
+    let members = device
+        .protocol
+        .channel_store
+        .replicas(SECRET_ID, ReplicaFilter::default())
+        .await
+        .expect("device roster load failed");
+    assert!(members.is_empty(), "no replica group is written");
+    println!("  restore keeps both recovery channels and drops the replica group  ✓");
+
+    let published = protect_across(
+        &mut device,
+        &mut [&mut helper_a, &mut helper_b],
+        "kept secret",
+    )
+    .await;
+    for channel_id in [recovery_a, recovery_b] {
+        let rows = device
+            .protocol
+            .share_store
+            .load(SECRET_ID, channel_id, &[published])
+            .await
+            .expect("device share load failed");
+        assert_eq!(rows.len(), 1, "the publish reached {channel_id:?}");
+    }
+    println!(
+        "  the restored device publishes v{published} on the kept channels as a lone owner  ✓"
+    );
+
+    for (recovery, old) in [(recovery_a, old_a), (recovery_b, old_b)] {
+        device
+            .protocol
+            .start(DeRecFlow::Unpair {
+                channel_id: recovery,
+                memo: None,
+                linked_channel_id: Some(old),
+            })
+            .await
+            .expect("device start(Unpair) of the old channel failed");
+    }
+    let unpaired: HashSet<ChannelId> = pump_many(&mut [&mut device, &mut helper_a, &mut helper_b])
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            DeRecEvent::Unpaired { channel_id } => Some(channel_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        unpaired,
+        HashSet::from([old_a, old_b]),
+        "the linked unpairs drop only the old channels"
+    );
+    for (helper, old, recovery) in [
+        (&helper_a, old_a, recovery_a),
+        (&helper_b, old_b, recovery_b),
+    ] {
+        let helper_sid = helper.protocol.secret_id();
+        let channels = &helper.protocol.channel_store;
+        assert!(
+            channels
+                .load(helper_sid, ChannelQuery::Helper { channel_id: old })
+                .await
+                .expect("helper channel load failed")
+                .is_none(),
+            "{}: the old channel is gone",
+            helper.label
+        );
+        assert!(
+            channels
+                .load(
+                    helper_sid,
+                    ChannelQuery::Helper {
+                        channel_id: recovery
+                    }
+                )
+                .await
+                .expect("helper channel load failed")
+                .is_some(),
+            "{}: the kept channel stays",
+            helper.label
+        );
+    }
+    println!("  linked unpairs retire both old channels at the helpers  ✓");
+
+    // The lost source still runs and publishes; no helper holds a key for
+    // its channels any more, so nothing it sends is accepted.
+    source
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![10],
+                name: "stale".to_owned(),
+                data: b"stale".to_vec(),
+            }],
+            description: None,
+            weights: HashMap::new(),
+            threshold: None,
+        })
+        .await
+        .expect("the lost source still starts a round");
+    let mut refused = 0;
+    for (endpoint, bytes) in source.drain() {
+        let helper = if endpoint.uri == helper_a.uri {
+            &mut helper_a
+        } else if endpoint.uri == helper_b.uri {
+            &mut helper_b
+        } else {
+            continue;
+        };
+        assert!(
+            helper.protocol.process(&bytes).await.is_err(),
+            "{} must not accept a message on a retired channel",
+            helper.label
+        );
+        assert!(
+            helper.drain().is_empty(),
+            "{} answers nothing",
+            helper.label
+        );
+        refused += 1;
+    }
+    assert_eq!(
+        refused, 2,
+        "the lost source reached both helpers and was refused by both"
+    );
+    println!("  the lost source's round reaches no helper  ✓");
+
+    device
+        .protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id: SECRET_ID,
+            version: published,
+            target: Target::All,
+        })
+        .await
+        .expect("device start(VerifyShares) failed");
+    let verified: HashSet<ChannelId> = pump_many(&mut [&mut device, &mut helper_a, &mut helper_b])
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ShareVerified { channel_id, .. } => Some(channel_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        verified,
+        HashSet::from([recovery_a, recovery_b]),
+        "both kept channels still verify"
+    );
+    println!("  both kept channels verify after the old ones are retired  ✓");
+
+    println!("Protocol restore on recovery channels flow test passed.");
+}
+
+/// A helper refuses a linked unpair until a share is stored on the channel it
+/// arrives on: before the restored device publishes, the old channel may hold
+/// that helper's only share for the owner.
+async fn run_linked_unpair_before_reshare_is_refused_flow() {
+    println!("=== Protocol linked unpair before reshare is refused flow test ===");
+
+    const SECRET_ID: u64 = 0x2E7;
+    let mut lost = Peer::with_secret_id("lost", "https://lost-early.example.com", SECRET_ID);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a-early.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b-early.example.com");
+    let old_a = pair(&mut lost, &mut helper_a, ChannelId(1)).await;
+    let old_b = pair(&mut lost, &mut helper_b, ChannelId(2)).await;
+    let version = protect_across(&mut lost, &mut [&mut helper_a, &mut helper_b], "early").await;
+    drop(lost);
+
+    let mut device = Peer::with_secret_id("device", "https://device-early.example.com", SECRET_ID);
+    let recovery_a = pair(&mut device, &mut helper_a, ChannelId(100)).await;
+    let recovery_b = pair(&mut device, &mut helper_b, ChannelId(101)).await;
+    for (helper, old, recovery) in [
+        (&mut helper_a, old_a, recovery_a),
+        (&mut helper_b, old_b, recovery_b),
+    ] {
+        let helper_sid = helper.protocol.secret_id();
+        helper
+            .protocol
+            .channel_store
+            .link_channel(helper_sid, old, recovery)
+            .await
+            .expect("link the recovery channel to the old one");
+    }
+    device
+        .protocol
+        .start(DeRecFlow::RecoverSecret {
+            secret_id: SECRET_ID,
+            version,
+        })
+        .await
+        .expect("device start(RecoverSecret) failed");
+    let recovered = pump_many(&mut [&mut device, &mut helper_a, &mut helper_b])
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            DeRecEvent::SecretRecovered { secret } => Some(secret),
+            _ => None,
+        })
+        .expect("RecoverSecret must surface SecretRecovered");
+    device
+        .protocol
+        .restore(
+            &recovered,
+            version,
+            version,
+            &[
+                KeepRecoveryChannel {
+                    roster_channel_id: old_a,
+                    recovery_channel_id: recovery_a,
+                },
+                KeepRecoveryChannel {
+                    roster_channel_id: old_b,
+                    recovery_channel_id: recovery_b,
+                },
+            ],
+        )
+        .await
+        .expect("restore keeping the recovery channels succeeds");
+
+    device
+        .protocol
+        .start(DeRecFlow::Unpair {
+            channel_id: recovery_a,
+            memo: None,
+            linked_channel_id: Some(old_a),
+        })
+        .await
+        .expect("device start(Unpair) of the old channel failed");
+    let events = pump_many(&mut [&mut device, &mut helper_a, &mut helper_b]).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DeRecEvent::UnpairRejected { channel_id, status, .. }
+                if *channel_id == old_a && *status == StatusEnum::Fail as i32
+        )),
+        "the helper refuses the linked unpair before a share is stored on the kept channel, got {events:?}"
+    );
+    let helper_sid = helper_a.protocol.secret_id();
+    let held = helper_a
+        .protocol
+        .share_store
+        .load(helper_sid, old_a, &[])
+        .await
+        .expect("helper share load failed");
+    assert!(!held.is_empty(), "the old channel keeps its share");
+    println!("  a linked unpair before the reshare → UnpairRejected(FAIL), old share kept  ✓");
+
+    println!("Protocol linked unpair before reshare is refused flow test passed.");
 }
 
 /// A replica destination's library refuses a copy whose share map does not
@@ -6237,7 +6680,7 @@ async fn run_restore_keeps_helper_duties_flow() {
 
     let restore_events = device
         .protocol
-        .restore(&recovered, version, version)
+        .restore(&recovered, version, version, &[])
         .await
         .expect("restore succeeds");
     let touched: Vec<ChannelId> = restore_events
@@ -6792,6 +7235,7 @@ async fn run_unpairing_flow() {
         .start(DeRecFlow::Unpair {
             channel_id,
             memo: Some("decommissioning".to_owned()),
+            linked_channel_id: None,
         })
         .await
         .expect("owner start(Unpair) failed");
@@ -6845,6 +7289,7 @@ async fn run_unpairing_flow() {
         .start(DeRecFlow::Unpair {
             channel_id: helper_init_channel,
             memo: Some("helper trying to unpair".to_owned()),
+            linked_channel_id: None,
         })
         .await;
     assert!(
@@ -7438,6 +7883,7 @@ async fn run_unpair_republishes_flow() {
         .start(DeRecFlow::Unpair {
             channel_id: channel_c,
             memo: None,
+            linked_channel_id: None,
         })
         .await
         .expect("owner start(Unpair) failed");
@@ -7469,6 +7915,7 @@ async fn run_unpair_republishes_flow() {
         .start(DeRecFlow::Unpair {
             channel_id: channel_b,
             memo: None,
+            linked_channel_id: None,
         })
         .await
         .expect("owner start(Unpair) failed");

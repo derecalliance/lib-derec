@@ -104,6 +104,8 @@ internal static class Protocol
         RunOrchestratorDisputedRecoveryTest();
         RunOrchestratorConflictingRecoveryTest();
         RunRestoreKeepsHelperDutiesTest();
+        RunRestoreOnRecoveryChannelsTest();
+        RunLinkedUnpairBeforeReshareIsRefusedTest();
         RunAbandonedReplicaPairingTest();
         RunContactOnTheGroupChannelTest();
         RunPairingExpiryTest();
@@ -1175,7 +1177,7 @@ internal static class Protocol
         // snapshot is recorded at the newest one, so the next publish numbers
         // above it.
         uint newest = v3 + 2;
-        restored.Protocol.RestoreAsync(recovered.Secret, v3, newest).GetAwaiter().GetResult();
+        restored.Protocol.RestoreAsync(recovered.Secret, v3, newest, []).GetAwaiter().GetResult();
         var restoredSnapshot = restored.UserSecretStore.LoadLatest(secretId);
         if (restoredSnapshot?.Threshold != 3)
             throw new InvalidOperationException($"restore must keep t=3; got {restoredSnapshot?.Threshold}");
@@ -2194,7 +2196,7 @@ internal static class Protocol
         owner.Dispose();
 
         using var device = MakeNode("Device", ownerUri, new NodeOptions(SecretId: secretId, KeyRotation: true));
-        device.Protocol.RestoreAsync(recovered.Secret, version: 2, newestVersion: 2).GetAwaiter().GetResult();
+        device.Protocol.RestoreAsync(recovered.Secret, version: 2, newestVersion: 2, keepRecoveryChannels: []).GetAwaiter().GetResult();
         foreach (var (channel, _) in helpers)
         {
             uint restoredEpoch = StoredKeyEpoch(device, secretId, channel);
@@ -2488,7 +2490,7 @@ internal static class Protocol
         if (recovered.Secret.Threshold != DefaultThreshold)
             throw new InvalidOperationException(
                 $"the recovered roster must carry t={DefaultThreshold}; got {recovered.Secret.Threshold}");
-        var restoreEvents = restored.Protocol.RestoreAsync(recovered.Secret, version: 1, newestVersion: 1).GetAwaiter().GetResult();
+        var restoreEvents = restored.Protocol.RestoreAsync(recovered.Secret, version: 1, newestVersion: 1, keepRecoveryChannels: []).GetAwaiter().GetResult();
         Console.WriteLine($"  RestoreAsync returned {restoreEvents.Count} event(s)  ✓");
 
         var snapshot = restored.UserSecretStore.LoadLatest(secretId)
@@ -2528,7 +2530,7 @@ internal static class Protocol
         DeRecException? conflict = null;
         try
         {
-            conflicted.Protocol.RestoreAsync(recovered.Secret, version: 1, newestVersion: 1).GetAwaiter().GetResult();
+            conflicted.Protocol.RestoreAsync(recovered.Secret, version: 1, newestVersion: 1, keepRecoveryChannels: []).GetAwaiter().GetResult();
         }
         catch (DeRecException e)
         {
@@ -2867,7 +2869,7 @@ internal static class Protocol
         var recovered = PumpAll(recoveryScope).OfType<SecretRecoveredEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException("the device must recover its own secret");
 
-        var restoreEvents = device.Protocol.RestoreAsync(recovered.Secret, version, version).GetAwaiter().GetResult();
+        var restoreEvents = device.Protocol.RestoreAsync(recovered.Secret, version, version, []).GetAwaiter().GetResult();
         var touched = restoreEvents
             .Select(e => e switch
             {
@@ -2913,6 +2915,245 @@ internal static class Protocol
         Console.WriteLine("  the other owner still verifies the device's share  ✓");
 
         Console.WriteLine("Orchestrator restore keeps helper duties test passed.\n");
+    }
+
+    /// <summary>
+    /// Recover on a new device, restore keeping the recovery channels, publish,
+    /// then retire the old channels with a linked unpair. Every version
+    /// Discovery reports names the old channel it is stored on, which maps each
+    /// recovery channel to the roster helper it replaces. The recovered replica
+    /// group is dropped, and the old devices — which still hold the old
+    /// channels' keys — reach no helper afterwards. Mirrors
+    /// <c>run_restore_on_recovery_channels_flow</c> in
+    /// <c>smoke-tests/rust/src/protocol.rs</c>.
+    /// </summary>
+    private static void RunRestoreOnRecoveryChannelsTest()
+    {
+        Console.WriteLine("=== Orchestrator restore on recovery channels test ===");
+
+        const ulong sid = 0x2E6UL;
+        const string sourceUri = "https://lost-source.example.com";
+        const string replicaUri = "https://lost-replica.example.com";
+        const string helperAUri = "https://helper-a-keep.example.com";
+        const string helperBUri = "https://helper-b-keep.example.com";
+        const string deviceUri = "https://device-keep.example.com";
+        using var source = MakeNode("lost-source", sourceUri, new NodeOptions(ReplicaId: 0x5011UL, SecretId: sid));
+        using var replica = MakeNode("lost-replica", replicaUri, new NodeOptions(ReplicaId: 0x5012UL, SecretId: sid));
+        using var helperA = MakeNode("helper-a", helperAUri);
+        using var helperB = MakeNode("helper-b", helperBUri);
+        ulong oldA = DoOrchestratorPair(helperA, helperA.Transport, source, source.Transport, 1UL);
+        ulong oldB = DoOrchestratorPair(helperB, helperB.Transport, source, source.Transport, 2UL);
+        ulong group = PairReplicaHandshake(source, replica, 3UL);
+        CrossConfirmFingerprint(source, replica, group);
+        PumpAll(new[] { (source, sourceUri), (replica, replicaUri), (helperA, helperAUri), (helperB, helperBUri) });
+        uint version = ProtectAcross(source, sourceUri,
+            new[] { (replica, replicaUri), (helperA, helperAUri), (helperB, helperBUri) }, "kept secret");
+
+        // Both devices are lost. A new one pairs with each helper afresh, and
+        // each helper links the owner's old channel to the new one.
+        using var device = MakeNode("device", deviceUri, new NodeOptions(SecretId: sid));
+        ulong recoveryA = DoOrchestratorPair(helperA, helperA.Transport, device, device.Transport, 100UL);
+        ulong recoveryB = DoOrchestratorPair(helperB, helperB.Transport, device, device.Transport, 101UL);
+        helperA.ChannelStore.LinkChannel(helperA.Protocol.SecretId, oldA, recoveryA);
+        helperB.ChannelStore.LinkChannel(helperB.Protocol.SecretId, oldB, recoveryB);
+        var scope = new[] { (device, deviceUri), (helperA, helperAUri), (helperB, helperBUri) };
+
+        device.Protocol.StartAsync(FlowKind.Discovery, new DiscoveryParams
+        {
+            Target = Target.Many(recoveryA, recoveryB),
+        }).GetAwaiter().GetResult();
+        var owning = new Dictionary<ulong, ulong>();
+        foreach (var discovered in PumpAll(scope).OfType<SecretsDiscoveredEvent>())
+        {
+            var entry = discovered.Secrets.FirstOrDefault(s => s.SecretId == sid)
+                ?? throw new InvalidOperationException("the helper must report the owner's secret");
+            var held = entry.Versions.FirstOrDefault(v => v.Version == version)
+                ?? throw new InvalidOperationException("the helper must report the published version");
+            owning[discovered.ChannelId] = held.ChannelId;
+        }
+        if (owning.Count != 2 || owning.GetValueOrDefault(recoveryA) != oldA || owning.GetValueOrDefault(recoveryB) != oldB)
+            throw new InvalidOperationException(
+                $"each version must name the old channel its share is stored on; got [{string.Join(", ", owning.Select(kv => $"{kv.Key}→{kv.Value}"))}]");
+        Console.WriteLine("  Discovery maps each recovery channel to the old channel it replaces  ✓");
+
+        device.Protocol.StartAsync(FlowKind.RecoverSecret, new RecoverSecretParams
+        {
+            SecretId = sid,
+            Version = version,
+        }).GetAwaiter().GetResult();
+        var recovered = PumpAll(scope).OfType<SecretRecoveredEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException("RecoverSecret must surface SecretRecovered");
+        if (recovered.Secret.Replicas is null)
+            throw new InvalidOperationException("the recovered roster must carry the replica group");
+
+        var keep = owning
+            .Select(kv => new KeepRecoveryChannel(RosterChannelId: kv.Value, RecoveryChannelId: kv.Key))
+            .ToList();
+        var restoreEvents = device.Protocol.RestoreAsync(recovered.Secret, version, version, keep).GetAwaiter().GetResult();
+        var dropped = restoreEvents
+            .OfType<PeerNotRestoredEvent>()
+            .Where(e => e.Reason == NotRestoredReason.ReplicaGroupDropped)
+            .Select(e => e.ReplicaId)
+            .OfType<ulong>()
+            .Order()
+            .ToList();
+        if (!dropped.SequenceEqual(new[] { 0x5011UL, 0x5012UL }))
+            throw new InvalidOperationException(
+                $"every member of the recovered group must be reported as dropped; got [{string.Join(", ", dropped)}]");
+        if (restoreEvents.OfType<UnpairStartedEvent>().Any())
+            throw new InvalidOperationException(
+                $"the kept recovery channels must not be unpaired; got [{string.Join(", ", restoreEvents.Select(e => e.EventType))}]");
+        foreach (var (recovery, old) in new[] { (recoveryA, oldA), (recoveryB, oldB) })
+        {
+            var kept = device.ChannelStore.Load(sid, recovery, 0)
+                ?? throw new InvalidOperationException($"the recovery channel {recovery} must be kept");
+            if (kept.Status != ChannelStatus.Paired)
+                throw new InvalidOperationException($"the kept channel {recovery} must stay Paired; is {kept.Status}");
+            if (device.ChannelStore.Load(sid, old, 0) is not null)
+                throw new InvalidOperationException($"the old channel {old} must not be written");
+        }
+        if (device.ChannelStore.ListReplicas(sid, ReplicaFilter.Any).Any())
+            throw new InvalidOperationException("no replica group may be written");
+        Console.WriteLine("  restore keeps both recovery channels and drops the replica group  ✓");
+
+        uint published = ProtectAcross(device, deviceUri, new[] { (helperA, helperAUri), (helperB, helperBUri) }, "kept secret");
+        foreach (ulong channel in new[] { recoveryA, recoveryB })
+        {
+            int rows = device.ShareStore.Load(sid, channel, new[] { published }).Count();
+            if (rows != 1)
+                throw new InvalidOperationException($"the publish must reach channel {channel}; {rows} share(s) tracked");
+        }
+        Console.WriteLine($"  the restored device publishes v{published} on the kept channels as a lone owner  ✓");
+
+        foreach (var (recovery, old) in new[] { (recoveryA, oldA), (recoveryB, oldB) })
+        {
+            device.Protocol.StartAsync(FlowKind.Unpair, new UnpairParams
+            {
+                ChannelId = recovery,
+                LinkedChannelId = old,
+            }).GetAwaiter().GetResult();
+        }
+        var unpaired = PumpAll(scope).OfType<UnpairedEvent>().Select(e => e.ChannelId).ToHashSet();
+        if (!unpaired.SetEquals(new[] { oldA, oldB }))
+            throw new InvalidOperationException(
+                $"the linked unpairs must drop only the old channels; got [{string.Join(", ", unpaired)}]");
+        foreach (var (label, helper, old, recovery) in new[] { ("helper-a", helperA, oldA, recoveryA), ("helper-b", helperB, oldB, recoveryB) })
+        {
+            ulong helperSid = helper.Protocol.SecretId;
+            if (helper.ChannelStore.Load(helperSid, old, 0) is not null)
+                throw new InvalidOperationException($"{label}: the old channel must be gone");
+            if (helper.ChannelStore.Load(helperSid, recovery, 0) is null)
+                throw new InvalidOperationException($"{label}: the kept channel must stay");
+        }
+        Console.WriteLine("  linked unpairs retire both old channels at the helpers  ✓");
+
+        // The lost source still runs and publishes; no helper holds a key for
+        // its channels any more, so nothing it sends is accepted.
+        source.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[] { new UserSecret { Id = new byte[] { 10 }, Name = "stale", Data = Encoding.UTF8.GetBytes("stale") } },
+        }).GetAwaiter().GetResult();
+        int refused = 0;
+        foreach (var (uri, _, bytes) in source.Transport.DrainAll())
+        {
+            var helper = uri == helperAUri ? helperA : uri == helperBUri ? helperB : null;
+            if (helper is null) continue;
+            bool rejected = false;
+            try
+            {
+                helper.Protocol.ProcessAsync(bytes).GetAwaiter().GetResult();
+            }
+            catch (DeRecException)
+            {
+                rejected = true;
+            }
+            if (!rejected)
+                throw new InvalidOperationException($"{uri} must not accept a message on a retired channel");
+            if (helper.Transport.DrainAll().Count != 0)
+                throw new InvalidOperationException($"{uri} must answer nothing");
+            refused++;
+        }
+        if (refused != 2)
+            throw new InvalidOperationException($"the lost source must reach both helpers and be refused by both; refused {refused}");
+        Console.WriteLine("  the lost source's round reaches no helper  ✓");
+
+        device.Protocol.StartAsync(FlowKind.VerifyShares, new VerifySharesParams
+        {
+            SecretId = sid,
+            Version = published,
+            Target = Target.All,
+        }).GetAwaiter().GetResult();
+        var verified = PumpAll(scope).OfType<ShareVerifiedEvent>().Select(e => e.ChannelId).ToHashSet();
+        if (!verified.SetEquals(new[] { recoveryA, recoveryB }))
+            throw new InvalidOperationException(
+                $"both kept channels must still verify; verified [{string.Join(", ", verified)}]");
+        Console.WriteLine("  both kept channels verify after the old ones are retired  ✓");
+
+        Console.WriteLine("Orchestrator restore on recovery channels test passed.\n");
+    }
+
+    /// <summary>
+    /// A helper refuses a linked unpair until a share is stored on the channel
+    /// it arrives on: before the restored device publishes, the old channel may
+    /// hold that helper's only share for the owner. Mirrors
+    /// <c>run_linked_unpair_before_reshare_is_refused_flow</c> in
+    /// <c>smoke-tests/rust/src/protocol.rs</c>.
+    /// </summary>
+    private static void RunLinkedUnpairBeforeReshareIsRefusedTest()
+    {
+        Console.WriteLine("=== Orchestrator linked unpair before reshare is refused test ===");
+
+        const ulong sid = 0x2E7UL;
+        const string lostUri = "https://lost-early.example.com";
+        const string helperAUri = "https://helper-a-early.example.com";
+        const string helperBUri = "https://helper-b-early.example.com";
+        const string deviceUri = "https://device-early.example.com";
+        using var helperA = MakeNode("helper-a", helperAUri);
+        using var helperB = MakeNode("helper-b", helperBUri);
+        ulong oldA, oldB;
+        uint version;
+        using (var lost = MakeNode("lost", lostUri, new NodeOptions(SecretId: sid)))
+        {
+            oldA = DoOrchestratorPair(helperA, helperA.Transport, lost, lost.Transport, 1UL);
+            oldB = DoOrchestratorPair(helperB, helperB.Transport, lost, lost.Transport, 2UL);
+            version = ProtectAcross(lost, lostUri, new[] { (helperA, helperAUri), (helperB, helperBUri) }, "early");
+        }
+
+        using var device = MakeNode("device", deviceUri, new NodeOptions(SecretId: sid));
+        ulong recoveryA = DoOrchestratorPair(helperA, helperA.Transport, device, device.Transport, 100UL);
+        ulong recoveryB = DoOrchestratorPair(helperB, helperB.Transport, device, device.Transport, 101UL);
+        helperA.ChannelStore.LinkChannel(helperA.Protocol.SecretId, oldA, recoveryA);
+        helperB.ChannelStore.LinkChannel(helperB.Protocol.SecretId, oldB, recoveryB);
+        var scope = new[] { (device, deviceUri), (helperA, helperAUri), (helperB, helperBUri) };
+
+        device.Protocol.StartAsync(FlowKind.RecoverSecret, new RecoverSecretParams
+        {
+            SecretId = sid,
+            Version = version,
+        }).GetAwaiter().GetResult();
+        var recovered = PumpAll(scope).OfType<SecretRecoveredEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException("RecoverSecret must surface SecretRecovered");
+        device.Protocol.RestoreAsync(recovered.Secret, version, version, new[]
+        {
+            new KeepRecoveryChannel(RosterChannelId: oldA, RecoveryChannelId: recoveryA),
+            new KeepRecoveryChannel(RosterChannelId: oldB, RecoveryChannelId: recoveryB),
+        }).GetAwaiter().GetResult();
+
+        device.Protocol.StartAsync(FlowKind.Unpair, new UnpairParams
+        {
+            ChannelId = recoveryA,
+            LinkedChannelId = oldA,
+        }).GetAwaiter().GetResult();
+        var events = PumpAll(scope);
+        if (!events.OfType<UnpairRejectedEvent>().Any(e =>
+                e.ChannelId == oldA && e.Status == Org.Derecalliance.Derec.Protobuf.StatusEnum.Fail))
+            throw new InvalidOperationException(
+                $"the helper must refuse the linked unpair before a share is stored on the kept channel; got [{string.Join(", ", events.Select(e => e.EventType))}]");
+        if (!helperA.ShareStore.Load(helperA.Protocol.SecretId, oldA, Array.Empty<uint>()).Any())
+            throw new InvalidOperationException("the old channel must keep its share");
+        Console.WriteLine("  a linked unpair before the reshare → UnpairRejected(FAIL), old share kept  ✓");
+
+        Console.WriteLine("Orchestrator linked unpair before reshare is refused test passed.\n");
     }
 
     /// <summary>
@@ -3297,7 +3538,7 @@ internal static class Protocol
 
         const ulong secretId = 0x1D5UL;
         using var node = MakeNode("TypedIds", "https://typed-ids.example.com", new NodeOptions(SecretId: secretId));
-        node.Protocol.RestoreAsync(recovered.Secret, version: 3, newestVersion: 3).GetAwaiter().GetResult();
+        node.Protocol.RestoreAsync(recovered.Secret, version: 3, newestVersion: 3, keepRecoveryChannels: []).GetAwaiter().GetResult();
         if (node.ChannelStore.Load(secretId, max, 0) is null)
             throw new InvalidOperationException("restore must write the helper channel at u64::MAX");
         Console.WriteLine("  RestoreAsync accepted a helper channel at u64::MAX  ✓");
@@ -3332,9 +3573,11 @@ internal static class Protocol
     }
 
     /// <summary>
-    /// A helper or member whose transports list is empty gets no channel:
+    /// A helper whose transports list is empty gets no channel:
     /// <see cref="DeRecProtocol.RestoreAsync"/> restores the rest of the roster
-    /// and reports each skipped entry as a <see cref="PeerNotRestoredEvent"/>.
+    /// and reports the skipped helper as a <see cref="PeerNotRestoredEvent"/>.
+    /// The replica group is never restored: every member, reachable or not, is
+    /// reported with <see cref="NotRestoredReason.ReplicaGroupDropped"/>.
     /// </summary>
     private static void RunPeerNotRestoredTest()
     {
@@ -3377,23 +3620,24 @@ internal static class Protocol
 
         const ulong secretId = 0x5E1UL;
         using var node = MakeNode("NotRestored", "https://not-restored.example.com", new NodeOptions(SecretId: secretId));
-        var events = node.Protocol.RestoreAsync(secret, version: 2, newestVersion: 2).GetAwaiter().GetResult();
+        var events = node.Protocol.RestoreAsync(secret, version: 2, newestVersion: 2, keepRecoveryChannels: []).GetAwaiter().GetResult();
         var skipped = events.OfType<PeerNotRestoredEvent>().ToList();
-        if (skipped.Count != 2
+        if (skipped.Count != 3
             || skipped[0].ChannelId != 12 || skipped[0].ReplicaId is not null
+            || skipped[0].Reason != NotRestoredReason.NoTransports
             || skipped[1].ChannelId != 21 || skipped[1].ReplicaId != 0xBEEF
-            || skipped.Any(e => e.Reason != NotRestoredReason.NoTransports))
+            || skipped[2].ChannelId != 21 || skipped[2].ReplicaId != 0xCAFE
+            || skipped.Skip(1).Any(e => e.Reason != NotRestoredReason.ReplicaGroupDropped))
             throw new InvalidOperationException(
-                $"expected the helper and the member without endpoints, got [{string.Join(", ", events)}]");
+                $"expected the helper without endpoints and both members dropped in roster order, got [{string.Join(", ", events)}]");
         if (node.ChannelStore.Load(secretId, 11, 0) is null)
             throw new InvalidOperationException("the reachable helper must be restored");
         if (node.ChannelStore.Load(secretId, 12, 0) is not null)
             throw new InvalidOperationException("no channel may be written for a helper with no endpoint");
-        if (node.ChannelStore.Load(secretId, 21, 0xCAFE) is null)
-            throw new InvalidOperationException("the reachable member must be restored");
-        if (node.ChannelStore.Load(secretId, 21, 0xBEEF) is not null)
-            throw new InvalidOperationException("no record may be written for a member with no endpoint");
-        Console.WriteLine("  RestoreAsync skips peers with no endpoint and reports each one  ✓");
+        if (node.ChannelStore.Load(secretId, 21, 0xCAFE) is not null
+            || node.ChannelStore.Load(secretId, 21, 0xBEEF) is not null)
+            throw new InvalidOperationException("no replica member may be written");
+        Console.WriteLine("  RestoreAsync skips a helper with no endpoint and drops every replica member  ✓");
 
         Console.WriteLine("PeerNotRestored test passed.\n");
     }
@@ -3615,6 +3859,7 @@ internal static class Protocol
         dtoType.GetProperty("Version")!.SetValue(dto, 7u);
         dtoType.GetProperty("NewestVersion")!.SetValue(dto, 9u);
         dtoType.GetProperty("RecoveredSecret")!.SetValue(dto, secret);
+        dtoType.GetProperty("KeepRecoveryChannels")!.SetValue(dto, Array.Empty<KeepRecoveryChannel>());
         AssertSection(fixture, "restore", JsonSerializer.Serialize(dto, dtoType, DeRecJsonOptions.Wire));
 
         // Rust omits an empty communication_info map; a null one is omitted too.
@@ -5513,7 +5758,7 @@ internal static class Protocol
         // tracking shares restore does not write, so restore is refused.
         try
         {
-            bob.Protocol.RestoreAsync(joined.Secret, v2, v2).GetAwaiter().GetResult();
+            bob.Protocol.RestoreAsync(joined.Secret, v2, v2, []).GetAwaiter().GetResult();
             throw new InvalidOperationException("a synced destination is already provisioned; restore must refuse it");
         }
         catch (DeRecException e) when (e.Code == DeRecCode.AlreadyRestored) { }
