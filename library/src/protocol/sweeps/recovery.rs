@@ -5,7 +5,7 @@
 
 use crate::protocol::DeRecProtocol;
 use crate::protocol::context::local;
-use crate::protocol::events::DeRecEvent;
+use crate::protocol::events::{DeRecEvent, RecoverFailureReason};
 use crate::protocol::handlers::recovery;
 use crate::protocol::handlers::replicas::discovery;
 use crate::protocol::stores::borrow_stores;
@@ -53,8 +53,8 @@ impl<
     /// deciding it on the shares it holds.
     ///
     /// Each Helper still silent is reported as
-    /// [`DeRecEvent::RecoverSecretFailed`] with error `"timeout"`, followed by
-    /// the recovery's decision. The row is removed before the decision is
+    /// [`DeRecEvent::RecoverSecretFailed`] with
+    /// [`RecoverFailureReason::TimedOut`], followed by the recovery's decision. The row is removed before the decision is
     /// reported, so a store failure leaves the recovery open for the next
     /// sweep rather than deciding it twice.
     pub(super) async fn check_recovery_timeouts(&mut self) -> Vec<DeRecEvent> {
@@ -112,6 +112,7 @@ impl<
                 events.push(DeRecEvent::RecoverSecretFailed {
                     channel_id,
                     version,
+                    reason: RecoverFailureReason::TimedOut,
                     error: "timeout".to_owned(),
                 });
             }

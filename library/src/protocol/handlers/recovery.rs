@@ -4,7 +4,7 @@
 use super::super::{
     ChannelKey, ChannelRequest, CollectedShare, CorruptionReason, DeRecChannelStore, DeRecEvent,
     DeRecShareStore, DeRecStateStore, DeRecTransport, KeyRing, MissingPolicy, PendingAction,
-    RecoveryCandidate, RecoveryHelper, now_secs,
+    RecoverFailureReason, RecoveryCandidate, RecoveryHelper, now_secs,
 };
 use super::NO_SHARE_FOR_VERSION;
 use super::replicas::recovery as replica;
@@ -769,6 +769,7 @@ async fn dispatch_all<S: StoreSet>(
             events.push(DeRecEvent::RecoverSecretFailed {
                 channel_id: channel.channel_id,
                 version,
+                reason: RecoverFailureReason::NoSharedKey,
                 error: super::NO_USABLE_KEY.to_owned(),
             });
             continue;
@@ -805,6 +806,7 @@ async fn dispatch_all<S: StoreSet>(
                 events.push(DeRecEvent::RecoverSecretFailed {
                     channel_id: channel.channel_id,
                     version,
+                    reason: RecoverFailureReason::DispatchFailed,
                     error: e.to_string(),
                 });
                 #[cfg(feature = "logging")]

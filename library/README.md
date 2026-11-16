@@ -567,7 +567,8 @@ before any target-level events are emitted.
   share was collected. A recovery reconstructs nothing until every helper it
   asked has answered, or `timeouts.get_share_response_secs` has passed since
   the requests went out (each silent helper is then reported as
-  `RecoverSecretFailed { …, error: "timeout" }`). It then decides exactly
+  `RecoverSecretFailed { …, reason: RecoverFailureReason::TimedOut }`). It
+  then decides exactly
   once:
   - `SecretRecovered { secret: Secret }` (typed; `secret.secrets` is the
     list of `UserSecret` the owner protected, alongside the captured
@@ -610,7 +611,7 @@ before any target-level events are emitted.
   damaged or compromised helper — e.g. offer to unpair it. A share that
   only disagrees with the others is never reported here: it is a dispute,
   not evidence against its helper
-- `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }` /
+- `Unpaired { channel_id, acknowledged }` / `UnpairRejected { channel_id, status, memo }` /
   `UnpairFailed { channel_id, error }` — emitted by `restore` when an
   ephemeral recovery channel's teardown could not be delivered. The restore
   has already committed, so local state is dropped anyway and an
@@ -654,7 +655,8 @@ This device keeps a proof of each helper's share (the exact bytes it sent)
 so it can check that helper's answers later. A stored proof is always one
 of two things: confirmed by its helper (`ShareConfirmed`), or part of a
 sharing round still open. When a round settles a channel as failed — the
-helper rejected the share (`ShareRejected`) or the round timed out — that
+helper rejected the share or the round timed out (`ShareRejected`, with
+`reason` `Refused` or `TimedOut`) — that
 channel's proof for the round's version is deleted, and a late
 `ShareConfirmed` for it is still emitted but stores nothing.
 
@@ -974,7 +976,7 @@ for event in protocol.process(&wire_bytes).await? {
 ```
 
 The owner receives a `StoreShareResponse` carrying that status and memo,
-surfacing as `ShareRejected { channel_id, version, status, memo }` on its
+surfacing as `ShareRejected { channel_id, version, reason: Refused, status, memo }` on its
 side — so a refusal is attributable rather than a silent timeout.
 
 Status codes for the common cases:
@@ -2659,7 +2661,12 @@ in either case. Meanwhile the channel is `ChannelStatus::Unpairing`: it keeps
 its key, so the reply can be read, but no flow selects it, so a publish
 started in that window does not hand the departing helper a share. A
 non-`Ok` reply emits `UnpairRejected` and returns the channel to `Paired`.
-`restore` unpairs its recovery channels the same way.
+`restore` unpairs its recovery channels the same way, marking them all
+`Unpairing` in one write, with one difference: a refusal does not keep the
+channel. `UnpairRejected` is reported and `Unpaired` follows, so the
+teardown never depends on the helper's answer. `Unpaired`'s `acknowledged`
+is `true` when the helper confirmed, and `false` when the window elapsed or
+the helper refused.
 
 `UnpairAck::NotRequired` drops local state immediately on `start(Unpair)`.
 The peer still answers, and since the channel is gone, `process` fails on

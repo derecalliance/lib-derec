@@ -123,7 +123,8 @@ pub use types::{
 pub use events::{
     Action, AutoAcceptPolicy, ChannelRequest, CorruptionReason, DeRecEvent, DeRecFlow,
     FailedRequest, IgnoreReason, NotRestoredReason, PendingAction, PendingActionKind,
-    RecoveryCandidate, RecoveryHelper, ReplyTarget, UnpairAck, VerifyFailureReason,
+    RecoverFailureReason, RecoveryCandidate, RecoveryHelper, ReplicaSyncFailureReason, ReplyTarget,
+    ShareRejectReason, UnpairAck, VerifyFailureReason,
 };
 pub use handlers::restore::RestoreError;
 

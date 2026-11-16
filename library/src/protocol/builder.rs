@@ -1360,6 +1360,13 @@ mod tests {
             fn save(&mut self, _: u64, _: ChannelId, _: Share) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
+            fn save_many(
+                &mut self,
+                _: u64,
+                _: Vec<(ChannelId, Share)>,
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
+            }
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
@@ -1447,6 +1454,9 @@ mod tests {
         struct NoopStateStore;
         impl DeRecStateStore for NoopStateStore {
             fn save(&mut self, _: u64, _: StateItem) -> StateStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
+            }
+            fn save_many(&mut self, _: u64, _: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
             fn load(&self, _: u64, _: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
@@ -1582,6 +1592,13 @@ mod tests {
             fn save(&mut self, _: u64, _: ChannelId, _: Share) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
+            fn save_many(
+                &mut self,
+                _: u64,
+                _: Vec<(ChannelId, Share)>,
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
+            }
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
@@ -1666,6 +1683,9 @@ mod tests {
         struct NoopStateStore;
         impl DeRecStateStore for NoopStateStore {
             fn save(&mut self, _: u64, _: StateItem) -> StateStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
+            }
+            fn save_many(&mut self, _: u64, _: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
             fn load(&self, _: u64, _: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
@@ -1794,6 +1814,13 @@ mod tests {
             fn save(&mut self, _: u64, _: ChannelId, _: Share) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
+            fn save_many(
+                &mut self,
+                _: u64,
+                _: Vec<(ChannelId, Share)>,
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
+            }
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
@@ -1878,6 +1905,9 @@ mod tests {
         struct NoopStateStore;
         impl DeRecStateStore for NoopStateStore {
             fn save(&mut self, _: u64, _: StateItem) -> StateStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
+            }
+            fn save_many(&mut self, _: u64, _: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
             fn load(&self, _: u64, _: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
@@ -2010,6 +2040,13 @@ mod tests {
             fn save(&mut self, _: u64, _: ChannelId, _: Share) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
+            fn save_many(
+                &mut self,
+                _: u64,
+                _: Vec<(ChannelId, Share)>,
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
+            }
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
@@ -2093,6 +2130,9 @@ mod tests {
         struct NoopStateStore;
         impl DeRecStateStore for NoopStateStore {
             fn save(&mut self, _: u64, _: StateItem) -> StateStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
+            }
+            fn save_many(&mut self, _: u64, _: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
             fn load(&self, _: u64, _: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
@@ -2225,6 +2265,13 @@ mod tests {
             fn save(&mut self, _: u64, _: ChannelId, _: Share) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
+            fn save_many(
+                &mut self,
+                _: u64,
+                _: Vec<(ChannelId, Share)>,
+            ) -> ShareStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
+            }
             fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
@@ -2308,6 +2355,9 @@ mod tests {
         struct NoopStateStore;
         impl DeRecStateStore for NoopStateStore {
             fn save(&mut self, _: u64, _: StateItem) -> StateStoreFuture<'_, ()> {
+                Box::pin(future::ready(Ok(())))
+            }
+            fn save_many(&mut self, _: u64, _: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
                 Box::pin(future::ready(Ok(())))
             }
             fn load(&self, _: u64, _: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {

@@ -16,7 +16,7 @@ dotnet add package DeRec.Library
 
 ## Requirements
 
-- .NET 6 or later
+- .NET 10 or later (the package targets `net10.0`)
 
 No additional native dependencies are required. The package includes the native DeRec library.
 
@@ -506,7 +506,10 @@ Each helper's answer to a recovery request surfaces as
 helper it asked has answered, or `Timeouts.GetShareResponse`
 (`timeouts.get_share_response_secs`) has passed since the requests went out —
 each silent helper is then reported as `RecoverSecretFailedEvent` with
-`Error` `"timeout"` by the next `TickAsync`. It then decides exactly once:
+`Reason` `RecoverFailureReason.TimedOut` by the next `TickAsync`
+(`RecoverFailureReason.NoSharedKey` and `RecoverFailureReason.DispatchFailed`
+mean the request was never sent; `Error` carries the cause). It then decides
+exactly once:
 
 - `SecretRecoveredEvent { Secret }` — one secret reconstructs and every
   collected share is part of it;
@@ -616,6 +619,14 @@ are cut off from the helpers:
    there, and while the old channel is not linked to it. The flow's events
    name the old channel.
 
+`UnpairedEvent { ChannelId, Acknowledged }` is reported on both sides once a
+channel's state is dropped. `Acknowledged` is `true` when both sides agreed to
+the unpair: the peer answered `Ok` on the initiator, or this device answered
+`Ok` on the responder. It is `false` when no acknowledgement was asked for
+(`UnpairAck.NotRequired`), when `Timeouts.UnpairAck` elapsed without an
+answer, or when the peer refused the teardown of a recovery channel by
+`RestoreAsync`, right after `UnpairRejectedEvent`.
+
 ```csharp
 // recoveryChannel → the old roster channel its share is stored on.
 var oldChannelOf = new Dictionary<ulong, ulong>();
@@ -702,6 +713,16 @@ The answer arrives typed the same way: `Status` on `ShareRejectedEvent`, `ShareR
 if (ev is ShareRejectedEvent { Status: Org.Derecalliance.Derec.Protobuf.StatusEnum.SizeLimitExceeded } rejected)
     Console.WriteLine($"helper {rejected.ChannelId} is over quota: {rejected.Memo}");
 ```
+
+`ShareRejectedEvent.Reason` is a `ShareRejectReason` constant: `Refused` when
+the helper answered with a non-OK status, in which case `Status` and `Memo`
+are its answer, or `TimedOut` when it did not answer within
+`Timeouts.SharingRound`, in which case `TickAsync` reports it and `Status` and
+`Memo` carry no answer from it. `ReplicaSyncFailedEvent { ReplicaId, Version,
+Reason, Error }` reports a member that received no sync: `Reason` is a
+`ReplicaSyncFailureReason` constant, `DispatchFailed` when nothing could be
+sent to it or `TimedOut` when it did not acknowledge within
+`Timeouts.SharingRound`, and `Error` is the failure rendered for display.
 
 ```csharp
 using DeRec.Library;
@@ -946,6 +967,46 @@ takes to arrive.
 
 With `WithKeyRotation(true)`, the owner advances each helper channel's key one epoch in every sharing round that reaches the threshold (a round below it advances none), and the replica group channel's key on every publish to replicas. Each step is K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" || be32(e+1)). Rotation is off by default, and off keeps the channel on its current key. The envelope's `sequence` carries the epoch, and peers follow on their own, so the setting is the owner's alone (`KeyRotation` in a config). A message under an epoch whose key the device cannot obtain is ignored as `MessageIgnoredEvent` with `IgnoreReason.KeyUnavailable`. A device keeps its newest key and the key of every secret version it still stores, so any kept version restores. The key ring is stored as a secret of kind `SecretKind.KeyRing` (`3`): persist its bytes as given, with any length, beside the kind-`0` shared key. Forward secrecy covers a compromised helper device, or a key alone, plus recorded traffic, and only for epochs older than the oldest key held; the owner and replica devices hold the plaintext secret and the keys of every version they store. A 0.0.x peer cannot follow a rotated channel: it must upgrade and re-pair.
 
+### Store interfaces
+
+`DeRecProtocolBuilder` requires five application-supplied stores, bundled in a
+`DeRecStores` for `WithStores` or set one by one with the `With*Store`
+setters, plus an `ITransport`:
+
+- `IChannelStore` — channel records, keyed by `(secretId, channelId,
+  replicaId)`. A `replicaId` of `0` addresses the helper channel; any other
+  value addresses that member of the replica group. `SaveMany` saves every
+  `ChannelRecord` in one call, each replacing the record at its own address
+  the way `Save` does; write them in one statement or transaction when your
+  backend can. `RemoveMany` removes every record its `(ChannelId, ReplicaId)`
+  queries address in one call, each addressed the same way, and skips entries
+  that name no record; delete them in one statement or transaction when your
+  backend can.
+- `ISecretStore` — pairing/session secret material. `SaveMany` saves every
+  `(ChannelId, Value)` entry in one call, each replacing the value the way
+  `Save`'s arguments address it; write them in one statement or transaction
+  when your backend can. `RemoveMany` removes every secret its
+  `(ChannelId, Kind)` entries name in one call, each addressed the way
+  `Remove`'s arguments are, and skips entries with nothing stored.
+- `IShareStore` — stored shares. `LoadMany` returns each share paired with
+  the channel it is stored under. `SaveMany` saves every `(ChannelId, Share)`
+  entry in one call, each stored and refused the way `Save` would store or
+  refuse it under its channel; write them in one statement or transaction
+  when your backend can. `RemoveVersionsMany` drops the versions each
+  `(ChannelId, Versions)` entry names under its channel in one call, skipping
+  versions not stored. On an owner, `KeepVersion` chooses the one older
+  version helpers keep besides the version being shared; see below.
+- `IUserSecretStore` — the latest user-facing secret snapshot per
+  `secretId`.
+- `IStateStore` — in-flight orchestrator state (pending
+  verification/recovery/unpair/sharing rounds). `SaveMany` saves every
+  `StateItem` in one call, each replacing the row with the same key the way
+  `Save` does; write them in one statement or transaction when your backend
+  can. `RemoveMany` removes every row its `StateKey`s name in one call and
+  skips keys with no row.
+- `ITransport` — outbound delivery. Try the endpoints in the peer's order,
+  stop at the first success, and throw only when none worked.
+
 #### Filtered listings
 
 `ListHelpers` and `ListReplicas` take a filter — `ids`, `status`, `role` and
@@ -970,8 +1031,8 @@ filter faithfully is still your job.
 
 App-side responsibilities (mirrors the other SDKs):
 
-- Implement `IChannelStore`, `IShareStore`, `ISecretStore`, `ITransport`
-  with persistent backends. The library ships none: the in-memory stores
+- Implement the five stores and `ITransport` (see
+  [Store interfaces](#store-interfaces)) with persistent backends. The library ships none: the in-memory stores
   in `smoke-tests/dotnet/InMemoryStores.cs` are a starting point to copy.
 - Run a reachable endpoint. Delivery is push-only: a reply produced by
   `ProcessAsync` goes out through `ITransport`, addressed to the peer, and

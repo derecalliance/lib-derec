@@ -16,6 +16,7 @@
 
 use derec_library::protocol::types::state_record::StateItemRecord;
 use derec_library::protocol::{DeRecStateStore, StateItem, StateKey, StateKind, StateStoreFuture};
+use tokio_postgres::Client;
 
 use crate::db::{SharedClient, u64_to_sql};
 
@@ -77,20 +78,26 @@ fn decode(bytes: &[u8]) -> StateItem {
 impl DeRecStateStore for PostgresStateStore {
     fn save(&mut self, secret_id: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
         let client = self.client.clone();
-        let secret_id = u64_to_sql(secret_id);
-        let (kind, sub_a, sub_b) = key_columns(&item.key());
-        let data = encode(&item);
+        Box::pin(async move {
+            upsert(&client, secret_id, &item).await;
+            Ok(())
+        })
+    }
+
+    fn save_many(&mut self, secret_id: u64, items: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
+        let client = self.client.clone();
         Box::pin(async move {
             client
-                .execute(
-                    "INSERT INTO protocol_state (secret_id, kind, sub_a, sub_b, data)
-                     VALUES ($1, $2, $3, $4, $5)
-                     ON CONFLICT (secret_id, kind, sub_a, sub_b) DO UPDATE SET
-                         data = EXCLUDED.data",
-                    &[&secret_id, &kind, &sub_a, &sub_b, &data],
-                )
+                .batch_execute("BEGIN")
                 .await
-                .expect("protocol_state save failed");
+                .expect("save_many transaction failed");
+            for item in &items {
+                upsert(&client, secret_id, item).await;
+            }
+            client
+                .batch_execute("COMMIT")
+                .await
+                .expect("save_many commit failed");
             Ok(())
         })
     }
@@ -167,4 +174,18 @@ impl DeRecStateStore for PostgresStateStore {
                 .collect())
         })
     }
+}
+
+async fn upsert(client: &Client, secret_id: u64, item: &StateItem) {
+    let (kind, sub_a, sub_b) = key_columns(&item.key());
+    client
+        .execute(
+            "INSERT INTO protocol_state (secret_id, kind, sub_a, sub_b, data)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (secret_id, kind, sub_a, sub_b) DO UPDATE SET
+                 data = EXCLUDED.data",
+            &[&u64_to_sql(secret_id), &kind, &sub_a, &sub_b, &encode(item)],
+        )
+        .await
+        .expect("protocol_state save failed");
 }

@@ -736,7 +736,7 @@ fn an_unpair_drop_failure_after_the_ack_is_reported_not_reanswered() {
             let unpaired = events
                 .iter()
                 .position(
-                    |e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == CHANNEL),
+                    |e| matches!(e, DeRecEvent::Unpaired { channel_id, acknowledged: true } if *channel_id == CHANNEL),
                 )
                 .expect("Unpaired is reported");
             let failed = events

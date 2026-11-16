@@ -114,6 +114,7 @@ class EmptyShareStore implements ShareStore {
     return [];
   }
   async save(): Promise<void> {}
+  async saveMany(): Promise<void> {}
   async latestVersion(): Promise<null> {
     return null;
   }
@@ -136,6 +137,7 @@ class EmptyUserSecretStore implements UserSecretStore {
 
 class EmptyStateStore implements StateStore {
   async save(): Promise<void> {}
+  async saveMany(): Promise<void> {}
   async load(): Promise<null> {
     return null;
   }

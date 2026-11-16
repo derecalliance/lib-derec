@@ -389,6 +389,15 @@ func (s *memShareStore) Save(secretID, channelID uint64, share protocol.Share) e
 	return nil
 }
 
+func (s *memShareStore) SaveMany(secretID uint64, entries []protocol.ShareEntry) error {
+	for _, e := range entries {
+		if err := s.Save(secretID, e.ChannelID, e.Share); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *memShareStore) RemoveChannel(secretID, channelID uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -538,6 +547,15 @@ func (s *memStateStore) Save(secretID uint64, item protocol.StateItem) error {
 		s.data[secretID] = make(map[string]protocol.StateItem)
 	}
 	s.data[secretID][stateKeyID(item.Key())] = item
+	return nil
+}
+
+func (s *memStateStore) SaveMany(secretID uint64, items []protocol.StateItem) error {
+	for _, item := range items {
+		if err := s.Save(secretID, item); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -2045,6 +2063,7 @@ func runShareStoreRefusal() {
 	}
 	assertTrue(len(shareRejected) == 1 && shareRejected[0].ChannelID == channelA &&
 		shareRejected[0].Version != nil && *shareRejected[0].Version == nextVersion &&
+		shareRejected[0].Reason == protocol.ShareRejectReasonRefused &&
 		shareRejected[0].Status == derecpb.StatusEnum_TOO_FREQUENT,
 		"expected one ShareRejected(TOO_FREQUENT) from helper-a, got %+v", shareRejected)
 	fmt.Println("  helper-a Save → RefusalTooFrequent; owner ShareRejected(status=TOO_FREQUENT)  ✓")
@@ -2156,6 +2175,7 @@ func runRequestFailedToken() {
 	}
 	assertTrue(len(rejected) == 1 && rejected[0].ChannelID == channelA &&
 		rejected[0].Version != nil && *rejected[0].Version == version &&
+		rejected[0].Reason == protocol.ShareRejectReasonRefused &&
 		rejected[0].Status == derecpb.StatusEnum_FAIL && rejected[0].Memo == rf.Memo,
 		"expected one ShareRejected(FAIL, event memo) from helper-a, got %+v", rejected)
 	fmt.Println("  helper-a Reject(token, event Status, event Memo) → one response; owner ShareRejected(status=FAIL, same memo)  ✓")
@@ -2792,17 +2812,43 @@ func runRecoverRestoreRepublish() {
 		assertTrue(ok && record.Helper != nil && record.Helper.Status == protocol.ChannelStatusUnpairing,
 			"recovery channel %d must be Unpairing until its helper answers", c)
 	}
-	// The helpers' acknowledgements land on channels that still exist, so
-	// Process ends each one rather than failing on an unknown channel.
+	// helper-a accepts its unpair; helper-b's application refuses its own.
+	for _, entry := range device.drain() {
+		if entry.uri == helperA.uri {
+			deliver(helperA, entry.message)
+			continue
+		}
+		processed, err := helperB.proto.Process(entry.message)
+		must(err, "helper-b Process(UnpairRequest)")
+		idx := slices.IndexFunc(processed, func(ev protocol.Event) bool {
+			return ev.Type == protocol.EventTypeActionRequired
+		})
+		assertTrue(idx >= 0, "helper-b must be asked whether to unpair, got %+v", processed)
+		must(helperB.proto.Reject(processed[idx].Action, derecpb.StatusEnum_FAIL, "not now"), "helper-b Reject(Unpair)")
+	}
+	answers := pumpMany(all)
 	unpaired := map[uint64]bool{}
-	for _, ev := range pumpMany(all) {
-		if ev.Type == protocol.EventTypeUnpaired {
+	for _, ev := range answers {
+		if ev.Type == protocol.EventTypeUnpaired && ev.Acknowledged {
 			unpaired[ev.ChannelID] = true
 		}
 	}
-	assertTrue(unpaired[recoveryA] && unpaired[recoveryB],
-		"the recovery helpers' answers must unpair both recovery channels, got %v", unpaired)
-	fmt.Println("  Restore unpairs the recovery channels once their helpers answer  ✓")
+	assertTrue(unpaired[recoveryA],
+		"helper-a's acceptance unpairs its recovery channel, acknowledged, got %+v", answers)
+	rejected := slices.IndexFunc(answers, func(ev protocol.Event) bool {
+		return ev.Type == protocol.EventTypeUnpairRejected && ev.ChannelID == recoveryB
+	})
+	dropped := slices.IndexFunc(answers, func(ev protocol.Event) bool {
+		return ev.Type == protocol.EventTypeUnpaired && ev.ChannelID == recoveryB && !ev.Acknowledged
+	})
+	assertTrue(rejected >= 0 && dropped >= 0 && rejected < dropped,
+		"helper-b's refusal is reported, then its recovery channel is unpaired anyway, got %+v", answers)
+	for _, c := range []uint64{recoveryA, recoveryB} {
+		_, ok, err := device.channelStore.Load(protocolSecretID, c, 0)
+		must(err, "device.channelStore.Load")
+		assertTrue(!ok, "recovery channel %d is gone whatever its helper answered", c)
+	}
+	fmt.Println("  Restore unpairs the recovery channels whatever their helpers answer (accept → Unpaired acknowledged, refuse → UnpairRejected + Unpaired unacknowledged)  ✓")
 	snapshot, ok, err := device.userSecrets.LoadLatest(protocolSecretID)
 	must(err, "device.userSecrets.LoadLatest")
 	assertTrue(ok && snapshot.Version == newest && subsharesText(snapshot.Threshold) == "3",
@@ -2996,6 +3042,7 @@ func runRestoreOnRecoveryChannels() {
 	unpaired := map[uint64]bool{}
 	for _, ev := range pumpMany([]*peer{device, helperA, helperB}) {
 		if ev.Type == protocol.EventTypeUnpaired {
+			assertTrue(ev.Acknowledged, "an accepted linked unpair is acknowledged, got %+v", ev)
 			unpaired[ev.ChannelID] = true
 		}
 	}
@@ -3192,7 +3239,7 @@ func runSilentHelperRecovery() {
 	assertTrue(len(settled) == 2, "expected a timeout then SecretRecovered, got %+v", settled)
 	failed, recovered := settled[0], settled[1]
 	assertTrue(failed.Type == protocol.EventTypeRecoverSecretFailed && failed.ChannelID == channelC &&
-		failed.Version != nil && *failed.Version == version && failed.Error == "timeout",
+		failed.Version != nil && *failed.Version == version && failed.Reason == protocol.RecoverFailureReasonTimedOut,
 		"helper-c must be reported as timed out, got %+v", failed)
 	assertTrue(recovered.Type == protocol.EventTypeSecretRecovered && recovered.Secret != nil,
 		"the recovery must settle as SecretRecovered, got %+v", recovered)
@@ -3552,6 +3599,7 @@ func runHelperShareRefused() {
 		refused[0].Status == derecpb.StatusEnum_SIZE_LIMIT_EXCEEDED && refused[0].Memo != "",
 		"helper-a must report one ShareRefused(SIZE_LIMIT_EXCEEDED) for v%d, got %+v", version, refused)
 	assertTrue(len(rejected) == 1 && rejected[0].ChannelID == channelA &&
+		rejected[0].Reason == protocol.ShareRejectReasonRefused &&
 		rejected[0].Status == derecpb.StatusEnum_SIZE_LIMIT_EXCEEDED && rejected[0].Memo == refused[0].Memo,
 		"the owner must see one ShareRejected(SIZE_LIMIT_EXCEEDED) with the helper's memo, got %+v", rejected)
 	assertTrue(!stored[channelA] && stored[channelB], "only helper-b may store its share, got %v", stored)
@@ -3678,6 +3726,7 @@ func runAutoRespondOnFailure() {
 	}
 	assertTrue(len(rejected) == 1 && rejected[0].ChannelID == channelA &&
 		rejected[0].Version != nil && *rejected[0].Version == version &&
+		rejected[0].Reason == protocol.ShareRejectReasonRefused &&
 		rejected[0].Status == derecpb.StatusEnum_FAIL && rejected[0].Memo == "request could not be processed",
 		"expected one ShareRejected(FAIL, generic memo) from helper-a, got %+v", rejected)
 	fmt.Println("  the library's own response reaches the owner as ShareRejected(status=FAIL, same memo)  ✓")
@@ -4618,11 +4667,11 @@ func runUnpairing() {
 	unpaired := 0
 	for _, ev := range pump(owner, helper) {
 		assertTrue(ev.Type != protocol.EventTypeUnpairRejected, "an accepted unpair must not be rejected, got %+v", ev)
-		if ev.Type == protocol.EventTypeUnpaired && ev.ChannelID == channelID {
+		if ev.Type == protocol.EventTypeUnpaired && ev.ChannelID == channelID && ev.Acknowledged {
 			unpaired++
 		}
 	}
-	assertTrue(unpaired >= 2, "expected Unpaired on both sides, got %d", unpaired)
+	assertTrue(unpaired >= 2, "expected acknowledged Unpaired on both sides, got %d", unpaired)
 	assertTrue(!hasChannelRecord(owner, channelID, 0), "the owner's channel record must be removed after unpair")
 	assertTrue(!hasChannelRecord(helper, channelID, 0), "the helper's channel record must be removed after unpair")
 	fmt.Println("  Start(Unpair) → Unpaired on both sides, channel record gone on both  ✓")
@@ -5590,7 +5639,7 @@ func runUnpairRepublishes() {
 	events := pumpMany([]*peer{owner, helperA, helperB, helperC})
 	var unpaired bool
 	for _, ev := range events {
-		unpaired = unpaired || (ev.Type == protocol.EventTypeUnpaired && ev.ChannelID == channelC)
+		unpaired = unpaired || (ev.Type == protocol.EventTypeUnpaired && ev.ChannelID == channelC && ev.Acknowledged)
 	}
 	assertTrue(unpaired, "expected Unpaired for helper-c: %+v", events)
 	want := sortedByChannel([]storedShare{{channelA, 2}, {channelB, 2}})

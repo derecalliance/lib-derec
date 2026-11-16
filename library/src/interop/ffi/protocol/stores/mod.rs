@@ -530,6 +530,11 @@ pub struct SecretStoreCallbacks {
 /// decimal string of the channel the share is stored under, so the caller can
 /// tell which channel each share came from.
 ///
+/// `save_many` receives a JSON array of `[channel_id, share]` pairs, the
+/// same pairs `load_many` returns: `channel_id` the decimal string of the
+/// channel to store the share under, `share` the object above. The buffer is
+/// owned by the caller and valid only for the duration of the call.
+///
 /// `remove_versions_many` receives a JSON array of `[channel_id, versions]`
 /// pairs, `channel_id` a decimal string and `versions` an array of numbers,
 /// each naming the versions to remove on that channel. A version that is not
@@ -540,8 +545,8 @@ pub struct SecretStoreCallbacks {
 /// version, other than `version`, every helper keeps, or `0` to keep no
 /// other version. Any non-zero return code is a backend failure.
 ///
-/// `save` and `record_verification` share a return-code convention: `0` is
-/// success; `3`/`4`/`10` (the
+/// `save`, `save_many` and `record_verification` share a return-code
+/// convention: `0` is success; `3`/`4`/`10` (the
 /// [`DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED) /
 /// [`DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT) /
 /// [`DEREC_SHARE_STORE_REFUSED_REJECTED`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_REJECTED)
@@ -593,6 +598,12 @@ pub struct ShareStoreCallbacks {
         channel_id: u64,
         share_json_ptr: *const u8,
         share_json_len: usize,
+    ) -> i32,
+    pub save_many: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        entries_json_ptr: *const u8,
+        entries_json_len: usize,
     ) -> i32,
     pub remove_channel:
         extern "C" fn(user_data: *mut c_void, secret_id: u64, channel_id: u64) -> i32,
@@ -734,6 +745,8 @@ impl TryFrom<UserSecretsRecord> for UserSecrets {
 /// - `remove`: `0` = ok (`*out_removed` set to `0` or `1`), other =
 ///   backend failure.
 /// - `save` / `load_all`: `0` = ok, other = backend failure.
+/// - `save_many`: `0` = ok, other = backend failure. The items arrive as a
+///   JSON array of the [`StateItemRecord`]s `save` takes one at a time.
 /// - `remove_many`: `0` = ok, other = backend failure. The keys arrive as a
 ///   JSON array of the [`StateKeyRecord`]s `remove` takes one at a time; a
 ///   key with no row is skipped.
@@ -745,6 +758,12 @@ pub struct StateStoreCallbacks {
         secret_id: u64,
         item_json_ptr: *const u8,
         item_json_len: usize,
+    ) -> i32,
+    pub save_many: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        items_json_ptr: *const u8,
+        items_json_len: usize,
     ) -> i32,
     pub load: extern "C" fn(
         user_data: *mut c_void,
@@ -1516,6 +1535,33 @@ impl DeRecShareStore for DotnetShareStore {
         Box::pin(async move { res })
     }
 
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, Share)>,
+    ) -> ShareStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let res = (|| -> Result<(), ShareStoreError> {
+            let wire: Vec<(String, ShareRecord)> = entries
+                .iter()
+                .map(|(channel_id, share)| (channel_id.0.to_string(), ShareRecord::from(share)))
+                .collect();
+            let bytes = serde_json::to_vec(&wire)
+                .map_err(|e| ShareStoreError::Backend(boxed_err(format!("save_many JSON: {e}"))))?;
+            let rc = (cb.save_many)(cb.user_data, secret_id, bytes.as_ptr(), bytes.len());
+            if rc != 0 {
+                return Err(match refusal_from_rc(rc) {
+                    Some(refusal) => ShareStoreError::Refused(refusal),
+                    None => ShareStoreError::Backend(boxed_err(format!(
+                        "share store save_many failed (rc={rc})"
+                    ))),
+                });
+            }
+            Ok(())
+        })();
+        Box::pin(async move { res })
+    }
+
     fn remove_channel(
         &mut self,
         secret_id: u64,
@@ -1766,6 +1812,23 @@ impl DeRecStateStore for DotnetStateStore {
             if rc != 0 {
                 return Err(StateStoreError::Backend(boxed_err(format!(
                     "state store save failed (rc={rc})"
+                ))));
+            }
+            Ok(())
+        })();
+        Box::pin(async move { res })
+    }
+
+    fn save_many(&mut self, secret_id: u64, items: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let res = (|| -> Result<(), StateStoreError> {
+            let records: Vec<StateItemRecord> = items.iter().map(StateItemRecord::from).collect();
+            let bytes = serde_json::to_vec(&records)
+                .map_err(|e| StateStoreError::Backend(boxed_err(format!("save_many JSON: {e}"))))?;
+            let rc = (cb.save_many)(cb.user_data, secret_id, bytes.as_ptr(), bytes.len());
+            if rc != 0 {
+                return Err(StateStoreError::Backend(boxed_err(format!(
+                    "state store save_many failed (rc={rc})"
                 ))));
             }
             Ok(())
@@ -2304,6 +2367,15 @@ mod share_store_refusal_tests {
         user_data as i32
     }
 
+    extern "C" fn stub_save_many(
+        user_data: *mut c_void,
+        _secret_id: u64,
+        _entries_json_ptr: *const u8,
+        _entries_json_len: usize,
+    ) -> i32 {
+        user_data as i32
+    }
+
     extern "C" fn stub_record_verification(
         user_data: *mut c_void,
         _secret_id: u64,
@@ -2321,6 +2393,7 @@ mod share_store_refusal_tests {
             load_all: unused_load_all,
             latest_version: unused_latest_version,
             save: stub_save,
+            save_many: stub_save_many,
             remove_channel: unused_remove_channel,
             remove_versions: unused_remove_versions,
             remove_versions_many: unused_remove_versions_many,
@@ -2365,6 +2438,36 @@ mod share_store_refusal_tests {
         };
         let err =
             block_on(store.save(1, ChannelId(2), sample_share())).expect_err("rc=7 must error");
+        assert!(
+            matches!(err, ShareStoreError::Backend(_)),
+            "an unrecognized rc must be a backend failure, got {err:?}"
+        );
+    }
+
+    /// `save_many` shares `save`'s return-code mapping.
+    #[test]
+    fn ffi_save_many_rc_maps_to_refusal() {
+        for (rc, expected) in [
+            (3, Refusal::SizeLimitExceeded),
+            (4, Refusal::TooFrequent),
+            (10, Refusal::Rejected),
+        ] {
+            let mut store = DotnetShareStore {
+                cb: callbacks_with_rc(rc),
+            };
+            let err = block_on(store.save_many(1, vec![(ChannelId(2), sample_share())]))
+                .expect_err("non-zero rc must error");
+            assert!(
+                matches!(err, ShareStoreError::Refused(r) if r == expected),
+                "rc={rc} should map to {expected:?}, got {err:?}"
+            );
+        }
+
+        let mut store = DotnetShareStore {
+            cb: callbacks_with_rc(7),
+        };
+        let err = block_on(store.save_many(1, vec![(ChannelId(2), sample_share())]))
+            .expect_err("rc=7 must error");
         assert!(
             matches!(err, ShareStoreError::Backend(_)),
             "an unrecognized rc must be a backend failure, got {err:?}"

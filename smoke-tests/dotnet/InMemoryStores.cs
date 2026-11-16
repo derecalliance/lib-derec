@@ -194,6 +194,12 @@ internal sealed class InMemoryShareStore : IShareStore
         _data[(secretId, channelId, share.Version)] = share;
     }
 
+    public void SaveMany(ulong secretId, IReadOnlyList<(ulong ChannelId, Share Share)> entries)
+    {
+        foreach (var (channelId, share) in entries)
+            Save(secretId, channelId, share);
+    }
+
     public void RemoveChannel(ulong secretId, ulong channelId)
     {
         var keys = _data.Keys
@@ -277,6 +283,12 @@ internal sealed class InMemoryStateStore : IStateStore
 
     public void Save(ulong secretId, StateItem item) =>
         _data[(secretId, item.Key())] = item;
+
+    public void SaveMany(ulong secretId, IReadOnlyList<StateItem> items)
+    {
+        foreach (var item in items)
+            Save(secretId, item);
+    }
 
     public StateItem? Load(ulong secretId, StateKey key)
     {

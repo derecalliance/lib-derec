@@ -22,7 +22,8 @@ use std::collections::BTreeSet;
 use std::fs;
 
 use derec_library::protocol::events::{
-    CorruptionReason, IgnoreReason, NotRestoredReason, PendingActionKind, VerifyFailureReason,
+    CorruptionReason, IgnoreReason, NotRestoredReason, PendingActionKind, RecoverFailureReason,
+    ReplicaSyncFailureReason, ShareRejectReason, VerifyFailureReason,
 };
 use derec_library::protocol::types::{ChannelStatus, ReplicaRole, SecretKind, StateKind};
 use derec_proto::{ContactMode, SenderKind, StatusEnum};
@@ -222,6 +223,53 @@ fn verify_failure_reason_fixture_is_complete() {
         })
         .collect();
     assert_matches_fixture("VerifyFailureReason", &names);
+}
+
+#[test]
+fn recover_failure_reason_fixture_is_complete() {
+    let all = [
+        RecoverFailureReason::NoSharedKey,
+        RecoverFailureReason::DispatchFailed,
+        RecoverFailureReason::TimedOut,
+    ];
+    let names: Vec<&str> = all
+        .iter()
+        .map(|r| match r {
+            RecoverFailureReason::NoSharedKey => "NoSharedKey",
+            RecoverFailureReason::DispatchFailed => "DispatchFailed",
+            RecoverFailureReason::TimedOut => "TimedOut",
+        })
+        .collect();
+    assert_matches_fixture("RecoverFailureReason", &names);
+}
+
+#[test]
+fn share_reject_reason_fixture_is_complete() {
+    let all = [ShareRejectReason::Refused, ShareRejectReason::TimedOut];
+    let names: Vec<&str> = all
+        .iter()
+        .map(|r| match r {
+            ShareRejectReason::Refused => "Refused",
+            ShareRejectReason::TimedOut => "TimedOut",
+        })
+        .collect();
+    assert_matches_fixture("ShareRejectReason", &names);
+}
+
+#[test]
+fn replica_sync_failure_reason_fixture_is_complete() {
+    let all = [
+        ReplicaSyncFailureReason::DispatchFailed,
+        ReplicaSyncFailureReason::TimedOut,
+    ];
+    let names: Vec<&str> = all
+        .iter()
+        .map(|r| match r {
+            ReplicaSyncFailureReason::DispatchFailed => "DispatchFailed",
+            ReplicaSyncFailureReason::TimedOut => "TimedOut",
+        })
+        .collect();
+    assert_matches_fixture("ReplicaSyncFailureReason", &names);
 }
 
 #[test]
@@ -505,6 +553,9 @@ fn every_typescript_surface_names_every_event_and_reason() {
             "NotRestoredReason",
             "CorruptionReason",
             "VerifyFailureReason",
+            "RecoverFailureReason",
+            "ShareRejectReason",
+            "ReplicaSyncFailureReason",
         ] {
             let header = format!("export type {reason} =");
             let line = source

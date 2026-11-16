@@ -69,7 +69,11 @@ pub enum IgnoreReason {
     /// held back by a pairing in progress.
     PendingVerification,
     /// The message is older than the configured inbound timeout
-    /// ([`crate::protocol::types::Timeouts::inbound_message`]).
+    /// ([`crate::protocol::types::Timeouts::inbound_message`]), or it is a
+    /// pairing request whose contact or own timestamp is older than the
+    /// pairing lifetime ([`crate::protocol::types::Timeouts::pairing`]), or
+    /// missing, when it reaches the contact's creator. An expired pairing
+    /// request is not answered.
     Expired,
     /// The envelope's timestamp and the encrypted inner message's timestamp
     /// differ, or either or both are absent. A sender stamps both with the
@@ -121,6 +125,45 @@ pub enum VerifyFailureReason {
     /// A local store or transport failure while preparing or sending the
     /// challenge; `error` names the cause.
     DispatchFailed,
+}
+
+/// Why [`DeRecEvent::RecoverSecretFailed`] reports a Helper that will not
+/// contribute a share to the recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RecoverFailureReason {
+    /// The secret store holds no usable key for the channel, so no request
+    /// could be encrypted to the Helper, and nothing is sent.
+    NoSharedKey,
+    /// A local store or transport failure while preparing or sending the
+    /// request; `error` names the cause.
+    DispatchFailed,
+    /// The Helper did not answer within
+    /// [`Timeouts::get_share_response`](crate::protocol::types::Timeouts::get_share_response).
+    TimedOut,
+}
+
+/// Why [`DeRecEvent::ShareRejected`] reports a Helper that did not store a
+/// share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ShareRejectReason {
+    /// The Helper answered with a non-`Ok` status; `status` and `memo` are
+    /// its answer.
+    Refused,
+    /// The Helper did not answer within
+    /// [`Timeouts::sharing_round`](crate::protocol::types::Timeouts::sharing_round).
+    TimedOut,
+}
+
+/// Why [`DeRecEvent::ReplicaSyncFailed`] reports a member that did not
+/// receive a sync.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReplicaSyncFailureReason {
+    /// Nothing could be sent to the member; `error` names the transport or
+    /// encoding failure.
+    DispatchFailed,
+    /// The member did not acknowledge within
+    /// [`Timeouts::sharing_round`](crate::protocol::types::Timeouts::sharing_round).
+    TimedOut,
 }
 
 /// Why [`DeRecEvent::PeerNotRestored`] left a roster entry without a channel.
@@ -986,8 +1029,8 @@ pub enum DeRecFlow {
     /// the last Helper answers, or when
     /// [`Timeouts::get_share_response`](crate::protocol::types::Timeouts::get_share_response)
     /// has elapsed since the requests went out — each silent Helper is then
-    /// reported as [`DeRecEvent::RecoverSecretFailed`] with error
-    /// `"timeout"`. The decision is exactly one of:
+    /// reported as [`DeRecEvent::RecoverSecretFailed`] with
+    /// [`RecoverFailureReason::TimedOut`]. The decision is exactly one of:
     ///
     /// - [`DeRecEvent::SecretRecovered`] — one secret reconstructs and
     ///   every collected share is part of it;
@@ -1551,9 +1594,11 @@ pub enum DeRecEvent {
         replica_id: u64,
         /// The version this round was publishing.
         version: u32,
-        /// `"timeout"` when the member did not acknowledge in time; otherwise
-        /// the transport or encoding failure, rendered for display.
-        reason: String,
+        /// Whether nothing could be sent or the member did not acknowledge in
+        /// time.
+        reason: ReplicaSyncFailureReason,
+        /// The failure, rendered for display.
+        error: String,
     },
 
     /// A member was removed from the group and its roster row dropped.
@@ -1657,13 +1702,12 @@ pub enum DeRecEvent {
     /// A Helper rejected or failed to store our share (Owner side).
     ///
     /// The protocol absorbs sharing failures and converts them to events
-    /// so the application can display per-participant progress. `status` and
-    /// `memo` come from the Helper's response, except for a Helper that did
-    /// not answer within
-    /// [`Timeouts::sharing_round`](crate::protocol::types::Timeouts::sharing_round):
-    /// [`super::DeRecProtocol::tick`] then reports it with status `FAIL` and
-    /// memo `"timeout"`. The memo of a Helper's own answer is free text and
-    /// can read the same.
+    /// so the application can display per-participant progress. `reason` says
+    /// whether the Helper refused, in which case `status` and `memo` come
+    /// from its response, or did not answer within
+    /// [`Timeouts::sharing_round`](crate::protocol::types::Timeouts::sharing_round),
+    /// in which case [`super::DeRecProtocol::tick`] reports it and `status`
+    /// and `memo` carry no answer.
     ///
     /// Reported as the response arrives, without matching it to a request
     /// this device sent: pairing it with what was asked is the application's
@@ -1671,9 +1715,11 @@ pub enum DeRecEvent {
     ShareRejected {
         channel_id: ChannelId,
         version: u32,
+        /// Whether the Helper refused or did not answer in time.
+        reason: ShareRejectReason,
         /// The `StatusEnum` value from the Helper's response.
         status: i32,
-        /// Human-readable reason from the Helper, or `"timeout"`.
+        /// Human-readable reason from the Helper.
         memo: String,
     },
 
@@ -2046,17 +2092,34 @@ pub enum DeRecEvent {
     ///
     /// - Initiator: emitted when (a) `UnpairAck::NotRequired` and the request
     ///   has just been sent, (b) `UnpairAck::Required` and the peer
-    ///   acknowledged with `Ok`, or (c) `UnpairAck::Required` and the
-    ///   configured timeout elapsed without a response.
+    ///   acknowledged with `Ok`, (c) `UnpairAck::Required` and the
+    ///   configured timeout elapsed without a response, or (d) the peer
+    ///   refused the unpair of a recovery channel torn down by
+    ///   [`super::DeRecProtocol::restore`], right after
+    ///   [`Self::UnpairRejected`]. Only case (b) is `acknowledged`.
     /// - Responder: emitted by [`super::DeRecProtocol::accept`] after the
-    ///   channel/share/secret state for the requesting peer has been removed.
-    Unpaired { channel_id: ChannelId },
+    ///   channel/share/secret state for the requesting peer has been removed,
+    ///   having answered `Ok`, so always `acknowledged`.
+    Unpaired {
+        channel_id: ChannelId,
+        /// Whether both sides agreed to the unpair: the peer answered `Ok`
+        /// on the initiator, or this device answered `Ok` on the responder.
+        /// `false` when no acknowledgement was asked for, when it timed out,
+        /// or when the peer refused a restore's teardown.
+        acknowledged: bool,
+    },
 
     /// The peer answered an outbound unpair request with a non-`Ok` status.
     ///
     /// The initiator's local state is **not** dropped, and the channel is
     /// `Paired` again — the application decides what to do (retry, escalate,
     /// or force-delete locally).
+    ///
+    /// The one exception is a recovery channel torn down by
+    /// [`super::DeRecProtocol::restore`]: its local state is dropped all the
+    /// same, and [`Self::Unpaired`] follows for the channel. The refusal is
+    /// reported so the application can tell the user the Helper did not
+    /// confirm.
     UnpairRejected {
         channel_id: ChannelId,
         /// The `StatusEnum` value from the peer's response.
@@ -2296,8 +2359,8 @@ pub enum DeRecEvent {
     /// A recovery share request was dispatched to `channel_id` for
     /// `version`. Answered by [`Self::RecoveryShareReceived`] /
     /// [`Self::RecoveryShareRefused`] / [`Self::RecoveryShareCorrupted`], or
-    /// by [`Self::RecoverSecretFailed`] with error `"timeout"` when the
-    /// Helper stays silent; see [`DeRecFlow::RecoverSecret`].
+    /// by [`Self::RecoverSecretFailed`] with
+    /// [`RecoverFailureReason::TimedOut`] when the Helper stays silent; see [`DeRecFlow::RecoverSecret`].
     RecoverSecretStarted {
         channel_id: ChannelId,
         version: u32,
@@ -2312,12 +2375,15 @@ pub enum DeRecEvent {
     /// for `version`, or the Helper did not answer it within
     /// [`Timeouts::get_share_response`](crate::protocol::types::Timeouts::get_share_response).
     ///
-    /// `error` is exactly `"timeout"` for a Helper that did not answer in
-    /// time, reported by [`super::DeRecProtocol::tick`]; otherwise it is the
-    /// dispatch failure, rendered for display.
+    /// `reason` is [`RecoverFailureReason::TimedOut`] for a Helper that did
+    /// not answer in time, reported by [`super::DeRecProtocol::tick`];
+    /// otherwise the request was never sent.
     RecoverSecretFailed {
         channel_id: ChannelId,
         version: u32,
+        /// Why the Helper will not contribute a share.
+        reason: RecoverFailureReason,
+        /// The failure, rendered for display.
         error: String,
     },
 
@@ -2327,8 +2393,15 @@ pub enum DeRecEvent {
     /// ephemeral recovery channels. A helper gone away is the expected
     /// condition during recovery and the restore has already committed, so
     /// the peer's reachability is not load-bearing: local state is dropped
-    /// anyway and a [`Self::Unpaired`] for the same channel follows. The pair reports "the channel is gone locally, but the
-    /// peer was not told" — the application may notify it out-of-band.
+    /// anyway and a [`Self::Unpaired`] for the same channel follows. The
+    /// pair reports "the channel is gone locally, but the peer was not
+    /// told" — the application may notify it out-of-band. Also emitted when
+    /// the request went out but its pending entry could not be saved; the
+    /// channel is dropped at once, and `Unpaired` follows as well.
+    ///
+    /// When dropping the channels' local state fails, `UnpairFailed` is
+    /// emitted for each of them with no `Unpaired`: those channels stay,
+    /// and the application can unpair them one by one.
     UnpairFailed {
         channel_id: ChannelId,
         error: String,
@@ -2340,8 +2413,9 @@ pub enum DeRecEvent {
     /// [`ChannelStatus::Unpairing`](crate::protocol::types::ChannelStatus::Unpairing),
     /// and [`Self::Unpaired`] follows once the peer acknowledges or the
     /// acknowledgement window elapses, or [`Self::UnpairRejected`] if the
-    /// peer refuses. Under [`UnpairAck::NotRequired`], `Unpaired` is
-    /// emitted in the same event vec immediately after `UnpairStarted`.
+    /// peer refuses (for a recovery channel torn down by `restore`,
+    /// `UnpairRejected` and then `Unpaired`). Under
+    /// [`UnpairAck::NotRequired`], `Unpaired` follows in the same event vec.
     UnpairStarted {
         channel_id: ChannelId,
         /// Correlates this request with the response it will draw, and with

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use crate::protocol::DeRecProtocol;
-use crate::protocol::events::DeRecEvent;
+use crate::protocol::events::{DeRecEvent, ShareRejectReason};
 use crate::protocol::traits::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
 };
@@ -79,6 +79,13 @@ mod proof_cleanup {
             share: Share,
         ) -> ShareStoreFuture<'_, ()> {
             self.inner.save(secret_id, channel_id, share)
+        }
+        fn save_many(
+            &mut self,
+            secret_id: u64,
+            entries: Vec<(ChannelId, Share)>,
+        ) -> ShareStoreFuture<'_, ()> {
+            self.inner.save_many(secret_id, entries)
         }
         fn remove_channel(
             &mut self,
@@ -221,6 +228,7 @@ mod proof_cleanup {
 
     fn rejected(channel_id: u64, version: u32) -> DeRecEvent {
         DeRecEvent::ShareRejected {
+            reason: ShareRejectReason::Refused,
             channel_id: ChannelId(channel_id),
             version,
             status: StatusEnum::Fail as i32,
@@ -415,6 +423,7 @@ mod proof_cleanup {
                     version: 4,
                 },
                 DeRecEvent::ShareRejected {
+                    reason: ShareRejectReason::Refused,
                     channel_id: ChannelId(9002),
                     version: 4,
                     status: StatusEnum::Fail as i32,
@@ -488,6 +497,7 @@ mod proof_cleanup {
             seed_round(&mut protocol, 4, &[9001, 9002]).await;
 
             let mut events = vec![DeRecEvent::ShareRejected {
+                reason: ShareRejectReason::Refused,
                 channel_id: ChannelId(9002),
                 version: 4,
                 status: StatusEnum::TooFrequent as i32,
@@ -526,6 +536,7 @@ mod proof_cleanup {
                     version: 4,
                 },
                 DeRecEvent::ShareRejected {
+                    reason: ShareRejectReason::Refused,
                     channel_id: ChannelId(9002),
                     version: 4,
                     status: StatusEnum::Fail as i32,
@@ -579,6 +590,7 @@ mod proof_cleanup {
 
             let mut events = vec![
                 DeRecEvent::ShareRejected {
+                    reason: ShareRejectReason::Refused,
                     channel_id: ChannelId(9002),
                     version: 4,
                     status: StatusEnum::Fail as i32,
@@ -690,12 +702,14 @@ mod proof_cleanup {
 
             let mut events = vec![
                 DeRecEvent::ShareRejected {
+                    reason: ShareRejectReason::Refused,
                     channel_id: ChannelId(9001),
                     version: 4,
                     status: StatusEnum::Fail as i32,
                     memo: "rejected".to_owned(),
                 },
                 DeRecEvent::ShareRejected {
+                    reason: ShareRejectReason::Refused,
                     channel_id: ChannelId(9001),
                     version: 4,
                     status: StatusEnum::Fail as i32,
@@ -827,6 +841,7 @@ mod weighted_tally {
             })
             .collect();
         events.extend(rejected.iter().map(|&c| DeRecEvent::ShareRejected {
+            reason: ShareRejectReason::Refused,
             channel_id: ChannelId(c),
             version: VERSION,
             status: StatusEnum::Fail as i32,
@@ -1348,6 +1363,7 @@ mod keep_version_proof {
             seed_open_round(&mut protocol, 4, Some(0)).await;
 
             let rejected = |version| DeRecEvent::ShareRejected {
+                reason: ShareRejectReason::Refused,
                 channel_id: ChannelId(B),
                 version,
                 status: StatusEnum::Fail as i32,
@@ -1392,6 +1408,7 @@ mod keep_version_proof {
 
             let mut events = vec![
                 DeRecEvent::ShareRejected {
+                    reason: ShareRejectReason::Refused,
                     channel_id: ChannelId(A),
                     version: 8,
                     status: StatusEnum::Fail as i32,

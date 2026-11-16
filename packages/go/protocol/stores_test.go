@@ -150,6 +150,9 @@ func (m *mockShareStore) LatestVersion(secretID uint64) (uint32, bool, error) {
 func (m *mockShareStore) Save(secretID, channelID uint64, share Share) error {
 	return nil
 }
+func (m *mockShareStore) SaveMany(secretID uint64, entries []ShareEntry) error {
+	return nil
+}
 func (m *mockShareStore) RemoveChannel(secretID, channelID uint64) error {
 	return nil
 }
@@ -185,6 +188,9 @@ var _ UserSecretStore = (*mockUserSecretStore)(nil)
 type mockStateStore struct{}
 
 func (m *mockStateStore) Save(secretID uint64, item StateItem) error {
+	return nil
+}
+func (m *mockStateStore) SaveMany(secretID uint64, items []StateItem) error {
 	return nil
 }
 func (m *mockStateStore) Load(secretID uint64, key StateKey) (StateItem, bool, error) {

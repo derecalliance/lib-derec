@@ -11,14 +11,19 @@ use derec_proto::{Protocol, SenderKind, TransportProtocol};
 use std::collections::HashMap;
 
 use crate::Error;
+use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::protocol::tests::{
-    FailingTransport, InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
-    InMemUserSecretStore, NoopTransport, StoreRig, run_async,
+    FailingTransport, InMemChannelStore, InMemPersistedStateStore, InMemSecretStore,
+    InMemShareStore, InMemStateStore, InMemUserSecretStore, NoopTransport, RecordingTransport,
+    StoreRig, run_async,
 };
+use crate::protocol::{StateItem, StateKey};
 use crate::transport;
 use crate::types::{ReplicaId, SharedKey};
+use derec_proto::{DeRecResult, MessageBody, StatusEnum, UnpairResponseMessage};
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use prost::Message as _;
 
 type TestProto = DeRecProtocol<
     InMemChannelStore,
@@ -668,7 +673,7 @@ fn a_channel_at_a_skipped_helpers_id_is_neither_a_conflict_nor_wiped() {
         assert!(
             !events.iter().any(|e| matches!(
                 e,
-                DeRecEvent::Unpaired { channel_id }
+                DeRecEvent::Unpaired { channel_id, .. }
                     | DeRecEvent::UnpairStarted { channel_id, .. }
                     | DeRecEvent::UnpairFailed { channel_id, .. }
                     if *channel_id == ChannelId(12)
@@ -818,8 +823,16 @@ fn a_legacy_roster_with_an_unserved_scheme_restores_the_rest() {
 /// SharedKey in `secret_store` so the unpair handler can build the
 /// encrypted request envelope.
 fn seed_recovery_channels(rig: &TestRig, secret_id: u64) {
+    seed_recovery_channels_into(&rig.channel_store, &rig.secret_store, secret_id);
+}
+
+fn seed_recovery_channels_into(
+    channels: &InMemChannelStore,
+    secrets: &InMemSecretStore,
+    secret_id: u64,
+) {
     for rcid in RECOVERY_IDS {
-        rig.channel_store.helper_rows.lock().unwrap().insert(
+        channels.helper_rows.lock().unwrap().insert(
             (secret_id, rcid),
             HelperChannel {
                 channel_id: ChannelId(rcid),
@@ -834,7 +847,7 @@ fn seed_recovery_channels(rig: &TestRig, secret_id: u64) {
                 weight: 1,
             },
         );
-        rig.secret_store.data.lock().unwrap().insert(
+        secrets.data.lock().unwrap().insert(
             (secret_id, rcid, SecretKind::SharedKey as u8),
             SecretValue::SharedKey(SharedKey::new([0x77; 32])),
         );
@@ -891,6 +904,266 @@ fn restore_leaves_recovery_channels_unpairing_until_answered() {
                 .iter()
                 .any(|e| matches!(e, DeRecEvent::Unpaired { .. })),
             "no recovery channel is unpaired before its helper answers, got {events:?}"
+        );
+    });
+}
+
+type AnsweringProto = DeRecProtocol<
+    InMemChannelStore,
+    InMemShareStore,
+    InMemSecretStore,
+    InMemUserSecretStore,
+    InMemPersistedStateStore,
+    RecordingTransport,
+>;
+
+/// A restore rig whose pending unpairs persist, so a helper's answer can be
+/// processed against them.
+struct AnsweringRig {
+    protocol: AnsweringProto,
+    channel_store: InMemChannelStore,
+    secret_store: InMemSecretStore,
+    state: InMemPersistedStateStore,
+}
+
+fn build_answering_rig(secret_id: u64) -> AnsweringRig {
+    let rig = StoreRig::new();
+    let state = InMemPersistedStateStore::default();
+    let protocol = DeRecProtocolBuilder::new(secret_id)
+        .with_unpair_ack(UnpairAck::Required)
+        .with_channel_store(rig.channels.clone())
+        .with_share_store(rig.shares.clone())
+        .with_secret_store(rig.secrets.clone())
+        .with_user_secret_store(rig.user_secrets.clone())
+        .with_transport(RecordingTransport::default())
+        .with_state_store(state.clone())
+        .with_own_transports(["https://owner.example.com"])
+        .with_threshold(2)
+        .build()
+        .expect("test rig builds");
+    seed_recovery_channels_into(&rig.channels, &rig.secrets, secret_id);
+    AnsweringRig {
+        protocol,
+        channel_store: rig.channels,
+        secret_store: rig.secrets,
+        state,
+    }
+}
+
+/// A recovery helper's answer to the unpair request restore sent on `rcid`.
+fn recovery_unpair_answer(rcid: u64, status: StatusEnum) -> Vec<u8> {
+    let ts = current_timestamp();
+    DeRecMessageBuilder::channel()
+        .channel_id(ChannelId(rcid))
+        .timestamp(ts)
+        .message_body(MessageBody::UnpairResponse(UnpairResponseMessage {
+            result: Some(DeRecResult {
+                status: status as i32,
+                memo: String::new(),
+            }),
+            timestamp: Some(ts),
+            channel_id: rcid,
+        }))
+        .encrypt(&ChannelKey::new(0, SharedKey::new([0x77; 32])))
+        .expect("encrypt")
+        .build()
+        .expect("build")
+        .encode_to_vec()
+}
+
+/// Every recovery channel's pending entry is saved in one state-store write
+/// and the channels are marked `Unpairing` in one channel-store write; each
+/// entry says the channel goes whatever the helper answers.
+#[test]
+fn restore_marks_every_recovery_channel_unpairing_in_one_write() {
+    run_async(async {
+        let secret_id: u64 = 0xDE_2EC;
+        let mut rig = build_answering_rig(secret_id);
+
+        rig.protocol
+            .restore(&fixture_secret(), 7, 7, &[])
+            .await
+            .expect("restore succeeds");
+
+        assert_eq!(
+            *rig.channel_store.save_calls.lock().unwrap(),
+            0,
+            "no channel is written on its own"
+        );
+        assert_eq!(
+            *rig.channel_store.save_many_calls.lock().unwrap(),
+            2,
+            "one write restores the roster, one marks the recovery channels"
+        );
+        assert_eq!(
+            (
+                *rig.state.save_calls.lock().unwrap(),
+                *rig.state.save_many_calls.lock().unwrap()
+            ),
+            (0, 1),
+            "every pending entry is saved in one call"
+        );
+        for rcid in RECOVERY_IDS {
+            let channel_id = ChannelId(rcid);
+            assert_eq!(
+                rig.channel_store
+                    .helper_rows
+                    .lock()
+                    .unwrap()
+                    .get(&(secret_id, rcid))
+                    .map(|h| h.status),
+                Some(ChannelStatus::Unpairing)
+            );
+            assert!(matches!(
+                rig.state
+                    .data
+                    .lock()
+                    .unwrap()
+                    .get(&(secret_id, StateKey::PendingUnpair { channel_id })),
+                Some(StateItem::PendingUnpair {
+                    drop_on_rejection: true,
+                    ..
+                })
+            ));
+        }
+    });
+}
+
+/// Pending entries that cannot be saved leave nothing to await: every
+/// recovery channel is reported and dropped straight away, and none is left
+/// `Unpairing`.
+#[test]
+fn unsaved_pending_entries_drop_every_recovery_channel_at_once() {
+    run_async(async {
+        let secret_id: u64 = 0xDE_2EC;
+        let mut rig = build_answering_rig(secret_id);
+        *rig.state.fail_writes.lock().unwrap() = true;
+
+        let events = rig
+            .protocol
+            .restore(&fixture_secret(), 7, 7, &[])
+            .await
+            .expect("restore succeeds");
+
+        for rcid in RECOVERY_IDS {
+            let channel_id = ChannelId(rcid);
+            let outcome: Vec<&DeRecEvent> = events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        DeRecEvent::UnpairFailed { channel_id: c, .. }
+                            | DeRecEvent::Unpaired { channel_id: c, .. }
+                            if *c == channel_id
+                    )
+                })
+                .collect();
+            assert!(
+                matches!(
+                    outcome.as_slice(),
+                    [DeRecEvent::UnpairFailed { .. }, DeRecEvent::Unpaired { .. }]
+                ),
+                "channel {rcid} is reported, then unpaired, got {events:?}"
+            );
+            assert!(
+                !rig.channel_store
+                    .helper_rows
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(secret_id, rcid))
+            );
+        }
+        assert_eq!(*rig.state.save_many_calls.lock().unwrap(), 1);
+    });
+}
+
+/// A helper refusing to unpair a recovery channel is reported, and the
+/// channel is dropped all the same: restore's teardown never depends on the
+/// answer.
+#[test]
+fn a_rejected_recovery_channel_unpair_still_drops_the_channel() {
+    run_async(async {
+        let secret_id: u64 = 0xDE_2EC;
+        let mut rig = build_answering_rig(secret_id);
+        rig.protocol
+            .restore(&fixture_secret(), 7, 7, &[])
+            .await
+            .expect("restore succeeds");
+        let rcid = RECOVERY_IDS[0];
+
+        let events = rig
+            .protocol
+            .process(&recovery_unpair_answer(rcid, StatusEnum::Fail))
+            .await
+            .expect("processed");
+
+        let channel_id = ChannelId(rcid);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    DeRecEvent::UnpairRejected { channel_id: rejected, .. },
+                    DeRecEvent::Unpaired { channel_id: unpaired, acknowledged: false },
+                ] if *rejected == channel_id && *unpaired == channel_id
+            ),
+            "the refusal is reported, then the channel is unpaired, got {events:?}"
+        );
+        assert!(
+            !rig.channel_store
+                .helper_rows
+                .lock()
+                .unwrap()
+                .contains_key(&(secret_id, rcid))
+        );
+        assert!(
+            rig.secret_store
+                .load(secret_id, channel_id, SecretKind::SharedKey)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !rig.state
+                .data
+                .lock()
+                .unwrap()
+                .contains_key(&(secret_id, StateKey::PendingUnpair { channel_id }))
+        );
+    });
+}
+
+/// A helper accepting the unpair of a recovery channel completes it as any
+/// acknowledged unpair does.
+#[test]
+fn an_accepted_recovery_channel_unpair_reports_unpaired() {
+    run_async(async {
+        let secret_id: u64 = 0xDE_2EC;
+        let mut rig = build_answering_rig(secret_id);
+        rig.protocol
+            .restore(&fixture_secret(), 7, 7, &[])
+            .await
+            .expect("restore succeeds");
+        let rcid = RECOVERY_IDS[1];
+
+        let events = rig
+            .protocol
+            .process(&recovery_unpair_answer(rcid, StatusEnum::Ok))
+            .await
+            .expect("processed");
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [DeRecEvent::Unpaired { channel_id, acknowledged: true }] if *channel_id == ChannelId(rcid)
+            ),
+            "got {events:?}"
+        );
+        assert!(
+            !rig.channel_store
+                .helper_rows
+                .lock()
+                .unwrap()
+                .contains_key(&(secret_id, rcid))
         );
     });
 }
@@ -1002,7 +1275,7 @@ fn restore_leaves_channels_where_this_device_is_the_helper() {
             assert!(
                 !events.iter().any(|e| match e {
                     DeRecEvent::UnpairStarted { channel_id, .. }
-                    | DeRecEvent::Unpaired { channel_id }
+                    | DeRecEvent::Unpaired { channel_id, .. }
                     | DeRecEvent::UnpairFailed { channel_id, .. } =>
                         *channel_id == ChannelId(OWNER_CHANNEL),
                     _ => false,
@@ -1043,7 +1316,7 @@ fn restore_leaves_channels_where_this_device_is_the_helper() {
                 events.iter().any(|e| matches!(
                     e,
                     DeRecEvent::UnpairStarted { channel_id, .. }
-                        | DeRecEvent::Unpaired { channel_id }
+                        | DeRecEvent::Unpaired { channel_id, .. }
                         if *channel_id == ChannelId(RECOVERY_IDS[0])
                 )),
                 "{unpair_ack:?}: the recovery channels are still wiped"
@@ -1106,7 +1379,7 @@ fn restore_succeeds_when_recovery_channel_unpair_cannot_be_delivered() {
         );
         assert!(
             events.iter().any(
-                |e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == ChannelId(99))
+                |e| matches!(e, DeRecEvent::Unpaired { channel_id, .. } if *channel_id == ChannelId(99))
             ),
             "local state is dropped regardless, so Unpaired still fires"
         );

@@ -361,7 +361,7 @@ case nothing is sent:
 - `accept()` throws. The pairing has completed and its response was sent,
   but `PairingCompleted` is not returned.
 - `verifyFingerprint()` throws. The promotion stands: calling it again
-  resolves `true` and publishes nothing.
+  resolves and publishes nothing.
 
 Call `start(FlowKind.ProtectSecret, ...)` with valid weights to publish to
 every helper.
@@ -449,7 +449,9 @@ A recovery reconstructs nothing until every helper it asked has answered (a
 share, a refusal or a corrupted share all count) or
 `timeouts.get_share_response_secs` has passed since the requests went out;
 each silent helper is then reported as `RecoverSecretFailed` with
-`error: "timeout"` from `tick()`. It then decides exactly once:
+`reason: "TimedOut"` from `tick()` (`reason` "NoSharedKey" or
+"DispatchFailed" means the request was never sent; `error` carries the
+cause). It then decides exactly once:
 
 - `SecretRecovered` — one secret reconstructs and every collected share is
   part of it;
@@ -588,6 +590,14 @@ A lost device that is still running gets no answer from a helper afterwards:
 the helper holds no key for the old channel, so it cannot reply, and the
 device's rounds time out.
 
+`Unpaired { channel_id, acknowledged }` is reported on both sides once a
+channel's state is dropped. `acknowledged` is `true` when both sides agreed
+to the unpair: the peer answered `Ok` on the initiator, or this device
+answered `Ok` on the responder. It is `false` when no acknowledgement was
+asked for (unpair ack `"not_required"`), when `timeouts.unpair_ack_secs`
+elapsed without an answer, or when the peer refused the teardown of a
+recovery channel by `restore`, right after `UnpairRejected`.
+
 ### Helpers and shares
 
 - Each share goes to a **different** helper. Threshold security depends on it:
@@ -705,6 +715,17 @@ from `SharingComplete` with `threshold_met` rather than by counting
 `ShareConfirmed`, since a helper can confirm twice or unasked. See [Matching
 responses to requests is the application's
 job](https://github.com/derecalliance/lib-derec/tree/main/library#matching-responses-to-requests-is-the-applications-job).
+
+`ShareRejected.reason` is a `ShareRejectReason`: "Refused" when the helper
+answered with a non-OK status, in which case `status` and `memo` are its
+answer, or "TimedOut" when it did not answer within
+`timeouts.sharing_round_secs`, in which case `tick()` reports it and `status`
+and `memo` carry no answer from it. `ReplicaSyncFailed { replica_id, version,
+reason, error }` reports a member that received no sync: `reason` is a
+`ReplicaSyncFailureReason`, "DispatchFailed" when nothing could be sent to
+it or "TimedOut" when it did not acknowledge within
+`timeouts.sharing_round_secs`, and `error` is the failure rendered for
+display.
 
 Every channel message carries one timestamp, its send time, in both the
 envelope and the inner message. A message whose two timestamps differ, or
@@ -1009,7 +1030,7 @@ push the publisher is answered with that `status` and `memo` and sees
 `ReplicaSyncRejected`; a copy served by a catch-up is not answered.
 
 On a helper channel, throw (or reject with) `shareStoreRefusal(reason)` from
-`ShareStore.save` (a genuinely new share version) or
+`ShareStore.save` or `saveMany` (a genuinely new share version) or
 `ShareStore.recordVerification` (an accepted verification challenge) to
 refuse it:
 
@@ -1216,7 +1237,7 @@ channel: `process` changes no store, sends nothing back, and returns
 trace_id }`. This matters most for a replica destination. The source's own
 confirmation publishes the vault immediately, so that copy usually arrives
 before the destination's user has confirmed. Confirming does not replay it:
-once the destination's `verifyFingerprint` resolves `true`, call
+once the destination's `verifyFingerprint` resolves, call
 `start(FlowKind.ReplicaDiscovery)` to pull the copy from the source.
 
 Until a device confirms a member, that member is not part of the group as

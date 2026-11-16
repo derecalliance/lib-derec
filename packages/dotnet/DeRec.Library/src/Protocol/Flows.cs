@@ -508,20 +508,32 @@ public sealed record ShareConfirmedEvent : DeRecEvent
 }
 
 /// <summary>
-/// A helper rejected or failed to store our share. <see cref="Status"/> and
-/// <see cref="Memo"/> come from the helper's response, except for a helper
-/// that did not answer within <c>Timeouts.SharingRound</c>:
-/// <c>TickAsync</c> then reports it with status <c>Fail</c> and memo
-/// <c>"timeout"</c>. The memo of a helper's own answer is free text and can
-/// read the same.
+/// A helper rejected or failed to store our share. <see cref="Reason"/> is a
+/// <see cref="ShareRejectReason"/> constant: <see cref="ShareRejectReason.Refused"/>
+/// when the helper answered with a non-<c>Ok</c> status, in which case
+/// <see cref="Status"/> and <see cref="Memo"/> are its answer, or
+/// <see cref="ShareRejectReason.TimedOut"/> when it did not answer within
+/// <c>Timeouts.SharingRound</c>, in which case <c>TickAsync</c> reports it
+/// and <see cref="Status"/> and <see cref="Memo"/> carry no answer from it.
 /// </summary>
 public sealed record ShareRejectedEvent : DeRecEvent
 {
     public override string EventType => "ShareRejected";
     public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
+    public required string Reason { get; init; }
     public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
     public required string Memo { get; init; }
+}
+
+/// <summary>
+/// The label vocabulary for <see cref="ShareRejectedEvent.Reason"/>.
+/// Matches the Rust <c>ShareRejectReason</c> discriminants one-for-one.
+/// </summary>
+public static class ShareRejectReason
+{
+    public const string Refused = "Refused";
+    public const string TimedOut = "TimedOut";
 }
 
 /// <summary>
@@ -811,10 +823,21 @@ public sealed record RecoveryIncompleteEvent : DeRecEvent
     public required uint SharesReceived { get; init; }
 }
 
+/// <summary>
+/// The local channel state for <see cref="ChannelId"/> was dropped by an
+/// unpair flow. Reported on both sides of the flow.
+/// </summary>
 public sealed record UnpairedEvent : DeRecEvent
 {
     public override string EventType => "Unpaired";
     public required ulong ChannelId { get; init; }
+
+    /// <summary>Whether both sides agreed to the unpair: the peer answered
+    /// <c>Ok</c> on the initiator, or this device answered <c>Ok</c> on the
+    /// responder. <c>false</c> when no acknowledgement was asked for, when it
+    /// timed out, or when the peer refused the teardown of a recovery channel
+    /// by <c>RestoreAsync</c>.</summary>
+    public required bool Acknowledged { get; init; }
 }
 
 public sealed record UnpairRejectedEvent : DeRecEvent
@@ -1157,9 +1180,11 @@ public sealed record ReplicaSyncRejectedEvent : DeRecEvent
 /// A secret sync could not be delivered to a member, or the member did not
 /// acknowledge it within <c>Timeouts.SharingRound</c> — distinct from
 /// <see cref="ReplicaSyncRejectedEvent"/>, which is the member answering "no".
-/// <see cref="Reason"/> is <c>"timeout"</c> when the member did not
-/// acknowledge in time (reported by <c>TickAsync</c>); otherwise it is the
-/// transport or encoding failure, rendered for display.
+/// <see cref="Reason"/> is a <see cref="ReplicaSyncFailureReason"/> constant:
+/// <see cref="ReplicaSyncFailureReason.TimedOut"/> when the member did not
+/// acknowledge in time (reported by <c>TickAsync</c>), or
+/// <see cref="ReplicaSyncFailureReason.DispatchFailed"/> when nothing could be
+/// sent to it. <see cref="Error"/> is the failure, rendered for display.
 /// </summary>
 public sealed record ReplicaSyncFailedEvent : DeRecEvent
 {
@@ -1167,6 +1192,17 @@ public sealed record ReplicaSyncFailedEvent : DeRecEvent
     public required ulong ReplicaId { get; init; }
     public required uint Version { get; init; }
     public required string Reason { get; init; }
+    public required string Error { get; init; }
+}
+
+/// <summary>
+/// The label vocabulary for <see cref="ReplicaSyncFailedEvent.Reason"/>.
+/// Matches the Rust <c>ReplicaSyncFailureReason</c> discriminants one-for-one.
+/// </summary>
+public static class ReplicaSyncFailureReason
+{
+    public const string DispatchFailed = "DispatchFailed";
+    public const string TimedOut = "TimedOut";
 }
 
 /// <summary>
@@ -1410,15 +1446,30 @@ public sealed record RecoverSecretStartedEvent : DeRecEvent
 /// <summary>
 /// A recovery share request could not be dispatched to
 /// <see cref="ChannelId"/>, or the helper did not answer it within
-/// <see cref="Timeouts.GetShareResponse"/> (<see cref="Error"/> is
-/// <c>"timeout"</c>).
+/// <see cref="Timeouts.GetShareResponse"/>. <see cref="Reason"/> is a
+/// <see cref="RecoverFailureReason"/> constant:
+/// <see cref="RecoverFailureReason.TimedOut"/> for a helper that did not
+/// answer in time, reported by <c>TickAsync</c>; otherwise the request was
+/// never sent. <see cref="Error"/> is the failure, rendered for display.
 /// </summary>
 public sealed record RecoverSecretFailedEvent : DeRecEvent
 {
     public override string EventType => "RecoverSecretFailed";
     public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
+    public required string Reason { get; init; }
     public required string Error { get; init; }
+}
+
+/// <summary>
+/// The label vocabulary for <see cref="RecoverSecretFailedEvent.Reason"/>.
+/// Matches the Rust <c>RecoverFailureReason</c> discriminants one-for-one.
+/// </summary>
+public static class RecoverFailureReason
+{
+    public const string NoSharedKey = "NoSharedKey";
+    public const string DispatchFailed = "DispatchFailed";
+    public const string TimedOut = "TimedOut";
 }
 
 public sealed record UnpairFailedEvent : DeRecEvent
@@ -1586,6 +1637,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
+                Reason = root.GetProperty("reason").GetString() ?? string.Empty,
                 Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
                 Memo = root.GetProperty("memo").GetString() ?? string.Empty,
             },
@@ -1670,6 +1722,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             "Unpaired" => new UnpairedEvent
             {
                 ChannelId = ReadId(root.GetProperty("channel_id")),
+                Acknowledged = root.GetProperty("acknowledged").GetBoolean(),
             },
             "UnpairRejected" => new UnpairRejectedEvent
             {
@@ -1730,7 +1783,8 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ReplicaId = ReadId(root.GetProperty("replica_id")),
                 Version = root.GetProperty("version").GetUInt32(),
-                Reason = root.GetProperty("reason").GetString()!,
+                Reason = root.GetProperty("reason").GetString() ?? string.Empty,
+                Error = root.GetProperty("error").GetString() ?? string.Empty,
             },
             "ReplicaRemoved" => new ReplicaRemovedEvent
             {
@@ -1861,6 +1915,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
+                Reason = root.GetProperty("reason").GetString() ?? string.Empty,
                 Error = root.GetProperty("error").GetString() ?? string.Empty,
             },
             "UnpairFailed" => new UnpairFailedEvent

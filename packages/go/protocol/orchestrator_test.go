@@ -505,7 +505,7 @@ func TestOrchestrator_RejectForwardsStatusEnum(t *testing.T) {
 	if len(rejected) != 1 {
 		t.Fatalf("expected one ShareRejected, got %+v", events)
 	}
-	if rejected[0].ChannelID != channelA || rejected[0].Status != derecpb.StatusEnum_SIZE_LIMIT_EXCEEDED ||
+	if rejected[0].ChannelID != channelA || rejected[0].Reason != ShareRejectReasonRefused || rejected[0].Status != derecpb.StatusEnum_SIZE_LIMIT_EXCEEDED ||
 		rejected[0].Memo != "over quota" {
 		t.Fatalf("ShareRejected: got %+v", rejected[0])
 	}

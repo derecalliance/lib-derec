@@ -16,6 +16,7 @@
 
 use derec_library::protocol::types::state_record::StateItemRecord;
 use derec_library::protocol::{DeRecStateStore, StateItem, StateKey, StateKind, StateStoreFuture};
+use rusqlite::Connection;
 use std::future;
 
 use crate::codec::u64_to_sql;
@@ -79,15 +80,19 @@ fn decode(bytes: &[u8]) -> StateItem {
 impl DeRecStateStore for SqliteStateStore {
     fn save(&mut self, secret_id: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
         let conn = lock(&self.connection);
-        let (kind, sub_a, sub_b) = key_columns(&item.key());
-        conn.execute(
-            "INSERT INTO protocol_state (secret_id, kind, sub_a, sub_b, data)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(secret_id, kind, sub_a, sub_b) DO UPDATE SET
-                 data = excluded.data",
-            rusqlite::params![u64_to_sql(secret_id), kind, sub_a, sub_b, encode(&item)],
-        )
-        .expect("protocol_state save failed");
+        upsert(&conn, secret_id, &item);
+        Box::pin(future::ready(Ok(())))
+    }
+
+    fn save_many(&mut self, secret_id: u64, items: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
+        let conn = lock(&self.connection);
+        let tx = conn
+            .unchecked_transaction()
+            .expect("save_many transaction failed");
+        for item in &items {
+            upsert(&tx, secret_id, item);
+        }
+        tx.commit().expect("save_many commit failed");
         Box::pin(future::ready(Ok(())))
     }
 
@@ -152,4 +157,16 @@ impl DeRecStateStore for SqliteStateStore {
             .collect();
         Box::pin(future::ready(Ok(items)))
     }
+}
+
+fn upsert(conn: &Connection, secret_id: u64, item: &StateItem) {
+    let (kind, sub_a, sub_b) = key_columns(&item.key());
+    conn.execute(
+        "INSERT INTO protocol_state (secret_id, kind, sub_a, sub_b, data)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(secret_id, kind, sub_a, sub_b) DO UPDATE SET
+             data = excluded.data",
+        rusqlite::params![u64_to_sql(secret_id), kind, sub_a, sub_b, encode(item)],
+    )
+    .expect("protocol_state save failed");
 }

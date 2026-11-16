@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use derec_library::protocol::DeRecFlow;
-use derec_library::protocol::events::DeRecEvent;
+use derec_library::protocol::events::{DeRecEvent, ShareRejectReason};
 use derec_library::protocol::types::UserSecret;
 use derec_library::types::ChannelId;
 use derec_proto::{ContactMode, SenderKind};
@@ -437,7 +437,7 @@ async fn a_scheduled_tick_shares_the_same_lock_as_inbound_messages() {
     assert!(
         !events.iter().any(|e| matches!(
             e,
-            DeRecEvent::ShareRejected { memo, .. } if memo == "timeout"
+            DeRecEvent::ShareRejected { reason, .. } if *reason == ShareRejectReason::TimedOut
         )),
         "a tick inside the window must not fail a helper that answered; got {events:?}"
     );

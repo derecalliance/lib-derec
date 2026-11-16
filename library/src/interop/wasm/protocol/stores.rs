@@ -28,6 +28,8 @@
 //!   // `undefined` where nothing of `kind` is stored.
 //!   loadMany(secretId: string, channelIds: string[], kind: SecretKind): Promise<Array<Uint8Array | null | undefined>>;
 //!   save(secretId: string, channelId: string, kind: SecretKind, value: Uint8Array): Promise<void>;
+//!   // `save` for each `[channelId, kind, value]` entry, in one call.
+//!   saveMany(secretId: string, entries: [channelId: string, kind: SecretKind, value: Uint8Array][]): Promise<void>;
 //!   remove(secretId: string, channelId: string, kind: SecretKind): Promise<void>;
 //!   // `remove` for each `[channelId, kind]` entry; an entry with nothing
 //!   // stored is skipped.
@@ -48,6 +50,8 @@
 //!   // member, keyed by `replicaId` alone. Bytes are a JSON `ChannelRecord`.
 //!   load(secretId: string, channelId: string, replicaId: string): Promise<Uint8Array | null | undefined>;
 //!   save(secretId: string, channelId: string, replicaId: string, bytes: Uint8Array): Promise<void>;
+//!   // `save` for each `[channelId, replicaId, bytes]` entry, in one call.
+//!   saveMany(secretId: string, records: [channelId: string, replicaId: string, bytes: Uint8Array][]): Promise<void>;
 //!   // Whether a record was removed.
 //!   remove(secretId: string, channelId: string, replicaId: string): Promise<boolean>;
 //!   // `remove` for each `[channelId, replicaId]` entry; an entry that names
@@ -86,6 +90,9 @@
 //!   // May reject or throw a `shareStoreRefusal(reason)` `Error` to refuse a
 //!   // share update on a helper channel.
 //!   save(secretId: string, channelId: string, share: Share): Promise<void>;
+//!   // `save` for each `[channelId, share]` entry, in one call; refused the
+//!   // same way.
+//!   saveMany(secretId: string, entries: [channelId: string, share: Share][]): Promise<void>;
 //!   // Drop every share stored under `(secretId, channelId)`; a channel with
 //!   // nothing stored is a no-op.
 //!   removeChannel(secretId: string, channelId: string): Promise<void>;
@@ -133,6 +140,8 @@
 //!   // Buffers are JSON `StateItemRecord` / `StateKeyRecord`; store an item
 //!   // under its key and return the exact bytes received.
 //!   save(secretId: string, itemJson: Uint8Array): Promise<void>;
+//!   // `itemsJson` is a JSON array of the items `save` takes.
+//!   saveMany(secretId: string, itemsJson: Uint8Array): Promise<void>;
 //!   load(secretId: string, keyJson: Uint8Array): Promise<Uint8Array | null | undefined>;
 //!   // Whether a row was removed.
 //!   remove(secretId: string, keyJson: Uint8Array): Promise<boolean>;
@@ -247,7 +256,7 @@ fn refusal_from_reason(reason: &str) -> Option<Refusal> {
     }
 }
 
-/// Maps a failed `save`/`recordVerification` call's thrown or rejected
+/// Maps a failed `save`/`saveMany`/`recordVerification` call's thrown or rejected
 /// `JsValue` to a [`ShareStoreError`]: a recognised `refusal` tag becomes
 /// [`ShareStoreError::Refused`], anything else an ordinary
 /// [`ShareStoreError::Backend`].
@@ -981,6 +990,33 @@ impl DeRecShareStore for JsShareStore {
         })
     }
 
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, Share)>,
+    ) -> ShareStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        Box::pin(async move {
+            let pairs = Array::new();
+            for (channel_id, share) in &entries {
+                let pair = Array::new();
+                pair.push(&JsValue::from_str(&channel_id.0.to_string()));
+                pair.push(&share_to_js(share));
+                pairs.push(&pair);
+            }
+            let args = Array::new();
+            args.push(&JsValue::from_str(&secret_str));
+            args.push(&pairs);
+            let promise_val = call_method_value(&obj, "saveMany", &args)
+                .map_err(|e| share_store_call_error("saveMany", &e))?;
+            resolve_promise_value(promise_val)
+                .await
+                .map_err(|e| share_store_call_error("saveMany", &e))?;
+            Ok(())
+        })
+    }
+
     fn load_many(
         &self,
         secret_id: u64,
@@ -1423,6 +1459,25 @@ impl DeRecStateStore for JsStateStore {
             args.push(&JsValue::from_str(&secret_str));
             args.push(&js_bytes);
             let promise_val = call_method(&obj, "save", &args)
+                .map_err(|e| StateStoreError::Backend(box_err(e)))?;
+            resolve_promise(promise_val)
+                .await
+                .map_err(|e| StateStoreError::Backend(box_err(e)))?;
+            Ok(())
+        })
+    }
+
+    fn save_many(&mut self, secret_id: u64, items: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        let records: Vec<StateItemRecord> = items.iter().map(StateItemRecord::from).collect();
+        Box::pin(async move {
+            let items_bytes = serde_json::to_vec(&records)
+                .map_err(|e| StateStoreError::Backend(box_err(e.to_string())))?;
+            let args = Array::new();
+            args.push(&JsValue::from_str(&secret_str));
+            args.push(&Uint8Array::from(items_bytes.as_slice()));
+            let promise_val = call_method(&obj, "saveMany", &args)
                 .map_err(|e| StateStoreError::Backend(box_err(e)))?;
             resolve_promise(promise_val)
                 .await

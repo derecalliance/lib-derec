@@ -542,6 +542,7 @@ fn an_expired_channel_takes_its_unpair_state_with_it() {
                     StateItem::PendingUnpair {
                         channel_id: ChannelId(cid),
                         started_at: now_secs(),
+                        drop_on_rejection: false,
                     },
                 )
                 .await

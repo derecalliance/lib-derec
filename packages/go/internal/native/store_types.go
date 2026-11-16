@@ -325,8 +325,8 @@ type Share struct {
 	Threshold *uint32
 }
 
-// ShareEntry is one ShareStore.LoadMany result: a share paired with the
-// channel it is stored under.
+// ShareEntry is a share paired with the channel it is stored under: one
+// ShareStore.LoadMany result, or one ShareStore.SaveMany entry.
 type ShareEntry struct {
 	ChannelID uint64
 	Share     Share
@@ -431,6 +431,10 @@ type StateItem struct {
 	// before 0.0.9 carry none, and the library judges such a round against
 	// the builder's threshold.
 	Threshold *uint32
+	// DropOnRejection is set on a pending unpair whose channel is dropped
+	// whatever the Helper answers. Nil when unset; rows written before
+	// 1.0.0 carry none, and the library reads them as false.
+	DropOnRejection *bool
 	// LocalVersion is the version this device held when a catch-up started.
 	LocalVersion *uint32
 	// Reported maps each member that has answered a catch-up to the version

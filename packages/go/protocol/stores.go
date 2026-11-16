@@ -84,8 +84,8 @@ type (
 	SecretValue = native.SecretValue
 	// Share is a single stored share entry.
 	Share = native.Share
-	// ShareEntry is one ShareStore.LoadMany result: a share paired with
-	// the channel it is stored under.
+	// ShareEntry is a share paired with the channel it is stored under:
+	// one ShareStore.LoadMany result, or one ShareStore.SaveMany entry.
 	ShareEntry = native.ShareEntry
 	// ShareVersionsEntry names the versions to drop under one channel for
 	// ShareStore.RemoveVersionsMany.
@@ -275,6 +275,13 @@ type ShareStore interface {
 	// the matching protocol status; any other error is an ordinary backend
 	// failure.
 	Save(secretID, channelID uint64, share Share) error
+	// SaveMany persists every entry in entries, in one call, the same as
+	// Save applied to each: each share is keyed by the secretID argument and
+	// its entry's ChannelID, refused the same way, and an empty slice writes
+	// nothing. The library calls it when it writes several shares at once,
+	// so a backend that can write them in one statement or transaction
+	// should.
+	SaveMany(secretID uint64, entries []ShareEntry) error
 	// RemoveChannel deletes every share stored for channelID within
 	// secretID.
 	RemoveChannel(secretID, channelID uint64) error
@@ -327,7 +334,7 @@ type ShareStore interface {
 }
 
 // ShareStoreRefusal is the reason a *ShareStoreRefusedError refuses a
-// ShareStore.Save or ShareStore.RecordVerification call. The library maps
+// ShareStore.Save, ShareStore.SaveMany or ShareStore.RecordVerification call. The library maps
 // each variant to the matching protocol status answered to the owner — the
 // application chooses the reason, never the wire status.
 type ShareStoreRefusal = derec.ShareStoreRefusal
@@ -338,8 +345,8 @@ const (
 	RefusalRejected          = derec.RefusalRejected
 )
 
-// ShareStoreRefusedError is returned from ShareStore.Save or
-// ShareStore.RecordVerification to refuse the write or verification with
+// ShareStoreRefusedError is returned from ShareStore.Save, ShareStore.SaveMany
+// or ShareStore.RecordVerification to refuse the write or verification with
 // Refusal. The library turns this into the matching protocol status
 // answered to the owner, rather than treating it as a backend failure.
 type ShareStoreRefusedError = derec.ShareStoreRefusedError
@@ -368,6 +375,12 @@ type StateStore interface {
 	// Save inserts or full-replaces the row at (secretID, item.Key()).
 	// Idempotent.
 	Save(secretID uint64, item StateItem) error
+	// SaveMany persists every item in items, in one call, the same as Save
+	// applied to each: each replaces any row with the same key, and an empty
+	// slice writes nothing. The library calls it when it writes several rows
+	// at once, so a backend that can write them in one statement or
+	// transaction should.
+	SaveMany(secretID uint64, items []StateItem) error
 	// Load returns the row at (secretID, key), or ok=false if no row
 	// exists.
 	Load(secretID uint64, key StateKey) (item StateItem, ok bool, err error)

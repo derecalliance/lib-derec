@@ -225,7 +225,7 @@ fn a_helper_is_unpairing_until_it_acknowledges() {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == A)),
+                .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id, acknowledged: true } if *channel_id == A)),
             "got {events:?}"
         );
         assert_eq!(rig.status(A).await, None, "the channel is gone");
@@ -266,7 +266,7 @@ fn an_acknowledgement_whose_teardown_fails_is_finished_by_processing_it_again() 
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == A)),
+                .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id, acknowledged: true } if *channel_id == A)),
             "got {events:?}"
         );
         assert_eq!(rig.status(A).await, None, "the channel is gone");
@@ -393,7 +393,7 @@ fn the_recovery_helpers_answers_end_their_channels_after_restore() {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == C)),
+                .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id, acknowledged: true } if *channel_id == C)),
             "got {events:?}"
         );
         assert_eq!(rig.status(C).await, None);
@@ -448,7 +448,7 @@ fn removing_a_share_holder_without_an_ack_republishes_at_once() {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == C)),
+                .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id, acknowledged: false } if *channel_id == C)),
             "got {events:?}"
         );
         assert_eq!(published_to(&events), vec![A, B], "got {events:?}");
@@ -475,6 +475,7 @@ fn a_timed_out_unpair_republishes_from_tick() {
                 StateItem::PendingUnpair {
                     channel_id: C,
                     started_at: 0,
+                    drop_on_rejection: false,
                 },
             )
             .await
@@ -484,7 +485,7 @@ fn a_timed_out_unpair_republishes_from_tick() {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == C)),
+                .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id, acknowledged: false } if *channel_id == C)),
             "got {events:?}"
         );
         assert_eq!(published_to(&events), vec![A, B], "got {events:?}");

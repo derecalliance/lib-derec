@@ -336,6 +336,10 @@ pub(crate) struct InMemShareStore {
     pub(crate) load_many_calls: Arc<Mutex<usize>>,
     /// How many times [`DeRecShareStore::remove_versions_many`] was called.
     pub(crate) remove_versions_many_calls: Arc<Mutex<usize>>,
+    /// How many times the single-share [`DeRecShareStore::save`] and the bulk
+    /// [`DeRecShareStore::save_many`] were called.
+    pub(crate) save_calls: Arc<Mutex<usize>>,
+    pub(crate) save_many_calls: Arc<Mutex<usize>>,
     /// When set, every [`DeRecShareStore::load_many`] fails with a backend
     /// error.
     pub(crate) fail_load_many: Arc<Mutex<bool>>,
@@ -402,8 +406,21 @@ impl DeRecShareStore for InMemShareStore {
         Box::pin(future::ready(Ok(None)))
     }
     fn save(&mut self, sid: u64, cid: ChannelId, share: Share) -> ShareStoreFuture<'_, ()> {
+        *self.save_calls.lock().unwrap() += 1;
         let v = share.version;
         self.data.lock().unwrap().insert((sid, cid.0, v), share);
+        Box::pin(future::ready(Ok(())))
+    }
+    fn save_many(
+        &mut self,
+        sid: u64,
+        entries: Vec<(ChannelId, Share)>,
+    ) -> ShareStoreFuture<'_, ()> {
+        *self.save_many_calls.lock().unwrap() += 1;
+        let mut data = self.data.lock().unwrap();
+        for (cid, share) in entries {
+            data.insert((sid, cid.0, share.version), share);
+        }
         Box::pin(future::ready(Ok(())))
     }
     fn remove_channel(&mut self, sid: u64, cid: ChannelId) -> ShareStoreFuture<'_, ()> {
@@ -538,6 +555,21 @@ impl DeRecShareStore for RefusingShareStore {
         }
         self.inner.save(secret_id, channel_id, share)
     }
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, Share)>,
+    ) -> ShareStoreFuture<'_, ()> {
+        if let Some(refusal) = *self.save_refusal.lock().unwrap() {
+            return Box::pin(future::ready(Err(ShareStoreError::Refused(refusal))));
+        }
+        if *self.save_backend_error.lock().unwrap() {
+            return Box::pin(future::ready(Err(ShareStoreError::Backend(
+                "share store backend unavailable".to_owned().into(),
+            ))));
+        }
+        self.inner.save_many(secret_id, entries)
+    }
     fn remove_channel(
         &mut self,
         secret_id: u64,
@@ -612,6 +644,9 @@ impl DeRecStateStore for InMemStateStore {
     fn save(&mut self, _: u64, _: StateItem) -> StateStoreFuture<'_, ()> {
         Box::pin(future::ready(Ok(())))
     }
+    fn save_many(&mut self, _: u64, _: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
+        Box::pin(future::ready(Ok(())))
+    }
     fn load(&self, _: u64, _: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
         Box::pin(future::ready(Ok(None)))
     }
@@ -636,10 +671,12 @@ pub(crate) struct InMemPersistedStateStore {
     pub(crate) data: Arc<Mutex<HashMap<(u64, StateKey), StateItem>>>,
     /// How many times `load_all` was asked for each kind.
     pub(crate) load_all_calls: Arc<Mutex<HashMap<StateKind, usize>>>,
-    /// When set, every `save`, `remove` and `remove_many` fails with a
-    /// backend error and changes nothing.
+    /// When set, every `save`, `save_many`, `remove` and `remove_many` fails
+    /// with a backend error and changes nothing.
     pub(crate) fail_writes: Arc<Mutex<bool>>,
-    /// How many times `remove_many` was called.
+    /// How many times `save`, `save_many` and `remove_many` were called.
+    pub(crate) save_calls: Arc<Mutex<usize>>,
+    pub(crate) save_many_calls: Arc<Mutex<usize>>,
     pub(crate) remove_many_calls: Arc<Mutex<usize>>,
 }
 impl InMemPersistedStateStore {
@@ -653,10 +690,22 @@ impl InMemPersistedStateStore {
 }
 impl DeRecStateStore for InMemPersistedStateStore {
     fn save(&mut self, sid: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
+        *self.save_calls.lock().unwrap() += 1;
         if let Some(refused) = self.refused() {
             return refused;
         }
         self.data.lock().unwrap().insert((sid, item.key()), item);
+        Box::pin(future::ready(Ok(())))
+    }
+    fn save_many(&mut self, sid: u64, items: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
+        *self.save_many_calls.lock().unwrap() += 1;
+        if let Some(refused) = self.refused() {
+            return refused;
+        }
+        let mut data = self.data.lock().unwrap();
+        for item in items {
+            data.insert((sid, item.key()), item);
+        }
         Box::pin(future::ready(Ok(())))
     }
     fn load(&self, sid: u64, key: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {

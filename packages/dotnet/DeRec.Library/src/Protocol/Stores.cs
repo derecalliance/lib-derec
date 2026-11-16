@@ -489,6 +489,19 @@ public interface IShareStore
     /// </para>
     /// </summary>
     void Save(ulong secretId, ulong channelId, Share share);
+
+    /// <summary>
+    /// Save every share in <paramref name="entries"/>, in one call.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Save"/> applied to each entry: each share is keyed by the
+    /// <paramref name="secretId"/> argument and its entry's <c>ChannelId</c>,
+    /// refused the same way, and an empty list writes nothing. The library
+    /// calls it when it saves several shares at once, so a backend that can
+    /// write them in one statement or transaction should.
+    /// </remarks>
+    void SaveMany(ulong secretId, IReadOnlyList<(ulong ChannelId, Share Share)> entries);
+
     void RemoveChannel(ulong secretId, ulong channelId);
     /// <summary>
     /// Drop the shares stored under <c>(secretId, channelId)</c> at each of
@@ -556,8 +569,8 @@ public interface IShareStore
 
 /// <summary>
 /// The reason a <see cref="ShareStoreRefusedException"/> refuses a
-/// <see cref="IShareStore.Save"/> or <see cref="IShareStore.RecordVerification"/>
-/// call. The library maps each variant to the matching protocol status
+/// <see cref="IShareStore.Save"/>, <see cref="IShareStore.SaveMany"/> or
+/// <see cref="IShareStore.RecordVerification"/> call. The library maps each variant to the matching protocol status
 /// answered to the owner.
 /// </summary>
 public enum ShareStoreRefusal
@@ -568,8 +581,8 @@ public enum ShareStoreRefusal
 }
 
 /// <summary>
-/// Thrown from <see cref="IShareStore.Save"/> or
-/// <see cref="IShareStore.RecordVerification"/> to refuse the write or
+/// Thrown from <see cref="IShareStore.Save"/>, <see cref="IShareStore.SaveMany"/>
+/// or <see cref="IShareStore.RecordVerification"/> to refuse the write or
 /// verification with <see cref="Refusal"/>. The library turns this into the
 /// matching protocol status answered to the owner, rather than treating it
 /// as a backend failure.
@@ -808,6 +821,11 @@ public sealed record StateKey(StateKind Kind, ulong? ChannelId, ulong? SecretId,
 /// <see cref="StateKind.SharingRound"/>). A row without it is judged against
 /// the builder's threshold.
 /// </param>
+/// <param name="DropOnRejection">
+/// <c>true</c> on a pending unpair whose channel is dropped whatever the
+/// Helper answers (only for <see cref="StateKind.PendingUnpair"/>). Null when
+/// unset; the library reads a row without it as <c>false</c>.
+/// </param>
 /// <remarks>
 /// Fields are carried exactly as the library wrote them. A replica-id set
 /// left null is read by the library as empty.
@@ -830,7 +848,8 @@ public sealed record StateItem(
     IReadOnlyDictionary<ulong, uint>? Reported = null,
     ulong[]? ShareChannels = null,
     uint? KeepVersion = null,
-    uint? Threshold = null)
+    uint? Threshold = null,
+    bool? DropOnRejection = null)
 {
     public StateKey Key() => Kind switch
     {
@@ -858,8 +877,9 @@ public sealed record StateItem(
         ulong startedAt) =>
         new(StateKind.PendingRecovery, null, secretId, version, startedAt, null, shares, pending,
             ShareChannels: shareChannels);
-    public static StateItem PendingUnpair(ulong channelId, ulong startedAt) =>
-        new(StateKind.PendingUnpair, channelId, null, null, startedAt, null, null);
+    public static StateItem PendingUnpair(ulong channelId, ulong startedAt, bool? dropOnRejection = null) =>
+        new(StateKind.PendingUnpair, channelId, null, null, startedAt, null, null,
+            DropOnRejection: dropOnRejection);
     public static StateItem SharingRound(
         uint version,
         ulong[] pending,
@@ -897,6 +917,17 @@ public interface IStateStore
     /// Idempotent.
     /// </summary>
     void Save(ulong secretId, StateItem item);
+
+    /// <summary>
+    /// Save every item in <paramref name="items"/>, in one call.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Save"/> applied to each item: each replaces whatever row
+    /// is stored under the same key, and an empty list writes nothing. The
+    /// library calls it when it saves several rows at once, so a backend that
+    /// can write them in one statement or transaction should.
+    /// </remarks>
+    void SaveMany(ulong secretId, IReadOnlyList<StateItem> items);
 
     /// <summary>
     /// Read the row at <c>(secretId, key)</c>. Return <c>null</c> when

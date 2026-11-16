@@ -4,6 +4,7 @@
 use derec_library::protocol::types::Share;
 use derec_library::protocol::{DeRecShareStore, ShareStoreFuture};
 use derec_library::types::ChannelId;
+use rusqlite::Connection;
 use std::future;
 
 use crate::codec::{
@@ -175,29 +176,24 @@ impl DeRecShareStore for SqliteShareStore {
         channel_id: ChannelId,
         share: Share,
     ) -> ShareStoreFuture<'_, ()> {
-        // `share.secret_id` is the Owner's id and differs from the partition
-        // whenever this peer holds someone else's share, so it goes in its own
-        // column rather than into the key. See `DeRecShareStore::save`.
         let conn = lock(&self.connection);
-        conn.execute(
-            "INSERT INTO shares (secret_id, channel_id, version, share_secret_id, bytes, subshares, threshold) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(secret_id, channel_id, version) DO UPDATE SET
-                 share_secret_id = excluded.share_secret_id,
-                 bytes           = excluded.bytes,
-                 subshares       = excluded.subshares,
-                 threshold       = excluded.threshold",
-            rusqlite::params![
-                u64_to_sql(secret_id),
-                u64_to_sql(channel_id.0),
-                share.version as i64,
-                u64_to_sql(share.secret_id),
-                share.bytes,
-                subshares_to_sql(share.subshares),
-                threshold_to_sql(share.threshold),
-            ],
-        )
-        .expect("share save failed");
+        upsert(&conn, secret_id, channel_id, &share);
+        Box::pin(future::ready(Ok(())))
+    }
+
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, Share)>,
+    ) -> ShareStoreFuture<'_, ()> {
+        let conn = lock(&self.connection);
+        let tx = conn
+            .unchecked_transaction()
+            .expect("save_many transaction failed");
+        for (channel_id, share) in &entries {
+            upsert(&tx, secret_id, *channel_id, share);
+        }
+        tx.commit().expect("save_many commit failed");
         Box::pin(future::ready(Ok(())))
     }
 
@@ -285,4 +281,29 @@ where
     I: Iterator<Item = rusqlite::Result<Share>>,
 {
     rows.map(|r| r.expect("share row failed")).collect()
+}
+
+fn upsert(conn: &Connection, secret_id: u64, channel_id: ChannelId, share: &Share) {
+    // `share.secret_id` is the Owner's id and differs from the partition
+    // whenever this peer holds someone else's share, so it goes in its own
+    // column rather than into the key. See `DeRecShareStore::save`.
+    conn.execute(
+        "INSERT INTO shares (secret_id, channel_id, version, share_secret_id, bytes, subshares, threshold) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(secret_id, channel_id, version) DO UPDATE SET
+             share_secret_id = excluded.share_secret_id,
+             bytes           = excluded.bytes,
+             subshares       = excluded.subshares,
+             threshold       = excluded.threshold",
+        rusqlite::params![
+            u64_to_sql(secret_id),
+            u64_to_sql(channel_id.0),
+            share.version as i64,
+            u64_to_sql(share.secret_id),
+            share.bytes,
+            subshares_to_sql(share.subshares),
+            threshold_to_sql(share.threshold),
+        ],
+    )
+    .expect("share save failed");
 }

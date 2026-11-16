@@ -43,8 +43,11 @@
 //! that. See [`restore`] for why.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecUserSecretStore, UnpairAck,
-    types::{ChannelRecord, HelperChannel, KeepRecoveryChannel, Secret, UserSecrets},
+    DeRecChannelStore, DeRecEvent, DeRecStateStore, DeRecUserSecretStore, StateItem, StateKey,
+    UnpairAck,
+    types::{
+        ChannelRecord, ChannelStatus, HelperChannel, KeepRecoveryChannel, Secret, UserSecrets,
+    },
 };
 use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::protocol::context::{Local, Round};
@@ -167,17 +170,21 @@ mod restore_plan;
 ///    retryable.
 /// 4. **Wipe.** Unpair every channel at no roster id whose peer is a
 ///    Helper — the recovery-mode channels minted to drive
-///    `start(RecoverSecret)` — under the
-///    configured `unpair_ack`, as `start(Unpair)` does. A channel whose peer
-///    is an Owner is this device helping someone else: it holds that
-///    owner's share and is never touched. Under
-///    `UnpairAck::Required` each one is
+///    `start(RecoverSecret)` — under the configured `unpair_ack`. A channel
+///    whose peer is an Owner is this device helping someone else: it holds
+///    that owner's share and is never touched. Each recovery channel is
+///    sent its own unpair request; the rest happens all at once. Under
+///    `UnpairAck::Required` every one is marked
 ///    [`ChannelStatus::Unpairing`](crate::protocol::types::ChannelStatus::Unpairing)
-///    until its helper answers or the acknowledgement window elapses, so
-///    no flow selects it in the meantime: the follow-up `ProtectSecret`
-///    reaches only the restored helpers, and the helper's answer lands on
-///    a channel that still exists. Under `UnpairAck::NotRequired` its
-///    local state is dropped as the request goes out.
+///    in a single write, so no flow selects it while its helper's answer is
+///    awaited: the follow-up `ProtectSecret` reaches only the restored
+///    helpers, and the answer lands on a channel that still exists. Unlike
+///    `start(Unpair)`, the outcome does not depend on the answer: an
+///    acceptance, the acknowledgement timeout and a refusal all drop the
+///    channel and report [`DeRecEvent::Unpaired`], a refusal preceded by
+///    [`DeRecEvent::UnpairRejected`]. The answer only tells the application
+///    whether the helper confirmed. Under `UnpairAck::NotRequired` the
+///    recovery channels are dropped together as the requests go out.
 ///
 ///    For the same reason the wipe cannot fail the restore. An old
 ///    helper that has gone away is the expected condition during
@@ -190,7 +197,9 @@ mod restore_plan;
 ///    every wiped channel yields exactly one [`DeRecEvent::Unpaired`]:
 ///    in the returned events when the request could not be sent or no
 ///    acknowledgement is required, later from `process` or the timeout
-///    sweep otherwise.
+///    sweep otherwise. Only a failure to drop the local state itself
+///    leaves channels behind, reported as `UnpairFailed` with no
+///    `Unpaired`.
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
 pub(in crate::protocol) async fn restore<S: StoreSet>(
     stores: &mut Stores<'_, S>,
@@ -326,8 +335,31 @@ async fn save_secret<S: StoreSet>(
     Ok(())
 }
 
-// TODO: We need to tackle this differently. Unpairing must happen independently of how the
-// counter-party responds, and ideally we must do it all at once. Lets discuss it apart
+/// Tear down the recovery channels: every channel at no roster id whose peer
+/// is a Helper and that is not kept.
+///
+/// Each one is sent an unpair request, which needs its own key and endpoint.
+/// The rest happens all at once:
+///
+/// - Under `UnpairAck::Required`, one state-store write saves a pending
+///   entry for every channel that was sent its request, marked to drop the
+///   channel whatever the Helper answers, and then one channel-store write
+///   marks all of them `Unpairing`, so no flow selects them while the answers are awaited. A
+///   Helper's acceptance, its refusal and the acknowledgement timeout each
+///   end in [`DeRecEvent::Unpaired`]; a refusal is reported first as
+///   [`DeRecEvent::UnpairRejected`].
+/// - Every other channel is dropped in one call: all of them under
+///   `UnpairAck::NotRequired`, and under `Required` those whose request could
+///   not be sent, or every channel if the pending entries could not be saved.
+///   If the `Unpairing` write fails, the channels awaiting an answer are dropped
+///   here too, so none is left selectable.
+///
+/// Nothing here fails the restore, which has already committed. A request
+/// that could not be sent, or pending entries that could not be saved, are
+/// reported as [`DeRecEvent::UnpairFailed`] before the channel's
+/// [`DeRecEvent::Unpaired`]. A drop that fails reports `UnpairFailed` for
+/// each channel it covered and no `Unpaired`: the channels stay, and the
+/// application can unpair them one by one.
 async fn unpair_recovery_channels<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -336,46 +368,196 @@ async fn unpair_recovery_channels<S: StoreSet>(
     kept_ids: &HashSet<u64>,
     unpair_ack: UnpairAck,
 ) -> Vec<DeRecEvent> {
-    let recovery_ids: Vec<ChannelId> = existing_channels
+    let recovery = recovery_channels(existing_channels, roster_ids, kept_ids);
+    if recovery.is_empty() {
+        return Vec::new();
+    }
+
+    let mut teardown = Teardown::default();
+    let sent = send_unpair_requests(stores, local, recovery, &mut teardown).await;
+    match unpair_ack {
+        UnpairAck::NotRequired => teardown.drop_now.extend(sent.iter().map(|c| c.channel_id)),
+        UnpairAck::Required => {
+            let awaiting = save_pending_unpairs(stores, local.secret_id, sent, &mut teardown).await;
+            mark_unpairing(stores, local.secret_id, &awaiting, &mut teardown).await;
+        }
+    }
+    teardown.drop_channels(stores, local).await
+}
+
+/// The events of a recovery-channel teardown, and the channels it drops in
+/// one call at the end instead of awaiting a Helper's answer.
+#[derive(Default)]
+struct Teardown {
+    events: Vec<DeRecEvent>,
+    drop_now: Vec<ChannelId>,
+}
+
+impl Teardown {
+    /// Report a step that failed for `channel_id` and drop the channel
+    /// instead of awaiting its Helper's answer.
+    fn failed(&mut self, channel_id: ChannelId, error: impl ToString) {
+        self.events.push(DeRecEvent::UnpairFailed {
+            channel_id,
+            error: error.to_string(),
+        });
+        self.drop_now.push(channel_id);
+    }
+
+    /// Drop every channel not awaiting an answer, in one call, and report
+    /// each as `Unpaired`, or as `UnpairFailed` if the drop fails.
+    async fn drop_channels<S: StoreSet>(
+        mut self,
+        stores: &mut Stores<'_, S>,
+        local: &Local<'_>,
+    ) -> Vec<DeRecEvent> {
+        if self.drop_now.is_empty() {
+            return self.events;
+        }
+        match drop_channels_state(stores, local, &self.drop_now).await {
+            Ok(()) => self
+                .events
+                .extend(
+                    self.drop_now
+                        .into_iter()
+                        .map(|channel_id| DeRecEvent::Unpaired {
+                            channel_id,
+                            acknowledged: false,
+                        }),
+                ),
+            Err(e) => self
+                .events
+                .extend(
+                    self.drop_now
+                        .into_iter()
+                        .map(|channel_id| DeRecEvent::UnpairFailed {
+                            channel_id,
+                            error: e.to_string(),
+                        }),
+                ),
+        }
+        self.events
+    }
+}
+
+/// The recovery channels among `existing_channels`: those whose peer is a
+/// Helper, at no roster id and not kept.
+fn recovery_channels<'a>(
+    existing_channels: &'a [HelperChannel],
+    roster_ids: &HashSet<u64>,
+    kept_ids: &HashSet<u64>,
+) -> Vec<&'a HelperChannel> {
+    existing_channels
         .iter()
         .filter(|c| {
             c.peer_role == SenderKind::Helper
                 && !roster_ids.contains(&c.channel_id.0)
                 && !kept_ids.contains(&c.channel_id.0)
         })
-        .map(|c| c.channel_id)
-        .collect();
-    if recovery_ids.is_empty() {
-        return Vec::new();
-    }
-    let now = now_secs();
+        .collect()
+}
+
+/// Send each channel its unpair request, all under one trace id, and return
+/// the channels it was sent to. A channel whose request could not be sent is
+/// reported and dropped.
+async fn send_unpair_requests<'a, S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    channels: Vec<&'a HelperChannel>,
+    teardown: &mut Teardown,
+) -> Vec<&'a HelperChannel> {
     let round = &Round {
         reply_to: &[],
         trace_id: fresh_trace_id(),
     };
-    let mut events = Vec::new();
-    for channel_id in recovery_ids {
-        match unpairing::start(
-            stores, local, channel_id, channel_id, None, unpair_ack, now, round,
-        )
-        .await
-        {
-            Ok(mut per_channel) => events.append(&mut per_channel),
-            Err(e) => {
-                events.push(DeRecEvent::UnpairFailed {
-                    channel_id,
-                    error: e.to_string(),
-                });
-                if drop_channels_state(stores, local, &[channel_id])
-                    .await
-                    .is_ok()
-                {
-                    events.push(DeRecEvent::Unpaired { channel_id });
-                }
-            }
+    let mut sent = Vec::new();
+    for channel in channels {
+        let channel_id = channel.channel_id;
+        teardown.events.push(DeRecEvent::UnpairStarted {
+            channel_id,
+            trace_id: round.trace_id,
+        });
+        match unpairing::send_request(stores, local, channel_id, channel_id, None, round).await {
+            Ok(()) => sent.push(channel),
+            Err(e) => teardown.failed(channel_id, e),
         }
     }
-    events
+    sent
+}
+
+/// Save every channel's pending entry in one call, each marked to drop the
+/// channel whatever its Helper answers, and return the channels now awaiting
+/// an answer. If the entries could not be saved, every channel is reported
+/// and dropped instead.
+async fn save_pending_unpairs<'a, S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    secret_id: u64,
+    channels: Vec<&'a HelperChannel>,
+    teardown: &mut Teardown,
+) -> Vec<&'a HelperChannel> {
+    if channels.is_empty() {
+        return channels;
+    }
+    let now = now_secs();
+    let pending: Vec<StateItem> = channels
+        .iter()
+        .map(|c| StateItem::PendingUnpair {
+            channel_id: c.channel_id,
+            started_at: now,
+            drop_on_rejection: true,
+        })
+        .collect();
+    match stores.state.save_many(secret_id, pending).await {
+        Ok(()) => channels,
+        Err(e) => {
+            for channel in channels {
+                teardown.failed(channel.channel_id, &e);
+            }
+            Vec::new()
+        }
+    }
+}
+
+/// Mark every awaiting channel `Unpairing` in one channel-store write.
+///
+/// Written after the pending entries, so an `Unpairing` channel always has
+/// one and the acknowledgement timeout always reaches it. Only a `Paired`
+/// channel becomes `Unpairing`, as in `start(Unpair)`. If the write fails,
+/// the pending entries are removed and the channels are dropped instead.
+async fn mark_unpairing<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    secret_id: u64,
+    awaiting: &[&HelperChannel],
+    teardown: &mut Teardown,
+) {
+    let unpairing: Vec<ChannelRecord> = awaiting
+        .iter()
+        .filter(|c| c.status == ChannelStatus::Paired)
+        .map(|&c| {
+            ChannelRecord::Helper(HelperChannel {
+                status: ChannelStatus::Unpairing,
+                ..c.clone()
+            })
+        })
+        .collect();
+    if unpairing.is_empty()
+        || stores
+            .channels
+            .save_many(secret_id, unpairing)
+            .await
+            .is_ok()
+    {
+        return;
+    }
+    let ids: Vec<ChannelId> = awaiting.iter().map(|c| c.channel_id).collect();
+    let entries: Vec<StateKey> = ids
+        .iter()
+        .map(|&channel_id| StateKey::PendingUnpair { channel_id })
+        .collect();
+    // Best effort: an entry left behind is completed by the timeout sweep,
+    // whose drop is idempotent.
+    let _ = stores.state.remove_many(secret_id, &entries).await;
+    teardown.drop_now.extend(ids);
 }
 
 #[cfg(test)]

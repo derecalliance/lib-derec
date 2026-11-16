@@ -9,6 +9,56 @@ all of them unless it names a specific binding.
 
 ### 1.0.0-alpha.1 (unreleased)
 
+- **Changed: timeouts are typed, and `Unpaired` says whether it was
+  acknowledged.** *(breaking; every SDK)*
+
+  A peer that did not answer in time used to be reported with the literal
+  `"timeout"` in a text field, which an application had to string-match and
+  which a helper's own free-text memo could also read. Each event now
+  carries a typed `reason`, following `VerifySharesFailed`:
+
+  - `RecoverSecretFailed` gains `reason: RecoverFailureReason`
+    (`NoSharedKey`, `DispatchFailed`, `TimedOut`).
+  - `ShareRejected` gains `reason: ShareRejectReason` (`Refused`,
+    `TimedOut`); `status` and `memo` are the helper's answer only when
+    `Refused`.
+  - `ReplicaSyncFailed` gains `reason: ReplicaSyncFailureReason`
+    (`DispatchFailed`, `TimedOut`), and its display text moves from
+    `reason` to `error`.
+  - `Unpaired` gains `acknowledged`: `true` when the peer answered `Ok` (or,
+    on the responder, when this device did), `false` when no
+    acknowledgement was asked for, when it timed out, or when the helper
+    refused a restore's teardown. An application no longer tells an
+    acknowledged unpair from a timed-out one by whether it came from
+    `process` or `tick`.
+
+  On the wire each `reason` is the variant name, as a string, and
+  `acknowledged` a boolean; `enums.json` records the three enums.
+
+  Migration: match on `reason` instead of comparing `error` or `memo` with
+  `"timeout"`, read `ReplicaSyncFailed`'s text from `error`, and read
+  `acknowledged` on `Unpaired` where the source of the event was used.
+
+- **Changed: `restore` tears down its recovery channels whatever their
+  helpers answer.** *(every SDK)*
+
+  Under `UnpairAck::Required`, a helper refusing the unpair of a recovery
+  channel used to return that channel to `Paired`, leaving a live channel at
+  no roster id after the restore. Now the refusal is reported as
+  `UnpairRejected` and the channel is dropped anyway, followed by `Unpaired`;
+  an acceptance and the acknowledgement timeout end in `Unpaired` as before.
+  The recovery channels' pending entries are saved in one state-store write
+  and the channels are marked `Unpairing` in one channel-store write; under
+  `UnpairAck::NotRequired` they are dropped in one call. Ordinary
+  `start(Unpair)` is unchanged.
+
+  - The pending-unpair state row gains `drop_on_rejection` (`true` for a
+    restore's recovery channels; absent when `false`, and on older rows,
+    which read as `false`). Node, web and React Native carry state rows as
+    opaque bytes and need no change. Go's `StateItem` gains
+    `DropOnRejection *bool` and .NET's `StateItem` gains
+    `bool? DropOnRejection`; a custom store that copies fields must carry it.
+
 - **Changed: `restore` keeps chosen recovery channels and drops the replica
   group.** *(breaking; every SDK)*
 
@@ -110,6 +160,36 @@ all of them unless it names a specific binding.
   `SecretStore.SaveMany(secretID, []protocol.SecretValueEntry)`.
 
   Migration: implement both on every channel and secret store.
+
+- **Added: `save_many` on the share and state stores.**
+  *(breaking; every SDK)*
+
+  `DeRecShareStore::save_many(secret_id, Vec<(ChannelId, Share)>)` and
+  `DeRecStateStore::save_many(secret_id, Vec<StateItem>)` save every entry
+  in one call, with `save`'s semantics per entry, refusals included; an
+  empty list writes nothing. A replica device receiving a sync now stores
+  every helper's tracking share in one share-store call, and `restore` saves
+  the pending unpair entries of all its recovery channels in one state-store
+  call. If that call fails, every recovery channel is reported as
+  `UnpairFailed` and dropped at once.
+  Distributing shares to helpers and sending verification challenges still
+  write one row per channel, so a store failure stays isolated to that
+  channel.
+
+  Over FFI `ShareStoreCallbacks` and `StateStoreCallbacks` each gain a
+  `save_many` slot right after `save`. The share slot takes a JSON array of
+  `[channel_id, share]` pairs, the same pairs `load_many` returns, and
+  answers with `save`'s return codes; the state slot takes a JSON array of
+  the `StateItemRecord`s `save` takes one at a time. In Node, web and React
+  Native they are `ShareStore.saveMany(secretId, entries)` with
+  `[channelId, share]` pairs and `StateStore.saveMany(secretId, itemsJson)`
+  with a JSON array of items; in .NET
+  `IShareStore.SaveMany(secretId, IReadOnlyList<(ulong ChannelId, Share Share)>)`
+  and `IStateStore.SaveMany(secretId, IReadOnlyList<StateItem>)`; in Go
+  `ShareStore.SaveMany(secretID, []protocol.ShareEntry)` and
+  `StateStore.SaveMany(secretID, []protocol.StateItem)`.
+
+  Migration: implement both on every share and state store.
 
 - **Changed: `restore` takes the newest version the helpers hold.**
   *(breaking; every SDK)*

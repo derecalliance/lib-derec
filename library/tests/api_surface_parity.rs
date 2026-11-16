@@ -366,6 +366,13 @@ const STORE_PARAMS: &[ParamOverride] = &[
     (
         "ts",
         "StateStore",
+        "saveMany",
+        &["secret_id", "items_json"],
+        "the items cross as the opaque JSON array the core wrote, and the name says so",
+    ),
+    (
+        "ts",
+        "StateStore",
         "load",
         &["secret_id", "key_json"],
         "the key crosses as the opaque JSON the core wrote, and the name says so",

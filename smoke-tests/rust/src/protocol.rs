@@ -25,10 +25,10 @@ use derec_library::protocol::{
     AutoAcceptPolicy, ChannelStoreFuture, CorruptionReason, DeRecChannelStore, DeRecEvent,
     DeRecFlow, DeRecProtocol, DeRecProtocolBuilder, DeRecSecretStore, DeRecShareStore,
     DeRecStateStore, DeRecStores, DeRecTransport, DeRecUserSecretStore, ExpiredChannelCleanup,
-    IgnoreReason, MissingPolicy, NotRestoredReason, PendingActionKind, RecoveryHelper, Refusal,
-    RestoreError, SecretKind, SecretStoreError, SecretStoreFuture, SecretValue, Share,
-    ShareStoreError, ShareStoreFuture, StateItem, StateKey, StateStoreFuture, TransportFuture,
-    VerifyFailureReason,
+    IgnoreReason, MissingPolicy, NotRestoredReason, PendingActionKind, RecoverFailureReason,
+    RecoveryHelper, Refusal, RestoreError, SecretKind, SecretStoreError, SecretStoreFuture,
+    SecretValue, Share, ShareStoreError, ShareStoreFuture, StateItem, StateKey, StateStoreFuture,
+    TransportFuture, VerifyFailureReason,
 };
 use derec_library::transport::TransportValidationError;
 use derec_library::types::{ChannelId, ReplicaId};
@@ -489,6 +489,28 @@ impl DeRecShareStore for InMemoryShareStore {
         Box::pin(future::ready(Ok(())))
     }
 
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, Share)>,
+    ) -> ShareStoreFuture<'_, ()> {
+        if self.refuse_saves {
+            return Box::pin(future::ready(Err(ShareStoreError::Refused(
+                Refusal::TooFrequent,
+            ))));
+        }
+        if self.fail_saves {
+            return Box::pin(future::ready(Err(ShareStoreError::Backend(
+                "simulated backend failure".into(),
+            ))));
+        }
+        for (channel_id, share) in entries {
+            self.data
+                .insert((channel_id.0, secret_id, share.version), share);
+        }
+        Box::pin(future::ready(Ok(())))
+    }
+
     fn remove_channel(
         &mut self,
         secret_id: u64,
@@ -645,6 +667,12 @@ struct InMemoryStateStore {
 impl DeRecStateStore for InMemoryStateStore {
     fn save(&mut self, secret_id: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
         self.data.insert((secret_id, item.key()), item);
+        Box::pin(future::ready(Ok(())))
+    }
+    fn save_many(&mut self, secret_id: u64, items: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
+        for item in items {
+            self.data.insert((secret_id, item.key()), item);
+        }
         Box::pin(future::ready(Ok(())))
     }
     fn load(&self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
@@ -4761,6 +4789,7 @@ fn share_rejections(events: &[DeRecEvent]) -> Vec<(ChannelId, u32, i32, String)>
                 version,
                 status,
                 memo,
+                ..
             } => Some((*channel_id, *version, *status, memo.clone())),
             _ => None,
         })
@@ -5643,19 +5672,69 @@ async fn run_recover_restore_republish_flow() {
             "recovery channel {channel_id:?} must be Unpairing until its helper answers"
         );
     }
-    let unpaired: HashSet<ChannelId> = pump_many(&mut [&mut device, &mut helper_a, &mut helper_b])
-        .await
-        .into_iter()
+    // helper-a accepts its unpair; helper-b's application refuses its own.
+    for (endpoint, bytes) in device.drain() {
+        if endpoint.uri == helper_a.uri {
+            deliver(&mut helper_a, &bytes).await;
+            continue;
+        }
+        let action = helper_b
+            .protocol
+            .process(&bytes)
+            .await
+            .expect("helper-b process(UnpairRequest) failed")
+            .into_iter()
+            .find_map(|e| match e {
+                DeRecEvent::ActionRequired { action, .. } => Some(action),
+                _ => None,
+            })
+            .expect("helper-b is asked whether to unpair");
+        helper_b
+            .protocol
+            .reject(action, StatusEnum::Fail, "not now")
+            .await
+            .expect("helper-b reject(Unpair) failed");
+    }
+    let answers = pump_many(&mut [&mut device, &mut helper_a, &mut helper_b]).await;
+    let unpaired: HashSet<ChannelId> = answers
+        .iter()
         .filter_map(|e| match e {
-            DeRecEvent::Unpaired { channel_id } => Some(channel_id),
+            DeRecEvent::Unpaired {
+                channel_id,
+                acknowledged: true,
+            } => Some(*channel_id),
             _ => None,
         })
         .collect();
     assert!(
-        unpaired.contains(&recovery_a) && unpaired.contains(&recovery_b),
-        "the recovery helpers' answers must unpair both recovery channels, got {unpaired:?}"
+        unpaired.contains(&recovery_a),
+        "helper-a's acceptance unpairs its recovery channel, got {answers:?}"
     );
-    println!("  restore unpairs the recovery channels once their helpers answer  ✓");
+    let rejected = answers.iter().position(
+        |e| matches!(e, DeRecEvent::UnpairRejected { channel_id, .. } if *channel_id == recovery_b),
+    );
+    let dropped = answers.iter().position(
+        |e| matches!(e, DeRecEvent::Unpaired { channel_id, acknowledged: false } if *channel_id == recovery_b),
+    );
+    assert!(
+        matches!((rejected, dropped), (Some(r), Some(d)) if r < d),
+        "helper-b's refusal is reported, then its recovery channel is unpaired anyway, got {answers:?}"
+    );
+    for channel_id in [recovery_a, recovery_b] {
+        assert!(
+            device
+                .protocol
+                .channel_store
+                .load(SECRET_ID, ChannelQuery::Helper { channel_id })
+                .await
+                .expect("device channel load failed")
+                .is_none(),
+            "recovery channel {channel_id:?} is gone whatever its helper answered"
+        );
+    }
+    println!(
+        "  restore unpairs the recovery channels whatever their helpers answer (accept → Unpaired acknowledged, refuse → UnpairRejected + Unpaired unacknowledged)  ✓"
+    );
 
     let snapshot = device
         .protocol
@@ -5998,7 +6077,7 @@ async fn run_restore_on_recovery_channels_flow() {
         .await
         .into_iter()
         .filter_map(|e| match e {
-            DeRecEvent::Unpaired { channel_id } => Some(channel_id),
+            DeRecEvent::Unpaired { channel_id, .. } => Some(channel_id),
             _ => None,
         })
         .collect();
@@ -6560,13 +6639,14 @@ async fn run_silent_helper_recovery_flow() {
             DeRecEvent::RecoverSecretFailed {
                 channel_id,
                 version: failed_version,
-                error,
+                reason,
+                ..
             },
             DeRecEvent::SecretRecovered { secret },
         ] => {
             assert_eq!(*channel_id, channel_c, "helper-c is the one that timed out");
             assert_eq!(*failed_version, version);
-            assert_eq!(error, "timeout");
+            assert_eq!(*reason, RecoverFailureReason::TimedOut);
             assert!(
                 secret
                     .secrets
@@ -6687,7 +6767,7 @@ async fn run_restore_keeps_helper_duties_flow() {
         .iter()
         .filter_map(|e| match e {
             DeRecEvent::UnpairStarted { channel_id, .. }
-            | DeRecEvent::Unpaired { channel_id }
+            | DeRecEvent::Unpaired { channel_id, .. }
             | DeRecEvent::UnpairFailed { channel_id, .. } => Some(*channel_id),
             _ => None,
         })
@@ -7243,7 +7323,7 @@ async fn run_unpairing_flow() {
     let events = pump(&mut owner, &mut helper).await;
     let unpaired = events
         .iter()
-        .filter(|e| matches!(e, DeRecEvent::Unpaired { channel_id: c } if *c == channel_id))
+        .filter(|e| matches!(e, DeRecEvent::Unpaired { channel_id: c, acknowledged: true } if *c == channel_id))
         .count();
     assert!(
         unpaired >= 2,
@@ -7895,9 +7975,9 @@ async fn run_unpair_republishes_flow() {
     );
     let events = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b, &mut helper_c]).await;
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == channel_c)),
+        events.iter().any(
+            |e| matches!(e, DeRecEvent::Unpaired { channel_id, .. } if *channel_id == channel_c)
+        ),
         "expected Unpaired for helper-c: {events:?}"
     );
     let mut expected = vec![(channel_a, 2), (channel_b, 2)];

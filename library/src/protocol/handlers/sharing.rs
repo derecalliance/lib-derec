@@ -3,7 +3,8 @@
 
 use super::super::{
     ChannelRequest, DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore,
-    DeRecTransport, IgnoreReason, MissingPolicy, PendingAction, SecretKind, Share, ShareStoreError,
+    DeRecTransport, IgnoreReason, MissingPolicy, PendingAction, SecretKind, Share,
+    ShareRejectReason, ShareStoreError,
 };
 use super::pairing::own_communication_info;
 use super::replicas::sharing as replica;
@@ -1008,6 +1009,7 @@ fn on_response(
                 Ok(vec![DeRecEvent::ShareRejected {
                     channel_id,
                     version,
+                    reason: ShareRejectReason::Refused,
                     status,
                     memo: memo.to_owned(),
                 }])

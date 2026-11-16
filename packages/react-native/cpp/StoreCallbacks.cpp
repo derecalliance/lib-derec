@@ -27,11 +27,11 @@ static_assert(sizeof(ChannelStoreCallbacks) == 11 * sizeof(void*),
               "ChannelStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(SecretStoreCallbacks) == 8 * sizeof(void*),
               "SecretStoreCallbacks layout changed; update the bindings");
-static_assert(sizeof(ShareStoreCallbacks) == 12 * sizeof(void*),
+static_assert(sizeof(ShareStoreCallbacks) == 13 * sizeof(void*),
               "ShareStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(UserSecretStoreCallbacks) == 5 * sizeof(void*),
               "UserSecretStoreCallbacks layout changed; update the bindings");
-static_assert(sizeof(StateStoreCallbacks) == 7 * sizeof(void*),
+static_assert(sizeof(StateStoreCallbacks) == 8 * sizeof(void*),
               "StateStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(TransportCallbacks) == 2 * sizeof(void*),
               "TransportCallbacks layout changed; update the bindings");
@@ -439,6 +439,61 @@ int32_t shareRefusalCode(jsi::Runtime& rt, const jsi::Value& value) {
 /// directly on a synchronous throw.
 CallResult toShareRefusalResult(jsi::Runtime& rt, const jsi::Value& value) {
   return CallResult{shareRefusalCode(rt, value), {}};
+}
+
+/// The `Share` object `ShareStore.save`/`saveMany` hand to JavaScript.
+jsi::Object shareToJs(jsi::Runtime& rt, const DecodedShare& decoded) {
+  jsi::Object shareObj(rt);
+  shareObj.setProperty(rt, "secretId", jsi::Value(rt, jsi::String::createFromUtf8(rt, decoded.secretId)));
+  shareObj.setProperty(rt, "version", jsi::Value(static_cast<int>(decoded.version)));
+  shareObj.setProperty(rt, "bytes", toUint8ArrayVal(rt, decoded.bytes));
+  if (decoded.subshares) {
+    shareObj.setProperty(rt, "subshares", jsi::Value(static_cast<double>(*decoded.subshares)));
+  }
+  if (decoded.threshold) {
+    shareObj.setProperty(rt, "threshold", jsi::Value(static_cast<double>(*decoded.threshold)));
+  }
+  return shareObj;
+}
+
+/// A `JSON.parse`d `ShareRecord`, read the way `decodeShareRecord` reads the
+/// raw buffer `ShareStore.save` receives: empty when `secret_id`, `version`
+/// or `bytes` is absent or mistyped; `subshares` and `threshold` are
+/// optional, and absent or `null` decodes as none.
+std::optional<DecodedShare> decodeShareRecordValue(jsi::Runtime& rt, const jsi::Value& value) {
+  if (!value.isObject()) {
+    return std::nullopt;
+  }
+  jsi::Object record = value.asObject(rt);
+  jsi::Value secretId = record.getProperty(rt, "secret_id");
+  jsi::Value version = record.getProperty(rt, "version");
+  jsi::Value bytes = record.getProperty(rt, "bytes");
+  if (!secretId.isString() || !version.isNumber() || !bytes.isObject() || !bytes.asObject(rt).isArray(rt)) {
+    return std::nullopt;
+  }
+  DecodedShare out;
+  out.secretId = secretId.asString(rt).utf8(rt);
+  out.version = static_cast<uint32_t>(version.asNumber());
+  jsi::Array byteArray = bytes.asObject(rt).asArray(rt);
+  size_t len = byteArray.size(rt);
+  out.bytes.reserve(len);
+  for (size_t i = 0; i < len; ++i) {
+    jsi::Value b = byteArray.getValueAtIndex(rt, i);
+    if (!b.isNumber()) {
+      return std::nullopt;
+    }
+    out.bytes.push_back(static_cast<uint8_t>(b.asNumber()));
+  }
+  auto optionalUnsigned = [&rt, &record](const char* field) -> std::optional<uint32_t> {
+    jsi::Value v = record.getProperty(rt, field);
+    if (v.isNumber()) {
+      return static_cast<uint32_t>(v.asNumber());
+    }
+    return std::nullopt;
+  };
+  out.subshares = optionalUnsigned("subshares");
+  out.threshold = optionalUnsigned("threshold");
+  return out;
 }
 
 /// `UserSecretStore.loadLatest(): Promise<UserSecrets | null | undefined>`.
@@ -1041,17 +1096,7 @@ extern "C" int32_t shareStoreSave(void* userData, uint64_t secretId, uint64_t ch
     jsi::Runtime& rt = keepAlive->runtime();
     auto store = keepAlive->shareStore();
     auto method = store->getPropertyAsFunction(rt, "save");
-    jsi::Object shareObj(rt);
-    shareObj.setProperty(rt, "secretId",
-                         jsi::Value(rt, jsi::String::createFromUtf8(rt, decoded.secretId)));
-    shareObj.setProperty(rt, "version", jsi::Value(static_cast<int>(decoded.version)));
-    shareObj.setProperty(rt, "bytes", toUint8ArrayVal(rt, decoded.bytes));
-    if (decoded.subshares) {
-      shareObj.setProperty(rt, "subshares", jsi::Value(static_cast<double>(*decoded.subshares)));
-    }
-    if (decoded.threshold) {
-      shareObj.setProperty(rt, "threshold", jsi::Value(static_cast<double>(*decoded.threshold)));
-    }
+    jsi::Object shareObj = shareToJs(rt, decoded);
     // A refusal thrown synchronously (rather than via a rejected promise)
     // never reaches `settleFromPromise`'s `onErr`, so it is read here,
     // before it would otherwise fall into `JsCallbackBridge::callSync`'s
@@ -1059,6 +1104,56 @@ extern "C" int32_t shareStoreSave(void* userData, uint64_t secretId, uint64_t ch
     try {
       jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId), idVal(rt, channelId),
                                                 jsi::Value(rt, shareObj));
+      keepAlive->settleFromPromise(rt, std::move(promise), settle, toVoidResult, toShareRefusalResult);
+    } catch (jsi::JSError& e) {
+      settle(toShareRefusalResult(rt, e.value()));
+    }
+  });
+  return result.code;
+}
+
+/// `ShareStore.saveMany(secretId, entries) -> void`
+///
+/// `entries` arrives as a JSON array of `[channelId, share]` pairs and is
+/// handed to JavaScript as `[channelId, Share]`, where `Share` is built from
+/// the record exactly as `save` builds it. A malformed record is a backend
+/// failure and the store is not called. A refusal maps to the same FFI codes
+/// as `save`. The buffer is owned by the core and valid only for this call,
+/// so it is copied before the promise is awaited.
+extern "C" int32_t shareStoreSaveMany(void* userData, uint64_t secretId, const uint8_t* entries,
+                                       size_t entriesLen) {
+  auto* self = static_cast<StoreBindings*>(userData);
+  // Kept alive past this call so the lambda handed to `callSync` — which the
+  // JavaScript CallInvoker's queue may still be holding after this object's
+  // owner has released its own reference — has somewhere safe to run.
+  auto keepAlive = self->shared_from_this();
+  std::vector<uint8_t> entriesJson(entries, entries + entriesLen);
+  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId, entriesJson](std::function<void(CallResult)> settle) {
+    jsi::Runtime& rt = keepAlive->runtime();
+    auto store = keepAlive->shareStore();
+    auto method = store->getPropertyAsFunction(rt, "saveMany");
+    // Channel ids arrive as decimal strings — the core encodes them that way
+    // because `JSON.parse` cannot hold a u64 — and are handed on unchanged.
+    jsi::Array pairs = entriesJson.empty()
+                           ? jsi::Array(rt, 0)
+                           : jsonParseUtf8(rt, entriesJson.data(), entriesJson.size()).asObject(rt).asArray(rt);
+    size_t count = pairs.size(rt);
+    jsi::Array entriesVal(rt, count);
+    for (size_t i = 0; i < count; ++i) {
+      jsi::Array pair = pairs.getValueAtIndex(rt, i).asObject(rt).asArray(rt);
+      std::optional<DecodedShare> decoded = decodeShareRecordValue(rt, pair.getValueAtIndex(rt, 1));
+      if (!decoded) {
+        settle(CallResult{kBackendFailure, {}});
+        return;
+      }
+      jsi::Array entry(rt, 2);
+      entry.setValueAtIndex(rt, 0, pair.getValueAtIndex(rt, 0));
+      entry.setValueAtIndex(rt, 1, jsi::Value(rt, shareToJs(rt, *decoded)));
+      entriesVal.setValueAtIndex(rt, i, std::move(entry));
+    }
+    // A refusal thrown synchronously is read here, as `save` reads it.
+    try {
+      jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId), jsi::Value(rt, entriesVal));
       keepAlive->settleFromPromise(rt, std::move(promise), settle, toVoidResult, toShareRefusalResult);
     } catch (jsi::JSError& e) {
       settle(toShareRefusalResult(rt, e.value()));
@@ -1271,6 +1366,25 @@ extern "C" int32_t stateStoreSave(void* userData, uint64_t secretId, const uint8
     auto method = store->getPropertyAsFunction(rt, "save");
     jsi::Value promise =
         method.callWithThis(rt, *store, idVal(rt, secretId), toUint8ArrayVal(rt, payload));
+    keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
+  });
+  return result.code;
+}
+
+/// `StateStore.saveMany(secretId, itemsJson) -> void`
+extern "C" int32_t stateStoreSaveMany(void* userData, uint64_t secretId, const uint8_t* itemsJsonPtr,
+                                       size_t itemsJsonLen) {
+  auto* self = static_cast<StoreBindings*>(userData);
+  // Kept alive past this call so the lambda handed to `callSync` — which the
+  // JavaScript CallInvoker's queue may still be holding after this object's
+  // owner has released its own reference — has somewhere safe to run.
+  auto keepAlive = self->shared_from_this();
+  std::vector<uint8_t> items(itemsJsonPtr, itemsJsonPtr + itemsJsonLen);
+  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId, items](std::function<void(CallResult)> settle) {
+    jsi::Runtime& rt = keepAlive->runtime();
+    auto store = keepAlive->stateStore();
+    auto method = store->getPropertyAsFunction(rt, "saveMany");
+    jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId), toUint8ArrayVal(rt, items));
     keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
   });
   return result.code;
@@ -1540,6 +1654,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
       shareStoreLoadAll,            // load_all
       shareStoreLatestVersion,      // latest_version
       shareStoreSave,               // save
+      shareStoreSaveMany,           // save_many
       shareStoreRemoveChannel,      // remove_channel
       shareStoreRemoveVersions,     // remove_versions
       shareStoreRemoveVersionsMany, // remove_versions_many
@@ -1557,6 +1672,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
   bindings->stateCallbacks_ = StateStoreCallbacks{
       self,               // user_data
       stateStoreSave,     // save
+      stateStoreSaveMany, // save_many
       stateStoreLoad,     // load
       stateStoreRemove,   // remove
       stateStoreRemoveMany, // remove_many
@@ -1595,6 +1711,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
   requireField(rt, bindings->shareCallbacks_.load_all, "ShareStoreCallbacks.load_all");
   requireField(rt, bindings->shareCallbacks_.latest_version, "ShareStoreCallbacks.latest_version");
   requireField(rt, bindings->shareCallbacks_.save, "ShareStoreCallbacks.save");
+  requireField(rt, bindings->shareCallbacks_.save_many, "ShareStoreCallbacks.save_many");
   requireField(rt, bindings->shareCallbacks_.remove_channel, "ShareStoreCallbacks.remove_channel");
   requireField(rt, bindings->shareCallbacks_.remove_versions, "ShareStoreCallbacks.remove_versions");
   requireField(rt, bindings->shareCallbacks_.remove_versions_many, "ShareStoreCallbacks.remove_versions_many");
@@ -1611,6 +1728,7 @@ std::shared_ptr<StoreBindings> StoreBindings::create(jsi::Runtime& rt, jsi::Obje
 
   requireField(rt, bindings->stateCallbacks_.user_data, "StateStoreCallbacks.user_data");
   requireField(rt, bindings->stateCallbacks_.save, "StateStoreCallbacks.save");
+  requireField(rt, bindings->stateCallbacks_.save_many, "StateStoreCallbacks.save_many");
   requireField(rt, bindings->stateCallbacks_.load, "StateStoreCallbacks.load");
   requireField(rt, bindings->stateCallbacks_.remove, "StateStoreCallbacks.remove");
   requireField(rt, bindings->stateCallbacks_.remove_many, "StateStoreCallbacks.remove_many");

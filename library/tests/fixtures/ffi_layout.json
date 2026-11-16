@@ -1112,32 +1112,36 @@
           "offset": 40
         },
         {
-          "name": "remove_channel",
+          "name": "save_many",
           "offset": 48
         },
         {
-          "name": "remove_versions",
+          "name": "remove_channel",
           "offset": 56
         },
         {
-          "name": "remove_versions_many",
+          "name": "remove_versions",
           "offset": 64
         },
         {
-          "name": "keep_version",
+          "name": "remove_versions_many",
           "offset": 72
         },
         {
-          "name": "record_verification",
+          "name": "keep_version",
           "offset": 80
         },
         {
-          "name": "free_buffer",
+          "name": "record_verification",
           "offset": 88
+        },
+        {
+          "name": "free_buffer",
+          "offset": 96
         }
       ],
       "name": "ShareStoreCallbacks",
-      "size": 96
+      "size": 104
     },
     {
       "align": 8,
@@ -1151,28 +1155,32 @@
           "offset": 8
         },
         {
-          "name": "load",
+          "name": "save_many",
           "offset": 16
         },
         {
-          "name": "remove",
+          "name": "load",
           "offset": 24
         },
         {
-          "name": "remove_many",
+          "name": "remove",
           "offset": 32
         },
         {
-          "name": "load_all",
+          "name": "remove_many",
           "offset": 40
         },
         {
-          "name": "free_buffer",
+          "name": "load_all",
           "offset": 48
+        },
+        {
+          "name": "free_buffer",
+          "offset": 56
         }
       ],
       "name": "StateStoreCallbacks",
-      "size": 56
+      "size": 64
     },
     {
       "align": 8,

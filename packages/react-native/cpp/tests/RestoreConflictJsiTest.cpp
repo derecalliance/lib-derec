@@ -73,6 +73,7 @@ int32_t shLatest(void*, uint64_t, uint32_t* has, uint32_t* version) {
   return 0;
 }
 int32_t shSave(void*, uint64_t, uint64_t, const uint8_t*, size_t) { return 0; }
+int32_t shSaveMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t shRemove(void*, uint64_t, uint64_t) { return 0; }
 int32_t shRemoveVersions(void*, uint64_t, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t shRemoveVersionsMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
@@ -84,6 +85,7 @@ int32_t usSave(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t usRemove(void*, uint64_t) { return 0; }
 
 int32_t stSave(void*, uint64_t, const uint8_t*, size_t) { return 0; }
+int32_t stSaveMany(void*, uint64_t, const uint8_t*, size_t) { return 0; }
 int32_t stLoad(void*, uint64_t, const uint8_t*, size_t, uint8_t**, size_t*) { return 1; }
 int32_t stRemove(void*, uint64_t, const uint8_t*, size_t, uint32_t* removed) {
   *removed = 0;
@@ -102,10 +104,11 @@ ChannelStoreCallbacks channelStore{nullptr,       chLoad,         chSave, chSave
 SecretStoreCallbacks secretStore{nullptr,  seLoad,       seLoadMany, seSave, seSaveMany,
                                  seRemove, seRemoveMany, freeBytes};
 ShareStoreCallbacks shareStore{nullptr, shLoad,   shLoadMany,       shLoadAll,  shLatest,
-                               shSave,  shRemove, shRemoveVersions, shRemoveVersionsMany, shKeepVersion,
-                               shRecordVerification, freeBytes};
+                               shSave,  shSaveMany, shRemove, shRemoveVersions, shRemoveVersionsMany,
+                               shKeepVersion, shRecordVerification, freeBytes};
 UserSecretStoreCallbacks userSecretStore{nullptr, usLoad, usSave, usRemove, freeBytes};
-StateStoreCallbacks stateStore{nullptr, stSave, stLoad, stRemove, stRemoveMany, stLoadAll, freeBytes};
+StateStoreCallbacks stateStore{nullptr, stSave, stSaveMany, stLoad, stRemove, stRemoveMany, stLoadAll,
+                               freeBytes};
 TransportCallbacks transport{nullptr, trSend};
 
 DeRecProtocolHandle* newProtocol() {

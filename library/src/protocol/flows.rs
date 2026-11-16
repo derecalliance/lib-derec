@@ -9,7 +9,7 @@
 //! the handlers it calls.
 
 use super::context::{Round, local, pairing_config};
-use super::events::{DeRecEvent, DeRecFlow};
+use super::events::{DeRecEvent, DeRecFlow, ReplicaSyncFailureReason};
 use super::stores::borrow_stores;
 use super::traits::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport,
@@ -220,17 +220,20 @@ impl<
     /// the user-secret snapshot of the recovered secrets is committed at
     /// `newest_version` with the roster's threshold
     /// ([`Secret::threshold`](crate::protocol::types::Secret::threshold));
-    /// every other channel under `self.secret_id` at no roster id (i.e. the
-    /// recovery-mode channels not kept) is unpaired as `start(`[`DeRecFlow::Unpair`]`)`
-    /// would, under the configured
+    /// every other channel under `self.secret_id` at no roster id whose peer
+    /// is a Helper (i.e. the recovery-mode channels not kept) is unpaired
+    /// under the configured
     /// [`with_unpair_ack`](crate::protocol::DeRecProtocolBuilder::with_unpair_ack):
     /// the returned events carry an `UnpairStarted` per channel, and under
     /// `UnpairAck::Required` its `Unpaired` arrives later, from `process`
-    /// on the helper's answer or from the timeout sweep. The protocol
+    /// on the helper's answer or from the timeout sweep. Unlike
+    /// `start(`[`DeRecFlow::Unpair`]`)`, a helper's refusal does not keep
+    /// the channel: `UnpairRejected` is reported, then `Unpaired`. The protocol
     /// resumes normal operation immediately — the next
     /// `start(ProtectSecret)` publishes `newest_version + 1` to the
     /// restored helpers only, since a channel still being unpaired is
-    /// never a publish target.
+    /// never a publish target. A channel on which this device is a Helper
+    /// for another owner is left alone.
     ///
     /// A helper whose `transports` is empty gets no
     /// channel — there would be nothing to send to. It is reported as
@@ -421,7 +424,8 @@ impl<
                 r.as_ref().err().map(|e| DeRecEvent::ReplicaSyncFailed {
                     replica_id: rid.0,
                     version,
-                    reason: e.to_string(),
+                    reason: ReplicaSyncFailureReason::DispatchFailed,
+                    error: e.to_string(),
                 })
             })
             .collect();

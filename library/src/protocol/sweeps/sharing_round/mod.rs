@@ -7,7 +7,7 @@
 
 use crate::Result;
 use crate::protocol::DeRecProtocol;
-use crate::protocol::events::DeRecEvent;
+use crate::protocol::events::{DeRecEvent, ReplicaSyncFailureReason, ShareRejectReason};
 use crate::protocol::traits::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport,
     DeRecUserSecretStore,
@@ -708,6 +708,7 @@ fn time_out(round: &mut SharingRoundState) -> (Vec<ChannelId>, Vec<DeRecEvent>) 
         events.push(DeRecEvent::ShareRejected {
             channel_id,
             version: round.version,
+            reason: ShareRejectReason::TimedOut,
             status: StatusEnum::Fail as i32,
             memo: "timeout".to_owned(),
         });
@@ -724,7 +725,8 @@ fn time_out(round: &mut SharingRoundState) -> (Vec<ChannelId>, Vec<DeRecEvent>) 
         events.push(DeRecEvent::ReplicaSyncFailed {
             replica_id: replica_id.0,
             version: round.version,
-            reason: "timeout".to_owned(),
+            reason: ReplicaSyncFailureReason::TimedOut,
+            error: "timeout".to_owned(),
         });
 
         #[cfg(feature = "logging")]

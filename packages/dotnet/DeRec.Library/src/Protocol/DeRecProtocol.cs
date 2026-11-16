@@ -52,6 +52,7 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.ShareStoreLoadAllDelegate _shareLoadAll;
     private readonly NP.ShareStoreLatestVersionDelegate _shareLatest;
     private readonly NP.ShareStoreSaveDelegate _shareSave;
+    private readonly NP.ShareStoreSaveManyDelegate _shareSaveMany;
     private readonly NP.ShareStoreRemoveChannelDelegate _shareRemoveChannel;
     private readonly NP.ShareStoreRemoveVersionsDelegate _shareRemoveVersions;
     private readonly NP.ShareStoreRemoveVersionsManyDelegate _shareRemoveVersionsMany;
@@ -63,6 +64,7 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.UserSecretStoreRemoveDelegate _userSecretRemove;
     private readonly NP.FreeBufferDelegate _userSecretFreeBuffer;
     private readonly NP.StateStoreSaveDelegate _stateSave;
+    private readonly NP.StateStoreSaveManyDelegate _stateSaveMany;
     private readonly NP.StateStoreLoadDelegate _stateLoad;
     private readonly NP.StateStoreRemoveDelegate _stateRemove;
     private readonly NP.StateStoreRemoveManyDelegate _stateRemoveMany;
@@ -136,6 +138,7 @@ public sealed class DeRecProtocol : IDisposable
         _shareLoadAll = ShareLoadAllImpl;
         _shareLatest = ShareLatestVersionImpl;
         _shareSave = ShareSaveImpl;
+        _shareSaveMany = ShareSaveManyImpl;
         _shareRemoveChannel = ShareRemoveChannelImpl;
         _shareRemoveVersions = ShareRemoveVersionsImpl;
         _shareRemoveVersionsMany = ShareRemoveVersionsManyImpl;
@@ -149,6 +152,7 @@ public sealed class DeRecProtocol : IDisposable
         _userSecretFreeBuffer = FreeBufferImpl;
 
         _stateSave = StateSaveImpl;
+        _stateSaveMany = StateSaveManyImpl;
         _stateLoad = StateLoadImpl;
         _stateRemove = StateRemoveImpl;
         _stateRemoveMany = StateRemoveManyImpl;
@@ -190,6 +194,7 @@ public sealed class DeRecProtocol : IDisposable
             LoadAll = Marshal.GetFunctionPointerForDelegate(_shareLoadAll),
             LatestVersion = Marshal.GetFunctionPointerForDelegate(_shareLatest),
             Save = Marshal.GetFunctionPointerForDelegate(_shareSave),
+            SaveMany = Marshal.GetFunctionPointerForDelegate(_shareSaveMany),
             RemoveChannel = Marshal.GetFunctionPointerForDelegate(_shareRemoveChannel),
             RemoveVersions = Marshal.GetFunctionPointerForDelegate(_shareRemoveVersions),
             RemoveVersionsMany = Marshal.GetFunctionPointerForDelegate(_shareRemoveVersionsMany),
@@ -209,6 +214,7 @@ public sealed class DeRecProtocol : IDisposable
         {
             UserData = IntPtr.Zero,
             Save = Marshal.GetFunctionPointerForDelegate(_stateSave),
+            SaveMany = Marshal.GetFunctionPointerForDelegate(_stateSaveMany),
             Load = Marshal.GetFunctionPointerForDelegate(_stateLoad),
             Remove = Marshal.GetFunctionPointerForDelegate(_stateRemove),
             RemoveMany = Marshal.GetFunctionPointerForDelegate(_stateRemoveMany),
@@ -567,7 +573,13 @@ public sealed class DeRecProtocol : IDisposable
     /// channel in place of its roster helper's old channel: the old channel
     /// is not written, and the recovery channel stays paired with its own
     /// endpoint and key, takes the roster entry's weight, and is not
-    /// unpaired. Only this device holds a recovery channel's key, while every
+    /// unpaired. Every other channel at no roster id whose peer is a helper
+    /// is unpaired; a channel on which this device is a helper for another
+    /// owner is left alone. Under <c>UnpairAck.Required</c> each one is
+    /// unpairing until its helper answers (<c>ProcessAsync</c>) or the
+    /// acknowledgement window elapses (<c>TickAsync</c>); a helper's refusal
+    /// is reported as <see cref="UnpairRejectedEvent"/> and the channel is
+    /// unpaired anyway. Only this device holds a recovery channel's key, while every
     /// lost device still holds the old one, so keeping it is what lets the
     /// owner cut the lost devices off: publish once on the kept channels,
     /// then retire each old channel with a linked unpair
@@ -1203,6 +1215,38 @@ public sealed class DeRecProtocol : IDisposable
         catch { return -1; }
     }
 
+    private int ShareSaveManyImpl(IntPtr userData, ulong secretId, IntPtr entries, UIntPtr entriesLen)
+    {
+        try
+        {
+            var bytes = new byte[(int)entriesLen];
+            if (bytes.Length > 0)
+                Marshal.Copy(entries, bytes, 0, bytes.Length);
+            var pairs = bytes.Length == 0
+                ? new List<JsonElement[]>()
+                : JsonSerializer.Deserialize<List<JsonElement[]>>(bytes, JsonOpts)
+                  ?? new List<JsonElement[]>();
+            var parsed = pairs
+                .Select(p =>
+                {
+                    var rec = p[1].Deserialize<ShareRecordDto>(JsonOpts)
+                              ?? throw new InvalidOperationException("null ShareRecord");
+                    return (
+                        ChannelId: ulong.Parse(
+                            p[0].GetString() ?? throw new InvalidOperationException("null channel id"),
+                            System.Globalization.CultureInfo.InvariantCulture),
+                        Share: new Share(
+                            ulong.Parse(rec.secret_id, System.Globalization.CultureInfo.InvariantCulture),
+                            rec.version, rec.bytes, rec.subshares, rec.threshold));
+                })
+                .ToList();
+            _shareStore.SaveMany(secretId, parsed);
+            return 0;
+        }
+        catch (ShareStoreRefusedException ex) { return RefusalCode(ex.Refusal); }
+        catch { return -1; }
+    }
+
     private int ShareRecordVerificationImpl(IntPtr userData, ulong secretId, ulong channelId, uint version)
     {
         try
@@ -1367,7 +1411,8 @@ public sealed class DeRecProtocol : IDisposable
         ReplicaDiscoveryReportDto[]? reported,
         string[]? share_channels,
         uint? keep_version,
-        uint? threshold);
+        uint? threshold,
+        bool? drop_on_rejection);
 
     private sealed record ReplicaDiscoveryReportDto(string replica_id, uint version);
 
@@ -1399,7 +1444,8 @@ public sealed class DeRecProtocol : IDisposable
             .ToArray(),
         item.ShareChannels?.Select(c => c.ToString()).ToArray(),
         item.KeepVersion,
-        item.Threshold);
+        item.Threshold,
+        item.DropOnRejection);
 
     private static StateItem FromDto(StateItemDto dto)
     {
@@ -1440,7 +1486,8 @@ public sealed class DeRecProtocol : IDisposable
         return new StateItem(
             kind, channelId, secretId, dto.version, startedAt, dto.bytes, dto.shares,
             pending, confirmed, failed, pendingReplicas, syncedReplicas, behindReplicas,
-            dto.local_version, reported, shareChannels, dto.keep_version, dto.threshold);
+            dto.local_version, reported, shareChannels, dto.keep_version, dto.threshold,
+            dto.drop_on_rejection);
     }
 
     private static StateKey ParseKeyBuffer(IntPtr ptr, UIntPtr len)
@@ -1502,6 +1549,28 @@ public sealed class DeRecProtocol : IDisposable
             var dto = JsonSerializer.Deserialize<StateItemDto>(buf, JsonOpts)
                 ?? throw new InvalidOperationException("null StateItem");
             _stateStore.Save(secretId, FromDto(dto));
+            return 0;
+        }
+        catch { return -1; }
+    }
+
+    private int StateSaveManyImpl(
+        IntPtr userData, ulong secretId, IntPtr itemsJsonPtr, UIntPtr itemsJsonLen)
+    {
+        try
+        {
+            byte[] buf = new byte[(int)itemsJsonLen];
+            var items = new List<StateItem>();
+            if (buf.Length > 0)
+            {
+                Marshal.Copy(itemsJsonPtr, buf, 0, buf.Length);
+                var dtos = JsonSerializer.Deserialize<List<StateItemDto>>(buf, JsonOpts)
+                    ?? throw new InvalidOperationException("null StateItem list");
+                items = dtos
+                    .Select(d => FromDto(d ?? throw new InvalidOperationException("null StateItem")))
+                    .ToList();
+            }
+            _stateStore.SaveMany(secretId, items);
             return 0;
         }
         catch { return -1; }

@@ -75,7 +75,7 @@ pub async fn run() {
     let events = pump_many(&mut [&mut owner, &mut helper]).await;
     let unpaired_count = events
         .iter()
-        .filter(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == cid))
+        .filter(|e| matches!(e, DeRecEvent::Unpaired { channel_id, acknowledged: true } if *channel_id == cid))
         .count();
     assert!(
         unpaired_count >= 2,

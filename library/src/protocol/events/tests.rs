@@ -391,7 +391,8 @@ mod golden {
             Event::ReplicaSyncFailed {
                 replica_id: "1024".into(),
                 version: 10,
-                reason: "sync failed".into(),
+                reason: "TimedOut".into(),
+                error: "sync failed".into(),
             },
             Event::ReplicaRemoved {
                 replica_id: "1025".into(),
@@ -427,6 +428,7 @@ mod golden {
             Event::ShareRejected {
                 channel_id: "1033".into(),
                 version: 18,
+                reason: "Refused".into(),
                 status: 6,
                 memo: "share rejected".into(),
             },
@@ -515,6 +517,7 @@ mod golden {
             },
             Event::Unpaired {
                 channel_id: "1043".into(),
+                acknowledged: true,
             },
             Event::UnpairRejected {
                 channel_id: "1044".into(),
@@ -630,6 +633,7 @@ mod golden {
             Event::RecoverSecretFailed {
                 channel_id: "1072".into(),
                 version: 32,
+                reason: "DispatchFailed".into(),
                 error: "recover failed".into(),
             },
             Event::UnpairFailed {

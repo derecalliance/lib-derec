@@ -15,6 +15,7 @@ import (
 // domain types — see the storeSet doc comment in callbacks.go.
 type stateStore interface {
 	Save(secretID uint64, item StateItem) error
+	SaveMany(secretID uint64, items []StateItem) error
 	Load(secretID uint64, key StateKey) (StateItem, bool, error)
 	Remove(secretID uint64, key StateKey) (bool, error)
 	RemoveMany(secretID uint64, keys []StateKey) error
@@ -26,6 +27,7 @@ type stateStore interface {
 type StateStoreCallbacks struct {
 	UserData   uintptr
 	Save       uintptr
+	SaveMany   uintptr
 	Load       uintptr
 	Remove     uintptr
 	RemoveMany uintptr
@@ -62,6 +64,38 @@ func dispatchStateSave(s *storeSet, secretID uint64, itemJSON []byte) (status in
 		return ffiStatusFailure
 	}
 	return ffiStatusOK
+}
+
+func dispatchStateSaveMany(s *storeSet, secretID uint64, itemsJSON []byte) (status int32) {
+	defer recoverInto(&status)
+	items, err := decodeStateItemList(itemsJSON)
+	if err != nil {
+		return ffiStatusFailure
+	}
+	if err := s.state.SaveMany(secretID, items); err != nil {
+		return ffiStatusFailure
+	}
+	return ffiStatusOK
+}
+
+// decodeStateItemList parses the core's JSON array of the item records
+// StateStoreCallbacks.save receives one at a time.
+func decodeStateItemList(data []byte) ([]StateItem, error) {
+	var raw []json.RawMessage
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, err
+		}
+	}
+	items := make([]StateItem, 0, len(raw))
+	for _, r := range raw {
+		item, err := DecodeStateItem(r)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, nil
 }
 
 func dispatchStateLoad(s *storeSet, secretID uint64, keyJSON []byte) (status int32, out []byte) {
@@ -153,6 +187,15 @@ func stateSaveCallback(userData uintptr, secretID uint64, itemPtr *byte, itemLen
 	return dispatchStateSave(s, secretID, unsafe.Slice(itemPtr, itemLen))
 }
 
+func stateSaveManyCallback(userData uintptr, secretID uint64, itemsPtr *byte, itemsLen uintptr) (status int32) {
+	defer recoverInto(&status)
+	s, ok := lookupStores(storeHandle(userData))
+	if !ok {
+		return ffiStatusFailure
+	}
+	return dispatchStateSaveMany(s, secretID, readFilterBytes(itemsPtr, itemsLen))
+}
+
 func stateLoadCallback(userData uintptr, secretID uint64, keyPtr *byte, keyLen uintptr, outPtr, outLen *uintptr) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
@@ -205,20 +248,21 @@ func stateLoadAllCallback(userData uintptr, secretID uint64, kind uint32, outPtr
 
 // stateCallbackPtrs holds the purego.NewCallback address for every
 // StateStoreCallbacks fn-pointer field except FreeBuffer (shared package-
-// wide via sharedFreeBufferCallback). These five functions are stateless
+// wide via sharedFreeBufferCallback). These six functions are stateless
 // package-level funcs, so each needs exactly one registration total — see
 // registerChannelCallbacks in callbacks_channel.go for why per-call
 // registration would exhaust purego's 2000-slot callback table.
 var (
 	stateCallbacksOnce sync.Once
 	stateCallbackPtrs  struct {
-		save, load, remove, removeMany, loadAll uintptr
+		save, saveMany, load, remove, removeMany, loadAll uintptr
 	}
 )
 
 func registerStateCallbacks() {
 	stateCallbacksOnce.Do(func() {
 		stateCallbackPtrs.save = purego.NewCallback(stateSaveCallback)
+		stateCallbackPtrs.saveMany = purego.NewCallback(stateSaveManyCallback)
 		stateCallbackPtrs.load = purego.NewCallback(stateLoadCallback)
 		stateCallbackPtrs.remove = purego.NewCallback(stateRemoveCallback)
 		stateCallbackPtrs.removeMany = purego.NewCallback(stateRemoveManyCallback)
@@ -234,6 +278,7 @@ func buildStateStoreCallbacks(h storeHandle) StateStoreCallbacks {
 	return StateStoreCallbacks{
 		UserData:   uintptr(h),
 		Save:       stateCallbackPtrs.save,
+		SaveMany:   stateCallbackPtrs.saveMany,
 		Load:       stateCallbackPtrs.load,
 		Remove:     stateCallbackPtrs.remove,
 		RemoveMany: stateCallbackPtrs.removeMany,

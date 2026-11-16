@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::iter;
 use std::time::Duration;
 
-use derec_library::protocol::events::DeRecEvent;
+use derec_library::protocol::events::{DeRecEvent, ShareRejectReason};
 use derec_library::protocol::types::{ChannelQuery, ChannelStatus, Secret, Target, UserSecret};
 use derec_library::protocol::{DeRecChannelStore, DeRecFlow};
 use derec_library::types::ChannelId;
@@ -1389,7 +1389,7 @@ async fn recover_from_helpers(
         for channel_id in &recovery_channels {
             assert!(
                 events.iter().any(
-                    |e| matches!(e, DeRecEvent::Unpaired { channel_id: c } if c == channel_id)
+                    |e| matches!(e, DeRecEvent::Unpaired { channel_id: c, acknowledged: true } if c == channel_id)
                 ),
                 "the helper's answer must unpair recovery channel {channel_id:?}"
             );
@@ -1544,7 +1544,7 @@ async fn step_10_a_silent_helper_is_resolved_by_a_scheduled_tick(
     assert!(
         events.iter().any(|e| matches!(
             e,
-            DeRecEvent::ShareRejected { memo, .. } if memo == "timeout"
+            DeRecEvent::ShareRejected { reason, .. } if *reason == ShareRejectReason::TimedOut
         )),
         "the silent helper is failed on the timeout; got {events:?}"
     );

@@ -268,7 +268,8 @@
       "version": 9
     },
     {
-      "reason": "sync failed",
+      "error": "sync failed",
+      "reason": "TimedOut",
       "replica_id": "1024",
       "type": "ReplicaSyncFailed",
       "version": 10
@@ -321,6 +322,7 @@
     {
       "channel_id": "1033",
       "memo": "share rejected",
+      "reason": "Refused",
       "status": 6,
       "type": "ShareRejected",
       "version": 18
@@ -711,6 +713,7 @@
       "version": 27
     },
     {
+      "acknowledged": true,
       "channel_id": "1043",
       "type": "Unpaired"
     },
@@ -865,6 +868,7 @@
     {
       "channel_id": "1072",
       "error": "recover failed",
+      "reason": "DispatchFailed",
       "type": "RecoverSecretFailed",
       "version": 32
     },

@@ -75,6 +75,7 @@ func TestBuildCallbacks_PopulatesAllSixStructs(t *testing.T) {
 	checkNonZero("Share.LoadAll", built.Share.LoadAll)
 	checkNonZero("Share.LatestVersion", built.Share.LatestVersion)
 	checkNonZero("Share.Save", built.Share.Save)
+	checkNonZero("Share.SaveMany", built.Share.SaveMany)
 	checkNonZero("Share.RemoveChannel", built.Share.RemoveChannel)
 	checkNonZero("Share.RemoveVersions", built.Share.RemoveVersions)
 	checkNonZero("Share.RemoveVersionsMany", built.Share.RemoveVersionsMany)
@@ -90,6 +91,7 @@ func TestBuildCallbacks_PopulatesAllSixStructs(t *testing.T) {
 
 	checkNonZero("State.UserData", built.State.UserData)
 	checkNonZero("State.Save", built.State.Save)
+	checkNonZero("State.SaveMany", built.State.SaveMany)
 	checkNonZero("State.Load", built.State.Load)
 	checkNonZero("State.Remove", built.State.Remove)
 	checkNonZero("State.RemoveMany", built.State.RemoveMany)
@@ -432,6 +434,7 @@ func TestBuildCallbacks_ManyInstancesDoNotExhaustCallbackTable(t *testing.T) {
 		checkNonZero("Share.LoadAll", built.Share.LoadAll)
 		checkNonZero("Share.LatestVersion", built.Share.LatestVersion)
 		checkNonZero("Share.Save", built.Share.Save)
+		checkNonZero("Share.SaveMany", built.Share.SaveMany)
 		checkNonZero("Share.RemoveChannel", built.Share.RemoveChannel)
 		checkNonZero("Share.RemoveVersions", built.Share.RemoveVersions)
 		checkNonZero("Share.RemoveVersionsMany", built.Share.RemoveVersionsMany)
@@ -445,6 +448,7 @@ func TestBuildCallbacks_ManyInstancesDoNotExhaustCallbackTable(t *testing.T) {
 		checkNonZero("UserSecret.FreeBuffer", built.UserSecret.FreeBuffer)
 
 		checkNonZero("State.Save", built.State.Save)
+		checkNonZero("State.SaveMany", built.State.SaveMany)
 		checkNonZero("State.Load", built.State.Load)
 		checkNonZero("State.Remove", built.State.Remove)
 		checkNonZero("State.RemoveMany", built.State.RemoveMany)

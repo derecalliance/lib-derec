@@ -514,7 +514,13 @@ func (p *DeRecProtocol) Reject(action []byte, status derecpb.StatusEnum, memo st
 // Each pair in keepRecoveryChannels makes Restore keep a recovery channel in
 // place of its roster helper's old channel: the old channel is not written,
 // and the recovery channel stays Paired with its own endpoint and key, takes
-// the roster entry's weight, and is not unpaired. Only this device holds a
+// the roster entry's weight, and is not unpaired. Every other channel at no
+// roster id whose peer is a helper is unpaired; a channel on which this device
+// is a helper for another owner is left alone. Under UnpairAckRequired each
+// one is Unpairing until its helper answers (Process) or the acknowledgement
+// window elapses (Tick); a helper's refusal is reported as
+// EventTypeUnpairRejected and the channel is unpaired anyway. Only this
+// device holds a
 // recovery channel's key, while every lost device still holds the old one,
 // so keeping it is what lets the owner cut the lost devices off: publish
 // once on the kept channels, then retire each old channel with

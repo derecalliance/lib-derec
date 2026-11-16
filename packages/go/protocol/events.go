@@ -216,10 +216,10 @@ type Event struct {
 	// Memo, which it observes as ShareRejected. A refusal from the
 	// application's own share store does not raise it.
 	//
-	// ShareRejected carries the helper's own Status and Memo, except for a
-	// helper that did not answer within Timeouts.SharingRoundSecs: Tick then
-	// reports it with StatusEnum_FAIL and Memo "timeout". The memo of a
-	// helper's own answer is free text and can read the same.
+	// ShareRejected carries the helper's own Status and Memo when Reason is
+	// ShareRejectReasonRefused. With ShareRejectReasonTimedOut the helper did
+	// not answer within Timeouts.SharingRoundSecs, Tick reports it, and Status
+	// and Memo carry no answer from it.
 	//
 	// RequestFailed carries the status and memo this device sent, or would
 	// have sent; see Responded below.
@@ -236,10 +236,21 @@ type Event struct {
 	// whose channel ChannelID names.
 	ReplicaID *uint64 `json:"replica_id,string"`
 
-	// ReplicaSyncFailed — "timeout" when the member did not acknowledge
-	// within Timeouts.SharingRoundSecs (reported by Tick); otherwise the
-	// transport or encoding failure, rendered for display. Distinct from
-	// Error, which the flow-level *Failed events use.
+	// ReplicaSyncFailed — why the member did not receive the sync, one of the
+	// ReplicaSyncFailureReason* constants: ReplicaSyncFailureReasonTimedOut
+	// when it did not acknowledge within Timeouts.SharingRoundSecs (reported
+	// by Tick), ReplicaSyncFailureReasonDispatchFailed when nothing could be
+	// sent to it. Error carries the failure, rendered for display.
+	//
+	// ShareRejected — whether the helper refused (ShareRejectReasonRefused)
+	// or did not answer in time (ShareRejectReasonTimedOut), one of the
+	// ShareRejectReason* constants.
+	//
+	// RecoverSecretFailed — why the helper will not contribute a share, one
+	// of the RecoverFailureReason* constants. RecoverFailureReasonTimedOut is
+	// a helper that did not answer within Timeouts.GetShareResponseSecs,
+	// reported by Tick; otherwise the request was never sent. Error carries
+	// the failure, rendered for display.
 	//
 	// MessageIgnored — why the message was dropped, one of the IgnoreReason*
 	// constants. The message changed no store and drew no reply.
@@ -309,8 +320,8 @@ type Event struct {
 	// A recovery reconstructs nothing until every helper it asked has
 	// answered (a share, a refusal or a corrupted share), or the
 	// get_share_response timeout has passed since the requests went out —
-	// each silent helper is then reported as RecoverSecretFailed with Error
-	// "timeout". It then decides exactly once: SecretRecovered (one secret
+	// each silent helper is then reported as RecoverSecretFailed with Reason
+	// RecoverFailureReasonTimedOut. It then decides exactly once: SecretRecovered (one secret
 	// reconstructs and every collected share is part of it),
 	// RecoveryDisputed (one secret reconstructs, but other helpers hold valid
 	// shares of a different split that does not), RecoveryConflict (two or
@@ -338,8 +349,14 @@ type Event struct {
 
 	// DiscoveryFailed, ProtectSecretFailed,
 	// VerifySharesFailed, RecoverSecretFailed, UnpairFailed,
-	// UpdateChannelInfoFailed.
+	// UpdateChannelInfoFailed, ReplicaSyncFailed.
 	Error string `json:"error"`
+
+	// Unpaired — whether both sides agreed to the unpair: the peer answered
+	// OK on the initiator, or this device answered OK on the responder. false
+	// when no acknowledgement was asked for, when it timed out, or when the
+	// peer refused the teardown of a recovery channel by Restore.
+	Acknowledged bool `json:"acknowledged"`
 
 	// RequestFailed — a request that arrived on an authenticated channel
 	// failed while it was being handled. Every such request is owed exactly
@@ -477,6 +494,42 @@ const (
 	// VerifyFailureReasonDispatchFailed: the challenge could not be sent to
 	// the helper.
 	VerifyFailureReasonDispatchFailed = "DispatchFailed"
+)
+
+// The label vocabulary for Event.Reason on a RecoverSecretFailed event.
+// Matches the Rust RecoverFailureReason discriminants one-for-one.
+const (
+	// RecoverFailureReasonNoSharedKey: the channel has no shared key to
+	// encrypt the request to the helper with; nothing is sent.
+	RecoverFailureReasonNoSharedKey = "NoSharedKey"
+	// RecoverFailureReasonDispatchFailed: the request could not be prepared
+	// or sent to the helper.
+	RecoverFailureReasonDispatchFailed = "DispatchFailed"
+	// RecoverFailureReasonTimedOut: the helper did not answer within
+	// Timeouts.GetShareResponseSecs.
+	RecoverFailureReasonTimedOut = "TimedOut"
+)
+
+// The label vocabulary for Event.Reason on a ShareRejected event. Matches
+// the Rust ShareRejectReason discriminants one-for-one.
+const (
+	// ShareRejectReasonRefused: the helper answered with a non-OK status;
+	// Status and Memo are its answer.
+	ShareRejectReasonRefused = "Refused"
+	// ShareRejectReasonTimedOut: the helper did not answer within
+	// Timeouts.SharingRoundSecs.
+	ShareRejectReasonTimedOut = "TimedOut"
+)
+
+// The label vocabulary for Event.Reason on a ReplicaSyncFailed event.
+// Matches the Rust ReplicaSyncFailureReason discriminants one-for-one.
+const (
+	// ReplicaSyncFailureReasonDispatchFailed: nothing could be sent to the
+	// member; Error names the transport or encoding failure.
+	ReplicaSyncFailureReasonDispatchFailed = "DispatchFailed"
+	// ReplicaSyncFailureReasonTimedOut: the member did not acknowledge within
+	// Timeouts.SharingRoundSecs.
+	ReplicaSyncFailureReasonTimedOut = "TimedOut"
 )
 
 // Secret mirrors SecretWire in wire.rs — the typed secret snapshot carried

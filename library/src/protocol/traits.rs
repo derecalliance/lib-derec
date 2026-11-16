@@ -583,6 +583,18 @@ pub trait DeRecShareStore {
         share: Share,
     ) -> ShareStoreFuture<'_, ()>;
 
+    /// Persist every `(channel_id, share)` in `entries`, in one call.
+    ///
+    /// The same as [`save`](DeRecShareStore::save) applied to each entry,
+    /// keyed and refused the same way, and an empty list writes nothing. The
+    /// library calls it when it writes several shares at once, so a backend
+    /// that can write them in one statement or transaction should.
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, Share)>,
+    ) -> ShareStoreFuture<'_, ()>;
+
     /// Drop every share stored under `(secret_id, channel_id)`. Used
     /// when an unpair flow tears down a channel. Idempotent.
     fn remove_channel(&mut self, secret_id: u64, channel_id: ChannelId)
@@ -953,6 +965,14 @@ pub trait DeRecStateStore {
     /// with the caller-supplied `item`.
     fn save(&mut self, secret_id: u64, item: StateItem) -> StateStoreFuture<'_, ()>;
 
+    /// Persist every item in `items`, in one call.
+    ///
+    /// The same as [`save`](DeRecStateStore::save) applied to each item: each
+    /// replaces any row with the same key, and an empty list writes nothing.
+    /// The library calls it when it writes several rows at once, so a backend
+    /// that can write them in one statement or transaction should.
+    fn save_many(&mut self, secret_id: u64, items: Vec<StateItem>) -> StateStoreFuture<'_, ()>;
+
     /// Read the item at `(secret_id, key)`. Returns `Ok(None)` when no
     /// row exists. No side effects.
     fn load(&self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, Option<StateItem>>;
@@ -1126,6 +1146,13 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for Box<T> {
     ) -> ShareStoreFuture<'_, ()> {
         (**self).save(secret_id, channel_id, share)
     }
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, Share)>,
+    ) -> ShareStoreFuture<'_, ()> {
+        (**self).save_many(secret_id, entries)
+    }
     fn remove_channel(
         &mut self,
         secret_id: u64,
@@ -1176,6 +1203,9 @@ impl<T: DeRecUserSecretStore + ?Sized> DeRecUserSecretStore for Box<T> {
 impl<T: DeRecStateStore + ?Sized> DeRecStateStore for Box<T> {
     fn save(&mut self, secret_id: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
         (**self).save(secret_id, item)
+    }
+    fn save_many(&mut self, secret_id: u64, items: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
+        (**self).save_many(secret_id, items)
     }
     fn load(&self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
         (**self).load(secret_id, key)
@@ -1341,6 +1371,13 @@ impl<T: DeRecShareStore + ?Sized> DeRecShareStore for &mut T {
     ) -> ShareStoreFuture<'_, ()> {
         (**self).save(secret_id, channel_id, share)
     }
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, Share)>,
+    ) -> ShareStoreFuture<'_, ()> {
+        (**self).save_many(secret_id, entries)
+    }
     fn remove_channel(
         &mut self,
         secret_id: u64,
@@ -1391,6 +1428,9 @@ impl<T: DeRecUserSecretStore + ?Sized> DeRecUserSecretStore for &mut T {
 impl<T: DeRecStateStore + ?Sized> DeRecStateStore for &mut T {
     fn save(&mut self, secret_id: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
         (**self).save(secret_id, item)
+    }
+    fn save_many(&mut self, secret_id: u64, items: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
+        (**self).save_many(secret_id, items)
     }
     fn load(&self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
         (**self).load(secret_id, key)
@@ -1485,6 +1525,7 @@ mod pointer_forwarding_tests {
                     StateItem::PendingUnpair {
                         channel_id: ChannelId(4242),
                         started_at: 1_700_000_000,
+                        drop_on_rejection: false,
                     },
                 )
                 .await

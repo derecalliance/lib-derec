@@ -262,6 +262,7 @@ fn generated() -> serde_json::Value {
             load_all,
             latest_version,
             save,
+            save_many,
             remove_channel,
             remove_versions,
             remove_versions_many,
@@ -279,6 +280,7 @@ fn generated() -> serde_json::Value {
         StateStoreCallbacks {
             user_data,
             save,
+            save_many,
             load,
             remove,
             remove_many,

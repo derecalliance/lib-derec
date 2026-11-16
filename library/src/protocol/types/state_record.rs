@@ -99,7 +99,8 @@ impl From<&StateKey> for StateKeyRecord {
 ///   `started_at` decodes as none pending, sent at `0`, so the next sweep
 ///   settles it on the shares it holds
 /// - `2` = PendingUnpair — `channel_id`, `started_at` (stringified u64
-///   unix-seconds)
+///   unix-seconds), `drop_on_rejection` (`true` when the channel is dropped
+///   whatever the Helper answers; absent when `false`)
 /// - `3` = SharingRound — `version`, `pending`, `confirmed`, `failed`
 ///   (each channel-id set is stringified u64s), `started_at`
 ///   (stringified u64 unix-seconds), `keep_version` (the older version every
@@ -169,6 +170,11 @@ pub struct StateItemRecord {
     /// round is judged against the builder's threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<u32>,
+    /// PendingUnpair only: `true` when the channel is dropped whatever the
+    /// Helper answers. Absent when `false`, and on rows written before
+    /// 1.0.0, which decode as `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_on_rejection: Option<bool>,
 }
 /// One member's answer in an in-flight catch-up. A nested record rather than
 /// a packed string so the pair stays self-describing for every binding.
@@ -203,6 +209,7 @@ impl From<&StateItem> for StateItemRecord {
                 reported: None,
                 keep_version: None,
                 threshold: None,
+                drop_on_rejection: None,
             },
             StateItem::PendingRecovery {
                 secret_id,
@@ -229,10 +236,12 @@ impl From<&StateItem> for StateItemRecord {
                 reported: None,
                 keep_version: None,
                 threshold: None,
+                drop_on_rejection: None,
             },
             StateItem::PendingUnpair {
                 channel_id,
                 started_at,
+                drop_on_rejection,
             } => Self {
                 kind: 2,
                 channel_id: Some(channel_id.0.to_string()),
@@ -252,6 +261,7 @@ impl From<&StateItem> for StateItemRecord {
                 reported: None,
                 keep_version: None,
                 threshold: None,
+                drop_on_rejection: drop_on_rejection.then_some(true),
             },
             StateItem::PendingReplicaDiscovery {
                 local_version,
@@ -285,6 +295,7 @@ impl From<&StateItem> for StateItemRecord {
                 ),
                 keep_version: None,
                 threshold: None,
+                drop_on_rejection: None,
             },
             StateItem::SharingRound(round) => Self {
                 kind: 3,
@@ -323,6 +334,7 @@ impl From<&StateItem> for StateItemRecord {
                 reported: None,
                 keep_version: round.keep_version,
                 threshold: round.threshold,
+                drop_on_rejection: None,
             },
         }
     }
@@ -455,6 +467,7 @@ impl StateItemRecord {
                 Ok(StateItem::PendingUnpair {
                     channel_id,
                     started_at,
+                    drop_on_rejection: self.drop_on_rejection.unwrap_or(false),
                 })
             }
             3 => {
@@ -545,6 +558,7 @@ mod tests {
             StateItem::PendingUnpair {
                 channel_id: ChannelId(9),
                 started_at: 100,
+                drop_on_rejection: false,
             },
             StateItem::PendingReplicaDiscovery {
                 local_version: 5,
@@ -564,6 +578,11 @@ mod tests {
                 keep_version: None,
                 threshold: None,
             })),
+            StateItem::PendingUnpair {
+                channel_id: ChannelId(10),
+                started_at: 100,
+                drop_on_rejection: true,
+            },
         ]
     }
 
@@ -752,6 +771,30 @@ mod tests {
             }
             other => panic!("decoded as {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_pending_unpair_row_carries_drop_on_rejection_only_when_set() {
+        let item = |drop_on_rejection| StateItem::PendingUnpair {
+            channel_id: ChannelId(9),
+            started_at: 100,
+            drop_on_rejection,
+        };
+        let set = serde_json::to_value(StateItemRecord::from(&item(true))).expect("encodes");
+        assert_eq!(set["drop_on_rejection"], true, "{set}");
+        let unset = serde_json::to_value(StateItemRecord::from(&item(false))).expect("encodes");
+        assert!(unset.get("drop_on_rejection").is_none(), "{unset}");
+
+        let older: StateItemRecord =
+            serde_json::from_str(r#"{"kind":2,"channel_id":"9","started_at":"100"}"#)
+                .expect("decodes");
+        assert!(matches!(
+            older.into_item().expect("valid row"),
+            StateItem::PendingUnpair {
+                drop_on_rejection: false,
+                ..
+            }
+        ));
     }
 
     #[test]

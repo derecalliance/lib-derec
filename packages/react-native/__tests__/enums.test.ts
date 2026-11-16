@@ -14,9 +14,12 @@ import {
   type IgnoreReason,
   type NotRestoredReason,
   type PendingActionKind,
+  type RecoverFailureReason,
+  type ReplicaSyncFailureReason,
   type ReplicaRoleName,
   type SecretStore,
   type SenderKindName,
+  type ShareRejectReason,
   type StateStore,
   type VerifyFailureReason,
 } from '../src/types';
@@ -72,6 +75,15 @@ const NAME_UNIONS: Record<string, Record<string, true>> = {
   NotRestoredReason: { NoTransports: true, ReplicaGroupDropped: true } satisfies Record<NotRestoredReason, true>,
   VerifyFailureReason: { NoSharedKey: true, NoProof: true, DispatchFailed: true } satisfies Record<
     VerifyFailureReason,
+    true
+  >,
+  RecoverFailureReason: { NoSharedKey: true, DispatchFailed: true, TimedOut: true } satisfies Record<
+    RecoverFailureReason,
+    true
+  >,
+  ShareRejectReason: { Refused: true, TimedOut: true } satisfies Record<ShareRejectReason, true>,
+  ReplicaSyncFailureReason: { DispatchFailed: true, TimedOut: true } satisfies Record<
+    ReplicaSyncFailureReason,
     true
   >,
   CorruptionReason: { Malformed: true, InvalidProof: true, Forged: true } satisfies Record<

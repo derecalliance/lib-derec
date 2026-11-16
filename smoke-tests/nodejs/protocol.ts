@@ -328,6 +328,15 @@ class InMemoryShareStore implements ShareStore {
     byVersion.set(share.version, share);
   }
 
+  async saveMany(
+    secretId: string,
+    entries: [channelId: string, share: Share][],
+  ): Promise<void> {
+    for (const [channelId, share] of entries) {
+      await this.save(secretId, channelId, share);
+    }
+  }
+
   async loadMany(
     secretId: string,
     channelIds: string[],
@@ -464,6 +473,13 @@ class InMemoryStateStore implements StateStore {
   async save(secretId: string, itemJson: Uint8Array): Promise<void> {
     const rec = this.parseBlob(itemJson);
     this.data.set(this.compositeKey(secretId, rec), itemJson);
+  }
+
+  async saveMany(secretId: string, itemsJson: Uint8Array): Promise<void> {
+    const items: StateRecord[] = JSON.parse(new TextDecoder().decode(itemsJson));
+    for (const rec of items) {
+      this.data.set(this.compositeKey(secretId, rec), new TextEncoder().encode(JSON.stringify(rec)));
+    }
   }
 
   async load(secretId: string, keyJson: Uint8Array): Promise<Uint8Array | null> {
@@ -2851,15 +2867,15 @@ async function runSilentHelperRecoveryFlow(): Promise<void> {
   if (failed.version !== version) {
     throw new Error(`RecoverSecretFailed.version: expected ${version}, got ${failed.version}`);
   }
-  if (failed.error !== "timeout") {
-    throw new Error(`RecoverSecretFailed.error: expected "timeout", got "${failed.error}"`);
+  if (failed.reason !== "TimedOut") {
+    throw new Error(`RecoverSecretFailed.reason: expected "TimedOut", got "${failed.reason}"`);
   }
   const recoveredSecret = recovered.secret.secrets.find((s) => s.id.length === 1 && s.id[0] === 9);
   if (!recoveredSecret || !byteArraysEqual(recoveredSecret.data, secretData)) {
     throw new Error("recovered secret must carry the protected bytes");
   }
   console.log(
-    `  [Owner]  after the window, tick() → RecoverSecretFailed(${channelC}, "timeout"), SecretRecovered("${recoveredSecret.name}")  ✓`,
+    `  [Owner]  after the window, tick() → RecoverSecretFailed(${channelC}, TimedOut), SecretRecovered("${recoveredSecret.name}")  ✓`,
   );
 
   const closed = await owner.protocol.tick();
@@ -3125,7 +3141,59 @@ async function runRestoreKeepsHelperDutiesFlow(): Promise<void> {
     }
   }
   console.log("  [Device]  restore unpairs both recovery channels, never the duty channel  ✓");
-  await pumpAll([device, helperA, helperB]);
+  if (restoreEvents.some((e) => e.type === "Unpaired")) {
+    throw new Error(
+      `restore must wait for the recovery helpers' answers: [${restoreEvents.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  expectSame(
+    "restore starts unpairing both recovery channels",
+    restoreEvents.flatMap((e) => (e.type === "UnpairStarted" ? [e.channel_id] : [])).sort(),
+    [...recoveryChannels].sort(),
+  );
+  for (const recoveryChannel of recoveryChannels) {
+    const bytes = await device.node.channelStore.load(deviceSid, recoveryChannel, "0");
+    const status = bytes ? JSON.parse(new TextDecoder().decode(bytes)).Helper.status : undefined;
+    if (status !== "Unpairing") {
+      throw new Error(`recovery channel ${recoveryChannel} must be Unpairing until its helper answers, got ${status}`);
+    }
+  }
+  console.log("  [Device]  no Unpaired yet: UnpairStarted and Unpairing on both recovery channels  ✓");
+
+  // helper-a accepts its unpair; helper-b's application refuses its own.
+  const [recoveryA, recoveryB] = recoveryChannels as [string, string];
+  for (const { endpoint, message } of device.node.transport.drain()) {
+    if (endpoint.uri === helperA.uri) {
+      await processAll(helperA.node, message);
+      continue;
+    }
+    if (endpoint.uri !== helperB.uri) {
+      throw new Error(`restore sends nothing to ${endpoint.uri}`);
+    }
+    const asked = requireEvent(await helperB.node.protocol.process(message), "ActionRequired", "helper-b");
+    await helperB.node.protocol.reject(asked.action, StatusEnum.Fail, "not now");
+  }
+  const answers = await pumpAll([device, helperA, helperB]);
+  const answerTypes = `[${answers.map((e) => e.type).join(", ")}]`;
+  const unpairedAt = (channelId: string, acknowledged: boolean): number =>
+    answers.findIndex((e) => e.type === "Unpaired" && e.channel_id === channelId && e.acknowledged === acknowledged);
+  if (unpairedAt(recoveryA, true) < 0) {
+    throw new Error(`helper-a's acceptance unpairs its recovery channel, got ${answerTypes}`);
+  }
+  const rejectedAt = answers.findIndex((e) => e.type === "UnpairRejected" && e.channel_id === recoveryB);
+  if (rejectedAt < 0 || unpairedAt(recoveryB, false) <= rejectedAt) {
+    throw new Error(
+      `helper-b's refusal is reported, then its recovery channel is unpaired anyway, got ${answerTypes}`,
+    );
+  }
+  for (const recoveryChannel of recoveryChannels) {
+    if (await device.node.channelStore.load(deviceSid, recoveryChannel, "0")) {
+      throw new Error(`recovery channel ${recoveryChannel} is gone whatever its helper answered`);
+    }
+  }
+  console.log(
+    "  [Device]  restore unpairs the recovery channels whatever their helpers answer (accept → Unpaired acknowledged, refuse → UnpairRejected + Unpaired unacknowledged)  ✓",
+  );
 
   const dutyBytes = await device.node.channelStore.load(deviceSid, dutyChannel, "0");
   if (!dutyBytes) throw new Error("the channel to the other owner survives restore");
@@ -3278,6 +3346,9 @@ async function runRestoreOnRecoveryChannelsFlow(): Promise<void> {
   unpairEvents.push(...(await pumpAll([device, helperA, helperB])));
   const unpaired = new Set(unpairEvents.flatMap((e) => (e.type === "Unpaired" ? [e.channel_id] : [])));
   expectSame("the linked unpairs drop only the old channels", [...unpaired].sort(), [oldA, oldB].sort());
+  if (unpairEvents.some((e) => e.type === "Unpaired" && !e.acknowledged)) {
+    throw new Error(`both sides acknowledge the linked unpairs: ${JSON.stringify(unpairEvents)}`);
+  }
   for (const [helper, label, old, recovery] of [
     [helperA, "HelperA", oldA, recoveryA],
     [helperB, "HelperB", oldB, recoveryB],
@@ -3786,6 +3857,9 @@ async function runUnpairingFlow(): Promise<void> {
       `Helper Unpaired channel_id mismatch: ${helperUnpaired.channel_id} ≠ ${longTermChannelId}`,
     );
   }
+  if (!helperUnpaired.acknowledged) {
+    throw new Error("Helper Unpaired must be acknowledged: it answered Ok");
+  }
   const unpairResponse = drainOne(helper, "Helper");
   console.log(
     `  [Helper] processAll(UnpairRequest) → Unpaired + UnpairResponse ${unpairResponse.length}B`,
@@ -3797,6 +3871,9 @@ async function runUnpairingFlow(): Promise<void> {
     throw new Error(
       `Owner Unpaired channel_id mismatch: ${ownerUnpaired.channel_id} ≠ ${longTermChannelId}`,
     );
+  }
+  if (!ownerUnpaired.acknowledged) {
+    throw new Error("Owner Unpaired must be acknowledged: the helper answered Ok");
   }
   console.log(`  [Owner]  processAll(UnpairResponse) → Unpaired`);
 
@@ -4057,8 +4134,8 @@ async function runUnpairRepublishesFlow(): Promise<void> {
     );
   }
   let events = await pumpAll([owner, helperA, helperB, helperC]);
-  if (!events.some((e) => e.type === "Unpaired" && e.channel_id === channelC)) {
-    throw new Error(`expected Unpaired for HelperC: [${events.map((e) => e.type).join(", ")}]`);
+  if (!events.some((e) => e.type === "Unpaired" && e.channel_id === channelC && e.acknowledged)) {
+    throw new Error(`expected an acknowledged Unpaired for HelperC: [${events.map((e) => e.type).join(", ")}]`);
   }
   const expected = [`${channelA}:2`, `${channelB}:2`].sort();
   if (storedVersions(events).join(",") !== expected.join(",")) {
@@ -4714,6 +4791,7 @@ async function runShareStoreRefusalFlow(): Promise<void> {
     shareRejected.length !== 1 ||
     shareRejected[0]!.channel_id !== pairedA.longTermChannelId ||
     shareRejected[0]!.version !== nextVersion ||
+    shareRejected[0]!.reason !== "Refused" ||
     shareRejected[0]!.status !== StatusEnum.TooFrequent
   ) {
     throw new Error(`expected one ShareRejected(TOO_FREQUENT) from HelperA, got ${JSON.stringify(shareRejected)}`);
@@ -4818,6 +4896,7 @@ async function runRequestFailedTokenFlow(): Promise<void> {
     rejected.length !== 1 ||
     rejected[0]!.channel_id !== pairedA.longTermChannelId ||
     rejected[0]!.version !== version ||
+    rejected[0]!.reason !== "Refused" ||
     rejected[0]!.status !== StatusEnum.Fail ||
     rejected[0]!.memo !== rf.memo
   ) {
@@ -4951,6 +5030,7 @@ async function runShareSizeRefusalFlow(): Promise<void> {
     rejected.length !== 1 ||
     rejected[0]!.channel_id !== pairedA.longTermChannelId ||
     rejected[0]!.version !== version ||
+    rejected[0]!.reason !== "Refused" ||
     rejected[0]!.status !== StatusEnum.SizeLimitExceeded ||
     rejected[0]!.memo !== memo
   ) {
@@ -5018,6 +5098,7 @@ async function runAutoRespondOnFailureFlow(): Promise<void> {
     rejected.length !== 1 ||
     rejected[0]!.channel_id !== pairedA.longTermChannelId ||
     rejected[0]!.version !== version ||
+    rejected[0]!.reason !== "Refused" ||
     rejected[0]!.status !== StatusEnum.Fail ||
     rejected[0]!.memo !== "request could not be processed"
   ) {
@@ -7757,7 +7838,9 @@ async function runStoreAnswerContractFlow(): Promise<void> {
   const paired = await doPair(leaving, owner, 86n, "Owner↔LeavingHelper");
   await owner.protocol.start(FlowKind.Unpair, { channel_id: paired.longTermChannelId });
   const leavingEvents = await processAll(leaving, drainOne(owner, "Owner"));
-  requireEvent(leavingEvents, "Unpaired", "LeavingHelper");
+  if (!requireEvent(leavingEvents, "Unpaired", "LeavingHelper").acknowledged) {
+    throw new Error("LeavingHelper's Unpaired must be acknowledged: it answered Ok");
+  }
   const removal = requireEvent(leavingEvents, "RequestFailed", "LeavingHelper");
   if (removal.action_kind !== "Unpair" || removal.error_code !== "store_error") {
     throw new Error(`a rejecting ChannelStore.removeMany must be a store error, got ${JSON.stringify(removal)}`);

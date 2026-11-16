@@ -5,6 +5,7 @@ use derec_library::protocol::types::Share;
 use derec_library::protocol::{DeRecShareStore, ShareStoreFuture};
 use derec_library::types::ChannelId;
 use std::future;
+use tokio_postgres::Client;
 use tokio_postgres::types::ToSql;
 
 use crate::codec::{sql_to_subshares, sql_to_threshold, subshares_to_sql, threshold_to_sql};
@@ -151,39 +152,31 @@ impl DeRecShareStore for PostgresShareStore {
         channel_id: ChannelId,
         share: Share,
     ) -> ShareStoreFuture<'_, ()> {
-        // `share.secret_id` is the Owner's id and differs from the partition
-        // whenever this peer holds someone else's share, so it goes in its own
-        // column rather than into the key. See `DeRecShareStore::save`.
         let client = self.client.clone();
-        let secret_id_i64 = u64_to_sql(secret_id);
-        let channel_id_i64 = u64_to_sql(channel_id.0);
-        let version_i64 = share.version as i64;
-        let share_secret_id_i64 = u64_to_sql(share.secret_id);
-        let bytes = share.bytes;
-        let subshares = subshares_to_sql(share.subshares);
-        let threshold = threshold_to_sql(share.threshold);
+        Box::pin(async move {
+            upsert(&client, secret_id, channel_id, &share).await;
+            Ok(())
+        })
+    }
+
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, Share)>,
+    ) -> ShareStoreFuture<'_, ()> {
+        let client = self.client.clone();
         Box::pin(async move {
             client
-                .execute(
-                    "INSERT INTO shares (secret_id, channel_id, version, share_secret_id, bytes, subshares, threshold) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7)
-                     ON CONFLICT ON CONSTRAINT shares_uniq DO UPDATE SET
-                         share_secret_id = EXCLUDED.share_secret_id,
-                         bytes           = EXCLUDED.bytes,
-                         subshares       = EXCLUDED.subshares,
-                         threshold       = EXCLUDED.threshold",
-                    &[
-                        &secret_id_i64,
-                        &channel_id_i64,
-                        &version_i64,
-                        &share_secret_id_i64,
-                        &bytes,
-                        &subshares,
-                        &threshold,
-                    ],
-                )
+                .batch_execute("BEGIN")
                 .await
-                .expect("share save failed");
+                .expect("save_many transaction failed");
+            for (channel_id, share) in &entries {
+                upsert(&client, secret_id, *channel_id, share).await;
+            }
+            client
+                .batch_execute("COMMIT")
+                .await
+                .expect("save_many commit failed");
             Ok(())
         })
     }
@@ -279,4 +272,31 @@ fn row_to_share(row: tokio_postgres::Row) -> Share {
         subshares: sql_to_subshares(row.get::<_, Option<i64>>(3)),
         threshold: sql_to_threshold(row.get::<_, Option<i64>>(4)),
     }
+}
+
+async fn upsert(client: &Client, secret_id: u64, channel_id: ChannelId, share: &Share) {
+    // `share.secret_id` is the Owner's id and differs from the partition
+    // whenever this peer holds someone else's share, so it goes in its own
+    // column rather than into the key. See `DeRecShareStore::save`.
+    client
+        .execute(
+            "INSERT INTO shares (secret_id, channel_id, version, share_secret_id, bytes, subshares, threshold) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT ON CONSTRAINT shares_uniq DO UPDATE SET
+                 share_secret_id = EXCLUDED.share_secret_id,
+                 bytes           = EXCLUDED.bytes,
+                 subshares       = EXCLUDED.subshares,
+                 threshold       = EXCLUDED.threshold",
+            &[
+                &u64_to_sql(secret_id),
+                &u64_to_sql(channel_id.0),
+                &(share.version as i64),
+                &u64_to_sql(share.secret_id),
+                &share.bytes,
+                &subshares_to_sql(share.subshares),
+                &threshold_to_sql(share.threshold),
+            ],
+        )
+        .await
+        .expect("share save failed");
 }

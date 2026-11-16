@@ -177,6 +177,9 @@ internal static class Protocol
         AssertLabelConstants(typeof(NotRestoredReason), enums, "NotRestoredReason");
         AssertLabelConstants(typeof(CorruptionReason), enums, "CorruptionReason");
         AssertLabelConstants(typeof(VerifyFailureReason), enums, "VerifyFailureReason");
+        AssertLabelConstants(typeof(RecoverFailureReason), enums, "RecoverFailureReason");
+        AssertLabelConstants(typeof(ShareRejectReason), enums, "ShareRejectReason");
+        AssertLabelConstants(typeof(ReplicaSyncFailureReason), enums, "ReplicaSyncFailureReason");
         AssertLabelConstants(typeof(PendingActionKind), enums, "PendingActionKind");
         AssertNumericEnum<FlowKind>(enums, "FlowKind");
         AssertNumericEnum<Pairing.SenderKind>(enums, "SenderKind");
@@ -192,7 +195,8 @@ internal static class Protocol
         var checkedEnums = new HashSet<string>
         {
             "ChannelStatus", "ReplicaRole", "StateKind", "SecretKind", "IgnoreReason",
-            "NotRestoredReason", "CorruptionReason", "VerifyFailureReason", "PendingActionKind",
+            "NotRestoredReason", "CorruptionReason", "VerifyFailureReason", "RecoverFailureReason",
+            "ShareRejectReason", "ReplicaSyncFailureReason", "PendingActionKind",
             "FlowKind", "SenderKind", "ContactMode", "StatusEnum", "DeRecEvent",
             "DeRecErrorCategory", "DeRecErrorCode",
         };
@@ -1705,7 +1709,8 @@ internal static class Protocol
         var nextVersion = Protect("second version");
         var shareRejected = RoundTrip().OfType<ShareRejectedEvent>().ToList();
         if (shareRejected.Count != 1 || shareRejected[0].ChannelId != channelA ||
-            shareRejected[0].Version != nextVersion || shareRejected[0].Status != tooFrequent)
+            shareRejected[0].Version != nextVersion || shareRejected[0].Reason != ShareRejectReason.Refused
+            || shareRejected[0].Status != tooFrequent)
             throw new InvalidOperationException(
                 $"expected one ShareRejected(TooFrequent) from HelperA; got [{string.Join(", ", shareRejected)}]");
         Console.WriteLine("  [HelperA] Save → TooFrequent; [Owner] ShareRejected(status=TooFrequent)  ✓");
@@ -1799,8 +1804,8 @@ internal static class Protocol
 
         var rejected = ownerEvents.OfType<ShareRejectedEvent>().ToList();
         if (rejected.Count != 1 || rejected[0].ChannelId != channelA
-            || rejected[0].Version != version || rejected[0].Status != fail
-            || rejected[0].Memo != failed.Memo)
+            || rejected[0].Version != version || rejected[0].Reason != ShareRejectReason.Refused
+            || rejected[0].Status != fail || rejected[0].Memo != failed.Memo)
             throw new InvalidOperationException(
                 $"expected one ShareRejected(Fail, event memo) from HelperA; got [{string.Join(", ", rejected)}]");
         Console.WriteLine("  [HelperA] RejectAsync(token, event.Status, event.Memo) → one response; [Owner] ShareRejected(status=Fail, same memo)  ✓");
@@ -1866,6 +1871,7 @@ internal static class Protocol
         ownerEvents.AddRange(owner.Protocol.ProcessAndAcceptAllAsync(helperA.Transport.DrainOne()).GetAwaiter().GetResult());
         var rejected = ownerEvents.OfType<ShareRejectedEvent>().ToList();
         if (rejected.Count != 1 || rejected[0].ChannelId != channelA || rejected[0].Version != version
+            || rejected[0].Reason != ShareRejectReason.Refused
             || rejected[0].Status != Org.Derecalliance.Derec.Protobuf.StatusEnum.Fail
             || rejected[0].Memo != "request could not be processed")
             throw new InvalidOperationException(
@@ -2633,12 +2639,12 @@ internal static class Protocol
             || settled[1] is not SecretRecoveredEvent recovered)
             throw new InvalidOperationException(
                 $"expected a timeout then SecretRecovered, got [{string.Join(", ", settled.Select(e => e.EventType))}]");
-        if (failed.ChannelId != channelC || failed.Version != version || failed.Error != "timeout")
+        if (failed.ChannelId != channelC || failed.Version != version || failed.Reason != RecoverFailureReason.TimedOut)
             throw new InvalidOperationException(
-                $"HelperC must time out: channel={failed.ChannelId} (want {channelC}) v={failed.Version} error={failed.Error}");
+                $"HelperC must time out: channel={failed.ChannelId} (want {channelC}) v={failed.Version} reason={failed.Reason}");
         if (!recovered.Secret.Secrets.Any(u => u.Id.SequenceEqual(new byte[] { 0x09 }) && u.Data.SequenceEqual(secretData)))
             throw new InvalidOperationException("recovered secret must carry the protected bytes");
-        Console.WriteLine($"  after the window → RecoverSecretFailed({channelC}, \"timeout\"), SecretRecovered  ✓");
+        Console.WriteLine($"  after the window → RecoverSecretFailed({channelC}, TimedOut), SecretRecovered  ✓");
 
         var after = owner.Protocol.TickAsync().GetAwaiter().GetResult();
         if (after.Count != 0)
@@ -2889,7 +2895,55 @@ internal static class Protocol
                 throw new InvalidOperationException($"restore must still wipe recovery channel {recoveryChannel}");
         }
         Console.WriteLine("  restore unpairs both recovery channels and leaves the duty channel alone  ✓");
-        PumpAll(recoveryScope);
+        if (restoreEvents.OfType<UnpairedEvent>().Any())
+            throw new InvalidOperationException(
+                $"restore must wait for the recovery helpers' answers: [{string.Join(", ", restoreEvents.Select(e => e.EventType))}]");
+        var started = restoreEvents.OfType<UnpairStartedEvent>().Select(e => e.ChannelId).ToHashSet();
+        if (!started.SetEquals(recoveryChannels))
+            throw new InvalidOperationException(
+                $"restore must start unpairing both recovery channels; started [{string.Join(", ", started)}]");
+        foreach (ulong recoveryChannel in recoveryChannels)
+        {
+            var record = device.ChannelStore.Load(deviceSid, recoveryChannel, 0);
+            if (record?.Status != ChannelStatus.Unpairing)
+                throw new InvalidOperationException(
+                    $"recovery channel {recoveryChannel} must be Unpairing until its helper answers; is {record?.Status}");
+        }
+
+        // helper-a accepts its unpair; helper-b's application refuses its own.
+        foreach (var (uri, _, bytes) in device.Transport.DrainAll())
+        {
+            if (uri == helperAUri)
+            {
+                helperA.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+                continue;
+            }
+            if (uri != helperBUri)
+                throw new InvalidOperationException($"restore must only message the recovery helpers; sent to {uri}");
+            var asked = helperB.Protocol.ProcessAsync(bytes).GetAwaiter().GetResult()
+                .OfType<ActionRequiredEvent>().FirstOrDefault()
+                ?? throw new InvalidOperationException("helper-b must be asked whether to unpair");
+            helperB.Protocol.RejectAsync(asked.Action, Org.Derecalliance.Derec.Protobuf.StatusEnum.Fail, "not now")
+                .GetAwaiter().GetResult();
+        }
+        var answers = PumpAll(recoveryScope);
+        ulong recoveryA = recoveryChannels[0];
+        ulong recoveryB = recoveryChannels[1];
+        if (!answers.OfType<UnpairedEvent>().Any(e => e.ChannelId == recoveryA && e.Acknowledged))
+            throw new InvalidOperationException(
+                $"helper-a's acceptance must unpair its recovery channel, acknowledged: [{string.Join(", ", answers.Select(e => e.EventType))}]");
+        int rejected = answers.FindIndex(e => e is UnpairRejectedEvent r && r.ChannelId == recoveryB);
+        int dropped = answers.FindIndex(e => e is UnpairedEvent u && u.ChannelId == recoveryB && !u.Acknowledged);
+        if (rejected < 0 || dropped < 0 || rejected > dropped)
+            throw new InvalidOperationException(
+                $"helper-b's refusal must be reported, then its recovery channel unpaired anyway: [{string.Join(", ", answers.Select(e => e.EventType))}]");
+        foreach (ulong recoveryChannel in recoveryChannels)
+        {
+            if (device.ChannelStore.Load(deviceSid, recoveryChannel, 0) is not null)
+                throw new InvalidOperationException(
+                    $"recovery channel {recoveryChannel} must be gone whatever its helper answered");
+        }
+        Console.WriteLine("  restore unpairs the recovery channels whatever their helpers answer (accept → Unpaired acknowledged, refuse → UnpairRejected + Unpaired unacknowledged)  ✓");
 
         var duty = device.ChannelStore.Load(deviceSid, dutyChannel, 0)
             ?? throw new InvalidOperationException("the channel to the other owner must survive restore");
@@ -3033,7 +3087,10 @@ internal static class Protocol
                 LinkedChannelId = old,
             }).GetAwaiter().GetResult();
         }
-        var unpaired = PumpAll(scope).OfType<UnpairedEvent>().Select(e => e.ChannelId).ToHashSet();
+        var unpairedEvents = PumpAll(scope).OfType<UnpairedEvent>().ToList();
+        if (unpairedEvents.Any(e => !e.Acknowledged))
+            throw new InvalidOperationException("an accepted linked unpair must be acknowledged");
+        var unpaired = unpairedEvents.Select(e => e.ChannelId).ToHashSet();
         if (!unpaired.SetEquals(new[] { oldA, oldB }))
             throw new InvalidOperationException(
                 $"the linked unpairs must drop only the old channels; got [{string.Join(", ", unpaired)}]");
@@ -3559,7 +3616,7 @@ internal static class Protocol
         bool rejected = false;
         try
         {
-            JsonSerializer.Deserialize<DeRecEvent>("""{ "type": "Unpaired", "channel_id": "18446744073709551616" }""");
+            JsonSerializer.Deserialize<DeRecEvent>("""{ "type": "Unpaired", "channel_id": "18446744073709551616", "acknowledged": true }""");
         }
         catch (JsonException)
         {
@@ -3718,7 +3775,8 @@ internal static class Protocol
         var rejected = owner.Protocol.ProcessAsync(helperA.Transport.DrainOne()).GetAwaiter().GetResult()
             .OfType<ShareRejectedEvent>().SingleOrDefault()
             ?? throw new InvalidOperationException("owner must emit ShareRejected");
-        if (rejected.ChannelId != channelA || rejected.Status != status || rejected.Memo != "over quota")
+        if (rejected.ChannelId != channelA || rejected.Reason != ShareRejectReason.Refused
+            || rejected.Status != status || rejected.Memo != "over quota")
             throw new InvalidOperationException(
                 $"ShareRejected mismatch: channel={rejected.ChannelId} status={rejected.Status} memo={rejected.Memo}");
         Console.WriteLine($"  RejectAsync(SizeLimitExceeded) → ShareRejected(status={rejected.Status})  ✓");
@@ -3890,7 +3948,7 @@ internal static class Protocol
             Org.Derecalliance.Derec.Protobuf.StatusEnum.SizeLimitExceeded;
         var events = new (string Json, Func<DeRecEvent, Org.Derecalliance.Derec.Protobuf.StatusEnum> Status)[]
         {
-            ("""{ "type": "ShareRejected", "channel_id": "1", "version": 1, "status": 3, "memo": "m" }""",
+            ("""{ "type": "ShareRejected", "channel_id": "1", "version": 1, "reason": "Refused", "status": 3, "memo": "m" }""",
                 e => ((ShareRejectedEvent)e).Status),
             ("""{ "type": "ShareRefused", "channel_id": "1", "version": 1, "status": 3, "memo": "m" }""",
                 e => ((ShareRefusedEvent)e).Status),
@@ -4742,6 +4800,8 @@ internal static class Protocol
             ?? throw new InvalidOperationException("helper must emit Unpaired");
         if (helperUnpaired.ChannelId != rekeyedId)
             throw new InvalidOperationException("Helper.Unpaired channel id mismatch");
+        if (!helperUnpaired.Acknowledged)
+            throw new InvalidOperationException("Helper.Unpaired must be acknowledged: the helper answered Ok");
 
         byte[] unpairResponse = helper.Transport.DrainOne();
         var ownerEvents = owner.Protocol.ProcessAndAcceptAllAsync(unpairResponse).GetAwaiter().GetResult();
@@ -4749,6 +4809,8 @@ internal static class Protocol
             ?? throw new InvalidOperationException("owner must emit Unpaired");
         if (ownerUnpaired.ChannelId != rekeyedId)
             throw new InvalidOperationException("Owner.Unpaired channel id mismatch");
+        if (!ownerUnpaired.Acknowledged)
+            throw new InvalidOperationException("Owner.Unpaired must be acknowledged: the helper answered Ok");
 
         // Both sides have dropped their channel records.
         if (helper.ChannelStore.Load(helper.Protocol.SecretId, rekeyedId, 0) is not null)
@@ -5065,7 +5127,7 @@ internal static class Protocol
                 "nothing is published before the helper acknowledges, got ["
                 + string.Join(", ", started.Select(e => e.EventType)) + "]");
         var events = PumpAll(allScope);
-        if (!events.OfType<UnpairedEvent>().Any(e => e.ChannelId == channelC))
+        if (!events.OfType<UnpairedEvent>().Any(e => e.ChannelId == channelC && e.Acknowledged))
             throw new InvalidOperationException(
                 "expected Unpaired for helper-c, got ["
                 + string.Join(", ", events.Select(e => e.EventType)) + "]");

@@ -384,11 +384,11 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
     // the two devices agree on what each Helper was given. `secret_id` is the
     // local partition, not the sender's: the wire id names the secret, the
     // partition names the store this device reads back from.
-    for share in checked.shares {
-        stores
-            .shares
-            .save(
-                secret_id,
+    let tracking: Vec<(ChannelId, Share)> = checked
+        .shares
+        .iter()
+        .map(|share| {
+            (
                 ChannelId(share.channel_id),
                 Share {
                     secret_id,
@@ -401,7 +401,10 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
                     threshold: secret.threshold,
                 },
             )
-            .await?;
+        })
+        .collect();
+    if !tracking.is_empty() {
+        stores.shares.save_many(secret_id, tracking).await?;
     }
 
     let Some((group, _)) = group else {
@@ -2065,6 +2068,12 @@ mod tests {
                     .get(&ChannelId(HELPER_CHANNEL))
                     .expect("share for helper"),
             );
+            let other_committed = Message::encode_to_vec(
+                split
+                    .shares
+                    .get(&ChannelId(HELPER_CHANNEL + 1))
+                    .expect("share for the other helper"),
+            );
 
             let lf = LocalFixture::with_replica(SECRET_ID, SELF_ID);
             let mut rig = StoreRig::new();
@@ -2099,14 +2108,24 @@ mod tests {
 
             let payload = ReplicaSecretPayload {
                 secret: Some(Secret {
-                    helpers: vec![HelperInfo {
-                        channel_id: HELPER_CHANNEL,
-                        transports: vec![endpoint("https://helper")],
-                        shared_key: vec![0xAA; 32],
-                        communication_info: HashMap::new(),
-                        weight: 1,
-                        key_epoch: 0,
-                    }],
+                    helpers: vec![
+                        HelperInfo {
+                            channel_id: HELPER_CHANNEL,
+                            transports: vec![endpoint("https://helper")],
+                            shared_key: vec![0xAA; 32],
+                            communication_info: HashMap::new(),
+                            weight: 1,
+                            key_epoch: 0,
+                        },
+                        HelperInfo {
+                            channel_id: HELPER_CHANNEL + 1,
+                            transports: vec![endpoint("https://other-helper")],
+                            shared_key: vec![0xBB; 32],
+                            communication_info: HashMap::new(),
+                            weight: 1,
+                            key_epoch: 0,
+                        },
+                    ],
                     secrets: Vec::new(),
                     replicas: Some(Replicas {
                         channel_id: GROUP_CHANNEL.0,
@@ -2129,10 +2148,16 @@ mod tests {
                     }),
                     threshold: None,
                 }),
-                shares: vec![ChannelShare {
-                    channel_id: HELPER_CHANNEL,
-                    committed_share: committed.clone(),
-                }],
+                shares: vec![
+                    ChannelShare {
+                        channel_id: HELPER_CHANNEL,
+                        committed_share: committed.clone(),
+                    },
+                    ChannelShare {
+                        channel_id: HELPER_CHANNEL + 1,
+                        committed_share: other_committed.clone(),
+                    },
+                ],
                 shared_key: Vec::new(),
                 version: VERSION,
                 author_replica_id: None,
@@ -2181,6 +2206,21 @@ mod tests {
                 stored[0].bytes, committed,
                 "the tracked bytes must be the same CommittedDeRecShare the helper \
                  received, since that is what the helper hashes"
+            );
+            let other = rig
+                .shares
+                .load(SECRET_ID, ChannelId(HELPER_CHANNEL + 1), &[VERSION])
+                .await
+                .expect("share store must answer");
+            assert_eq!(other.len(), 1);
+            assert_eq!(other[0].bytes, other_committed);
+            assert_eq!(
+                (
+                    *rig.shares.save_calls.lock().unwrap(),
+                    *rig.shares.save_many_calls.lock().unwrap()
+                ),
+                (0, 1),
+                "every tracking share is written in one call"
             );
         });
     }

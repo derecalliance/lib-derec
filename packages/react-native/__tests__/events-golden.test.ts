@@ -157,7 +157,9 @@ const EVENTS = {
   ReplicaSyncRejected: {
     fields: { type: 'required', replica_id: 'required', secret_id: 'required', version: 'required', ...STATUS_MEMO },
   },
-  ReplicaSyncFailed: { fields: { type: 'required', replica_id: 'required', version: 'required', reason: 'required' } },
+  ReplicaSyncFailed: {
+    fields: { type: 'required', replica_id: 'required', version: 'required', reason: 'required', error: 'required' },
+  },
   ReplicaRemoved: { fields: { type: 'required', replica_id: 'required' } },
   ReplicaSourceChanged: { fields: { type: 'required', replica_id: 'required' } },
   SelfRemovedFromGroup: { fields: { type: 'required', version: 'required' } },
@@ -168,7 +170,9 @@ const EVENTS = {
   ShareStored: { fields: { type: 'required', channel_id: 'required', version: 'required' } },
   ShareRefused: { fields: { type: 'required', channel_id: 'required', version: 'required', ...STATUS_MEMO } },
   ShareConfirmed: { fields: { type: 'required', channel_id: 'required', version: 'required' } },
-  ShareRejected: { fields: { type: 'required', channel_id: 'required', version: 'required', ...STATUS_MEMO } },
+  ShareRejected: {
+    fields: { type: 'required', channel_id: 'required', version: 'required', reason: 'required', ...STATUS_MEMO },
+  },
   SharingComplete: {
     fields: {
       type: 'required',
@@ -214,7 +218,7 @@ const EVENTS = {
     nested: { secret: SECRET, supported_by: RECOVERY_HELPER, disputed_by: RECOVERY_HELPER },
   },
   RecoveryIncomplete: { fields: { type: 'required', secret_id: 'required', version: 'required', shares_received: 'required' } },
-  Unpaired: { fields: { type: 'required', channel_id: 'required' } },
+  Unpaired: { fields: { type: 'required', channel_id: 'required', acknowledged: 'required' } },
   UnpairRejected: { fields: { type: 'required', channel_id: 'required', ...STATUS_MEMO } },
   PrePairRejected: { fields: { type: 'required', channel_id: 'required', ...STATUS_MEMO } },
   ErrorResponseReceived: { fields: { type: 'required', channel_id: 'required', ...STATUS_MEMO } },
@@ -293,7 +297,7 @@ const EVENTS = {
     fields: { type: 'required', channel_id: 'required', version: 'required', trace_id: 'required' },
   },
   RecoverSecretFailed: {
-    fields: { type: 'required', channel_id: 'required', version: 'required', error: 'required' },
+    fields: { type: 'required', channel_id: 'required', version: 'required', reason: 'required', error: 'required' },
   },
   UnpairFailed: { fields: { type: 'required', channel_id: 'required', error: 'required' } },
   UnpairStarted: { fields: { type: 'required', channel_id: 'required', trace_id: 'required' } },

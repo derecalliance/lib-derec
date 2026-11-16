@@ -990,6 +990,11 @@ typedef struct SecretStoreCallbacks {
  * decimal string of the channel the share is stored under, so the caller can
  * tell which channel each share came from.
  *
+ * `save_many` receives a JSON array of `[channel_id, share]` pairs, the
+ * same pairs `load_many` returns: `channel_id` the decimal string of the
+ * channel to store the share under, `share` the object above. The buffer is
+ * owned by the caller and valid only for the duration of the call.
+ *
  * `remove_versions_many` receives a JSON array of `[channel_id, versions]`
  * pairs, `channel_id` a decimal string and `versions` an array of numbers,
  * each naming the versions to remove on that channel. A version that is not
@@ -1000,8 +1005,8 @@ typedef struct SecretStoreCallbacks {
  * version, other than `version`, every helper keeps, or `0` to keep no
  * other version. Any non-zero return code is a backend failure.
  *
- * `save` and `record_verification` share a return-code convention: `0` is
- * success; `3`/`4`/`10` (the
+ * `save`, `save_many` and `record_verification` share a return-code
+ * convention: `0` is success; `3`/`4`/`10` (the
  * [`DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_SIZE_LIMIT_EXCEEDED) /
  * [`DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_TOO_FREQUENT) /
  * [`DEREC_SHARE_STORE_REFUSED_REJECTED`](crate::interop::ffi::error::DEREC_SHARE_STORE_REFUSED_REJECTED)
@@ -1044,6 +1049,10 @@ typedef struct ShareStoreCallbacks {
                   uint64_t channel_id,
                   const uint8_t *share_json_ptr,
                   size_t share_json_len);
+  int32_t (*save_many)(void *user_data,
+                       uint64_t secret_id,
+                       const uint8_t *entries_json_ptr,
+                       size_t entries_json_len);
   int32_t (*remove_channel)(void *user_data, uint64_t secret_id, uint64_t channel_id);
   int32_t (*remove_versions)(void *user_data,
                              uint64_t secret_id,
@@ -1106,6 +1115,8 @@ typedef struct UserSecretStoreCallbacks {
  * - `remove`: `0` = ok (`*out_removed` set to `0` or `1`), other =
  *   backend failure.
  * - `save` / `load_all`: `0` = ok, other = backend failure.
+ * - `save_many`: `0` = ok, other = backend failure. The items arrive as a
+ *   JSON array of the [`StateItemRecord`]s `save` takes one at a time.
  * - `remove_many`: `0` = ok, other = backend failure. The keys arrive as a
  *   JSON array of the [`StateKeyRecord`]s `remove` takes one at a time; a
  *   key with no row is skipped.
@@ -1116,6 +1127,10 @@ typedef struct StateStoreCallbacks {
                   uint64_t secret_id,
                   const uint8_t *item_json_ptr,
                   size_t item_json_len);
+  int32_t (*save_many)(void *user_data,
+                       uint64_t secret_id,
+                       const uint8_t *items_json_ptr,
+                       size_t items_json_len);
   int32_t (*load)(void *user_data,
                   uint64_t secret_id,
                   const uint8_t *key_json_ptr,

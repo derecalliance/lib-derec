@@ -1395,6 +1395,10 @@ pub enum StateItem {
     PendingUnpair {
         channel_id: ChannelId,
         started_at: u64,
+        /// The channel is dropped whatever the Helper answers: a refusal is
+        /// reported and the channel still goes, instead of returning to
+        /// `Paired`. Set for the recovery channels a restore tears down.
+        drop_on_rejection: bool,
     },
 
     /// Active sharing round, keyed by the version it distributes. Created by

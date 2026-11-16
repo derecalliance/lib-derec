@@ -302,10 +302,28 @@ func TestDecodeEvents_ShareRejected(t *testing.T) {
 		"type": "ShareRejected",
 		"channel_id": "11",
 		"version": 1,
+		"reason": "Refused",
 		"status": 3,
-		"memo": "timeout"
+		"memo": "over quota"
 	}`)
-	if ev.Type != EventTypeShareRejected || ev.Status != derecpb.StatusEnum_SIZE_LIMIT_EXCEEDED || ev.Memo != "timeout" {
+	if ev.Type != EventTypeShareRejected || ev.Reason != ShareRejectReasonRefused ||
+		ev.Status != derecpb.StatusEnum_SIZE_LIMIT_EXCEEDED || ev.Memo != "over quota" {
+		t.Fatalf("got %+v", ev)
+	}
+}
+
+func TestDecodeEvents_ShareRejectedTimedOut(t *testing.T) {
+	ev := decodeOne(t, `{"type": "ShareRejected", "channel_id": "11", "version": 1, "reason": "TimedOut", "status": 1, "memo": "timeout"}`)
+	if ev.Type != EventTypeShareRejected || ev.Reason != ShareRejectReasonTimedOut {
+		t.Fatalf("got %+v", ev)
+	}
+}
+
+func TestDecodeEvents_ReplicaSyncFailed(t *testing.T) {
+	ev := decodeOne(t, `{"type": "ReplicaSyncFailed", "replica_id": "9", "version": 5, "reason": "DispatchFailed", "error": "connection refused"}`)
+	if ev.Type != EventTypeReplicaSyncFailed || ev.ReplicaID == nil || *ev.ReplicaID != 9 ||
+		ev.Version == nil || *ev.Version != 5 ||
+		ev.Reason != ReplicaSyncFailureReasonDispatchFailed || ev.Error != "connection refused" {
 		t.Fatalf("got %+v", ev)
 	}
 }
@@ -576,8 +594,12 @@ func TestDecodeEvents_ReplicaSecretRefused(t *testing.T) {
 }
 
 func TestDecodeEvents_Unpaired(t *testing.T) {
-	ev := decodeOne(t, `{"type": "Unpaired", "channel_id": "11"}`)
-	if ev.Type != EventTypeUnpaired || ev.ChannelID != 11 {
+	ev := decodeOne(t, `{"type": "Unpaired", "channel_id": "11", "acknowledged": true}`)
+	if ev.Type != EventTypeUnpaired || ev.ChannelID != 11 || !ev.Acknowledged {
+		t.Fatalf("got %+v", ev)
+	}
+	ev = decodeOne(t, `{"type": "Unpaired", "channel_id": "11", "acknowledged": false}`)
+	if ev.Type != EventTypeUnpaired || ev.ChannelID != 11 || ev.Acknowledged {
 		t.Fatalf("got %+v", ev)
 	}
 }
@@ -958,8 +980,8 @@ func TestDecodeEvents_RecoverSecretStarted(t *testing.T) {
 }
 
 func TestDecodeEvents_RecoverSecretFailed(t *testing.T) {
-	ev := decodeOne(t, `{"type": "RecoverSecretFailed", "channel_id": "11", "version": 1, "error": "no quorum"}`)
-	if ev.Type != EventTypeRecoverSecretFailed || ev.Error != "no quorum" {
+	ev := decodeOne(t, `{"type": "RecoverSecretFailed", "channel_id": "11", "version": 1, "reason": "TimedOut", "error": "timeout"}`)
+	if ev.Type != EventTypeRecoverSecretFailed || ev.Reason != RecoverFailureReasonTimedOut || ev.Error != "timeout" {
 		t.Fatalf("got %+v", ev)
 	}
 }

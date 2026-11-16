@@ -97,6 +97,7 @@ type mockShareStore struct {
 	loadAllFn            func(secretID uint64, channelIDs []uint64) ([]Share, error)
 	latestVersionFn      func(secretID uint64) (uint32, bool, error)
 	saveFn               func(secretID, channelID uint64, share Share) error
+	saveManyFn           func(secretID uint64, entries []ShareEntry) error
 	removeChannelFn      func(secretID, channelID uint64) error
 	removeVersionsFn     func(secretID, channelID uint64, versions []uint32) error
 	removeVersionsManyFn func(secretID uint64, entries []ShareVersionsEntry) error
@@ -118,6 +119,9 @@ func (m *mockShareStore) LatestVersion(secretID uint64) (uint32, bool, error) {
 }
 func (m *mockShareStore) Save(secretID, channelID uint64, share Share) error {
 	return m.saveFn(secretID, channelID, share)
+}
+func (m *mockShareStore) SaveMany(secretID uint64, entries []ShareEntry) error {
+	return m.saveManyFn(secretID, entries)
 }
 func (m *mockShareStore) RemoveChannel(secretID, channelID uint64) error {
 	return m.removeChannelFn(secretID, channelID)
@@ -157,6 +161,7 @@ var _ userSecretStore = (*mockUserSecretStore)(nil)
 
 type mockStateStore struct {
 	saveFn       func(secretID uint64, item StateItem) error
+	saveManyFn   func(secretID uint64, items []StateItem) error
 	loadFn       func(secretID uint64, key StateKey) (StateItem, bool, error)
 	removeFn     func(secretID uint64, key StateKey) (bool, error)
 	removeManyFn func(secretID uint64, keys []StateKey) error
@@ -165,6 +170,9 @@ type mockStateStore struct {
 
 func (m *mockStateStore) Save(secretID uint64, item StateItem) error {
 	return m.saveFn(secretID, item)
+}
+func (m *mockStateStore) SaveMany(secretID uint64, items []StateItem) error {
+	return m.saveManyFn(secretID, items)
 }
 func (m *mockStateStore) Load(secretID uint64, key StateKey) (StateItem, bool, error) {
 	return m.loadFn(secretID, key)
@@ -501,6 +509,61 @@ func TestDispatchSecretRemoveMany_DecodesPairs(t *testing.T) {
 	calls = 0
 	for _, bad := range []string{`[["x",0]]`, `[[12,0]]`, `[["12"]]`, `[["12","0"]]`} {
 		if status := dispatchSecretRemoveMany(s, 1, []byte(bad)); status != ffiStatusFailure {
+			t.Fatalf("%s: status = %d, want ffiStatusFailure", bad, status)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("malformed input reached the store %d times", calls)
+	}
+}
+
+func TestDispatchStateSaveMany_DecodesItems(t *testing.T) {
+	var got []StateItem
+	calls := 0
+	s := &storeSet{state: &mockStateStore{
+		saveManyFn: func(secretID uint64, items []StateItem) error {
+			calls++
+			got = items
+			return nil
+		},
+	}}
+	cid, version := uint64(12), uint32(4)
+	verification, err := EncodeStateItem(StateItem{Kind: StateKindPendingVerification, ChannelID: &cid, Bytes: []byte{1, 2}})
+	if err != nil {
+		t.Fatalf("EncodeStateItem(verification): %v", err)
+	}
+	round, err := EncodeStateItem(StateItem{Kind: StateKindSharingRound, Version: &version, Bytes: []byte{3}})
+	if err != nil {
+		t.Fatalf("EncodeStateItem(round): %v", err)
+	}
+	payload, err := json.Marshal([]json.RawMessage{verification, round})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if status := dispatchStateSaveMany(s, 1, payload); status != ffiStatusOK {
+		t.Fatalf("status = %d, want ffiStatusOK", status)
+	}
+	if len(got) != 2 ||
+		got[0].Kind != StateKindPendingVerification || got[0].ChannelID == nil || *got[0].ChannelID != 12 || !bytes.Equal(got[0].Bytes, []byte{1, 2}) ||
+		got[1].Kind != StateKindSharingRound || got[1].Version == nil || *got[1].Version != 4 {
+		t.Fatalf("items = %+v, want [PendingVerification ch 12, SharingRound v4]", got)
+	}
+	if status := dispatchStateSaveMany(s, 1, nil); status != ffiStatusOK || len(got) != 0 {
+		t.Fatalf("empty buffer: status = %d items = %v, want ok and none", status, got)
+	}
+
+	failing := &storeSet{state: &mockStateStore{
+		saveManyFn: func(secretID uint64, items []StateItem) error {
+			return errors.New("backend down")
+		},
+	}}
+	if status := dispatchStateSaveMany(failing, 1, payload); status != ffiStatusFailure {
+		t.Fatalf("store error must surface as ffiStatusFailure, got %d", status)
+	}
+
+	calls = 0
+	for _, bad := range []string{`not json`, `[{"kind":0,"channel_id":"x","bytes":[]}]`, `["not an object"]`} {
+		if status := dispatchStateSaveMany(s, 1, []byte(bad)); status != ffiStatusFailure {
 			t.Fatalf("%s: status = %d, want ffiStatusFailure", bad, status)
 		}
 	}
@@ -857,9 +920,71 @@ func TestDispatchShareSave(t *testing.T) {
 	}
 }
 
-// TestShareSaveRefusalReturnsStatusCode proves dispatchShareSave and
-// dispatchShareRecordVerification map a *ShareStoreRefusedError to the FFI
-// return code documented on ShareStoreCallbacks.Save/RecordVerification in
+func TestDispatchShareSaveMany_DecodesPairs(t *testing.T) {
+	var gotSecretID uint64
+	var got []ShareEntry
+	calls := 0
+	s := &storeSet{share: &mockShareStore{
+		saveManyFn: func(secretID uint64, entries []ShareEntry) error {
+			calls++
+			gotSecretID, got = secretID, entries
+			return nil
+		},
+	}}
+	threshold := uint32(2)
+	first, err := EncodeShare(Share{SecretID: 9, Version: 4, Bytes: []byte{1, 2}, Threshold: &threshold})
+	if err != nil {
+		t.Fatalf("EncodeShare(first): %v", err)
+	}
+	second, err := EncodeShare(Share{SecretID: 5, Version: 7, Bytes: []byte{3}})
+	if err != nil {
+		t.Fatalf("EncodeShare(second): %v", err)
+	}
+	payload, err := json.Marshal([][2]any{
+		{"12", json.RawMessage(first)},
+		{"18446744073709551615", json.RawMessage(second)},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if status := dispatchShareSaveMany(s, 5, payload); status != ffiStatusOK || gotSecretID != 5 {
+		t.Fatalf("status = %d secretID = %d, want ffiStatusOK and 5", status, gotSecretID)
+	}
+	want := []ShareEntry{
+		{ChannelID: 12, Share: Share{SecretID: 9, Version: 4, Bytes: []byte{1, 2}, Threshold: &threshold}},
+		{ChannelID: 18446744073709551615, Share: Share{SecretID: 5, Version: 7, Bytes: []byte{3}}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("entries = %+v, want %+v", got, want)
+	}
+	if status := dispatchShareSaveMany(s, 5, nil); status != ffiStatusOK || len(got) != 0 {
+		t.Fatalf("empty buffer: status = %d entries = %v, want ok and none", status, got)
+	}
+
+	failing := &storeSet{share: &mockShareStore{
+		saveManyFn: func(secretID uint64, entries []ShareEntry) error {
+			return errors.New("backend down")
+		},
+	}}
+	if status := dispatchShareSaveMany(failing, 5, payload); status != ffiStatusFailure {
+		t.Fatalf("store error must surface as ffiStatusFailure, got %d", status)
+	}
+
+	calls = 0
+	for _, bad := range []string{`not json`, `[["x",{}]]`, `[[12,{}]]`, `[["12"]]`, `[["12","not an object"]]`, `[["12",{"secret_id":"x","version":1,"bytes":[]}]]`} {
+		if status := dispatchShareSaveMany(s, 5, []byte(bad)); status != ffiStatusFailure {
+			t.Fatalf("%s: status = %d, want ffiStatusFailure", bad, status)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("malformed input reached the store %d times", calls)
+	}
+}
+
+// TestShareSaveRefusalReturnsStatusCode proves dispatchShareSave,
+// dispatchShareSaveMany and dispatchShareRecordVerification map a
+// *ShareStoreRefusedError to the FFI return code documented on
+// ShareStoreCallbacks.Save/SaveMany/RecordVerification in
 // stores.rs (3/4/10, the StatusEnum numbers), and fall back to the existing
 // backend-failure code for a plain error that is not a refusal.
 func TestShareSaveRefusalReturnsStatusCode(t *testing.T) {
@@ -886,6 +1011,25 @@ func TestShareSaveRefusalReturnsStatusCode(t *testing.T) {
 				},
 			}}
 			if status := dispatchShareSave(s, 5, 6, payload); status != c.want {
+				t.Fatalf("status = %d, want %d", status, c.want)
+			}
+		})
+
+		t.Run("SaveMany/"+c.name, func(t *testing.T) {
+			share, err := EncodeShare(Share{SecretID: 5, Version: 4, Bytes: []byte{1, 2}})
+			if err != nil {
+				t.Fatalf("EncodeShare: %v", err)
+			}
+			payload, err := json.Marshal([][2]any{{"6", json.RawMessage(share)}})
+			if err != nil {
+				t.Fatalf("json.Marshal: %v", err)
+			}
+			s := &storeSet{share: &mockShareStore{
+				saveManyFn: func(secretID uint64, entries []ShareEntry) error {
+					return c.err
+				},
+			}}
+			if status := dispatchShareSaveMany(s, 5, payload); status != c.want {
 				t.Fatalf("status = %d, want %d", status, c.want)
 			}
 		})

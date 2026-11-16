@@ -130,30 +130,19 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     round: &Round<'_>,
 ) -> Result<Vec<DeRecEvent>> {
     let secret_id = local.secret_id;
-    let memo_str = memo.unwrap_or_default();
     let mut events = vec![DeRecEvent::UnpairStarted {
         channel_id: unpaired,
         trace_id: round.trace_id,
     }];
 
-    let key = stores.secrets.current_key(secret_id, channel_id).await?;
-
-    // Helper unpair: no member is named, which is what marks this the
-    // owner ↔ helper path rather than a replica-group removal.
-    let request =
-        produce_unpair_request(channel_id, &memo_str, &key, round.reply_to, None, unpaired)?;
-    let envelope = apply_trace_id(&request.envelope, round.trace_id)?;
-    let endpoint = stores
-        .channels
-        .peer_endpoints(secret_id, channel_id)
-        .await?;
-    stores.transport.send(&endpoint, envelope).await?;
+    send_request(stores, local, channel_id, unpaired, memo, round).await?;
 
     match unpair_ack {
         UnpairAck::NotRequired => {
             drop_channels_state(stores, local, &[unpaired]).await?;
             events.push(DeRecEvent::Unpaired {
                 channel_id: unpaired,
+                acknowledged: false,
             });
         }
         UnpairAck::Required => {
@@ -164,6 +153,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
                     StateItem::PendingUnpair {
                         channel_id: unpaired,
                         started_at: now,
+                        drop_on_rejection: false,
                     },
                 )
                 .await?;
@@ -189,6 +179,37 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     );
 
     Ok(events)
+}
+
+/// Send the unpair request on `channel_id` naming `unpaired`, and nothing
+/// else: no pending entry, no status change, no event.
+pub(in crate::protocol) async fn send_request<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    channel_id: ChannelId,
+    unpaired: ChannelId,
+    memo: Option<String>,
+    round: &Round<'_>,
+) -> Result<()> {
+    let secret_id = local.secret_id;
+    let key = stores.secrets.current_key(secret_id, channel_id).await?;
+
+    // Helper unpair: no member is named, which is what marks this the
+    // owner ↔ helper path rather than a replica-group removal.
+    let request = produce_unpair_request(
+        channel_id,
+        &memo.unwrap_or_default(),
+        &key,
+        round.reply_to,
+        None,
+        unpaired,
+    )?;
+    let envelope = apply_trace_id(&request.envelope, round.trace_id)?;
+    let endpoint = stores
+        .channels
+        .peer_endpoints(secret_id, channel_id)
+        .await?;
+    stores.transport.send(&endpoint, envelope).await
 }
 
 #[cfg_attr(
@@ -244,6 +265,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         exchange.obligation,
         vec![DeRecEvent::Unpaired {
             channel_id: unpaired,
+            acknowledged: true,
         }],
         sent.and(dropped),
     )
@@ -475,21 +497,36 @@ async fn on_response<S: StoreSet>(
     let pending = StateKey::PendingUnpair {
         channel_id: unpaired,
     };
-    if stores
-        .state
-        .load(local.secret_id, pending.clone())
-        .await?
-        .is_none()
-    {
+    let Some(StateItem::PendingUnpair {
+        drop_on_rejection, ..
+    }) = stores.state.load(local.secret_id, pending.clone()).await?
+    else {
         return Ok(vec![DeRecEvent::NoOp]);
-    }
+    };
 
     let events = match process_unpair_response(response) {
         Ok(_) => {
             drop_channels_state(stores, local, &[unpaired]).await?;
             vec![DeRecEvent::Unpaired {
                 channel_id: unpaired,
+                acknowledged: true,
             }]
+        }
+        Err(Error::Unpairing(UnpairingError::NonOkStatus { status, memo }))
+            if drop_on_rejection =>
+        {
+            drop_channels_state(stores, local, &[unpaired]).await?;
+            vec![
+                DeRecEvent::UnpairRejected {
+                    channel_id: unpaired,
+                    status,
+                    memo,
+                },
+                DeRecEvent::Unpaired {
+                    channel_id: unpaired,
+                    acknowledged: false,
+                },
+            ]
         }
         Err(Error::Unpairing(UnpairingError::NonOkStatus { status, memo })) => {
             set_status(

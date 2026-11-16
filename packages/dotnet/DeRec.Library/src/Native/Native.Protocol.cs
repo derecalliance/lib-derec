@@ -152,6 +152,10 @@ internal static class Protocol
         IntPtr shareJsonPtr, UIntPtr shareJsonLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int ShareStoreSaveManyDelegate(
+        IntPtr userData, ulong secretId, IntPtr entries, UIntPtr entriesLen);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ShareStoreRemoveChannelDelegate(
         IntPtr userData, ulong secretId, ulong channelId);
 
@@ -182,6 +186,7 @@ internal static class Protocol
         public IntPtr LoadAll;
         public IntPtr LatestVersion;
         public IntPtr Save;
+        public IntPtr SaveMany;
         public IntPtr RemoveChannel;
         public IntPtr RemoveVersions;
         public IntPtr RemoveVersionsMany;
@@ -220,6 +225,11 @@ internal static class Protocol
         IntPtr itemJsonPtr, UIntPtr itemJsonLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int StateStoreSaveManyDelegate(
+        IntPtr userData, ulong secretId,
+        IntPtr itemsJsonPtr, UIntPtr itemsJsonLen);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int StateStoreLoadDelegate(
         IntPtr userData, ulong secretId,
         IntPtr keyJsonPtr, UIntPtr keyJsonLen,
@@ -246,6 +256,7 @@ internal static class Protocol
     {
         public IntPtr UserData;
         public IntPtr Save;
+        public IntPtr SaveMany;
         public IntPtr Load;
         public IntPtr Remove;
         public IntPtr RemoveMany;

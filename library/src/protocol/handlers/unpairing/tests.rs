@@ -211,7 +211,7 @@ fn unpaired(events: &[DeRecEvent]) -> Vec<ChannelId> {
     events
         .iter()
         .filter_map(|e| match e {
-            DeRecEvent::Unpaired { channel_id } => Some(*channel_id),
+            DeRecEvent::Unpaired { channel_id, .. } => Some(*channel_id),
             _ => None,
         })
         .collect()
@@ -731,6 +731,7 @@ fn a_linked_unpair_times_out_on_its_target() {
             StateItem::PendingUnpair {
                 channel_id: OLD,
                 started_at: 0,
+                drop_on_rejection: false,
             },
         );
 

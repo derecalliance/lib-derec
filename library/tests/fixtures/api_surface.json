@@ -589,6 +589,20 @@
           ]
         },
         {
+          "rust": "save_many",
+          "dotnet": "SaveMany",
+          "go": "SaveMany",
+          "ts": "saveMany",
+          "rust_params": [
+            "secret_id",
+            "entries"
+          ],
+          "params": [
+            "secret_id",
+            "entries"
+          ]
+        },
+        {
           "rust": "remove_channel",
           "dotnet": "RemoveChannel",
           "go": "RemoveChannel",
@@ -728,6 +742,20 @@
           "params": [
             "secret_id",
             "item"
+          ]
+        },
+        {
+          "rust": "save_many",
+          "dotnet": "SaveMany",
+          "go": "SaveMany",
+          "ts": "saveMany",
+          "rust_params": [
+            "secret_id",
+            "items"
+          ],
+          "params": [
+            "secret_id",
+            "items"
           ]
         },
         {

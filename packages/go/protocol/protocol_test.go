@@ -350,6 +350,15 @@ func (s *inMemoryShareStore) Save(secretID uint64, channelID uint64, share Share
 	return nil
 }
 
+func (s *inMemoryShareStore) SaveMany(secretID uint64, entries []ShareEntry) error {
+	for _, e := range entries {
+		if err := s.Save(secretID, e.ChannelID, e.Share); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *inMemoryShareStore) RemoveChannel(secretID, channelID uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -475,6 +484,15 @@ func (s *inMemoryStateStore) Save(secretID uint64, item StateItem) error {
 		s.data[secretID] = make(map[string]StateItem)
 	}
 	s.data[secretID][stateKeyID(item.Key())] = item
+	return nil
+}
+
+func (s *inMemoryStateStore) SaveMany(secretID uint64, items []StateItem) error {
+	for _, item := range items {
+		if err := s.Save(secretID, item); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

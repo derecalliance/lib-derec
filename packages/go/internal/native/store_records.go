@@ -458,6 +458,8 @@ type stateItemWire struct {
 	// Threshold is SharingRound only. Absent on rows written before 0.0.9,
 	// which the library judges against the builder's threshold.
 	Threshold *uint32 `json:"threshold,omitempty"`
+	// DropOnRejection is PendingUnpair only. Absent when false.
+	DropOnRejection *bool `json:"drop_on_rejection,omitempty"`
 }
 
 type replicaDiscoveryWire struct {
@@ -523,6 +525,8 @@ func EncodeStateItem(item StateItem) ([]byte, error) {
 			pending := stringifyUint64s(item.Pending)
 			w.Pending = &pending
 		}
+	case StateKindPendingUnpair:
+		w.DropOnRejection = item.DropOnRejection
 	case StateKindSharingRound:
 		pending := stringifyUint64s(item.Pending)
 		confirmed := stringifyUint64s(item.Confirmed)
@@ -602,6 +606,7 @@ func DecodeStateItem(data []byte) (StateItem, error) {
 	}
 	item.KeepVersion = w.KeepVersion
 	item.Threshold = w.Threshold
+	item.DropOnRejection = w.DropOnRejection
 	if w.Reported != nil {
 		item.Reported = make(map[uint64]uint32, len(*w.Reported))
 		for _, r := range *w.Reported {

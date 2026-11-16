@@ -137,6 +137,52 @@
         }
       ]
     },
+    "RecoverFailureReason": {
+      "encoding": "name",
+      "note": "RecoverSecretFailed.reason",
+      "variants": [
+        {
+          "name": "NoSharedKey",
+          "wire": "NoSharedKey"
+        },
+        {
+          "name": "DispatchFailed",
+          "wire": "DispatchFailed"
+        },
+        {
+          "name": "TimedOut",
+          "wire": "TimedOut"
+        }
+      ]
+    },
+    "ShareRejectReason": {
+      "encoding": "name",
+      "note": "ShareRejected.reason",
+      "variants": [
+        {
+          "name": "Refused",
+          "wire": "Refused"
+        },
+        {
+          "name": "TimedOut",
+          "wire": "TimedOut"
+        }
+      ]
+    },
+    "ReplicaSyncFailureReason": {
+      "encoding": "name",
+      "note": "ReplicaSyncFailed.reason",
+      "variants": [
+        {
+          "name": "DispatchFailed",
+          "wire": "DispatchFailed"
+        },
+        {
+          "name": "TimedOut",
+          "wire": "TimedOut"
+        }
+      ]
+    },
     "CorruptionReason": {
       "encoding": "name",
       "note": "RecoveryShareCorrupted.reason",

@@ -2,7 +2,9 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use crate::protocol::DeRecProtocol;
-use crate::protocol::events::DeRecEvent;
+use crate::protocol::events::{
+    DeRecEvent, RecoverFailureReason, ReplicaSyncFailureReason, ShareRejectReason,
+};
 use crate::protocol::traits::{DeRecChannelStore, DeRecStateStore};
 use crate::protocol::types::{StateItem, StateKey};
 use crate::types::ChannelId;
@@ -262,8 +264,8 @@ mod sharing_round_outcome {
             assert!(
                 events.iter().any(|e| matches!(
                     e,
-                    DeRecEvent::ShareRejected { channel_id, memo, .. }
-                        if *channel_id == ChannelId(9001) && memo == "timeout"
+                    DeRecEvent::ShareRejected { channel_id, reason, .. }
+                        if *channel_id == ChannelId(9001) && *reason == ShareRejectReason::TimedOut
                 )),
                 "the silent helper is failed; got {events:?}"
             );
@@ -271,7 +273,7 @@ mod sharing_round_outcome {
                 events.iter().any(|e| matches!(
                     e,
                     DeRecEvent::ReplicaSyncFailed { replica_id, reason, .. }
-                        if *replica_id == 1002 && reason == "timeout"
+                        if *replica_id == 1002 && *reason == ReplicaSyncFailureReason::TimedOut
                 )),
                 "the silent member is reported behind; got {events:?}"
             );
@@ -330,8 +332,8 @@ mod sharing_round_outcome {
             assert!(
                 error.events.iter().any(|e| matches!(
                     e,
-                    DeRecEvent::ShareRejected { channel_id, memo, .. }
-                        if *channel_id == ChannelId(9001) && memo == "timeout"
+                    DeRecEvent::ShareRejected { channel_id, reason, .. }
+                        if *channel_id == ChannelId(9001) && *reason == ShareRejectReason::TimedOut
                 )),
                 "the timeout travels with the error; got {:?}",
                 error.events
@@ -451,6 +453,7 @@ mod sharing_round_outcome {
                     StateItem::PendingUnpair {
                         channel_id: ChannelId(4242),
                         started_at: now_secs().saturating_sub(600),
+                        drop_on_rejection: false,
                     },
                 )
                 .await
@@ -461,7 +464,8 @@ mod sharing_round_outcome {
             assert!(
                 events.iter().any(|e| matches!(
                     e,
-                    DeRecEvent::Unpaired { channel_id } if *channel_id == ChannelId(4242)
+                    DeRecEvent::Unpaired { channel_id, acknowledged: false }
+                        if *channel_id == ChannelId(4242)
                 )),
                 "the unacknowledged unpair completes on the timeout; got {events:?}"
             );
@@ -492,6 +496,7 @@ mod sharing_round_outcome {
                 StateItem::PendingUnpair {
                     channel_id: channel,
                     started_at: now_secs().saturating_sub(600),
+                    drop_on_rejection: false,
                 },
             )
             .await
@@ -515,7 +520,9 @@ mod sharing_round_outcome {
     fn unpaired(events: &[DeRecEvent], channel: ChannelId) -> usize {
         events
             .iter()
-            .filter(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == channel))
+            .filter(
+                |e| matches!(e, DeRecEvent::Unpaired { channel_id, .. } if *channel_id == channel),
+            )
             .count()
     }
 
@@ -620,6 +627,7 @@ mod sharing_round_outcome {
                     StateItem::PendingUnpair {
                         channel_id: ChannelId(4242),
                         started_at: now_secs(),
+                        drop_on_rejection: false,
                     },
                 )
                 .await
@@ -1072,7 +1080,8 @@ mod sharing_round_outcome {
                 DeRecEvent::ReplicaSyncFailed {
                     replica_id: 1003,
                     version: 4,
-                    reason: "transport unreachable".to_owned(),
+                    reason: ReplicaSyncFailureReason::DispatchFailed,
+                    error: "transport unreachable".to_owned(),
                 },
             ];
             // A dispatch failure never entered `pending_replicas`, so the round
@@ -1147,6 +1156,7 @@ mod sharing_round_outcome {
                 DeRecEvent::ShareRejected {
                     channel_id: ChannelId(9003),
                     version: 4,
+                    reason: ShareRejectReason::Refused,
                     status: derec_proto::StatusEnum::VersionConflict as i32,
                     memo: "conflict".to_owned(),
                 },
@@ -1300,12 +1310,13 @@ mod sharing_round_outcome {
                     DeRecEvent::RecoverSecretFailed {
                         channel_id,
                         version: 1,
-                        error,
+                        reason,
+                        ..
                     },
                     DeRecEvent::SecretRecovered { secret },
                 ] => {
                     assert_eq!(*channel_id, ChannelId(9003));
-                    assert_eq!(error, "timeout");
+                    assert_eq!(*reason, RecoverFailureReason::TimedOut);
                     assert_eq!(secret.secrets[0].name, "real");
                 }
                 other => panic!("expected a timeout then SecretRecovered, got {other:?}"),

@@ -337,6 +337,18 @@ export interface ShareStore {
    * failure.
    */
   save(secretId: string, channelId: string, share: Share): Promise<void>;
+  /**
+   * Save every share `entries` carries, in one call. Each entry is a
+   * `[channelId, share]` pair addressed the way `save`'s arguments are, and
+   * refused the same way: reject, or throw, a {@link shareStoreRefusal}
+   * `Error` to refuse the update. An empty list writes nothing. The library
+   * calls it when it writes several shares at once, so a backend that can
+   * write them in one statement or transaction should.
+   */
+  saveMany(
+    secretId: string,
+    entries: [channelId: string, share: Share][],
+  ): Promise<void>;
   latestVersion(secretId: string): Promise<number | null>;
   removeChannel(secretId: string, channelId: string): Promise<void>;
   /**
@@ -453,6 +465,14 @@ export interface UserSecretStore {
  */
 export interface StateStore {
   save(secretId: string, itemJson: Uint8Array): Promise<void>;
+  /**
+   * Save every item `itemsJson` carries, in one call. `itemsJson` is a JSON
+   * array of the item objects `save` receives one at a time as `itemJson`;
+   * each replaces any row with the same key. An empty list writes nothing.
+   * The library calls it when it writes several rows at once, so a backend
+   * that can write them in one statement or transaction should.
+   */
+  saveMany(secretId: string, itemsJson: Uint8Array): Promise<void>;
   load(
     secretId: string,
     keyJson: Uint8Array,
@@ -749,7 +769,7 @@ export interface ProtectSecretParams {
    * (`PairingCompleted` included); `accept()` throws after the pairing has
    * completed and its response was sent, without returning
    * `PairingCompleted`; `verifyFingerprint()` throws after the promotion,
-   * which stands, and a retry resolves `true` and publishes nothing. Call
+   * which stands, and a retry resolves and publishes nothing. Call
    * `start` with `ProtectSecret` and valid weights to publish.
    *
    * When the paired helpers' resolved total is below the round's threshold
@@ -839,7 +859,7 @@ export interface Timeouts {
   /** How long a recovery waits for a helper to answer its share request. A
    *  recovery decides only once every helper it asked has answered or this
    *  has elapsed since the requests went out; each silent helper is then
-   *  reported as `RecoverSecretFailed` with error `"timeout"`. The budget is
+   *  reported as `RecoverSecretFailed` with reason `"TimedOut"`. The budget is
    *  a **human** one when helpers approve share requests by hand. The same
    *  budget bounds a replica version check (`FlowKind.ReplicaDiscovery`):
    *  once it elapses, the check concludes on the versions already reported.
@@ -964,12 +984,19 @@ export type DeRecEvent =
    *  from the application's own share store does not raise it. */
   | { type: "ShareRefused"; channel_id: string; version: number; status: StatusEnum; memo: string }
   | { type: "ShareConfirmed"; channel_id: string; version: number }
-  /** A helper rejected or failed to store our share. `status` and `memo`
-   *  come from the helper's response, except for a helper that did not
-   *  answer within `timeouts.sharing_round_secs`: `tick()` then reports it
-   *  with status `FAIL` and memo `"timeout"`. The memo of a helper's own
-   *  answer is free text and can read the same. */
-  | { type: "ShareRejected"; channel_id: string; version: number; status: StatusEnum; memo: string }
+  /** A helper rejected or failed to store our share. `reason` is
+   *  `"Refused"` when the helper answered with a non-OK status, in which
+   *  case `status` and `memo` are its answer, or `"TimedOut"` when it did not
+   *  answer within `timeouts.sharing_round_secs`, in which case `tick()`
+   *  reports it and `status` and `memo` carry no answer. */
+  | {
+      type: "ShareRejected";
+      channel_id: string;
+      version: number;
+      reason: ShareRejectReason;
+      status: StatusEnum;
+      memo: string;
+    }
   /** A publishing round finished — every targeted helper confirmed,
    *  rejected, or timed out.
    *
@@ -1003,10 +1030,16 @@ export type DeRecEvent =
   /** A secret sync could not be delivered to a member, or the member did not
    *  acknowledge it within `timeouts.sharing_round_secs` — distinct from
    *  `ReplicaSyncRejected`, which is the member answering "no". `reason` is
-   *  `"timeout"` when the member did not acknowledge in time (reported by
-   *  `tick()`); otherwise the transport or encoding failure, rendered for
-   *  display. */
-  | { type: "ReplicaSyncFailed"; replica_id: string; version: number; reason: string }
+   *  `"TimedOut"` when the member did not acknowledge in time (reported by
+   *  `tick()`), or `"DispatchFailed"` when nothing could be sent to it.
+   *  `error` is the failure, rendered for display. */
+  | {
+      type: "ReplicaSyncFailed";
+      replica_id: string;
+      version: number;
+      reason: ReplicaSyncFailureReason;
+      error: string;
+    }
   /** A member left the group and its roster row was dropped. Fires on the
    *  members that remain. */
   | { type: "ReplicaRemoved"; replica_id: string }
@@ -1066,7 +1099,7 @@ export type DeRecEvent =
    *  reconstructed until every helper asked has answered or
    *  `timeouts.get_share_response_secs` has passed since the requests went
    *  out (each silent helper is then reported as `RecoverSecretFailed` with
-   *  error `"timeout"`). The recovery then decides exactly once:
+   *  reason `"TimedOut"`). The recovery then decides exactly once:
    *  `SecretRecovered`, `RecoveryDisputed`, `RecoveryConflict` or
    *  `RecoveryIncomplete`. */
   | { type: "RecoveryShareReceived"; channel_id: string; shares_received: number }
@@ -1191,7 +1224,14 @@ export type DeRecEvent =
    *  collected. Start `RecoverSecret` again to retry. */
   | { type: "RecoveryIncomplete"; secret_id: string; version: number; shares_received: number }
 
-  | { type: "Unpaired"; channel_id: string }
+  /** The local channel state for `channel_id` was dropped by an unpair flow,
+   *  on both sides. `acknowledged` is `true` when both sides agreed to the
+   *  unpair: the peer answered `Ok` on the initiator, or this device answered
+   *  `Ok` on the responder. It is `false` when no acknowledgement was asked
+   *  for (unpair ack `"not_required"`), when `timeouts.unpair_ack_secs`
+   *  elapsed without an answer, or when the peer refused the teardown of a
+   *  recovery channel by `restore`, right after `UnpairRejected`. */
+  | { type: "Unpaired"; channel_id: string; acknowledged: boolean }
 
   | { type: "UnpairRejected"; channel_id: string; status: StatusEnum; memo: string }
 
@@ -1529,7 +1569,9 @@ export type DeRecEvent =
    *  Confirming does not replay it: after `verifyFingerprint` succeeds, a
    *  replica destination calls `start(FlowKind.ReplicaDiscovery)` to pull
    *  the copy itself. `"Expired"` means the message was older than the
-   *  inbound timeout. `"TimestampMismatch"` means the envelope's timestamp
+   *  inbound timeout, or a pairing request reached the contact's creator
+   *  with its contact or own timestamp older than the pairing lifetime,
+   *  or missing; it is not answered. `"TimestampMismatch"` means the envelope's timestamp
    *  and the encrypted message's differ, or one is absent: a sender stamps
    *  both with the same time, so the envelope was altered or built by a
    *  non-conforming peer. `"StaleResponse"` means a verification answer to
@@ -1604,11 +1646,15 @@ export type DeRecEvent =
     }
   /** A recovery share request was dispatched to `channel_id`. */
   | { type: "RecoverSecretStarted"; channel_id: string; version: number; trace_id: string }
-  /** A recovery share request could not be dispatched to `channel_id`. */
+  /** A recovery share request could not be dispatched to `channel_id`, or
+   *  the helper did not answer it within `timeouts.get_share_response_secs`.
+   *  `reason` says why; `"TimedOut"` is reported by `tick()`, and otherwise
+   *  the request was never sent. */
   | {
       type: "RecoverSecretFailed";
       channel_id: string;
       version: number;
+      reason: RecoverFailureReason;
       error: string;
     }
   /** An unpair request was dispatched to `channel_id`, by
@@ -1617,7 +1663,9 @@ export type DeRecEvent =
    *  `UnpairAck.Required` the channel is now `"Unpairing"`, and an
    *  `Unpaired` event follows once the peer acknowledges or the
    *  acknowledgement window elapses, or `UnpairRejected` if the peer
-   *  refuses (the channel is `"Paired"` again). Under
+   *  refuses (the channel is `"Paired"` again, except a recovery channel
+   *  torn down by `restore`, which goes anyway: `UnpairRejected`, then
+   *  `Unpaired`). Under
    *  `UnpairAck.NotRequired`, `Unpaired` follows in the same event vec. */
   | { type: "UnpairFailed"; channel_id: string; error: string }
   | { type: "UnpairStarted"; channel_id: string; trace_id: string }
@@ -2191,7 +2239,12 @@ export declare class DeRecProtocol {
    * place of its old roster channel: the old channel is not written, and the
    * recovery channel stays `"Paired"` with its own endpoint and key, takes
    * the roster entry's weight, and is not unpaired. Every other channel at no
-   * roster id is unpaired. Only this device holds a recovery channel's key,
+   * roster id whose peer is a helper is unpaired; a channel on which this
+   * device is a helper for another owner is left alone. Under
+   * `UnpairAck.Required` each one is `"Unpairing"` until its helper answers
+   * (`process`) or the acknowledgement window elapses (`tick`); a helper's
+   * refusal is reported as `UnpairRejected` and the channel is unpaired
+   * anyway. Only this device holds a recovery channel's key,
    * so publish once on the kept channels, then retire each old channel with
    * `start(FlowKind.Unpair, { channel_id: recovery, linked_channel_id: old })`.
    * The `channel_id` of each version in `SecretsDiscovered` names the old
@@ -2392,6 +2445,20 @@ export type NotRestoredReason = "NoTransports" | "ReplicaGroupDropped";
  *  Matches the Rust `VerifyFailureReason` discriminants
  *  one-for-one. */
 export type VerifyFailureReason = "NoSharedKey" | "NoProof" | "DispatchFailed";
+
+/** Why a `RecoverSecretFailed` event reports a helper that will not
+ *  contribute a share to the recovery. Matches the Rust
+ *  `RecoverFailureReason` discriminants one-for-one. */
+export type RecoverFailureReason = "NoSharedKey" | "DispatchFailed" | "TimedOut";
+
+/** Why a `ShareRejected` event reports a helper that did not store a share.
+ *  Matches the Rust `ShareRejectReason` discriminants one-for-one. */
+export type ShareRejectReason = "Refused" | "TimedOut";
+
+/** Why a `ReplicaSyncFailed` event reports a member that did not receive a
+ *  sync. Matches the Rust `ReplicaSyncFailureReason` discriminants
+ *  one-for-one. */
+export type ReplicaSyncFailureReason = "DispatchFailed" | "TimedOut";
 
 /** Why a `RecoveryShareCorrupted` event set a helper's share aside.
  *  Matches the Rust `CorruptionReason` discriminants one-for-one:

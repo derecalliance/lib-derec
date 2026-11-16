@@ -190,11 +190,24 @@ from `SharingComplete` with `threshold_met` rather than by counting
 responses to requests is the application's
 job](https://github.com/derecalliance/lib-derec/tree/main/library#matching-responses-to-requests-is-the-applications-job).
 
+`ShareRejected.reason` is a `ShareRejectReason`: 'Refused' when the helper
+answered with a non-OK status, in which case `status` and `memo` are its
+answer, or 'TimedOut' when it did not answer within
+`timeouts.sharing_round_secs`, in which case `tick()` reports it and `status`
+and `memo` carry no answer from it. `ReplicaSyncFailed { replica_id, version,
+reason, error }` reports a member that received no sync: `reason` is a
+`ReplicaSyncFailureReason`, 'DispatchFailed' when nothing could be sent to
+it or 'TimedOut' when it did not acknowledge within
+`timeouts.sharing_round_secs`, and `error` is the failure rendered for
+display.
+
 A recovery reconstructs nothing until every helper it asked has answered (a
 share, a refusal or a corrupted share all count) or
 `timeouts.get_share_response_secs` has passed since the requests went out;
 each silent helper is then reported as `RecoverSecretFailed` with
-`error: "timeout"` from `tick()`. It then decides exactly once:
+`reason: 'TimedOut'` from `tick()` (`reason` 'NoSharedKey' or
+'DispatchFailed' means the request was never sent; `error` carries the
+cause). It then decides exactly once:
 
 - `SecretRecovered` — one secret reconstructs and every collected share is
   part of it;
@@ -320,6 +333,14 @@ await protocol.start(FlowKind.Unpair, {
 A lost device that is still running gets no answer from a helper afterwards:
 the helper holds no key for the old channel, so it cannot reply, and the
 device's rounds time out.
+
+`Unpaired { channel_id, acknowledged }` is reported on both sides once a
+channel's state is dropped. `acknowledged` is `true` when both sides agreed
+to the unpair: the peer answered `Ok` on the initiator, or this device
+answered `Ok` on the responder. It is `false` when no acknowledgement was
+asked for (unpair ack `"not_required"`), when `timeouts.unpair_ack_secs`
+elapsed without an answer, or when the peer refused the teardown of a
+recovery channel by `restore`, right after `UnpairRejected`.
 
 ### Key rotation
 
@@ -467,7 +488,9 @@ declared in `src/types.ts`:
   backend can.
 - **`ShareStore`** — versioned VSS shares this device holds as a helper.
   `loadMany` resolves to `[channelId, share]` pairs, each share paired with
-  the channel it is stored under. On an owner, `keepVersion` chooses the one older version helpers keep
+  the channel it is stored under. `saveMany` saves every `[channelId, share]`
+  pair in one call, each addressed the way `save`'s arguments are and refused
+  the same way; an empty list writes nothing. On an owner, `keepVersion` chooses the one older version helpers keep
   besides the one being shared (`0` keeps none); an answer equal to or
   greater than that version fails the round with `invalid_keep_version`; see
   [`DeRecShareStore::keep_version`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html#tymethod.keep_version).
@@ -482,7 +505,9 @@ declared in `src/types.ts`:
   `secretId`, used to auto-publish to newly paired peers.
 - **`StateStore`** — in-flight orchestrator bookkeeping (pending
   verifications, recoveries, unpairs, sharing rounds, replica discoveries) so a
-  multi-round flow survives an app restart. `removeMany` receives a JSON
+  multi-round flow survives an app restart. `saveMany` receives a JSON array
+  of the items `save` takes one at a time, each replacing any row with the
+  same key; an empty list writes nothing. `removeMany` receives a JSON
   array of the keys `remove` takes one at a time and skips keys with no row.
 - **`Transport`** — outbound delivery.
   `send(endpoints: ReadonlyArray<{ protocol: string; uri: string }>, message: Uint8Array): Promise<void>`
@@ -535,7 +560,7 @@ unbounded) is answered with `SIZE_LIMIT_EXCEEDED` before any
 verifications are the application's to enforce, from its share store.
 
 On a helper channel, throw (or reject with) `shareStoreRefusal(reason)` from
-`ShareStore.save` (a genuinely new share version) or
+`ShareStore.save` or `saveMany` (a genuinely new share version) or
 `ShareStore.recordVerification` (an accepted verification challenge) to
 refuse it:
 
@@ -667,7 +692,7 @@ case nothing is sent:
 - `accept()` throws. The pairing has completed and its response was sent,
   but `PairingCompleted` is not returned.
 - `verifyFingerprint()` throws. The promotion stands: calling it again
-  resolves `true` and publishes nothing.
+  resolves and publishes nothing.
 
 Call `start` with `ProtectSecret` and valid weights to publish to every
 helper.

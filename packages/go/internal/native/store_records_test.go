@@ -710,6 +710,49 @@ func TestDecodeStateItem_SharingRoundWithoutKeepVersion(t *testing.T) {
 	}
 }
 
+// A pending unpair marked to drop its channel whatever the Helper answers
+// round-trips the mark; an unmarked row (or one written before the field
+// existed) carries none and writes none back.
+func TestStateItemRoundTrip_PendingUnpairDropOnRejection(t *testing.T) {
+	cid := uint64(9)
+	sa := uint64(100)
+	drop := true
+	wire, err := EncodeStateItem(StateItem{
+		Kind:            StateKindPendingUnpair,
+		ChannelID:       &cid,
+		StartedAt:       &sa,
+		DropOnRejection: &drop,
+	})
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	if !strings.Contains(string(wire), `"drop_on_rejection":true`) {
+		t.Fatalf("drop_on_rejection must be written, got %s", wire)
+	}
+	got, err := DecodeStateItem(wire)
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if got.DropOnRejection == nil || !*got.DropOnRejection {
+		t.Fatalf("DropOnRejection = %v", got.DropOnRejection)
+	}
+
+	older, err := DecodeStateItem([]byte(`{"kind":2,"channel_id":"9","started_at":"100"}`))
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if older.DropOnRejection != nil {
+		t.Fatalf("absent drop_on_rejection must stay absent, got %v", *older.DropOnRejection)
+	}
+	wire, err = EncodeStateItem(older)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	if strings.Contains(string(wire), "drop_on_rejection") {
+		t.Fatalf("absent drop_on_rejection must not be written, got %s", wire)
+	}
+}
+
 func TestDecodeStateItem_KnownGoodRustSample_SharingRound(t *testing.T) {
 	sample := `{"kind":3,"version":5,"started_at":"1700000000","pending":["1","2"],"confirmed":[],"failed":["3"]}`
 	item, err := DecodeStateItem([]byte(sample))

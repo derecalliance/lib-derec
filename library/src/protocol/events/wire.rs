@@ -28,7 +28,10 @@ use crate::protocol::{
     Action, ChannelRequest, DeRecEvent, PendingAction,
     types::{ChannelShare, Secret},
 };
-use crate::protocol::{CorruptionReason, IgnoreReason, NotRestoredReason, VerifyFailureReason};
+use crate::protocol::{
+    CorruptionReason, IgnoreReason, NotRestoredReason, RecoverFailureReason,
+    ReplicaSyncFailureReason, ShareRejectReason, VerifyFailureReason,
+};
 use crate::utils::is_zero;
 use derec_proto::TransportProtocol;
 use serde::Serialize;
@@ -114,7 +117,10 @@ pub(crate) enum Event {
     ReplicaSyncFailed {
         replica_id: String,
         version: u32,
+        /// [`replica_sync_failure_reason_label`] — `"DispatchFailed"` or
+        /// `"TimedOut"`.
         reason: String,
+        error: String,
     },
     /// A member left the group; its roster row was dropped. Fires on the
     /// members that remain.
@@ -163,6 +169,8 @@ pub(crate) enum Event {
     ShareRejected {
         channel_id: String,
         version: u32,
+        /// [`share_reject_reason_label`] — `"Refused"` or `"TimedOut"`.
+        reason: String,
         status: i32,
         memo: String,
     },
@@ -241,6 +249,7 @@ pub(crate) enum Event {
     },
     Unpaired {
         channel_id: String,
+        acknowledged: bool,
     },
     UnpairRejected {
         channel_id: String,
@@ -411,6 +420,9 @@ pub(crate) enum Event {
     RecoverSecretFailed {
         channel_id: String,
         version: u32,
+        /// [`recover_failure_reason_label`] — `"NoSharedKey"`,
+        /// `"DispatchFailed"` or `"TimedOut"`.
+        reason: String,
         error: String,
     },
     UnpairFailed {
@@ -730,10 +742,12 @@ impl Event {
                 replica_id,
                 version,
                 reason,
+                error,
             } => Self::ReplicaSyncFailed {
                 replica_id: encode_replica_id(replica_id),
                 version,
-                reason,
+                reason: replica_sync_failure_reason_label(reason).to_owned(),
+                error,
             },
             DeRecEvent::ReplicaRemoved { replica_id } => Self::ReplicaRemoved {
                 replica_id: encode_replica_id(replica_id),
@@ -803,11 +817,13 @@ impl Event {
             DeRecEvent::ShareRejected {
                 channel_id,
                 version,
+                reason,
                 status,
                 memo,
             } => Self::ShareRejected {
                 channel_id: channel_id.0.to_string(),
                 version,
+                reason: share_reject_reason_label(reason).to_owned(),
                 status,
                 memo,
             },
@@ -937,8 +953,12 @@ impl Event {
                 version,
                 shares_received: shares_received as u32,
             },
-            DeRecEvent::Unpaired { channel_id } => Self::Unpaired {
+            DeRecEvent::Unpaired {
+                channel_id,
+                acknowledged,
+            } => Self::Unpaired {
                 channel_id: channel_id.0.to_string(),
+                acknowledged,
             },
             DeRecEvent::UnpairRejected {
                 channel_id,
@@ -1159,10 +1179,12 @@ impl Event {
             DeRecEvent::RecoverSecretFailed {
                 channel_id,
                 version,
+                reason,
                 error,
             } => Self::RecoverSecretFailed {
                 channel_id: channel_id.0.to_string(),
                 version,
+                reason: recover_failure_reason_label(reason).to_owned(),
                 error,
             },
             DeRecEvent::UnpairStarted {
@@ -1217,6 +1239,35 @@ pub(crate) fn verify_failure_reason_label(reason: VerifyFailureReason) -> &'stat
         VerifyFailureReason::NoSharedKey => "NoSharedKey",
         VerifyFailureReason::NoProof => "NoProof",
         VerifyFailureReason::DispatchFailed => "DispatchFailed",
+    }
+}
+
+/// Wire label for a [`RecoverFailureReason`](crate::protocol::RecoverFailureReason):
+/// the variant name, matching `library/tests/fixtures/enums.json`.
+pub(crate) fn recover_failure_reason_label(reason: RecoverFailureReason) -> &'static str {
+    match reason {
+        RecoverFailureReason::NoSharedKey => "NoSharedKey",
+        RecoverFailureReason::DispatchFailed => "DispatchFailed",
+        RecoverFailureReason::TimedOut => "TimedOut",
+    }
+}
+
+/// Wire label for a [`ShareRejectReason`](crate::protocol::ShareRejectReason):
+/// the variant name, matching `library/tests/fixtures/enums.json`.
+pub(crate) fn share_reject_reason_label(reason: ShareRejectReason) -> &'static str {
+    match reason {
+        ShareRejectReason::Refused => "Refused",
+        ShareRejectReason::TimedOut => "TimedOut",
+    }
+}
+
+/// Wire label for a
+/// [`ReplicaSyncFailureReason`](crate::protocol::ReplicaSyncFailureReason): the
+/// variant name, matching `library/tests/fixtures/enums.json`.
+pub(crate) fn replica_sync_failure_reason_label(reason: ReplicaSyncFailureReason) -> &'static str {
+    match reason {
+        ReplicaSyncFailureReason::DispatchFailed => "DispatchFailed",
+        ReplicaSyncFailureReason::TimedOut => "TimedOut",
     }
 }
 
@@ -1607,6 +1658,87 @@ mod tests {
             assert_eq!(json["version"], 5);
             assert_eq!(json["reason"], label);
             assert_eq!(json["error"], "cause");
+        }
+    }
+
+    #[test]
+    fn recover_secret_failed_maps_reason_and_error() {
+        for (reason, label) in [
+            (RecoverFailureReason::NoSharedKey, "NoSharedKey"),
+            (RecoverFailureReason::DispatchFailed, "DispatchFailed"),
+            (RecoverFailureReason::TimedOut, "TimedOut"),
+        ] {
+            let mapped = Event::from_event(DeRecEvent::RecoverSecretFailed {
+                channel_id: ChannelId(u64::MAX),
+                version: 5,
+                reason,
+                error: "cause".to_owned(),
+            })
+            .expect("RecoverSecretFailed must map");
+
+            let json = serde_json::to_value(&mapped).expect("serializes");
+            assert_eq!(json["type"], "RecoverSecretFailed");
+            assert_eq!(json["reason"], label);
+            assert_eq!(json["error"], "cause");
+        }
+    }
+
+    #[test]
+    fn share_rejected_maps_reason_status_and_memo() {
+        for (reason, label) in [
+            (ShareRejectReason::Refused, "Refused"),
+            (ShareRejectReason::TimedOut, "TimedOut"),
+        ] {
+            let mapped = Event::from_event(DeRecEvent::ShareRejected {
+                channel_id: ChannelId(7),
+                version: 5,
+                reason,
+                status: StatusEnum::Fail as i32,
+                memo: "memo".to_owned(),
+            })
+            .expect("ShareRejected must map");
+
+            let json = serde_json::to_value(&mapped).expect("serializes");
+            assert_eq!(json["type"], "ShareRejected");
+            assert_eq!(json["reason"], label);
+            assert_eq!(json["status"], StatusEnum::Fail as i32);
+            assert_eq!(json["memo"], "memo");
+        }
+    }
+
+    #[test]
+    fn replica_sync_failed_maps_reason_and_error() {
+        for (reason, label) in [
+            (ReplicaSyncFailureReason::DispatchFailed, "DispatchFailed"),
+            (ReplicaSyncFailureReason::TimedOut, "TimedOut"),
+        ] {
+            let mapped = Event::from_event(DeRecEvent::ReplicaSyncFailed {
+                replica_id: 9,
+                version: 5,
+                reason,
+                error: "cause".to_owned(),
+            })
+            .expect("ReplicaSyncFailed must map");
+
+            let json = serde_json::to_value(&mapped).expect("serializes");
+            assert_eq!(json["type"], "ReplicaSyncFailed");
+            assert_eq!(json["reason"], label);
+            assert_eq!(json["error"], "cause");
+        }
+    }
+
+    #[test]
+    fn unpaired_maps_acknowledged() {
+        for acknowledged in [true, false] {
+            let mapped = Event::from_event(DeRecEvent::Unpaired {
+                channel_id: ChannelId(7),
+                acknowledged,
+            })
+            .expect("Unpaired must map");
+
+            let json = serde_json::to_value(&mapped).expect("serializes");
+            assert_eq!(json["type"], "Unpaired");
+            assert_eq!(json["acknowledged"], acknowledged);
         }
     }
 

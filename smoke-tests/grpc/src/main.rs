@@ -422,6 +422,19 @@ impl DeRecShareStore for InMemoryShareStore {
         Box::pin(std::future::ready(Ok(())))
     }
 
+    fn save_many(
+        &mut self,
+        secret_id: u64,
+        entries: Vec<(ChannelId, Share)>,
+    ) -> ShareStoreFuture<'_, ()> {
+        let _ = secret_id;
+        for (channel_id, share) in entries {
+            let key = (channel_id.0, share.secret_id, share.version);
+            self.data.insert(key, share);
+        }
+        Box::pin(std::future::ready(Ok(())))
+    }
+
     fn remove_channel(
         &mut self,
         secret_id: u64,
@@ -494,6 +507,13 @@ struct InMemoryStateStore {
 impl DeRecStateStore for InMemoryStateStore {
     fn save(&mut self, secret_id: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
         self.data.insert((secret_id, item.key()), item);
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn save_many(&mut self, secret_id: u64, items: Vec<StateItem>) -> StateStoreFuture<'_, ()> {
+        for item in items {
+            self.data.insert((secret_id, item.key()), item);
+        }
         Box::pin(std::future::ready(Ok(())))
     }
 

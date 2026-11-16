@@ -170,6 +170,115 @@ func TestVerifyFailureReasonConstantsMatchTheFixture(t *testing.T) {
 	}
 }
 
+func TestRecoverFailureReasonConstantsMatchTheFixture(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "library", "tests", "fixtures", "enums.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var doc struct {
+		Enums map[string]json.RawMessage `json:"enums"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+	var reasons struct {
+		Variants []struct {
+			Wire string `json:"wire"`
+		} `json:"variants"`
+	}
+	if err := json.Unmarshal(doc.Enums["RecoverFailureReason"], &reasons); err != nil {
+		t.Fatalf("parsing RecoverFailureReason: %v", err)
+	}
+
+	constants := map[string]bool{
+		RecoverFailureReasonNoSharedKey:    true,
+		RecoverFailureReasonDispatchFailed: true,
+		RecoverFailureReasonTimedOut:       true,
+	}
+	variants := reasons.Variants
+	for _, v := range variants {
+		if !constants[v.Wire] {
+			t.Errorf("fixture reason %q has no RecoverFailureReason constant", v.Wire)
+		}
+	}
+	if len(variants) != len(constants) {
+		t.Errorf("fixture lists %d reasons, Go declares %d", len(variants), len(constants))
+	}
+}
+
+func TestShareRejectReasonConstantsMatchTheFixture(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "library", "tests", "fixtures", "enums.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var doc struct {
+		Enums map[string]json.RawMessage `json:"enums"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+	var reasons struct {
+		Variants []struct {
+			Wire string `json:"wire"`
+		} `json:"variants"`
+	}
+	if err := json.Unmarshal(doc.Enums["ShareRejectReason"], &reasons); err != nil {
+		t.Fatalf("parsing ShareRejectReason: %v", err)
+	}
+
+	constants := map[string]bool{
+		ShareRejectReasonRefused:  true,
+		ShareRejectReasonTimedOut: true,
+	}
+	variants := reasons.Variants
+	for _, v := range variants {
+		if !constants[v.Wire] {
+			t.Errorf("fixture reason %q has no ShareRejectReason constant", v.Wire)
+		}
+	}
+	if len(variants) != len(constants) {
+		t.Errorf("fixture lists %d reasons, Go declares %d", len(variants), len(constants))
+	}
+}
+
+func TestReplicaSyncFailureReasonConstantsMatchTheFixture(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "library", "tests", "fixtures", "enums.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var doc struct {
+		Enums map[string]json.RawMessage `json:"enums"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+	var reasons struct {
+		Variants []struct {
+			Wire string `json:"wire"`
+		} `json:"variants"`
+	}
+	if err := json.Unmarshal(doc.Enums["ReplicaSyncFailureReason"], &reasons); err != nil {
+		t.Fatalf("parsing ReplicaSyncFailureReason: %v", err)
+	}
+
+	constants := map[string]bool{
+		ReplicaSyncFailureReasonDispatchFailed: true,
+		ReplicaSyncFailureReasonTimedOut:       true,
+	}
+	variants := reasons.Variants
+	for _, v := range variants {
+		if !constants[v.Wire] {
+			t.Errorf("fixture reason %q has no ReplicaSyncFailureReason constant", v.Wire)
+		}
+	}
+	if len(variants) != len(constants) {
+		t.Errorf("fixture lists %d reasons, Go declares %d", len(variants), len(constants))
+	}
+}
+
 func TestActionKindConstantsMatchTheFixture(t *testing.T) {
 	path := filepath.Join("..", "..", "..", "library", "tests", "fixtures", "enums.json")
 	raw, err := os.ReadFile(path)

@@ -78,18 +78,16 @@ impl<
         share_holders: &HashSet<ChannelId>,
     ) -> Result<Vec<DeRecEvent>> {
         let a_share_holder_was_removed = events.iter().any(|event| {
-            matches!(event, DeRecEvent::Unpaired { channel_id } if share_holders.contains(channel_id))
+            matches!(event, DeRecEvent::Unpaired { channel_id, .. } if share_holders.contains(channel_id))
         });
-        let a_usable_helper_just_paired = self.a_usable_helper_just_paired(events).await?;
-        if !a_usable_helper_just_paired && !a_share_holder_was_removed {
+        let a_helper_was_paired = self.has_newly_paired_helper(events).await?;
+        if !a_helper_was_paired && !a_share_holder_was_removed {
             return Ok(Vec::new());
         }
         let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;
         let (secrets, description, threshold) = match snapshot {
             Some(s) => (s.secrets, s.description, s.threshold),
-            None if a_usable_helper_just_paired
-                && self.has_paired_replica_destination().await? =>
-            {
+            None if a_helper_was_paired && self.has_paired_replica_destination().await? => {
                 (Vec::new(), None, None)
             }
             None => return Ok(Vec::new()),
@@ -224,8 +222,10 @@ impl<
         .await
     }
 
-    // TODO: revisit this name
-    async fn a_usable_helper_just_paired(&self, events: &[DeRecEvent]) -> Result<bool> {
+    /// Returns `true` when `events` complete a pairing with a Helper whose
+    /// channel is now `Paired`, i.e. a Helper that can receive shares. A
+    /// `NoKeys` pairing that completed into `Pending` does not count.
+    async fn has_newly_paired_helper(&self, events: &[DeRecEvent]) -> Result<bool> {
         for event in events {
             let DeRecEvent::PairingCompleted {
                 kind: derec_proto::SenderKind::Owner,

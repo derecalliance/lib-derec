@@ -65,6 +65,7 @@ impl<
                 StateItem::PendingUnpair {
                     channel_id,
                     started_at,
+                    ..
                 } if now.saturating_sub(started_at) > self.timeouts.unpair_ack.as_secs() => {
                     Some(channel_id)
                 }
@@ -107,7 +108,10 @@ impl<
 
         expired
             .into_iter()
-            .map(|channel_id| DeRecEvent::Unpaired { channel_id })
+            .map(|channel_id| DeRecEvent::Unpaired {
+                channel_id,
+                acknowledged: false,
+            })
             .collect()
     }
 }
