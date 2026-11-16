@@ -394,6 +394,22 @@ impl DeRecProtocolBuilderWasm {
         self
     }
 
+    /// Whether a completed pairing with a Helper starts a sharing round on
+    /// its own. Default: true.
+    #[wasm_bindgen(js_name = withSharingAfterPairing)]
+    pub fn with_sharing_after_pairing(mut self, enabled: bool) -> DeRecProtocolBuilderWasm {
+        self.config.sharing_after_pairing = Some(enabled);
+        self
+    }
+
+    /// Whether a completed pairing with a Helper sends it a Discovery
+    /// request on its own. Default: false.
+    #[wasm_bindgen(js_name = withDiscoveryAfterPairing)]
+    pub fn with_discovery_after_pairing(mut self, enabled: bool) -> DeRecProtocolBuilderWasm {
+        self.config.discovery_after_pairing = Some(enabled);
+        self
+    }
+
     /// `ack` is exactly `"required"` (default) or `"not_required"`, naming
     /// [`crate::protocol::UnpairAck::Required`] and
     /// [`crate::protocol::UnpairAck::NotRequired`].

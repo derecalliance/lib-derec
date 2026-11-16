@@ -738,7 +738,8 @@ const unpairing = {
       memo: string,
       shared_key: Uint8Array,
       epoch: number,
-      reply_to?: TransportProtocol[],
+      reply_to: TransportProtocol[] | undefined,
+      unpair_channel_id: bigint,
     ): ProduceResult {
       const envelope = call(
         'produce_unpair_request_message',
@@ -747,6 +748,7 @@ const unpairing = {
         shared_key,
         epoch,
         replyTo(reply_to),
+        unpair_channel_id,
       );
       return { envelope: bytes(envelope) };
     },
@@ -768,8 +770,19 @@ const unpairing = {
   },
 
   response: {
-    produce(channel_id: bigint, shared_key: Uint8Array, epoch: number): ProduceResult {
-      const envelope = call('produce_unpair_response_message', channel_id, shared_key, epoch);
+    produce(
+      channel_id: bigint,
+      shared_key: Uint8Array,
+      epoch: number,
+      unpair_channel_id: bigint,
+    ): ProduceResult {
+      const envelope = call(
+        'produce_unpair_response_message',
+        channel_id,
+        shared_key,
+        epoch,
+        unpair_channel_id,
+      );
       return { envelope: bytes(envelope) };
     },
 

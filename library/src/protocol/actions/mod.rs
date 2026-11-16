@@ -70,8 +70,8 @@ impl<
     ///
     /// `Err` is left for what cannot be answered: the checks above, a
     /// [`Action::RespondToFailure`](crate::protocol::Action::RespondToFailure) (which only `reject` resolves),
-    /// failures of the pairing handshake, and a failure of the publish that
-    /// follows a completed pairing.
+    /// failures of the pairing handshake, and a failure of the publish or the
+    /// Discovery request that follows a completed pairing.
     ///
     /// That publish runs after the pairing is complete and its response has
     /// been sent. It reuses every Helper's stored weight, and a stored weight
@@ -106,7 +106,9 @@ impl<
             }
             None => self.accept_inner(action, key, None).await?,
         };
+        let discovery_events = self.maybe_discover_after_pairing(&events).await?;
         let auto_publish_events = self.maybe_auto_publish(&events, &HashSet::new()).await?;
+        events.extend(discovery_events);
         events.extend(auto_publish_events);
         Ok(events)
     }

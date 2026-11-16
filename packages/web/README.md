@@ -836,6 +836,63 @@ const key = channel_key.derive(k0, 0, epoch);
 const { request } = primitives.verification.request.extract(bytes, key);
 ```
 
+#### Unpairing primitives
+
+`unpairing.request.produce(channel_id, memo, shared_key, epoch, reply_to,
+unpair_channel_id)` and `unpairing.response.produce(channel_id, shared_key,
+epoch, unpair_channel_id)` take the channel to unpair last; pass `undefined`
+for `reply_to` to route to the endpoints already recorded. For an ordinary
+unpair `unpair_channel_id` is `channel_id`. A linked unpair asks the helper,
+over `channel_id`, to unpair another channel linked to it: the request names
+that channel and the response names it back, as `request.channel_id` and
+`response.channel_id` after `extract`.
+
+```ts
+const { envelope: bytes } = primitives.unpairing.request.produce(
+  recovery, "retire", key, 0, undefined, old,
+);
+const { request } = primitives.unpairing.request.extract(bytes, key);
+// request.channel_id === old
+```
+
+### After a pairing
+
+By default, when a helper pairing completes on the owner, the library starts a sharing round on its own: the latest snapshot is published as the next version to every paired helper, the new one included, with the stored weights and threshold. Two builder switches decide what happens at that moment instead:
+
+| Setter | Config key | Default | When on |
+|--------|------------|---------|---------|
+| `withSharingAfterPairing(bool)` | `sharing_after_pairing` | `true` | Start a sharing round, as above. Off, the pairing only reports `PairingCompleted`, and the application publishes with `start(FlowKind.ProtectSecret, …)` when it decides. |
+| `withDiscoveryAfterPairing(bool)` | `discovery_after_pairing` | `false` | Send a Discovery request to each newly paired helper. Its answer, `SecretsDiscovered`, confirms the channel; a freshly paired helper answers with an empty list. |
+
+The two are independent: with both on, the sharing round does not wait for the Discovery answer. Both apply only to helper pairings, on the owner; for `NoKeys` they act when the fingerprint is confirmed. A replica pairing always publishes, since the joining device needs the vault. A Discovery request that cannot be sent is reported as `DiscoveryFailed`, and the pairing stays completed.
+
+A new pairing that has not been confirmed through Discovery is not to be trusted. A pairing can complete that the user never meant: an `accept` that arrives late, two starts on one contact, or a scanner that lost its state after sending its request. Sharing to such a channel gives that peer a share of the secret and records it in the roster the secret carries (its channel key and endpoints), so every later recovery restores a channel to it. The safe pattern is to confirm, then share: build with sharing off and Discovery on, wait for `SecretsDiscovered` from each new helper, then publish with the stored weights.
+
+```ts
+const protocol = new DeRecProtocolBuilder(secretId)
+  .withStores({ channelStore, shareStore, secretStore, userSecretStore, stateStore })
+  .withTransport(transport)
+  .withOwnTransports([{ uri: "https://owner.example.com", protocol: "https" }])
+  .withSharingAfterPairing(false)
+  .withDiscoveryAfterPairing(true)
+  .build();
+
+const awaitingConfirmation = new Set<string>();
+for (const event of await protocol.process(bytes)) {
+  if (event.type === "PairingCompleted") {
+    awaitingConfirmation.add(event.channel_id);
+  } else if (event.type === "SecretsDiscovered" && awaitingConfirmation.delete(event.channel_id)) {
+    if (awaitingConfirmation.size === 0) {
+      await protocol.start(FlowKind.ProtectSecret, { secrets, weights: storedWeights });
+    }
+  }
+}
+```
+
+A helper that never answers is never shared to; unpair it, or pair again. Sharing off also suits pairing several helpers in a row, at onboarding say: pair them all, then publish once, for one round and one version instead of one per pairing.
+
+The republish after an unpair is always on, whatever `sharing_after_pairing` says. An unpair is a request, not proof that the helper deleted anything: an unpaired helper may keep its share and its channel key, and only a fresh split, sent to the helpers that remain, makes that share useless.
+
 ---
 
 ## Usage with Bundlers
@@ -1005,6 +1062,8 @@ The canonical JSON, shared by every SDK, is:
   "auto_accept": { "pairing": true, "store_share": true },
   "auto_respond_on_failure": false,
   "key_rotation": false,
+  "sharing_after_pairing": true,
+  "discovery_after_pairing": false,
   "auto_reply_to": false,
   "unpair_ack": "required",
   "unsafe_connection": false,

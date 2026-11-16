@@ -1969,6 +1969,8 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *   "threshold": 3,
  *   "auto_respond_on_failure": false,
  *   "key_rotation": false,
+ *   "sharing_after_pairing": true,
+ *   "discovery_after_pairing": false,
  *   "unpair_ack": 0,
  *   "auto_reply_to": false,
  *   "auto_accept": {
@@ -2025,6 +2027,10 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  * - `key_rotation`: whether each helper channel advances one key epoch in
  *   every sharing round that reaches the threshold, and the replica group
  *   channel on every publish to replicas; omitted means `false`.
+ * - `sharing_after_pairing`: whether a completed pairing with a helper
+ *   starts a sharing round on its own; omitted means `true`.
+ * - `discovery_after_pairing`: whether a completed pairing with a helper
+ *   sends it a Discovery request on its own; omitted means `false`.
  * - `timeouts`: the four waiting periods, in whole seconds. Each field is
  *   optional and omitted means the [`crate::protocol::types::Timeouts`]
  *   default. `expired_channels` is the automatic removal of `Pending`
@@ -2583,7 +2589,8 @@ struct ProduceUnpairRequestMessageResult produce_unpair_request_message(uint64_t
                                                                         size_t shared_key_len,
                                                                         uint32_t epoch,
                                                                         const uint8_t *reply_to_ptr,
-                                                                        size_t reply_to_len);
+                                                                        size_t reply_to_len,
+                                                                        uint64_t unpair_channel_id);
 
 /**
  * # Safety
@@ -2603,7 +2610,8 @@ struct ExtractUnpairRequestResult extract_unpair_request(const uint8_t *request_
 struct ProduceUnpairResponseMessageResult produce_unpair_response_message(uint64_t channel_id,
                                                                           const uint8_t *shared_key_ptr,
                                                                           size_t shared_key_len,
-                                                                          uint32_t epoch);
+                                                                          uint32_t epoch,
+                                                                          uint64_t unpair_channel_id);
 
 /**
  * # Safety

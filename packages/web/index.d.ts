@@ -1800,6 +1800,8 @@ export interface DeRecAutoAcceptConfig {
  *   "auto_accept": { "pairing": true, "store_share": true },
  *   "auto_respond_on_failure": false,
  *   "key_rotation": false,
+ *   "sharing_after_pairing": true,
+ *   "discovery_after_pairing": false,
  *   "auto_reply_to": false,
  *   "unpair_ack": "required",
  *   "unsafe_connection": false,
@@ -1819,6 +1821,8 @@ export interface DeRecProtocolConfig {
   auto_accept?: DeRecAutoAcceptConfig;
   auto_respond_on_failure?: boolean;
   key_rotation?: boolean;
+  sharing_after_pairing?: boolean;
+  discovery_after_pairing?: boolean;
   auto_reply_to?: boolean;
   /** Its name, or the discriminant `0` (`"required"`) / `1`
    *  (`"not_required"`). */
@@ -1959,6 +1963,26 @@ export declare class DeRecProtocolBuilder {
    * current key. Default: false.
    */
   withKeyRotation(enabled: boolean): DeRecProtocolBuilder;
+  /**
+   * Whether a completed pairing with a helper starts a sharing round on its
+   * own: when `PairingCompleted` reports a paired helper channel, or when
+   * `verifyFingerprint` confirms a `NoKeys` pairing. `false` publishes
+   * nothing; the application starts `ProtectSecret` when it decides. A
+   * pairing the helper has not confirmed is not to be trusted: confirm it
+   * with `withDiscoveryAfterPairing` and share once `SecretsDiscovered`
+   * arrives from that helper. Replica pairings and the publish after an
+   * unpair are not affected. Default: true.
+   */
+  withSharingAfterPairing(enabled: boolean): DeRecProtocolBuilder;
+  /**
+   * Whether a completed pairing with a helper sends it a Discovery request
+   * on its own, at the same moments `withSharingAfterPairing` would share.
+   * The helper's answer confirms the channel; a request that cannot be sent
+   * is reported as `DiscoveryFailed`. Independent of
+   * `withSharingAfterPairing`: with both on, the sharing round does not wait
+   * for the answer. Default: false.
+   */
+  withDiscoveryAfterPairing(enabled: boolean): DeRecProtocolBuilder;
   /** Exactly `"required"` or `"not_required"`; any other string throws
    *  `invalid_unpair_ack`. Default: `"required"`. */
   withUnpairAck(ack: UnpairAck): DeRecProtocolBuilder;
@@ -3211,18 +3235,42 @@ export declare const primitives: {
   };
   unpairing: {
     request: {
+      /**
+       * @param channel_id         The channel the request travels on.
+       * @param reply_to           See `discovery.request.produce.reply_to`;
+       *                           pass `undefined` for no override.
+       * @param unpair_channel_id  The channel to unpair: `channel_id` for an
+       *                           ordinary unpair, or another channel linked
+       *                           to it for a linked unpair, which asks the
+       *                           helper, over `channel_id`, to unpair that
+       *                           channel instead. Carried as
+       *                           `request.channel_id` on extract.
+       */
       produce(
         channel_id: bigint,
         memo: string,
         shared_key: Uint8Array,
         epoch: number,
-        /** See `discovery.request.produce.reply_to`. */
-        reply_to?: TransportProtocol[],
+        reply_to: TransportProtocol[] | undefined,
+        unpair_channel_id: bigint,
       ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { request: UnpairRequestMessage };
     };
     response: {
-      produce(channel_id: bigint, shared_key: Uint8Array, epoch: number): ProduceResult;
+      /**
+       * @param channel_id         The channel the response travels on.
+       * @param unpair_channel_id  The channel the request named
+       *                           (`request.channel_id`), echoed back so the
+       *                           requester learns which channel was
+       *                           unpaired. Carried as `response.channel_id`
+       *                           on extract.
+       */
+      produce(
+        channel_id: bigint,
+        shared_key: Uint8Array,
+        epoch: number,
+        unpair_channel_id: bigint,
+      ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { response: UnpairResponseMessage };
       process(response: UnpairResponseMessage): UnpairingProcessResult;
     };

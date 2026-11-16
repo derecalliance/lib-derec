@@ -9,6 +9,65 @@ all of them unless it names a specific binding.
 
 ### 1.0.0-alpha.1 (unreleased)
 
+- **Changed: the unpair primitives name the channel to unpair in every
+  SDK.** *(breaking; every SDK's primitives)*
+
+  The Rust primitives `unpairing::request::produce` and
+  `unpairing::response::produce` take the channel the unpair names, which is
+  the envelope's channel for an ordinary unpair and a linked channel for a
+  [linked unpair](library/README.md). The bindings used to fill it with the
+  envelope's channel, so no SDK could send or answer a linked unpair through
+  its primitives. Over FFI, `produce_unpair_request_message` and
+  `produce_unpair_response_message` take `unpair_channel_id` as their last
+  argument, and over WASM `unpairing_request_produce` and
+  `unpairing_response_produce` do the same; each SDK's unpair primitives
+  take it as a required argument.
+
+  Migration: pass the channel the message travels on for an ordinary unpair,
+  and the linked channel for a linked unpair.
+
+- **Changed: the protocol version is 1.0.** *(every SDK)*
+
+  `ProtocolVersion::current()`, the version written into every envelope's
+  `protocolVersionMajor` / `protocolVersionMinor`, is now `1.0`; 0.0.x wrote
+  `0.0`. 1.0.0-alpha.1 changes the wire (the unpair and Discovery fields, the
+  envelope `sequence` as the key epoch), so a 0.0.x peer cannot follow it.
+  Neither side rejects a message for its version yet: upgrade every device
+  together. Go's `CurrentProtocolVersion`, .NET's `ProtocolVersion.Current()`
+  and `protocol_version()` in Node, web and React Native report the new value.
+
+- **Added: switches for what happens after a pairing.** *(every SDK)*
+
+  A completed helper pairing used to start a share round on its own, always.
+  Two builder options now decide what the owner does at that moment. Not
+  breaking: the defaults keep today's behaviour.
+
+  - `DeRecProtocolBuilder::with_sharing_after_pairing(bool)`, default `true`:
+    a completed helper pairing — for a `NoKeys` helper, a confirmed
+    fingerprint — starts a share round, as before. Off, the pairing only
+    reports `PairingCompleted`, and the application publishes when it decides
+    with `start(ProtectSecret)`; several helpers paired in a row then cost
+    one round and one version instead of one per pairing.
+  - `DeRecProtocolBuilder::with_discovery_after_pairing(bool)`, default
+    `false`: the owner sends a Discovery request (`GetSecretIdsVersions`) to
+    each newly paired helper (for `NoKeys`, at fingerprint confirmation). A
+    helper that answers is confirmed; an empty list with status `Ok` is the
+    normal answer from a fresh helper. A request that cannot be sent is
+    reported as `DiscoveryFailed` and does not fail `process`, `accept` or
+    `verify_fingerprint`.
+  - The two are independent: with both on, Discovery and the share round
+    both start, and the round does not wait for the Discovery answer. A new
+    pairing not yet confirmed through Discovery is not to be trusted; the
+    recommended pattern is sharing off, Discovery on, and
+    `start(ProtectSecret)` after `SecretsDiscovered` from the new helpers.
+  - Helper pairings only. A replica pairing still publishes, and the
+    republish after an unpair stays on, with no switch.
+  - Config keys `sharing_after_pairing` and `discovery_after_pairing`.
+    .NET: `WithSharingAfterPairing` / `WithDiscoveryAfterPairing`. Node, web
+    and React Native: `withSharingAfterPairing` /
+    `withDiscoveryAfterPairing`. Go: `SharingAfterPairing` /
+    `DiscoveryAfterPairing` on `DeRecProtocolConfig`.
+
 - **Changed: timeouts are typed, and `Unpaired` says whether it was
   acknowledged.** *(breaking; every SDK)*
 
@@ -236,8 +295,9 @@ all of them unless it names a specific binding.
   - **Retention follows stored versions.** A party holds its newest key and the
     key of every secret version it still stores, and drops a key when the last
     version under it goes. Any version kept with `keepVersion` therefore
-    restores. The published secret records each helper's and each replica's
-    `key_epoch` (JSON `key_epoch`, omitted when 0), and the recovered-secret
+    restores. The published secret records the `key_epoch` of each helper
+    channel and of the replica group channel (JSON `key_epoch`, omitted when
+    0), and the recovered-secret
     JSON the SDKs pass back carries it. The publishing device keeps an old key
     only for answers still in flight: when a helper fails or times out of a
     round, that round's pin on its channel goes, so a helper that receives
@@ -274,8 +334,8 @@ all of them unless it names a specific binding.
     device cannot obtain. Every SDK exposes it.
   - **Pending actions.** The token records the epoch it is answered under, and
     accepting or rejecting a token whose epoch's key can no longer be obtained
-    fails with "the action can no longer be answered: its channel key is no
-    longer held".
+    fails with `InvalidInput` ("the action can no longer be answered: its
+    channel key is no longer held"), and nothing is sent.
   - **Fingerprints** describe the pairing key. They are meaningful while a
     channel is `Pending`; after a rotation a fingerprint differs from the one
     shown at pairing.
@@ -376,8 +436,8 @@ all of them unless it names a specific binding.
   - A channel with no stored key can no longer be answered with a key copied
     into the token: `accept` and `reject` return `InvalidInput`, and nothing
     is stored or sent.
-  - A token issued by v0.0.10 is refused: `accept` and `reject` fail to
-    decode it, with the same error as any malformed token (`decode_error` in
+  - A token issued by any 0.0.x release is refused: `accept` and `reject`
+    fail to decode it, with the same error as any malformed token (`decode_error` in
     Node and web, FFI code 103 `ffi_bad_proto` in .NET, Go and React Native), and
     nothing is sent, so its sender times out as for any unanswered request.
   - .NET, Go, Node, web and React Native pass the token through unchanged:

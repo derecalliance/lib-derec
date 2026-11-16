@@ -355,6 +355,64 @@ describe('sharing.request.split', () => {
   });
 });
 
+describe('unpair channel', () => {
+  // The C ABI takes the channel to unpair as the last argument of both
+  // producers; it is the envelope channel for an ordinary unpair and another
+  // channel linked to it for a linked unpair.
+  it('forwards the envelope channel as the unpair channel for an ordinary unpair', () => {
+    const key = new Uint8Array(32);
+    primitives.unpairing.request.produce(5n, 'bye', key, 0, undefined, 5n);
+    primitives.unpairing.response.produce(5n, key, 0, 5n);
+
+    const request = find('produce_unpair_request_message').args;
+    expect(request).toHaveLength(6);
+    expect(request[0]).toBe(5n);
+    expect(request[5]).toBe(5n);
+    const response = find('produce_unpair_response_message').args;
+    expect(response).toHaveLength(4);
+    expect(response[0]).toBe(5n);
+    expect(response[3]).toBe(5n);
+  });
+
+  it('forwards a linked channel distinct from the envelope channel', () => {
+    const key = new Uint8Array(32);
+    primitives.unpairing.request.produce(5n, 'bye', key, 0, undefined, 9n);
+    primitives.unpairing.response.produce(5n, key, 0, 9n);
+
+    const request = find('produce_unpair_request_message').args;
+    expect(request[0]).toBe(5n);
+    expect(request[5]).toBe(9n);
+    const response = find('produce_unpair_response_message').args;
+    expect(response[0]).toBe(5n);
+    expect(response[3]).toBe(9n);
+  });
+
+  it('surfaces the named channel on the extracted request and response', () => {
+    replies.extract_unpair_request = {
+      channel_id: 5n,
+      memo: 'bye',
+      request_proto_bytes: new Uint8Array().buffer,
+    };
+    replies.extract_unpair_response = {
+      channel_id: 5n,
+      response_proto_bytes: new Uint8Array().buffer,
+    };
+    decodedMessages = [{ memo: 'bye', channel_id: '9' }, { channel_id: '9' }];
+
+    const { request } = primitives.unpairing.request.extract(
+      new Uint8Array([1]),
+      new Uint8Array(32),
+    );
+    const { response } = primitives.unpairing.response.extract(
+      new Uint8Array([1]),
+      new Uint8Array(32),
+    );
+
+    expect(request.channel_id).toBe(9n);
+    expect(response.channel_id).toBe(9n);
+  });
+});
+
 describe('channel key epoch', () => {
   // The C ABI takes the epoch right after the shared key; a wrapper that
   // dropped or reordered it would stamp the wrong `sequence` on the envelope.
@@ -373,8 +431,8 @@ describe('channel key epoch', () => {
       version: 3,
     };
     primitives.sharing.response.produce(1n, req, key, 7);
-    primitives.unpairing.request.produce(1n, 'bye', key, 7);
-    primitives.unpairing.response.produce(1n, key, 7);
+    primitives.unpairing.request.produce(1n, 'bye', key, 7, undefined, 1n);
+    primitives.unpairing.response.produce(1n, key, 7, 1n);
     primitives.verification.request.produce(1n, 2n, 3, key, 7);
     primitives.verification.response.produce(1n, req, key, 7, new Uint8Array([1]));
 

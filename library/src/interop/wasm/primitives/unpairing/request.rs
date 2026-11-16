@@ -36,6 +36,9 @@ pub fn produce(
     epoch: u32,
     // Optional `TransportProtocol`. Pass null/undefined for no override.
     reply_to: JsValue,
+    // The channel to unpair: `channel_id` for an ordinary unpair, or a
+    // channel linked to it for a linked unpair.
+    unpair_channel_id: u64,
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
     let reply_to_proto = parse_transport_protocol_list(reply_to)?;
@@ -47,8 +50,7 @@ pub fn produce(
         &crate::types::ChannelKey::new(epoch, shared_key),
         &reply_to_proto,
         None,
-        // An ordinary unpair names the channel it travels on.
-        channel_id.into(),
+        unpair_channel_id.into(),
     )
     .map_err(js_error_from_lib)?;
     to_js(&ProduceResult {

@@ -14,14 +14,10 @@ func TestSymbolResolvesKnownExport(t *testing.T) {
 
 func TestProtocolVersionMatchesSourceOfTruth(t *testing.T) {
 	major, minor := ProtocolVersion()
-	// library/src/protocol_version.rs defines CURRENT = { major: 0, minor: 0 }
-	// as the source of truth for the DeRec protocol version at this stage of
-	// the project (pre-1.0). A zero value here is therefore the correct
-	// result, not a sign of a broken struct-return decode: the decode path
-	// was independently cross-checked against ctypes calling the same
-	// exported symbol, and both decoders agree on {0, 0}.
-	if major != 0 || minor != 0 {
-		t.Fatalf("expected protocol version 0.0 (per library/src/protocol_version.rs CURRENT), got %d.%d", major, minor)
+	// library/src/protocol_version.rs defines CURRENT = { major: 1, minor: 0 }
+	// as the source of truth for the DeRec protocol version.
+	if major != 1 || minor != 0 {
+		t.Fatalf("expected protocol version 1.0 (per library/src/protocol_version.rs CURRENT), got %d.%d", major, minor)
 	}
 }
 

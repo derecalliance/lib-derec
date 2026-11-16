@@ -60,7 +60,8 @@ internal static class Unpairing
         UIntPtr sharedKeyLen,
         uint epoch,
         byte[]? replyTo,
-        UIntPtr replyToLen
+        UIntPtr replyToLen,
+        ulong unpairChannelId
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
@@ -76,7 +77,8 @@ internal static class Unpairing
         ulong channelId,
         byte[] sharedKey,
         UIntPtr sharedKeyLen,
-        uint epoch
+        uint epoch,
+        ulong unpairChannelId
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

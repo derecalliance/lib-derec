@@ -113,6 +113,7 @@ internal static class Protocol
         RunOrchestratorUnpairingFlowTest();
         RunOrchestratorUpdateChannelInfoFlowTest();
         RunOrchestratorReplyToFlowTest();
+        RunOrchestratorConfirmThenShareFlowTest();
         RunOrchestratorPairingBelowThresholdPublishesNothingFlowTest();
         RunOrchestratorUnpairRepublishesFlowTest();
         RunOrchestratorReplicaRemovalPublishesTheRosterFlowTest();
@@ -5010,6 +5011,126 @@ internal static class Protocol
             .ToList();
 
     /// <summary>
+    /// The channel of every <c>SecretsDiscovered</c> event in
+    /// <paramref name="events"/>, ordered by channel id. Mirrors the Rust
+    /// binding's <c>discovered_from</c>.
+    /// </summary>
+    private static List<ulong> DiscoveredFrom(IEnumerable<DeRecEvent> events) =>
+        events.OfType<SecretsDiscoveredEvent>()
+            .Select(e => e.ChannelId)
+            .OrderBy(c => c)
+            .ToList();
+
+    /// <summary>
+    /// Start a <c>ProtectSecret</c> round of <paramref name="payload"/>.
+    /// Mirrors the Rust binding's <c>protect_now</c>.
+    /// </summary>
+    private static void ProtectNow(Node owner, string payload) =>
+        owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret
+                {
+                    Id = new byte[] { 0x42 },
+                    Name = "secret",
+                    Data = Encoding.UTF8.GetBytes(payload),
+                },
+            },
+        }).GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Pair the last node of <paramref name="scope"/> with
+    /// <paramref name="owner"/> and deliver everything that follows, keeping
+    /// every event any node reports. Returns the long-term channel and those
+    /// events. Mirrors the Rust binding's <c>pair_and_settle</c>.
+    /// </summary>
+    private static (ulong ChannelId, List<DeRecEvent> Events) PairAndSettle(
+        Node owner, (Node Node, string Uri)[] scope, ulong channelId)
+    {
+        HelperStartPair(owner, scope[^1].Node, channelId);
+        var events = PumpAll(scope);
+        var completed = events.OfType<PairingCompletedEvent>()
+            .FirstOrDefault(e => e.PairingChannelId == channelId)
+            ?? throw new InvalidOperationException(
+                $"the pairing on {channelId} must complete, got ["
+                + string.Join(", ", events.Select(e => e.EventType)) + "]");
+        return (completed.ChannelId, events);
+    }
+
+    /// <summary>
+    /// With sharing after pairing off and Discovery after pairing on, a new
+    /// helper is asked for its catalog instead of being shared with, and the
+    /// application shares once the helper has answered. Mirrors the Rust
+    /// binding's <c>run_confirm_then_share_flow</c>.
+    /// </summary>
+    private static void RunOrchestratorConfirmThenShareFlowTest()
+    {
+        Console.WriteLine("=== Orchestrator confirm-then-share flow test ===");
+
+        const string ownerUri = "https://owner.example.com";
+        const string helperAUri = "https://helper-a.example.com";
+        const string helperBUri = "https://helper-b.example.com";
+        const string helperCUri = "https://helper-c.example.com";
+
+        using var owner = MakeNode("Owner", ownerUri,
+            new NodeOptions(SharingAfterPairing: false, DiscoveryAfterPairing: true));
+        using var helperA = MakeNode("HelperA", helperAUri);
+        using var helperB = MakeNode("HelperB", helperBUri);
+        using var helperC = MakeNode("HelperC", helperCUri);
+        ulong secretId = owner.Protocol.SecretId;
+
+        static string Describe(List<(ulong ChannelId, uint Version)> stored) =>
+            "[" + string.Join(", ", stored.Select(s => $"{s.ChannelId}@v{s.Version}")) + "]";
+        static void AssertDiscoveredFrom(List<DeRecEvent> events, ulong channelId, string label)
+        {
+            var discovered = DiscoveredFrom(events);
+            if (discovered.Count != 1 || discovered[0] != channelId)
+                throw new InvalidOperationException(
+                    $"{label}'s pairing must be confirmed by SecretsDiscovered from it only (channel {channelId}), got ["
+                    + string.Join(", ", discovered) + "]");
+        }
+        static void AssertStored(List<(ulong ChannelId, uint Version)> stored, List<(ulong ChannelId, uint Version)> expected)
+        {
+            if (!stored.SequenceEqual(expected))
+                throw new InvalidOperationException(
+                    $"expected stored shares {Describe(expected)}, got {Describe(stored)}");
+        }
+
+        var (channelA, eventsA) = PairAndSettle(owner, new[] { (owner, ownerUri), (helperA, helperAUri) }, 1UL);
+        var (channelB, eventsB) = PairAndSettle(owner,
+            new[] { (owner, ownerUri), (helperA, helperAUri), (helperB, helperBUri) }, 2UL);
+        AssertDiscoveredFrom(eventsA, channelA, "helper-a");
+        AssertDiscoveredFrom(eventsB, channelB, "helper-b");
+
+        ProtectNow(owner, "first");
+        var first = StoredVersions(PumpAll(new[] { (owner, ownerUri), (helperA, helperAUri), (helperB, helperBUri) }));
+        AssertStored(first, new List<(ulong, uint)> { (channelA, 1u), (channelB, 1u) }.OrderBy(s => s.Item1).ToList());
+
+        var (channelC, confirmation) = PairAndSettle(owner, new[]
+        {
+            (owner, ownerUri), (helperA, helperAUri), (helperB, helperBUri), (helperC, helperCUri),
+        }, 3UL);
+        AssertDiscoveredFrom(confirmation, channelC, "helper-c");
+        if (StoredVersions(confirmation).Count != 0)
+            throw new InvalidOperationException(
+                "a pairing shares nothing while sharing after pairing is off, got "
+                + Describe(StoredVersions(confirmation)));
+        AssertLatestVersion(owner, secretId, 1);
+
+        ProtectNow(owner, "second");
+        var second = StoredVersions(PumpAll(new[]
+        {
+            (owner, ownerUri), (helperA, helperAUri), (helperB, helperBUri), (helperC, helperCUri),
+        }));
+        AssertStored(second, new List<(ulong, uint)> { (channelA, 2u), (channelB, 2u), (channelC, 2u) }
+            .OrderBy(s => s.Item1).ToList());
+
+        Console.WriteLine("  pairing confirmed through Discovery, then shared once by the application  ✓");
+        Console.WriteLine("Orchestrator confirm-then-share flow test passed.");
+    }
+
+    /// <summary>
     /// A publish the library starts on its own runs only once the helpers
     /// meet the threshold: with <c>threshold = 3</c>, pairing the second
     /// helper after a below-threshold <c>ProtectSecret</c> publishes nothing
@@ -6528,7 +6649,9 @@ internal static class Protocol
         bool? AutoRespondOnFailure = null,
         Timeouts? Timeouts = null,
         TransportProtocol[]? OwnTransports = null,
-        bool? KeyRotation = null);
+        bool? KeyRotation = null,
+        bool? SharingAfterPairing = null,
+        bool? DiscoveryAfterPairing = null);
 
     private const int DefaultThreshold = 2;
 
@@ -6696,6 +6819,10 @@ internal static class Protocol
             builder = builder.WithKeyRotation(keyRotation);
         if (options.Timeouts is Timeouts timeouts)
             builder = builder.WithTimeouts(timeouts);
+        if (options.SharingAfterPairing is bool sharingAfterPairing)
+            builder = builder.WithSharingAfterPairing(sharingAfterPairing);
+        if (options.DiscoveryAfterPairing is bool discoveryAfterPairing)
+            builder = builder.WithDiscoveryAfterPairing(discoveryAfterPairing);
 
         return new Node(builder.Build(), transport, channelStore, shareStore, secretStore, userSecretStore, stateStore);
     }

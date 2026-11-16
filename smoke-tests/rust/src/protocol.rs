@@ -94,6 +94,7 @@ pub async fn run_all() {
     run_superseded_share_request_flow().await;
     run_reply_to_flow().await;
     run_auto_publish_on_pair_flow().await;
+    run_confirm_then_share_flow().await;
     run_pairing_below_threshold_publishes_nothing_flow().await;
     run_unpair_republishes_flow().await;
     run_replica_removal_publishes_the_roster_flow().await;
@@ -751,6 +752,31 @@ impl Peer {
             .with_own_transports([uri])
             .with_threshold(2)
             .with_auto_respond_on_failure(true)
+            .build()
+            .expect("test fixture: builder.build() should succeed");
+        Self {
+            label,
+            uri: uri.to_owned(),
+            protocol,
+            transport,
+        }
+    }
+
+    /// Set what the library does on its own once a helper pairing
+    /// completes: share the secret, and send the helper a Discovery request.
+    fn with_after_pairing(label: &'static str, uri: &str, sharing: bool, discovery: bool) -> Self {
+        let transport = InProcessTransport::new();
+        let protocol = DeRecProtocolBuilder::new(DEFAULT_TEST_SECRET_ID)
+            .with_channel_store(InMemoryChannelStore::default())
+            .with_share_store(InMemoryShareStore::default())
+            .with_secret_store(InMemorySecretStore::default())
+            .with_user_secret_store(InMemoryUserSecretStore::default())
+            .with_transport(transport.clone())
+            .with_state_store(InMemoryStateStore::default())
+            .with_own_transports([uri])
+            .with_threshold(2)
+            .with_sharing_after_pairing(sharing)
+            .with_discovery_after_pairing(discovery)
             .build()
             .expect("test fixture: builder.build() should succeed");
         Self {
@@ -7843,6 +7869,117 @@ async fn run_auto_publish_on_pair_flow() {
     );
 
     println!("Protocol auto-publish-on-pair flow test passed.");
+}
+
+fn discovered_from(events: &[DeRecEvent]) -> Vec<ChannelId> {
+    let mut channels: Vec<ChannelId> = events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::SecretsDiscovered { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        })
+        .collect();
+    channels.sort_by_key(|c| c.0);
+    channels
+}
+
+async fn protect_now(owner: &mut Peer, payload: &[u8]) {
+    owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![0x42],
+                name: "secret".to_owned(),
+                data: payload.to_vec(),
+            }],
+            description: None,
+            weights: HashMap::new(),
+            threshold: None,
+        })
+        .await
+        .expect("owner start(ProtectSecret) failed");
+}
+
+/// Pair `helper` with `owner` and deliver everything that follows, keeping
+/// every event both sides report. Returns the long-term channel and those
+/// events.
+async fn pair_and_settle(
+    owner: &mut Peer,
+    others: &mut [&mut Peer],
+    channel_id: ChannelId,
+) -> (ChannelId, Vec<DeRecEvent>) {
+    let contact = owner
+        .protocol
+        .create_contact(Some(channel_id), ContactMode::InlineKeys, None)
+        .await
+        .expect("owner.create_contact failed");
+    let helper = others.last_mut().expect("the new helper is last");
+    helper
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Helper,
+            contact,
+            peer_communication_info: HashMap::new(),
+        })
+        .await
+        .expect("helper start(Pairing) failed");
+    let mut peers: Vec<&mut Peer> = vec![owner];
+    peers.extend(others.iter_mut().map(|p| &mut **p));
+    let events = pump_many(&mut peers).await;
+    let paired =
+        extract_paired_channel_id(events.iter(), channel_id).expect("the pairing completes");
+    (paired, events)
+}
+
+/// With sharing after pairing off and Discovery after pairing on, a new
+/// helper is asked for its catalog instead of being shared with, and the
+/// application shares once the helper has answered.
+async fn run_confirm_then_share_flow() {
+    println!("=== Protocol confirm-then-share flow ===");
+
+    let mut owner = Peer::with_after_pairing("owner", "https://owner.example.com", false, true);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let mut helper_c = Peer::new("helper-c", "https://helper-c.example.com");
+
+    let (channel_a, events_a) =
+        pair_and_settle(&mut owner, &mut [&mut helper_a], ChannelId(1)).await;
+    let (channel_b, events_b) = pair_and_settle(
+        &mut owner,
+        &mut [&mut helper_a, &mut helper_b],
+        ChannelId(2),
+    )
+    .await;
+    assert_eq!(discovered_from(&events_a), vec![channel_a], "{events_a:?}");
+    assert_eq!(discovered_from(&events_b), vec![channel_b], "{events_b:?}");
+
+    protect_now(&mut owner, b"first").await;
+    let first = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+    let mut expected = vec![(channel_a, 1), (channel_b, 1)];
+    expected.sort_by_key(|(c, _)| c.0);
+    assert_eq!(stored_versions(&first), expected);
+
+    let (channel_c, confirmation) = pair_and_settle(
+        &mut owner,
+        &mut [&mut helper_a, &mut helper_b, &mut helper_c],
+        ChannelId(3),
+    )
+    .await;
+    assert_eq!(discovered_from(&confirmation), vec![channel_c]);
+    assert!(
+        stored_versions(&confirmation).is_empty(),
+        "a pairing shares nothing while sharing after pairing is off: {confirmation:?}"
+    );
+    assert_eq!(latest_version(&owner).await, Some(1), "no version consumed");
+
+    protect_now(&mut owner, b"second").await;
+    let second = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b, &mut helper_c]).await;
+    let mut expected = vec![(channel_a, 2), (channel_b, 2), (channel_c, 2)];
+    expected.sort_by_key(|(c, _)| c.0);
+    assert_eq!(stored_versions(&second), expected);
+
+    println!("  pairing confirmed through Discovery, then shared once by the application  ✓");
+    println!("Protocol confirm-then-share flow test passed.");
 }
 
 async fn latest_version(peer: &Peer) -> Option<u32> {

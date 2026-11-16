@@ -499,7 +499,7 @@ impl<
         }])
     }
 
-    async fn start_discovery(
+    pub(super) async fn start_discovery(
         &mut self,
         target: Target,
         round: &Round<'_>,

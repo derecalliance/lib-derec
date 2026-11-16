@@ -372,6 +372,46 @@ export function runPrimitivesSmoke(): void {
   console.log("✓ Rotated channel passed.\n");
 
 
+  console.log("=== [Primitives] Unpairing Flow ===");
+
+  // `unpair_channel_id` names the channel to unpair. For an ordinary unpair
+  // it is the channel the request travels on; for a linked unpair the owner
+  // asks the helper, over one channel, to unpair another channel linked to
+  // it, and the helper's answer names that channel back.
+  const unpairRoundTrip = (label: string, unpairChannelId: bigint): void => {
+    const travelChannel = 2n;
+    const key = keyFor(travelChannel);
+
+    const reqEnvelope = primitives.unpairing.request.produce(
+      travelChannel, "bye", key, 0, undefined, unpairChannelId,
+    );
+    const { request } = primitives.unpairing.request.extract(reqEnvelope.envelope, key);
+    if (request.memo !== "bye") {
+      throw new Error(`${label}: memo mismatch (${request.memo})`);
+    }
+    if (request.channel_id !== unpairChannelId) {
+      throw new Error(`${label}: request names ${request.channel_id}, expected ${unpairChannelId}`);
+    }
+
+    const respEnvelope = primitives.unpairing.response.produce(
+      travelChannel, key, 0, request.channel_id,
+    );
+    const { response } = primitives.unpairing.response.extract(respEnvelope.envelope, key);
+    if (response.channel_id !== unpairChannelId) {
+      throw new Error(`${label}: response names ${response.channel_id}, expected ${unpairChannelId}`);
+    }
+    const result = primitives.unpairing.response.process(response);
+    if (!result.acknowledged) {
+      throw new Error(`${label}: response not acknowledged`);
+    }
+    console.log(`  [${label}] request on ${travelChannel} names ${unpairChannelId}, response echoes it  ✓`);
+  };
+  unpairRoundTrip("ordinary", 2n);
+  unpairRoundTrip("linked", 3n);
+
+  console.log("✓ Unpairing flow passed.\n");
+
+
   console.log("=== [Primitives] Pairing Flow (INLINE_KEYS) ===");
 
   const pairingChannelId = 1n;

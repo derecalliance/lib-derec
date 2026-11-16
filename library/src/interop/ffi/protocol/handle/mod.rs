@@ -224,6 +224,8 @@ fn unpair_ack_out_of_range(value: Option<&Value>) -> Option<DeRecError> {
 ///   "threshold": 3,
 ///   "auto_respond_on_failure": false,
 ///   "key_rotation": false,
+///   "sharing_after_pairing": true,
+///   "discovery_after_pairing": false,
 ///   "unpair_ack": 0,
 ///   "auto_reply_to": false,
 ///   "auto_accept": {
@@ -280,6 +282,10 @@ fn unpair_ack_out_of_range(value: Option<&Value>) -> Option<DeRecError> {
 /// - `key_rotation`: whether each helper channel advances one key epoch in
 ///   every sharing round that reaches the threshold, and the replica group
 ///   channel on every publish to replicas; omitted means `false`.
+/// - `sharing_after_pairing`: whether a completed pairing with a helper
+///   starts a sharing round on its own; omitted means `true`.
+/// - `discovery_after_pairing`: whether a completed pairing with a helper
+///   sends it a Discovery request on its own; omitted means `false`.
 /// - `timeouts`: the four waiting periods, in whole seconds. Each field is
 ///   optional and omitted means the [`crate::protocol::types::Timeouts`]
 ///   default. `expired_channels` is the automatic removal of `Pending`

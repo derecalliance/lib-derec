@@ -270,7 +270,9 @@ req, err := verification.Request.Extract(wire, key)
 
 `channelkey.Derive` only moves forward and is bounded at 512 steps per call; a target below `epoch` or further than 512 above it fails with `derec.CodeInvalidInput`. `Extract` always takes the bare 32-byte key.
 
-The last argument of every request `Produce` (sharing, verification, recovery, discovery, unpairing) is `replyTo []Endpoint`: the endpoints, in preference order, the peer should answer on. `nil` means answer on the endpoints recorded for the channel.
+Every request `Produce` (sharing, verification, recovery, discovery, unpairing) takes `replyTo []Endpoint`, its last argument except for unpairing: the endpoints, in preference order, the peer should answer on. `nil` means answer on the endpoints recorded for the channel.
+
+Unpairing names the channel to unpair explicitly: `unpairing.Request.Produce(channelID, memo, sharedKey, epoch, replyTo, unpairChannelID)` and `unpairing.Response.Produce(channelID, sharedKey, epoch, unpairChannelID)`. Pass `channelID` for an ordinary unpair. For a linked unpair the request travels on `channelID` and names a channel linked to it; the responder answers with the request's `UnpairChannelID`. `Extract` exposes the named channel as `UnpairChannelID` on both the request and the response.
 
 The helper side extracts with `sharing.Request.Extract`, persists the request, and answers with `sharing.Response.Produce` (returning the `CommittedShare`, `SecretID`, and `Version` it stored). The owner confirms with `sharing.Response.Extract` + `sharing.Response.Process`.
 
@@ -526,6 +528,8 @@ The canonical JSON (`library/tests/fixtures/protocol_config.json` holds a full e
   "auto_accept": { "pairing": true, "store_share": true },
   "auto_respond_on_failure": false,
   "key_rotation": false,
+  "sharing_after_pairing": true,
+  "discovery_after_pairing": false,
   "auto_reply_to": false,
   "unpair_ack": "required",
   "unsafe_connection": false,
@@ -679,6 +683,16 @@ Within the inbound window `Process` handles every copy of a message it is given,
 ### Key rotation
 
 With `KeyRotation: proto.Bool(true)` in the config, the owner advances each helper channel's key one epoch in every sharing round that reaches the threshold (a round below it advances none), and the replica group channel's key on every publish to replicas. Each step is K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" || be32(e+1)). Rotation is off by default, and off keeps the channel on its current key. The envelope's `sequence` carries the epoch, and peers follow on their own, so the setting is the owner's alone (`KeyRotation` in `DeRecProtocolConfig`). A message under an epoch whose key the device cannot obtain is ignored as `EventTypeMessageIgnored` with `IgnoreReasonKeyUnavailable`. A device keeps its newest key and the key of every secret version it still stores, so any kept version restores. The key ring is stored as a secret of kind `protocol.SecretKindKeyRing` (`3`): persist its bytes as given, with any length, beside the kind-`0` shared key. Forward secrecy covers a compromised helper device, or a key alone, plus recorded traffic, and only for epochs older than the oldest key held; the owner and replica devices hold the plaintext secret and the keys of every version they store. A 0.0.x peer cannot follow a rotated channel: it must upgrade and re-pair.
+
+### After a pairing
+
+Two settings decide what the owner does when a helper pairing completes (for `ContactModeNoKeys`, when its fingerprint is confirmed). `SharingAfterPairing` (default `true`) starts a sharing round on its own: the latest snapshot goes out as the next version to every paired helper, the new one included. Off, nothing is published, and the application starts `FlowKindProtectSecret` when it decides. `DiscoveryAfterPairing` (default `false`) sends the new helper a Discovery request; its answer, `EventTypeSecretsDiscovered`, confirms the channel, and a request that cannot be sent is reported as `EventTypeDiscoveryFailed` without failing the pairing. The two are independent: with both on, the sharing round does not wait for the answer. Both apply to helper pairings only; a replica pairing always publishes.
+
+A pairing not yet confirmed through Discovery is not to be trusted. A late `Accept`, two starts on one contact, or a scanner that lost its state after sending its request can complete a pairing the user never meant. Sharing to it gives that peer a share of the secret and records it in the roster the secret carries, so every later recovery restores a channel to it. The safe pattern is to confirm, then share: set `SharingAfterPairing: proto.Bool(false)` and `DiscoveryAfterPairing: proto.Bool(true)`, pair the helper, wait for `EventTypeSecretsDiscovered` from it (from each new helper, when several were paired), then call `Start(protocol.FlowKindProtectSecret, ...)` with the stored weights. A helper that never answers is never shared to; unpair it, or pair again.
+
+With sharing on, every completed pairing starts its own round and consumes its own version. An application that pairs several helpers in a row, at onboarding say, can turn sharing off, pair them all, and publish once: one round and one version instead of one per pairing.
+
+The republish after an unpair is always on: removing a helper that held a share republishes to the helpers that remain, whatever `SharingAfterPairing` says. An unpaired helper may keep its share and its channel key; only a fresh split sent to the helpers that remain makes that share useless, and the publish is how the owner's replicas learn the helper was removed.
 
 A pairing has a lifetime, `Timeouts.PairingSecs` (default 30). Both sides enforce it and nothing is sent on expiry: `Start(FlowKindPairing, …)` refuses a contact older than it with `derec.CodePairingExpired`; the contact's creator reports a request on such a contact, or a request older than the lifetime, as `EventTypeMessageIgnored` with `IgnoreReasonExpired` before any `ActionRequired`, and `Accept` refuses a request that outlived it with `derec.CodePairingExpired`. Pairing involves both parties, so treat an expiry as a retry and ask the user to scan or share a fresh contact. Keep the scanner's `ExpiredChannels` timeout at least `PairingSecs` plus the time a response takes to arrive.
 

@@ -332,7 +332,8 @@ function toBigInt(id: bigint | number): bigint {
  *
  * Every value the caller supplies is forwarded verbatim — defaults, clamping
  * and the meaning of a disabled cleanup policy are library decisions.
- * `threshold`, `auto_respond_on_failure`, `key_rotation`, `unpair_ack`,
+ * `threshold`, `auto_respond_on_failure`, `key_rotation`,
+ * `sharing_after_pairing`, `discovery_after_pairing`, `unpair_ack`,
  * `auto_reply_to` and `auto_accept` are omitted entirely from the emitted config unless
  * their setter was called: `ProtocolConfig` has a
  * `#[serde(default = "...")]` on each of them, reading the same constants
@@ -482,6 +483,34 @@ export class DeRecProtocolBuilder {
    */
   withKeyRotation(enabled: boolean): this {
     this.config.key_rotation = enabled;
+    return this;
+  }
+
+  /**
+   * Whether a completed pairing with a helper starts a sharing round on its
+   * own: when `PairingCompleted` reports a paired helper channel, or when
+   * `verifyFingerprint` confirms a `NoKeys` pairing. `false` publishes
+   * nothing; the application starts `ProtectSecret` when it decides. A
+   * pairing the helper has not confirmed is not to be trusted: confirm it
+   * with `withDiscoveryAfterPairing` and share once `SecretsDiscovered`
+   * arrives from that helper. Replica pairings and the publish after an
+   * unpair are not affected. Default: true.
+   */
+  withSharingAfterPairing(enabled: boolean): this {
+    this.config.sharing_after_pairing = enabled;
+    return this;
+  }
+
+  /**
+   * Whether a completed pairing with a helper sends it a Discovery request
+   * on its own, at the same moments `withSharingAfterPairing` would share.
+   * The helper's answer confirms the channel; a request that cannot be sent
+   * is reported as `DiscoveryFailed`. Independent of
+   * `withSharingAfterPairing`: with both on, the sharing round does not wait
+   * for the answer. Default: false.
+   */
+  withDiscoveryAfterPairing(enabled: boolean): this {
+    this.config.discovery_after_pairing = enabled;
     return this;
   }
 

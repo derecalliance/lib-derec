@@ -34,6 +34,8 @@
     },
     "auto_respond_on_failure": true,
     "key_rotation": true,
+    "sharing_after_pairing": false,
+    "discovery_after_pairing": true,
     "auto_reply_to": true,
     "unpair_ack": "not_required",
     "unsafe_connection": false,

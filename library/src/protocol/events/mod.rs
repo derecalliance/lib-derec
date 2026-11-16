@@ -1279,9 +1279,15 @@ pub enum DeRecEvent {
     /// message. Applications use `kind` to decide what to do next:
     ///
     /// - [`SenderKind::Owner`] — the Owner completed pairing with a Helper.
-    ///   Call [`super::DeRecProtocol::start`] with [`DeRecFlow::ProtectSecret`]
-    ///   to distribute shares, or [`DeRecFlow::Discovery`] to ask the Helper
-    ///   which secrets it holds (e.g. after a recovery re-pairing).
+    ///   By default the library then publishes the latest secret to it, and
+    ///   it can also send it a Discovery request; see
+    ///   [`with_sharing_after_pairing`](crate::protocol::DeRecProtocolBuilder::with_sharing_after_pairing)
+    ///   and
+    ///   [`with_discovery_after_pairing`](crate::protocol::DeRecProtocolBuilder::with_discovery_after_pairing).
+    ///   Otherwise call [`super::DeRecProtocol::start`] with
+    ///   [`DeRecFlow::ProtectSecret`] to distribute shares, or
+    ///   [`DeRecFlow::Discovery`] to ask the Helper which secrets it holds
+    ///   (e.g. after a recovery re-pairing).
     /// - [`SenderKind::Helper`] — the Helper side completed pairing; no
     ///   additional action is required (the Helper waits for incoming messages).
     /// - [`SenderKind::ReplicaSource`] / [`SenderKind::ReplicaDestination`] —

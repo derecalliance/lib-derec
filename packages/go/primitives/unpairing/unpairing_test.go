@@ -28,7 +28,7 @@ func TestUnpairRequestRoundTrip(t *testing.T) {
 	const memo = "no longer needed"
 	key := sharedKey()
 
-	envelope, err := unpairing.Request.Produce(channelID, memo, key, 0, nil)
+	envelope, err := unpairing.Request.Produce(channelID, memo, key, 0, nil, channelID)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}
@@ -43,6 +43,9 @@ func TestUnpairRequestRoundTrip(t *testing.T) {
 	if got.ChannelID != channelID {
 		t.Fatalf("channel id: want %d got %d", channelID, got.ChannelID)
 	}
+	if got.UnpairChannelID != channelID {
+		t.Fatalf("unpair channel id: want %d got %d", channelID, got.UnpairChannelID)
+	}
 	if got.Memo != memo {
 		t.Fatalf("memo: want %q got %q", memo, got.Memo)
 	}
@@ -55,7 +58,7 @@ func TestUnpairRequestRoundTrip(t *testing.T) {
 }
 
 func TestUnpairRequestRejectsShortKey(t *testing.T) {
-	_, err := unpairing.Request.Produce(1, "reason", make([]byte, 16), 0, nil)
+	_, err := unpairing.Request.Produce(1, "reason", make([]byte, 16), 0, nil, 1)
 	if err == nil {
 		t.Fatal("expected an error for a 16-byte shared key")
 	}
@@ -69,7 +72,7 @@ func TestUnpairResponseRoundTrip(t *testing.T) {
 	const channelID = uint64(7)
 	key := sharedKey()
 
-	reqEnvelope, err := unpairing.Request.Produce(channelID, "no longer needed", key, 0, nil)
+	reqEnvelope, err := unpairing.Request.Produce(channelID, "no longer needed", key, 0, nil, channelID)
 	if err != nil {
 		t.Fatalf("request produce: %v", err)
 	}
@@ -77,7 +80,7 @@ func TestUnpairResponseRoundTrip(t *testing.T) {
 		t.Fatalf("request extract: %v", err)
 	}
 
-	respEnvelope, err := unpairing.Response.Produce(channelID, key, 0)
+	respEnvelope, err := unpairing.Response.Produce(channelID, key, 0, channelID)
 	if err != nil {
 		t.Fatalf("response produce: %v", err)
 	}
@@ -92,11 +95,62 @@ func TestUnpairResponseRoundTrip(t *testing.T) {
 	if extractedResp.ChannelID != channelID {
 		t.Fatalf("channel id: want %d got %d", channelID, extractedResp.ChannelID)
 	}
+	if extractedResp.UnpairChannelID != channelID {
+		t.Fatalf("unpair channel id: want %d got %d", channelID, extractedResp.UnpairChannelID)
+	}
 	if len(extractedResp.ResponseProto) == 0 {
 		t.Fatal("response extract returned empty response proto")
 	}
 
 	if err := unpairing.Response.Process(extractedResp.ResponseProto); err != nil {
+		t.Fatalf("response process: %v", err)
+	}
+}
+
+// A linked unpair travels on one channel and names another; the request and
+// its answer both carry the named channel.
+func TestLinkedUnpairNamesItsTargetInRequestAndResponse(t *testing.T) {
+	const channelID = uint64(7)
+	const linkedID = uint64(9)
+	key := sharedKey()
+
+	reqEnvelope, err := unpairing.Request.Produce(channelID, "leaving", key, 0, nil, linkedID)
+	if err != nil {
+		t.Fatalf("request produce: %v", err)
+	}
+	req, err := unpairing.Request.Extract(reqEnvelope, key)
+	if err != nil {
+		t.Fatalf("request extract: %v", err)
+	}
+	if req.ChannelID != channelID {
+		t.Fatalf("request channel id: want %d got %d", channelID, req.ChannelID)
+	}
+	if req.UnpairChannelID != linkedID {
+		t.Fatalf("request unpair channel id: want %d got %d", linkedID, req.UnpairChannelID)
+	}
+	var reqMsg derecpb.UnpairRequestMessage
+	if err := proto.Unmarshal(req.RequestProto, &reqMsg); err != nil {
+		t.Fatalf("decode inner request: %v", err)
+	}
+	if reqMsg.GetChannelId() != linkedID {
+		t.Fatalf("request proto channel id: want %d got %d", linkedID, reqMsg.GetChannelId())
+	}
+
+	respEnvelope, err := unpairing.Response.Produce(channelID, key, 0, req.UnpairChannelID)
+	if err != nil {
+		t.Fatalf("response produce: %v", err)
+	}
+	resp, err := unpairing.Response.Extract(respEnvelope, key)
+	if err != nil {
+		t.Fatalf("response extract: %v", err)
+	}
+	if resp.ChannelID != channelID {
+		t.Fatalf("response channel id: want %d got %d", channelID, resp.ChannelID)
+	}
+	if resp.UnpairChannelID != linkedID {
+		t.Fatalf("response unpair channel id: want %d got %d", linkedID, resp.UnpairChannelID)
+	}
+	if err := unpairing.Response.Process(resp.ResponseProto); err != nil {
 		t.Fatalf("response process: %v", err)
 	}
 }
@@ -123,7 +177,7 @@ var replyTo = []unpairing.Endpoint{
 
 func TestUnpairRequestCarriesReplyTo(t *testing.T) {
 	key := sharedKey()
-	envelope, err := unpairing.Request.Produce(7, "bye", key, 0, replyTo)
+	envelope, err := unpairing.Request.Produce(7, "bye", key, 0, replyTo, 7)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}
@@ -138,7 +192,7 @@ func TestUnpairRequestCarriesReplyTo(t *testing.T) {
 
 func TestUnpairRequestNilReplyToIsEmpty(t *testing.T) {
 	key := sharedKey()
-	envelope, err := unpairing.Request.Produce(7, "bye", key, 0, nil)
+	envelope, err := unpairing.Request.Produce(7, "bye", key, 0, nil, 7)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}

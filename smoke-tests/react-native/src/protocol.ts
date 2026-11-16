@@ -577,6 +577,8 @@ function makeNode(
     parameterRange?: Partial<ParameterRange>;
     autoRespondOnFailure?: boolean;
     keyRotation?: boolean;
+    sharingAfterPairing?: boolean;
+    discoveryAfterPairing?: boolean;
     timeouts?: import("@derec-alliance/react-native").Timeouts;
   } = {},
 ): Node {
@@ -618,6 +620,12 @@ function makeNode(
   }
   if (options.keyRotation !== undefined) {
     builder = builder.withKeyRotation(options.keyRotation);
+  }
+  if (options.sharingAfterPairing !== undefined) {
+    builder = builder.withSharingAfterPairing(options.sharingAfterPairing);
+  }
+  if (options.discoveryAfterPairing !== undefined) {
+    builder = builder.withDiscoveryAfterPairing(options.discoveryAfterPairing);
   }
   if (options.timeouts !== undefined) {
     builder = builder.withTimeouts(options.timeouts);
@@ -6106,6 +6114,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runUnpairingFlow();
   await runUpdateChannelInfoFlow();
   await runReplyToFlow();
+  await runConfirmThenShareFlow();
   await runPairingBelowThresholdPublishesNothingFlow();
   await runUnpairRepublishesFlow();
   await runReplicaRemovalPublishesTheRosterFlow();
@@ -6227,6 +6236,104 @@ function storedVersions(events: DeRecEvent[]): string[] {
   }
   stored.sort(([a], [b]) => (BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0));
   return stored.map(([channelId, version]) => `${channelId}:${version}`);
+}
+
+/** Every channel a `SecretsDiscovered` in `events` came from, sorted. */
+function discoveredFrom(events: DeRecEvent[]): string[] {
+  return events
+    .flatMap((e) => (e.type === "SecretsDiscovered" ? [e.channel_id] : []))
+    .sort();
+}
+
+async function protectNow(owner: Node, payload: string): Promise<void> {
+  await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([0x42]), name: "secret", data: utf8Encode(payload) }],
+  });
+}
+
+/**
+ * Pairs the last of `others` with `owner` and delivers everything that
+ * follows, keeping every event both sides report. Returns the long-term
+ * channel and those events.
+ */
+async function pairAndSettle(
+  owner: AddressedNode,
+  others: AddressedNode[],
+  channelId: bigint,
+): Promise<{ channel: string; events: DeRecEvent[] }> {
+  const helper = others[others.length - 1]!;
+  await helperStartPairAt(owner, helper, channelId);
+  const events = await pumpAll([owner, ...others]);
+  const completed = events.find(
+    (e) => e.type === "PairingCompleted" && BigInt(e.pairing_channel_id) === channelId,
+  );
+  if (!completed || completed.type !== "PairingCompleted") {
+    throw new Error(`pairAndSettle(cid=${channelId}): missing PairingCompleted`);
+  }
+  return { channel: completed.channel_id, events };
+}
+
+/**
+ * With sharing after pairing off and Discovery after pairing on, a new
+ * helper is asked for its catalog instead of being shared with, and the
+ * application shares once the helper has answered.
+ */
+async function runConfirmThenShareFlow(): Promise<void> {
+  console.log("=== [Protocol] Confirm-then-share flow ===\n");
+
+  const owner = {
+    node: makeNode("Owner", "https://owner.example.com", {
+      sharingAfterPairing: false,
+      discoveryAfterPairing: true,
+    }),
+    uri: "https://owner.example.com",
+  };
+  const helperA = { node: makeNode("HelperA", "https://helper-a.example.com"), uri: "https://helper-a.example.com" };
+  const helperB = { node: makeNode("HelperB", "https://helper-b.example.com"), uri: "https://helper-b.example.com" };
+  const helperC = { node: makeNode("HelperC", "https://helper-c.example.com"), uri: "https://helper-c.example.com" };
+
+  const a = await pairAndSettle(owner, [helperA], 91n);
+  const b = await pairAndSettle(owner, [helperA, helperB], 92n);
+  for (const [paired, label] of [[a, "HelperA"], [b, "HelperB"]] as const) {
+    const discovered = discoveredFrom(paired.events);
+    if (discovered.join(",") !== paired.channel) {
+      throw new Error(
+        `${label}'s pairing is confirmed by SecretsDiscovered from its channel only: [${discovered.join(", ")}] events=[${paired.events.map((e) => e.type).join(", ")}]`,
+      );
+    }
+  }
+
+  await protectNow(owner.node, "first");
+  const first = await pumpAll([owner, helperA, helperB]);
+  let expected = [`${a.channel}:1`, `${b.channel}:1`].sort();
+  if ([...storedVersions(first)].sort().join(",") !== expected.join(",")) {
+    throw new Error(`both helpers store v1: [${storedVersions(first).join(", ")}]`);
+  }
+
+  const c = await pairAndSettle(owner, [helperA, helperB, helperC], 93n);
+  if (discoveredFrom(c.events).join(",") !== c.channel) {
+    throw new Error(
+      `HelperC's pairing is confirmed by SecretsDiscovered from its channel only: [${discoveredFrom(c.events).join(", ")}]`,
+    );
+  }
+  if (storedVersions(c.events).length !== 0) {
+    throw new Error(
+      `a pairing shares nothing while sharing after pairing is off: [${storedVersions(c.events).join(", ")}]`,
+    );
+  }
+  if ((await latestVersion(owner.node)) !== 1) {
+    throw new Error(`no version consumed: expected v1, got ${await latestVersion(owner.node)}`);
+  }
+
+  await protectNow(owner.node, "second");
+  const second = await pumpAll([owner, helperA, helperB, helperC]);
+  expected = [`${a.channel}:2`, `${b.channel}:2`, `${c.channel}:2`].sort();
+  if ([...storedVersions(second)].sort().join(",") !== expected.join(",")) {
+    throw new Error(`all three helpers store v2: [${storedVersions(second).join(", ")}]`);
+  }
+
+  console.log("  pairing confirmed through Discovery, then shared once by the application  ✓");
+  console.log("\n✓ Confirm-then-share flow passed.\n");
 }
 
 /**

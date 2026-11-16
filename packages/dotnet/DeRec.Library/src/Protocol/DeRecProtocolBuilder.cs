@@ -40,6 +40,7 @@ public sealed record DeRecStores(
 /// Optional setters left uncalled take the library's defaults: <see cref="WithThreshold"/> (3),
 /// <see cref="WithTimeouts"/> (library defaults), <see cref="WithCommunicationInfo"/> (empty),
 /// <see cref="WithAutoRespondOnFailure"/> (false), <see cref="WithKeyRotation"/> (false),
+/// <see cref="WithSharingAfterPairing"/> (true), <see cref="WithDiscoveryAfterPairing"/> (false),
 /// <see cref="WithUnpairAck"/> (<see cref="UnpairAck.Required"/>),
 /// <see cref="WithAutoReplyTo"/> (false), <see cref="WithReplicaId"/> (unset),
 /// <see cref="WithMaxSubshares"/> (unset, no cap).
@@ -249,6 +250,39 @@ public sealed class DeRecProtocolBuilder
     }
 
     /// <summary>
+    /// Whether a completed pairing with a helper starts a sharing round on
+    /// its own: when <c>PairingCompletedEvent</c> reports a paired helper
+    /// channel, or when <c>VerifyFingerprintAsync</c> confirms a
+    /// <c>NoKeys</c> pairing. Off, nothing is published, and the application
+    /// starts <c>FlowKind.ProtectSecret</c> when it decides. A pairing the
+    /// helper has not confirmed is not to be trusted: confirm it with
+    /// <see cref="WithDiscoveryAfterPairing"/> and share once
+    /// <c>SecretsDiscoveredEvent</c> arrives from that helper. Replica
+    /// pairings and the publish after an unpair are not affected.
+    /// Default: true.
+    /// </summary>
+    public DeRecProtocolBuilder WithSharingAfterPairing(bool enabled)
+    {
+        _config = _config with { SharingAfterPairing = enabled };
+        return this;
+    }
+
+    /// <summary>
+    /// Whether a completed pairing with a helper sends it a Discovery
+    /// request on its own, at the same moments
+    /// <see cref="WithSharingAfterPairing"/> would share. The helper's answer
+    /// confirms the channel; a request that cannot be sent is reported as
+    /// <c>DiscoveryFailedEvent</c>. Independent of
+    /// <see cref="WithSharingAfterPairing"/>: with both on, the sharing round
+    /// does not wait for the answer. Default: false.
+    /// </summary>
+    public DeRecProtocolBuilder WithDiscoveryAfterPairing(bool enabled)
+    {
+        _config = _config with { DiscoveryAfterPairing = enabled };
+        return this;
+    }
+
+    /// <summary>
     /// Whether the unpair initiator waits for the peer's ack before
     /// dropping local state. Default: <see cref="UnpairAck.Required"/>.
     /// </summary>
@@ -397,6 +431,8 @@ public sealed class DeRecProtocolBuilder
             AutoAccept = config.AutoAccept ?? current.AutoAccept,
             AutoRespondOnFailure = config.AutoRespondOnFailure ?? current.AutoRespondOnFailure,
             KeyRotation = config.KeyRotation ?? current.KeyRotation,
+            SharingAfterPairing = config.SharingAfterPairing ?? current.SharingAfterPairing,
+            DiscoveryAfterPairing = config.DiscoveryAfterPairing ?? current.DiscoveryAfterPairing,
             AutoReplyTo = config.AutoReplyTo ?? current.AutoReplyTo,
             UnpairAck = config.UnpairAck ?? current.UnpairAck,
             UnsafeConnection = config.UnsafeConnection ?? current.UnsafeConnection,

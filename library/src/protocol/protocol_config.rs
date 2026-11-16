@@ -50,6 +50,8 @@ use derec_proto::ParameterRange;
 ///   "auto_accept": { "pairing": true, "store_share": true },
 ///   "auto_respond_on_failure": false,
 ///   "key_rotation": false,
+///   "sharing_after_pairing": true,
+///   "discovery_after_pairing": false,
 ///   "auto_reply_to": false,
 ///   "unpair_ack": "required",
 ///   "unsafe_connection": false,
@@ -102,6 +104,10 @@ pub struct DeRecProtocolConfig {
     pub auto_respond_on_failure: Option<bool>,
     /// See [`with_key_rotation`](crate::protocol::DeRecProtocolBuilder::with_key_rotation).
     pub key_rotation: Option<bool>,
+    /// See [`with_sharing_after_pairing`](crate::protocol::DeRecProtocolBuilder::with_sharing_after_pairing).
+    pub sharing_after_pairing: Option<bool>,
+    /// See [`with_discovery_after_pairing`](crate::protocol::DeRecProtocolBuilder::with_discovery_after_pairing).
+    pub discovery_after_pairing: Option<bool>,
     /// See [`with_auto_reply_to`](crate::protocol::DeRecProtocolBuilder::with_auto_reply_to).
     pub auto_reply_to: Option<bool>,
     /// See [`with_unpair_ack`](crate::protocol::DeRecProtocolBuilder::with_unpair_ack).
@@ -243,6 +249,8 @@ impl DeRecProtocolConfig {
             auto_accept,
             auto_respond_on_failure,
             key_rotation,
+            sharing_after_pairing,
+            discovery_after_pairing,
             auto_reply_to,
             unpair_ack,
             unsafe_connection,
@@ -273,6 +281,8 @@ impl DeRecProtocolConfig {
         over(&mut self.auto_accept, auto_accept);
         over(&mut self.auto_respond_on_failure, auto_respond_on_failure);
         over(&mut self.key_rotation, key_rotation);
+        over(&mut self.sharing_after_pairing, sharing_after_pairing);
+        over(&mut self.discovery_after_pairing, discovery_after_pairing);
         over(&mut self.auto_reply_to, auto_reply_to);
         over(&mut self.unpair_ack, unpair_ack);
         over(&mut self.unsafe_connection, unsafe_connection);
@@ -396,6 +406,10 @@ mod wire {
         auto_respond_on_failure: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         key_rotation: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sharing_after_pairing: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        discovery_after_pairing: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         auto_reply_to: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -634,6 +648,8 @@ mod wire {
                 auto_accept: w.auto_accept.map(Into::into),
                 auto_respond_on_failure: w.auto_respond_on_failure,
                 key_rotation: w.key_rotation,
+                sharing_after_pairing: w.sharing_after_pairing,
+                discovery_after_pairing: w.discovery_after_pairing,
                 auto_reply_to: w.auto_reply_to,
                 unpair_ack: w.unpair_ack.map(UnpairAckWire::resolve).transpose()?,
                 unsafe_connection: w.unsafe_connection,
@@ -654,6 +670,8 @@ mod wire {
                 auto_accept: c.auto_accept.map(Into::into),
                 auto_respond_on_failure: c.auto_respond_on_failure,
                 key_rotation: c.key_rotation,
+                sharing_after_pairing: c.sharing_after_pairing,
+                discovery_after_pairing: c.discovery_after_pairing,
                 auto_reply_to: c.auto_reply_to,
                 unpair_ack: c.unpair_ack.map(|ack| {
                     UnpairAckWire::Name(protocol_names::unpair_ack_to_name(ack).to_owned())
@@ -716,6 +734,8 @@ mod tests {
         },
         "auto_respond_on_failure": true,
         "key_rotation": true,
+        "sharing_after_pairing": false,
+        "discovery_after_pairing": true,
         "auto_reply_to": true,
         "unpair_ack": "not_required",
         "unsafe_connection": true,
@@ -768,6 +788,8 @@ mod tests {
         );
         assert_eq!(c.auto_respond_on_failure, Some(true));
         assert_eq!(c.key_rotation, Some(true));
+        assert_eq!(c.sharing_after_pairing, Some(false));
+        assert_eq!(c.discovery_after_pairing, Some(true));
         assert_eq!(c.auto_reply_to, Some(true));
         assert_eq!(c.unpair_ack, Some(UnpairAck::NotRequired));
         assert_eq!(c.unsafe_connection, Some(true));

@@ -40,6 +40,7 @@ func main() {
 	runRestoreOnRecoveryChannels()
 	runLinkedUnpairBeforeReshareIsRefused()
 	runKeyRotation()
+	runConfirmThenShare()
 	runPairingBelowThresholdPublishesNothing()
 	runUnpairRepublishes()
 	runReplicaRemovalPublishesTheRoster()

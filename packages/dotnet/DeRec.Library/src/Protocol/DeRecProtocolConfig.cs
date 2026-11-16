@@ -67,6 +67,12 @@ public sealed record DeRecProtocolConfig
     /// <summary>See <see cref="DeRecProtocolBuilder.WithKeyRotation"/>.</summary>
     public bool? KeyRotation { get; init; }
 
+    /// <summary>See <see cref="DeRecProtocolBuilder.WithSharingAfterPairing"/>.</summary>
+    public bool? SharingAfterPairing { get; init; }
+
+    /// <summary>See <see cref="DeRecProtocolBuilder.WithDiscoveryAfterPairing"/>.</summary>
+    public bool? DiscoveryAfterPairing { get; init; }
+
     /// <summary>See <see cref="DeRecProtocolBuilder.WithAutoReplyTo"/>.</summary>
     public bool? AutoReplyTo { get; init; }
 
@@ -144,6 +150,8 @@ internal sealed class DeRecProtocolConfigJsonConverter : JsonConverter<DeRecProt
                 },
             AutoRespondOnFailure = w.AutoRespondOnFailure,
             KeyRotation = w.KeyRotation,
+            SharingAfterPairing = w.SharingAfterPairing,
+            DiscoveryAfterPairing = w.DiscoveryAfterPairing,
             AutoReplyTo = w.AutoReplyTo,
             UnpairAck = w.UnpairAck,
             UnsafeConnection = w.UnsafeConnection,
@@ -206,6 +214,8 @@ internal sealed class DeRecProtocolConfigJsonConverter : JsonConverter<DeRecProt
                 },
             AutoRespondOnFailure = value.AutoRespondOnFailure,
             KeyRotation = value.KeyRotation,
+            SharingAfterPairing = value.SharingAfterPairing,
+            DiscoveryAfterPairing = value.DiscoveryAfterPairing,
             AutoReplyTo = value.AutoReplyTo,
             UnpairAck = value.UnpairAck,
             UnsafeConnection = value.UnsafeConnection,
@@ -307,6 +317,12 @@ internal sealed class DeRecProtocolConfigJsonConverter : JsonConverter<DeRecProt
 
         [JsonPropertyName("key_rotation"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public bool? KeyRotation { get; init; }
+
+        [JsonPropertyName("sharing_after_pairing"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public bool? SharingAfterPairing { get; init; }
+
+        [JsonPropertyName("discovery_after_pairing"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public bool? DiscoveryAfterPairing { get; init; }
 
         [JsonPropertyName("auto_reply_to"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public bool? AutoReplyTo { get; init; }

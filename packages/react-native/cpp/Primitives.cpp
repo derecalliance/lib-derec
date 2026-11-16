@@ -1216,22 +1216,23 @@ jsi::Value processStoreShareResponseMessage(jsi::Runtime& rt,
 }
 
 /// `produce_unpair_request_message(channelId: bigint, memo: ArrayBuffer,
-///   sharedKey: ArrayBuffer, epoch: number, replyTo: ArrayBuffer|null)
-///   -> ArrayBuffer`
+///   sharedKey: ArrayBuffer, epoch: number, replyTo: ArrayBuffer|null,
+///   unpairChannelId: bigint) -> ArrayBuffer`
 jsi::Value produceUnpairRequestMessage(jsi::Runtime& rt,
                                        const jsi::Value&,
                                        const jsi::Value* args,
                                        size_t count) {
-  requireArgs(rt, "produce_unpair_request_message", count, 5);
+  requireArgs(rt, "produce_unpair_request_message", count, 6);
   uint64_t channelId = asU64(rt, args[0]);
   ByteView memo = asBytes(rt, args[1]);
   ByteView sharedKey = asBytes(rt, args[2]);
   auto epoch = static_cast<uint32_t>(asScalarInteger(
       rt, "produce_unpair_request_message", "epoch", args[3], std::numeric_limits<uint32_t>::max()));
   ByteView replyTo = asBytes(rt, args[4]);
+  uint64_t unpairChannelId = asU64(rt, args[5]);
   ProduceUnpairRequestMessageResult result = produce_unpair_request_message(
       channelId, memo.ptr, memo.len, sharedKey.ptr, sharedKey.len, epoch,
-      replyTo.ptr, replyTo.len);
+      replyTo.ptr, replyTo.len, unpairChannelId);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
@@ -1265,18 +1266,19 @@ jsi::Value extractUnpairRequest(jsi::Runtime& rt,
 }
 
 /// `produce_unpair_response_message(channelId: bigint, sharedKey:
-///   ArrayBuffer, epoch: number) -> ArrayBuffer`
+///   ArrayBuffer, epoch: number, unpairChannelId: bigint) -> ArrayBuffer`
 jsi::Value produceUnpairResponseMessage(jsi::Runtime& rt,
                                         const jsi::Value&,
                                         const jsi::Value* args,
                                         size_t count) {
-  requireArgs(rt, "produce_unpair_response_message", count, 3);
+  requireArgs(rt, "produce_unpair_response_message", count, 4);
   uint64_t channelId = asU64(rt, args[0]);
   ByteView sharedKey = asBytes(rt, args[1]);
   auto epoch = static_cast<uint32_t>(asScalarInteger(
       rt, "produce_unpair_response_message", "epoch", args[2], std::numeric_limits<uint32_t>::max()));
+  uint64_t unpairChannelId = asU64(rt, args[3]);
   ProduceUnpairResponseMessageResult result = produce_unpair_response_message(
-      channelId, sharedKey.ptr, sharedKey.len, epoch);
+      channelId, sharedKey.ptr, sharedKey.len, epoch, unpairChannelId);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
@@ -1512,10 +1514,10 @@ void installPrimitives(jsi::Runtime& rt, jsi::Object& host) {
   bind(rt, host, "extract_store_share_response", 2, extractStoreShareResponse);
   bind(rt, host, "process_store_share_response_message", 2,
        processStoreShareResponseMessage);
-  bind(rt, host, "produce_unpair_request_message", 5,
+  bind(rt, host, "produce_unpair_request_message", 6,
        produceUnpairRequestMessage);
   bind(rt, host, "extract_unpair_request", 2, extractUnpairRequest);
-  bind(rt, host, "produce_unpair_response_message", 3,
+  bind(rt, host, "produce_unpair_response_message", 4,
        produceUnpairResponseMessage);
   bind(rt, host, "extract_unpair_response", 2, extractUnpairResponse);
   bind(rt, host, "process_unpair_response_message", 1,

@@ -12,21 +12,30 @@ public static partial class Unpairing
         public sealed class ExtractResult
         {
             public required ulong ChannelId { get; init; }
+            /// <summary>
+            /// The channel the request named, echoed back by the answer.
+            /// </summary>
+            public required ulong UnpairChannelId { get; init; }
             public required byte[] ResponseProtoBytes { get; init; }
         }
 
         /// <summary>
         /// <c>epoch</c> is the epoch of <c>sharedKey</c> in the channel's key chain,
         /// stamped into the envelope's <c>sequence</c>; 0 for a freshly paired channel.
+        /// <c>unpairChannelId</c> is the channel the request named
+        /// (<see cref="Request.ExtractResult.UnpairChannelId"/>), which the answer names
+        /// back: <c>channelId</c> for an ordinary unpair, the linked channel for a
+        /// linked unpair.
         /// </summary>
-        public static DeRecMessage Produce(ulong channelId, byte[] sharedKey, uint epoch)
+        public static DeRecMessage Produce(ulong channelId, byte[] sharedKey, uint epoch, ulong unpairChannelId)
         {
             Native.Unpairing.ProduceUnpairResponseMessageResult nativeResult =
                 Native.Unpairing.produce_unpair_response_message(
                     channelId,
                     sharedKey,
                     (UIntPtr)sharedKey.Length,
-                    epoch
+                    epoch,
+                    unpairChannelId
                 );
 
             try
@@ -55,10 +64,14 @@ public static partial class Unpairing
             try
             {
                 Utils.ThrowIfError(nativeResult.Error);
+                byte[] innerBytes = Utils.CopyBuffer(nativeResult.ResponseProtoBytes);
+                var inner = Org.Derecalliance.Derec.Protobuf.UnpairResponseMessage.Parser
+                    .ParseFrom(innerBytes);
                 return new ExtractResult
                 {
                     ChannelId = nativeResult.ChannelId,
-                    ResponseProtoBytes = Utils.CopyBuffer(nativeResult.ResponseProtoBytes),
+                    UnpairChannelId = inner.ChannelId,
+                    ResponseProtoBytes = innerBytes,
                 };
             }
             finally

@@ -395,6 +395,8 @@ var req = Verification.Request.Extract(envelope, key);
 
 `ChannelKey.Derive` only moves forward and is bounded at 512 steps per call; a target below `epoch` or further than 512 above it throws a `DeRecException` with `DeRecCode.InvalidInput`. `Extract` always takes the bare 32-byte key.
 
+Unpairing names the channel to unpair explicitly: `Unpairing.Request.Produce(channelId, memo, sharedKey, epoch, unpairChannelId, replyTo)` and `Unpairing.Response.Produce(channelId, sharedKey, epoch, unpairChannelId)`. Pass `channelId` for an ordinary unpair. For a linked unpair the request travels on `channelId` and names a channel linked to it; the responder answers with the request's `UnpairChannelId`. `Extract` exposes the named channel as `UnpairChannelId` on both the request and the response.
+
 ---
 
 ## Example: Verification Flow
@@ -967,6 +969,16 @@ takes to arrive.
 
 With `WithKeyRotation(true)`, the owner advances each helper channel's key one epoch in every sharing round that reaches the threshold (a round below it advances none), and the replica group channel's key on every publish to replicas. Each step is K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" || be32(e+1)). Rotation is off by default, and off keeps the channel on its current key. The envelope's `sequence` carries the epoch, and peers follow on their own, so the setting is the owner's alone (`KeyRotation` in a config). A message under an epoch whose key the device cannot obtain is ignored as `MessageIgnoredEvent` with `IgnoreReason.KeyUnavailable`. A device keeps its newest key and the key of every secret version it still stores, so any kept version restores. The key ring is stored as a secret of kind `SecretKind.KeyRing` (`3`): persist its bytes as given, with any length, beside the kind-`0` shared key. Forward secrecy covers a compromised helper device, or a key alone, plus recorded traffic, and only for epochs older than the oldest key held; the owner and replica devices hold the plaintext secret and the keys of every version they store. A 0.0.x peer cannot follow a rotated channel: it must upgrade and re-pair.
 
+### After a pairing
+
+Two builder settings decide what the owner does when a helper pairing completes (for `ContactMode.NoKeys`, when its fingerprint is confirmed). `WithSharingAfterPairing(bool)` (default `true`) starts a sharing round on its own: the latest snapshot goes out as the next version to every paired helper, the new one included. Off, nothing is published, and the application calls `StartAsync(FlowKind.ProtectSecret, …)` when it decides. `WithDiscoveryAfterPairing(bool)` (default `false`) sends the new helper a Discovery request; its answer, `SecretsDiscoveredEvent`, confirms the channel, and a request that cannot be sent is reported as `DiscoveryFailedEvent` without failing the pairing. The two are independent: with both on, the sharing round does not wait for the answer. Both apply to helper pairings only; a replica pairing always publishes. In a config they are `SharingAfterPairing` / `DiscoveryAfterPairing` (`sharing_after_pairing` / `discovery_after_pairing` in JSON).
+
+A pairing not yet confirmed through Discovery is not to be trusted. A late `AcceptAsync`, two starts on one contact, or a scanner that lost its state after sending its request can complete a pairing the user never meant. Sharing to it gives that peer a share of the secret and records it in the roster the secret carries, so every later recovery restores a channel to it. The safe pattern is to confirm, then share: build with `WithSharingAfterPairing(false)` and `WithDiscoveryAfterPairing(true)`, pair the helper, wait for `SecretsDiscoveredEvent` from it (from each new helper, when several were paired), then call `StartAsync(FlowKind.ProtectSecret, …)` with the stored weights. A helper that never answers is never shared to; unpair it, or pair again.
+
+With sharing on, every completed pairing starts its own round and consumes its own version. An application that pairs several helpers in a row, at onboarding say, can turn sharing off, pair them all, and publish once: one round and one version instead of one per pairing.
+
+The republish after an unpair is always on: removing a helper that held a share republishes to the helpers that remain, whatever `WithSharingAfterPairing` says. An unpaired helper may keep its share and its channel key; only a fresh split sent to the helpers that remain makes that share useless, and the publish is how the owner's replicas learn the helper was removed.
+
 ### Store interfaces
 
 `DeRecProtocolBuilder` requires five application-supplied stores, bundled in a
@@ -1110,6 +1122,8 @@ The record reads and writes the canonical JSON shared by every SDK
   "auto_accept": { "pairing": true, "store_share": true },
   "auto_respond_on_failure": false,
   "key_rotation": false,
+  "sharing_after_pairing": true,
+  "discovery_after_pairing": false,
   "auto_reply_to": false,
   "unpair_ack": "required",
   "unsafe_connection": false,

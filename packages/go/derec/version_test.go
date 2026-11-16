@@ -14,15 +14,15 @@ import (
 
 func TestCurrentProtocolVersionMatchesCore(t *testing.T) {
 	got := derec.CurrentProtocolVersion()
-	// library/src/protocol_version.rs: CURRENT = { major: 0, minor: 0 }.
-	if want := (derec.ProtocolVersion{Major: 0, Minor: 0}); got != want {
+	// library/src/protocol_version.rs: CURRENT = { major: 1, minor: 0 }.
+	if want := (derec.ProtocolVersion{Major: 1, Minor: 0}); got != want {
 		t.Fatalf("want %+v got %+v", want, got)
 	}
 }
 
 func TestCurrentProtocolVersionMatchesEnvelopeStamp(t *testing.T) {
 	key := make([]byte, 32)
-	wire, err := unpairing.Request.Produce(1, "", key, 0, nil)
+	wire, err := unpairing.Request.Produce(1, "", key, 0, nil, 1)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}

@@ -115,6 +115,25 @@ type DeRecProtocolConfig struct {
 	// to replicas. false keeps the current key. Default: false.
 	KeyRotation *bool `json:"key_rotation,omitempty"`
 
+	// SharingAfterPairing decides whether a completed pairing with a
+	// helper starts a sharing round on its own: when EventTypePairingCompleted
+	// reports a Paired helper channel, or when VerifyFingerprint confirms a
+	// NoKeys pairing. false publishes nothing; the application starts
+	// FlowKindProtectSecret when it decides. A pairing the helper has not
+	// confirmed is not to be trusted: confirm it with DiscoveryAfterPairing
+	// and share once EventTypeSecretsDiscovered arrives from that helper.
+	// Replica pairings and the publish after an unpair are not affected.
+	// Default: true.
+	SharingAfterPairing *bool `json:"sharing_after_pairing,omitempty"`
+
+	// DiscoveryAfterPairing decides whether a completed pairing with a
+	// helper sends it a Discovery request on its own, at the same moments
+	// SharingAfterPairing would share. The helper's answer confirms the
+	// channel; a request that cannot be sent is reported as
+	// EventTypeDiscoveryFailed. Independent of SharingAfterPairing: with both
+	// on, the sharing round does not wait for the answer. Default: false.
+	DiscoveryAfterPairing *bool `json:"discovery_after_pairing,omitempty"`
+
 	// AutoReplyTo controls whether outbound requests carry an ephemeral
 	// replyTo pointing at OwnTransports. Default: false.
 	AutoReplyTo *bool `json:"auto_reply_to,omitempty"`
@@ -217,6 +236,12 @@ func (c *DeRecProtocolConfig) UnmarshalJSON(data []byte) error {
 	}
 	if layer.KeyRotation != nil {
 		c.KeyRotation = layer.KeyRotation
+	}
+	if layer.SharingAfterPairing != nil {
+		c.SharingAfterPairing = layer.SharingAfterPairing
+	}
+	if layer.DiscoveryAfterPairing != nil {
+		c.DiscoveryAfterPairing = layer.DiscoveryAfterPairing
 	}
 	if layer.AutoReplyTo != nil {
 		c.AutoReplyTo = layer.AutoReplyTo

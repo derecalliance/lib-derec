@@ -890,9 +890,9 @@ impl ChannelRecord {
 /// [`crate::protocol::DeRecUserSecretStore`] for one `secret_id`.
 ///
 /// Written every time the application calls
-/// `start(FlowKind::ProtectSecret)`; read by the pair-completion
-/// auto-publish hook so a freshly-paired Helper or Replica receives the
-/// current state without an explicit re-publish from the app.
+/// `start(FlowKind::ProtectSecret)`; read by the publishes the library
+/// starts on its own: after a pairing (unless sharing after pairing is off
+/// for a Helper), after an unpair, and after a replica removal.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UserSecrets {
     /// Secret version this snapshot represents. Monotonically increasing

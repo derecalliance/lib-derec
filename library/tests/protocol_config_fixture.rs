@@ -43,6 +43,8 @@ fn full_fixture_sets_every_field() {
         auto_accept,
         auto_respond_on_failure,
         key_rotation,
+        sharing_after_pairing,
+        discovery_after_pairing,
         auto_reply_to,
         unpair_ack,
         unsafe_connection,
@@ -88,6 +90,8 @@ fn full_fixture_sets_every_field() {
     );
     assert_eq!(auto_respond_on_failure, Some(true));
     assert_eq!(key_rotation, Some(true));
+    assert_eq!(sharing_after_pairing, Some(false));
+    assert_eq!(discovery_after_pairing, Some(true));
     assert_eq!(auto_reply_to, Some(true));
     assert_eq!(unpair_ack, Some(UnpairAck::NotRequired));
     assert_eq!(unsafe_connection, Some(false));

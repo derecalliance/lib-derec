@@ -41,7 +41,8 @@ var (
 	produceUnpairReqFn   func(channelID uint64,
 		memo *byte, memoLen uintptr,
 		sharedKey *byte, sharedKeyLen uintptr, epoch uint32,
-		replyTo *byte, replyToLen uintptr) produceUnpairRequestMessageResult
+		replyTo *byte, replyToLen uintptr,
+		unpairChannelID uint64) produceUnpairRequestMessageResult
 
 	extractUnpairReqOnce sync.Once
 	extractUnpairReqFn   func(request *byte, requestLen uintptr,
@@ -49,7 +50,8 @@ var (
 
 	produceUnpairRespOnce sync.Once
 	produceUnpairRespFn   func(channelID uint64,
-		sharedKey *byte, sharedKeyLen uintptr, epoch uint32) produceUnpairResponseMessageResult
+		sharedKey *byte, sharedKeyLen uintptr, epoch uint32,
+		unpairChannelID uint64) produceUnpairResponseMessageResult
 
 	extractUnpairRespOnce sync.Once
 	extractUnpairRespFn   func(response *byte, responseLen uintptr,
@@ -63,9 +65,9 @@ var (
 )
 
 // ProduceUnpairRequest builds the wire-encoded DeRecMessage asking the peer
-// on channelID to drop all state for the paired relationship, carrying memo,
-// encrypted under sharedKey.
-func ProduceUnpairRequest(channelID uint64, memo string, sharedKey []byte, epoch uint32, replyTo []Endpoint) ([]byte, error) {
+// on channelID to drop all state for the paired relationship named by
+// unpairChannelID, carrying memo, encrypted under sharedKey.
+func ProduceUnpairRequest(channelID uint64, memo string, sharedKey []byte, epoch uint32, replyTo []Endpoint, unpairChannelID uint64) ([]byte, error) {
 	produceUnpairReqOnce.Do(func() {
 		purego.RegisterFunc(&produceUnpairReqFn, symbol("produce_unpair_request_message"))
 	})
@@ -77,7 +79,8 @@ func ProduceUnpairRequest(channelID uint64, memo string, sharedKey []byte, epoch
 	res := produceUnpairReqFn(channelID,
 		bytePtr(memoBytes), uintptr(len(memoBytes)),
 		bytePtr(sharedKey), uintptr(len(sharedKey)), epoch,
-		bytePtr(replyToBytes), uintptr(len(replyToBytes)))
+		bytePtr(replyToBytes), uintptr(len(replyToBytes)),
+		unpairChannelID)
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err
 	}
@@ -98,14 +101,14 @@ func ExtractUnpairRequest(request, sharedKey []byte) (uint64, string, []byte, er
 	return res.ChannelID, stringFromCString(res.Memo), bytesFromBuffer(res.RequestProtoBytes), nil
 }
 
-// ProduceUnpairResponse builds the wire-encoded DeRecMessage acknowledging
-// termination of the paired relationship on channelID, encrypted under
-// sharedKey.
-func ProduceUnpairResponse(channelID uint64, sharedKey []byte, epoch uint32) ([]byte, error) {
+// ProduceUnpairResponse builds the wire-encoded DeRecMessage, sent on
+// channelID, acknowledging termination of the paired relationship named by
+// unpairChannelID, encrypted under sharedKey.
+func ProduceUnpairResponse(channelID uint64, sharedKey []byte, epoch uint32, unpairChannelID uint64) ([]byte, error) {
 	produceUnpairRespOnce.Do(func() {
 		purego.RegisterFunc(&produceUnpairRespFn, symbol("produce_unpair_response_message"))
 	})
-	res := produceUnpairRespFn(channelID, bytePtr(sharedKey), uintptr(len(sharedKey)), epoch)
+	res := produceUnpairRespFn(channelID, bytePtr(sharedKey), uintptr(len(sharedKey)), epoch, unpairChannelID)
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err
 	}

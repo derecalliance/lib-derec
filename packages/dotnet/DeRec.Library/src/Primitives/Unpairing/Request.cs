@@ -13,11 +13,13 @@ public static partial class Unpairing
         public sealed class ExtractResult
         {
             public required ulong ChannelId { get; init; }
-            public required string Memo { get; init; }
             /// <summary>
-            /// Optional response endpoint advertised by the sender on
-            /// the inner request. Mirrors the JS bridge surface.
+            /// The channel the request asks to unpair: <see cref="ChannelId"/>
+            /// for an ordinary unpair, a channel linked to it for a linked
+            /// unpair.
             /// </summary>
+            public required ulong UnpairChannelId { get; init; }
+            public required string Memo { get; init; }
             /// <summary>
             /// Every endpoint the requester asked to be answered on, in its
             /// own preference order. Empty means route to the endpoints
@@ -30,8 +32,12 @@ public static partial class Unpairing
         /// <summary>
         /// <c>epoch</c> is the epoch of <c>sharedKey</c> in the channel's key chain,
         /// stamped into the envelope's <c>sequence</c>; 0 for a freshly paired channel.
+        /// <c>unpairChannelId</c> is the channel to unpair: <c>channelId</c> for an
+        /// ordinary unpair, or a channel linked to it for a linked unpair, where the
+        /// request travels on <c>channelId</c> and asks the peer to unpair the linked
+        /// channel.
         /// </summary>
-        public static DeRecMessage Produce(ulong channelId, string memo, byte[] sharedKey, uint epoch, IReadOnlyList<TransportProtocol>? replyTo = null)
+        public static DeRecMessage Produce(ulong channelId, string memo, byte[] sharedKey, uint epoch, ulong unpairChannelId, IReadOnlyList<TransportProtocol>? replyTo = null)
         {
             byte[] memoBytes = System.Text.Encoding.UTF8.GetBytes(memo ?? string.Empty);
             byte[]? replyToBytes = replyTo is { Count: > 0 }
@@ -48,7 +54,8 @@ public static partial class Unpairing
                     (UIntPtr)sharedKey.Length,
                     epoch,
                     replyToBytes,
-                    replyToLen
+                    replyToLen,
+                    unpairChannelId
                 );
 
             try
@@ -86,6 +93,7 @@ public static partial class Unpairing
                 return new ExtractResult
                 {
                     ChannelId = nativeResult.ChannelId,
+                    UnpairChannelId = inner.ChannelId,
                     Memo = memo,
                     ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyToTransports),
                 };

@@ -12,6 +12,9 @@ use derec_library::primitives::pairing::{
 };
 use derec_library::primitives::recovery::{request as rec_request, response as rec_response};
 use derec_library::primitives::sharing::{request as share_request, response as share_response};
+use derec_library::primitives::unpairing::{
+    request as unpair_request, response as unpair_response,
+};
 use derec_library::primitives::verification::{
     request as verif_request, response as verif_response,
 };
@@ -40,6 +43,7 @@ pub fn run_all() {
     run_discovery_flow_test();
     run_envelope_trace_id_test();
     run_rotated_channel_primitives_test();
+    run_unpairing_flow_test();
     run_request_reply_to_test();
 }
 
@@ -1002,6 +1006,45 @@ fn run_rotated_channel_primitives_test() {
     k0.derive(512).expect("a 512-epoch derivation must succeed");
 
     println!("Primitives on a rotated channel test passed.");
+}
+
+/// `unpair_channel_id` names the channel to unpair: the channel the request
+/// travels on for an ordinary unpair, or a channel linked to it for a linked
+/// unpair, which the helper's answer names back.
+fn run_unpairing_flow_test() {
+    println!("=== Primitives unpairing flow test ===");
+
+    let travel = ChannelId(2);
+    let key = ChannelKey::new(0, SharedKey::new([21u8; 32]));
+    for (label, named) in [("ordinary", travel), ("linked", ChannelId(3))] {
+        let produced = unpair_request::produce(travel, "bye", &key, &[], None, named)
+            .expect("unpair_request::produce failed");
+        let request = unpair_request::extract(&produced.envelope, key.key())
+            .expect("unpair_request::extract failed")
+            .request;
+        assert_eq!(request.memo, "bye", "{label}: memo");
+        assert_eq!(
+            request.channel_id, named.0,
+            "{label}: the request names the channel"
+        );
+
+        let answered = unpair_response::produce(travel, &key, ChannelId(request.channel_id))
+            .expect("unpair_response::produce failed");
+        let response = unpair_response::extract(&answered.envelope, key.key())
+            .expect("unpair_response::extract failed")
+            .response;
+        assert_eq!(
+            response.channel_id, named.0,
+            "{label}: the response echoes it"
+        );
+        unpair_response::process(&response).expect("unpair_response::process failed");
+        println!(
+            "  [{label}] request on {} names {}, response echoes it  ✓",
+            travel.0, named.0
+        );
+    }
+
+    println!("Primitives unpairing flow test passed.");
 }
 
 fn run_request_reply_to_test() {

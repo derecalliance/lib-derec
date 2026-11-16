@@ -88,4 +88,4 @@ impl fmt::Display for ProtocolVersion {
 ///
 /// assert_eq!(CURRENT, ProtocolVersion::current());
 /// ```
-pub const CURRENT: ProtocolVersion = ProtocolVersion { major: 0, minor: 0 };
+pub const CURRENT: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };

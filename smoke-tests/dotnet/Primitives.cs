@@ -35,6 +35,7 @@ internal static class Primitives
         RunRecoveryFlowTest();
         RunDiscoveryFlowTest();
         RunUnpairingFlowTest();
+        RunLinkedUnpairTest();
         RunUnpairingNonAsciiMemoTest();
         RunEnvelopeAndReplyToTest();
         RunRotatedChannelPrimitivesTest();
@@ -1132,7 +1133,7 @@ internal static class Primitives
         byte[] sharedKey = Make32(0x23);
         const string Memo = "adiós — ✓";
 
-        var extracted = Unpairing.Request.Extract(Unpairing.Request.Produce(7, Memo, sharedKey, 0u), sharedKey);
+        var extracted = Unpairing.Request.Extract(Unpairing.Request.Produce(7, Memo, sharedKey, 0u, 7), sharedKey);
         if (extracted.Memo != Memo)
             throw new InvalidOperationException($"non-ASCII memo must round-trip unchanged; got '{extracted.Memo}'");
 
@@ -1148,26 +1149,61 @@ internal static class Primitives
         const string Memo = "goodbye";
 
         // Initiator side: produce request
-        DeRecMessage requestEnvelope = Unpairing.Request.Produce(channelId, Memo, sharedKey, 0u);
+        DeRecMessage requestEnvelope = Unpairing.Request.Produce(channelId, Memo, sharedKey, 0u, channelId);
 
         // Responder side: extract request
         var extractedRequest = Unpairing.Request.Extract(requestEnvelope, sharedKey);
         if (extractedRequest.ChannelId != channelId)
             throw new InvalidOperationException("Unpairing test failed: channel_id mismatch on extract request.");
+        if (extractedRequest.UnpairChannelId != channelId)
+            throw new InvalidOperationException("Unpairing test failed: unpair channel_id mismatch on extract request.");
         if (extractedRequest.Memo != Memo)
             throw new InvalidOperationException($"Unpairing test failed: memo mismatch (got '{extractedRequest.Memo}').");
 
         // Responder side: produce ack response
-        DeRecMessage responseEnvelope = Unpairing.Response.Produce(channelId, sharedKey, 0u);
+        DeRecMessage responseEnvelope = Unpairing.Response.Produce(channelId, sharedKey, 0u, extractedRequest.UnpairChannelId);
 
         // Initiator side: extract response then process
         var extractedResponse = Unpairing.Response.Extract(responseEnvelope, sharedKey);
         if (extractedResponse.ChannelId != channelId)
             throw new InvalidOperationException("Unpairing test failed: channel_id mismatch on extract response.");
+        if (extractedResponse.UnpairChannelId != channelId)
+            throw new InvalidOperationException("Unpairing test failed: unpair channel_id mismatch on extract response.");
 
         Unpairing.Response.Process(extractedResponse.ResponseProtoBytes);
 
         Console.WriteLine("Unpairing flow test passed.");
+    }
+
+    /// <summary>
+    /// A linked unpair travels on one channel and names a channel linked to
+    /// it; the request carries the named channel and the answer names it back.
+    /// </summary>
+    private static void RunLinkedUnpairTest()
+    {
+        Console.WriteLine("=== Linked unpair test ===");
+
+        const ulong ChannelId = 7;
+        const ulong LinkedId = 9;
+        byte[] sharedKey = Make32(0x24);
+
+        var request = Unpairing.Request.Extract(
+            Unpairing.Request.Produce(ChannelId, "leaving", sharedKey, 0u, LinkedId), sharedKey);
+        if (request.ChannelId != ChannelId)
+            throw new InvalidOperationException($"Linked unpair test failed: request channel_id {request.ChannelId}, want {ChannelId}.");
+        if (request.UnpairChannelId != LinkedId)
+            throw new InvalidOperationException($"Linked unpair test failed: request unpair channel_id {request.UnpairChannelId}, want {LinkedId}.");
+
+        var response = Unpairing.Response.Extract(
+            Unpairing.Response.Produce(ChannelId, sharedKey, 0u, request.UnpairChannelId), sharedKey);
+        if (response.ChannelId != ChannelId)
+            throw new InvalidOperationException($"Linked unpair test failed: response channel_id {response.ChannelId}, want {ChannelId}.");
+        if (response.UnpairChannelId != LinkedId)
+            throw new InvalidOperationException($"Linked unpair test failed: response unpair channel_id {response.UnpairChannelId}, want {LinkedId}.");
+
+        Unpairing.Response.Process(response.ResponseProtoBytes);
+
+        Console.WriteLine("Linked unpair test passed.");
     }
 
     /// <summary>

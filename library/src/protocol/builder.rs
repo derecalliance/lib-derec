@@ -121,6 +121,8 @@ pub struct DeRecProtocolBuilder<
     communication_info: HashMap<String, String>,
     auto_respond_on_failure: bool,
     key_rotation: bool,
+    sharing_after_pairing: bool,
+    discovery_after_pairing: bool,
     unpair_ack: UnpairAck,
     auto_reply_to: bool,
     auto_accept: AutoAcceptPolicy,
@@ -160,6 +162,8 @@ impl
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
             key_rotation: false,
+            sharing_after_pairing: true,
+            discovery_after_pairing: false,
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
             auto_accept: AutoAcceptPolicy::default(),
@@ -418,6 +422,60 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         self
     }
 
+    /// Whether a completed pairing with a Helper starts a sharing round on
+    /// its own.
+    ///
+    /// On, the owner publishes the latest secret as soon as a Helper channel
+    /// is `Paired`: when [`DeRecEvent::PairingCompleted`](crate::protocol::DeRecEvent::PairingCompleted) reports it, or, for
+    /// a [`ContactMode::NoKeys`](derec_proto::ContactMode::NoKeys) pairing,
+    /// when [`DeRecProtocol::verify_fingerprint`] confirms it. Off, nothing
+    /// is published, and the application starts
+    /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret)
+    /// when it decides: after the user confirms, or once after pairing
+    /// several Helpers rather than once per pairing.
+    ///
+    /// A pairing the Helper has not confirmed is not to be trusted: a late
+    /// accept, a second start on one contact, or a scanner that lost its
+    /// state can complete a pairing the user never meant. A publish gives that
+    /// peer a share of the secret and records it in the roster the secret
+    /// carries, so every later recovery restores a channel to it.
+    /// Confirm it first with
+    /// [`with_discovery_after_pairing`](Self::with_discovery_after_pairing),
+    /// or the application's own Discovery, and share once
+    /// [`DeRecEvent::SecretsDiscovered`](crate::protocol::DeRecEvent::SecretsDiscovered) arrives from the Helper. The two
+    /// options are independent: with both on, Discovery and the sharing
+    /// round start together, and the round does not wait for the answer.
+    ///
+    /// Replica pairings and the publish after an unpair are not affected.
+    ///
+    /// Default: `true`.
+    pub fn with_sharing_after_pairing(mut self, enabled: bool) -> Self {
+        self.sharing_after_pairing = enabled;
+        self
+    }
+
+    /// Whether a completed pairing with a Helper sends it a Discovery
+    /// request on its own.
+    ///
+    /// On, the owner starts [`DeRecFlow::Discovery`](crate::protocol::DeRecFlow::Discovery)
+    /// for every Helper channel that became `Paired`: when
+    /// [`DeRecEvent::PairingCompleted`](crate::protocol::DeRecEvent::PairingCompleted) reports it, or, for a
+    /// [`ContactMode::NoKeys`](derec_proto::ContactMode::NoKeys) pairing, when
+    /// [`DeRecProtocol::verify_fingerprint`] confirms it. The Helper's answer,
+    /// [`DeRecEvent::SecretsDiscovered`](crate::protocol::DeRecEvent::SecretsDiscovered), confirms the channel to the owner,
+    /// and the request confirms it to the Helper; an empty catalog is the
+    /// normal answer from a fresh Helper. A request that cannot be sent is
+    /// reported as [`DeRecEvent::DiscoveryFailed`](crate::protocol::DeRecEvent::DiscoveryFailed) among the returned events.
+    ///
+    /// See [`with_sharing_after_pairing`](Self::with_sharing_after_pairing)
+    /// for why a pairing should be confirmed before it is shared with.
+    ///
+    /// Default: `false`.
+    pub fn with_discovery_after_pairing(mut self, enabled: bool) -> Self {
+        self.discovery_after_pairing = enabled;
+        self
+    }
+
     /// Whether the unpair initiator waits for the peer's acknowledgement
     /// before dropping local state.
     ///
@@ -647,6 +705,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             auto_accept,
             auto_respond_on_failure,
             key_rotation,
+            sharing_after_pairing,
+            discovery_after_pairing,
             auto_reply_to,
             unpair_ack,
             unsafe_connection,
@@ -675,6 +735,12 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         }
         if let Some(enabled) = key_rotation {
             self = self.with_key_rotation(enabled);
+        }
+        if let Some(enabled) = sharing_after_pairing {
+            self = self.with_sharing_after_pairing(enabled);
+        }
+        if let Some(enabled) = discovery_after_pairing {
+            self = self.with_discovery_after_pairing(enabled);
         }
         if let Some(enabled) = auto_reply_to {
             self = self.with_auto_reply_to(enabled);
@@ -797,6 +863,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             key_rotation: self.key_rotation,
+            sharing_after_pairing: self.sharing_after_pairing,
+            discovery_after_pairing: self.discovery_after_pairing,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -849,6 +917,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             key_rotation: self.key_rotation,
+            sharing_after_pairing: self.sharing_after_pairing,
+            discovery_after_pairing: self.discovery_after_pairing,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -901,6 +971,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             key_rotation: self.key_rotation,
+            sharing_after_pairing: self.sharing_after_pairing,
+            discovery_after_pairing: self.discovery_after_pairing,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -956,6 +1028,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             key_rotation: self.key_rotation,
+            sharing_after_pairing: self.sharing_after_pairing,
+            discovery_after_pairing: self.discovery_after_pairing,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -1004,6 +1078,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore>
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             key_rotation: self.key_rotation,
+            sharing_after_pairing: self.sharing_after_pairing,
+            discovery_after_pairing: self.discovery_after_pairing,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -1061,6 +1137,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             key_rotation: self.key_rotation,
+            sharing_after_pairing: self.sharing_after_pairing,
+            discovery_after_pairing: self.discovery_after_pairing,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
@@ -1179,6 +1257,8 @@ impl<
         protocol.communication_info = self.communication_info;
         protocol.auto_respond_on_failure = self.auto_respond_on_failure;
         protocol.key_rotation = self.key_rotation;
+        protocol.sharing_after_pairing = self.sharing_after_pairing;
+        protocol.discovery_after_pairing = self.discovery_after_pairing;
         protocol.unpair_ack = self.unpair_ack;
         protocol.auto_reply_to = self.auto_reply_to;
         protocol.auto_accept = self.auto_accept;
@@ -2861,6 +2941,8 @@ mod tests {
         communication_info: HashMap<String, String>,
         auto_respond_on_failure: bool,
         key_rotation: bool,
+        sharing_after_pairing: bool,
+        discovery_after_pairing: bool,
         unpair_ack: UnpairAck,
         auto_reply_to: bool,
         auto_accept: AutoAcceptPolicy,
@@ -2880,6 +2962,8 @@ mod tests {
             communication_info: b.communication_info.clone(),
             auto_respond_on_failure: b.auto_respond_on_failure,
             key_rotation: b.key_rotation,
+            sharing_after_pairing: b.sharing_after_pairing,
+            discovery_after_pairing: b.discovery_after_pairing,
             unpair_ack: b.unpair_ack,
             auto_reply_to: b.auto_reply_to,
             auto_accept: b.auto_accept,
@@ -2917,6 +3001,8 @@ mod tests {
             }),
             auto_respond_on_failure: Some(true),
             key_rotation: Some(true),
+            sharing_after_pairing: Some(false),
+            discovery_after_pairing: Some(true),
             auto_reply_to: Some(true),
             unpair_ack: Some(UnpairAck::NotRequired),
             unsafe_connection: Some(true),
@@ -2927,6 +3013,15 @@ mod tests {
             ]),
             replica_id: Some(9_007_199_254_740_993),
         }
+    }
+
+    /// A pairing shares the secret and sends no Discovery unless told
+    /// otherwise.
+    #[test]
+    fn after_pairing_switches_default_to_sharing_without_discovery() {
+        let b = DeRecProtocolBuilder::new(0);
+        assert!(b.sharing_after_pairing);
+        assert!(!b.discovery_after_pairing);
     }
 
     /// An empty config is a no-op: every setting an earlier call made, and
@@ -2979,6 +3074,8 @@ mod tests {
             })
             .with_auto_respond_on_failure(true)
             .with_key_rotation(true)
+            .with_sharing_after_pairing(false)
+            .with_discovery_after_pairing(true)
             .with_auto_reply_to(true)
             .with_unpair_ack(UnpairAck::NotRequired)
             .with_unsafe_connection(true)

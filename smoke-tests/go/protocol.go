@@ -5559,6 +5559,88 @@ func runContactOnTheGroupChannel() {
 	fmt.Println("Protocol contact on the group channel test passed.")
 }
 
+// discoveredFrom lists the channel of every SecretsDiscovered event, ordered
+// by channel — mirroring `discovered_from` in smoke-tests/rust/src/protocol.rs.
+func discoveredFrom(events []protocol.Event) []uint64 {
+	var channels []uint64
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeSecretsDiscovered {
+			channels = append(channels, ev.ChannelID)
+		}
+	}
+	slices.Sort(channels)
+	return channels
+}
+
+// protectNow has owner start a ProtectSecret round of payload — mirroring
+// `protect_now` in smoke-tests/rust/src/protocol.rs.
+func protectNow(owner *peer, payload []byte) {
+	_, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{0x42}, Name: "secret", Data: payload}},
+	})
+	must(err, fmt.Sprintf("[%s] Start(ProtectSecret)", owner.label))
+}
+
+// pairAndSettle pairs the last of others with owner and delivers everything
+// that follows, keeping every event any peer reports. Returns the long-term
+// channel and those events — mirroring `pair_and_settle` in
+// smoke-tests/rust/src/protocol.rs.
+func pairAndSettle(owner *peer, others []*peer, transient uint64) (uint64, []protocol.Event) {
+	helperStartPair(owner, others[len(others)-1], transient)
+	events := pumpMany(append([]*peer{owner}, others...))
+	return pairedChannelID(events, transient), events
+}
+
+// runConfirmThenShare mirrors smoke-tests/rust/src/protocol.rs's
+// run_confirm_then_share_flow: with sharing after pairing off and Discovery
+// after pairing on, a new helper is asked for its catalog instead of being
+// shared with, and the application shares once the helper has answered.
+func runConfirmThenShare() {
+	fmt.Println("=== Protocol confirm-then-share flow test ===")
+
+	owner, err := newPeerWithConfig("owner", "https://owner-confirm.example.com", protocol.Config{
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			Threshold:             proto.Uint32(2),
+			SharingAfterPairing:   proto.Bool(false),
+			DiscoveryAfterPairing: proto.Bool(true),
+		},
+	})
+	must(err, "protocol.New(owner)")
+	helperA := newPeer("helper-a", "https://helper-a-confirm.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-confirm.example.com", 2)
+	helperC := newPeer("helper-c", "https://helper-c-confirm.example.com", 2)
+	for _, p := range []*peer{owner, helperA, helperB, helperC} {
+		defer p.proto.Close()
+	}
+
+	channelA, eventsA := pairAndSettle(owner, []*peer{helperA}, 1)
+	channelB, eventsB := pairAndSettle(owner, []*peer{helperA, helperB}, 2)
+	assertTrue(slices.Equal(discoveredFrom(eventsA), []uint64{channelA}),
+		"helper-a's pairing must be confirmed by SecretsDiscovered from it only: got %v, want [%d]", discoveredFrom(eventsA), channelA)
+	assertTrue(slices.Equal(discoveredFrom(eventsB), []uint64{channelB}),
+		"helper-b's pairing must be confirmed by SecretsDiscovered from it only: got %v, want [%d]", discoveredFrom(eventsB), channelB)
+
+	protectNow(owner, []byte("first"))
+	first := storedVersions(pumpMany([]*peer{owner, helperA, helperB}))
+	want := sortedByChannel([]storedShare{{channelA, 1}, {channelB, 1}})
+	assertTrue(slices.Equal(first, want), "both helpers store v1: got %+v, want %+v", first, want)
+
+	channelC, confirmation := pairAndSettle(owner, []*peer{helperA, helperB, helperC}, 3)
+	assertTrue(slices.Equal(discoveredFrom(confirmation), []uint64{channelC}),
+		"helper-c's pairing must be confirmed by SecretsDiscovered from it only: got %v, want [%d]", discoveredFrom(confirmation), channelC)
+	assertTrue(len(storedVersions(confirmation)) == 0,
+		"a pairing shares nothing while sharing after pairing is off: %+v", storedVersions(confirmation))
+	assertTrue(versionText(latestVersion(owner)) == "1", "no version consumed, got %s", versionText(latestVersion(owner)))
+
+	protectNow(owner, []byte("second"))
+	second := storedVersions(pumpMany([]*peer{owner, helperA, helperB, helperC}))
+	want = sortedByChannel([]storedShare{{channelA, 2}, {channelB, 2}, {channelC, 2}})
+	assertTrue(slices.Equal(second, want), "all three helpers store v2: got %+v, want %+v", second, want)
+
+	fmt.Println("  pairing confirmed through Discovery, then shared once by the application  ✓")
+	fmt.Println("Protocol confirm-then-share flow test passed.")
+}
+
 // runPairingBelowThresholdPublishesNothing mirrors smoke-tests/rust/src/protocol.rs's
 // run_pairing_below_threshold_publishes_nothing_flow: a publish the library
 // starts on its own runs only once the helpers meet the threshold. With a

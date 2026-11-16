@@ -219,13 +219,15 @@ impl<
 
         let settled = self.update_sharing_round(&mut events).await;
 
-        let published = match self.maybe_auto_publish(&events, &share_holders).await {
-            Ok(auto_publish_events) => {
-                events.extend(auto_publish_events);
-                Ok(())
+        let discovered = self.maybe_discover_after_pairing(&events).await;
+        let auto_published = self.maybe_auto_publish(&events, &share_holders).await;
+        let mut published = Ok(());
+        for outcome in [discovered, auto_published] {
+            match outcome {
+                Ok(started) => events.extend(started),
+                Err(source) => published = published.and(Err(source)),
             }
-            Err(source) => Err(source),
-        };
+        }
 
         let failure = match (settled, published) {
             (Ok(()), Ok(())) => return Ok(events),

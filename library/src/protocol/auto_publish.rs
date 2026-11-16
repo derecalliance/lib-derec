@@ -9,6 +9,7 @@
 //! application's next `start(ProtectSecret)`.
 
 use crate::Result;
+use crate::derec_message::fresh_trace_id;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::protocol::DeRecProtocol;
 use crate::protocol::context::Round;
@@ -17,7 +18,9 @@ use crate::protocol::traits::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport,
     DeRecUserSecretStore,
 };
+use crate::protocol::types::{ChannelQuery, ChannelStatus, Target};
 use crate::types::ChannelId;
+use derec_proto::{SenderKind, TransportProtocol};
 use std::collections::HashSet;
 
 impl<
@@ -30,7 +33,8 @@ impl<
 > DeRecProtocol<Ch, Sh, Ss, Us, St, T>
 {
     /// Publish the cached secret when `events` call for it: a helper-side
-    /// `PairingCompleted` (the freshly-paired Helper needs shares), or an
+    /// `PairingCompleted` (the freshly-paired Helper needs shares), unless
+    /// sharing after pairing is off, or an
     /// [`DeRecEvent::Unpaired`] for a channel in `share_holders` (the Helpers
     /// that remain need a fresh split the removed one has no share of). The
     /// replica-side pairing equivalent fires from `verify_fingerprint` once the
@@ -80,7 +84,8 @@ impl<
         let a_share_holder_was_removed = events.iter().any(|event| {
             matches!(event, DeRecEvent::Unpaired { channel_id, .. } if share_holders.contains(channel_id))
         });
-        let a_helper_was_paired = self.has_newly_paired_helper(events).await?;
+        let a_helper_was_paired =
+            self.sharing_after_pairing && self.has_newly_paired_helper(events).await?;
         if !a_helper_was_paired && !a_share_holder_was_removed {
             return Ok(Vec::new());
         }
@@ -226,9 +231,17 @@ impl<
     /// channel is now `Paired`, i.e. a Helper that can receive shares. A
     /// `NoKeys` pairing that completed into `Pending` does not count.
     async fn has_newly_paired_helper(&self, events: &[DeRecEvent]) -> Result<bool> {
+        Ok(!self.newly_paired_helpers(events).await?.is_empty())
+    }
+
+    /// The Helper channels `events` complete a pairing on that are now
+    /// `Paired`, in event order. A `NoKeys` pairing that completed into
+    /// `Pending` is left out until its fingerprint is confirmed.
+    async fn newly_paired_helpers(&self, events: &[DeRecEvent]) -> Result<Vec<ChannelId>> {
+        let mut paired = Vec::new();
         for event in events {
             let DeRecEvent::PairingCompleted {
-                kind: derec_proto::SenderKind::Owner,
+                kind: SenderKind::Owner,
                 channel_id,
                 ..
             } = event
@@ -239,19 +252,52 @@ impl<
                 .channel_store
                 .load(
                     self.secret_id,
-                    crate::protocol::types::ChannelQuery::Helper {
+                    ChannelQuery::Helper {
                         channel_id: *channel_id,
                     },
                 )
                 .await?
-                .is_some_and(|record| {
-                    record.status() == crate::protocol::types::ChannelStatus::Paired
-                })
+                .is_some_and(|record| record.status() == ChannelStatus::Paired)
             {
-                return Ok(true);
+                paired.push(*channel_id);
             }
         }
-        Ok(false)
+        Ok(paired)
+    }
+
+    /// Send a Discovery request to every Helper `events` newly paired, when
+    /// discovery after pairing is on. The Helper's answer confirms the
+    /// channel to the owner, and the request confirms it to the Helper.
+    pub(super) async fn maybe_discover_after_pairing(
+        &mut self,
+        events: &[DeRecEvent],
+    ) -> Result<Vec<DeRecEvent>> {
+        if !self.discovery_after_pairing {
+            return Ok(Vec::new());
+        }
+        let channels = self.newly_paired_helpers(events).await?;
+        if channels.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.start_auto_discovery(Target::Many(channels)).await
+    }
+
+    /// Start a Discovery round the library decided on itself, with the
+    /// configured `reply_to` policy.
+    pub(super) async fn start_auto_discovery(&mut self, target: Target) -> Result<Vec<DeRecEvent>> {
+        let reply_to: Vec<TransportProtocol> = if self.auto_reply_to {
+            self.own_transports.clone()
+        } else {
+            Vec::new()
+        };
+        self.start_discovery(
+            target,
+            &Round {
+                reply_to: &reply_to,
+                trace_id: fresh_trace_id(),
+            },
+        )
+        .await
     }
 
     /// Returns `true` when at least one channel records a

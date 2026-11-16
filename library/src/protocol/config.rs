@@ -89,6 +89,8 @@ impl<
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
             key_rotation: false,
+            sharing_after_pairing: true,
+            discovery_after_pairing: false,
             auto_reply_to: false,
             auto_accept: AutoAcceptPolicy::default(),
             replica_id: None,

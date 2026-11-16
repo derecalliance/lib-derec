@@ -76,6 +76,9 @@ pub extern "C" fn produce_unpair_request_message(
     // `reply_to` semantics — `reply_to_len == 0` means "no override".
     reply_to_ptr: *const u8,
     reply_to_len: usize,
+    // The channel to unpair: `channel_id` for an ordinary unpair, or a
+    // channel linked to it for a linked unpair.
+    unpair_channel_id: u64,
 ) -> ProduceUnpairRequestMessageResult {
     let with_err = |error| ProduceUnpairRequestMessageResult {
         error,
@@ -113,8 +116,7 @@ pub extern "C" fn produce_unpair_request_message(
         // Helper path. Replica-group removal is orchestrated through the
         // `UnpairReplica` flow, which names the departing member itself.
         None,
-        // An ordinary unpair names the channel it travels on.
-        channel_id.into(),
+        unpair_channel_id.into(),
     ) {
         Ok(r) => ProduceUnpairRequestMessageResult {
             error: success(),
@@ -194,6 +196,8 @@ pub extern "C" fn produce_unpair_response_message(
     // The epoch of `shared_key` in the channel's key chain, stamped into
     // the envelope's `sequence` so the receiver can pick the key.
     epoch: u32,
+    // The channel the request named, which the answer names back.
+    unpair_channel_id: u64,
 ) -> ProduceUnpairResponseMessageResult {
     let with_err = |error| ProduceUnpairResponseMessageResult {
         error,
@@ -208,7 +212,7 @@ pub extern "C" fn produce_unpair_response_message(
     match response::produce(
         channel_id.into(),
         &crate::types::ChannelKey::new(epoch, shared_key),
-        channel_id.into(),
+        unpair_channel_id.into(),
     ) {
         Ok(r) => ProduceUnpairResponseMessageResult {
             error: success(),
@@ -320,4 +324,72 @@ fn parse_shared_key(ptr: *const u8, len: usize) -> Result<crate::types::SharedKe
             "shared_key must be exactly 32 bytes",
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interop::ffi::common::{derec_free_buffer, derec_free_string};
+    use crate::interop::ffi::error::derec_free_error;
+    use derec_proto::UnpairRequestMessage;
+
+    const CHANNEL: u64 = 7;
+    const LINKED: u64 = 9;
+    const KEY: [u8; 32] = [0x5A; 32];
+
+    fn take_buffer(buffer: DeRecBuffer) -> Vec<u8> {
+        if buffer.ptr.is_null() {
+            return Vec::new();
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) }.to_vec();
+        derec_free_buffer(buffer.ptr, buffer.len);
+        bytes
+    }
+
+    fn assert_ok(mut error: DeRecError) {
+        let code = error.code;
+        unsafe { derec_free_error(&mut error) };
+        assert_eq!(code, 0, "the call must succeed");
+    }
+
+    /// A linked unpair travels on one channel and names another; the request
+    /// and its answer both carry the named channel.
+    #[test]
+    fn a_linked_unpair_names_its_target_in_request_and_response() {
+        let memo = b"leaving";
+        let produced = produce_unpair_request_message(
+            CHANNEL,
+            memo.as_ptr(),
+            memo.len(),
+            KEY.as_ptr(),
+            KEY.len(),
+            0,
+            ptr::null(),
+            0,
+            LINKED,
+        );
+        assert_ok(produced.error);
+        let envelope = take_buffer(produced.request_wire_bytes);
+
+        let extracted =
+            extract_unpair_request(envelope.as_ptr(), envelope.len(), KEY.as_ptr(), KEY.len());
+        assert_ok(extracted.error);
+        assert_eq!(extracted.channel_id, CHANNEL);
+        derec_free_string(extracted.memo);
+        let request =
+            UnpairRequestMessage::decode(take_buffer(extracted.request_proto_bytes).as_slice())
+                .expect("request decodes");
+        assert_eq!(request.channel_id, LINKED);
+
+        let answered = produce_unpair_response_message(CHANNEL, KEY.as_ptr(), KEY.len(), 0, LINKED);
+        assert_ok(answered.error);
+        let envelope = take_buffer(answered.response_wire_bytes);
+        let extracted =
+            extract_unpair_response(envelope.as_ptr(), envelope.len(), KEY.as_ptr(), KEY.len());
+        assert_ok(extracted.error);
+        let response =
+            UnpairResponseMessage::decode(take_buffer(extracted.response_proto_bytes).as_slice())
+                .expect("response decodes");
+        assert_eq!(response.channel_id, LINKED);
+    }
 }

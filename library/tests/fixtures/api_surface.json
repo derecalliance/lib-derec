@@ -106,6 +106,18 @@
       "ts": "withKeyRotation"
     },
     {
+      "rust": "sharing_after_pairing",
+      "dotnet": "WithSharingAfterPairing",
+      "go": "SharingAfterPairing",
+      "ts": "withSharingAfterPairing"
+    },
+    {
+      "rust": "discovery_after_pairing",
+      "dotnet": "WithDiscoveryAfterPairing",
+      "go": "DiscoveryAfterPairing",
+      "ts": "withDiscoveryAfterPairing"
+    },
+    {
       "rust": "unpair_ack",
       "dotnet": "WithUnpairAck",
       "go": "UnpairAck",

@@ -224,6 +224,10 @@ pub struct DeRecProtocol<
     ///
     /// Configured via [`DeRecProtocolBuilder::with_key_rotation`](crate::protocol::DeRecProtocolBuilder::with_key_rotation).
     pub(crate) key_rotation: bool,
+    /// Configured via [`DeRecProtocolBuilder::with_sharing_after_pairing`](crate::protocol::DeRecProtocolBuilder::with_sharing_after_pairing).
+    pub(crate) sharing_after_pairing: bool,
+    /// Configured via [`DeRecProtocolBuilder::with_discovery_after_pairing`](crate::protocol::DeRecProtocolBuilder::with_discovery_after_pairing).
+    pub(crate) discovery_after_pairing: bool,
     /// Configured via [`DeRecProtocolBuilder::with_auto_reply_to`](crate::protocol::DeRecProtocolBuilder::with_auto_reply_to).
     ///
     /// When `true`, every outbound request envelope carries

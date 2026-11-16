@@ -2,8 +2,8 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 // Primitive-level smoke tests: exercises the low-level produce/extract/
-// process surface for pairing, sharing, verification, recovery, and
-// discovery, plus the cross-cutting envelope trace-id helpers. Mirrors
+// process surface for pairing, sharing, verification, recovery, discovery,
+// and unpairing, plus the cross-cutting envelope trace-id helpers. Mirrors
 // smoke-tests/rust/src/primitives.rs. Imports only the public
 // packages/go/primitives/* packages, packages/go/derec, and
 // packages/go/derecpb — the same surface an external consumer has.
@@ -46,6 +46,8 @@ func runPrimitives() {
 	runEnvelopeTraceID()
 	runRotatedChannelPrimitives()
 	runRequestReplyTo()
+	runUnpairingFlow()
+	runLinkedUnpair()
 }
 
 // runProtocolVersion prints the core's protocol version and checks it is the
@@ -55,7 +57,7 @@ func runProtocolVersion() {
 	version := derec.CurrentProtocolVersion()
 	fmt.Printf("protocol version = %d.%d\n", version.Major, version.Minor)
 
-	wire, err := unpairing.Request.Produce(1, "", sharedKeyFill(1), 0, nil)
+	wire, err := unpairing.Request.Produce(1, "", sharedKeyFill(1), 0, nil, 1)
 	must(err, "unpair request produce")
 	var msg derecpb.DeRecMessage
 	must(proto.Unmarshal(wire, &msg), "decode envelope")
@@ -75,7 +77,7 @@ func runRequestReplyTo() {
 		{URI: "https://owner.example/derec", Protocol: int32(derecpb.Protocol_HTTPS)},
 		{URI: "https://owner-backup.example/derec", Protocol: int32(derecpb.Protocol_HTTPS)},
 	}
-	wire, err := unpairing.Request.Produce(3, "bye", key, 0, replyTo)
+	wire, err := unpairing.Request.Produce(3, "bye", key, 0, replyTo, 3)
 	must(err, "unpair request produce with reply-to")
 	extracted, err := unpairing.Request.Extract(wire, key)
 	must(err, "unpair request extract")
@@ -88,6 +90,63 @@ func runRequestReplyTo() {
 			"reply-to[%d]: want %+v got %v", i, replyTo[i], tp)
 	}
 	fmt.Println("Request reply-to test passed.")
+}
+
+// runUnpairingFlow runs an ordinary unpair: the request names the channel it
+// travels on, and the answer names it back.
+func runUnpairingFlow() {
+	fmt.Println("=== Unpairing flow test ===")
+	const channelID = uint64(99)
+	const memo = "goodbye"
+	key := sharedKeyFill(0x22)
+
+	requestWire, err := unpairing.Request.Produce(channelID, memo, key, 0, nil, channelID)
+	must(err, "unpair request produce")
+	request, err := unpairing.Request.Extract(requestWire, key)
+	must(err, "unpair request extract")
+	assertTrue(request.ChannelID == channelID, "unpair request: channel id %d, want %d", request.ChannelID, channelID)
+	assertTrue(request.UnpairChannelID == channelID,
+		"unpair request: unpair channel id %d, want %d", request.UnpairChannelID, channelID)
+	assertTrue(request.Memo == memo, "unpair request: memo %q, want %q", request.Memo, memo)
+
+	responseWire, err := unpairing.Response.Produce(channelID, key, 0, request.UnpairChannelID)
+	must(err, "unpair response produce")
+	response, err := unpairing.Response.Extract(responseWire, key)
+	must(err, "unpair response extract")
+	assertTrue(response.ChannelID == channelID, "unpair response: channel id %d, want %d", response.ChannelID, channelID)
+	assertTrue(response.UnpairChannelID == channelID,
+		"unpair response: unpair channel id %d, want %d", response.UnpairChannelID, channelID)
+	must(unpairing.Response.Process(response.ResponseProto), "unpair response process")
+	fmt.Println("Unpairing flow test passed.")
+}
+
+// runLinkedUnpair runs a linked unpair: the request travels on one channel
+// and names a channel linked to it, and the answer names that channel back.
+func runLinkedUnpair() {
+	fmt.Println("=== Linked unpair test ===")
+	const channelID = uint64(7)
+	const linkedID = uint64(9)
+	key := sharedKeyFill(0x24)
+
+	requestWire, err := unpairing.Request.Produce(channelID, "leaving", key, 0, nil, linkedID)
+	must(err, "linked unpair request produce")
+	request, err := unpairing.Request.Extract(requestWire, key)
+	must(err, "linked unpair request extract")
+	assertTrue(request.ChannelID == channelID,
+		"linked unpair request: channel id %d, want %d", request.ChannelID, channelID)
+	assertTrue(request.UnpairChannelID == linkedID,
+		"linked unpair request: unpair channel id %d, want %d", request.UnpairChannelID, linkedID)
+
+	responseWire, err := unpairing.Response.Produce(channelID, key, 0, request.UnpairChannelID)
+	must(err, "linked unpair response produce")
+	response, err := unpairing.Response.Extract(responseWire, key)
+	must(err, "linked unpair response extract")
+	assertTrue(response.ChannelID == channelID,
+		"linked unpair response: channel id %d, want %d", response.ChannelID, channelID)
+	assertTrue(response.UnpairChannelID == linkedID,
+		"linked unpair response: unpair channel id %d, want %d", response.UnpairChannelID, linkedID)
+	must(unpairing.Response.Process(response.ResponseProto), "linked unpair response process")
+	fmt.Println("Linked unpair test passed.")
 }
 
 // transportListBytes frames a preference-ordered endpoint list the way

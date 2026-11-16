@@ -408,6 +408,8 @@ Optional setters have defaults:
 | `with_max_subshares(max)` | unset (no cap) | Cap on a sharing round's total subshares (the sum of the Helpers' weights). Checked at sharing only, never at recovery; must be `>= threshold`. See [Weighted helpers](#weighted-helpers). |
 | `with_auto_respond_on_failure(bool)` | `false` | Who answers an inbound request whose handling failed. If `true`, the library sends the response itself; if `false`, it reports `RequestFailed` with a token the app passes to `reject`. See [Failed requests](#failed-requests). |
 | `with_key_rotation(bool)` | `false` | Whether this device advances channel keys one epoch (`K(e+1) = HMAC-SHA256(K(e), "derec channel key v1" ‖ be32(e+1))`): each helper channel in every sharing round that reaches the threshold, and the replica group channel on every publish to replicas. Off keeps the current key, never the pairing one. Peers follow on their own. |
+| `with_sharing_after_pairing(bool)` | `true` | Whether a completed helper pairing (for `NoKeys`, a confirmed fingerprint) starts a share round on its own. Off, the application publishes with `start(ProtectSecret)`. See [After a pairing](#after-a-pairing). |
+| `with_discovery_after_pairing(bool)` | `false` | Whether the owner sends a Discovery request to each newly paired helper, so the application can confirm the pairing before sharing. See [After a pairing](#after-a-pairing). |
 | `with_unpair_ack(ack)` | `UnpairAck::Required` | Whether the unpair initiator waits for the peer's `Ok` before dropping local state. |
 | `with_auto_reply_to(bool)` | `false` | If `true`, every outbound request stamps `replyTo = own_transport` so the responder routes the reply back to this node — even if the channel's stored peer endpoint points elsewhere. Useful for replica scenarios. See [Correlation and routing on the wire](#correlation-and-routing-on-the-wire). |
 
@@ -473,6 +475,8 @@ SDK, is:
   "auto_accept": { "pairing": true, "store_share": true },
   "auto_respond_on_failure": false,
   "key_rotation": false,
+  "sharing_after_pairing": true,
+  "discovery_after_pairing": false,
   "auto_reply_to": false,
   "unpair_ack": "required",
   "unsafe_connection": false,
@@ -1066,7 +1070,8 @@ not name receives one subshare. The intended flow:
    weights unchanged. A Helper left out returns to 1, which silently undoes
    the user's choice.
 3. Only the publishes the library starts on its own, after pairing and after
-   a fingerprint is confirmed, reuse the stored weights by themselves.
+   a fingerprint is confirmed (see [After a pairing](#after-a-pairing)),
+   reuse the stored weights by themselves.
 
 Validation runs in `start` before anything is written or sent: every key must
 be a currently paired Helper channel of this secret, and every weight must
@@ -1326,7 +1331,117 @@ clocks, so clocks more than the lifetime apart cannot pair. Two starts on
 one contact are still the application's to reconcile: the scanner keeps only
 the last request's keys, so accepting the earlier one leaves a channel the
 scanner cannot open. Confirming a new pairing before relying on it catches
-both.
+both; see [After a pairing](#after-a-pairing).
+
+### After a pairing
+
+By default, when a helper pairing completes on the owner, the library starts
+a share round on its own: the latest snapshot is published as the next
+version to every paired helper, the new one included, with the stored
+weights and threshold. A `NoKeys` helper is published to when its
+fingerprint is confirmed instead, since its channel is `Pending` until then.
+The round's events come back with `PairingCompleted` (from `process` or
+`accept`) or from `verify_fingerprint`.
+
+Two builder switches decide what the library does at that moment instead:
+
+| Setter | Config key | Default | When on |
+|--------|------------|---------|---------|
+| `with_sharing_after_pairing(bool)` | `sharing_after_pairing` | `true` | Start a share round, as above. Off, the pairing only reports `PairingCompleted`, and the application shares when it decides, with `start(ProtectSecret)`. |
+| `with_discovery_after_pairing(bool)` | `discovery_after_pairing` | `false` | Send a Discovery request (`GetSecretIdsVersionsRequest`) to each newly paired helper — for `NoKeys`, when its fingerprint is confirmed. |
+
+The two are independent:
+
+| Sharing | Discovery | After a helper pairing |
+|---------|-----------|------------------------|
+| on | off | A share round starts (the default). |
+| off | off | Nothing is sent. The application publishes when it decides. |
+| off | on | Discovery is sent to the new helpers; nothing is shared until the application publishes. |
+| on | on | Discovery is sent and a share round starts. The round does not wait for the Discovery answer. |
+
+Both apply to helper pairings only, and only on the owner: the helper side of
+a pairing sends nothing. A replica pairing always publishes, since the
+joining device needs the vault. When one message completes several helper
+pairings, one Discovery covers exactly those channels.
+
+A helper that answers the Discovery request is confirmed: it reports
+`SecretsDiscovered`. A freshly paired helper holds nothing yet, so an empty
+list with status `Ok` is its normal answer. A Discovery request that cannot be
+sent is reported as `DiscoveryFailed` among the returned events; it does not
+fail `process`, `accept` or `verify_fingerprint`, and the pairing stays
+completed.
+
+```rust,ignore
+let protocol = DeRecProtocolBuilder::new(secret_id)
+    .with_stores(stores)
+    .with_transport(my_transport)
+    .with_own_transports(["https://my-node.example/derec"])
+    .with_sharing_after_pairing(false)
+    .with_discovery_after_pairing(true)
+    .build()?;
+```
+
+#### Do not trust an unconfirmed pairing
+
+A new pairing that has not been confirmed through Discovery is not to be
+trusted. A pairing can complete that the user never meant: an `accept` that
+arrives late, two starts on one contact, or a scanner that lost its state
+after sending its request. Sharing to such a channel gives that peer a share
+of the secret, and records it in the roster the secret carries — its channel
+key and endpoints — so every later recovery restores a channel to it.
+
+The safe pattern is to confirm, then share:
+
+1. Build the protocol with sharing off and Discovery on.
+2. Pair the helper. `PairingCompleted` arrives, and the library sends it a
+   Discovery request.
+3. Wait for `SecretsDiscovered` from the new helper (from each new helper,
+   when several were paired).
+4. Publish with `start(ProtectSecret)`, passing the stored weights.
+
+```rust,ignore
+for event in protocol.process(&wire_bytes).await? {
+    match event {
+        DeRecEvent::PairingCompleted { channel_id, .. } => {
+            awaiting_confirmation.insert(channel_id);
+        }
+        DeRecEvent::SecretsDiscovered { channel_id, .. }
+            if awaiting_confirmation.remove(&channel_id) =>
+        {
+            if awaiting_confirmation.is_empty() {
+                protocol.start(DeRecFlow::ProtectSecret {
+                    secrets: current_secrets.clone(),
+                    description: None,
+                    weights: stored_weights.clone(),
+                    threshold: None,
+                }).await?;
+            }
+        }
+        _ => {}
+    }
+}
+```
+
+A helper that never answers is never shared to; unpair it, or pair again.
+
+#### Pairing several helpers at once
+
+With sharing on, every completed pairing starts its own round and consumes
+its own version. An application that pairs several helpers in a row — at
+onboarding, say — can turn sharing off, pair them all, and publish once with
+`start(ProtectSecret)`: one round and one version, instead of one per
+pairing.
+
+#### The republish after an unpair is always on
+
+Removing a helper that held a share republishes to the helpers that remain
+(see [Unpairing](#unpairing)), whatever `sharing_after_pairing` says; no
+switch turns it off. An unpair is a request,
+not proof that the helper deleted anything: an unpaired helper may keep its
+share and its channel key. Only a fresh split, sent to the helpers that
+remain, makes that share useless. The publish is also how the owner's other
+devices (replicas) learn that the helper was removed. Without it, one of
+them could later send a new share to the removed helper.
 
 ---
 
@@ -1413,7 +1528,10 @@ This holds in every contact mode.
 
 Confirmation is also the moment the peer becomes reachable, so the current
 snapshot is published to it then — a `NoKeys` helper was not an eligible
-target at handshake time, and the pairing-time auto-publish skipped it.
+target at handshake time, and the pairing-time auto-publish skipped it. For a
+helper, that publish follows `with_sharing_after_pairing`, and with
+`with_discovery_after_pairing` on, the Discovery request is sent at
+confirmation too; see [After a pairing](#after-a-pairing).
 
 On a replica **destination**, confirming is also the decision to adopt the
 group's vault. Once the channel is `Paired`, the source's publish is
@@ -1695,7 +1813,7 @@ so implementations need no internal synchronization:
 | [`DeRecChannelStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecChannelStore.html) | Helper channels (keyed by `channel_id`), replica-group members (keyed by `replica_id`), and the channel-link graph. |
 | [`DeRecShareStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html) | Encoded share entries keyed by `(secret_id, channel_id, version)` — the `secret_id` *argument*, which is the partition every load filters by. `Share::secret_id` is a different value and routinely differs from it; see below. |
 | [`DeRecSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecSecretStore.html) | Per-channel cryptographic material (shared keys, pairing secrets, pairing contacts, and the channel key ring, `SecretKind::KeyRing`, whose bytes are opaque and variable-length). |
-| [`DeRecUserSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecUserSecretStore.html) | The latest user-facing secret snapshot per `secret_id` — what a freshly-paired peer is sent. |
+| [`DeRecUserSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecUserSecretStore.html) | The latest user-facing secret snapshot per `secret_id` — what the next publish sends, including the one a completed pairing starts. |
 | [`DeRecStateStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecStateStore.html) | In-flight orchestrator state: verification challenges, recovery accumulators, pending unpairs, the active sharing round and catch-up. Must be durable in any deployment that can restart mid-flow. |
 | [`DeRecTransport`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecTransport.html) | Outbound envelope delivery to peers. |
 
@@ -2044,7 +2162,7 @@ Two details carry this, and both are easy to miss:
   one exchange, or concurrent requests mix their replies. This is the same
   per-request pattern a stateless deployment uses anyway.
 - **Correlation by `trace_id`.** Admitting a helper also republishes to every
-  *other* helper, so the buffer routinely holds messages for several peers.
+  *other* helper (unless `with_sharing_after_pairing` is off), so the buffer routinely holds messages for several peers.
   Responses echo the inbound envelope's `trace_id`;
   `derec_message::read_trace_id` tells them apart. Returning the whole buffer —
   or blindly returning its first entry — is the mistake to avoid.

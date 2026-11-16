@@ -5751,6 +5751,201 @@ mod weighted_round_tests {
         });
     }
 
+    /// With sharing after pairing off, a completed pairing publishes nothing
+    /// and consumes no version.
+    #[test]
+    fn a_pairing_publishes_nothing_when_sharing_after_pairing_is_off() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 2).await;
+            protect(&mut rig, &[]).await;
+            rig.protocol.sharing_after_pairing = false;
+
+            seed_helper(&mut rig.channels, &mut rig.secrets, 53).await;
+            let events = rig
+                .protocol
+                .maybe_auto_publish(&[paired(53)], &std::collections::HashSet::new())
+                .await
+                .expect("auto-publish runs");
+
+            assert!(events.is_empty(), "got {events:?}");
+            assert_eq!(snapshot_version(&rig).await, Some(1));
+        });
+    }
+
+    /// The fingerprint promotion of a `NoKeys` pairing follows the same
+    /// switch.
+    #[test]
+    fn a_fingerprint_promotion_publishes_nothing_when_sharing_after_pairing_is_off() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 2).await;
+            protect(&mut rig, &[]).await;
+            rig.protocol.sharing_after_pairing = false;
+
+            seed_pending_helper(&mut rig, 53).await;
+            let fingerprint = rig.protocol.get_fingerprint(ChannelId(53)).await.unwrap();
+            rig.protocol
+                .verify_fingerprint(ChannelId(53), &fingerprint)
+                .await
+                .expect("verify_fingerprint");
+
+            assert_eq!(snapshot_version(&rig).await, Some(1));
+        });
+    }
+
+    /// The switch covers pairings only: removing a share holder still
+    /// republishes, so the Helpers that remain get a split the removed one
+    /// has no share of.
+    #[test]
+    fn an_unpair_still_republishes_when_sharing_after_pairing_is_off() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52, 53], 2).await;
+            protect(&mut rig, &[]).await;
+            rig.protocol.sharing_after_pairing = false;
+
+            let events = rig
+                .protocol
+                .maybe_auto_publish(
+                    &[DeRecEvent::Unpaired {
+                        channel_id: ChannelId(53),
+                        acknowledged: true,
+                    }],
+                    &std::collections::HashSet::from([ChannelId(53)]),
+                )
+                .await
+                .expect("auto-publish runs");
+
+            assert!(!events.is_empty(), "the unpair republishes");
+            assert_eq!(snapshot_version(&rig).await, Some(2));
+        });
+    }
+
+    fn discovered(events: &[DeRecEvent]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DeRecEvent::DiscoveryStarted { channel_id, .. } => Some(channel_id.0),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// With discovery after pairing on, the owner asks the new Helper, and
+    /// only it, for its catalog.
+    #[test]
+    fn a_pairing_sends_discovery_when_discovery_after_pairing_is_on() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 2).await;
+            rig.protocol.discovery_after_pairing = true;
+
+            seed_helper(&mut rig.channels, &mut rig.secrets, 53).await;
+            let events = rig
+                .protocol
+                .maybe_discover_after_pairing(&[paired(53)])
+                .await
+                .expect("discovery runs");
+
+            assert_eq!(discovered(&events), vec![53]);
+            assert_eq!(
+                rig.protocol.transport.sent_uris(),
+                vec!["https://helper-53.example".to_owned()]
+            );
+        });
+    }
+
+    /// Every Helper a message pairs is asked, in one fan-out.
+    #[test]
+    fn two_pairings_in_one_message_send_discovery_to_each() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51], 2).await;
+            rig.protocol.discovery_after_pairing = true;
+
+            seed_helper(&mut rig.channels, &mut rig.secrets, 53).await;
+            seed_helper(&mut rig.channels, &mut rig.secrets, 54).await;
+            let events = rig
+                .protocol
+                .maybe_discover_after_pairing(&[paired(53), paired(54)])
+                .await
+                .expect("discovery runs");
+
+            let mut channels = discovered(&events);
+            channels.sort_unstable();
+            assert_eq!(channels, vec![53, 54]);
+            assert_eq!(rig.protocol.transport.sent_uris().len(), 2);
+        });
+    }
+
+    /// Off by default: a pairing sends no Discovery.
+    #[test]
+    fn a_pairing_sends_no_discovery_by_default() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51], 2).await;
+
+            seed_helper(&mut rig.channels, &mut rig.secrets, 53).await;
+            let events = rig
+                .protocol
+                .maybe_discover_after_pairing(&[paired(53)])
+                .await
+                .expect("discovery runs");
+
+            assert!(events.is_empty(), "got {events:?}");
+            assert!(rig.protocol.transport.sent_uris().is_empty());
+        });
+    }
+
+    /// Only the owner discovers: a Helper completing its side of a pairing
+    /// sends nothing.
+    #[test]
+    fn a_helper_side_pairing_sends_no_discovery() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51], 2).await;
+            rig.protocol.discovery_after_pairing = true;
+
+            let events = rig
+                .protocol
+                .maybe_discover_after_pairing(&[DeRecEvent::PairingCompleted {
+                    channel_id: ChannelId(51),
+                    pairing_channel_id: ChannelId(51),
+                    kind: SenderKind::Helper,
+                    peer_communication_info: HashMap::new(),
+                }])
+                .await
+                .expect("discovery runs");
+
+            assert!(events.is_empty(), "got {events:?}");
+            assert!(rig.protocol.transport.sent_uris().is_empty());
+        });
+    }
+
+    /// A `NoKeys` pairing is still `Pending` when it completes: Discovery
+    /// waits for the fingerprint confirmation.
+    #[test]
+    fn a_no_keys_pairing_sends_discovery_on_fingerprint_confirmation() {
+        run_async(async {
+            let mut rig = protocol_rig(&[51, 52], 2).await;
+            rig.protocol.discovery_after_pairing = true;
+            rig.protocol.sharing_after_pairing = false;
+
+            seed_pending_helper(&mut rig, 53).await;
+            let events = rig
+                .protocol
+                .maybe_discover_after_pairing(&[paired(53)])
+                .await
+                .expect("discovery runs");
+            assert!(events.is_empty(), "nothing while Pending: {events:?}");
+
+            let fingerprint = rig.protocol.get_fingerprint(ChannelId(53)).await.unwrap();
+            rig.protocol
+                .verify_fingerprint(ChannelId(53), &fingerprint)
+                .await
+                .expect("verify_fingerprint");
+
+            assert_eq!(
+                rig.protocol.transport.sent_uris(),
+                vec!["https://helper-53.example".to_owned()]
+            );
+        });
+    }
+
     /// An explicit map is the full assignment: a Helper it does not name goes
     /// back to one subshare, and an empty map resets every Helper.
     #[test]

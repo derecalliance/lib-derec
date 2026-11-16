@@ -700,9 +700,9 @@ pub trait DeRecShareStore {
 ///
 /// One `secret_id` maps to at most one [`UserSecrets`] entry — the most
 /// recent snapshot the application handed off via
-/// `start(FlowKind::ProtectSecret)`. The pair-completion auto-publish
-/// hook reads from here so a freshly-paired Helper or Replica receives
-/// the current secret without an explicit re-publish from the app.
+/// `start(FlowKind::ProtectSecret)`. The publishes the library starts on
+/// its own read from here: after a pairing (unless sharing after pairing is
+/// off for a Helper), after an unpair, and after a replica removal.
 ///
 /// # Executor independence
 ///

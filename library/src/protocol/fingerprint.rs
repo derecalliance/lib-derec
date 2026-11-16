@@ -20,7 +20,7 @@ use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::primitives::pairing;
 use crate::protocol::handlers::pairing::claim_own_member;
 use crate::protocol::types::{
-    ChannelQuery, ChannelRecord, ChannelStatus, ReplicaFilter, ReplicaRole,
+    ChannelQuery, ChannelRecord, ChannelStatus, ReplicaFilter, ReplicaRole, Target,
 };
 use crate::transport::TransportPolicy;
 use crate::{Error, Result, types::ChannelId};
@@ -183,7 +183,12 @@ impl<
             .await?;
         }
 
-        if transitioned_replica || transitioned_helper {
+        if transitioned_helper && self.discovery_after_pairing {
+            self.start_auto_discovery(Target::Single(channel_id))
+                .await?;
+        }
+
+        if transitioned_replica || (transitioned_helper && self.sharing_after_pairing) {
             let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;
             let payload = match snapshot {
                 Some(s) => Some((s.secrets, s.description, s.threshold)),

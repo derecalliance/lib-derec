@@ -1953,6 +1953,8 @@ export interface DeRecAutoAcceptConfig {
  *   "auto_accept": { "pairing": true, "store_share": true },
  *   "auto_respond_on_failure": false,
  *   "key_rotation": false,
+ *   "sharing_after_pairing": true,
+ *   "discovery_after_pairing": false,
  *   "auto_reply_to": false,
  *   "unpair_ack": "required",
  *   "unsafe_connection": false,
@@ -1972,6 +1974,8 @@ export interface DeRecProtocolConfig {
   auto_accept?: DeRecAutoAcceptConfig;
   auto_respond_on_failure?: boolean;
   key_rotation?: boolean;
+  sharing_after_pairing?: boolean;
+  discovery_after_pairing?: boolean;
   auto_reply_to?: boolean;
   /** Its name, or the discriminant `0` (`"required"`) / `1`
    *  (`"not_required"`). */
