@@ -14,8 +14,8 @@ import (
 
 func TestCurrentProtocolVersionMatchesCore(t *testing.T) {
 	got := derec.CurrentProtocolVersion()
-	// library/src/protocol_version.rs: CURRENT = { major: 0, minor: 0 }.
-	if want := (derec.ProtocolVersion{Major: 0, Minor: 0}); got != want {
+	// library/src/protocol_version.rs: CURRENT = { major: 0, minor: 1 }.
+	if want := (derec.ProtocolVersion{Major: 0, Minor: 1}); got != want {
 		t.Fatalf("want %+v got %+v", want, got)
 	}
 }

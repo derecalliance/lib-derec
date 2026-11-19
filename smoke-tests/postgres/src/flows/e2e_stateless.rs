@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::{ChannelQuery, ChannelStatus, Secret, Target, UserSecret};
-use derec_library::protocol::{DeRecChannelStore, DeRecFlow};
+use derec_library::protocol::{DeRecChannelStore, DeRecFlow, DeRecUserSecretStore};
 use derec_library::types::ChannelId;
 use derec_proto::{ContactMode, SenderKind};
 use tokio::time::sleep;
@@ -211,7 +211,7 @@ pub async fn run() {
     .await;
     step_7_admit_remaining_replicas(&owner, &helpers, &mut replicas).await;
     let secrets = step_8_protect_more_secrets(&owner, &helpers, &replicas, secrets).await;
-    step_9_remove_a_replica(&owner, &helpers, &mut replicas, &secrets).await;
+    step_9_remove_a_replica(&owner, &helpers, &mut replicas).await;
     step_10_a_silent_helper_is_resolved_by_a_scheduled_tick(
         &mut owner, &helpers, &replicas, &secrets,
     )
@@ -548,8 +548,17 @@ async fn step_7_admit_remaining_replicas(
         },
     )
     .await;
-    for (replica, shares) in replicas.iter().zip([15, 10, 5]) {
-        assert_replica(replica, "step 7", 4, shares).await;
+    // The last device admitted still holds its pairing key: the owner keeps
+    // sending to it there until its answer on the group channel arrives, and
+    // it drops the key once the owner reaches it on the group channel, which
+    // the next publish does. Every earlier joiner has already been reached
+    // there by the round that admitted the next one.
+    for (replica, shares, secrets) in [
+        (&replicas[0], 15, 6),
+        (&replicas[1], 10, 6),
+        (&replicas[2], 5, 7),
+    ] {
+        assert_replica_holding(replica, "step 7", 4, shares, secrets).await;
     }
     assert_helpers(helpers, "step 7").await;
     println!("  step 7: two more replicas admitted — all 4 devices share one roster  ✓");
@@ -631,14 +640,14 @@ async fn step_8_protect_more_secrets(
 
 /// Retire one of the user's devices from the group.
 ///
-/// The evicted device is told to leave, then receives the roster that omits
-/// it; only once it has seen both does it drop its copy of the secret. The
-/// remaining members drop its row and carry on.
+/// `UnpairReplica` tells every member, drops the evicted device on the owner
+/// at once, and publishes the roster without it. The evicted device drops its
+/// copy of the secret as soon as it is told, and is sent nothing more; the
+/// remaining members drop its row when the roster arrives.
 async fn step_9_remove_a_replica(
     owner: &StatelessPeer,
     helpers: &[HelperDevice],
     replicas: &mut Vec<ReplicaDevice>,
-    secrets: &[UserSecret],
 ) {
     let evicted = replicas.pop().expect("three replicas were admitted");
     assert_eq!(evicted.replica_id, REPLICA_FOUR);
@@ -652,17 +661,11 @@ async fn step_9_remove_a_replica(
         .await
         .expect("owner.start(UnpairReplica) failed");
 
-    // The publish that completes the removal has to reach the evictee too —
-    // its absence from that roster is what tells it it may leave.
-    let refs: Vec<&ReplicaDevice> = replicas.iter().chain(iter::once(&evicted)).collect();
-    protect(
-        owner,
-        helpers,
-        &refs,
-        secrets.to_vec(),
-        "roster without the retired tablet",
-    )
-    .await;
+    // The removal publishes the roster itself; nothing else is published.
+    let mut cast: Vec<&StatelessPeer> = vec![owner, &evicted.peer];
+    cast.extend(helpers.iter().map(|h| &h.peer));
+    cast.extend(replicas.iter().map(|r| &r.peer));
+    pump(&cast).await;
 
     let expected = vec![REPLICA_OWNER, REPLICA_TWO, REPLICA_THREE];
     assert_eq!(
@@ -794,9 +797,28 @@ async fn admit_replica(
         .await
         .expect("replica verify_fingerprint");
 
-    // Admission triggers the sync that carries the new member to the current
-    // version. That publish is a full round: every helper and every member
-    // already in the group receives it, not only the newcomer.
+    // With both sides confirmed, the owner's application publishes the latest
+    // snapshot: that is the sync that carries the new member to the current
+    // version. It is a full round: every helper and every member already in
+    // the group receives it, not only the newcomer.
+    let mut session = owner.session();
+    let latest = session
+        .user_secret_store
+        .load_latest(SECRET_ID)
+        .await
+        .expect("owner load_latest");
+    let (secrets, description) = latest
+        .map(|s| (s.secrets, s.description))
+        .unwrap_or_default();
+    session
+        .start(DeRecFlow::ProtectSecret {
+            secrets,
+            description,
+            weights: HashMap::new(),
+            threshold: None,
+        })
+        .await
+        .expect("the application's publish after confirming failed");
     let mut cast: Vec<&StatelessPeer> = vec![owner, &replica.peer];
     cast.extend(helpers.iter().map(|h| &h.peer));
     cast.extend(already_admitted.iter().map(|r| &r.peer));
@@ -1446,6 +1468,16 @@ async fn assert_helpers(helpers: &[HelperDevice], step: &str) {
 /// the mirrored share map for every version it synced since joining, one row
 /// per helper per version, so it can verify those helpers itself.
 async fn assert_replica(replica: &ReplicaDevice, step: &str, members: i64, shares: i64) {
+    assert_replica_holding(replica, step, members, shares, 6).await;
+}
+
+async fn assert_replica_holding(
+    replica: &ReplicaDevice,
+    step: &str,
+    members: i64,
+    shares: i64,
+    secrets: i64,
+) {
     assert_tables(
         &replica.peer.client(),
         SECRET_ID,
@@ -1454,7 +1486,7 @@ async fn assert_replica(replica: &ReplicaDevice, step: &str, members: i64, share
         Tables {
             channels: 5,
             replica_members: members,
-            secrets: 6,
+            secrets,
             shares,
             user_secrets: 1,
             ..Default::default()

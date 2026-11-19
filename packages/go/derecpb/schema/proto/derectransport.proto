@@ -25,9 +25,15 @@ import "google/protobuf/empty.proto";
 ///
 /// # Security
 ///
-/// This service provides no security guarantees of its own. Every
-/// `DeRecMessage` carries its payload signed and encrypted at the
-/// application layer, and remains valid regardless of transport.
+/// This service provides no security guarantees of its own. On an established
+/// channel, every `DeRecMessage` payload is encrypted and authenticated with
+/// AES-256-GCM under the channel's shared key at the application layer; the
+/// pairing messages are protected by the pairing handshake instead. Messages
+/// are not signed. The envelope header is not covered by the authentication
+/// tag: the receiver binds `timestamp` and the protocol version to copies in
+/// the authenticated payload, and `channelId` selects the key, so none of
+/// them can be altered undetected; `sequence` and `traceId` carry no
+/// authenticated meaning. A message remains valid regardless of transport.
 service DeRecTransport {
   /// Deliver one DeRec envelope to this endpoint.
   ///

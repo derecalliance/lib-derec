@@ -11,3 +11,4 @@ derec-library = { path = "../../library" }
 derec-proto = { path = "../../protobufs" }
 prost = "0.14.4"
 
+serde_json = "1.0.151"

@@ -52,11 +52,15 @@ use crate::derec_message::{apply_trace_id, current_timestamp};
 use crate::extensions::advertised_endpoints::reply_to_owned;
 use crate::extensions::channel_store::{ChannelStoreExt as _, send_channel_message};
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
+#[cfg(target_arch = "wasm32")]
+use crate::interop::wasm::now_secs;
 use crate::primitives::unpairing::UnpairingError;
 use crate::protocol::context::{Exchange, Local, Round};
 use crate::protocol::obligation;
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{ChannelQuery, ChannelRecord, ChannelStatus};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::utils::now_secs;
 use crate::{
     Error, Result,
     primitives::unpairing::{
@@ -115,7 +119,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     channel_id: ChannelId,
     memo: Option<String>,
     unpair_ack: UnpairAck,
-    now: u64,
+    drop_on_rejection: bool,
     round: &Round<'_>,
 ) -> Result<Vec<DeRecEvent>> {
     let secret_id = local.secret_id;
@@ -160,7 +164,8 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
                     secret_id,
                     StateItem::PendingUnpair {
                         channel_id,
-                        started_at: now,
+                        started_at: now_secs(),
+                        drop_on_rejection,
                     },
                 )
                 .await?;
@@ -332,16 +337,16 @@ async fn on_response<S: StoreSet>(
     exchange: &Exchange<'_>,
     response: &UnpairResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
-    if !stores
-        .state
-        .remove(
-            local.secret_id,
-            StateKey::PendingUnpair {
-                channel_id: exchange.channel_id,
-            },
-        )
-        .await?
-    {
+    let pending = StateKey::PendingUnpair {
+        channel_id: exchange.channel_id,
+    };
+    let Some(StateItem::PendingUnpair {
+        drop_on_rejection, ..
+    }) = stores.state.load(local.secret_id, pending.clone()).await?
+    else {
+        return Ok(vec![DeRecEvent::NoOp]);
+    };
+    if !stores.state.remove(local.secret_id, pending).await? {
         return Ok(vec![DeRecEvent::NoOp]);
     }
 
@@ -351,6 +356,21 @@ async fn on_response<S: StoreSet>(
             Ok(vec![DeRecEvent::Unpaired {
                 channel_id: exchange.channel_id,
             }])
+        }
+        Err(Error::Unpairing(UnpairingError::NonOkStatus { status, memo }))
+            if drop_on_rejection =>
+        {
+            drop_channel_state(stores, local, exchange.channel_id).await?;
+            Ok(vec![
+                DeRecEvent::UnpairRejected {
+                    channel_id: exchange.channel_id,
+                    status,
+                    memo,
+                },
+                DeRecEvent::Unpaired {
+                    channel_id: exchange.channel_id,
+                },
+            ])
         }
         Err(Error::Unpairing(UnpairingError::NonOkStatus { status, memo })) => {
             set_status(

@@ -7,11 +7,10 @@ use crate::extensions::contact_message::ContactMessageExt as _;
 use crate::extensions::pair_request::PairRequestMessageExt as _;
 use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::primitives::pairing::PairingError;
-use crate::utils::verify_timestamps;
+use crate::utils::{verify_protocol_version, verify_timestamps};
 use crate::{
     Error,
-    derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_plaintext_message},
-    protocol_version::ProtocolVersion,
+    derec_message::{DeRecMessageBuilder, current_timestamp, open_plaintext_message},
     types::ChannelId,
     utils::{generate_seed, random_u64},
 };
@@ -497,17 +496,12 @@ pub fn produce_pre_pair_request(
         timestamp: Some(timestamp),
     };
 
-    let protocol_version = ProtocolVersion::current();
-    let envelope = DeRecMessage {
-        protocol_version_major: protocol_version.major,
-        protocol_version_minor: protocol_version.minor,
-        sequence: 0,
-        channel_id: contact_message.channel_id,
-        timestamp: Some(timestamp),
-        message: MessageBody::PrePairRequest(request).encode_to_vec(),
-        trace_id: 0,
-    }
-    .encode_to_vec();
+    let envelope = DeRecMessageBuilder::plaintext()
+        .channel_id(ChannelId(contact_message.channel_id))
+        .timestamp(timestamp)
+        .message_body(MessageBody::PrePairRequest(request))
+        .build()?
+        .encode_to_vec();
 
     #[cfg(feature = "logging")]
     tracing::info!("PrePair request envelope produced");
@@ -633,18 +627,20 @@ pub fn extract(
     let plaintext = pairing_envelope::decrypt(&envelope.message, ecies_secret_key)
         .map_err(PairingError::PairingEncryption)?;
 
-    let request =
-        match MessageBody::decode_from_vec(plaintext.as_slice()).map_err(Error::ProtobufDecode)? {
-            MessageBody::PairRequest(r) => r,
-            _ => {
-                #[cfg(feature = "logging")]
-                tracing::warn!("unexpected message type; expected PairRequestMessage");
+    let (body, version) =
+        MessageBody::decode_versioned(plaintext.as_slice()).map_err(Error::ProtobufDecode)?;
+    verify_protocol_version(&envelope, version)?;
+    let request = match body {
+        MessageBody::PairRequest(r) => r,
+        _ => {
+            #[cfg(feature = "logging")]
+            tracing::warn!("unexpected message type; expected PairRequestMessage");
 
-                return Err(Error::Invariant(
-                    "Invalid message. Expected: PairRequestMessage",
-                ));
-            }
-        };
+            return Err(Error::Invariant(
+                "Invalid message. Expected: PairRequestMessage",
+            ));
+        }
+    };
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
@@ -706,7 +702,7 @@ pub fn extract(
 pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, Error> {
     let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
-    let request = match extract_inner_plaintext_message(&envelope.message)? {
+    let request = match open_plaintext_message(&envelope)? {
         MessageBody::PrePairRequest(r) => r,
         _ => {
             #[cfg(feature = "logging")]

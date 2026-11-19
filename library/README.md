@@ -12,7 +12,8 @@ targets, and is the reference implementation maintained by the **DeRec
 Alliance**.
 
 > [!WARNING]
-> This is a pre-release version. APIs may change until 0.1.0.
+> This is a pre-release version. APIs may change in any 0.x release; breaking
+> changes are listed in the CHANGELOG with migration notes.
 
 ---
 
@@ -666,34 +667,72 @@ ignored this way.
 
 ### Replays and reflections
 
+Replay protection inside the inbound window is the application's job, by
+design: the application owns the transport, so it is the one place every
+envelope passes through. The library bounds a message's age and keeps each
+flow safe to repeat; it does not remember which messages it has seen.
+
 `process` ignores a message older than `Timeouts::inbound_message`, but
 within that window it processes every copy of a message it is handed. Both
 ends of a channel encrypt under one key, so a message this device sent,
-delivered back to it, decrypts as if the peer had sent it. Detecting both is
-the job of the application's transport layer, keyed on
-`derec_message::message_id(envelope)`:
+delivered back to it, decrypts as if the peer had sent it. `sequence` is not
+a replay counter and is not checked. Detecting both replays and reflections
+is the application's job, and how it does so is its choice. Two properties
+are worth knowing when choosing:
 
-- `id` is a SHA-256 of the envelope's encrypted `message` field. It is the
-  same for every copy of one message and different for every other message.
-  The cleartext fields around it (`sequence`, `traceId`, the protocol
-  version) are not authenticated and an envelope can be re-encoded, so never
-  key on a hash of the raw bytes.
-- Keep the `id` of every envelope this device sends, and of every envelope
-  `process` accepted (it returned `Ok` without `MessageIgnored`), until
-  `max(received or sent at, timestamp) + inbound_message`. Drop an inbound
-  envelope whose `id` is kept, without calling `process`.
-- Keep the record across restarts, or hold inbound traffic for one window
-  after starting.
+- The envelope's encrypted `message` field cannot be changed without
+  failing decryption, and differs for every message, since each is sealed
+  under a fresh random nonce. `sequence` and `traceId` are not
+  authenticated, and an envelope can be re-encoded, so a copy can arrive as
+  different bytes: a hash of the raw envelope does not identify a message.
+- A copy can arrive for as long as the inbound window lasts, measured from
+  the later of its arrival and its envelope `timestamp` (a message stamped
+  ahead of this device's clock stays inside the window until that time has
+  passed), including after a restart.
+
+A sender that retries by building the message again draws a new nonce, so
+its retry is a new message; each flow below is safe to receive twice for
+that reason.
+
+**The protocol version.** The envelope's version is copied into the
+encrypted payload and checked like the timestamp, so it cannot be changed
+undetected: a message whose copy differs is reported as `MessageIgnored`
+with `IgnoreReason::ProtocolVersionMismatch`. A message from an earlier
+release carries no copy, which reads as 0.0, its envelope's version.
+`DeRecProtocolBuilder::with_min_protocol_version` (default 0.0, every
+version) stops accepting older releases: once every peer runs 0.1.0 or
+later, raise it to 0.1, and a message naming an older version is reported
+as `MessageIgnored` with `IgnoreReason::ProtocolVersionTooOld` and nothing
+in it is read, stored or answered.
+
+**Choosing the window.** The protocol does not fix one; the default is 300
+seconds. It has to cover the longest a message can take to arrive plus the
+clock difference between devices, or legitimate messages are dropped as
+`MessageIgnored` with `IgnoreReason::Expired`. A store-and-forward relay
+with devices offline for long periods may need much longer, such as an
+hour. A longer window is also a longer time during which a captured message
+can be replayed, so any duplicate record the application keeps must cover
+it: its size grows with the window and the traffic in it.
+
+**What each flow does with a message it has already handled:**
+
+| Message received again | Outcome |
+|---|---|
+| `StoreShareRequest`, same version, same bytes | Acknowledged again; nothing is rewritten |
+| `StoreShareRequest`, same version, different bytes | Refused with `VERSION_CONFLICT` |
+| `StoreShareRequest` for a version older than the newest stored on the channel, and not stored itself | Ignored as `MessageIgnored` with `IgnoreReason::Superseded`, unanswered: a dropped version never comes back |
+| A replica's `StoreShareRequest` carrying the secret | The held version from the same author is acknowledged again; an older one is refused with `VERSION_CONFLICT` |
+| `VerifyShareRequest`, `GetShareRequest` | Answered again, encrypted to the channel's recorded endpoints |
+| `VerifyShareResponse` to a challenge a newer one replaced | Ignored as `MessageIgnored` with `IgnoreReason::StaleResponse` |
+| `UnpairRequest` after the unpair completed | The channel is gone, so `process` fails with an unknown-channel error |
+| `UpdateChannelInfoRequest` | **Applied again**, which can roll the peer's endpoints back to an older set |
 
 A message held back and delivered late is a first delivery, so no record
-catches it. A `StoreShareRequest` for a version older than the newest one a
-helper stores on the channel, and not stored itself, is ignored as
-`MessageIgnored` with `IgnoreReason::Superseded`, so a dropped version never
-comes back. A contact update is the application's to order: the `timestamp`
-of the envelope that raised an `UpdateChannelInfo` `ActionRequired` is when
-the update was sent, and an update older than the last one accepted on the
-channel should be rejected. That needs `AutoAcceptPolicy::update_channel_info`
-off.
+catches it. That is what makes a contact update the application's to order:
+the `timestamp` of the envelope that raised an `UpdateChannelInfo`
+`ActionRequired` is when the update was sent, and an update older than the
+last one accepted on the channel should be rejected. That needs
+`AutoAcceptPolicy::update_channel_info` off.
 
 ### When `process` fails
 
@@ -2548,7 +2587,10 @@ in either case. Meanwhile the channel is `ChannelStatus::Unpairing`: it keeps
 its key, so the reply can be read, but no flow selects it, so a publish
 started in that window does not hand the departing helper a share. A
 non-`Ok` reply emits `UnpairRejected` and returns the channel to `Paired`.
-`restore` unpairs its recovery channels the same way.
+`restore` unpairs its recovery channels the same way, except that a refusal
+does not keep one: it emits `UnpairRejected`, then `Unpaired`, and the
+channel is dropped. Its helper also holds a restored channel, so keeping
+both would hand that helper two shares of every later split.
 
 `UnpairAck::NotRequired` drops local state immediately on `start(Unpair)`.
 The peer still answers, and since the channel is gone, `process` fails on
@@ -2606,9 +2648,8 @@ Applications using this SDK should ensure:
   keychain-grade — see the trait doc).
 - Proper authentication of helpers.
 - Safe transport channels.
-- Detection of replayed and reflected messages within the inbound window,
-  keyed on `derec_message::message_id` (see
-  [Replays and reflections](#replays-and-reflections)).
+- Detection of replayed and reflected messages within the inbound window
+  (see [Replays and reflections](#replays-and-reflections)).
 
 The DeRec protocol assumes helpers are independent and trusted entities.
 

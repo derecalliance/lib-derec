@@ -70,7 +70,7 @@ func (b *JSONByteArray) UnmarshalJSON(data []byte) error {
 // refuses a release where they disagree — so a build of this package knows
 // exactly the field set of the core it will call. The marker therefore
 // describes the shape being written, which is the shape of these structs.
-const ChannelRecordSchemaVersion uint8 = 3
+const ChannelRecordSchemaVersion uint8 = 4
 
 // Field order matters: these are compared byte-for-byte against the Rust
 // serializer's output, and encoding/json emits struct fields in declaration
@@ -96,6 +96,7 @@ type replicaMemberWire struct {
 	Role              ReplicaRole       `json:"role"`
 	Status            ChannelStatus     `json:"status"`
 	CreatedAt         uint64            `json:"created_at"`
+	HandoverChannel   *uint64           `json:"handover_channel,omitempty"`
 }
 
 type channelRecordWire struct {
@@ -141,6 +142,7 @@ func memberToWire(m ReplicaMember) replicaMemberWire {
 		Role:              m.Role,
 		Status:            m.Status,
 		CreatedAt:         m.CreatedAt,
+		HandoverChannel:   m.HandoverChannel,
 	}
 }
 
@@ -165,6 +167,7 @@ func memberFromWire(w replicaMemberWire) ReplicaMember {
 		Role:              w.Role,
 		Status:            w.Status,
 		CreatedAt:         w.CreatedAt,
+		HandoverChannel:   w.HandoverChannel,
 	}
 }
 
@@ -443,6 +446,9 @@ type stateItemWire struct {
 	// Threshold is SharingRound only. Absent on rows written before 0.0.9,
 	// which the library judges against the builder's threshold.
 	Threshold *uint32 `json:"threshold,omitempty"`
+	// DropOnRejection is PendingUnpair only. Written only when true; absent
+	// on rows written before 0.1.0, which decode as false.
+	DropOnRejection bool `json:"drop_on_rejection,omitempty"`
 }
 
 type replicaDiscoveryWire struct {
@@ -508,6 +514,8 @@ func EncodeStateItem(item StateItem) ([]byte, error) {
 			pending := stringifyUint64s(item.Pending)
 			w.Pending = &pending
 		}
+	case StateKindPendingUnpair:
+		w.DropOnRejection = item.DropOnRejection
 	case StateKindSharingRound:
 		pending := stringifyUint64s(item.Pending)
 		confirmed := stringifyUint64s(item.Confirmed)
@@ -587,6 +595,7 @@ func DecodeStateItem(data []byte) (StateItem, error) {
 	}
 	item.KeepVersion = w.KeepVersion
 	item.Threshold = w.Threshold
+	item.DropOnRejection = w.DropOnRejection
 	if w.Reported != nil {
 		item.Reported = make(map[uint64]uint32, len(*w.Reported))
 		for _, r := range *w.Reported {

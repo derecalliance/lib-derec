@@ -502,6 +502,32 @@ async fn cross_confirm_fingerprint(owner: &mut Peer, replica: &mut Peer, channel
         .verify_fingerprint(channel_id, &owner_fp)
         .await
         .unwrap();
+    publish_after_confirming(owner).await;
+}
+
+/// What the owner's application does once both sides of a replica pairing
+/// have confirmed: publish the latest snapshot, or an empty one when there is
+/// none, so the joiner receives the vault, the roster and the group key.
+async fn publish_after_confirming(source: &mut Peer) {
+    let latest = source
+        .protocol
+        .user_secret_store
+        .load_latest(PROTECTED_SECRET_ID)
+        .await
+        .expect("source load_latest failed");
+    let (secrets, description) = latest
+        .map(|s| (s.secrets, s.description))
+        .unwrap_or_default();
+    source
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets,
+            description,
+            weights: HashMap::new(),
+            threshold: None,
+        })
+        .await
+        .expect("the application's publish after confirming failed");
 }
 
 async fn helper_start_pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) {

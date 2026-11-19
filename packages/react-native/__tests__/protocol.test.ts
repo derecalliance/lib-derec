@@ -86,6 +86,16 @@ describe('DeRecProtocolBuilder', () => {
     expect(lastConfig).not.toHaveProperty('max_subshares');
   });
 
+  it('sends min_protocol_version as {major, minor}', () => {
+    baseBuilder().withMinProtocolVersion(0, 1).build();
+    expect(lastConfig!.min_protocol_version).toEqual({ major: 0, minor: 1 });
+  });
+
+  it('omits min_protocol_version when never configured', () => {
+    baseBuilder().build();
+    expect(lastConfig).not.toHaveProperty('min_protocol_version');
+  });
+
   it('does not clamp threshold', () => {
     baseBuilder().withThreshold(0).build();
     expect(lastConfig!.threshold).toBe(0);

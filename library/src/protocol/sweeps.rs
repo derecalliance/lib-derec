@@ -781,6 +781,7 @@ impl<
                 StateItem::PendingUnpair {
                     channel_id,
                     started_at,
+                    ..
                 } if now.saturating_sub(started_at) > self.timeouts.unpair_ack.as_secs() => {
                     Some(channel_id)
                 }
@@ -930,42 +931,6 @@ impl<
                 threshold_met,
             });
 
-            let mut removed_replicas: Vec<u64> = Vec::new();
-            // An empty `ids` is "every member", not "no member", so a round
-            // that synced nobody must not reach the store at all.
-            let leaving = if synced_replicas.is_empty() {
-                Ok(Vec::new())
-            } else {
-                self.channel_store
-                    .replicas_matching(
-                        self.secret_id,
-                        ReplicaFilter {
-                            ids: synced_replicas.iter().copied().collect(),
-                            status: vec![ChannelStatus::Unpairing],
-                            ..Default::default()
-                        },
-                    )
-                    .await
-            };
-            if let Ok(roster) = leaving {
-                for member in roster {
-                    if self
-                        .channel_store
-                        .remove(
-                            self.secret_id,
-                            ChannelQuery::Replica {
-                                channel_id: member.channel_id,
-                                replica_id: member.replica_id,
-                            },
-                        )
-                        .await
-                        .is_ok()
-                    {
-                        removed_replicas.push(member.replica_id.0);
-                    }
-                }
-            }
-
             if !synced_replicas.is_empty() || !behind_replicas.is_empty() {
                 let mut synced: Vec<u64> = synced_replicas.iter().map(|r| r.0).collect();
                 let mut behind: Vec<u64> = behind_replicas.iter().map(|r| r.0).collect();
@@ -986,11 +951,6 @@ impl<
                     synced,
                     behind,
                 });
-            }
-
-            removed_replicas.sort_unstable();
-            for replica_id in removed_replicas {
-                produced.push(DeRecEvent::ReplicaRemoved { replica_id });
             }
 
             #[cfg(feature = "logging")]
@@ -1145,6 +1105,7 @@ mod expired_channel_sweep_tests {
                     role: ReplicaRole::Destination,
                     status,
                     created_at: now_secs().saturating_sub(age_secs),
+                    handover_channel: None,
                 }),
             )
             .await
@@ -1378,6 +1339,7 @@ mod expired_channel_sweep_tests {
                     role: ReplicaRole::Destination,
                     status,
                     created_at: now_secs().saturating_sub(age_secs),
+                    handover_channel: None,
                 }),
             )
             .await
@@ -1558,8 +1520,8 @@ mod sharing_round_outcome_tests {
 
     use crate::primitives::sharing::request;
     use crate::protocol::types::{
-        ChannelRecord, ChannelStatus, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember,
-        ReplicaRole, Secret, SharingRoundState, UserSecret,
+        ChannelRecord, ChannelStatus, HelperChannel, HelperFilter, Secret, SharingRoundState,
+        UserSecret,
     };
     use crate::protocol::{CollectedShare, ExpiredChannelCleanup};
     use derec_proto::{
@@ -1855,6 +1817,7 @@ mod sharing_round_outcome_tests {
                     StateItem::PendingUnpair {
                         channel_id: ChannelId(4242),
                         started_at: now_secs().saturating_sub(600),
+                        drop_on_rejection: false,
                     },
                 )
                 .await
@@ -1900,6 +1863,7 @@ mod sharing_round_outcome_tests {
                     StateItem::PendingUnpair {
                         channel_id: ChannelId(4242),
                         started_at: now_secs(),
+                        drop_on_rejection: false,
                     },
                 )
                 .await
@@ -2271,155 +2235,6 @@ mod sharing_round_outcome_tests {
                     .expect("load")
                     .is_some(),
                 "the round is still in flight"
-            );
-        });
-    }
-
-    /// The publisher drops a departing member's row once that member has
-    /// acknowledged the version excluding it.
-    ///
-    /// Reconciliation normally runs when a roster *arrives*, but the device
-    /// that ran the removal never receives the roster it just sent. Without a
-    /// publisher-side pass it would keep the flagged row forever and keep
-    /// addressing a member that has already torn itself down — the removal
-    /// would converge everywhere except on the device that ordered it.
-    #[test]
-    fn the_publisher_drops_a_departing_member_once_it_acknowledges() {
-        run_async(async {
-            let mut protocol = build(2);
-            seed_round(&mut protocol, 7, &[9001], &[1002, 1003]).await;
-
-            for (id, status) in [
-                (1002u64, ChannelStatus::Paired),
-                (1003, ChannelStatus::Unpairing),
-            ] {
-                protocol
-                    .channel_store
-                    .save(
-                        SECRET_ID,
-                        ChannelRecord::Replica(ReplicaMember {
-                            channel_id: ChannelId(5001),
-                            replica_id: ReplicaId(id),
-                            transports: vec![TransportProtocol {
-                                uri: "https://peer.example".to_owned(),
-                                protocol: Protocol::Https as i32,
-                            }],
-                            communication_info: HashMap::new(),
-                            role: ReplicaRole::Destination,
-                            status,
-                            created_at: 0,
-                        }),
-                    )
-                    .await
-                    .expect("seed member");
-            }
-
-            let mut events = vec![
-                DeRecEvent::ShareConfirmed {
-                    channel_id: ChannelId(9001),
-                    version: 7,
-                },
-                DeRecEvent::ReplicaSecretAcked {
-                    channel_id: ChannelId(5001),
-                    from_replica_id: 1002,
-                    secret_id: SECRET_ID,
-                    version: 7,
-                    status: 0,
-                    memo: String::new(),
-                },
-                DeRecEvent::ReplicaSecretAcked {
-                    channel_id: ChannelId(5001),
-                    from_replica_id: 1003,
-                    secret_id: SECRET_ID,
-                    version: 7,
-                    status: 0,
-                    memo: String::new(),
-                },
-            ];
-            protocol.update_sharing_round(&mut events).await;
-
-            let remaining: Vec<u64> = protocol
-                .channel_store
-                .replicas(SECRET_ID, ReplicaFilter::default())
-                .await
-                .expect("roster")
-                .into_iter()
-                .map(|m| m.replica_id.0)
-                .collect();
-            assert_eq!(
-                remaining,
-                vec![1002],
-                "the acknowledged departing member is gone; the other survives"
-            );
-            assert!(
-                events.iter().any(|e| matches!(
-                    e,
-                    DeRecEvent::ReplicaRemoved { replica_id } if *replica_id == 1003
-                )),
-                "the removal is reported to the application; got {events:?}"
-            );
-        });
-    }
-
-    /// A member flagged as leaving that has **not** acknowledged keeps its row.
-    ///
-    /// Its departure is not complete until it has seen the excluding version,
-    /// and dropping it early would stop the publisher addressing the very
-    /// member it still needs to reach.
-    #[test]
-    fn a_departing_member_that_has_not_answered_is_kept() {
-        run_async(async {
-            let mut protocol = build(2);
-            seed_round(&mut protocol, 7, &[9001], &[1002]).await;
-
-            protocol
-                .channel_store
-                .save(
-                    SECRET_ID,
-                    ChannelRecord::Replica(ReplicaMember {
-                        channel_id: ChannelId(5001),
-                        replica_id: ReplicaId(1003),
-                        transports: vec![TransportProtocol {
-                            uri: "https://peer.example".to_owned(),
-                            protocol: Protocol::Https as i32,
-                        }],
-                        communication_info: HashMap::new(),
-                        role: ReplicaRole::Destination,
-                        status: ChannelStatus::Unpairing,
-                        created_at: 0,
-                    }),
-                )
-                .await
-                .expect("seed member");
-
-            let mut events = vec![
-                DeRecEvent::ShareConfirmed {
-                    channel_id: ChannelId(9001),
-                    version: 7,
-                },
-                DeRecEvent::ReplicaSecretAcked {
-                    channel_id: ChannelId(5001),
-                    from_replica_id: 1002,
-                    secret_id: SECRET_ID,
-                    version: 7,
-                    status: 0,
-                    memo: String::new(),
-                },
-            ];
-            protocol.update_sharing_round(&mut events).await;
-
-            let remaining: Vec<u64> = protocol
-                .channel_store
-                .replicas(SECRET_ID, ReplicaFilter::default())
-                .await
-                .expect("roster")
-                .into_iter()
-                .map(|m| m.replica_id.0)
-                .collect();
-            assert_eq!(
-                remaining,
-                vec![1003],
-                "an unacknowledged departure leaves the row in place"
             );
         });
     }

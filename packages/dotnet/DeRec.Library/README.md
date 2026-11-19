@@ -823,19 +823,41 @@ where either or both are absent, is ignored as `MessageIgnoredEvent` with
 
 Within the inbound window `ProcessAsync` handles every copy of a message it is
 given, including one of this device's own messages delivered back to it.
-Detecting both is the app's transport's job: `Envelope.ReadMessageId(bytes)`
-returns an `Id` that is the same for every copy of one message, whatever its
-unauthenticated fields (sequence, trace id, protocol version) say, and a
-`Timestamp`. Keep the `Id` of every envelope you send and of every envelope
-`ProcessAsync` accepted (no exception and no `MessageIgnoredEvent`) until
-`max(received or sent at, Timestamp) + InboundMessage`, drop an inbound
-envelope whose `Id` you kept, and keep the record across restarts. Never key
-on a hash of the raw bytes. A helper ignores a `StoreShareRequest` for a
+Detecting both is the application's job, and how it does so is its choice.
+The envelope's encrypted `message` field cannot be changed without failing
+decryption and differs for every message, so it identifies one; never key on
+a hash of the raw envelope, since `sequence` and `traceId` are not
+authenticated and a copy can arrive as different bytes. A copy can arrive for
+as long as the inbound window lasts, measured from the later of its arrival
+and its envelope timestamp, including after a restart, so whatever record the
+app keeps has to cover that span and survive restarts. A helper ignores a `StoreShareRequest` for a
 version older than the newest it stores on the channel, and not stored
 itself, as `MessageIgnoredEvent` with `IgnoreReason.Superseded`, unanswered.
+The envelope's protocol version is copied into the encrypted payload and
+checked like the timestamp, so it cannot be changed undetected: a message whose
+copy differs is ignored as `MessageIgnoredEvent` with
+`IgnoreReason.ProtocolVersionMismatch`. A message from an earlier release
+carries no copy, which reads as 0.0, its envelope's version.
+`WithMinProtocolVersion(major, minor)` (default 0.0, every version) stops
+accepting older releases: once every peer runs 0.1.0 or later, raise it to
+0.1, and a message naming an older version is ignored as `MessageIgnoredEvent`
+with `IgnoreReason.ProtocolVersionTooOld`: nothing is decrypted, stored or
+answered.
 Reject a contact update older than the last one you accepted on the channel,
 using the `Timestamp` of the envelope that raised it; that needs auto-accept
 off for `UpdateChannelInfo`.
+
+Replay protection inside the window is the application's job by design, since
+the application owns the transport; `sequence` is not a replay counter.
+Every message is encrypted under a fresh nonce, so a sender that retries by
+building the message again sends a new message, and each flow is safe to
+receive twice. Choose `Timeouts.InboundMessage` to cover the longest a message can take
+to arrive plus the clock difference between devices (default 300 seconds; a
+store-and-forward relay with devices offline for long periods may need an
+hour); a longer window is a longer replay exposure, so a duplicate record
+must cover all of it. What each flow does with a message it already handled is in
+[Replays and
+reflections](https://github.com/derecalliance/lib-derec/tree/main/library#replays-and-reflections).
 
 A pairing has a lifetime, `Timeouts.Pairing` (default 30 s). Both sides
 enforce it and nothing is sent on expiry: `StartAsync(FlowKind.Pairing, …)`
@@ -955,13 +977,15 @@ The record reads and writes the canonical JSON shared by every SDK
   "unsafe_connection": false,
   "communication_info": { "name": "alice" },
   "own_transports": [{ "uri": "https://me.example.com/derec", "protocol": "https" }],
-  "replica_id": "9007199254740993"
+  "replica_id": "9007199254740993",
+  "min_protocol_version": { "major": 0, "minor": 1 }
 }
 ```
 
 Keys are `snake_case` and every key is optional. `replica_id` and
 `max_subshares` are decimal strings, so values above 2^53 survive. Timeouts
-are whole seconds. **An unknown key fails the read** with a `JsonException`
+are whole seconds. `min_protocol_version` is `{ "major", "minor" }`, both
+numbers. **An unknown key fails the read** with a `JsonException`
 naming it, at every level, so a misspelled setting is never silently dropped.
 Serializing a `DeRecProtocolConfig` writes the same shape, which is also what
 `Build()` sends to the library.

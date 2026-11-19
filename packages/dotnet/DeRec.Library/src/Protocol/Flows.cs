@@ -280,28 +280,58 @@ public sealed record ReplicaDiscoveryParams;
 /// member is rejected, not silently ignored.
 /// </para>
 /// <para>
-/// <b>Starting this flow removes nothing on its own</b> and emits no
-/// <c>ReplicaRemovedEvent</c>. It tells every member and flags the target
-/// locally; the removal completes only once the application publishes a
-/// roster omitting that member — an ordinary
-/// <see cref="FlowKind.ProtectSecret"/> — at which point
-/// <c>ReplicaRemovedEvent</c> fires. A group with no secret to publish
-/// therefore cannot complete a removal.
+/// <see cref="DeRecProtocol.StartAsync"/> tells every member, the departing
+/// one included, and then:
+/// </para>
+/// <list type="bullet">
+/// <item><description><b>Removing another member:</b> drops it on this device
+/// at once, with any key only it used, and emits
+/// <see cref="ReplicaRemovedEvent"/>.</description></item>
+/// <item><description><b>Removing this device:</b> keeps its own row out of
+/// the roster for the publish below, then drops this device's whole
+/// <c>secret_id</c> partition and emits
+/// <see cref="SelfRemovedFromGroupEvent"/>.</description></item>
+/// </list>
+/// <para>
+/// Either way it then publishes the latest snapshot, or an empty payload when
+/// there is none, with a roster that omits the member: the events of that round
+/// follow, as for <see cref="FlowKind.ProtectSecret"/>. The application does
+/// not publish anything itself to complete a removal.
+/// </para>
+/// <para>
+/// The departing member is on no distribution list from then on: it receives
+/// nothing more. Every other member flags it when told and drops it, with
+/// <see cref="ReplicaRemovedEvent"/>, once that roster arrives. Absence from a
+/// roster alone never removes anyone, since a device may hold members a roster
+/// has not caught up with yet.
+/// </para>
+/// <para>
+/// When this device removes itself, the remaining members acknowledge the
+/// publish after it has dropped the group channel;
+/// <see cref="DeRecProtocol.ProcessAsync"/> fails those acknowledgements with
+/// an unknown-channel error, which the application can disregard.
 /// </para>
 /// <para>
 /// Any member may remove any member, the source included: a lost or stolen
 /// source must be removable by the devices that remain, and the library checks
 /// no role. Ask the user before starting this flow, above all when it names the
 /// source. Removing the source promotes the first remaining member in the order
-/// <c>IChannelStore.ListReplicas</c> returns. The removed member is not asked
-/// and gets no event when told to leave: when a roster excluding it arrives it
-/// drops its whole <c>secret_id</c> partition and emits
-/// <see cref="SelfRemovedFromGroupEvent"/>. The secret survives on the
-/// remaining members and the helpers.
+/// <c>IChannelStore.ListReplicas</c> returns; the device running this flow
+/// decides, and every other member reads the result from the roster. Removing a
+/// sole source dissolves the group.
 /// </para>
 /// <para>
-/// Removal does not replace the group key, so it relies on the removed
-/// device's library deleting its copy. That covers a lost or stolen device
+/// The removed member is not asked. When the notice naming it arrives, it drops
+/// its whole <c>secret_id</c> partition automatically and emits
+/// <see cref="SelfRemovedFromGroupEvent"/>. If the notice is lost, it keeps
+/// what it held, but it is sent nothing new and the remaining members refuse
+/// its messages once the roster without it has reached them. The secret
+/// survives on the remaining members and the helpers.
+/// </para>
+/// <para>
+/// Removal does not replace the group key. The remaining members keep
+/// publishing under it, and nothing more is sent to the removed member, but
+/// removal still relies on the removed device's library deleting its copy. That covers a lost or stolen device
 /// whose storage was not read. Whoever read a device's storage keeps the group
 /// key and can decrypt every later publication it obtains, the one completing
 /// the removal included.
@@ -933,9 +963,15 @@ public sealed record ReplicaSecretReceivedEvent : DeRecEvent
 }
 
 /// <summary>
-/// A member left the group and its roster row was dropped. Fires on the
-/// members that remain.
+/// A member was removed from the group and its roster row dropped. Fires on
+/// the device that ran the removal, when it starts it, and on every other
+/// remaining member when the roster without the member arrives. The departing
+/// device instead emits <see cref="SelfRemovedFromGroupEvent"/>.
 /// </summary>
+/// <remarks>
+/// The group key is unchanged, so a removed device whose storage was read can
+/// still decrypt later publications; see <see cref="UnpairReplicaParams"/>.
+/// </remarks>
 public sealed record ReplicaRemovedEvent : DeRecEvent
 {
     public override string EventType => "ReplicaRemoved";
@@ -956,9 +992,13 @@ public sealed record ReplicaSourceChangedEvent : DeRecEvent
 
 /// <summary>
 /// This device left the group and dropped its whole <c>SecretId</c>
-/// partition. Fires only once it was told to leave and has since seen a
-/// roster excluding it. The teardown is automatic: this device is not asked
-/// first and gets no earlier event.
+/// partition: group channel, helper channels, shares, secrets and the
+/// user-secret snapshot. Fires when this device is told to leave, when it
+/// removes itself after publishing the roster without it, or when a roster
+/// excluding it arrives after it was told to leave by a device on an earlier
+/// release. The teardown is automatic: this device is not asked first and gets
+/// no earlier event. The secret survives on the remaining members and the
+/// helpers.
 /// </summary>
 public sealed record SelfRemovedFromGroupEvent : DeRecEvent
 {
@@ -1196,6 +1236,23 @@ public static class IgnoreReason
     /// and not answered.
     /// </summary>
     public const string Superseded = "Superseded";
+
+    /// <summary>
+    /// The envelope names a protocol version older than the minimum this
+    /// device accepts (<see cref="DeRecProtocolBuilder.WithMinProtocolVersion"/>).
+    /// Checked before anything else, so nothing is decrypted, stored or
+    /// answered.
+    /// </summary>
+    public const string ProtocolVersionTooOld = "ProtocolVersionTooOld";
+
+    /// <summary>
+    /// The envelope's protocol version and the copy inside the encrypted
+    /// payload differ: the envelope was altered, or built by a non-conforming
+    /// peer. A payload from a release that writes no version reads as 0.0,
+    /// the version such a release puts on its envelope. Checked after
+    /// decryption and before dispatch, like <see cref="TimestampMismatch"/>.
+    /// </summary>
+    public const string ProtocolVersionMismatch = "ProtocolVersionMismatch";
 }
 
 /// <summary>

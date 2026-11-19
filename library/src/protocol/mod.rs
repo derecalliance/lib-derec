@@ -126,6 +126,7 @@ pub use handlers::restore::RestoreError;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
 use crate::protocol::types::Timeouts;
+use crate::protocol_version::ProtocolVersion;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
 
@@ -213,6 +214,8 @@ pub struct DeRecProtocol<
     pub(crate) communication_info: HashMap<String, String>,
     /// Configured via [`DeRecProtocolBuilder::with_auto_respond_on_failure`](crate::protocol::DeRecProtocolBuilder::with_auto_respond_on_failure).
     pub(crate) auto_respond_on_failure: bool,
+    /// Configured via [`DeRecProtocolBuilder::with_min_protocol_version`](crate::protocol::DeRecProtocolBuilder::with_min_protocol_version).
+    pub(crate) min_protocol_version: ProtocolVersion,
     /// Configured via [`DeRecProtocolBuilder::with_auto_reply_to`](crate::protocol::DeRecProtocolBuilder::with_auto_reply_to).
     ///
     /// When `true`, every outbound request envelope carries

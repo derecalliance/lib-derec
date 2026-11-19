@@ -186,10 +186,11 @@ type ContactMessage struct {
 	// `contactBindingHash` does not cover this field. An attacker able to
 	// rewrite an out-of-band contact can therefore remove entries. Removing
 	// the secure ones leaves only plaintext, which the recipient's transport
-	// policy refuses unless plaintext has been explicitly opted into. DeRec
-	// messages are signed and encrypted at the application layer on every
-	// transport, so substituting one secure transport for another is not a
-	// loss of confidentiality or authenticity.
+	// policy refuses unless plaintext has been explicitly opted into. On an
+	// established channel DeRec messages are encrypted and authenticated with
+	// AES-256-GCM at the application layer on every transport, so substituting
+	// one secure transport for another is not a loss of confidentiality or
+	// authenticity.
 	SupportedTransports []*TransportProtocol `protobuf:"bytes,9,rep,name=supportedTransports,proto3" json:"supportedTransports,omitempty"`
 	// The creator's commitment to the fingerprint nonce it reveals in
 	// `PairResponseMessage.fingerprintNonce`:

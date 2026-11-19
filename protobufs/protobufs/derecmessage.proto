@@ -81,9 +81,9 @@ package org.derecalliance.derec.protobuf;
 // encrypt under one key, so a message delivered back to its own sender
 // decrypts there too. The transport MUST:
 //
-// - identify an envelope by a hash of its `message` field only. `sequence`,
-//  `traceId` and the protocol version are not authenticated, and an
-//  envelope can be re-encoded, so a copy can arrive as different bytes;
+// - identify an envelope by a hash of its `message` field only. `sequence`
+//  and `traceId` are not authenticated, and an envelope can be re-encoded,
+//  so a copy can arrive as different bytes;
 // - keep the identity of every envelope it accepted and of every envelope
 //  it sent until the later of its arrival (or sending) and its `timestamp`,
 //  plus the inbound-message window, and drop an inbound envelope whose
@@ -146,6 +146,11 @@ message DeRecMessage {
   // Not yet implemented by this library: a sender may set this field, but it
   // is not checked on receipt, and it does not trigger key rotation. Replay
   // protection currently relies on `timestamp`.
+  //
+  // Unlike `timestamp` and the protocol version, this field has no copy in
+  // the encrypted payload, so it is not authenticated: it can be changed in
+  // transit without failing decryption. Giving it a meaning requires such a
+  // copy, checked on receipt.
   uint32 sequence = 3;
 
   // Channel identifier associated with this communication session.
@@ -177,12 +182,11 @@ message DeRecMessage {
 
   // Encrypted message payload.
   //
-  // This field contains the encrypted bytes of a serialized MessageBody.
-  // The encryption scheme and key material are defined by the pairing process
-  // and subsequent key management flows.
-  //
-  // Upon decryption, this field MUST deserialize into a valid MessageBody
-  // containing exactly one protocol message.
+  // This field contains the encrypted bytes of a serialized DeRecPayload,
+  // which carries exactly one protocol message. The encryption scheme and key
+  // material are defined by the pairing process and subsequent key management
+  // flows. The `PrePair` leg of pairing, sent before any key exists, carries
+  // the DeRecPayload unencrypted.
   bytes message = 6;
 
   // Application-supplied correlation token, echoed verbatim by the
@@ -245,4 +249,31 @@ message DeRecMessage {
       PrePairResponseMessage prePairResponseMessage = 17;
     }
   }
+}
+
+// The payload a DeRecMessage carries in `message`: one protocol message,
+// identified by name, and a copy of the envelope's protocol version.
+//
+// Fields 1 and 2 are those of google.protobuf.Any, so a reader that decodes
+// the payload as Any reads the same message and skips fields 3 and 4.
+//
+// The receiver checks that the copied version equals the envelope's
+// `protocolVersionMajor` and `protocolVersionMinor`, and discards the message
+// otherwise, as it does for the timestamp. The payload is encrypted and
+// authenticated, so the envelope's version cannot be changed undetected. A
+// payload from a release that writes no version reads as 0.0, the version
+// such a release puts on its envelope.
+message DeRecPayload {
+  // `type.derec.org/` followed by the message's name, e.g.
+  // `type.derec.org/StoreShareRequestMessage`.
+  string type_url = 1;
+
+  // The encoded protocol message.
+  bytes value = 2;
+
+  // Copy of the envelope's `protocolVersionMajor`.
+  uint32 protocolVersionMajor = 3;
+
+  // Copy of the envelope's `protocolVersionMinor`.
+  uint32 protocolVersionMinor = 4;
 }

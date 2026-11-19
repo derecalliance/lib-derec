@@ -10,7 +10,7 @@ public readonly struct ProtocolVersion
     public uint Major { get; }
     public uint Minor { get; }
 
-    internal ProtocolVersion(uint major, uint minor)
+    public ProtocolVersion(uint major, uint minor)
     {
         Major = major;
         Minor = minor;

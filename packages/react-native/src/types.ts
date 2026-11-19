@@ -868,11 +868,13 @@ export type ReplicaDiscoveryParams = Record<string, never>;
  *  source must be removable by the devices that remain, and the library
  *  checks no role. Ask the user before starting this flow, above all when it
  *  names the source. Removing the source promotes the first remaining member
- *  in the order the channel store's `listReplicas` returns. The removed
- *  member is not asked and gets no event when told to leave: when a roster
- *  excluding it arrives it drops its whole `secret_id` partition and emits
- *  `SelfRemovedFromGroup`. The secret survives on the remaining members and
- *  the helpers.
+ *  in the order the channel store's `listReplicas` returns; removing a sole
+ *  source dissolves the group. The removed member is not asked: when the
+ *  notice naming it arrives it drops its whole `secret_id` partition and
+ *  emits `SelfRemovedFromGroup`. If the notice is lost it keeps what it held,
+ *  but it is sent nothing new and the remaining members refuse its messages
+ *  once the roster without it has reached them. The secret survives on the
+ *  remaining members and the helpers.
  *
  *  Removal does not replace the group key, so it relies on the removed
  *  device's library deleting its copy. That covers a lost or stolen device
@@ -1005,7 +1007,9 @@ export type DeRecEvent =
    *  display. */
   | { type: "ReplicaSyncFailed"; replica_id: string; version: number; reason: string }
   /** A member left the group and its roster row was dropped. Fires on the
-   *  members that remain. */
+   *  device that ran the removal, when it starts it, and on every other
+   *  remaining member when the roster without the member arrives. The
+   *  departing device reports `SelfRemovedFromGroup` instead. */
   | { type: "ReplicaRemoved"; replica_id: string }
   /** The group's source role moved to another member because the previous
    *  source is leaving. Fires on the device that chose the successor — which
@@ -1014,9 +1018,11 @@ export type DeRecEvent =
   | { type: "ReplicaSourceChanged"; replica_id: string }
   /** This device left the group and dropped its whole `secret_id` partition —
    *  group channel, helper channels, shares, secrets and the snapshot. Fires
-   *  only once it was told to leave *and* has since seen a roster excluding
-   *  it; absence alone never destroys a copy of the secret. The teardown is
-   *  automatic: this device is not asked first and gets no earlier event. */
+   *  when this device is told to leave, when it removes itself after
+   *  publishing the roster without it, or when a roster excluding it arrives
+   *  after it was told to leave by a device on an earlier release. The
+   *  teardown is automatic: this device is not asked first and gets no
+   *  earlier event. */
   | { type: "SelfRemovedFromGroup"; version: number }
   /** A replica catch-up finished. `fetched_from` is absent when this device
    *  was already current, in which case no hydration event follows. */
@@ -1509,8 +1515,15 @@ export type DeRecEvent =
    *  outstanding challenge is kept. `"Superseded"` means a
    *  `StoreShareRequest` for a version older than the newest one this
    *  helper stores on the channel, and not stored itself; it is not stored
-   *  and not answered. `trace_id` matches the peer's
-   *  `*Started` event for the same round (`"0"` when the sender set none). */
+   *  and not answered. `"ProtocolVersionTooOld"` means the envelope names a
+   *  protocol version older than the one set with `withMinProtocolVersion`;
+   *  nothing is decrypted, stored or answered. `"ProtocolVersionMismatch"`
+   *  means the envelope's protocol version and the copy inside the
+   *  encrypted payload differ: the envelope was altered or built by a
+   *  non-conforming peer; a payload from a release that writes no version
+   *  reads as 0.0, the version such a release puts on its envelope.
+   *  `trace_id` matches the peer's `*Started` event for the same round
+   *  (`"0"` when the sender set none). */
   | {
       type: "MessageIgnored";
       channel_id: string;
@@ -1582,7 +1595,9 @@ export type DeRecEvent =
    *  `UnpairAck.Required` the channel is now `"Unpairing"`, and an
    *  `Unpaired` event follows once the peer acknowledges or the
    *  acknowledgement window elapses, or `UnpairRejected` if the peer
-   *  refuses (the channel is `"Paired"` again). Under
+   *  refuses: after `start(Unpair)` the channel is `"Paired"` again; a
+   *  recovery channel `restore` unpaired is dropped instead, and
+   *  `Unpaired` follows the `UnpairRejected`. Under
    *  `UnpairAck.NotRequired`, `Unpaired` follows in the same event vec. */
   | { type: "UnpairFailed"; channel_id: string; error: string }
   | { type: "UnpairStarted"; channel_id: string; trace_id: string }
@@ -1711,7 +1726,7 @@ export interface CommunicationInfo {
 
 /** Why a `MessageIgnored` event dropped a message. Matches the Rust
  *  `IgnoreReason` discriminants one-for-one. */
-export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse" | "Superseded";
+export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse" | "Superseded" | "ProtocolVersionTooOld" | "ProtocolVersionMismatch";
 
 /** Why a `PeerNotRestored` event left a roster entry without a channel.
  *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */
@@ -1830,7 +1845,8 @@ export interface DeRecAutoAcceptConfig {
  *   "unsafe_connection": false,
  *   "communication_info": { "name": "alice" },
  *   "own_transports": [{ "uri": "https://me.example.com/derec", "protocol": "https" }],
- *   "replica_id": "9007199254740993"
+ *   "replica_id": "9007199254740993",
+ *   "min_protocol_version": { "major": 0, "minor": 1 }
  * }
  * ```
  */
@@ -1853,6 +1869,7 @@ export interface DeRecProtocolConfig {
   /** Decimal string. A `bigint` is rejected; call
    *  `DeRecProtocolBuilder.withReplicaId` directly for a `bigint`. */
   replica_id?: string;
+  min_protocol_version?: { major: number; minor: number };
 }
 
 export interface PairRequestMessage {
@@ -2150,10 +2167,3 @@ export interface DiscoveryProcessResult {
   secret_list: SecretVersionEntry[];
 }
 
-/** The identity of one delivered message; see `envelope.message_id`. */
-export interface MessageId {
-  /** SHA-256 of the envelope's encrypted `message` field. */
-  id: Uint8Array;
-  /** The envelope's send time, in seconds since the Unix epoch. */
-  timestamp: bigint;
-}

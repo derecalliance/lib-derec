@@ -27,6 +27,7 @@ use crate::derec_message;
 use crate::interop::wasm::now_secs;
 use crate::protocol::types::Secret;
 use crate::protocol::types::SharingRoundState;
+use crate::protocol::types::StateKey;
 use crate::protocol::types::Target;
 use crate::protocol::types::UserSecret;
 use crate::types::ReplicaId;
@@ -120,14 +121,19 @@ impl<
                 .await
             }
             DeRecFlow::UnpairReplica { replica_id, memo } => {
-                handlers::replicas::unpairing::start(
+                let mut events = handlers::replicas::unpairing::start(
                     &mut borrow_stores!(self),
                     &local!(self),
                     replica_id,
                     memo,
                     trace_id,
                 )
-                .await
+                .await?;
+                events.extend(self.publish_after_replica_removal(round).await?);
+                if self.replica_id == Some(replica_id) {
+                    events.push(self.leave_replica_group().await?);
+                }
+                Ok(events)
             }
             DeRecFlow::Unpair { channel_id, memo } => {
                 self.start_unpair(channel_id, memo, round).await
@@ -303,6 +309,47 @@ impl<
             self.unpair_ack,
         )
         .await
+    }
+
+    /// Publish the roster that completes a replica removal, right after
+    /// [`handlers::replicas::unpairing::start`] took the member out.
+    ///
+    /// The latest snapshot is published, or an empty payload when there is
+    /// none: the roster is what the removal needs. It reaches every remaining
+    /// member and the helpers; the departing member is no longer on the
+    /// distribution list.
+    async fn publish_after_replica_removal(
+        &mut self,
+        round: &Round<'_>,
+    ) -> Result<Vec<DeRecEvent>> {
+        let (secrets, description) = self
+            .user_secret_store
+            .load_latest(self.secret_id)
+            .await?
+            .map(|held| (held.secrets, held.description))
+            .unwrap_or_default();
+        self.start_protect_secret(secrets, description, None, None, round)
+            .await
+    }
+
+    /// Drop this device's whole `secret_id` partition after it removed itself
+    /// from the replica group and published the roster without it.
+    async fn leave_replica_group(&mut self) -> Result<DeRecEvent> {
+        let version = self
+            .user_secret_store
+            .load_latest(self.secret_id)
+            .await?
+            .map_or(0, |held| held.version);
+        handlers::replicas::unpairing::tear_down(&mut borrow_stores!(self), &local!(self)).await?;
+        let _ = self
+            .state_store
+            .remove(self.secret_id, StateKey::SharingRound { version })
+            .await;
+
+        #[cfg(feature = "logging")]
+        tracing::info!(version, "left the replica group; partition dropped");
+
+        Ok(DeRecEvent::SelfRemovedFromGroup { version })
     }
 
     /// Run one publish round: VSS-split for Helpers when the threshold is
@@ -556,7 +603,7 @@ impl<
             channel_id,
             memo,
             self.unpair_ack,
-            now_secs(),
+            false,
             round,
         )
         .await

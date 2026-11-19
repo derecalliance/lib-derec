@@ -443,6 +443,7 @@ fn seeded_member(channel_id: u64, replica_id: u64) -> ChannelRecord {
         role: ReplicaRole::Destination,
         status: ChannelStatus::Pending,
         created_at: 1_700_000_000,
+        handover_channel: None,
     })
 }
 

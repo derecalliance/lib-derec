@@ -1345,6 +1345,7 @@ mod pointer_forwarding_tests {
                     StateItem::PendingUnpair {
                         channel_id: ChannelId(4242),
                         started_at: 1_700_000_000,
+                        drop_on_rejection: false,
                     },
                 )
                 .await

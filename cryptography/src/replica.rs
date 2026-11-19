@@ -53,8 +53,8 @@ fn compute_digits(shared_key: &[u8; 32]) -> [u8; 16] {
     let hash = Sha256::digest(shared_key);
     let mut digits = [0u8; 16];
 
-    for (i, chunk) in hash.chunks_exact(2).enumerate() {
-        let value = u16::from_be_bytes([chunk[0], chunk[1]]);
+    for (i, chunk) in hash.as_chunks::<2>().0.iter().enumerate() {
+        let value = u16::from_be_bytes(*chunk);
         digits[i] = (value % 10) as u8;
     }
 

@@ -1,0 +1,26 @@
+[package]
+name = "derec-compat-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Self-contained workspace. The released versions below share their package
+# names with the in-tree crates, so keeping them out of the main workspace's
+# lockfile keeps `cargo -p derec-library` unambiguous there. Nothing here is
+# patched to the in-tree sources: each release must build exactly as
+# published, against its own proto and cryptography crates.
+[workspace]
+
+[dev-dependencies]
+derec-library = { path = "../library" }
+derec-proto = { path = "../protobufs" }
+prost = "0.14.4"
+tokio = { version = "1.53.1", features = ["rt"], default-features = false }
+# The released versions a peer may still run, exercised against the in-tree
+# build. Pinned exactly: each is a fixed point the wire must stay compatible
+# with.
+derec-library-0-0-10 = { package = "derec-library", version = "=0.0.10" }
+derec-library-0-0-11 = { package = "derec-library", version = "=0.0.11" }
+derec-proto-0-0-10 = { package = "derec-proto", version = "=0.0.10" }
+derec-proto-0-0-11 = { package = "derec-proto", version = "=0.0.11" }
+serde_json = "1.0.151"

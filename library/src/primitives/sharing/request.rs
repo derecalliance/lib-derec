@@ -6,7 +6,7 @@ use crate::extensions::request_message::RequestMessageExt as _;
 use crate::primitives::sharing::SharingError;
 use crate::{
     Error,
-    derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
+    derec_message::{DeRecMessageBuilder, current_timestamp, open_channel_message},
     types::{ChannelId, SharedKey, WeightedChannel},
     utils::{generate_seed, verify_timestamps},
 };
@@ -402,7 +402,7 @@ pub(crate) fn validate_keep_version(keep_version: u32, version: u32) -> Result<(
 pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractResult, Error> {
     let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
-    let request = match extract_inner_message(&envelope.message, shared_key)? {
+    let request = match open_channel_message(&envelope, shared_key)? {
         MessageBody::StoreShareRequest(message) => message,
         _ => {
             #[cfg(feature = "logging")]

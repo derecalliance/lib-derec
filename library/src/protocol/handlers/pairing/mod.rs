@@ -554,6 +554,7 @@ pub(in crate::protocol) async fn claim_own_member<S: StoreSet>(
                 role,
                 status: ChannelStatus::Paired,
                 created_at: now_secs(),
+                handover_channel: None,
             }),
         )
         .await?;

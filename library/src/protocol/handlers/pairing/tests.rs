@@ -528,6 +528,7 @@ mod prepair_record_shape_tests {
                         role: ReplicaRole::Source,
                         status: ChannelStatus::Pending,
                         created_at: 0,
+                        handover_channel: None,
                     }),
                 )
                 .await
@@ -589,6 +590,7 @@ mod prepair_record_shape_tests {
                 role: ReplicaRole::Destination,
                 status: ChannelStatus::Pending,
                 created_at: 0,
+                handover_channel: None,
             });
         });
     }
@@ -683,6 +685,7 @@ mod replica_id_conflict_tests {
                     role: ReplicaRole::Source,
                     status: ChannelStatus::Paired,
                     created_at: 0,
+                    handover_channel: None,
                 }),
             )
             .await
@@ -1146,6 +1149,7 @@ mod own_member_channel_tests {
                         role: ReplicaRole::Source,
                         status: ChannelStatus::Paired,
                         created_at: 0,
+                        handover_channel: None,
                     }),
                 )
                 .await
@@ -1253,6 +1257,7 @@ mod channel_in_use_tests {
                     role: ReplicaRole::Destination,
                     status: ChannelStatus::Paired,
                     created_at: 1_700_000_000,
+                    handover_channel: None,
                 }),
             )
             .await

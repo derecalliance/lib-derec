@@ -86,7 +86,8 @@ func TestDeRecProtocolConfig_FullFixtureSetsEveryField(t *testing.T) {
 			{URI: "https://me.example.com/derec", Protocol: int32(derecpb.Protocol_HTTPS)},
 			{URI: "grpcs://me.example.com:443", Protocol: int32(derecpb.Protocol_GRPC)},
 		},
-		ReplicaID: proto.Uint64(9007199254740993),
+		ReplicaID:          proto.Uint64(9007199254740993),
+		MinProtocolVersion: &derec.ProtocolVersion{Major: 0, Minor: 1},
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("fixture `full`:\n got  %+v\n want %+v", cfg, want)

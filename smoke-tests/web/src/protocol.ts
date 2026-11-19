@@ -8,7 +8,7 @@
 // resolve them by BFS closure, key shares for lookup, and record transport
 // calls for assertions; they are Map-backed instead of localStorage-backed.
 
-import { channelFilterMatches, ContactMode, DeRecProtocol, DeRecProtocolBuilder, envelope, FlowKind, SenderKind, StatusEnum, generate_replica_id, primitives, shareStoreRefusal } from "@derec-alliance/web";
+import { channelFilterMatches, ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, StatusEnum, generate_replica_id, primitives, shareStoreRefusal } from "@derec-alliance/web";
 import type {
   ChannelStatusName,
   ChannelStore,
@@ -31,6 +31,7 @@ import type {
   UserSecrets,
 } from "@derec-alliance/web";
 import protocolConfigFixtures from "../../../library/tests/fixtures/protocol_config.json";
+import legacyMessages from "../../../library/tests/fixtures/legacy_messages.json";
 
 /**
  * The unrestricted filters, for assertions that want the whole listing.
@@ -485,6 +486,7 @@ function makeNode(
     channelStore?: InMemoryChannelStore;
     autoRespondOnFailure?: boolean;
     timeouts?: import("@derec-alliance/web").Timeouts;
+    minProtocolVersion?: { major: number; minor: number };
   } = {},
 ): Node {
   const channelStore = options.channelStore ?? new InMemoryChannelStore();
@@ -527,6 +529,12 @@ function makeNode(
   }
   if (options.timeouts !== undefined) {
     builder = builder.withTimeouts(options.timeouts);
+  }
+  if (options.minProtocolVersion !== undefined) {
+    builder = builder.withMinProtocolVersion(
+      options.minProtocolVersion.major,
+      options.minProtocolVersion.minor,
+    );
   }
   const protocol = builder.build();
   return { protocol, transport, channelStore, shareStore, secretStore, userSecretStore, stateStore };
@@ -2710,6 +2718,171 @@ async function runRestoreKeepsHelperDutiesFlow(): Promise<void> {
 }
 
 /**
+ * After `restore` the device holds two channels to every helper it recovered
+ * from: the restored one and the recovery channel it collected the share on,
+ * which `restore` unpairs. A helper that refuses that unpair does not keep
+ * the recovery channel: the owner reports `UnpairRejected`, then `Unpaired`,
+ * and drops it, so every later split hands that helper one share, on its
+ * restored channel.
+ */
+async function runRestoreUnpairRefusedFlow(): Promise<void> {
+  console.log("=== [Protocol] Restore Unpair Refused Flow ===\n");
+
+  const secretId = 4646n;
+  const lost: AddressedNode = {
+    node: makeNode("lost-device", "https://lost.example.com", { secretId }),
+    uri: "https://lost.example.com",
+  };
+  const helperA: AddressedNode = {
+    node: makeNode("helper-a", "https://helper-a.example.com"),
+    uri: "https://helper-a.example.com",
+  };
+  const helperB: AddressedNode = {
+    node: makeNode("helper-b", "https://helper-b.example.com"),
+    uri: "https://helper-b.example.com",
+  };
+  const { longTermChannelId: channelA } = await doPair(helperA.node, lost.node, 1n, "Lost↔HelperA");
+  const { longTermChannelId: channelB } = await doPair(helperB.node, lost.node, 2n, "Lost↔HelperB");
+  const version = await protectAcross(lost, [helperA, helperB], "own secret");
+
+  const device: AddressedNode = {
+    node: makeNode("new-device", "https://device.example.com", { secretId }),
+    uri: "https://device.example.com",
+  };
+  const deviceSid = String(device.node.protocol.secretId());
+
+  const recoveryChannels: string[] = [];
+  for (const [helper, original, transient] of [
+    [helperA, channelA, 100n],
+    [helperB, channelB, 101n],
+  ] as const) {
+    const contact: ContactMessage = await device.node.protocol.createContact(transient, ContactMode.InlineKeys);
+    await helper.node.protocol.start(FlowKind.Pairing, { kind: SenderKind.Helper, contact });
+    const events = await pumpAll([device, helper]);
+    const paired = events.find(
+      (e) => e.type === "PairingCompleted" && e.pairing_channel_id === String(transient),
+    ) as Extract<DeRecEvent, { type: "PairingCompleted" }> | undefined;
+    if (!paired) {
+      throw new Error(`the recovery pairing on ${transient} completes: [${events.map((e) => e.type).join(", ")}]`);
+    }
+    await helper.node.channelStore.linkChannel(
+      String(helper.node.protocol.secretId()),
+      original,
+      paired.channel_id,
+    );
+    recoveryChannels.push(paired.channel_id);
+  }
+  const [recoveryA, recoveryB] = recoveryChannels as [string, string];
+  if (new Set([recoveryA, recoveryB, channelA, channelB]).size !== 4) {
+    throw new Error("each recovery channel is distinct from the channel it recovers");
+  }
+
+  await device.node.protocol.start(FlowKind.RecoverSecret, { secretId, version });
+  const recovered = requireEvent(
+    await pumpAll([device, helperA, helperB]),
+    "SecretRecovered",
+    "Device",
+  ).secret;
+  console.log("  [Device]  recovers over recovery channels to both helpers  ✓");
+
+  const restoreEvents = await device.node.protocol.restore(recovered, version);
+  const started = restoreEvents.flatMap((e) => (e.type === "UnpairStarted" ? [e.channel_id] : []));
+  expectSame("restore unpairs both recovery channels", [...started].sort(), [recoveryA, recoveryB].sort());
+
+  // Helper A accepts the unpair; helper B's app refuses it.
+  const requests = device.node.transport.drain();
+  if (requests.length !== 2) {
+    throw new Error(`restore sends one UnpairRequest per recovery channel, got ${requests.length}`);
+  }
+  const ownerEvents: DeRecEvent[] = [];
+  let refused = false;
+  for (const request of requests) {
+    if (request.endpoint.uri === helperA.uri) {
+      const events = await processAll(helperA.node, request.message);
+      requireEvent(events, "Unpaired", "HelperA");
+      ownerEvents.push(...(await device.node.protocol.process(drainOne(helperA.node, "HelperA"))));
+    } else if (request.endpoint.uri === helperB.uri) {
+      const events = await helperB.node.protocol.process(request.message);
+      const action = requireEvent(events, "ActionRequired", "HelperB");
+      if (action.action_kind !== "Unpair" || action.channel_id !== recoveryB) {
+        throw new Error(
+          `HelperB: expected ActionRequired(Unpair) on ${recoveryB}, got ${action.action_kind} on ${action.channel_id}`,
+        );
+      }
+      await helperB.node.protocol.reject(action.action, StatusEnum.Rejected, "keep the channel");
+      ownerEvents.push(...(await device.node.protocol.process(drainOne(helperB.node, "HelperB"))));
+      refused = true;
+    } else {
+      throw new Error(`UnpairRequest addressed to an unknown peer ${request.endpoint.uri}`);
+    }
+  }
+  if (!refused) throw new Error("helper B received the UnpairRequest");
+  console.log("  [HelperB] ActionRequired(Unpair) on its recovery channel → reject(Rejected)  ✓");
+
+  const onB = ownerEvents.filter(
+    (e) => (e.type === "UnpairRejected" || e.type === "Unpaired") && e.channel_id === recoveryB,
+  );
+  expectSame("events for the refused recovery channel", onB.map((e) => e.type), ["UnpairRejected", "Unpaired"]);
+  const rejected = onB[0] as Extract<DeRecEvent, { type: "UnpairRejected" }>;
+  if (rejected.status !== StatusEnum.Rejected || rejected.memo !== "keep the channel") {
+    throw new Error(`UnpairRejected carries the refusal: got ${rejected.status} "${rejected.memo}"`);
+  }
+  if (ownerEvents.some((e) => e.type === "UnpairRejected" && e.channel_id !== recoveryB)) {
+    throw new Error("only the refused recovery channel reports UnpairRejected");
+  }
+  requireEvent(
+    ownerEvents.filter((e) => e.type === "Unpaired" && e.channel_id === recoveryA),
+    "Unpaired",
+    "Device (accepted recovery channel)",
+  );
+  console.log(`  [Device]  UnpairRejected then Unpaired on refused recovery channel ${recoveryB}  ✓`);
+
+  for (const recoveryChannel of [recoveryA, recoveryB]) {
+    if ((await device.node.channelStore.load(deviceSid, recoveryChannel, "0")) !== null) {
+      throw new Error(`recovery channel ${recoveryChannel} is gone from the channel store`);
+    }
+  }
+  for (const restoredChannel of [channelA, channelB]) {
+    const bytes = await device.node.channelStore.load(deviceSid, restoredChannel, "0");
+    if (!bytes) throw new Error(`restored channel ${restoredChannel} is in the channel store`);
+    const status = JSON.parse(new TextDecoder().decode(bytes)).Helper.status;
+    if (status !== "Paired") {
+      throw new Error(`restored channel ${restoredChannel} is Paired, got ${status}`);
+    }
+  }
+  console.log("  [Device]  both recovery channels dropped; restored channels Paired  ✓");
+
+  const protectEvents = await device.node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([10]), name: "after restore", data: new TextEncoder().encode("after restore") }],
+  });
+  const targets = protectEvents.flatMap((e) => (e.type === "ProtectSecretStarted" ? [e.channel_id] : []));
+  expectSame("ProtectSecret targets after restore", [...targets].sort(), [channelA, channelB].sort());
+  const nextVersion = requireEvent(protectEvents, "ProtectSecretStarted", "Device").version;
+  const sent = device.node.transport.drain();
+  expectSame(
+    "ProtectSecret requests per helper",
+    sent.map((m) => m.endpoint.uri).sort(),
+    [helperA.uri, helperB.uri].sort(),
+  );
+  for (const m of sent) {
+    const [helper, label, channel] =
+      m.endpoint.uri === helperA.uri ? [helperA, "HelperA", channelA] : [helperB, "HelperB", channelB];
+    const stored = (await processAll(helper.node, m.message)).flatMap((e) =>
+      e.type === "ShareStored" ? [e.channel_id] : [],
+    );
+    expectSame(`${label} stores its share on the restored channel`, stored, [channel]);
+    helper.node.transport.drain();
+  }
+  const heldB = await helperB.node.shareStore.load(String(helperB.node.protocol.secretId()), recoveryB, [nextVersion]);
+  if (heldB.length !== 0) {
+    throw new Error(`helper B holds no v${nextVersion} share on the refused recovery channel`);
+  }
+  console.log(`  [Device]  ProtectSecret v${nextVersion} sends one share per helper, on the restored channels  ✓`);
+
+  console.log("\n✓ Restore unpair refused flow passed.\n");
+}
+
+/**
  * Start a replica pairing from `scanner`, as `kind`, against a fresh contact
  * from `creator` at `transient`.
  */
@@ -3352,15 +3525,12 @@ async function runReplicaPairingAndSecretSyncFlow(): Promise<void> {
   await destination.protocol.verifyFingerprint(replicaChannel, ownerFp);
   console.log(`  fingerprint cross-confirmed (${ownerFp.length} chars)  ✓`);
 
-  // verifyFingerprint auto-publishes an empty-secret roster snapshot
-  // to every paired peer (2 helpers + 1 replica) so the newly-Paired
-  // Destination receives the current state without an explicit
-  // ProtectSecret call. Drain that round here — the assertions below
-  // target the subsequent explicit publish.
+  // Confirming a replica destination publishes nothing; the application
+  // publishes once both sides confirmed.
   const autoPublish = owner.transport.drain();
-  if (autoPublish.length !== 3) {
+  if (autoPublish.length !== 0) {
     throw new Error(
-      `verifyFingerprint auto-publish must fan out to 2 helpers + 1 replica (v=1, empty secrets), got ${autoPublish.length}`,
+      `confirming a replica destination publishes nothing; the application publishes, got ${autoPublish.length} messages`,
     );
   }
 
@@ -3977,77 +4147,6 @@ async function runInvalidKeepVersionFlow(): Promise<void> {
 }
 
 /**
- * The application's replay record: the identity of every envelope a device
- * sent or accepted, keyed on `envelope.message_id`.
- */
-class SeenEnvelopes {
-  private readonly ids = new Set<string>();
-
-  private static idOf(bytes: Uint8Array): string {
-    return Array.from(envelope.message_id(bytes).id, (b) => b.toString(16).padStart(2, "0")).join("");
-  }
-
-  record(bytes: Uint8Array): void {
-    this.ids.add(SeenEnvelopes.idOf(bytes));
-  }
-
-  contains(bytes: Uint8Array): boolean {
-    return this.ids.has(SeenEnvelopes.idOf(bytes));
-  }
-}
-
-function raisedUpdateChannelInfo(events: DeRecEvent[]): boolean {
-  return events.some((e) => e.type === "ActionRequired" && e.action_kind === "UpdateChannelInfo");
-}
-
-/**
- * The library processes every copy of a message delivered within the inbound
- * window, including one delivered back to its own sender. An application that
- * records the message id of what it sends and accepts drops a replay, a copy
- * whose unauthenticated trace id was changed, and a reflection.
- */
-async function runReplayDetectionFlow(): Promise<void> {
-  console.log("=== [Protocol] Replay detection ===\n");
-
-  const helper = makeNode("Helper", "https://helper.example.com");
-  const owner = makeNode("Owner", "https://owner.example.com");
-  const { longTermChannelId } = await doPair(helper, owner, 61n, "ReplayDetection");
-  owner.transport.drain();
-  const ownerSeen = new SeenEnvelopes();
-  const helperSeen = new SeenEnvelopes();
-
-  await owner.protocol.start(FlowKind.UpdateChannelInfo, {
-    target: BigInt(longTermChannelId),
-    communication_info: { name: "owner-renamed" },
-  });
-  const update = drainOne(owner, "Owner");
-  ownerSeen.record(update);
-
-  if (helperSeen.contains(update)) throw new Error("a first delivery is not in the record");
-  let events = await helper.protocol.process(update);
-  if (!raisedUpdateChannelInfo(events)) {
-    throw new Error(`the update must raise ActionRequired; got ${JSON.stringify(events.map((e) => e.type))}`);
-  }
-  helperSeen.record(update);
-
-  const restamped = envelope.apply_trace_id(update, 0x7e57n);
-  if (byteArraysEqual(restamped, update)) throw new Error("the copy travels as different bytes");
-  if (!helperSeen.contains(update) || !helperSeen.contains(restamped)) {
-    throw new Error("the replay and the re-stamped copy must be recognised");
-  }
-  events = await helper.protocol.process(restamped);
-  if (!raisedUpdateChannelInfo(events)) throw new Error("unchecked, the library processes the copy again");
-  console.log("  [Helper] replay and re-stamped copy share the original's message id  ✓");
-
-  if (!ownerSeen.contains(update)) throw new Error("the reflection must be recognised");
-  events = await owner.protocol.process(update);
-  if (!raisedUpdateChannelInfo(events)) throw new Error("unchecked, the library reads its own update as the peer's");
-  console.log("  [Owner]  reflected update matches an outbound message id  ✓");
-
-  console.log("Replay detection flow passed.\n");
-}
-
-/**
  * A helper that dropped v2 under v3's `keepVersion` does not store v2 again
  * when v2's request is delivered once more: it is ignored as `Superseded`,
  * unanswered.
@@ -4092,6 +4191,62 @@ async function runSupersededShareRequestFlow(): Promise<void> {
   console.log("  [HelperA] v2 delivered after v3 → MessageIgnored(Superseded), still holds [3]  ✓");
 
   console.log("Superseded share request flow passed.\n");
+}
+
+function unhex(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(2 * i, 2 * i + 2), 16);
+  return out;
+}
+
+/**
+ * A `StoreShareRequest` the 0.0.11 release sealed, on a helper channel whose
+ * peer is an Owner. It is accepted while the minimum protocol version admits
+ * 0.0, and ignored unread as `ProtocolVersionTooOld` once the minimum is 0.1.
+ */
+async function processLegacyMessage(
+  minProtocolVersion: { major: number; minor: number } | undefined,
+): Promise<DeRecEvent[]> {
+  const secretId = BigInt(legacyMessages.secret_id);
+  const channelId = legacyMessages.channel_id;
+  const node = makeNode("Helper", "https://helper.example/derec", {
+    secretId,
+    timeouts: { inbound_message_secs: 2 ** 40 },
+    ...(minProtocolVersion === undefined ? {} : { minProtocolVersion }),
+  });
+  const sid = secretId.toString();
+  const record = {
+    Helper: {
+      channel_id: Number(channelId),
+      transports: [{ uri: "https://owner.example/derec", protocol: 0 }],
+      communication_info: {},
+      peer_role: "Owner",
+      status: "Paired",
+      created_at: 0,
+    },
+  };
+  await node.channelStore.save(sid, channelId, "0", new TextEncoder().encode(JSON.stringify(record)));
+  await node.secretStore.save(sid, channelId, 0, unhex(legacyMessages.shared_key_hex));
+  return node.protocol.process(unhex(legacyMessages.store_share_request_hex));
+}
+
+async function runLegacyMessageFlow(): Promise<void> {
+  console.log("=== Protocol legacy message and minimum protocol version ===\n");
+
+  const accepted = await processLegacyMessage(undefined);
+  if (accepted.length === 0 || accepted.some((e) => e.type === "MessageIgnored")) {
+    throw new Error(`a message from 0.0.11 must be processed by default, got ${JSON.stringify(accepted)}`);
+  }
+  console.log("  a message from 0.0.11 is accepted by default  ✓");
+
+  const ignored = await processLegacyMessage({ major: 0, minor: 1 });
+  const [only] = ignored;
+  if (ignored.length !== 1 || only?.type !== "MessageIgnored" || only.reason !== "ProtocolVersionTooOld") {
+    throw new Error(`a message from 0.0.11 must be MessageIgnored(ProtocolVersionTooOld) once the minimum is 0.1, got ${JSON.stringify(ignored)}`);
+  }
+  console.log("  a message from 0.0.11 is ignored once the minimum is 0.1  ✓");
+
+  console.log("\n✓ Legacy message flow passed.\n");
 }
 
 /** Asserts a byte field crossed the bridge as a `Uint8Array`. */
@@ -4585,6 +4740,7 @@ async function runReplicaSecretRefusedFlow(): Promise<void> {
   // the destination still shows the code and is ignored there.
   const destinationFp = await destination.node.protocol.getFingerprint(rekeyed);
   await source.node.protocol.verifyFingerprint(rekeyed, destinationFp);
+  await publishAfterConfirming(source.node);
   await pumpAll([source, helperA, helperB, destination]);
 
   const sid = secretId.toString();
@@ -4648,13 +4804,14 @@ async function storedRoster(
 ): Promise<Array<{
   replica_id: string;
   channel_id: string;
+  handover_channel?: string;
   transports: Array<{ uri: string }>;
   communication_info?: Record<string, string>;
 }>> {
   const text = new TextDecoder().decode(
     await node.channelStore.listReplicas(String(node.protocol.secretId()), ANY_REPLICAS),
   );
-  return JSON.parse(text.replace(/"(replica_id|channel_id)":(\d+)/g, '"$1":"$2"'));
+  return JSON.parse(text.replace(/"(replica_id|channel_id|handover_channel)":(\d+)/g, '"$1":"$2"'));
 }
 
 /**
@@ -4694,9 +4851,12 @@ async function runReplicaMirrorThenVerifyFlow(): Promise<void> {
   const { longTermChannelId: channelA } = await doPair(helperA.node, source.node, 1n, "Source↔HelperA");
   const { longTermChannelId: channelB } = await doPair(helperB.node, source.node, 2n, "Source↔HelperB");
   const { rekeyed } = await pairReplicaHandshake(source, destination, 3n);
-  await crossConfirmFingerprint(source.node, destination.node, rekeyed);
-  // The pair-completion auto-publish is not the round under test.
-  await pumpAll(all);
+  // A replica channel counts as paired only once both sides confirm the
+  // fingerprint, so this is what puts the Destination on the publish roster.
+  const sourceFp = await source.node.protocol.getFingerprint(rekeyed);
+  const destinationFp = await destination.node.protocol.getFingerprint(rekeyed);
+  await source.node.protocol.verifyFingerprint(rekeyed, destinationFp);
+  await destination.node.protocol.verifyFingerprint(rekeyed, sourceFp);
 
   const protect = (data: string, description: string) =>
     source.node.protocol.start(FlowKind.ProtectSecret, {
@@ -5150,16 +5310,18 @@ function channelKey(node: Node, secretId: bigint, channelId: bigint): Promise<Ui
  * The replica group is one channel and one key. The first destination's
  * pairing fixes the group key; a second destination pairs on an ephemeral key,
  * then the handover moves it onto the group channel, after which every entry
- * holds the identical key, the ephemeral channel is gone on both sides, and a
- * follow-up round reaches the joiner on the group channel. Mirrors
+ * holds the identical key. Source drops the ephemeral channel once Dest2
+ * answers on the group channel; Dest2 keeps it, recorded on Source's row,
+ * until a follow-up round reaches it on the group channel. Mirrors
  * `run_replica_group_key_handover_flow` in `smoke-tests/rust/src/protocol.rs`.
  */
 async function runReplicaGroupKeyHandoverFlow(): Promise<void> {
   console.log("=== [Protocol] Replica group-key handover Flow ===\n");
 
   const sid = 0xBEEFn;
+  const sourceId = 0xC0DE_C0DE_C0DE_C0DEn;
   const source: AddressedNode = {
-    node: makeNode("Source", "https://handover-source.example.com", { secretId: sid, replicaId: 0xC0DE_C0DE_C0DE_C0DEn }),
+    node: makeNode("Source", "https://handover-source.example.com", { secretId: sid, replicaId: sourceId }),
     uri: "https://handover-source.example.com",
   };
   const dest1: AddressedNode = {
@@ -5202,10 +5364,14 @@ async function runReplicaGroupKeyHandoverFlow(): Promise<void> {
       throw new Error(`${label} must hold the group key, fixed at the first pairing, on the group channel`);
     }
   }
-  for (const [label, node] of [["Source", source.node], ["Dest2", dest2.node]] as const) {
-    if ((await channelKey(node, sid, ephemeral)) !== null) {
-      throw new Error(`${label} must drop the ephemeral pairing channel's key after the handover`);
-    }
+  if ((await channelKey(source.node, sid, ephemeral)) !== null) {
+    throw new Error("Source must drop the ephemeral pairing channel's key once Dest2 answers on the group channel");
+  }
+  if ((await channelKey(dest2.node, sid, ephemeral)) === null) {
+    throw new Error("Dest2 must keep the ephemeral key until Source reaches it on the group channel");
+  }
+  if ((await memberHandoverChannel(dest2.node, sourceId)) !== String(ephemeral)) {
+    throw new Error("Dest2 records the ephemeral channel on Source's row");
   }
   for (const [label, node] of [["Source", source.node], ["Dest1", dest1.node], ["Dest2", dest2.node]] as const) {
     const roster = await storedRoster(node);
@@ -5228,6 +5394,12 @@ async function runReplicaGroupKeyHandoverFlow(): Promise<void> {
   if (!snapshot?.secrets.some((s) => byteArraysEqual(s.data, payload))) {
     throw new Error("Dest2 must decrypt the post-handover payload with the group key");
   }
+  if ((await channelKey(dest2.node, sid, ephemeral)) !== null) {
+    throw new Error("Dest2 must drop the ephemeral key once Source reaches it on the group channel");
+  }
+  if ((await memberHandoverChannel(dest2.node, sourceId)) !== undefined) {
+    throw new Error("Dest2 must clear the handover channel once Source reaches it on the group channel");
+  }
   if (!byteArraysEqual(await requireKey(source.node, groupChannel, "Source"), groupKey)) {
     throw new Error("the group key must stay stable across follow-up rounds");
   }
@@ -5237,19 +5409,22 @@ async function runReplicaGroupKeyHandoverFlow(): Promise<void> {
 }
 
 /**
- * A publish sent before the joiner's handover acknowledgement reaches the
- * source still reaches the joiner, and so does every later one when that
- * acknowledgement never arrives: the joiner drops its ephemeral channel as
- * soon as it hydrates, so the source must already address it on the group
- * channel. Mirrors `run_replica_publish_before_handover_ack_flow` in
+ * The joiner's handover acknowledgement is lost, so the source keeps it on
+ * the ephemeral pairing channel and re-sends there. The joiner still reads
+ * that copy, and its answer on the group channel completes the move on the
+ * source; a publish by the joiner in that window still reaches the source;
+ * and the source's first message on the group channel lets the joiner drop
+ * the pairing key. Mirrors `run_replica_publish_before_handover_ack_flow` in
  * `smoke-tests/rust/src/protocol.rs`.
  */
 async function runReplicaPublishBeforeHandoverAckFlow(): Promise<void> {
   console.log("=== [Protocol] Replica publish before handover ack Flow ===\n");
 
   const sid = 0xBEEFn;
+  const sourceId = 0xC0DE_C0DE_C0DE_C0DEn;
+  const dest2Id = 0xD2D2_D2D2_D2D2_D2D2n;
   const source: AddressedNode = {
-    node: makeNode("Source", "https://lost-ack-source.example.com", { secretId: sid, replicaId: 0xC0DE_C0DE_C0DE_C0DEn }),
+    node: makeNode("Source", "https://lost-ack-source.example.com", { secretId: sid, replicaId: sourceId }),
     uri: "https://lost-ack-source.example.com",
   };
   const dest1: AddressedNode = {
@@ -5257,7 +5432,7 @@ async function runReplicaPublishBeforeHandoverAckFlow(): Promise<void> {
     uri: "https://lost-ack-dest1.example.com",
   };
   const dest2: AddressedNode = {
-    node: makeNode("Dest2", "https://lost-ack-dest2.example.com", { secretId: sid, replicaId: 0xD2D2_D2D2_D2D2_D2D2n }),
+    node: makeNode("Dest2", "https://lost-ack-dest2.example.com", { secretId: sid, replicaId: dest2Id }),
     uri: "https://lost-ack-dest2.example.com",
   };
   const all = [source, dest1, dest2];
@@ -5276,22 +5451,350 @@ async function runReplicaPublishBeforeHandoverAckFlow(): Promise<void> {
     throw new Error("Dest2 must have acknowledged the handover before the acknowledgement is dropped");
   }
   await pumpAll(all);
+  if ((await memberChannel(source.node, dest2Id)) !== String(ephemeral)) {
+    throw new Error("Source must keep Dest2 on the ephemeral channel until Dest2 answers on the group channel");
+  }
+  if ((await channelKey(source.node, sid, ephemeral)) === null) {
+    throw new Error("Source must keep the ephemeral key until Dest2 answers on the group channel");
+  }
+  if ((await memberHandoverChannel(dest2.node, sourceId)) !== String(ephemeral)) {
+    throw new Error("Dest2 keeps Source's handover channel while Source may still send there");
+  }
+  if ((await channelKey(dest2.node, sid, ephemeral)) === null) {
+    throw new Error("Dest2 must keep the ephemeral key while Source may still send there");
+  }
   console.log("  step 1: handover delivered, Dest2's acknowledgement lost  ✓");
 
-  for (const text of ["before the ack", "after the ack"]) {
-    const payload = new TextEncoder().encode(text);
-    await source.node.protocol.start(FlowKind.ProtectSecret, {
-      secrets: [{ id: new Uint8Array([0x42]), name: "handover", data: payload }],
-    });
-    await pumpAll(all);
-    const snapshot = await dest2.node.userSecretStore.loadLatest(String(sid));
-    if (!snapshot?.secrets.some((s) => byteArraysEqual(s.data, payload))) {
-      throw new Error(`Dest2 must receive the publish carrying "${text}"`);
-    }
+  // Source never saw the acknowledgement, so its next publish goes on the
+  // ephemeral channel again. Dest2 still reads it there, and its answer on
+  // the group channel completes the move on Source.
+  await publish(source.node, "resent on the ephemeral channel");
+  await pumpAll(all);
+  await assertHolds(dest2.node, "Dest2", sid, "resent on the ephemeral channel");
+  if ((await memberChannel(source.node, dest2Id)) !== String(groupChannel)) {
+    throw new Error("Source must move Dest2 onto the group channel once Dest2 answers there");
   }
-  console.log("  step 2: both publishes reached Dest2 on the group channel  ✓");
+  if ((await channelKey(source.node, sid, ephemeral)) !== null) {
+    throw new Error("Source drops the ephemeral key once Dest2 answers on the group channel");
+  }
+  if ((await channelKey(dest2.node, sid, ephemeral)) === null) {
+    throw new Error("Dest2 has not heard from Source on the group channel yet");
+  }
+  console.log("  step 2: the resent copy is read on the ephemeral channel; Source moves Dest2  ✓");
+
+  // Dest2 publishes before Source reaches it on the group channel. It sends
+  // to every member on the group channel, so Source, which no longer holds
+  // the ephemeral key, still reads it.
+  await publish(dest2.node, "published by the joiner");
+  await pumpAll(all);
+  await assertHolds(source.node, "Source", sid, "published by the joiner");
+  await assertHolds(dest1.node, "Dest1", sid, "published by the joiner");
+  console.log("  step 3: Dest2's own publish reaches Source on the group channel  ✓");
+
+  await publish(source.node, "on the group channel");
+  await pumpAll(all);
+  await assertHolds(dest2.node, "Dest2", sid, "on the group channel");
+  if ((await channelKey(dest2.node, sid, ephemeral)) !== null) {
+    throw new Error("Dest2 drops the ephemeral key once Source reaches it on the group channel");
+  }
+  if ((await memberHandoverChannel(dest2.node, sourceId)) !== undefined) {
+    throw new Error("Dest2 must clear the handover channel once Source reaches it on the group channel");
+  }
+  console.log("  step 4: Source reaches Dest2 on the group channel; Dest2 drops the ephemeral key  ✓");
 
   console.log("\n✓ Replica publish before handover ack flow passed.\n");
+}
+
+/**
+ * A device joining an existing group whose pairing the source confirmed, and
+ * whose application published, before the joiner confirmed. The joiner
+ * ignores that copy, then confirms and asks: the answer arrives on the
+ * pairing channel and carries the group key, and the next two publishes
+ * complete the handover on both sides. Mirrors `run_replica_late_joiner_flow`
+ * in `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runReplicaLateJoinerFlow(): Promise<void> {
+  console.log("=== [Protocol] Replica late joiner Flow ===\n");
+
+  const sid = 0x1A7En;
+  const sourceId = 0x5050_5050_5050_5050n;
+  const joinerId = 0x1010_1010_1010_1010n;
+  const source: AddressedNode = {
+    node: makeNode("Source", "https://late-joiner-source.example.com", { secretId: sid, replicaId: sourceId }),
+    uri: "https://late-joiner-source.example.com",
+  };
+  const dest1: AddressedNode = {
+    node: makeNode("Dest1", "https://late-joiner-dest1.example.com", { secretId: sid, replicaId: 0xD1D1_D1D1_D1D1_D1D1n }),
+    uri: "https://late-joiner-dest1.example.com",
+  };
+  const joiner: AddressedNode = {
+    node: makeNode("Joiner", "https://late-joiner-joiner.example.com", { secretId: sid, replicaId: joinerId }),
+    uri: "https://late-joiner-joiner.example.com",
+  };
+  const all = [source, dest1, joiner];
+
+  const { rekeyed: groupChannel } = await pairReplicaHandshake(source, dest1, 1n);
+  await crossConfirmFingerprint(source.node, dest1.node, groupChannel);
+  await pumpAll(all);
+
+  const { rekeyed: ephemeral } = await pairReplicaHandshake(source, joiner, 2n);
+  const joinerFp = await joiner.node.protocol.getFingerprint(ephemeral);
+  await source.node.protocol.verifyFingerprint(ephemeral, joinerFp);
+  await publish(source.node, "before the joiner confirmed");
+  const early = await pumpAll(all);
+  if (
+    !early.some(
+      (e) =>
+        e.type === "MessageIgnored" &&
+        e.reason === "PendingVerification" &&
+        BigInt(e.channel_id) === ephemeral,
+    )
+  ) {
+    throw new Error(
+      `the joiner ignores a copy that arrives before it confirms, got [${early.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  await assertHolds(dest1.node, "Dest1", sid, "before the joiner confirmed");
+  if ((await joiner.node.userSecretStore.loadLatest(String(sid))) != null) {
+    throw new Error("the joiner must hold no snapshot before it confirms");
+  }
+  console.log("  step 1: the source published before the joiner confirmed; the joiner ignored it  ✓");
+
+  const sourceFp = await source.node.protocol.getFingerprint(ephemeral);
+  await joiner.node.protocol.verifyFingerprint(ephemeral, sourceFp);
+  await joiner.node.protocol.start(FlowKind.ReplicaDiscovery);
+  const caughtUp = await pumpAll(all);
+  if (!caughtUp.some((e) => e.type === "ReplicaSecretInstalled")) {
+    throw new Error(
+      `the joiner installs the copy it asked for, got [${caughtUp.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  await assertHolds(joiner.node, "Joiner", sid, "before the joiner confirmed");
+  const joinerGroupKey = await channelKey(joiner.node, sid, groupChannel);
+  const sourceGroupKey = await channelKey(source.node, sid, groupChannel);
+  if (!joinerGroupKey || !sourceGroupKey || !byteArraysEqual(joinerGroupKey, sourceGroupKey)) {
+    throw new Error("the answer carried the group key");
+  }
+  if ((await memberChannel(joiner.node, sourceId)) !== String(groupChannel)) {
+    throw new Error("the joiner must record the source on the group channel");
+  }
+  if ((await memberHandoverChannel(joiner.node, sourceId)) !== String(ephemeral)) {
+    throw new Error("the joiner must record the pairing channel as the source's handover channel");
+  }
+  if ((await memberChannel(source.node, joinerId)) !== String(ephemeral)) {
+    throw new Error("the source must keep the joiner on the pairing channel until the joiner answers on the group channel");
+  }
+  console.log("  step 2: the joiner confirmed and asked; it holds the group key and the copy  ✓");
+
+  await publish(source.node, "after the joiner caught up");
+  await pumpAll(all);
+  for (const [label, entry] of [["Dest1", dest1], ["Joiner", joiner]] as const) {
+    await assertHolds(entry.node, label, sid, "after the joiner caught up");
+  }
+  if ((await memberChannel(source.node, joinerId)) !== String(groupChannel)) {
+    throw new Error("the source must move the joiner onto the group channel");
+  }
+  if ((await channelKey(source.node, sid, ephemeral)) !== null) {
+    throw new Error("the source must drop the pairing key once the joiner answers on the group channel");
+  }
+  if ((await channelKey(joiner.node, sid, ephemeral)) === null) {
+    throw new Error("the joiner must keep the pairing key until the source reaches it on the group channel");
+  }
+  console.log("  step 3: the next publish reaches the joiner on the pairing channel; the source moves it  ✓");
+
+  await publish(source.node, "on the group channel");
+  await pumpAll(all);
+  for (const [label, entry] of [["Dest1", dest1], ["Joiner", joiner]] as const) {
+    await assertHolds(entry.node, label, sid, "on the group channel");
+  }
+  if ((await channelKey(joiner.node, sid, ephemeral)) !== null) {
+    throw new Error("the joiner must drop the pairing key once the source reaches it on the group channel");
+  }
+  if ((await memberHandoverChannel(joiner.node, sourceId)) !== undefined) {
+    throw new Error("the joiner must clear the handover channel once the source reaches it on the group channel");
+  }
+  console.log("  step 4: the source reaches the joiner on the group channel; the joiner drops the pairing key  ✓");
+
+  console.log("\n✓ Replica late joiner flow passed.\n");
+}
+
+/** The replica ids a node records, as sorted decimal strings. */
+async function rosterIds(node: Node): Promise<string[]> {
+  return (await storedRoster(node))
+    .map((m) => m.replica_id)
+    .sort((x, y) => (BigInt(x) < BigInt(y) ? -1 : BigInt(x) > BigInt(y) ? 1 : 0));
+}
+
+/**
+ * Removing a member: `UnpairReplica` drops it on the device that ran it and
+ * publishes the roster without it; the removed device drops everything when
+ * told and receives nothing afterwards; a device can also remove itself.
+ * Mirrors `run_replica_removal_flow` in `smoke-tests/rust/src/protocol.rs`.
+ */
+async function runReplicaRemovalFlow(): Promise<void> {
+  console.log("=== [Protocol] Replica removal Flow ===\n");
+
+  const sid = 0x7E40n;
+  const aId = 0x0A0A_0A0A_0A0A_0A0An;
+  const bId = 0x0B0B_0B0B_0B0B_0B0Bn;
+  const cId = 0x0C0C_0C0C_0C0C_0C0Cn;
+  const a: AddressedNode = {
+    node: makeNode("A", "https://removal-a.example.com", { secretId: sid, replicaId: aId }),
+    uri: "https://removal-a.example.com",
+  };
+  const b: AddressedNode = {
+    node: makeNode("B", "https://removal-b.example.com", { secretId: sid, replicaId: bId }),
+    uri: "https://removal-b.example.com",
+  };
+  const c: AddressedNode = {
+    node: makeNode("C", "https://removal-c.example.com", { secretId: sid, replicaId: cId }),
+    uri: "https://removal-c.example.com",
+  };
+  const all = [a, b, c];
+  const names = (events: DeRecEvent[]) => `[${events.map((e) => e.type).join(", ")}]`;
+  const removed = (events: DeRecEvent[], id: bigint) =>
+    events.some((e) => e.type === "ReplicaRemoved" && e.replica_id === String(id));
+  const sameIds = (actual: string[], expected: bigint[]) =>
+    actual.length === expected.length && actual.every((id, i) => id === String(expected[i]));
+
+  const { rekeyed: group } = await pairReplicaHandshake(a, b, 1n);
+  await crossConfirmFingerprint(a.node, b.node, group);
+  await pumpAll(all);
+  const { rekeyed: joining } = await pairReplicaHandshake(a, c, 2n);
+  await crossConfirmFingerprint(a.node, c.node, joining);
+  await pumpAll(all);
+  await publish(a.node, "before the removal");
+  await pumpAll(all);
+  await assertHolds(b.node, "B", sid, "before the removal");
+  await assertHolds(c.node, "C", sid, "before the removal");
+
+  const started = await a.node.protocol.start(FlowKind.UnpairReplica, {
+    replica_id: String(cId),
+    memo: "retired tablet",
+  });
+  if (!removed(started, cId)) {
+    throw new Error(`the device running the removal drops the member at once, got ${names(started)}`);
+  }
+  if (!sameIds(await rosterIds(a.node), [aId, bId])) {
+    throw new Error("the device running the removal must no longer record the member");
+  }
+  const published = a.node.transport.drain();
+  const toC = published.filter((m) => m.endpoint.uri === c.uri);
+  if (toC.length === 0) throw new Error("the removed member is told");
+  if (toC.length !== 1) throw new Error("the removed member receives the notice and nothing else");
+  const seenByB: DeRecEvent[] = [];
+  for (const { endpoint, message } of published) {
+    if (endpoint.uri === b.uri) {
+      seenByB.push(...(await processAll(b.node, message)));
+    } else if (endpoint.uri === c.uri) {
+      const events = await processAll(c.node, message);
+      if (!events.some((e) => e.type === "SelfRemovedFromGroup")) {
+        throw new Error(`the removed member drops everything when told, got ${names(events)}`);
+      }
+    }
+  }
+  console.log("  step 1: removing a member drops it at once and publishes without it; it is told and drops everything  ✓");
+
+  seenByB.push(...(await pumpAll(all)));
+  if (!removed(seenByB, cId)) {
+    throw new Error(`the remaining member drops it when the roster arrives, got ${names(seenByB)}`);
+  }
+  if (!sameIds(await rosterIds(b.node), [aId, bId])) {
+    throw new Error("the remaining member must no longer record the removed member");
+  }
+  if ((await rosterIds(c.node)).length !== 0) {
+    throw new Error("the removed member must record no member");
+  }
+  if ((await c.node.userSecretStore.loadLatest(String(sid))) != null) {
+    throw new Error("the removed member keeps no copy of the secret");
+  }
+  console.log("  step 2: the remaining member drops it with the roster; the removed member holds nothing  ✓");
+
+  await publish(a.node, "after the removal");
+  const after = a.node.transport.drain();
+  if (after.some((m) => m.endpoint.uri === c.uri)) {
+    throw new Error("nothing more is sent to the removed member");
+  }
+  for (const { endpoint, message } of after) {
+    if (endpoint.uri === b.uri) await processAll(b.node, message);
+  }
+  await pumpAll(all);
+  await assertHolds(b.node, "B", sid, "after the removal");
+  console.log("  step 3: a later publish reaches the remaining member only  ✓");
+
+  const left = await b.node.protocol.start(FlowKind.UnpairReplica, { replica_id: String(bId) });
+  if (!left.some((e) => e.type === "SelfRemovedFromGroup")) {
+    throw new Error(`a device removing itself publishes and then drops everything, got ${names(left)}`);
+  }
+  if ((await rosterIds(b.node)).length !== 0) {
+    throw new Error("a device that removed itself must record no member");
+  }
+  const farewell: DeRecEvent[] = [];
+  for (const { endpoint, message } of b.node.transport.drain()) {
+    if (endpoint.uri === a.uri) farewell.push(...(await processAll(a.node, message)));
+  }
+  // The remaining member acknowledges the roster to a device that has
+  // already dropped the channel, which refuses the acknowledgement as an
+  // unknown channel.
+  let late = 0;
+  for (const { endpoint, message } of a.node.transport.drain()) {
+    if (endpoint.uri === b.uri) {
+      late += 1;
+      let refused = false;
+      try {
+        await b.node.protocol.process(message);
+      } catch {
+        refused = true;
+      }
+      if (!refused) {
+        throw new Error("an acknowledgement reaching the departed device finds no channel");
+      }
+    }
+  }
+  if (late === 0) throw new Error("the remaining member acknowledges the departing roster");
+  if (!removed(farewell, bId)) {
+    throw new Error(`the remaining member drops the device that left, got ${names(farewell)}`);
+  }
+  if (!sameIds(await rosterIds(a.node), [aId])) {
+    throw new Error("the remaining member must record only itself");
+  }
+  console.log("  step 4: a device removing itself publishes the roster without it, then drops everything  ✓");
+
+  console.log("\n✓ Replica removal flow passed.\n");
+}
+
+/** Publish one user secret carrying `text`. */
+async function publish(node: Node, text: string): Promise<void> {
+  await node.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([0x42]), name: "handover", data: new TextEncoder().encode(text) }],
+  });
+}
+
+/** Assert a node's latest snapshot carries `text`. */
+async function assertHolds(node: Node, label: string, secretId: bigint, text: string): Promise<void> {
+  const payload = new TextEncoder().encode(text);
+  const snapshot = await node.userSecretStore.loadLatest(String(secretId));
+  if (!snapshot) throw new Error(`${label} must hold a snapshot`);
+  if (!snapshot.secrets.some((s) => byteArraysEqual(s.data, payload))) {
+    throw new Error(`${label} must hold the publish carrying "${text}"`);
+  }
+}
+
+/** The channel a node records `replicaId` on, as a decimal string. */
+async function memberChannel(node: Node, replicaId: bigint): Promise<string> {
+  const member = (await storedRoster(node)).find((m) => m.replica_id === String(replicaId));
+  if (!member) throw new Error(`no member row for replica ${replicaId}`);
+  return member.channel_id;
+}
+
+/**
+ * The channel a node recorded `replicaId` as having handed the group over on,
+ * as a decimal string, if it is still in use.
+ */
+async function memberHandoverChannel(node: Node, replicaId: bigint): Promise<string | undefined> {
+  const member = (await storedRoster(node)).find((m) => m.replica_id === String(replicaId));
+  if (!member) throw new Error(`no member row for replica ${replicaId}`);
+  return member.handover_channel;
 }
 
 /**
@@ -5401,7 +5904,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runOwnerKeepVersionMissedRoundFlow();
   await runInvalidKeepVersionFlow();
   await runSupersededShareRequestFlow();
-  await runReplayDetectionFlow();
+  await runLegacyMessageFlow();
   await runDiscoveryAndRecoveryFlow();
   await runHelperWithoutTheVersionFlow();
   await runCorruptedShareFlow();
@@ -5409,6 +5912,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runDisputedRecoveryFlow();
   await runConflictingRecoveryFlow();
   await runRestoreKeepsHelperDutiesFlow();
+  await runRestoreUnpairRefusedFlow();
   await runAbandonedReplicaPairingFlow();
   await runContactOnTheGroupChannelFlow();
   await runPairingExpiryFlow();
@@ -5425,6 +5929,8 @@ export async function runProtocolSmoke(): Promise<void> {
   await runReplicaSyncVersionProgressionFlow();
   await runReplicaGroupKeyHandoverFlow();
   await runReplicaPublishBeforeHandoverAckFlow();
+  await runReplicaLateJoinerFlow();
+  await runReplicaRemovalFlow();
   await runReplicaSecretRefusedFlow();
   await runAutoAcceptFlow();
   await runStartPairingRejectsAlreadyPairedChannelFlow();
@@ -5790,6 +6296,8 @@ async function runUnconfirmedDestinationIgnoresTheCopyFlow(): Promise<void> {
   const { rekeyed } = await pairReplicaHandshake(source, destination, 31n);
   const destinationFp = await destination.node.protocol.getFingerprint(rekeyed);
   await source.node.protocol.verifyFingerprint(rekeyed, destinationFp);
+  // The source's application publishes once the source confirmed.
+  await source.node.protocol.start(FlowKind.ProtectSecret, { secrets: [] });
 
   const early = await pumpAll([source, destination]);
   const ignored = early.find(
@@ -5877,6 +6385,24 @@ async function crossConfirmFingerprint(owner: Node, replica: Node, channelId: bi
   }
   await owner.protocol.verifyFingerprint(channelId, replicaFp);
   await replica.protocol.verifyFingerprint(channelId, ownerFp);
+  const isHelper =
+    (await owner.channelStore.load(String(owner.protocol.secretId()), String(channelId), "0")) != null;
+  if (!isHelper) {
+    await publishAfterConfirming(owner);
+  }
+}
+
+/**
+ * What the owner's application does once both sides of a replica pairing
+ * have confirmed: publish the latest snapshot, or an empty one when there is
+ * none, so the joiner receives the vault, the roster and the group key.
+ */
+async function publishAfterConfirming(source: Node): Promise<void> {
+  const latest = await source.userSecretStore.loadLatest(String(source.protocol.secretId()));
+  await source.protocol.start(FlowKind.ProtectSecret, {
+    secrets: latest?.secrets ?? [],
+    ...(latest?.description !== undefined ? { description: latest.description } : {}),
+  });
 }
 
 async function helperStartPair(owner: Node, helper: Node, channelId: bigint) {

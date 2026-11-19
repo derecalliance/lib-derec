@@ -139,6 +139,12 @@ public sealed record HelperChannel(
 /// <param name="Role">This member's role (<see cref="ReplicaRole"/>).</param>
 /// <param name="Status">Lifecycle state (<see cref="ChannelStatus"/>).</param>
 /// <param name="CreatedAt">Unix timestamp (seconds) when the row was created.</param>
+/// <param name="HandoverChannel">
+/// The channel this member handed the group over to this device on, while it
+/// is still in use: set on the device that joined through this member, and
+/// cleared once the member reaches it on the group channel. <c>null</c> on
+/// every other row.
+/// </param>
 public sealed record ReplicaMember(
     ulong ChannelId,
     ulong ReplicaId,
@@ -146,7 +152,8 @@ public sealed record ReplicaMember(
     Dictionary<string, string> CommunicationInfo,
     ReplicaRole Role,
     ChannelStatus Status,
-    ulong CreatedAt);
+    ulong CreatedAt,
+    ulong? HandoverChannel = null);
 
 /// <summary>
 /// A record held by <see cref="IChannelStore"/>: either a helper channel or
@@ -857,6 +864,13 @@ public sealed record StateKey(StateKind Kind, ulong? ChannelId, ulong? SecretId,
 /// <see cref="StateKind.SharingRound"/>). A row without it is judged against
 /// the builder's threshold.
 /// </param>
+/// <param name="DropOnRejection">
+/// Whether the channel is dropped whatever the Helper answers (only for
+/// <see cref="StateKind.PendingUnpair"/>). Set for the unpair of a recovery
+/// channel that a restore started: a Helper that refuses it no longer leaves
+/// that channel paired. <c>false</c> on every other row, and on rows written
+/// without it.
+/// </param>
 /// <remarks>
 /// Fields are carried exactly as the library wrote them. A replica-id set
 /// left null is read by the library as empty.
@@ -879,7 +893,8 @@ public sealed record StateItem(
     IReadOnlyDictionary<ulong, uint>? Reported = null,
     ulong[]? ShareChannels = null,
     uint? KeepVersion = null,
-    uint? Threshold = null)
+    uint? Threshold = null,
+    bool DropOnRejection = false)
 {
     public StateKey Key() => Kind switch
     {
@@ -907,8 +922,9 @@ public sealed record StateItem(
         ulong startedAt) =>
         new(StateKind.PendingRecovery, null, secretId, version, startedAt, null, shares, pending,
             ShareChannels: shareChannels);
-    public static StateItem PendingUnpair(ulong channelId, ulong startedAt) =>
-        new(StateKind.PendingUnpair, channelId, null, null, startedAt, null, null);
+    public static StateItem PendingUnpair(ulong channelId, ulong startedAt, bool dropOnRejection = false) =>
+        new(StateKind.PendingUnpair, channelId, null, null, startedAt, null, null,
+            DropOnRejection: dropOnRejection);
     public static StateItem SharingRound(
         uint version,
         ulong[] pending,

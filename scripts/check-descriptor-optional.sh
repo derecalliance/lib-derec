@@ -56,7 +56,7 @@ while IFS= read -r rlib; do
     echo "      ($rlib contains $hits occurrences of '$MARKER')" >&2
     exit 1
   fi
-done < <(find "$TARGET_DIR/debug/deps" -name 'libderec_proto-*.rlib')
+done < <(find "$TARGET_DIR/debug" -name 'libderec_proto-*.rlib')
 
 if [[ "$found" -eq 0 ]]; then
   echo "could not locate a built derec-proto rlib" >&2

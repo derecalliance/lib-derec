@@ -39,7 +39,7 @@ func TestEncodeChannelRecord_Helper_MatchesRustJSONShape(t *testing.T) {
 		t.Fatalf("EncodeChannelRecord: %v", err)
 	}
 
-	want := `{"Helper":{"schema_version":3,"channel_id":123456789,"transports":[{"uri":"https://example.com/derec","protocol":0}],` +
+	want := `{"Helper":{"schema_version":4,"channel_id":123456789,"transports":[{"uri":"https://example.com/derec","protocol":0}],` +
 		`"communication_info":{"name":"helper"},"peer_role":"Helper","status":"Paired","created_at":1700000000,"weight":2}}`
 	if string(got) != want {
 		t.Fatalf("EncodeChannelRecord mismatch:\n got: %s\nwant: %s", got, want)
@@ -62,7 +62,7 @@ func TestEncodeChannelRecord_Replica_MatchesRustJSONShape(t *testing.T) {
 		t.Fatalf("EncodeChannelRecord: %v", err)
 	}
 
-	want := `{"Replica":{"schema_version":3,"channel_id":123456789,"replica_id":42,"transports":[{"uri":"https://replica.example.com","protocol":0}],` +
+	want := `{"Replica":{"schema_version":4,"channel_id":123456789,"replica_id":42,"transports":[{"uri":"https://replica.example.com","protocol":0}],` +
 		`"communication_info":{"name":"alice-2"},"role":"Destination","status":"Pending","created_at":1700000000}}`
 	if string(got) != want {
 		t.Fatalf("EncodeChannelRecord mismatch:\n got: %s\nwant: %s", got, want)
@@ -200,7 +200,7 @@ func TestChannelRecordRoundTrip_StampsTheMarkerOnUnversionedInput(t *testing.T) 
 	if err != nil {
 		t.Fatalf("EncodeChannelRecord: %v", err)
 	}
-	if !strings.Contains(string(got), `"schema_version":3`) {
+	if !strings.Contains(string(got), `"schema_version":4`) {
 		t.Fatalf("re-encoded record is missing the marker: %s", got)
 	}
 }
@@ -635,6 +635,44 @@ func TestStateItemRoundTrip_PendingUnpair(t *testing.T) {
 	}
 	if got.Kind != want.Kind || *got.ChannelID != *want.ChannelID || *got.StartedAt != *want.StartedAt {
 		t.Fatalf("mismatch: got %+v want %+v", got, want)
+	}
+}
+
+func TestStateItemRoundTrip_PendingUnpairDropOnRejection(t *testing.T) {
+	cid := uint64(20)
+	sa := uint64(1700000000)
+	for _, drop := range []bool{false, true} {
+		item := StateItem{Kind: StateKindPendingUnpair, ChannelID: &cid, StartedAt: &sa, DropOnRejection: drop}
+		wire, err := EncodeStateItem(item)
+		if err != nil {
+			t.Fatalf("EncodeStateItem: %v", err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(wire, &fields); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		raw, present := fields["drop_on_rejection"]
+		if present != drop {
+			t.Fatalf("drop_on_rejection=%v: key present=%v in %s", drop, present, wire)
+		}
+		if drop && string(raw) != "true" {
+			t.Fatalf("expected drop_on_rejection:true, got %s", raw)
+		}
+		got, err := DecodeStateItem(wire)
+		if err != nil {
+			t.Fatalf("DecodeStateItem: %v", err)
+		}
+		if got.DropOnRejection != drop {
+			t.Fatalf("DropOnRejection: got %v want %v", got.DropOnRejection, drop)
+		}
+	}
+
+	got, err := DecodeStateItem([]byte(`{"kind":2,"channel_id":"20","started_at":"1700000000"}`))
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if got.DropOnRejection {
+		t.Fatal("a row without drop_on_rejection must decode as false")
 	}
 }
 
@@ -1221,5 +1259,44 @@ func TestStateItemRoundTrip_SharingRoundThreshold(t *testing.T) {
 	}
 	if strings.Contains(string(wire), "threshold") {
 		t.Fatalf("absent threshold must not be written, got %s", wire)
+	}
+}
+
+// A member row carries handover_channel only while it is set, matching the
+// core, which skips the field when it is None.
+func TestChannelRecordRoundTrip_HandoverChannel(t *testing.T) {
+	handover := uint64(7)
+	m := ReplicaMember{
+		ChannelID:       9,
+		ReplicaID:       3,
+		Transports:      []TransportEndpoint{{URI: "https://member.example", Protocol: 0}},
+		Role:            ReplicaRoleSource,
+		Status:          ChannelStatusPaired,
+		HandoverChannel: &handover,
+	}
+	got, err := EncodeChannelRecord(ChannelRecord{Replica: &m})
+	if err != nil {
+		t.Fatalf("EncodeChannelRecord: %v", err)
+	}
+	want := `{"Replica":{"schema_version":4,"channel_id":9,"replica_id":3,"transports":[{"uri":"https://member.example","protocol":0}],` +
+		`"communication_info":{},"role":"Source","status":"Paired","created_at":0,"handover_channel":7}}`
+	if string(got) != want {
+		t.Fatalf("EncodeChannelRecord mismatch:\n got: %s\nwant: %s", got, want)
+	}
+	record, err := DecodeChannelRecord(got)
+	if err != nil {
+		t.Fatalf("DecodeChannelRecord: %v", err)
+	}
+	if record.Replica.HandoverChannel == nil || *record.Replica.HandoverChannel != 7 {
+		t.Fatalf("HandoverChannel = %v, want 7", record.Replica.HandoverChannel)
+	}
+
+	m.HandoverChannel = nil
+	got, err = EncodeChannelRecord(ChannelRecord{Replica: &m})
+	if err != nil {
+		t.Fatalf("EncodeChannelRecord: %v", err)
+	}
+	if strings.Contains(string(got), "handover_channel") {
+		t.Fatalf("an unset handover channel is written: %s", got)
 	}
 }

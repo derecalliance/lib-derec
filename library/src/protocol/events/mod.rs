@@ -88,6 +88,19 @@ pub enum IgnoreReason {
     /// stored, not raised as [`DeRecEvent::ActionRequired`], and not
     /// answered.
     Superseded,
+    /// The envelope names a protocol version older than the minimum this
+    /// device accepts
+    /// ([`with_min_protocol_version`](crate::protocol::DeRecProtocolBuilder::with_min_protocol_version)).
+    /// Checked before anything else, so nothing is decrypted, stored or
+    /// answered.
+    ProtocolVersionTooOld,
+    /// The envelope's protocol version and the copy inside the encrypted
+    /// payload differ: the envelope was altered, or built by a non-conforming
+    /// peer. A payload from a release that writes no version reads as 0.0,
+    /// the version such a release puts on its envelope. Checked after
+    /// decryption and before dispatch, like
+    /// [`TimestampMismatch`](Self::TimestampMismatch).
+    ProtocolVersionMismatch,
 }
 
 /// Why [`DeRecEvent::VerifySharesFailed`] reached no verdict for a channel.
@@ -237,8 +250,8 @@ pub enum PendingActionKind {
 ///   device sent, delivered back to it, decrypts like one from the peer.
 ///   An older update delivered again, or held back and delivered after
 ///   a newer one, decrypts too. Catching both is the application's
-///   replay detection (see
-///   [`message_id`](crate::derec_message::message_id)), and rejecting a
+///   replay detection (see the security note on
+///   [`process`](crate::protocol::DeRecProtocol::process)), and rejecting a
 ///   contact update older than the last one accepted on the channel
 ///   needs the application to see each update, which this flag
 ///   removes. Keep it `false` unless the transport rules both out. It
@@ -834,28 +847,31 @@ pub enum DeRecFlow {
     /// eviction. A `replica_id` that names no current member is rejected with
     /// [`crate::Error::InvalidInput`] rather than silently doing nothing.
     ///
-    /// # Announcing is all this flow does
+    /// # What this flow does
     ///
-    /// `start` tells every member, including the departing one, and flags that
-    /// member locally. **It removes nothing on its own, and emits no
-    /// [`DeRecEvent::ReplicaRemoved`].** The flag keeps the member out of the
-    /// next roster while leaving it on the distribution list, which is how it
-    /// learns it may tear down.
+    /// `start` tells every member, the departing one included, and then:
     ///
-    /// The removal completes only when **the application publishes a roster
-    /// that omits the member** — an ordinary
-    /// [`DeRecFlow::ProtectSecret`]. `ReplicaRemoved` fires when that round
-    /// completes, not before. An application that calls this flow and then
-    /// waits for the event without publishing waits forever.
+    /// - **Removing another member:** drops it on this device at once, with any
+    ///   key only it used, and reports [`DeRecEvent::ReplicaRemoved`].
+    /// - **Removing this device:** keeps its own row out of the roster for the
+    ///   publish below, then drops this device's whole `secret_id` partition
+    ///   and reports [`DeRecEvent::SelfRemovedFromGroup`].
     ///
-    /// One consequence is worth stating plainly: **a group with no secret to
-    /// publish cannot complete a removal**, because there is no roster to
-    /// send. The member stays flagged until something is published.
+    /// Either way it then publishes the latest snapshot, or an empty payload
+    /// when there is none, with a roster that omits the member: the events of
+    /// that round follow, as for [`DeRecFlow::ProtectSecret`]. The application
+    /// does not publish anything itself to complete a removal.
     ///
-    /// A member tears down only once it has been told to leave *and* has seen
-    /// a newer roster excluding it. Absence alone never destroys a copy of the
-    /// secret — a publisher that silently omitted a member would otherwise
-    /// destroy that member's state instead of merely forgetting it.
+    /// The departing member is on no distribution list from then on: it
+    /// receives nothing more. Every other member flags it when told and drops
+    /// it, with [`DeRecEvent::ReplicaRemoved`], once that roster arrives.
+    /// Absence from a roster alone never removes anyone, since a device may
+    /// hold members a roster has not caught up with yet.
+    ///
+    /// When this device removes itself, the remaining members acknowledge the
+    /// publish after it has dropped the group channel; `process` fails those
+    /// acknowledgements with an unknown-channel error, which the application
+    /// can disregard.
     ///
     /// # Who may remove whom
     ///
@@ -873,18 +889,19 @@ pub enum DeRecFlow {
     ///
     /// # What the removed member experiences
     ///
-    /// It is not asked, and gets no event when it is told to leave. When a
-    /// roster excluding it arrives, it drops its whole `secret_id` partition
-    /// automatically and emits [`DeRecEvent::SelfRemovedFromGroup`]. The
+    /// It is not asked. When the notice naming it arrives, it drops its whole
+    /// `secret_id` partition automatically and emits
+    /// [`DeRecEvent::SelfRemovedFromGroup`]. If the notice is lost, it keeps
+    /// what it held, but it is sent nothing new and the remaining members
+    /// refuse its messages once the roster without it has reached them. The
     /// secret survives on the remaining members and the helpers.
     ///
     /// # Removal does not protect against a compromised device
     ///
     /// Every member holds the same group key, and removal does not replace
-    /// it. The remaining members keep publishing under it, and the roster that
-    /// completes the removal is itself sent to the removed member under it.
-    /// Removal therefore relies on the removed device's own library deleting
-    /// its copy. That covers a lost or stolen device whose storage was not
+    /// it. The remaining members keep publishing under it, and nothing more is
+    /// sent to the removed member, but removal still relies on the removed
+    /// device's own library deleting its copy. That covers a lost or stolen device whose storage was not
     /// read. It does not cover a device whose storage was read: whoever read
     /// it keeps the group key and can decrypt every later publication it
     /// obtains, the one completing the removal included. Shared-key rotation
@@ -1300,7 +1317,9 @@ pub enum DeRecEvent {
 
     /// A member was removed from the group and its roster row dropped.
     ///
-    /// Fires on the members that remain. The departing device instead reports
+    /// Fires on the device that ran the removal, when it starts it, and on
+    /// every other remaining member when the roster without the member
+    /// arrives. The departing device instead reports
     /// [`Self::SelfRemovedFromGroup`].
     ///
     /// The group key is unchanged, so a removed device whose storage was read
@@ -1327,15 +1346,16 @@ pub enum DeRecEvent {
     /// partition — group channel, helper channels, shares, secrets and the
     /// user-secret snapshot.
     ///
-    /// Fires only after both halves of the safety rule hold: this device was
-    /// told to leave, and has since seen a roster excluding it.
+    /// Fires when this device is told to leave, when it removes itself after
+    /// publishing the roster without it, or when a roster excluding it
+    /// arrives after it was told to leave by a device on an earlier release.
     ///
     /// The teardown is automatic: this device is not asked first, and gets no
     /// earlier event. The secret survives on the remaining members and the
     /// helpers. Any member may cause it, the source included — see
     /// [`DeRecFlow::UnpairReplica`].
     SelfRemovedFromGroup {
-        /// The version whose roster completed the removal.
+        /// The newest version this device held when it left.
         version: u32,
     },
 
@@ -1788,17 +1808,21 @@ pub enum DeRecEvent {
     ///
     /// - Initiator: emitted when (a) `UnpairAck::NotRequired` and the request
     ///   has just been sent, (b) `UnpairAck::Required` and the peer
-    ///   acknowledged with `Ok`, or (c) `UnpairAck::Required` and the
-    ///   configured timeout elapsed without a response.
+    ///   acknowledged with `Ok`, (c) `UnpairAck::Required` and the
+    ///   configured timeout elapsed without a response, or (d) a recovery
+    ///   channel `restore` tears down was refused, right after
+    ///   [`Self::UnpairRejected`].
     /// - Responder: emitted by [`super::DeRecProtocol::accept`] after the
     ///   channel/share/secret state for the requesting peer has been removed.
     Unpaired { channel_id: ChannelId },
 
     /// The peer answered an outbound unpair request with a non-`Ok` status.
     ///
-    /// The initiator's local state is **not** dropped, and the channel is
-    /// `Paired` again — the application decides what to do (retry, escalate,
-    /// or force-delete locally).
+    /// After `start(Unpair)` the initiator's local state is **not** dropped,
+    /// and the channel is `Paired` again — the application decides what to do
+    /// (retry, escalate, or force-delete locally). A recovery channel
+    /// `restore` tears down is dropped all the same, and
+    /// [`Self::Unpaired`] follows.
     UnpairRejected {
         channel_id: ChannelId,
         /// The `StatusEnum` value from the peer's response.

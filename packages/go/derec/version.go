@@ -6,10 +6,11 @@ package derec
 import "github.com/derecalliance/lib-derec/packages/go/internal/native"
 
 // ProtocolVersion is the DeRec protocol version a build speaks, as reported
-// by the core library. Record it in audit trails and logs.
+// by the core library. Record it in audit trails and logs. In the canonical
+// config JSON it is {"major": <n>, "minor": <n>}, both JSON numbers.
 type ProtocolVersion struct {
-	Major uint32
-	Minor uint32
+	Major uint32 `json:"major"`
+	Minor uint32 `json:"minor"`
 }
 
 // CurrentProtocolVersion returns the protocol version compiled into the

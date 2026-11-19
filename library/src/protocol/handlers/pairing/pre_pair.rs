@@ -16,7 +16,7 @@
 //! in [`DeRecProtocol::process`](crate::protocol::DeRecProtocol::process)
 //! decodes the body before any key is available and calls them directly.
 
-use crate::derec_message::{apply_trace_id, fresh_trace_id};
+use crate::derec_message::{DeRecMessageBuilder, apply_trace_id, fresh_trace_id};
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::sender_kind::SenderKindExt as _;
 use crate::primitives::pairing::PairingError;
@@ -237,19 +237,13 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         fingerprint_commitment: None,
     };
 
-    use crate::protocol_version::ProtocolVersion;
-    use derec_proto::DeRecMessage;
-    let protocol_version = ProtocolVersion::current();
-    let envelope = DeRecMessage {
-        protocol_version_major: protocol_version.major,
-        protocol_version_minor: protocol_version.minor,
-        sequence: 0,
-        channel_id: channel_id.into(),
-        timestamp: Some(timestamp),
-        message: MessageBody::PrePairResponse(response).encode_to_vec(),
-        trace_id,
-    }
-    .encode_to_vec();
+    let envelope = DeRecMessageBuilder::plaintext()
+        .channel_id(channel_id)
+        .timestamp(timestamp)
+        .message_body(MessageBody::PrePairResponse(response))
+        .trace_id(trace_id)
+        .build()?
+        .encode_to_vec();
 
     stores
         .transport

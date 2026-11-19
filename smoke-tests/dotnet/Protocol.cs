@@ -83,7 +83,7 @@ internal static class Protocol
         RunOwnerKeepVersionAcrossMissedRoundTest();
         RunInvalidKeepVersionFailsRoundTest();
         RunSupersededShareRequestTest();
-        RunReplayDetectionTest();
+        RunLegacyMessageMinProtocolVersionTest();
         RunShareStoreRefusalTest();
         RunRequestFailedTokenTest();
         RunAutoRespondOnFailureTest();
@@ -103,6 +103,7 @@ internal static class Protocol
         RunOrchestratorDisputedRecoveryTest();
         RunOrchestratorConflictingRecoveryTest();
         RunRestoreKeepsHelperDutiesTest();
+        RunRestoreUnpairRejectedDropsChannelTest();
         RunAbandonedReplicaPairingTest();
         RunContactOnTheGroupChannelTest();
         RunPairingExpiryTest();
@@ -117,6 +118,8 @@ internal static class Protocol
         RunReplicaRosterDescribesEveryMemberTest();
         RunReplicaGroupKeyHandoverTest();
         RunReplicaPublishBeforeHandoverAckTest();
+        RunReplicaLateJoinerTest();
+        RunReplicaRemovalTest();
         RunReplicaVersionConflictEventParseTest();
         RunTypedIdRoundTripTest();
         RunPeerNotRestoredTest();
@@ -944,7 +947,7 @@ internal static class Protocol
         var record = new HelperChannel(42, new[] { new TransportProtocol("https://helper.example/derec") },
             new(), ChannelStatus.Paired, 1_700_000_000, Pairing.SenderKind.Helper, Weight: 3);
         string written = JsonSerializer.Serialize(toDto.Invoke(null, new object[] { record }), dtoType, DeRecJsonOptions.Wire);
-        const string expectedJson = """{"schema_version":3,"channel_id":42,"transports":[{"uri":"https://helper.example/derec","protocol":0}],"communication_info":{},"peer_role":"Helper","status":"Paired","created_at":1700000000,"weight":3}""";
+        const string expectedJson = """{"schema_version":4,"channel_id":42,"transports":[{"uri":"https://helper.example/derec","protocol":0}],"communication_info":{},"peer_role":"Helper","status":"Paired","created_at":1700000000,"weight":3}""";
         if (written != expectedJson)
             throw new InvalidOperationException($"HelperChannelDto must match the Rust record:\n  expected {expectedJson}\n  written  {written}");
         var reread = (HelperChannel)fromDto.Invoke(null, new[] { JsonSerializer.Deserialize(written, dtoType, DeRecJsonOptions.Wire) })!;
@@ -1542,73 +1545,66 @@ internal static class Protocol
     }
 
     /// <summary>
-    /// The application's replay record: the identity of every envelope a
-    /// device sent or accepted, keyed on <see cref="Envelope.ReadMessageId(byte[])"/>.
+    /// <c>library/tests/fixtures/legacy_messages.json</c> holds a
+    /// <c>StoreShareRequest</c> the 0.0.11 release produced. It is accepted
+    /// while the minimum protocol version admits 0.0, and ignored unread as
+    /// <see cref="IgnoreReason.ProtocolVersionTooOld"/> once the minimum is
+    /// 0.1. Mirrors the Rust core's <c>tests/legacy_fixture.rs</c>.
     /// </summary>
-    private sealed class SeenEnvelopes
+    private static void RunLegacyMessageMinProtocolVersionTest()
     {
-        private readonly HashSet<string> _ids = new();
+        Console.WriteLine("=== Protocol legacy message and minimum protocol version ===");
 
-        private static string IdOf(byte[] envelope) => Convert.ToHexString(Envelope.ReadMessageId(envelope).Id);
+        string path = Path.Combine("..", "..", "library", "tests", "fixtures", "legacy_messages.json");
+        if (!File.Exists(path))
+            throw new Exception($"legacy message fixture not found at {Path.GetFullPath(path)}");
+        using var fixture = JsonDocument.Parse(File.ReadAllText(path));
+        string Field(string name) => fixture.RootElement.GetProperty(name).GetString()
+            ?? throw new Exception($"legacy fixture field {name} is not a string");
+        ulong secretId = ulong.Parse(Field("secret_id"), System.Globalization.CultureInfo.InvariantCulture);
+        ulong channelId = ulong.Parse(Field("channel_id"), System.Globalization.CultureInfo.InvariantCulture);
+        byte[] sharedKey = Convert.FromHexString(Field("shared_key_hex"));
+        byte[] request = Convert.FromHexString(Field("store_share_request_hex"));
+        if (sharedKey.Length != 32)
+            throw new Exception($"legacy fixture shared key must be 32 bytes, got {sharedKey.Length}");
 
-        public void Record(byte[] envelope) => _ids.Add(IdOf(envelope));
-
-        public bool Contains(byte[] envelope) => _ids.Contains(IdOf(envelope));
-    }
-
-    private static bool RaisedUpdateChannelInfo(IReadOnlyList<DeRecEvent> events) =>
-        events.OfType<ActionRequiredEvent>().Any(e => e.ActionKind == PendingActionKind.UpdateChannelInfo);
-
-    /// <summary>
-    /// The library processes every copy of a message delivered within the
-    /// inbound window, including one delivered back to its own sender. An
-    /// application that records the message id of what it sends and accepts
-    /// drops a replay, a copy whose unauthenticated trace id was changed, and
-    /// a reflection.
-    /// </summary>
-    private static void RunReplayDetectionTest()
-    {
-        Console.WriteLine("=== Replay detection ===");
-
-        using var owner = MakeNode("Owner", "https://owner.example.com");
-        using var helper = MakeNode("Helper", "https://helper.example.com");
-        ulong channelId = DoOrchestratorPair(helper, helper.Transport, owner, owner.Transport, 61UL);
-        var ownerSeen = new SeenEnvelopes();
-        var helperSeen = new SeenEnvelopes();
-
-        owner.Protocol.StartAsync(FlowKind.UpdateChannelInfo, new UpdateChannelInfoParams
+        IReadOnlyList<DeRecEvent> Process(Func<DeRecProtocolBuilder, DeRecProtocolBuilder> floor)
         {
-            Target = Target.One(channelId),
-            CommunicationInfo = new Dictionary<string, string> { { "name", "owner-renamed" } },
-        }).GetAwaiter().GetResult();
-        byte[] update = owner.Transport.DrainOne();
-        ownerSeen.Record(update);
+            var channelStore = new InMemoryChannelStore();
+            var secretStore = new InMemorySecretStore();
+            channelStore.Save(secretId, ChannelRecord.Of(new HelperChannel(
+                ChannelId: channelId,
+                Transports: new[] { new TransportProtocol("https://owner.example/derec") },
+                CommunicationInfo: new Dictionary<string, string>(),
+                Status: ChannelStatus.Paired,
+                CreatedAt: 0,
+                PeerRole: Pairing.SenderKind.Owner)));
+            secretStore.Save(secretId, channelId, new SecretValue(SecretKind.SharedKey, sharedKey));
+            using var protocol = floor(new DeRecProtocolBuilder(secretId)
+                    .WithStores(new DeRecStores(channelStore, new InMemoryShareStore(), secretStore,
+                        new InMemoryUserSecretStore(), new InMemoryStateStore()))
+                    .WithTransport(new RecordingTransport())
+                    .WithOwnTransports(new[] { new TransportProtocol("https://helper.example/derec") })
+                    .WithTimeouts(new Timeouts(InboundMessage: TimeSpan.FromSeconds(1L << 38))))
+                .Build();
+            return protocol.ProcessAsync(request).GetAwaiter().GetResult();
+        }
 
-        if (helperSeen.Contains(update))
-            throw new InvalidOperationException("a first delivery is not in the record");
-        var events = helper.Protocol.ProcessAsync(update).GetAwaiter().GetResult();
-        if (!RaisedUpdateChannelInfo(events))
-            throw new InvalidOperationException($"the update must raise ActionRequired; got [{string.Join(", ", events)}]");
-        helperSeen.Record(update);
+        var accepted = Process(b => b);
+        if (accepted.Count == 0 || accepted.Any(e => e is MessageIgnoredEvent))
+            throw new InvalidOperationException(
+                $"a 0.0.11 message must be processed under the default minimum; got [{string.Join(", ", accepted)}]");
+        Console.WriteLine("  a message from 0.0.11 is accepted by default  ✓");
 
-        byte[] restamped = Envelope.ApplyTraceId(update, 0x7E57UL);
-        if (restamped.AsSpan().SequenceEqual(update))
-            throw new InvalidOperationException("the copy travels as different bytes");
-        if (!helperSeen.Contains(update) || !helperSeen.Contains(restamped))
-            throw new InvalidOperationException("the replay and the re-stamped copy must be recognised");
-        events = helper.Protocol.ProcessAsync(restamped).GetAwaiter().GetResult();
-        if (!RaisedUpdateChannelInfo(events))
-            throw new InvalidOperationException("unchecked, the library processes the copy again");
-        Console.WriteLine("  [Helper] replay and re-stamped copy share the original's message id  ✓");
+        var ignored = Process(b => b.WithMinProtocolVersion(0, 1));
+        if (ignored.Count != 1
+            || ignored[0] is not MessageIgnoredEvent tooOld
+            || tooOld.Reason != IgnoreReason.ProtocolVersionTooOld)
+            throw new InvalidOperationException(
+                $"a 0.0.11 message must be MessageIgnored(ProtocolVersionTooOld) under a 0.1 minimum; got [{string.Join(", ", ignored)}]");
+        Console.WriteLine("  a message from 0.0.11 is ignored once the minimum is 0.1  ✓");
 
-        if (!ownerSeen.Contains(update))
-            throw new InvalidOperationException("the reflection must be recognised");
-        events = owner.Protocol.ProcessAsync(update).GetAwaiter().GetResult();
-        if (!RaisedUpdateChannelInfo(events))
-            throw new InvalidOperationException("unchecked, the library reads its own update as the peer's");
-        Console.WriteLine("  [Owner]  reflected update matches an outbound message id  ✓");
-
-        Console.WriteLine("Replay detection test passed.\n");
+        Console.WriteLine("Protocol legacy message and minimum protocol version test passed.\n");
     }
 
     private static void StartKeepRound(Node owner, byte secretTag, int round) =>
@@ -2742,6 +2738,177 @@ internal static class Protocol
     }
 
     /// <summary>
+    /// Restoring unpairs the recovery channels, and a helper that refuses that
+    /// unpair does not keep its recovery channel paired: the owner reports
+    /// <see cref="UnpairRejectedEvent"/> then <see cref="UnpairedEvent"/> and
+    /// drops the channel, so the next round sends that helper one share, on
+    /// its restored channel, rather than two shares of the same split.
+    /// </summary>
+    private static void RunRestoreUnpairRejectedDropsChannelTest()
+    {
+        Console.WriteLine("=== Orchestrator restore unpair rejected drops channel test ===");
+
+        const ulong ownSecretId = 4646UL;
+        const string lostUri = "https://lost.example.com";
+        const string helperAUri = "https://helper-a.example.com";
+        const string helperBUri = "https://helper-b.example.com";
+        const string deviceUri = "https://device.example.com";
+
+        using var lost = MakeNode("lost-device", lostUri, new NodeOptions(SecretId: ownSecretId));
+        using var helperA = MakeNode("helper-a", helperAUri);
+        using var helperB = MakeNode("helper-b", helperBUri);
+        ulong channelA = DoOrchestratorPair(helperA, helperA.Transport, lost, lost.Transport, 1UL);
+        ulong channelB = DoOrchestratorPair(helperB, helperB.Transport, lost, lost.Transport, 2UL);
+        uint version = ProtectAcross(lost, lostUri, new[] { (helperA, helperAUri), (helperB, helperBUri) }, "own secret");
+
+        // The owner recovers on a new device over fresh recovery channels.
+        using var device = MakeNode("new-device", deviceUri, new NodeOptions(SecretId: ownSecretId));
+        ulong deviceSid = device.Protocol.SecretId;
+        var recoveryChannels = new List<ulong>();
+        foreach (var (helper, original, transient) in new[] { (helperA, channelA, 100UL), (helperB, channelB, 101UL) })
+        {
+            ulong recoveryChannel = DoOrchestratorPair(device, device.Transport, helper, helper.Transport,
+                transient, Pairing.SenderKind.Helper);
+            helper.ChannelStore.LinkChannel(helper.Protocol.SecretId, original, recoveryChannel);
+            recoveryChannels.Add(recoveryChannel);
+        }
+        ulong recoveryA = recoveryChannels[0];
+        ulong recoveryB = recoveryChannels[1];
+        var restoredChannels = new[] { channelA, channelB };
+        if (restoredChannels.Intersect(recoveryChannels).Any())
+            throw new InvalidOperationException("recovery channels must differ from the restored helper channels");
+
+        var recoveryScope = new[] { (device, deviceUri), (helperA, helperAUri), (helperB, helperBUri) };
+        device.Protocol.StartAsync(FlowKind.RecoverSecret, new RecoverSecretParams
+        {
+            SecretId = ownSecretId,
+            Version = version,
+        }).GetAwaiter().GetResult();
+        var recovered = PumpAll(recoveryScope).OfType<SecretRecoveredEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException("the device must recover its own secret");
+        var helperIds = recovered.Secret.Helpers.Select(h => h.ChannelId).OrderBy(c => c).ToArray();
+        if (!helperIds.SequenceEqual(restoredChannels.OrderBy(c => c)))
+            throw new InvalidOperationException(
+                $"the recovered secret must list the two original helper channels; lists [{string.Join(", ", helperIds)}]");
+
+        var restoreEvents = device.Protocol.RestoreAsync(recovered.Secret, version).GetAwaiter().GetResult();
+        var unpairStarted = restoreEvents.OfType<UnpairStartedEvent>().Select(e => e.ChannelId).ToList();
+        if (!unpairStarted.Contains(recoveryA) || !unpairStarted.Contains(recoveryB))
+            throw new InvalidOperationException(
+                $"restore must unpair both recovery channels: [{string.Join(", ", restoreEvents.Select(e => e.EventType))}]");
+
+        // Restore marks each of its unpairs to drop the channel whatever the
+        // helper answers, and the .NET state mapping carries the flag.
+        var pendingUnpairs = device.StateStore.LoadAll(deviceSid, StateKind.PendingUnpair).ToList();
+        foreach (ulong recoveryChannel in recoveryChannels)
+        {
+            var row = pendingUnpairs.SingleOrDefault(r => r.ChannelId == recoveryChannel)
+                ?? throw new InvalidOperationException($"restore must record a PendingUnpair for {recoveryChannel}");
+            if (!row.DropOnRejection)
+                throw new InvalidOperationException(
+                    $"the PendingUnpair a restore records must carry DropOnRejection; {recoveryChannel} does not");
+        }
+        Console.WriteLine($"  restore unpairs recovery channels {recoveryA}, {recoveryB} with DropOnRejection set  ✓");
+
+        // HelperA's app refuses the unpair; HelperB accepts it.
+        int rejected = 0;
+        foreach (var (uri, _, bytes) in device.Transport.DrainAll())
+        {
+            if (uri == helperAUri)
+            {
+                foreach (var ev in helperA.Protocol.ProcessAsync(bytes).GetAwaiter().GetResult())
+                {
+                    if (ev is not ActionRequiredEvent ar)
+                        continue;
+                    if (ar.ActionKind == PendingActionKind.Unpair)
+                    {
+                        helperA.Protocol.RejectAsync(ar.Action, Org.Derecalliance.Derec.Protobuf.StatusEnum.Fail,
+                            "keeping this channel").GetAwaiter().GetResult();
+                        rejected++;
+                    }
+                    else
+                    {
+                        helperA.Protocol.AcceptAsync(ar.Action).GetAwaiter().GetResult();
+                    }
+                }
+            }
+            else if (uri == helperBUri)
+            {
+                helperB.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+            }
+            else
+            {
+                throw new InvalidOperationException($"restore sent to an unknown peer {uri}");
+            }
+        }
+        if (rejected != 1)
+            throw new InvalidOperationException($"HelperA must be asked to unpair exactly once; was asked {rejected} time(s)");
+
+        var deviceEvents = new List<DeRecEvent>();
+        foreach (var helper in new[] { helperA, helperB })
+        {
+            foreach (var (uri, _, bytes) in helper.Transport.DrainAll())
+            {
+                if (uri != deviceUri)
+                    throw new InvalidOperationException($"a helper answered an unknown peer {uri}");
+                deviceEvents.AddRange(device.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult());
+            }
+        }
+        PumpAll(recoveryScope);
+
+        int rejectedAt = deviceEvents.FindIndex(e => e is UnpairRejectedEvent r && r.ChannelId == recoveryA);
+        int unpairedAt = deviceEvents.FindIndex(e => e is UnpairedEvent u && u.ChannelId == recoveryA);
+        if (rejectedAt < 0 || unpairedAt < 0 || rejectedAt > unpairedAt)
+            throw new InvalidOperationException(
+                $"the refused unpair must emit UnpairRejected then Unpaired for {recoveryA}: "
+                + $"[{string.Join(", ", deviceEvents.Select(e => e.EventType))}]");
+        var refusal = (UnpairRejectedEvent)deviceEvents[rejectedAt];
+        if (refusal.Status != Org.Derecalliance.Derec.Protobuf.StatusEnum.Fail || refusal.Memo != "keeping this channel")
+            throw new InvalidOperationException(
+                $"UnpairRejected must carry HelperA's answer: status={refusal.Status} memo={refusal.Memo}");
+        if (!deviceEvents.Any(e => e is UnpairedEvent u && u.ChannelId == recoveryB))
+            throw new InvalidOperationException($"the accepted unpair must emit Unpaired for {recoveryB}");
+        Console.WriteLine($"  HelperA refuses → UnpairRejected then Unpaired for {recoveryA}  ✓");
+
+        foreach (ulong recoveryChannel in recoveryChannels)
+        {
+            if (device.ChannelStore.Load(deviceSid, recoveryChannel, 0) is not null)
+                throw new InvalidOperationException($"recovery channel {recoveryChannel} must be gone from the channel store");
+        }
+        if (device.StateStore.LoadAll(deviceSid, StateKind.PendingUnpair).Any())
+            throw new InvalidOperationException("no PendingUnpair may remain once both helpers answered");
+        foreach (ulong restored in restoredChannels)
+        {
+            var channel = device.ChannelStore.Load(deviceSid, restored, 0)
+                ?? throw new InvalidOperationException($"restored helper channel {restored} must exist");
+            if (channel.Status != ChannelStatus.Paired)
+                throw new InvalidOperationException($"restored helper channel {restored} must be Paired; is {channel.Status}");
+        }
+        Console.WriteLine("  both recovery channels dropped, restored helper channels still Paired  ✓");
+
+        // The next round sends one share per helper, on its restored channel.
+        var protectEvents = device.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret { Id = new byte[] { 0x0a }, Name = "after restore", Data = Encoding.UTF8.GetBytes("after restore") },
+            },
+        }).GetAwaiter().GetResult();
+        var targeted = protectEvents.OfType<ProtectSecretStartedEvent>().Select(e => e.ChannelId).OrderBy(c => c).ToArray();
+        if (!targeted.SequenceEqual(restoredChannels.OrderBy(c => c)))
+            throw new InvalidOperationException(
+                $"ProtectSecret must target exactly the restored helper channels [{channelA}, {channelB}]; "
+                + $"targeted [{string.Join(", ", targeted)}]");
+        var sentTo = device.Transport.DrainAll().Select(m => m.Uri).OrderBy(u => u, StringComparer.Ordinal).ToArray();
+        if (!sentTo.SequenceEqual(new[] { helperAUri, helperBUri }))
+            throw new InvalidOperationException(
+                $"ProtectSecret must send exactly one share per helper; sent to [{string.Join(", ", sentTo)}]");
+        Console.WriteLine($"  next ProtectSecret targets only [{channelA}, {channelB}], one share per helper  ✓");
+
+        Console.WriteLine("Orchestrator restore unpair rejected drops channel test passed.\n");
+    }
+
+    /// <summary>
     /// Start a replica pairing from <paramref name="scanner"/>, as
     /// <paramref name="kind"/>, against a fresh contact from
     /// <paramref name="creator"/> at <paramref name="transient"/>.
@@ -3745,15 +3912,12 @@ internal static class Protocol
         destination.Protocol.VerifyFingerprintAsync(destId, ownerFp).GetAwaiter().GetResult();
         Console.WriteLine($"  fingerprint cross-confirmed ({ownerFp.Length} chars)  ✓");
 
-        // verify_fingerprint auto-publishes an empty-secret roster
-        // snapshot to every paired peer (2 helpers + 1 replica) so the
-        // newly-Paired Destination receives the current state without
-        // an explicit ProtectSecret call. Drain that round here — the
-        // assertions below cover the subsequent explicit publish.
+        // Confirming a replica destination publishes nothing; the
+        // application's explicit publish below is what reaches it.
         var autoPublish = owner.Transport.DrainAll();
-        if (autoPublish.Count != 3)
+        if (autoPublish.Count != 0)
             throw new InvalidOperationException(
-                $"verify_fingerprint auto-publish must fan out to 2 helpers + 1 replica, got {autoPublish.Count}");
+                $"confirming a replica destination publishes nothing; the application publishes, got {autoPublish.Count} messages");
 
         owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
         {
@@ -3858,8 +4022,8 @@ internal static class Protocol
         var received2 = destEvents2.OfType<ReplicaSecretReceivedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException(
                 $"v2: destination did not emit ReplicaSecretReceived; got [{string.Join(", ", destEvents2.Select(e => e.EventType))}]");
-        if (received2.Version != 3u)
-            throw new InvalidOperationException($"v2: expected Version=3, got {received2.Version}");
+        if (received2.Version != 2u)
+            throw new InvalidOperationException($"v2: expected Version=2, got {received2.Version}");
         if (received2.Secret.Secrets.Count != 1 || !received2.Secret.Secrets[0].Data.SequenceEqual(secretDataV2))
             throw new InvalidOperationException("v2: secret.secrets[0].data must round-trip the updated bytes");
         Console.WriteLine(
@@ -4868,6 +5032,10 @@ internal static class Protocol
         ulong channel = PairReplicaHandshake(source, destination, 31);
         string destinationFp = destination.Protocol.GetFingerprintAsync(channel).GetAwaiter().GetResult();
         source.Protocol.VerifyFingerprintAsync(channel, destinationFp).GetAwaiter().GetResult();
+        source.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = Array.Empty<UserSecret>(),
+        }).GetAwaiter().GetResult();
 
         var early = PumpAll(scope);
         if (!early.OfType<MessageIgnoredEvent>().Any(e =>
@@ -4985,8 +5153,13 @@ internal static class Protocol
         ulong channelA = DoOrchestratorPair(helperA, helperA.Transport, source, source.Transport, 1UL);
         ulong channelB = DoOrchestratorPair(helperB, helperB.Transport, source, source.Transport, 2UL);
         ulong group = PairReplicaHandshake(source, destination, 3UL);
-        CrossConfirmFingerprint(source, destination, group);
-        PumpAll(scope);
+        // A replica channel counts as paired only once both sides confirm the
+        // fingerprint, so this is what puts the Destination on the publish
+        // roster at all.
+        string sourceFp = source.Protocol.GetFingerprintAsync(group).GetAwaiter().GetResult();
+        string destinationFp = destination.Protocol.GetFingerprintAsync(group).GetAwaiter().GetResult();
+        source.Protocol.VerifyFingerprintAsync(group, destinationFp).GetAwaiter().GetResult();
+        destination.Protocol.VerifyFingerprintAsync(group, sourceFp).GetAwaiter().GetResult();
 
         uint Protect(string data, string description) =>
             source.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
@@ -5272,9 +5445,11 @@ internal static class Protocol
     /// The group key is fixed at the first replica pairing. A second
     /// Destination pairs on an ephemeral channel and is handed over onto the
     /// group channel: every member then holds the identical group key there,
-    /// the ephemeral channel's key is gone on both of its ends, every roster
-    /// places all three members on the group channel, and a follow-up round
-    /// decrypts on the new member.
+    /// every roster places all three members on the group channel, and a
+    /// follow-up round decrypts on the new member. The Source drops the
+    /// ephemeral key once the new member answers on the group channel; the
+    /// new member keeps it, recorded on the Source's row, until the Source
+    /// reaches it on the group channel.
     /// Mirrors <c>run_replica_group_key_handover_flow</c> in
     /// <c>smoke-tests/rust/src/protocol.rs</c>.
     /// </summary>
@@ -5283,10 +5458,11 @@ internal static class Protocol
         Console.WriteLine("=== Orchestrator replica group-key handover test ===");
 
         const ulong sid = 0xBEEFUL;
+        const ulong ownerReplicaId = 0xC0DE_C0DE_C0DE_C0DEUL;
         const string sourceUri = "https://source.example.com";
         const string dest1Uri = "https://dest1.example.com";
         const string dest2Uri = "https://dest2.example.com";
-        using var source = MakeNode("Source", sourceUri, new NodeOptions(ReplicaId: 0xC0DE_C0DE_C0DE_C0DEUL, SecretId: sid));
+        using var source = MakeNode("Source", sourceUri, new NodeOptions(ReplicaId: ownerReplicaId, SecretId: sid));
         using var dest1 = MakeNode("Dest1", dest1Uri, new NodeOptions(ReplicaId: 0xD1D1_D1D1_D1D1_D1D1UL, SecretId: sid));
         using var dest2 = MakeNode("Dest2", dest2Uri, new NodeOptions(ReplicaId: 0xD2D2_D2D2_D2D2_D2D2UL, SecretId: sid));
         var scope = new[] { (source, sourceUri), (dest1, dest1Uri), (dest2, dest2Uri) };
@@ -5318,11 +5494,14 @@ internal static class Protocol
             if (!RequireKey(node, group, label).SequenceEqual(groupKey))
                 throw new InvalidOperationException($"{label} must hold the group key fixed at the first pairing");
         }
-        foreach (var (label, node) in new[] { ("Source", source), ("Dest2", dest2) })
-        {
-            if (Key(node, ephemeral) is not null)
-                throw new InvalidOperationException($"{label} must drop the ephemeral pairing channel's key after handover");
-        }
+        if (Key(source, ephemeral) is not null)
+            throw new InvalidOperationException(
+                "Source must drop the ephemeral pairing channel's key once Dest2 answers on the group channel");
+        if (Key(dest2, ephemeral) is null)
+            throw new InvalidOperationException(
+                "Dest2 must keep the ephemeral key until Source reaches it on the group channel");
+        if (MemberHandoverChannel(dest2, sid, ownerReplicaId) != ephemeral)
+            throw new InvalidOperationException("Dest2 records the ephemeral channel on Source's row");
         foreach (var (label, node) in new[] { ("Source", source), ("Dest1", dest1), ("Dest2", dest2) })
         {
             var roster = node.ChannelStore.ListReplicas(sid, ReplicaFilter.Any).ToList();
@@ -5346,6 +5525,11 @@ internal static class Protocol
             ?? throw new InvalidOperationException("Dest2 must hold a snapshot");
         if (!dest2Snapshot.Secrets.Any(u => u.Data.SequenceEqual(payload)))
             throw new InvalidOperationException("Dest2 must decrypt the post-handover payload with the group key");
+        if (Key(dest2, ephemeral) is not null)
+            throw new InvalidOperationException(
+                "Dest2 must drop the ephemeral key once Source reaches it on the group channel");
+        if (MemberHandoverChannel(dest2, sid, ownerReplicaId) is { } stale)
+            throw new InvalidOperationException($"Dest2 must clear Source's handover channel, still {stale}");
         if (!RequireKey(source, group, "Source").SequenceEqual(groupKey))
             throw new InvalidOperationException("the group key must stay stable across follow-up rounds");
         Console.WriteLine("  step 3: follow-up round under the group key; Dest2 decrypted it  ✓");
@@ -5356,8 +5540,10 @@ internal static class Protocol
     /// <summary>
     /// A publish sent before the joiner's handover acknowledgement reaches the
     /// Source still reaches the joiner, and so does every later one when that
-    /// acknowledgement is lost: the joiner drops its ephemeral channel once it
-    /// hydrates, so the Source already addresses it on the group channel.
+    /// acknowledgement is lost: the Source keeps addressing the joiner on the
+    /// ephemeral channel until the joiner speaks on the group channel, and the
+    /// joiner keeps reading there until the Source reaches it on the group
+    /// channel.
     /// Mirrors <c>run_replica_publish_before_handover_ack_flow</c> in
     /// <c>smoke-tests/rust/src/protocol.rs</c>.
     /// </summary>
@@ -5366,12 +5552,14 @@ internal static class Protocol
         Console.WriteLine("=== Orchestrator replica publish before handover ack test ===");
 
         const ulong sid = 0xBEEFUL;
+        const ulong sourceId = 0xC0DE_C0DE_C0DE_C0DEUL;
+        const ulong dest2Id = 0xD2D2_D2D2_D2D2_D2D2UL;
         const string sourceUri = "https://source.example.com";
         const string dest1Uri = "https://dest1.example.com";
         const string dest2Uri = "https://dest2.example.com";
-        using var source = MakeNode("Source", sourceUri, new NodeOptions(ReplicaId: 0xC0DE_C0DE_C0DE_C0DEUL, SecretId: sid));
+        using var source = MakeNode("Source", sourceUri, new NodeOptions(ReplicaId: sourceId, SecretId: sid));
         using var dest1 = MakeNode("Dest1", dest1Uri, new NodeOptions(ReplicaId: 0xD1D1_D1D1_D1D1_D1D1UL, SecretId: sid));
-        using var dest2 = MakeNode("Dest2", dest2Uri, new NodeOptions(ReplicaId: 0xD2D2_D2D2_D2D2_D2D2UL, SecretId: sid));
+        using var dest2 = MakeNode("Dest2", dest2Uri, new NodeOptions(ReplicaId: dest2Id, SecretId: sid));
         var scope = new[] { (source, sourceUri), (dest1, dest1Uri), (dest2, dest2Uri) };
 
         ulong group = PairReplicaHandshake(source, dest1, 1UL);
@@ -5388,25 +5576,322 @@ internal static class Protocol
         if (dest2.Transport.DrainAll().Count == 0)
             throw new InvalidOperationException("Dest2 must have acknowledged the handover before it is dropped");
         PumpAll(scope);
+        if (MemberChannel(source, sid, dest2Id) != ephemeral)
+            throw new InvalidOperationException("Source must still address Dest2 on the ephemeral channel");
+        if (ChannelKey(source, sid, ephemeral) is null)
+            throw new InvalidOperationException("Source must keep the ephemeral key until Dest2 speaks on the group channel");
+        if (MemberHandoverChannel(dest2, sid, sourceId) != ephemeral)
+            throw new InvalidOperationException("Dest2 keeps Source's handover channel while Source may still send there");
+        if (ChannelKey(dest2, sid, ephemeral) is null)
+            throw new InvalidOperationException("Dest2 must keep the ephemeral key");
         Console.WriteLine("  step 1: handover delivered, Dest2's acknowledgement lost  ✓");
 
-        foreach (string text in new[] { "before the ack", "after the ack" })
-        {
-            byte[] payload = Encoding.UTF8.GetBytes(text);
-            source.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
-            {
-                Secrets = new[] { new UserSecret { Id = new byte[] { 0x42 }, Name = "handover", Data = payload } },
-            }).GetAwaiter().GetResult();
-            PumpAll(scope);
-            var snapshot = dest2.UserSecretStore.LoadLatest(sid)
-                ?? throw new InvalidOperationException("Dest2 must hold a snapshot");
-            if (!snapshot.Secrets.Any(u => u.Data.SequenceEqual(payload)))
-                throw new InvalidOperationException($"Dest2 must receive the publish carrying \"{text}\"");
-        }
-        Console.WriteLine("  step 2: both publishes reached Dest2 on the group channel  ✓");
+        // Source never saw the acknowledgement, so its next publish goes on the
+        // ephemeral channel again. Dest2 still reads it there, and its answer on
+        // the group channel completes the move on Source.
+        Publish(source, "resent on the ephemeral channel");
+        PumpAll(scope);
+        AssertHolds(dest2, "Dest2", sid, "resent on the ephemeral channel");
+        if (MemberChannel(source, sid, dest2Id) != group)
+            throw new InvalidOperationException("Source must move Dest2 onto the group channel");
+        if (ChannelKey(source, sid, ephemeral) is not null)
+            throw new InvalidOperationException("Source drops the ephemeral key once Dest2 answers on the group channel");
+        if (ChannelKey(dest2, sid, ephemeral) is null)
+            throw new InvalidOperationException("Dest2 has not heard from Source on the group channel yet");
+        Console.WriteLine("  step 2: the resent copy is read on the ephemeral channel; Source moves Dest2  ✓");
+
+        // Dest2 publishes before Source reaches it on the group channel. It
+        // sends to every member on the group channel, so Source, which no longer
+        // holds the ephemeral key, still reads it.
+        Publish(dest2, "published by the joiner");
+        PumpAll(scope);
+        AssertHolds(source, "Source", sid, "published by the joiner");
+        AssertHolds(dest1, "Dest1", sid, "published by the joiner");
+        Console.WriteLine("  step 3: Dest2's own publish reaches Source on the group channel  ✓");
+
+        Publish(source, "on the group channel");
+        PumpAll(scope);
+        AssertHolds(dest2, "Dest2", sid, "on the group channel");
+        if (ChannelKey(dest2, sid, ephemeral) is not null)
+            throw new InvalidOperationException("Dest2 drops the ephemeral key once Source reaches it on the group channel");
+        if (MemberHandoverChannel(dest2, sid, sourceId) is { } stale)
+            throw new InvalidOperationException($"Dest2 must clear Source's handover channel, still {stale}");
+        Console.WriteLine("  step 4: Source reaches Dest2 on the group channel; Dest2 drops the ephemeral key  ✓");
 
         Console.WriteLine("Orchestrator replica publish before handover ack test passed.\n");
     }
+
+    /// <summary>
+    /// A device joining an existing group whose pairing the Source confirmed,
+    /// and whose application published, before the joiner confirmed. The
+    /// joiner ignores that copy, then confirms and asks: the answer arrives on
+    /// the pairing channel and carries the group key, and the next two
+    /// publishes complete the handover on both sides.
+    /// Mirrors <c>run_replica_late_joiner_flow</c> in
+    /// <c>smoke-tests/rust/src/protocol.rs</c>.
+    /// </summary>
+    private static void RunReplicaLateJoinerTest()
+    {
+        Console.WriteLine("=== Orchestrator replica late joiner test ===");
+
+        const ulong sid = 0x1A7EUL;
+        const ulong sourceId = 0x5050_5050_5050_5050UL;
+        const ulong joinerId = 0x1010_1010_1010_1010UL;
+        const string sourceUri = "https://source.example.com";
+        const string dest1Uri = "https://dest1.example.com";
+        const string joinerUri = "https://joiner.example.com";
+        using var source = MakeNode("Source", sourceUri, new NodeOptions(ReplicaId: sourceId, SecretId: sid));
+        using var dest1 = MakeNode("Dest1", dest1Uri, new NodeOptions(ReplicaId: 0xD1D1_D1D1_D1D1_D1D1UL, SecretId: sid));
+        using var joiner = MakeNode("Joiner", joinerUri, new NodeOptions(ReplicaId: joinerId, SecretId: sid));
+        var scope = new[] { (source, sourceUri), (dest1, dest1Uri), (joiner, joinerUri) };
+
+        ulong group = PairReplicaHandshake(source, dest1, 1UL);
+        CrossConfirmFingerprint(source, dest1, group);
+        PumpAll(scope);
+
+        ulong ephemeral = PairReplicaHandshake(source, joiner, 2UL);
+        string joinerFp = joiner.Protocol.GetFingerprintAsync(ephemeral).GetAwaiter().GetResult();
+        source.Protocol.VerifyFingerprintAsync(ephemeral, joinerFp).GetAwaiter().GetResult();
+        Publish(source, "before the joiner confirmed");
+        var early = PumpAll(scope);
+        if (!early.OfType<MessageIgnoredEvent>().Any(e =>
+                e.Reason == IgnoreReason.PendingVerification && e.ChannelId == ephemeral))
+        {
+            throw new InvalidOperationException(
+                "the joiner ignores a copy that arrives before it confirms, got ["
+                + string.Join(", ", early.Select(e => e.EventType)) + "]");
+        }
+        AssertHolds(dest1, "Dest1", sid, "before the joiner confirmed");
+        if (joiner.UserSecretStore.LoadLatest(sid) is not null)
+            throw new InvalidOperationException("the joiner must hold no snapshot before it confirms");
+        Console.WriteLine("  step 1: the source published before the joiner confirmed; the joiner ignored it  ✓");
+
+        string sourceFp = source.Protocol.GetFingerprintAsync(ephemeral).GetAwaiter().GetResult();
+        joiner.Protocol.VerifyFingerprintAsync(ephemeral, sourceFp).GetAwaiter().GetResult();
+        joiner.Protocol.StartAsync(FlowKind.ReplicaDiscovery, new ReplicaDiscoveryParams())
+            .GetAwaiter().GetResult();
+        var caughtUp = PumpAll(scope);
+        if (!caughtUp.OfType<ReplicaSecretInstalledEvent>().Any())
+            throw new InvalidOperationException(
+                "the joiner installs the copy it asked for, got ["
+                + string.Join(", ", caughtUp.Select(e => e.EventType)) + "]");
+        AssertHolds(joiner, "Joiner", sid, "before the joiner confirmed");
+        byte[] groupKey = ChannelKey(source, sid, group)
+            ?? throw new InvalidOperationException("Source must hold the group key");
+        if (!(ChannelKey(joiner, sid, group)?.SequenceEqual(groupKey) ?? false))
+            throw new InvalidOperationException("the answer carried the group key");
+        if (MemberChannel(joiner, sid, sourceId) != group)
+            throw new InvalidOperationException("the joiner must place Source on the group channel");
+        if (MemberHandoverChannel(joiner, sid, sourceId) != ephemeral)
+            throw new InvalidOperationException("the joiner records the pairing channel on Source's row");
+        if (MemberChannel(source, sid, joinerId) != ephemeral)
+            throw new InvalidOperationException("Source must still address the joiner on the pairing channel");
+        Console.WriteLine("  step 2: the joiner confirmed and asked; it holds the group key and the copy  ✓");
+
+        Publish(source, "after the joiner caught up");
+        PumpAll(scope);
+        AssertHolds(dest1, "Dest1", sid, "after the joiner caught up");
+        AssertHolds(joiner, "Joiner", sid, "after the joiner caught up");
+        if (MemberChannel(source, sid, joinerId) != group)
+            throw new InvalidOperationException("Source must move the joiner onto the group channel");
+        if (ChannelKey(source, sid, ephemeral) is not null)
+            throw new InvalidOperationException("Source drops the pairing key once the joiner answers on the group channel");
+        if (ChannelKey(joiner, sid, ephemeral) is null)
+            throw new InvalidOperationException("the joiner has not heard from Source on the group channel yet");
+        Console.WriteLine("  step 3: the next publish reaches the joiner on the pairing channel; the source moves it  ✓");
+
+        Publish(source, "on the group channel");
+        PumpAll(scope);
+        AssertHolds(dest1, "Dest1", sid, "on the group channel");
+        AssertHolds(joiner, "Joiner", sid, "on the group channel");
+        if (ChannelKey(joiner, sid, ephemeral) is not null)
+            throw new InvalidOperationException("the joiner drops the pairing key once Source reaches it on the group channel");
+        if (MemberHandoverChannel(joiner, sid, sourceId) is { } stale)
+            throw new InvalidOperationException($"the joiner must clear Source's handover channel, still {stale}");
+        Console.WriteLine("  step 4: the source reaches the joiner on the group channel; the joiner drops the pairing key  ✓");
+
+        Console.WriteLine("Orchestrator replica late joiner test passed.\n");
+    }
+
+    /// <summary>The replica ids a node records, sorted.</summary>
+    private static List<ulong> RosterIds(Node node, ulong secretId) =>
+        node.ChannelStore.ListReplicas(secretId, ReplicaFilter.Any).Select(m => m.ReplicaId).OrderBy(id => id).ToList();
+
+    /// <summary>
+    /// Removing a member: <see cref="FlowKind.UnpairReplica"/> drops it on the
+    /// device that ran it and publishes the roster without it; the removed
+    /// device drops everything when told and receives nothing afterwards; a
+    /// device can also remove itself.
+    /// Mirrors <c>run_replica_removal_flow</c> in
+    /// <c>smoke-tests/rust/src/protocol.rs</c>.
+    /// </summary>
+    private static void RunReplicaRemovalTest()
+    {
+        Console.WriteLine("=== Orchestrator replica removal test ===");
+
+        const ulong sid = 0x7E40UL;
+        const ulong aId = 0x0A0A_0A0A_0A0A_0A0AUL;
+        const ulong bId = 0x0B0B_0B0B_0B0B_0B0BUL;
+        const ulong cId = 0x0C0C_0C0C_0C0C_0C0CUL;
+        const string aUri = "https://a.example.com";
+        const string bUri = "https://b.example.com";
+        const string cUri = "https://c.example.com";
+        using var a = MakeNode("A", aUri, new NodeOptions(ReplicaId: aId, SecretId: sid));
+        using var b = MakeNode("B", bUri, new NodeOptions(ReplicaId: bId, SecretId: sid));
+        using var c = MakeNode("C", cUri, new NodeOptions(ReplicaId: cId, SecretId: sid));
+        var scope = new[] { (a, aUri), (b, bUri), (c, cUri) };
+        static string Names(IEnumerable<DeRecEvent> events) =>
+            "[" + string.Join(", ", events.Select(e => e.EventType)) + "]";
+
+        ulong group = PairReplicaHandshake(a, b, 1UL);
+        CrossConfirmFingerprint(a, b, group);
+        PumpAll(scope);
+        ulong joining = PairReplicaHandshake(a, c, 2UL);
+        CrossConfirmFingerprint(a, c, joining);
+        PumpAll(scope);
+        Publish(a, "before the removal");
+        PumpAll(scope);
+        AssertHolds(b, "B", sid, "before the removal");
+        AssertHolds(c, "C", sid, "before the removal");
+
+        var started = a.Protocol.StartAsync(FlowKind.UnpairReplica, new UnpairReplicaParams
+        {
+            ReplicaId = cId,
+            Memo = "retired tablet",
+        }).GetAwaiter().GetResult();
+        if (!started.OfType<ReplicaRemovedEvent>().Any(e => e.ReplicaId == cId))
+            throw new InvalidOperationException(
+                $"the device running the removal drops the member at once, got {Names(started)}");
+        if (!RosterIds(a, sid).SequenceEqual(new[] { aId, bId }))
+            throw new InvalidOperationException("A's roster must hold A and B only");
+        var published = a.Transport.DrainAll();
+        if (!published.Any(o => o.Uri == cUri))
+            throw new InvalidOperationException("the removed member is told");
+        if (published.Count(o => o.Uri == cUri) != 1)
+            throw new InvalidOperationException("the removed member receives the notice and nothing else");
+        var seenByB = new List<DeRecEvent>();
+        foreach (var (uri, _, bytes) in published)
+        {
+            if (uri == bUri)
+            {
+                seenByB.AddRange(b.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult());
+            }
+            else if (uri == cUri)
+            {
+                var events = c.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+                if (!events.OfType<SelfRemovedFromGroupEvent>().Any())
+                    throw new InvalidOperationException(
+                        $"the removed member drops everything when told, got {Names(events)}");
+            }
+        }
+        Console.WriteLine("  step 1: removing a member drops it at once and publishes without it; it is told and drops everything  ✓");
+
+        seenByB.AddRange(PumpAll(scope));
+        if (!seenByB.OfType<ReplicaRemovedEvent>().Any(e => e.ReplicaId == cId))
+            throw new InvalidOperationException(
+                $"the remaining member drops it when the roster arrives, got {Names(seenByB)}");
+        if (!RosterIds(b, sid).SequenceEqual(new[] { aId, bId }))
+            throw new InvalidOperationException("B's roster must hold A and B only");
+        if (RosterIds(c, sid).Count != 0)
+            throw new InvalidOperationException("the removed member must hold no roster");
+        if (c.UserSecretStore.LoadLatest(sid) is not null)
+            throw new InvalidOperationException("the removed member keeps no copy of the secret");
+        Console.WriteLine("  step 2: the remaining member drops it with the roster; the removed member holds nothing  ✓");
+
+        Publish(a, "after the removal");
+        var after = a.Transport.DrainAll();
+        if (after.Any(o => o.Uri == cUri))
+            throw new InvalidOperationException("nothing more is sent to the removed member");
+        foreach (var (uri, _, bytes) in after)
+        {
+            if (uri == bUri) b.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+        }
+        PumpAll(scope);
+        AssertHolds(b, "B", sid, "after the removal");
+        Console.WriteLine("  step 3: a later publish reaches the remaining member only  ✓");
+
+        var left = b.Protocol.StartAsync(FlowKind.UnpairReplica, new UnpairReplicaParams { ReplicaId = bId })
+            .GetAwaiter().GetResult();
+        if (!left.OfType<SelfRemovedFromGroupEvent>().Any())
+            throw new InvalidOperationException(
+                $"a device removing itself publishes and then drops everything, got {Names(left)}");
+        if (RosterIds(b, sid).Count != 0)
+            throw new InvalidOperationException("the device that left must hold no roster");
+        var farewell = new List<DeRecEvent>();
+        foreach (var (uri, _, bytes) in b.Transport.DrainAll())
+        {
+            if (uri == aUri) farewell.AddRange(a.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult());
+        }
+        // The remaining member acknowledges the roster to a device that has
+        // already dropped the channel, which refuses the acknowledgement as an
+        // unknown channel.
+        int late = 0;
+        foreach (var (uri, _, bytes) in a.Transport.DrainAll())
+        {
+            if (uri != bUri) continue;
+            late++;
+            bool refused = false;
+            try
+            {
+                b.Protocol.ProcessAsync(bytes).GetAwaiter().GetResult();
+            }
+            catch (DeRecException)
+            {
+                refused = true;
+            }
+            if (!refused)
+                throw new InvalidOperationException("an acknowledgement reaching the departed device finds no channel");
+        }
+        if (late == 0)
+            throw new InvalidOperationException("the remaining member acknowledges the departing roster");
+        if (!farewell.OfType<ReplicaRemovedEvent>().Any(e => e.ReplicaId == bId))
+            throw new InvalidOperationException(
+                $"the remaining member drops the device that left, got {Names(farewell)}");
+        if (!RosterIds(a, sid).SequenceEqual(new[] { aId }))
+            throw new InvalidOperationException("A's roster must hold A only");
+        Console.WriteLine("  step 4: a device removing itself publishes the roster without it, then drops everything  ✓");
+
+        Console.WriteLine("Orchestrator replica removal test passed.\n");
+    }
+
+    /// <summary>Publish one user secret carrying <paramref name="payload"/>.</summary>
+    private static void Publish(Node node, string payload) =>
+        node.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret { Id = new byte[] { 0x42 }, Name = "handover", Data = Encoding.UTF8.GetBytes(payload) },
+            },
+        }).GetAwaiter().GetResult();
+
+    /// <summary>Assert a node's latest snapshot carries <paramref name="payload"/>.</summary>
+    private static void AssertHolds(Node node, string label, ulong secretId, string payload)
+    {
+        var snapshot = node.UserSecretStore.LoadLatest(secretId)
+            ?? throw new InvalidOperationException($"{label} must hold a snapshot");
+        byte[] bytes = Encoding.UTF8.GetBytes(payload);
+        if (!snapshot.Secrets.Any(u => u.Data.SequenceEqual(bytes)))
+            throw new InvalidOperationException($"{label} must hold the publish carrying \"{payload}\"");
+    }
+
+    private static ReplicaMember MemberRow(Node node, ulong secretId, ulong replicaId) =>
+        node.ChannelStore.ListReplicas(secretId, ReplicaFilter.Any).FirstOrDefault(m => m.ReplicaId == replicaId)
+            ?? throw new InvalidOperationException($"no member row for replica {replicaId}");
+
+    /// <summary>The channel a node records <paramref name="replicaId"/> on.</summary>
+    private static ulong MemberChannel(Node node, ulong secretId, ulong replicaId) =>
+        MemberRow(node, secretId, replicaId).ChannelId;
+
+    /// <summary>
+    /// The channel a node recorded <paramref name="replicaId"/> as having
+    /// handed the group over on, if it is still in use.
+    /// </summary>
+    private static ulong? MemberHandoverChannel(Node node, ulong secretId, ulong replicaId) =>
+        MemberRow(node, secretId, replicaId).HandoverChannel;
+
+    /// <summary>A channel's stored shared key, or <c>null</c> when it holds none.</summary>
+    private static byte[]? ChannelKey(Node node, ulong secretId, ulong channelId) =>
+        node.SecretStore.Load(secretId, channelId, SecretKind.SharedKey)?.Bytes;
 
     /// <summary>
     /// A helper's stored share is tampered with. Recovery reports it as
@@ -5666,6 +6151,26 @@ internal static class Protocol
             throw new InvalidOperationException($"fingerprint mismatch: owner={ownerFp} replica={replicaFp}");
         owner.Protocol.VerifyFingerprintAsync(channelId, replicaFp).GetAwaiter().GetResult();
         replica.Protocol.VerifyFingerprintAsync(channelId, ownerFp).GetAwaiter().GetResult();
+        bool isHelper = owner.ChannelStore.Load(owner.Protocol.SecretId, channelId, 0UL)?.Helper is not null;
+        if (!isHelper)
+            PublishAfterConfirming(owner);
+    }
+
+    /// <summary>
+    /// What the owner's application does once both sides of a replica pairing
+    /// have confirmed: publish the latest snapshot, or an empty one when there
+    /// is none, so the joiner receives the vault, the roster and the group key.
+    /// </summary>
+    private static void PublishAfterConfirming(Node source)
+    {
+        var latest = source.UserSecretStore.LoadLatest(source.Protocol.SecretId);
+        source.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = latest?.Secrets
+                .Select(u => new UserSecret { Id = u.Id, Name = u.Name, Data = u.Data })
+                .ToArray() ?? Array.Empty<UserSecret>(),
+            Description = latest?.Description,
+        }).GetAwaiter().GetResult();
     }
 
     private static void HelperStartPair(Node owner, Node helper, ulong channelId)
@@ -6233,6 +6738,24 @@ internal static class Protocol
             Console.WriteLine($"  GenerateReplicaId: 64 non-zero ids; WithReplicaId({generatedIds[0]}) builds  ✓");
         }
 
+        // The minimum protocol version crosses as the config JSON's
+        // min_protocol_version object, omitted when unset.
+        var floorJson = System.Text.Json.Nodes.JsonNode.Parse(JsonSerializer.Serialize(
+            new DeRecProtocolConfig { MinProtocolVersion = new ProtocolVersion(0, 1) }, DeRecJsonOptions.Wire))!.AsObject();
+        if (!System.Text.Json.Nodes.JsonNode.DeepEquals(
+                floorJson["min_protocol_version"],
+                System.Text.Json.Nodes.JsonNode.Parse("""{ "major": 0, "minor": 1 }""")))
+            throw new InvalidOperationException($"config JSON must carry min_protocol_version as {{major, minor}}; got {floorJson.ToJsonString()}");
+        if (ConfigJson(null).ContainsKey("min_protocol_version"))
+            throw new InvalidOperationException("an unset min_protocol_version must be omitted");
+        using (Base()
+            .WithOwnTransports(new[] { new TransportProtocol("https://owner.example.com") })
+            .WithMinProtocolVersion(0, 1)
+            .Build())
+        {
+            Console.WriteLine("  WithMinProtocolVersion(0, 1) rides in the config JSON, accepted by the FFI  ✓");
+        }
+
         // Timeouts cross as whole seconds. The library is the one that
         // accepts or refuses a value, so a negative or sub-second duration
         // reaches it unchanged and is refused there.
@@ -6450,6 +6973,7 @@ internal static class Protocol
         if (full.Threshold != 3
             || full.MaxSubshares != 12
             || full.ReplicaId != 9007199254740993UL
+            || full.MinProtocolVersion is not { Major: 0, Minor: 1 }
             || full.Timeouts?.InboundMessage != TimeSpan.FromSeconds(120)
             || full.Timeouts?.SharingRound != TimeSpan.FromSeconds(30)
             || full.Timeouts?.UnpairAck != TimeSpan.FromSeconds(45)
@@ -6485,6 +7009,7 @@ internal static class Protocol
             """{ "auto_accept": { "pair": true } }""",
             """{ "parameter_range": { "min_size": 1 } }""",
             """{ "timeouts": { "expired_channels": { "enabled": true, "timeout": 5 } } }""",
+            """{ "min_protocol_version": { "major": 0, "minr": 1 } }""",
         })
         {
             var refused = false;

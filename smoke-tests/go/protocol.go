@@ -13,8 +13,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -24,7 +28,6 @@ import (
 	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/discovery"
-	"github.com/derecalliance/lib-derec/packages/go/primitives/envelope"
 	"github.com/derecalliance/lib-derec/packages/go/protocol"
 
 	"google.golang.org/protobuf/proto"
@@ -1525,77 +1528,94 @@ func runHelperKeepVersionPrunesShareStore() {
 	fmt.Println("Helper keepVersion test passed.")
 }
 
-// seenEnvelopes is the application's replay record: the identity of every
-// envelope a device sent or accepted, keyed on envelope.ReadMessageID.
-type seenEnvelopes map[string]struct{}
-
-func messageIDOf(envelopeBytes []byte) string {
-	id, err := envelope.ReadMessageID(envelopeBytes)
-	must(err, "envelope.ReadMessageID")
-	return string(id.ID)
+// legacyMessage is library/tests/fixtures/legacy_messages.json: a
+// StoreShareRequest the 0.0.11 release produced, and the helper channel and
+// shared key it was sealed under.
+type legacyMessage struct {
+	secretID  uint64
+	channelID uint64
+	key       []byte
+	request   []byte
 }
 
-func (s seenEnvelopes) record(envelopeBytes []byte) { s[messageIDOf(envelopeBytes)] = struct{}{} }
-
-func (s seenEnvelopes) contains(envelopeBytes []byte) bool {
-	_, ok := s[messageIDOf(envelopeBytes)]
-	return ok
+func readLegacyMessage() legacyMessage {
+	path := filepath.Join("..", "..", "library", "tests", "fixtures", "legacy_messages.json")
+	raw, err := os.ReadFile(path)
+	must(err, "read "+path)
+	var fixture map[string]string
+	must(json.Unmarshal(raw, &fixture), "parse "+path)
+	decimal := func(name string) uint64 {
+		n, err := strconv.ParseUint(fixture[name], 10, 64)
+		must(err, "parse "+name)
+		return n
+	}
+	unhex := func(name string) []byte {
+		b, err := hex.DecodeString(fixture[name])
+		must(err, "decode "+name)
+		return b
+	}
+	return legacyMessage{
+		secretID:  decimal("secret_id"),
+		channelID: decimal("channel_id"),
+		key:       unhex("shared_key_hex"),
+		request:   unhex("store_share_request_hex"),
+	}
 }
 
-func raisedUpdateChannelInfo(events []protocol.Event) bool {
-	return slices.ContainsFunc(events, func(e protocol.Event) bool {
-		return e.Type == protocol.EventTypeActionRequired && e.ActionKind == protocol.ActionKindUpdateChannelInfo
+// processLegacyMessage seeds a helper paired with the fixture's owner and
+// processes the fixture's StoreShareRequest with minimum as the oldest
+// protocol version accepted, messages of any age being admitted.
+func processLegacyMessage(minimum *derec.ProtocolVersion) []protocol.Event {
+	legacy := readLegacyMessage()
+	channels := newMemChannelStore()
+	secrets := newMemSecretStore()
+	must(channels.Save(legacy.secretID, protocol.ChannelRecord{Helper: &protocol.HelperChannel{
+		ChannelID:  legacy.channelID,
+		Transports: []protocol.TransportEndpoint{{URI: "https://owner.example/derec", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		PeerRole:   protocol.SenderKindOwner,
+		Status:     protocol.ChannelStatusPaired,
+		Weight:     1,
+	}}), "seed channel")
+	must(secrets.Save(legacy.secretID, legacy.channelID, protocol.SecretValue{Kind: protocol.SecretKindSharedKey, Bytes: legacy.key}), "seed key")
+	p, err := protocol.New(protocol.Stores{
+		Channel:    channels,
+		Share:      newMemShareStore(),
+		Secret:     secrets,
+		UserSecret: newMemUserSecretStore(),
+		State:      newMemStateStore(),
+	}, newMemTransport(), protocol.Config{
+		SecretID: legacy.secretID,
+		DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+			OwnTransports:      []protocol.TransportProtocolParam{{URI: "https://helper.example/derec", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Timeouts:           &protocol.Timeouts{InboundMessageSecs: proto.Uint64(1 << 40)},
+			MinProtocolVersion: minimum,
+		},
 	})
+	must(err, "protocol.New(legacy helper)")
+	defer p.Close()
+	events, err := p.Process(legacy.request)
+	must(err, "Process(legacy request)")
+	return events
 }
 
-// runReplayDetection: the library processes every copy of a message
-// delivered within the inbound window, including one delivered back to its
-// own sender. An application that records the message id of what it sends
-// and accepts drops a replay, a copy whose unauthenticated trace id was
-// changed, and a reflection.
-func runReplayDetection() {
-	fmt.Println("=== Replay detection ===")
+// runLegacyMessageMinimumVersion: a message the 0.0.11 release produced is
+// accepted while the minimum protocol version admits 0.0, and ignored unread
+// as ProtocolVersionTooOld once the minimum is 0.1.
+func runLegacyMessageMinimumVersion() {
+	fmt.Println("=== Protocol legacy message and minimum protocol version ===")
 
-	owner := newPeer("owner", "https://owner-replay.example.com", 2)
-	helper := newPeer("helper", "https://helper-replay.example.com", 2)
-	defer owner.proto.Close()
-	defer helper.proto.Close()
-	channelID := pairPeers(owner, helper, 61)
-	owner.drain()
-	ownerSeen, helperSeen := seenEnvelopes{}, seenEnvelopes{}
+	events := processLegacyMessage(nil)
+	assertTrue(len(events) > 0, "the legacy message must raise events, got none")
+	for _, ev := range events {
+		assertTrue(ev.Type != protocol.EventTypeMessageIgnored, "the legacy message must not be ignored by default, got %+v", events)
+	}
+	fmt.Println("  a message from 0.0.11 is accepted by default  ✓")
 
-	_, err := owner.proto.Start(protocol.FlowKindUpdateChannelInfo, protocol.UpdateChannelInfoParams{
-		Target:            protocol.TargetOne(channelID),
-		CommunicationInfo: map[string]string{"name": "owner-renamed"},
-	})
-	must(err, "owner Start(UpdateChannelInfo)")
-	sent := owner.drain()
-	assertTrue(len(sent) == 1, "one update for one channel, got %d", len(sent))
-	update := sent[0].message
-	ownerSeen.record(update)
-
-	assertTrue(!helperSeen.contains(update), "a first delivery is not in the record")
-	events, err := helper.proto.Process(update)
-	must(err, "helper Process(update)")
-	assertTrue(raisedUpdateChannelInfo(events), "the update must raise ActionRequired, got %+v", events)
-	helperSeen.record(update)
-
-	restamped, err := envelope.ApplyTraceID(update, 0x7E57)
-	must(err, "envelope.ApplyTraceID")
-	assertTrue(!bytes.Equal(restamped, update), "the copy travels as different bytes")
-	assertTrue(helperSeen.contains(update), "the replay is recognised")
-	assertTrue(helperSeen.contains(restamped), "the re-stamped copy is recognised")
-	events, err = helper.proto.Process(restamped)
-	must(err, "helper Process(copy)")
-	assertTrue(raisedUpdateChannelInfo(events), "unchecked, the library processes the copy again, got %+v", events)
-	fmt.Println("  [helper] replay and re-stamped copy share the original's message id  ✓")
-
-	assertTrue(ownerSeen.contains(update), "the reflection is recognised")
-	events, err = owner.proto.Process(update)
-	must(err, "owner Process(reflected update)")
-	assertTrue(raisedUpdateChannelInfo(events), "unchecked, the library reads its own update as the peer's, got %+v", events)
-	fmt.Println("  [owner]  reflected update matches an outbound message id  ✓")
-	fmt.Println("Replay detection test passed.")
+	events = processLegacyMessage(&derec.ProtocolVersion{Major: 0, Minor: 1})
+	assertTrue(len(events) == 1 && events[0].Type == protocol.EventTypeMessageIgnored &&
+		events[0].Reason == protocol.IgnoreReasonProtocolVersionTooOld,
+		"the legacy message must be ignored as ProtocolVersionTooOld, got %+v", events)
+	fmt.Println("  a message from 0.0.11 is ignored once the minimum is 0.1  ✓")
 }
 
 // runSupersededShareRequest: a helper that dropped v2 under v3's keepVersion
@@ -2544,6 +2564,8 @@ func runUnconfirmedDestination() {
 	destinationFp, err := destination.proto.GetFingerprint(replicaChannel)
 	must(err, "destination.GetFingerprint")
 	must(source.proto.VerifyFingerprint(replicaChannel, destinationFp), "source.VerifyFingerprint")
+	_, err = source.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{})
+	must(err, "the source's application publishes once the source confirmed")
 
 	var ignored bool
 	for _, ev := range pump(source, destination) {
@@ -2610,9 +2632,9 @@ func assertProtects(owner *peer, name string) {
 	must(err, fmt.Sprintf("ProtectSecret (%s) must succeed", name))
 }
 
-// crossConfirmFingerprint has both ends of a replica channel confirm the
-// other's fingerprint.
-func crossConfirmFingerprint(a, b *peer, channelID uint64) {
+// confirmFingerprints has both ends of a channel confirm the other's
+// fingerprint, and nothing more.
+func confirmFingerprints(a, b *peer, channelID uint64) {
 	aFp, err := a.proto.GetFingerprint(channelID)
 	must(err, fmt.Sprintf("[%s] GetFingerprint", a.label))
 	bFp, err := b.proto.GetFingerprint(channelID)
@@ -2620,6 +2642,36 @@ func crossConfirmFingerprint(a, b *peer, channelID uint64) {
 	assertTrue(aFp == bFp, "both ends must derive the same fingerprint, got %q and %q", aFp, bFp)
 	must(a.proto.VerifyFingerprint(channelID, bFp), fmt.Sprintf("[%s] VerifyFingerprint", a.label))
 	must(b.proto.VerifyFingerprint(channelID, aFp), fmt.Sprintf("[%s] VerifyFingerprint", b.label))
+}
+
+// crossConfirmFingerprint has both ends of a channel confirm the other's
+// fingerprint and, when owner holds no helper record on it, publishes as the
+// owner's application does once a replica pairing is confirmed — mirroring
+// `cross_confirm_fingerprint` in smoke-tests/rust/src/protocol.rs.
+func crossConfirmFingerprint(owner, replica *peer, channelID uint64) {
+	confirmFingerprints(owner, replica, channelID)
+	_, isHelper, err := owner.channelStore.Load(owner.proto.SecretID(), channelID, 0)
+	must(err, fmt.Sprintf("[%s] channelStore.Load(%d)", owner.label, channelID))
+	if !isHelper {
+		publishAfterConfirming(owner)
+	}
+}
+
+// publishAfterConfirming is what the owner's application does once both
+// sides of a replica pairing have confirmed: publish the latest snapshot, or
+// an empty one when there is none, so the joiner receives the vault, the
+// roster and the group key — mirroring `publish_after_confirming` in
+// smoke-tests/rust/src/protocol.rs.
+func publishAfterConfirming(source *peer) {
+	latest, ok, err := source.userSecrets.LoadLatest(source.proto.SecretID())
+	must(err, fmt.Sprintf("[%s] userSecrets.LoadLatest", source.label))
+	var params protocol.ProtectSecretParams
+	if ok {
+		params.Secrets = latest.Secrets
+		params.Description = latest.Description
+	}
+	_, err = source.proto.Start(protocol.FlowKindProtectSecret, params)
+	must(err, fmt.Sprintf("[%s] the application's publish after confirming", source.label))
 }
 
 // runAbandonedReplicaPairing: a replica pairing the peer never answers leaves
@@ -2928,6 +2980,188 @@ func runRecoverRestoreRepublish() {
 	fmt.Printf("  verifying the recovered v%d → VerifySharesFailed(NoProof) on both helpers, nothing sent  ✓\n", v1)
 
 	fmt.Println("Protocol recover → restore → republish test passed.")
+}
+
+// pumpManyRefusingUnpair is pumpMany where refuser's app rejects every
+// ActionRequired for an unpair instead of accepting it. It returns the events
+// observer reports and the channels refuser rejected an unpair on.
+func pumpManyRefusingUnpair(peers []*peer, refuser, observer *peer) ([]protocol.Event, []uint64) {
+	var observed []protocol.Event
+	var refused []uint64
+	for {
+		type routed struct {
+			target *peer
+			entry  outboxEntry
+		}
+		var work []routed
+		for _, src := range peers {
+			for _, entry := range src.drain() {
+				var target *peer
+				for _, p := range peers {
+					if p.uri == entry.uri {
+						target = p
+						break
+					}
+				}
+				if target == nil {
+					fail("no peer for destination uri %s", entry.uri)
+				}
+				work = append(work, routed{target: target, entry: entry})
+			}
+		}
+		if len(work) == 0 {
+			return observed, refused
+		}
+		for _, w := range work {
+			var events []protocol.Event
+			if w.target == refuser {
+				processed, err := refuser.proto.Process(w.entry.message)
+				must(err, fmt.Sprintf("[%s] Process()", refuser.label))
+				for _, ev := range processed {
+					switch {
+					case ev.Type == protocol.EventTypeActionRequired && ev.ActionKind == protocol.ActionKindUnpair:
+						refused = append(refused, ev.ChannelID)
+						must(refuser.proto.Reject(ev.Action, derecpb.StatusEnum_REJECTED, "unpair refused"),
+							fmt.Sprintf("[%s] Reject(Unpair)", refuser.label))
+					case ev.Type == protocol.EventTypeActionRequired:
+						accepted, err := refuser.proto.Accept(ev.Action)
+						must(err, fmt.Sprintf("[%s] Accept()", refuser.label))
+						events = append(events, accepted...)
+					default:
+						events = append(events, ev)
+					}
+				}
+			} else {
+				events = deliver(w.target, w.entry.message)
+			}
+			if w.target == observer {
+				observed = append(observed, events...)
+			}
+		}
+	}
+}
+
+// runRestoreRecoveryUnpairRefused: after a restore the owner unpairs its
+// recovery channels. A helper that refuses that unpair must not keep the
+// recovery channel alive on the owner: the owner reports the refusal, drops
+// the channel, and every later publish sends that helper one share, over its
+// restored helper channel. Mirrors run_restore_recovery_unpair_refused_flow in
+// smoke-tests/rust/src/protocol.rs.
+func runRestoreRecoveryUnpairRefused() {
+	fmt.Println("=== Protocol restore: a helper refuses the recovery-channel unpair ===")
+
+	const ownerURI = "https://owner-refusal.example.com"
+	owner := newPeer("owner", ownerURI, 2)
+	helperA := newPeer("helper-a", "https://helper-a-refusal.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-refusal.example.com", 2)
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+
+	channelA := pairPeers(owner, helperA, 1)
+	channelB := pairPeers(owner, helperB, 2)
+
+	events, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{12}, Name: "own secret", Data: []byte("own secret")}},
+	})
+	must(err, "owner.Start(ProtectSecret)")
+	var version uint32
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeProtectSecretStarted && ev.Version != nil {
+			version = *ev.Version
+		}
+	}
+	assertTrue(version != 0, "Start(ProtectSecret) must emit ProtectSecretStarted, got %+v", events)
+	confirmed := 0
+	for _, ev := range pumpMany([]*peer{owner, helperA, helperB}) {
+		if ev.Type == protocol.EventTypeShareConfirmed {
+			confirmed++
+		}
+	}
+	assertTrue(confirmed == 2, "both helpers must confirm the share, got %d", confirmed)
+	owner.proto.Close()
+
+	device := newPeer("device", ownerURI, 2)
+	defer device.proto.Close()
+	recoveryA := pairPeers(device, helperA, 100)
+	recoveryB := pairPeers(device, helperB, 101)
+	must(helperA.channelStore.LinkChannel(protocolSecretID, channelA, recoveryA), "helper-a LinkChannel")
+	must(helperB.channelStore.LinkChannel(protocolSecretID, channelB, recoveryB), "helper-b LinkChannel")
+	all := []*peer{device, helperA, helperB}
+
+	_, err = device.proto.Start(protocol.FlowKindRecoverSecret, protocol.RecoverSecretParams{
+		SecretID: protocolSecretID,
+		Version:  version,
+	})
+	must(err, "device.Start(RecoverSecret)")
+	var recovered *protocol.Secret
+	for _, ev := range pumpMany(all) {
+		if ev.Type == protocol.EventTypeSecretRecovered && ev.Secret != nil {
+			recovered = ev.Secret
+		}
+	}
+	assertTrue(recovered != nil, "RecoverSecret must surface SecretRecovered")
+
+	restoreEvents, err := device.proto.Restore(*recovered, version)
+	must(err, "device.Restore")
+	started := map[uint64]bool{}
+	for _, ev := range restoreEvents {
+		if ev.Type == protocol.EventTypeUnpairStarted {
+			started[ev.ChannelID] = true
+		}
+	}
+	assertTrue(len(started) == 2 && started[recoveryA] && started[recoveryB],
+		"Restore must start unpairing both recovery channels, got %+v", restoreEvents)
+	fmt.Println("  [device]   Restore → UnpairStarted on both recovery channels  ✓")
+
+	deviceEvents, refused := pumpManyRefusingUnpair(all, helperB, device)
+	assertTrue(len(refused) == 1 && refused[0] == recoveryB,
+		"helper-b's app must reject exactly the unpair of its recovery channel %d, rejected %v", recoveryB, refused)
+	rejectedAt, unpairedAt := -1, -1
+	unpairedA := false
+	for i, ev := range deviceEvents {
+		switch {
+		case ev.Type == protocol.EventTypeUnpairRejected && ev.ChannelID == recoveryB &&
+			ev.Status == derecpb.StatusEnum_REJECTED && rejectedAt < 0:
+			rejectedAt = i
+		case ev.Type == protocol.EventTypeUnpaired && ev.ChannelID == recoveryB && unpairedAt < 0:
+			unpairedAt = i
+		case ev.Type == protocol.EventTypeUnpaired && ev.ChannelID == recoveryA:
+			unpairedA = true
+		}
+	}
+	assertTrue(rejectedAt >= 0 && unpairedAt > rejectedAt,
+		"the device must report UnpairRejected(REJECTED), then Unpaired, for %d; got %+v", recoveryB, deviceEvents)
+	assertTrue(unpairedA, "helper-a accepts, so its recovery channel %d must be unpaired; got %+v", recoveryA, deviceEvents)
+	fmt.Println("  [helper-b] Reject(Unpair) → [device] UnpairRejected(REJECTED) then Unpaired  ✓")
+
+	for _, c := range []uint64{recoveryA, recoveryB} {
+		assertTrue(!hasChannelRecord(device, c, 0),
+			"recovery channel %d must be gone from the device's channel store", c)
+	}
+	fmt.Println("  [device]   both recovery channels gone from the channel store  ✓")
+
+	events, err = device.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{10}, Name: "after refusal", Data: []byte("after refusal")}},
+	})
+	must(err, "device.Start(ProtectSecret) after the refused unpair")
+	targets := map[uint64]int{}
+	for _, ev := range events {
+		assertTrue(ev.Type != protocol.EventTypeProtectSecretFailed, "the publish emitted ProtectSecretFailed: %+v", ev)
+		if ev.Type == protocol.EventTypeProtectSecretStarted {
+			targets[ev.ChannelID]++
+		}
+	}
+	assertTrue(len(targets) == 2 && targets[channelA] == 1 && targets[channelB] == 1,
+		"the publish must target each restored helper channel (%d, %d) exactly once, got %v", channelA, channelB, targets)
+	sent := map[string]int{}
+	for _, entry := range device.drain() {
+		sent[entry.uri]++
+	}
+	assertTrue(sent[helperA.uri] == 1, "helper-a must receive one share, got %v", sent)
+	assertTrue(sent[helperB.uri] == 1, "helper-b must receive one share, not one per channel, got %v", sent)
+	fmt.Println("  [device]   next ProtectSecret → one share per helper, restored channels only  ✓")
+
+	fmt.Println("Protocol restore: a helper refuses the recovery-channel unpair test passed.")
 }
 
 // runSilentHelperRecovery recovers with three helpers while one never
@@ -3671,6 +3905,47 @@ func channelKey(p *peer, secretID, channelID uint64) []byte {
 	return v.Bytes
 }
 
+// publish has p publish one user secret carrying payload — mirroring
+// `publish` in smoke-tests/rust/src/protocol.rs.
+func publish(p *peer, payload string) {
+	_, err := p.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{0x42}, Name: "handover", Data: []byte(payload)}},
+	})
+	must(err, fmt.Sprintf("[%s] Start(ProtectSecret)", p.label))
+}
+
+// assertHolds fails unless p's latest snapshot carries payload — mirroring
+// `assert_holds` in smoke-tests/rust/src/protocol.rs.
+func assertHolds(p *peer, secretID uint64, payload string) {
+	snapshot, ok, err := p.userSecrets.LoadLatest(secretID)
+	must(err, fmt.Sprintf("[%s] userSecrets.LoadLatest", p.label))
+	assertTrue(ok, "%s must hold a snapshot", p.label)
+	assertTrue(slices.ContainsFunc(snapshot.Secrets, func(us protocol.UserSecret) bool { return string(us.Data) == payload }),
+		"%s must hold the publish carrying %q", p.label, payload)
+}
+
+// memberRow returns the member row p records for replicaID.
+func memberRow(p *peer, secretID, replicaID uint64) protocol.ReplicaMember {
+	roster, err := p.channelStore.ListReplicas(secretID, protocol.ReplicaFilter{})
+	must(err, p.label+" ListReplicas")
+	idx := slices.IndexFunc(roster, func(m protocol.ReplicaMember) bool { return m.ReplicaID == replicaID })
+	assertTrue(idx >= 0, "%s holds no member row for %#x", p.label, replicaID)
+	return roster[idx]
+}
+
+// memberChannel returns the channel p records replicaID on — mirroring
+// `member_channel` in smoke-tests/rust/src/protocol.rs.
+func memberChannel(p *peer, secretID, replicaID uint64) uint64 {
+	return memberRow(p, secretID, replicaID).ChannelID
+}
+
+// memberHandoverChannel returns the channel p recorded replicaID as having
+// handed the group over on, or nil once it is no longer in use — mirroring
+// `member_handover_channel` in smoke-tests/rust/src/protocol.rs.
+func memberHandoverChannel(p *peer, secretID, replicaID uint64) *uint64 {
+	return memberRow(p, secretID, replicaID).HandoverChannel
+}
+
 // loadChannelKey is channelKey for a key that must be present.
 func loadChannelKey(p *peer, secretID, channelID uint64) []byte {
 	key := channelKey(p, secretID, channelID)
@@ -3827,8 +4102,7 @@ func runReplicaMirrorThenVerify() {
 	channelA := pairPeers(source, helperA, 1)
 	channelB := pairPeers(source, helperB, 2)
 	replicaChannel := pairReplicaHandshake(source, destination, 3)
-	crossConfirmFingerprint(source, destination, replicaChannel)
-	pumpMany(all)
+	confirmFingerprints(source, destination, replicaChannel)
 
 	_, err := source.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
 		Secrets: []protocol.UserSecret{{ID: []byte{1}, Name: "mirrored secret", Data: []byte("vault-contents")}},
@@ -4771,9 +5045,9 @@ func runProtectSecretWithReplicaTargets() {
 	assertTrue(ok && record.Replica != nil && record.Replica.Role == protocol.ReplicaRoleDestination,
 		"the owner must hold a Destination member row for the replica, got ok=%v %+v", ok, record)
 
-	crossConfirmFingerprint(owner, replica, replicaChannel)
+	confirmFingerprints(owner, replica, replicaChannel)
 	autoPublish := owner.drain()
-	assertTrue(len(autoPublish) == 3, "the confirmation's publish must fan out to 2 helpers + 1 replica, got %d", len(autoPublish))
+	assertTrue(len(autoPublish) == 0, "confirming a replica destination publishes nothing; the application publishes, got %d messages", len(autoPublish))
 
 	secretData := []byte("secret-payload-for-replica-and-helper")
 	description := "replica + helper distribution"
@@ -5016,16 +5290,19 @@ func runReplicaSyncVersionProgression() {
 }
 
 // runReplicaGroupKeyHandover: the first replica pairing fixes the group key;
-// a second Destination is moved onto the group channel and key, its
-// ephemeral pairing channel dropped on both sides, every member is recorded
-// on the group channel, and a follow-up round is decrypted by the newcomer.
+// a second Destination is moved onto the group channel and key, every member
+// is recorded on the group channel, and a follow-up round is decrypted by the
+// newcomer. Source drops the ephemeral pairing channel once Dest2 answers on
+// the group channel; Dest2 keeps it, recorded on Source's row, until Source
+// reaches it on the group channel.
 // Mirrors run_replica_group_key_handover_flow in
 // smoke-tests/rust/src/protocol.rs.
 func runReplicaGroupKeyHandover() {
 	fmt.Println("=== Protocol replica group-key handover test ===")
 
 	const sid uint64 = 0xBEEF
-	source := newReplicaPeer("source", "https://source-handover.example.com", sid, 0xC0DEC0DEC0DEC0DE, 2)
+	const sourceID uint64 = 0xC0DEC0DEC0DEC0DE
+	source := newReplicaPeer("source", "https://source-handover.example.com", sid, sourceID, 2)
 	dest1 := newReplicaPeer("dest1", "https://dest1-handover.example.com", sid, 0xD1D1D1D1D1D1D1D1, 2)
 	dest2 := newReplicaPeer("dest2", "https://dest2-handover.example.com", sid, 0xD2D2D2D2D2D2D2D2, 2)
 	all := []*peer{source, dest1, dest2}
@@ -5053,9 +5330,13 @@ func runReplicaGroupKeyHandover() {
 	assertTrue(bytes.Equal(loadChannelKey(dest1, sid, groupChannel), kSource), "Dest1 must hold K_group")
 	assertTrue(bytes.Equal(loadChannelKey(dest2, sid, groupChannel), kSource), "Dest2 must have adopted K_group on the group channel")
 	assertTrue(bytes.Equal(kSource, kGroup), "K_group is fixed at the first replica pairing and never re-derived")
-	for _, p := range []*peer{source, dest2} {
-		assertTrue(channelKey(p, sid, ephemeral) == nil, "%s must drop the ephemeral pairing channel's key after the handover", p.label)
-	}
+	assertTrue(channelKey(source, sid, ephemeral) == nil,
+		"Source must drop the ephemeral pairing channel's key once Dest2 answers on the group channel")
+	assertTrue(channelKey(dest2, sid, ephemeral) != nil,
+		"Dest2 must keep the ephemeral key until Source reaches it on the group channel")
+	handover := memberHandoverChannel(dest2, sid, sourceID)
+	assertTrue(handover != nil && *handover == ephemeral,
+		"Dest2 records the ephemeral channel %d on Source's row, got %v", ephemeral, handover)
 	for _, p := range all {
 		roster, err := p.channelStore.ListReplicas(sid, protocol.ReplicaFilter{})
 		must(err, p.label+" ListReplicas")
@@ -5080,6 +5361,10 @@ func runReplicaGroupKeyHandover() {
 	must(err, "dest2 userSecrets.LoadLatest")
 	assertTrue(ok && slices.ContainsFunc(snapshot.Secrets, func(us protocol.UserSecret) bool { return string(us.Data) == "k_group payload" }),
 		"Dest2 must decrypt the post-handover payload with K_group")
+	assertTrue(channelKey(dest2, sid, ephemeral) == nil,
+		"Dest2 must drop the ephemeral key once Source reaches it on the group channel")
+	assertTrue(memberHandoverChannel(dest2, sid, sourceID) == nil,
+		"Dest2 must clear the handover channel once Source reaches it on the group channel")
 	assertTrue(bytes.Equal(loadChannelKey(source, sid, groupChannel), kGroup), "K_group must remain stable across follow-up rounds")
 	fmt.Println("  step 3: follow-up ProtectSecret round encrypted with K_group; Dest2 decrypted cleanly  ✓")
 
@@ -5087,16 +5372,21 @@ func runReplicaGroupKeyHandover() {
 }
 
 // runReplicaPublishBeforeHandoverAck: the joiner's handover acknowledgement
-// is lost, and the publishes after it still reach the joiner on the group
-// channel. Mirrors run_replica_publish_before_handover_ack_flow in
+// is lost, so the source keeps the joiner on the ephemeral pairing channel
+// and re-sends its next publish there. The joiner still reads it, its answer
+// on the group channel completes the move on the source, its own publish
+// reaches every member on the group channel, and the source's next publish
+// on the group channel lets it drop the ephemeral key. Mirrors
+// run_replica_publish_before_handover_ack_flow in
 // smoke-tests/rust/src/protocol.rs.
 func runReplicaPublishBeforeHandoverAck() {
 	fmt.Println("=== Protocol replica publish before handover ack test ===")
 
 	const sid uint64 = 0xBEEF
-	source := newReplicaPeer("source", "https://source-lost-ack.example.com", sid, 0xC0DEC0DEC0DEC0DE, 2)
+	const sourceID, dest2ID uint64 = 0xC0DEC0DEC0DEC0DE, 0xD2D2D2D2D2D2D2D2
+	source := newReplicaPeer("source", "https://source-lost-ack.example.com", sid, sourceID, 2)
 	dest1 := newReplicaPeer("dest1", "https://dest1-lost-ack.example.com", sid, 0xD1D1D1D1D1D1D1D1, 2)
-	dest2 := newReplicaPeer("dest2", "https://dest2-lost-ack.example.com", sid, 0xD2D2D2D2D2D2D2D2, 2)
+	dest2 := newReplicaPeer("dest2", "https://dest2-lost-ack.example.com", sid, dest2ID, 2)
 	all := []*peer{source, dest1, dest2}
 	for _, p := range all {
 		defer p.proto.Close()
@@ -5119,20 +5409,267 @@ func runReplicaPublishBeforeHandoverAck() {
 	lost := dest2.drain()
 	assertTrue(len(lost) > 0, "Dest2 must have acknowledged the handover before it is dropped")
 	pumpMany(all)
+	assertTrue(memberChannel(source, sid, dest2ID) == ephemeral,
+		"Source keeps Dest2 on the ephemeral channel until Dest2 answers on the group channel")
+	assertTrue(channelKey(source, sid, ephemeral) != nil, "Source keeps the ephemeral key while Dest2 is on it")
+	handover := memberHandoverChannel(dest2, sid, sourceID)
+	assertTrue(handover != nil && *handover == ephemeral,
+		"Dest2 keeps Source's handover channel %d while Source may still send there, got %v", ephemeral, handover)
+	assertTrue(channelKey(dest2, sid, ephemeral) != nil, "Dest2 keeps the ephemeral key while Source may still send there")
 	fmt.Println("  step 1: handover delivered, Dest2's acknowledgement lost  ✓")
 
-	for _, payload := range []string{"before the ack", "after the ack"} {
-		_, err := source.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
-			Secrets: []protocol.UserSecret{{ID: []byte{0x42}, Name: "handover", Data: []byte(payload)}},
-		})
-		must(err, "source.Start(ProtectSecret)")
-		pumpMany(all)
-		snapshot, ok, err := dest2.userSecrets.LoadLatest(sid)
-		must(err, "dest2 userSecrets.LoadLatest")
-		assertTrue(ok && slices.ContainsFunc(snapshot.Secrets, func(us protocol.UserSecret) bool { return string(us.Data) == payload }),
-			"Dest2 must receive the publish carrying %q", payload)
-	}
-	fmt.Println("  step 2: both publishes reached Dest2 on the group channel  ✓")
+	// Source never saw the acknowledgement, so its next publish goes on the
+	// ephemeral channel again. Dest2 still reads it there, and its answer on
+	// the group channel completes the move on Source.
+	publish(source, "resent on the ephemeral channel")
+	pumpMany(all)
+	assertHolds(dest2, sid, "resent on the ephemeral channel")
+	assertTrue(memberChannel(source, sid, dest2ID) == groupChannel, "Source must move Dest2 onto the group channel")
+	assertTrue(channelKey(source, sid, ephemeral) == nil,
+		"Source drops the ephemeral key once Dest2 answers on the group channel")
+	assertTrue(channelKey(dest2, sid, ephemeral) != nil,
+		"Dest2 has not heard from Source on the group channel yet")
+	fmt.Println("  step 2: the resent copy is read on the ephemeral channel; Source moves Dest2  ✓")
+
+	// Dest2 publishes before Source reaches it on the group channel. It
+	// sends to every member on the group channel, so Source, which no longer
+	// holds the ephemeral key, still reads it.
+	publish(dest2, "published by the joiner")
+	pumpMany(all)
+	assertHolds(source, sid, "published by the joiner")
+	assertHolds(dest1, sid, "published by the joiner")
+	fmt.Println("  step 3: Dest2's own publish reaches Source on the group channel  ✓")
+
+	publish(source, "on the group channel")
+	pumpMany(all)
+	assertHolds(dest2, sid, "on the group channel")
+	assertTrue(channelKey(dest2, sid, ephemeral) == nil,
+		"Dest2 drops the ephemeral key once Source reaches it on the group channel")
+	assertTrue(memberHandoverChannel(dest2, sid, sourceID) == nil,
+		"Dest2 must clear the handover channel once Source reaches it on the group channel")
+	fmt.Println("  step 4: Source reaches Dest2 on the group channel; Dest2 drops the ephemeral key  ✓")
 
 	fmt.Println("Protocol replica publish before handover ack test passed.")
+}
+
+// runReplicaLateJoiner: a device joining an existing group whose pairing the
+// source confirmed, and whose application published, before the joiner
+// confirmed. The joiner ignores that copy, then confirms and asks: the answer
+// arrives on the pairing channel and carries the group key, and the next two
+// publishes complete the handover on both sides. Mirrors
+// run_replica_late_joiner_flow in smoke-tests/rust/src/protocol.rs.
+func runReplicaLateJoiner() {
+	fmt.Println("=== Protocol replica late joiner test ===")
+
+	const sid uint64 = 0x1A7E
+	const sourceID, joinerID uint64 = 0x5050505050505050, 0x1010101010101010
+	source := newReplicaPeer("source", "https://source-late-joiner.example.com", sid, sourceID, 2)
+	dest1 := newReplicaPeer("dest1", "https://dest1-late-joiner.example.com", sid, 0xD1D1D1D1D1D1D1D1, 2)
+	joiner := newReplicaPeer("joiner", "https://joiner-late-joiner.example.com", sid, joinerID, 2)
+	all := []*peer{source, dest1, joiner}
+	for _, p := range all {
+		defer p.proto.Close()
+	}
+
+	groupChannel := pairReplicaHandshake(source, dest1, 1)
+	crossConfirmFingerprint(source, dest1, groupChannel)
+	pumpMany(all)
+
+	ephemeral := pairReplicaHandshake(source, joiner, 2)
+	joinerFp, err := joiner.proto.GetFingerprint(ephemeral)
+	must(err, "joiner.GetFingerprint")
+	must(source.proto.VerifyFingerprint(ephemeral, joinerFp), "the source must accept the matching fingerprint")
+	publish(source, "before the joiner confirmed")
+	early := pumpMany(all)
+	assertTrue(slices.ContainsFunc(early, func(ev protocol.Event) bool {
+		return ev.Type == protocol.EventTypeMessageIgnored &&
+			ev.Reason == protocol.IgnoreReasonPendingVerification &&
+			ev.ChannelID == ephemeral
+	}), "the joiner ignores a copy that arrives before it confirms, got %+v", early)
+	assertHolds(dest1, sid, "before the joiner confirmed")
+	_, held, err := joiner.userSecrets.LoadLatest(sid)
+	must(err, "joiner userSecrets.LoadLatest")
+	assertTrue(!held, "the joiner must hold no snapshot before it confirms")
+	fmt.Println("  step 1: the source published before the joiner confirmed; the joiner ignored it  ✓")
+
+	sourceFp, err := source.proto.GetFingerprint(ephemeral)
+	must(err, "source.GetFingerprint")
+	must(joiner.proto.VerifyFingerprint(ephemeral, sourceFp), "the joiner must accept the matching fingerprint")
+	_, err = joiner.proto.Start(protocol.FlowKindReplicaDiscovery, nil)
+	must(err, "joiner.Start(ReplicaDiscovery)")
+	caughtUp := pumpMany(all)
+	assertTrue(slices.ContainsFunc(caughtUp, func(ev protocol.Event) bool {
+		return ev.Type == protocol.EventTypeReplicaSecretInstalled
+	}), "the joiner installs the copy it asked for, got %+v", caughtUp)
+	assertHolds(joiner, sid, "before the joiner confirmed")
+	assertTrue(bytes.Equal(loadChannelKey(joiner, sid, groupChannel), loadChannelKey(source, sid, groupChannel)),
+		"the answer carried the group key")
+	assertTrue(memberChannel(joiner, sid, sourceID) == groupChannel, "the joiner records the source on the group channel")
+	handover := memberHandoverChannel(joiner, sid, sourceID)
+	assertTrue(handover != nil && *handover == ephemeral,
+		"the joiner records the source's handover channel %d, got %v", ephemeral, handover)
+	assertTrue(memberChannel(source, sid, joinerID) == ephemeral,
+		"the source keeps the joiner on the pairing channel until it answers on the group channel")
+	fmt.Println("  step 2: the joiner confirmed and asked; it holds the group key and the copy  ✓")
+
+	publish(source, "after the joiner caught up")
+	pumpMany(all)
+	for _, p := range []*peer{dest1, joiner} {
+		assertHolds(p, sid, "after the joiner caught up")
+	}
+	assertTrue(memberChannel(source, sid, joinerID) == groupChannel, "the source must move the joiner onto the group channel")
+	assertTrue(channelKey(source, sid, ephemeral) == nil, "the source drops the pairing key once the joiner answers on the group channel")
+	assertTrue(channelKey(joiner, sid, ephemeral) != nil, "the joiner has not heard from the source on the group channel yet")
+	fmt.Println("  step 3: the next publish reaches the joiner on the pairing channel; the source moves it  ✓")
+
+	publish(source, "on the group channel")
+	pumpMany(all)
+	for _, p := range []*peer{dest1, joiner} {
+		assertHolds(p, sid, "on the group channel")
+	}
+	assertTrue(channelKey(joiner, sid, ephemeral) == nil,
+		"the joiner drops the pairing key once the source reaches it on the group channel")
+	assertTrue(memberHandoverChannel(joiner, sid, sourceID) == nil,
+		"the joiner must clear the handover channel once the source reaches it on the group channel")
+	fmt.Println("  step 4: the source reaches the joiner on the group channel; the joiner drops the pairing key  ✓")
+
+	fmt.Println("Protocol replica late joiner test passed.")
+}
+
+// rosterIDs returns the replica ids p records under secretID, sorted —
+// mirroring `roster_ids` in smoke-tests/rust/src/protocol.rs.
+func rosterIDs(p *peer, secretID uint64) []uint64 {
+	roster, err := p.channelStore.ListReplicas(secretID, protocol.ReplicaFilter{})
+	must(err, p.label+" ListReplicas")
+	ids := make([]uint64, 0, len(roster))
+	for _, m := range roster {
+		ids = append(ids, m.ReplicaID)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// isReplicaRemoved reports whether ev is a ReplicaRemoved naming replicaID.
+func isReplicaRemoved(ev protocol.Event, replicaID uint64) bool {
+	return ev.Type == protocol.EventTypeReplicaRemoved && ev.ReplicaID != nil && *ev.ReplicaID == replicaID
+}
+
+// isSelfRemoved reports whether ev is a SelfRemovedFromGroup.
+func isSelfRemoved(ev protocol.Event) bool {
+	return ev.Type == protocol.EventTypeSelfRemovedFromGroup
+}
+
+// runReplicaRemoval: UnpairReplica drops the member on the device that ran
+// it and publishes the roster without it; the removed device drops
+// everything when told and receives nothing afterwards; a device can also
+// remove itself. Mirrors run_replica_removal_flow in
+// smoke-tests/rust/src/protocol.rs.
+func runReplicaRemoval() {
+	fmt.Println("=== Protocol replica removal test ===")
+
+	const sid uint64 = 0x7E40
+	const aID, bID, cID uint64 = 0x0A0A0A0A0A0A0A0A, 0x0B0B0B0B0B0B0B0B, 0x0C0C0C0C0C0C0C0C
+	a := newReplicaPeer("a", "https://a-removal.example.com", sid, aID, 2)
+	b := newReplicaPeer("b", "https://b-removal.example.com", sid, bID, 2)
+	c := newReplicaPeer("c", "https://c-removal.example.com", sid, cID, 2)
+	all := []*peer{a, b, c}
+	for _, p := range all {
+		defer p.proto.Close()
+	}
+
+	group := pairReplicaHandshake(a, b, 1)
+	crossConfirmFingerprint(a, b, group)
+	pumpMany(all)
+	joining := pairReplicaHandshake(a, c, 2)
+	crossConfirmFingerprint(a, c, joining)
+	pumpMany(all)
+	publish(a, "before the removal")
+	pumpMany(all)
+	for _, p := range []*peer{b, c} {
+		assertHolds(p, sid, "before the removal")
+	}
+
+	memo := "retired tablet"
+	started, err := a.proto.Start(protocol.FlowKindUnpairReplica, protocol.UnpairReplicaParams{ReplicaID: cID, Memo: &memo})
+	must(err, "a.Start(UnpairReplica)")
+	assertTrue(slices.ContainsFunc(started, func(ev protocol.Event) bool { return isReplicaRemoved(ev, cID) }),
+		"the device running the removal drops the member at once, got %+v", started)
+	assertTrue(slices.Equal(rosterIDs(a, sid), []uint64{aID, bID}),
+		"a must record only a and b, got %v", rosterIDs(a, sid))
+	published := a.drain()
+	toC := 0
+	for _, entry := range published {
+		if entry.uri == c.uri {
+			toC++
+		}
+	}
+	assertTrue(toC > 0, "the removed member is told")
+	assertTrue(toC == 1, "the removed member receives the notice and nothing else, got %d messages", toC)
+	var seenByB []protocol.Event
+	for _, entry := range published {
+		switch entry.uri {
+		case b.uri:
+			seenByB = append(seenByB, deliver(b, entry.message)...)
+		case c.uri:
+			events := deliver(c, entry.message)
+			assertTrue(slices.ContainsFunc(events, isSelfRemoved),
+				"the removed member drops everything when told, got %+v", events)
+		}
+	}
+	fmt.Println("  step 1: removing a member drops it at once and publishes without it; it is told and drops everything  ✓")
+
+	seenByB = append(seenByB, pumpMany(all)...)
+	assertTrue(slices.ContainsFunc(seenByB, func(ev protocol.Event) bool { return isReplicaRemoved(ev, cID) }),
+		"the remaining member drops it when the roster arrives, got %+v", seenByB)
+	assertTrue(slices.Equal(rosterIDs(b, sid), []uint64{aID, bID}),
+		"b must record only a and b, got %v", rosterIDs(b, sid))
+	assertTrue(len(rosterIDs(c, sid)) == 0, "the removed member must record no member, got %v", rosterIDs(c, sid))
+	_, held, err := c.userSecrets.LoadLatest(sid)
+	must(err, "c userSecrets.LoadLatest")
+	assertTrue(!held, "the removed member keeps no copy of the secret")
+	fmt.Println("  step 2: the remaining member drops it with the roster; the removed member holds nothing  ✓")
+
+	publish(a, "after the removal")
+	after := a.drain()
+	assertTrue(!slices.ContainsFunc(after, func(entry outboxEntry) bool { return entry.uri == c.uri }),
+		"nothing more is sent to the removed member")
+	for _, entry := range after {
+		if entry.uri == b.uri {
+			deliver(b, entry.message)
+		}
+	}
+	pumpMany(all)
+	assertHolds(b, sid, "after the removal")
+	fmt.Println("  step 3: a later publish reaches the remaining member only  ✓")
+
+	left, err := b.proto.Start(protocol.FlowKindUnpairReplica, protocol.UnpairReplicaParams{ReplicaID: bID})
+	must(err, "b.Start(UnpairReplica) on itself")
+	assertTrue(slices.ContainsFunc(left, isSelfRemoved),
+		"a device removing itself publishes and then drops everything, got %+v", left)
+	assertTrue(len(rosterIDs(b, sid)) == 0, "the departed device must record no member, got %v", rosterIDs(b, sid))
+	var farewell []protocol.Event
+	for _, entry := range b.drain() {
+		if entry.uri == a.uri {
+			farewell = append(farewell, deliver(a, entry.message)...)
+		}
+	}
+	// The remaining member acknowledges the roster to a device that has
+	// already dropped the channel, which refuses the acknowledgement as an
+	// unknown channel.
+	late := 0
+	for _, entry := range a.drain() {
+		if entry.uri == b.uri {
+			late++
+			_, err := b.proto.Process(entry.message)
+			assertTrue(err != nil, "an acknowledgement reaching the departed device finds no channel")
+		}
+	}
+	assertTrue(late > 0, "the remaining member acknowledges the departing roster")
+	assertTrue(slices.ContainsFunc(farewell, func(ev protocol.Event) bool { return isReplicaRemoved(ev, bID) }),
+		"the remaining member drops the device that left, got %+v", farewell)
+	assertTrue(slices.Equal(rosterIDs(a, sid), []uint64{aID}),
+		"a must record only itself, got %v", rosterIDs(a, sid))
+	fmt.Println("  step 4: a device removing itself publishes the roster without it, then drops everything  ✓")
+
+	fmt.Println("Protocol replica removal test passed.")
 }

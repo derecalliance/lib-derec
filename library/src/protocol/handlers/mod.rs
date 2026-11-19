@@ -38,11 +38,11 @@ pub(super) mod update_channel_info;
 pub(super) mod verification;
 
 use super::{DeRecEvent, IgnoreReason};
-use crate::derec_message::{decrypt_inner_message, extract_inner_pairing_message};
+use crate::derec_message::{decode_pairing_payload, decrypt_inner_message};
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::message_body::{MessageBodyExt as _, Route};
 use crate::protocol::obligation;
-use crate::utils::verify_timestamps;
+use crate::utils::{verify_protocol_version, verify_timestamps};
 use crate::{
     Error, Result,
     protocol::{
@@ -103,8 +103,8 @@ pub(super) async fn handle<S: StoreSet>(
     let plaintext = decrypt_inner_message(&message.message, shared_key)?;
     // The sender holds the channel key, so a body that does not decode is
     // still a request owed an answer, though no request type can be named.
-    let inner_message = match MessageBody::decode_from_vec(&plaintext) {
-        Ok(body) => body,
+    let (inner_message, payload_version) = match MessageBody::decode_versioned(&plaintext) {
+        Ok(decoded) => decoded,
         Err(error) => {
             let obligation =
                 Obligation::undecodable(channel_id, shared_key, message.trace_id, local.policy);
@@ -126,6 +126,15 @@ pub(super) async fn handle<S: StoreSet>(
         return Ok(vec![DeRecEvent::MessageIgnored {
             channel_id,
             reason: IgnoreReason::TimestampMismatch,
+            trace_id: message.trace_id,
+        }]);
+    }
+
+    // The same holds for the protocol version, copied into the payload.
+    if verify_protocol_version(message, payload_version).is_err() {
+        return Ok(vec![DeRecEvent::MessageIgnored {
+            channel_id,
+            reason: IgnoreReason::ProtocolVersionMismatch,
             trace_id: message.trace_id,
         }]);
     }
@@ -168,16 +177,38 @@ pub(super) async fn handle<S: StoreSet>(
     }
 
     // A body naming a group member is read as the replica relationship only
-    // on that member's own channel. The `replica_id` is written by the
-    // sender, so on any other channel it is a peer impersonating a member.
+    // on that member's own channel, or on the channel it handed the group
+    // over on. The `replica_id` is written by the sender, so on any other
+    // channel it is a peer impersonating a member. The one exception is a
+    // member this device admitted, still recorded on its pairing channel, now
+    // speaking on the group channel under the group key: that proves it holds
+    // the handover, so the admission completes. The mirror case, the member
+    // that admitted this device reaching it on the group channel, releases
+    // the handover channel.
     if refused.is_none()
         && let Route::Replica(author) = inner_message.route()
-        && let Err(e) = stores
+    {
+        match stores
             .channels
             .load_replica_member(local.secret_id, channel_id, author)
             .await
-    {
-        refused = Some(e);
+        {
+            Ok(member) => {
+                if let Err(error) =
+                    replicas::sharing::release_handover(stores, local, &member, channel_id).await
+                {
+                    refused = Some(error);
+                }
+            }
+            Err(e) => {
+                match replicas::sharing::complete_handover(stores, local, channel_id, author).await
+                {
+                    Ok(true) => {}
+                    Ok(false) => refused = Some(e),
+                    Err(error) => refused = Some(error),
+                }
+            }
+        }
     }
 
     let outcome = match refused {
@@ -247,7 +278,14 @@ pub(in crate::protocol) async fn handle_pairing<S: StoreSet>(
     channel_id: ChannelId,
     pairing_secret: &PairingSecretKeyMaterial,
 ) -> Result<Vec<DeRecEvent>> {
-    let inner = extract_inner_pairing_message(&message.message, pairing_secret)?;
+    let (inner, payload_version) = decode_pairing_payload(&message.message, pairing_secret)?;
+    if verify_protocol_version(message, payload_version).is_err() {
+        return Ok(vec![DeRecEvent::MessageIgnored {
+            channel_id,
+            reason: IgnoreReason::ProtocolVersionMismatch,
+            trace_id: message.trace_id,
+        }]);
+    }
 
     // Same single gate as the channel path: the endpoint a peer offers at
     // pairing is the one every later message to it is addressed to.
@@ -559,8 +597,8 @@ mod replica_channel_binding_tests {
     use crate::utils::now_secs;
     use derec_proto::{
         DeRecResult, GetSecretIdsVersionsResponseMessage, GetShareResponseMessage, MessageBody,
-        Protocol, SenderKind, StatusEnum, StoreShareRequestMessage, TransportProtocol,
-        UnpairRequestMessage,
+        Protocol, SenderKind, StatusEnum, StoreShareRequestMessage, StoreShareResponseMessage,
+        TransportProtocol, UnpairRequestMessage,
     };
     use prost::Message as _;
     use std::collections::HashMap;
@@ -583,6 +621,7 @@ mod replica_channel_binding_tests {
 
     struct Rig {
         channels: InMemChannelStore,
+        secrets: InMemSecretStore,
         user_secrets: InMemUserSecretStore,
         protocol: DeRecProtocol<
             InMemChannelStore,
@@ -634,6 +673,7 @@ mod replica_channel_binding_tests {
                     role: ReplicaRole::Source,
                     status: ChannelStatus::Paired,
                     created_at: now_secs(),
+                    handover_channel: None,
                 }),
             )
             .await
@@ -659,7 +699,7 @@ mod replica_channel_binding_tests {
         let protocol = DeRecProtocolBuilder::new(SECRET_ID)
             .with_channel_store(channels.clone())
             .with_share_store(InMemShareStore::default())
-            .with_secret_store(secrets)
+            .with_secret_store(secrets.clone())
             .with_user_secret_store(user_secrets.clone())
             .with_transport(RecordingTransport::default())
             .with_state_store(InMemStateStore)
@@ -672,6 +712,7 @@ mod replica_channel_binding_tests {
             .expect("test protocol builds");
         Rig {
             channels,
+            secrets,
             user_secrets,
             protocol,
         }
@@ -760,6 +801,139 @@ mod replica_channel_binding_tests {
             .get(&(SECRET_ID, MEMBER))
             .expect("member row")
             .status
+    }
+
+    const JOINER: u64 = 8;
+    const PAIRING_CHANNEL: ChannelId = ChannelId(6001);
+    const PAIRING_KEY: SharedKey = [6u8; 32];
+
+    /// This device's own row on the group channel, plus a joiner it admitted
+    /// that is still recorded on its pairing channel with `status`.
+    async fn seed_joiner(rig: &mut Rig, status: ChannelStatus) {
+        for (replica_id, channel_id, role, status) in [
+            (
+                OWN_ID,
+                GROUP_CHANNEL,
+                ReplicaRole::Destination,
+                ChannelStatus::Paired,
+            ),
+            (JOINER, PAIRING_CHANNEL, ReplicaRole::Destination, status),
+        ] {
+            rig.channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Replica(ReplicaMember {
+                        channel_id,
+                        replica_id: ReplicaId(replica_id),
+                        transports: vec![endpoint("https://joiner.example")],
+                        communication_info: HashMap::new(),
+                        role,
+                        status,
+                        created_at: now_secs(),
+                        handover_channel: None,
+                    }),
+                )
+                .await
+                .expect("seed member");
+        }
+        rig.secrets
+            .save(
+                SECRET_ID,
+                PAIRING_CHANNEL,
+                SecretValue::SharedKey(PAIRING_KEY),
+            )
+            .await
+            .expect("seed pairing key");
+    }
+
+    fn joiner_ack(ts: prost_types::Timestamp) -> MessageBody {
+        MessageBody::StoreShareResponse(StoreShareResponseMessage {
+            result: Some(DeRecResult {
+                status: StatusEnum::Ok as i32,
+                memo: String::new(),
+            }),
+            version: 1,
+            timestamp: Some(ts),
+            secret_id: SECRET_ID,
+            replica_id: Some(JOINER),
+        })
+    }
+
+    fn joiner_channel(rig: &Rig) -> ChannelId {
+        rig.channels
+            .member_rows
+            .lock()
+            .unwrap()
+            .get(&(SECRET_ID, JOINER))
+            .expect("joiner row")
+            .channel_id
+    }
+
+    fn holds_pairing_key(rig: &Rig) -> bool {
+        rig.secrets
+            .data
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(sid, cid, _)| *sid == SECRET_ID && *cid == PAIRING_CHANNEL.0)
+    }
+
+    /// A joiner speaking on the group channel under the group key proves it
+    /// holds the handover: it is moved onto the group channel and its pairing
+    /// key is dropped, and its message is handled, not refused.
+    #[test]
+    fn a_joiners_message_on_the_group_channel_completes_the_handover() {
+        run_async(async {
+            let mut rig = rig().await;
+            seed_joiner(&mut rig, ChannelStatus::Paired).await;
+
+            let result = rig
+                .protocol
+                .process(&envelope(GROUP_CHANNEL, &GROUP_KEY, joiner_ack))
+                .await;
+
+            assert!(result.is_ok(), "the joiner is not refused: {result:?}");
+            assert_eq!(joiner_channel(&rig), GROUP_CHANNEL);
+            assert!(!holds_pairing_key(&rig), "the pairing key is dropped");
+        });
+    }
+
+    /// Only the group channel completes a handover: naming the joiner on any
+    /// other channel is still a member impersonated.
+    #[test]
+    fn a_joiner_named_on_another_channel_is_still_refused() {
+        run_async(async {
+            let mut rig = rig().await;
+            seed_joiner(&mut rig, ChannelStatus::Paired).await;
+
+            let result = rig
+                .protocol
+                .process(&envelope(HELPER_CHANNEL, &HELPER_KEY, joiner_ack))
+                .await;
+
+            assert!(result.is_err(), "expected a refusal, got {result:?}");
+            assert_eq!(joiner_channel(&rig), PAIRING_CHANNEL);
+            assert!(holds_pairing_key(&rig));
+        });
+    }
+
+    /// A member this device has not confirmed is not part of the group, so
+    /// it cannot complete a handover.
+    #[test]
+    fn an_unconfirmed_joiner_does_not_complete_a_handover() {
+        run_async(async {
+            let mut rig = rig().await;
+            seed_joiner(&mut rig, ChannelStatus::Pending).await;
+
+            let result = rig
+                .protocol
+                .process(&envelope(GROUP_CHANNEL, &GROUP_KEY, joiner_ack))
+                .await;
+
+            assert!(result.is_err(), "expected a refusal, got {result:?}");
+            assert_eq!(joiner_channel(&rig), PAIRING_CHANNEL);
+            assert!(holds_pairing_key(&rig));
+        });
     }
 
     #[test]

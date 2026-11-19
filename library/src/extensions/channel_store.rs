@@ -216,6 +216,12 @@ pub(crate) trait ChannelStoreExt: DeRecChannelStore {
     /// and the store does not match `channel_id`; without this check, any peer
     /// holding a channel key could name a member and reach the replica path on
     /// its own channel.
+    ///
+    /// A member is also resolved on its
+    /// [`handover_channel`](ReplicaMember::handover_channel), whose key only
+    /// it and this device hold. The member is returned as reached there, with
+    /// `channel_id` set to that channel, so an answer goes back on the channel
+    /// and under the key the message arrived with.
     async fn load_replica_member(
         &self,
         secret_id: u64,
@@ -232,7 +238,18 @@ pub(crate) trait ChannelStoreExt: DeRecChannelStore {
         )
         .await?
         .and_then(|r| r.as_replica().cloned())
-        .filter(|member| member.channel_id == channel_id)
+        .and_then(|member| {
+            if member.channel_id == channel_id {
+                Some(member)
+            } else if member.handover_channel == Some(channel_id) {
+                Some(ReplicaMember {
+                    channel_id,
+                    ..member
+                })
+            } else {
+                None
+            }
+        })
         .ok_or(Error::InvalidInput(
             "replica sync names a member that is not in the group",
         ))
@@ -425,6 +442,7 @@ mod defiant_store_tests {
                     role: ReplicaRole::Destination,
                     status,
                     created_at: 0,
+                    handover_channel: None,
                 }),
             )
             .await
@@ -538,6 +556,7 @@ mod defiant_store_tests {
                             role: ReplicaRole::Destination,
                             status,
                             created_at: 0,
+                            handover_channel: None,
                         }),
                     )
                     .await

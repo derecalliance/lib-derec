@@ -42,14 +42,15 @@
  * fields this build cannot see and writing the truncated result back.
  *
  * The value tracks the release that last changed the shape, not the release
- * that is current: it moved to 3 when `transport` became `transports`, and
- * stays there until the next shape change.
+ * that is current: it moved to 3 when `transport` became `transports`, to 4
+ * when [`ReplicaMember::handover_channel`] was added, and stays there until
+ * the next shape change.
  *
  * Declared unconditionally, unlike the serde impls that stamp it: the SDK
  * bridges mirror this number in their own encoders, and a constant they must
  * agree with should not appear and disappear with a feature flag.
  */
-#define CHANNEL_RECORD_SCHEMA_VERSION 3
+#define CHANNEL_RECORD_SCHEMA_VERSION 4
 
 /**
  * Latest encoding major version, used for all new encodes. Bump only on a
@@ -581,20 +582,6 @@ typedef struct ReadTraceIdResult {
    */
   uint64_t trace_id;
 } ReadTraceIdResult;
-
-typedef struct MessageIdResult {
-  struct DeRecError error;
-  /**
-   * SHA-256 of the envelope's encrypted `message` field (32 bytes). Empty
-   * on error.
-   */
-  struct DeRecBuffer id;
-  /**
-   * The envelope's send time, in seconds since the Unix epoch. Zero on
-   * error.
-   */
-  uint64_t timestamp;
-} MessageIdResult;
 
 /**
  * Result of a message JSON codec call. `bytes` is UTF-8 JSON for
@@ -1467,19 +1454,6 @@ struct ApplyTraceIdResult apply_trace_id_to_envelope(const uint8_t *envelope_ptr
  */
 struct ReadTraceIdResult read_trace_id_from_envelope(const uint8_t *envelope_ptr,
                                                      size_t envelope_len);
-
-/**
- * Identify an envelope for replay and reflection detection: the same `id`
- * for every copy of one message, whatever its unauthenticated cleartext
- * fields say, and a different one for every other message.
- *
- * Mirrors [`crate::derec_message::message_id`].
- *
- * # Safety
- *
- * `envelope_ptr` must point to a readable byte range of length `envelope_len`.
- */
-struct MessageIdResult message_id_from_envelope(const uint8_t *envelope_ptr, size_t envelope_len);
 
 /**
  * Releases the owned strings carried by a [`DeRecError`]. After

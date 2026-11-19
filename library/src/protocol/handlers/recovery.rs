@@ -1126,6 +1126,7 @@ mod recovery_ids_tests {
                 role,
                 status,
                 created_at: 1,
+                handover_channel: None,
             }),
             None => ChannelRecord::Helper(HelperChannel {
                 channel_id: ChannelId(cid),

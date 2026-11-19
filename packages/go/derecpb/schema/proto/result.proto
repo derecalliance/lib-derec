@@ -110,9 +110,10 @@ enum StatusEnum {
   // - corrupted ciphertext
   DECRYPTION_FAILED = 7;
 
-  // The message signature or authentication could not be verified.
+  // A share does not verify against its Merkle commitment.
   //
-  // This indicates that the message integrity or authenticity check failed.
+  // Sent in answer to a share whose subshares and Merkle path do not
+  // reproduce the commitment it carries.
   VERIFICATION_FAILED = 8;
 
   // The message format is invalid.

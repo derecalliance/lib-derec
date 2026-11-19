@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::protocol::types::Timeouts;
 use crate::protocol::{AutoAcceptPolicy, ExpiredChannelCleanup, UnpairAck};
+use crate::protocol_version::ProtocolVersion;
 use crate::transport::TransportProtocol;
 use derec_proto::ParameterRange;
 
@@ -54,7 +55,8 @@ use derec_proto::ParameterRange;
 ///   "unsafe_connection": false,
 ///   "communication_info": { "name": "alice" },
 ///   "own_transports": [{ "uri": "https://me.example.com/derec", "protocol": "https" }],
-///   "replica_id": "9007199254740993"
+///   "replica_id": "9007199254740993",
+///   "min_protocol_version": { "major": 0, "minor": 1 }
 /// }
 /// ```
 ///
@@ -75,6 +77,7 @@ use derec_proto::ParameterRange;
 ///   `0` or `1`.
 /// - Each `own_transports` entry is `{uri, protocol}`, where `protocol` is
 ///   `"https"` or `"grpc"` (any case) or its discriminant `0` or `1`.
+/// - `min_protocol_version` is `{major, minor}`, both JSON numbers.
 ///
 /// Serializing writes only the fields that are set, names rather than
 /// discriminants, and every flow of `auto_accept` and every bound of
@@ -114,6 +117,8 @@ pub struct DeRecProtocolConfig {
     pub own_transports: Option<Vec<TransportProtocol>>,
     /// See [`with_replica_id`](crate::protocol::DeRecProtocolBuilder::with_replica_id).
     pub replica_id: Option<u64>,
+    /// See [`with_min_protocol_version`](crate::protocol::DeRecProtocolBuilder::with_min_protocol_version).
+    pub min_protocol_version: Option<ProtocolVersion>,
 }
 
 /// The four waiting periods of [`Timeouts`], in whole seconds, each one
@@ -245,6 +250,7 @@ impl DeRecProtocolConfig {
             communication_info,
             own_transports,
             replica_id,
+            min_protocol_version,
         } = top;
         over(&mut self.threshold, threshold);
         over(&mut self.max_subshares, max_subshares);
@@ -274,6 +280,7 @@ impl DeRecProtocolConfig {
         over(&mut self.communication_info, communication_info);
         over(&mut self.own_transports, own_transports);
         over(&mut self.replica_id, replica_id);
+        over(&mut self.min_protocol_version, min_protocol_version);
     }
 }
 
@@ -372,6 +379,7 @@ mod wire {
     use super::{DeRecProtocolConfig, TimeoutsConfig};
     use crate::interop::protocol_names;
     use crate::protocol::{AutoAcceptPolicy, UnpairAck};
+    use crate::protocol_version::ProtocolVersion;
     use crate::transport::TransportProtocol;
 
     #[derive(Serialize, Deserialize, Default)]
@@ -401,6 +409,16 @@ mod wire {
         own_transports: Option<Vec<OwnTransportWire>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         replica_id: Option<DecimalU64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min_protocol_version: Option<VersionWire>,
+    }
+
+    /// A protocol version as `{major, minor}`.
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct VersionWire {
+        major: u32,
+        minor: u32,
     }
 
     /// One boolean per flow; an absent flow takes the policy default.
@@ -632,6 +650,10 @@ mod wire {
                 communication_info: w.communication_info,
                 own_transports,
                 replica_id: decimal_u64("replica_id", w.replica_id)?,
+                min_protocol_version: w.min_protocol_version.map(|v| ProtocolVersion {
+                    major: v.major,
+                    minor: v.minor,
+                }),
             })
         }
     }
@@ -661,6 +683,10 @@ mod wire {
                         .collect()
                 }),
                 replica_id: c.replica_id.map(|v| DecimalU64::Decimal(v.to_string())),
+                min_protocol_version: c.min_protocol_version.map(|v| VersionWire {
+                    major: v.major,
+                    minor: v.minor,
+                }),
             }
         }
     }

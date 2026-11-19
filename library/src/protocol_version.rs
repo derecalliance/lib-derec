@@ -36,7 +36,7 @@ use std::fmt;
 /// assert!(version.major >= 0);
 /// assert!(version.minor >= 0);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion {
     pub major: u32,
     pub minor: u32,
@@ -88,4 +88,4 @@ impl fmt::Display for ProtocolVersion {
 ///
 /// assert_eq!(CURRENT, ProtocolVersion::current());
 /// ```
-pub const CURRENT: ProtocolVersion = ProtocolVersion { major: 0, minor: 0 };
+pub const CURRENT: ProtocolVersion = ProtocolVersion { major: 0, minor: 1 };

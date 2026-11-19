@@ -480,6 +480,18 @@ export class DeRecProtocolBuilder {
   }
 
   /**
+   * The oldest protocol version whose messages this device still accepts.
+   * An inbound envelope naming an older version is ignored with
+   * `MessageIgnored` reason `"ProtocolVersionTooOld"`: nothing is
+   * decrypted, stored or answered. Default: 0.0, which accepts every
+   * version.
+   */
+  withMinProtocolVersion(major: number, minor: number): this {
+    this.config.min_protocol_version = { major, minor };
+    return this;
+  }
+
+  /**
    * Declare the bounds this node advertises during pair negotiation.
    *
    * Embedded in outbound `PairRequest`/`PairResponse` envelopes and checked
@@ -702,6 +714,23 @@ export class DeRecProtocol {
   start(flowKind: FlowKind.Unpair, params: UnpairParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.ReplicaDiscovery, params?: ReplicaDiscoveryParams): Promise<DeRecEvent[]>;
+  /** Remove a member from the replica group; naming this device is a
+   *  voluntary departure. It tells every member, the departing one included,
+   *  then either drops the named member on this device at once, with any key
+   *  only it used, and reports `ReplicaRemoved`, or, when removing this
+   *  device, publishes without its own row and then drops the whole
+   *  `secret_id` partition, reporting `SelfRemovedFromGroup`. Either way it
+   *  publishes the latest snapshot, or an empty payload when there is none,
+   *  with a roster that omits the member; that round's events follow, as for
+   *  `start(FlowKind.ProtectSecret)`. The application publishes nothing
+   *  itself to complete a removal.
+   *
+   *  The departing member is on no distribution list from then on. Every
+   *  other member flags it when told and drops it, with `ReplicaRemoved`,
+   *  once that roster arrives. When this device removes itself, the remaining
+   *  members acknowledge the publish after it dropped the group channel, and
+   *  `process` fails those acknowledgements with an unknown-channel error,
+   *  which can be disregarded. */
   start(flowKind: FlowKind.UnpairReplica, params: UnpairReplicaParams): Promise<DeRecEvent[]>;
   async start(flowKind: FlowKind, params?: unknown): Promise<DeRecEvent[]> {
     const paramsBytes = buildStartParams(flowKind, params);

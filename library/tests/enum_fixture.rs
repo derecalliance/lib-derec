@@ -172,6 +172,8 @@ fn ignore_reason_fixture_is_complete() {
         IgnoreReason::TimestampMismatch,
         IgnoreReason::StaleResponse,
         IgnoreReason::Superseded,
+        IgnoreReason::ProtocolVersionTooOld,
+        IgnoreReason::ProtocolVersionMismatch,
     ];
     let names: Vec<&str> = all
         .iter()
@@ -181,6 +183,8 @@ fn ignore_reason_fixture_is_complete() {
             IgnoreReason::TimestampMismatch => "TimestampMismatch",
             IgnoreReason::StaleResponse => "StaleResponse",
             IgnoreReason::Superseded => "Superseded",
+            IgnoreReason::ProtocolVersionTooOld => "ProtocolVersionTooOld",
+            IgnoreReason::ProtocolVersionMismatch => "ProtocolVersionMismatch",
         })
         .collect();
     assert_matches_fixture("IgnoreReason", &names);

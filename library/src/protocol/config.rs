@@ -16,6 +16,7 @@ use super::traits::{
 use super::types::{PairingKeyMaterial, SecretValue};
 use crate::Error;
 use crate::protocol::types::Timeouts;
+use crate::protocol_version::ProtocolVersion;
 use crate::transport;
 use crate::transport::IntoOwnTransport;
 use crate::utils;
@@ -88,6 +89,7 @@ impl<
             unsafe_connection: false,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
+            min_protocol_version: ProtocolVersion { major: 0, minor: 0 },
             auto_reply_to: false,
             auto_accept: AutoAcceptPolicy::default(),
             replica_id: None,

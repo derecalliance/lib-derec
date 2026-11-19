@@ -123,7 +123,8 @@ pub enum ChannelStatus {
     /// Being torn down. A helper channel is `Unpairing` from the moment an
     /// unpair under [`UnpairAck::Required`](crate::protocol::UnpairAck::Required)
     /// is sent until the helper answers or the acknowledgement window
-    /// elapses; a rejection returns it to `Paired`. A replica member is
+    /// elapses; a rejection returns it to `Paired`, except for a recovery
+    /// channel `restore` tears down, which is dropped. A replica member is
     /// `Unpairing` once told to leave, until the version that completes its
     /// removal. Not a publish target, not a recovery source, and not a
     /// target of any new request, but inbound messages on it are still
@@ -482,6 +483,18 @@ pub struct ReplicaMember {
     pub status: ChannelStatus,
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub created_at: u64,
+    /// The channel this member handed the group over to this device on, while
+    /// that channel is still in use.
+    ///
+    /// Set on the device that joined the group through this member: the
+    /// handover arrives on the pairing channel, and the member keeps sending
+    /// there, under the pairing key, until it learns this device holds the
+    /// group key. The pairing key is kept at this channel so those copies stay
+    /// readable, and a message from this member on that channel is read as
+    /// coming from it. The first message from the member on the group channel
+    /// proves it has moved on: the key at this channel is removed and the
+    /// field cleared. `None` on every other row.
+    pub handover_channel: Option<ChannelId>,
 }
 
 /// Schema version stamped onto every channel record this build writes.
@@ -499,13 +512,14 @@ pub struct ReplicaMember {
 /// fields this build cannot see and writing the truncated result back.
 ///
 /// The value tracks the release that last changed the shape, not the release
-/// that is current: it moved to 3 when `transport` became `transports`, and
-/// stays there until the next shape change.
+/// that is current: it moved to 3 when `transport` became `transports`, to 4
+/// when [`ReplicaMember::handover_channel`] was added, and stays there until
+/// the next shape change.
 ///
 /// Declared unconditionally, unlike the serde impls that stamp it: the SDK
 /// bridges mirror this number in their own encoders, and a constant they must
 /// agree with should not appear and disappear with a feature flag.
-pub const CHANNEL_RECORD_SCHEMA_VERSION: u8 = 3;
+pub const CHANNEL_RECORD_SCHEMA_VERSION: u8 = 4;
 
 /// Stored-format compatibility for the two channel records.
 ///
@@ -653,6 +667,8 @@ mod channel_wire {
         status: ChannelStatus,
         #[serde(default)]
         created_at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handover_channel: Option<ChannelId>,
     }
 
     impl From<ReplicaMember> for ReplicaMemberWire {
@@ -667,6 +683,7 @@ mod channel_wire {
                 role: value.role,
                 status: value.status,
                 created_at: value.created_at,
+                handover_channel: value.handover_channel,
             }
         }
     }
@@ -684,6 +701,7 @@ mod channel_wire {
                 role: wire.role,
                 status: wire.status,
                 created_at: wire.created_at,
+                handover_channel: wire.handover_channel,
             })
         }
     }
@@ -1364,6 +1382,10 @@ pub enum StateItem {
     PendingUnpair {
         channel_id: ChannelId,
         started_at: u64,
+        /// The channel is dropped whatever the Helper answers: a refusal is
+        /// reported and the channel still goes, instead of returning to
+        /// `Paired`. Set for the recovery channels a restore tears down.
+        drop_on_rejection: bool,
     },
 
     /// Active sharing round, keyed by the version it distributes. Created by
@@ -1583,6 +1605,45 @@ mod channel_record_format_tests {
         assert_eq!(decoded.replica_id, ReplicaId(3));
     }
 
+    /// A member row written before `handover_channel` existed has none.
+    #[test]
+    fn a_v3_replica_record_reads_with_no_handover_channel() {
+        let v3 = r#"{"schema_version":3,"channel_id":9,"replica_id":3,"transports":[{"uri":"https://member.example/derec","protocol":0}],"communication_info":{},"role":"Source","status":"Paired","created_at":0}"#;
+
+        let decoded: ReplicaMember = serde_json::from_str(v3).expect("a v3 replica row");
+
+        assert_eq!(decoded.handover_channel, None);
+    }
+
+    /// The field is written only when set, so a member row without one keeps
+    /// the exact text the Go and .NET bridges rebuild.
+    #[test]
+    fn a_handover_channel_is_written_only_when_set() {
+        let mut member = ReplicaMember {
+            channel_id: ChannelId(9),
+            replica_id: ReplicaId(3),
+            transports: vec![endpoint("https://member.example/derec")],
+            communication_info: HashMap::new(),
+            role: ReplicaRole::Source,
+            status: ChannelStatus::Paired,
+            created_at: 0,
+            handover_channel: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&member).expect("serializes"),
+            r#"{"schema_version":4,"channel_id":9,"replica_id":3,"transports":[{"uri":"https://member.example/derec","protocol":0}],"communication_info":{},"role":"Source","status":"Paired","created_at":0}"#
+        );
+
+        member.handover_channel = Some(ChannelId(7));
+        let json = serde_json::to_string(&member).expect("serializes");
+        assert_eq!(
+            json,
+            r#"{"schema_version":4,"channel_id":9,"replica_id":3,"transports":[{"uri":"https://member.example/derec","protocol":0}],"communication_info":{},"role":"Source","status":"Paired","created_at":0,"handover_channel":7}"#
+        );
+        let reloaded: ReplicaMember = serde_json::from_str(&json).expect("reloads");
+        assert_eq!(reloaded.handover_channel, Some(ChannelId(7)));
+    }
+
     /// The loud-failure property the `transport` -> `transports` change was
     /// made to keep. Defaulting these to an empty list would produce a channel
     /// that looks paired and can never be reached.
@@ -1656,7 +1717,7 @@ mod channel_record_format_tests {
         assert_eq!(reloaded.weight, 3);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&json).unwrap()["schema_version"],
-            serde_json::json!(3)
+            serde_json::json!(4)
         );
     }
 
@@ -1739,7 +1800,7 @@ mod channel_record_format_tests {
         // hand-written SDK expectation that nothing cross-checks.
         assert_eq!(
             serde_json::to_string(&record).expect("serializes"),
-            r#"{"schema_version":3,"channel_id":42,"transports":[{"uri":"https://helper.example/derec","protocol":0}],"communication_info":{},"peer_role":"Helper","status":"Paired","created_at":1700000000,"weight":1}"#
+            r#"{"schema_version":4,"channel_id":42,"transports":[{"uri":"https://helper.example/derec","protocol":0}],"communication_info":{},"peer_role":"Helper","status":"Paired","created_at":1700000000,"weight":1}"#
         );
     }
 

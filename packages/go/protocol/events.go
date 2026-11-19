@@ -431,6 +431,14 @@ const (
 	// the newest one this helper stores on the channel, and not stored
 	// itself. It is not stored and not answered.
 	IgnoreReasonSuperseded = "Superseded"
+	// IgnoreReasonProtocolVersionTooOld: the envelope names a protocol
+	// version below MinProtocolVersion. Nothing is decrypted, stored or
+	// answered.
+	IgnoreReasonProtocolVersionTooOld = "ProtocolVersionTooOld"
+	// IgnoreReasonProtocolVersionMismatch: the protocol version copied into
+	// the encrypted payload differs from the envelope's. Nothing is stored or
+	// answered.
+	IgnoreReasonProtocolVersionMismatch = "ProtocolVersionMismatch"
 )
 
 // The label vocabulary for Event.Reason on a PeerNotRestored event. Matches

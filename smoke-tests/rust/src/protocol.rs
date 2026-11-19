@@ -12,9 +12,7 @@ use std::time::Duration;
 
 use derec_cryptography::channel::{decrypt_message, encrypt_message};
 use derec_library::Error;
-use derec_library::derec_message::{
-    DeRecMessageBuilder, apply_trace_id, current_timestamp, extract_inner_message, message_id,
-};
+use derec_library::derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message};
 use derec_library::primitives::pairing::PairingError;
 use derec_library::primitives::sharing::SharingError;
 use derec_library::protocol::types::{
@@ -31,6 +29,7 @@ use derec_library::protocol::{
     ShareStoreError, ShareStoreFuture, StateItem, StateKey, StateKind, StateStoreFuture,
     TransportFuture, VerifyFailureReason,
 };
+use derec_library::protocol_version::ProtocolVersion;
 use derec_library::transport::TransportValidationError;
 use derec_library::types::{ChannelId, ReplicaId};
 use derec_proto::{
@@ -84,17 +83,20 @@ pub async fn run_all() {
     run_disputed_recovery_flow().await;
     run_conflicting_recovery_flow().await;
     run_restore_keeps_helper_duties_flow().await;
+    run_restore_recovery_unpair_refused_flow().await;
     run_abandoned_replica_pairing_flow().await;
     run_contact_on_the_group_channel_flow().await;
     run_unpairing_flow().await;
     run_update_channel_info_flow().await;
-    run_replay_detection_flow().await;
     run_superseded_share_request_flow().await;
     run_reply_to_flow().await;
     run_auto_publish_on_pair_flow().await;
     run_replica_sync_version_progression_flow().await;
     run_replica_group_key_handover_flow().await;
     run_replica_publish_before_handover_ack_flow().await;
+    run_replica_late_joiner_flow().await;
+    run_replica_removal_flow().await;
+    run_legacy_message_and_minimum_version_flow().await;
     run_auto_accept_flow().await;
     run_start_pairing_rejects_already_paired_channel().await;
     run_pairing_rejects_incompatible_parameter_range().await;
@@ -764,6 +766,39 @@ impl Peer {
             .with_own_transports([uri])
             .with_threshold(2)
             .with_parameter_range(range)
+            .build()
+            .expect("test fixture: builder.build() should succeed");
+        Self {
+            label,
+            uri: uri.to_owned(),
+            protocol,
+            transport,
+        }
+    }
+
+    /// Build a peer for `secret_id` that accepts messages of any age, from
+    /// protocol `floor` on.
+    fn with_min_protocol_version(
+        label: &'static str,
+        uri: &str,
+        secret_id: u64,
+        floor: ProtocolVersion,
+    ) -> Self {
+        let transport = InProcessTransport::new();
+        let protocol = DeRecProtocolBuilder::new(secret_id)
+            .with_channel_store(InMemoryChannelStore::default())
+            .with_share_store(InMemoryShareStore::default())
+            .with_secret_store(InMemorySecretStore::default())
+            .with_user_secret_store(InMemoryUserSecretStore::default())
+            .with_transport(transport.clone())
+            .with_state_store(InMemoryStateStore::default())
+            .with_own_transports([uri])
+            .with_threshold(2)
+            .with_timeouts(Timeouts {
+                inbound_message: std::time::Duration::from_secs(1 << 40),
+                ..Timeouts::default()
+            })
+            .with_min_protocol_version(floor)
             .build()
             .expect("test fixture: builder.build() should succeed");
         Self {
@@ -1920,10 +1955,10 @@ async fn run_protect_secret_with_replica_targets_flow() {
         .expect("replica verify_fingerprint");
 
     let auto_publish = owner.transport.drain();
-    assert_eq!(
-        auto_publish.len(),
-        3,
-        "verify_fingerprint auto-publish must fan out to 2 helpers + 1 replica (v=1, empty secrets)"
+    assert!(
+        auto_publish.is_empty(),
+        "confirming a replica destination publishes nothing; the application publishes, got {} messages",
+        auto_publish.len()
     );
 
     let secret_data = b"secret-payload-for-replica-and-helper".to_vec();
@@ -2709,6 +2744,16 @@ async fn run_unconfirmed_destination_ignores_the_copy_flow() {
         .verify_fingerprint(replica_channel, &destination_fp)
         .await
         .expect("the source must accept the matching fingerprint");
+    source
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: Vec::new(),
+            description: None,
+            weights: HashMap::new(),
+            threshold: None,
+        })
+        .await
+        .expect("the source's application publishes once the source confirmed");
 
     let early = pump(&mut source, &mut destination).await;
     assert!(
@@ -2828,9 +2873,6 @@ async fn run_replica_mirror_then_verify_flow() {
         .verify_fingerprint(replica_channel, &source_fp)
         .await
         .expect("destination verify_fingerprint");
-
-    // The pair-completion auto-publish is not the round under test.
-    let _ = pump_many(&mut [&mut source, &mut helper_a, &mut helper_b, &mut destination]).await;
 
     source
         .protocol
@@ -3234,6 +3276,7 @@ async fn run_replica_verifies_only_synced_versions_flow() {
         .verify_fingerprint(replica_channel, &alice_fp)
         .await
         .expect("bob verify_fingerprint");
+    publish_after_confirming(&mut alice).await;
 
     let joined = pump_many(&mut [&mut alice, &mut h1, &mut h2, &mut h3, &mut bob]).await;
     let (v2, synced_secret) = joined
@@ -5499,6 +5542,7 @@ async fn run_replica_secret_refused_flow() {
         .verify_fingerprint(replica_channel, &destination_fp)
         .await
         .expect("the source must accept the matching fingerprint");
+    publish_after_confirming(&mut source).await;
     pump_many(&mut [&mut source, &mut helper_a, &mut helper_b, &mut destination]).await;
 
     let version = source
@@ -6008,6 +6052,263 @@ async fn run_restore_keeps_helper_duties_flow() {
     );
 
     println!("Protocol restore keeps helper duties flow test passed.");
+}
+
+/// [`pump_many`] where the peer at `refuser` rejects every unpair request it
+/// receives instead of accepting it. Returns the events seen by the peer at
+/// `observer` and the channels on which `refuser` rejected an unpair.
+async fn pump_many_refusing_unpair(
+    peers: &mut [&mut Peer],
+    refuser: usize,
+    observer: usize,
+) -> (Vec<DeRecEvent>, Vec<ChannelId>) {
+    let mut observed = Vec::new();
+    let mut refused = Vec::new();
+
+    loop {
+        let mut pending: Vec<(usize, Vec<u8>)> = Vec::new();
+        for src in 0..peers.len() {
+            for (tp, bytes) in peers[src].drain() {
+                let dest = peers
+                    .iter()
+                    .position(|p| p.uri == tp.uri)
+                    .unwrap_or_else(|| panic!("no peer for destination uri {}", tp.uri));
+                pending.push((dest, bytes));
+            }
+        }
+        if pending.is_empty() {
+            break;
+        }
+        for (dest, bytes) in pending {
+            let events = if dest == refuser {
+                let peer = &mut *peers[dest];
+                let events = peer
+                    .protocol
+                    .process(&bytes)
+                    .await
+                    .unwrap_or_else(|e| panic!("[{}] process() failed: {e}", peer.label));
+                let mut kept = Vec::new();
+                for event in events {
+                    match event {
+                        DeRecEvent::ActionRequired {
+                            action: action @ PendingAction::Unpair { .. },
+                            ..
+                        } => {
+                            if let PendingAction::Unpair { channel_id, .. } = &action {
+                                refused.push(*channel_id);
+                            }
+                            peer.protocol
+                                .reject(action, StatusEnum::Rejected, "unpair refused")
+                                .await
+                                .unwrap_or_else(|e| {
+                                    panic!("[{}] reject(Unpair) failed: {e}", peer.label)
+                                });
+                        }
+                        DeRecEvent::ActionRequired { action, .. } => {
+                            kept.extend(peer.protocol.accept(action).await.unwrap_or_else(|e| {
+                                panic!("[{}] accept() failed: {e}", peer.label)
+                            }));
+                        }
+                        other => kept.push(other),
+                    }
+                }
+                kept
+            } else {
+                deliver(peers[dest], &bytes).await
+            };
+            if dest == observer {
+                observed.extend(events);
+            }
+        }
+    }
+
+    (observed, refused)
+}
+
+/// After a restore the owner unpairs its recovery channels. A helper that
+/// refuses that unpair must not keep the recovery channel alive on the
+/// owner: the owner reports the refusal, drops the channel, and every later
+/// publish sends that helper one share, over its restored helper channel.
+async fn run_restore_recovery_unpair_refused_flow() {
+    println!("=== Restore: a helper refuses the recovery-channel unpair ===");
+
+    const OWN_SECRET_ID: u64 = 4646;
+    let mut lost = Peer::with_secret_id(
+        "lost-device",
+        "https://lost-refusal.example.com",
+        OWN_SECRET_ID,
+    );
+    let mut helper_a = Peer::new("helper-a", "https://helper-a-refusal.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b-refusal.example.com");
+    let channel_a = pair(&mut lost, &mut helper_a, ChannelId(1)).await;
+    let channel_b = pair(&mut lost, &mut helper_b, ChannelId(2)).await;
+    let version =
+        protect_across(&mut lost, &mut [&mut helper_a, &mut helper_b], "own secret").await;
+
+    let mut device = Peer::with_secret_id(
+        "new-device",
+        "https://device-refusal.example.com",
+        OWN_SECRET_ID,
+    );
+    let mut recovery_channels = Vec::new();
+    for (helper, original, transient) in [
+        (&mut helper_a, channel_a, ChannelId(100)),
+        (&mut helper_b, channel_b, ChannelId(101)),
+    ] {
+        let contact = device
+            .protocol
+            .create_contact(Some(transient), ContactMode::InlineKeys, None)
+            .await
+            .expect("create the recovery contact");
+        helper
+            .protocol
+            .start(DeRecFlow::Pairing {
+                kind: SenderKind::Helper,
+                contact,
+                peer_communication_info: HashMap::new(),
+            })
+            .await
+            .expect("helper start(Pairing recovery) failed");
+        let events = pump_many(&mut [&mut device, helper]).await;
+        let recovery_channel = extract_paired_channel_id(events.iter(), transient)
+            .expect("the recovery pairing completes");
+        let helper_sid = helper.protocol.secret_id();
+        helper
+            .protocol
+            .channel_store
+            .link_channel(helper_sid, original, recovery_channel)
+            .await
+            .expect("link the recovery channel to the original");
+        recovery_channels.push(recovery_channel);
+    }
+    let [recovery_a, recovery_b] = recovery_channels[..] else {
+        unreachable!("two recovery pairings");
+    };
+
+    device
+        .protocol
+        .start(DeRecFlow::RecoverSecret {
+            secret_id: OWN_SECRET_ID,
+            version,
+        })
+        .await
+        .expect("device start(RecoverSecret) failed");
+    let recovered = pump_many(&mut [&mut device, &mut helper_a, &mut helper_b])
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            DeRecEvent::SecretRecovered { secret } => Some(secret),
+            _ => None,
+        })
+        .expect("the device recovers its own secret");
+
+    let restore_events = device
+        .protocol
+        .restore(&recovered, version)
+        .await
+        .expect("restore succeeds");
+    for recovery_channel in [recovery_a, recovery_b] {
+        assert!(
+            restore_events.iter().any(|e| matches!(
+                e,
+                DeRecEvent::UnpairStarted { channel_id, .. } if *channel_id == recovery_channel
+            )),
+            "restore unpairs recovery channel {recovery_channel:?}: {restore_events:?}"
+        );
+    }
+    println!("  [device]   restore → UnpairStarted on both recovery channels  ✓");
+
+    let (device_events, refused) =
+        pump_many_refusing_unpair(&mut [&mut device, &mut helper_a, &mut helper_b], 2, 0).await;
+    assert_eq!(
+        refused,
+        vec![recovery_b],
+        "helper-b's app rejects exactly the unpair of its recovery channel"
+    );
+    let rejected = device_events.iter().position(|e| {
+        matches!(
+            e,
+            DeRecEvent::UnpairRejected { channel_id, status, .. }
+                if *channel_id == recovery_b && *status == StatusEnum::Rejected as i32
+        )
+    });
+    let unpaired = device_events.iter().position(
+        |e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == recovery_b),
+    );
+    assert!(
+        matches!((rejected, unpaired), (Some(r), Some(u)) if r < u),
+        "the device reports UnpairRejected, then Unpaired, for {recovery_b:?}: {device_events:?}"
+    );
+    assert!(
+        device_events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == recovery_a)),
+        "helper-a accepts, so its recovery channel is unpaired: {device_events:?}"
+    );
+    println!("  [helper-b] reject(Unpair) → [device] UnpairRejected(REJECTED) then Unpaired  ✓");
+
+    let device_sid = device.protocol.secret_id();
+    for recovery_channel in [recovery_a, recovery_b] {
+        let record = device
+            .protocol
+            .channel_store
+            .load(
+                device_sid,
+                ChannelQuery::Helper {
+                    channel_id: recovery_channel,
+                },
+            )
+            .await
+            .expect("load the recovery channel");
+        assert!(
+            record.is_none(),
+            "recovery channel {recovery_channel:?} is gone from the channel store, got {record:?}"
+        );
+    }
+    println!("  [device]   both recovery channels gone from the channel store  ✓");
+
+    let protect_events = device
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![10],
+                name: "after refusal".to_owned(),
+                data: b"after refusal".to_vec(),
+            }],
+            description: None,
+            weights: HashMap::new(),
+            threshold: None,
+        })
+        .await
+        .expect("device start(ProtectSecret) failed");
+    let mut targets: Vec<ChannelId> = protect_events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ProtectSecretStarted { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        })
+        .collect();
+    targets.sort_by_key(|c| c.0);
+    let mut expected = vec![channel_a, channel_b];
+    expected.sort_by_key(|c| c.0);
+    assert_eq!(
+        targets, expected,
+        "the publish targets each restored helper channel exactly once: {protect_events:?}"
+    );
+    let sent: Vec<String> = device.drain().into_iter().map(|(tp, _)| tp.uri).collect();
+    assert_eq!(
+        sent.iter().filter(|uri| **uri == helper_a.uri).count(),
+        1,
+        "helper-a receives one share: {sent:?}"
+    );
+    assert_eq!(
+        sent.iter().filter(|uri| **uri == helper_b.uri).count(),
+        1,
+        "helper-b receives one share, not one per channel: {sent:?}"
+    );
+    println!("  [device]   next ProtectSecret → one share per helper, restored channels only  ✓");
+
+    println!("Restore: a helper refuses the recovery-channel unpair flow test passed.");
 }
 
 /// Start a replica pairing from `scanner`, as `kind`, against a fresh contact
@@ -6654,114 +6955,6 @@ async fn run_update_channel_info_flow() {
     );
 
     println!("Protocol UpdateChannelInfo flow test passed.");
-}
-
-/// The application's replay record: the identity of every envelope a device
-/// sent or accepted, keyed on `message_id`.
-#[derive(Default)]
-struct SeenEnvelopes(HashSet<[u8; 32]>);
-
-impl SeenEnvelopes {
-    fn record(&mut self, envelope: &[u8]) {
-        self.0.insert(
-            message_id(envelope)
-                .expect("message_id of a valid envelope")
-                .id,
-        );
-    }
-
-    fn contains(&self, envelope: &[u8]) -> bool {
-        self.0.contains(
-            &message_id(envelope)
-                .expect("message_id of a valid envelope")
-                .id,
-        )
-    }
-}
-
-fn raised_update_channel_info(events: &[DeRecEvent]) -> bool {
-    events.iter().any(|e| {
-        matches!(
-            e,
-            DeRecEvent::ActionRequired {
-                action: PendingAction::UpdateChannelInfo { .. },
-                ..
-            }
-        )
-    })
-}
-
-/// The library processes every copy of a message delivered within the
-/// inbound window, including one delivered back to its own sender. An
-/// application that records the `message_id` of what it sends and accepts
-/// drops a replay, a copy whose unauthenticated `traceId` was changed, and a
-/// reflection.
-async fn run_replay_detection_flow() {
-    println!("=== Protocol replay detection flow ===");
-
-    let mut owner = Peer::new("owner", "https://owner.example.com");
-    let mut helper = Peer::new("helper", "https://helper.example.com");
-    let channel_id = pair(&mut owner, &mut helper, ChannelId(61)).await;
-    let mut owner_seen = SeenEnvelopes::default();
-    let mut helper_seen = SeenEnvelopes::default();
-
-    owner
-        .protocol
-        .start(DeRecFlow::UpdateChannelInfo {
-            target: Target::Single(channel_id),
-            communication_info: Some(HashMap::from([(
-                "name".to_owned(),
-                "owner-renamed".to_owned(),
-            )])),
-            own_transports: Vec::new(),
-        })
-        .await
-        .expect("owner start(UpdateChannelInfo) failed");
-    let sent = owner.drain();
-    assert_eq!(sent.len(), 1, "one update for one channel");
-    let update = sent[0].1.clone();
-    owner_seen.record(&update);
-
-    assert!(!helper_seen.contains(&update));
-    let events = helper
-        .protocol
-        .process(&update)
-        .await
-        .expect("helper process(update) failed");
-    assert!(raised_update_channel_info(&events), "got {events:?}");
-    helper_seen.record(&update);
-
-    let copy = apply_trace_id(&update, 0x7E57).expect("re-stamp the copy");
-    assert_ne!(copy, update, "the copy travels as different bytes");
-    assert!(helper_seen.contains(&update), "the replay is recognised");
-    assert!(
-        helper_seen.contains(&copy),
-        "the re-stamped copy is recognised"
-    );
-    let events = helper
-        .protocol
-        .process(&copy)
-        .await
-        .expect("helper process(copy) failed");
-    assert!(
-        raised_update_channel_info(&events),
-        "unchecked, the library processes the copy again: {events:?}"
-    );
-    println!("  [helper] replay and re-stamped copy share the original's message_id  ✓");
-
-    assert!(owner_seen.contains(&update), "the reflection is recognised");
-    let events = owner
-        .protocol
-        .process(&update)
-        .await
-        .expect("owner process(reflected update) failed");
-    assert!(
-        raised_update_channel_info(&events),
-        "unchecked, the library reads its own update as the peer's: {events:?}"
-    );
-    println!("  [owner]  reflected update matches an outbound message_id  ✓");
-
-    println!("Protocol replay detection flow test passed.");
 }
 
 /// A Helper that dropped v2 under v3's `keepVersion` does not store v2 again
@@ -7506,9 +7699,10 @@ async fn run_replica_group_key_handover_flow() {
     let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
 
     // Handover moves Dest2 onto the group channel rather than copying the
-    // group key onto its ephemeral one: the group is one channel and one key,
-    // so the ephemeral channel is torn down on both sides once it has served
-    // its purpose.
+    // group key onto its ephemeral one: the group is one channel and one key.
+    // Source drops the ephemeral channel once Dest2 answers on the group
+    // channel; Dest2 keeps it, recorded on Source's row, until Source reaches
+    // it on the group channel.
     let k_source_group = load_channel_key(&source, sid, dest1_channel).await;
     let k_dest1 = load_channel_key(&dest1, sid, dest1_channel).await;
     let k_dest2 = load_channel_key(&dest2, sid, dest1_channel).await;
@@ -7526,12 +7720,19 @@ async fn run_replica_group_key_handover_flow() {
         "K_group is fixed at the first replica pairing and never re-derived"
     );
 
-    for (label, peer) in [("Source", &source), ("Dest2", &dest2)] {
-        assert!(
-            channel_key(peer, sid, dest2_channel).await.is_none(),
-            "{label} must drop the ephemeral pairing channel's key after handover"
-        );
-    }
+    assert!(
+        channel_key(&source, sid, dest2_channel).await.is_none(),
+        "Source must drop the ephemeral pairing channel's key once Dest2 answers on the group channel"
+    );
+    assert!(
+        channel_key(&dest2, sid, dest2_channel).await.is_some(),
+        "Dest2 must keep the ephemeral key until Source reaches it on the group channel"
+    );
+    assert_eq!(
+        member_handover_channel(&dest2, sid, owner_replica_id).await,
+        Some(dest2_channel),
+        "Dest2 records the ephemeral channel on Source's row"
+    );
     for (label, peer) in [("Source", &source), ("Dest1", &dest1), ("Dest2", &dest2)] {
         let roster = peer
             .protocol
@@ -7585,6 +7786,14 @@ async fn run_replica_group_key_handover_flow() {
             .iter()
             .any(|us| us.data == b"k_group payload"),
         "Dest2 must successfully decrypt the post-handover payload using K_group"
+    );
+    assert!(
+        channel_key(&dest2, sid, dest2_channel).await.is_none(),
+        "Dest2 must drop the ephemeral key once Source reaches it on the group channel"
+    );
+    assert_eq!(
+        member_handover_channel(&dest2, sid, owner_replica_id).await,
+        None
     );
 
     let k_source_final = load_channel_key(&source, sid, dest1_channel).await;
@@ -7654,41 +7863,459 @@ async fn run_replica_publish_before_handover_ack_flow() {
         "Dest2 must have acknowledged the handover before it is dropped"
     );
     let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+    let source_id = 0xC0DE_C0DE_C0DE_C0DEu64;
+    let dest2_id = 0xD2D2_D2D2_D2D2_D2D2u64;
+    assert_eq!(member_channel(&source, sid, dest2_id).await, ephemeral);
+    assert!(channel_key(&source, sid, ephemeral).await.is_some());
+    assert_eq!(
+        member_handover_channel(&dest2, sid, source_id).await,
+        Some(ephemeral),
+        "Dest2 keeps Source's handover channel while Source may still send there"
+    );
+    assert!(channel_key(&dest2, sid, ephemeral).await.is_some());
     println!("  step 1: handover delivered, Dest2's acknowledgement lost  ✓");
 
-    for payload in [b"before the ack".as_slice(), b"after the ack".as_slice()] {
-        source
-            .protocol
-            .start(DeRecFlow::ProtectSecret {
-                secrets: vec![UserSecret {
-                    id: vec![0x42],
-                    name: "handover".to_owned(),
-                    data: payload.to_vec(),
-                }],
-                description: None,
-                weights: HashMap::new(),
-                threshold: None,
-            })
-            .await
-            .expect("source start(ProtectSecret) failed");
-        let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+    // Source never saw the acknowledgement, so its next publish goes on the
+    // ephemeral channel again. Dest2 still reads it there, and its answer on
+    // the group channel completes the move on Source.
+    publish(&mut source, b"resent on the ephemeral channel").await;
+    let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+    assert_holds(&dest2, sid, b"resent on the ephemeral channel").await;
+    assert_eq!(member_channel(&source, sid, dest2_id).await, group_channel);
+    assert!(
+        channel_key(&source, sid, ephemeral).await.is_none(),
+        "Source drops the ephemeral key once Dest2 answers on the group channel"
+    );
+    assert!(
+        channel_key(&dest2, sid, ephemeral).await.is_some(),
+        "Dest2 has not heard from Source on the group channel yet"
+    );
+    println!("  step 2: the resent copy is read on the ephemeral channel; Source moves Dest2  ✓");
 
-        let snapshot = dest2
+    // Dest2 publishes before Source reaches it on the group channel. It
+    // sends to every member on the group channel, so Source, which no longer
+    // holds the ephemeral key, still reads it.
+    publish(&mut dest2, b"published by the joiner").await;
+    let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+    assert_holds(&source, sid, b"published by the joiner").await;
+    assert_holds(&dest1, sid, b"published by the joiner").await;
+    println!("  step 3: Dest2's own publish reaches Source on the group channel  ✓");
+
+    publish(&mut source, b"on the group channel").await;
+    let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+    assert_holds(&dest2, sid, b"on the group channel").await;
+    assert!(
+        channel_key(&dest2, sid, ephemeral).await.is_none(),
+        "Dest2 drops the ephemeral key once Source reaches it on the group channel"
+    );
+    assert_eq!(member_handover_channel(&dest2, sid, source_id).await, None);
+    println!(
+        "  step 4: Source reaches Dest2 on the group channel; Dest2 drops the ephemeral key  ✓"
+    );
+
+    println!("Protocol replica publish before handover ack flow test passed.");
+}
+
+/// A device joining an existing group whose pairing the source confirmed, and
+/// whose application published, before the joiner confirmed. The joiner
+/// ignores that copy, then confirms and asks: the answer arrives on the
+/// pairing channel and carries the group key, and the next two publishes
+/// complete the handover on both sides.
+async fn run_replica_late_joiner_flow() {
+    println!("=== Protocol replica late joiner flow ===");
+    let sid = 0x1A7Eu64;
+    let source_id = 0x5050_5050_5050_5050u64;
+    let joiner_id = 0x1010_1010_1010_1010u64;
+    let mut source =
+        Peer::with_secret_id_and_replica_id("source", "https://source.example.com", sid, source_id);
+    let mut dest1 = Peer::with_options(
+        "dest1",
+        "https://dest1.example.com",
+        2,
+        false,
+        Some(0xD1D1_D1D1_D1D1_D1D1u64),
+        sid,
+    );
+    let mut joiner = Peer::with_options(
+        "joiner",
+        "https://joiner.example.com",
+        2,
+        false,
+        Some(joiner_id),
+        sid,
+    );
+
+    let group_channel = pair_replica_handshake(&mut source, &mut dest1, ChannelId(1)).await;
+    cross_confirm_fingerprint(&mut source, &mut dest1, group_channel).await;
+    let _ = pump_many(&mut [&mut source, &mut dest1, &mut joiner]).await;
+
+    let ephemeral = pair_replica_handshake(&mut source, &mut joiner, ChannelId(2)).await;
+    let joiner_fp = joiner
+        .protocol
+        .get_fingerprint(ephemeral)
+        .await
+        .expect("joiner fingerprint");
+    source
+        .protocol
+        .verify_fingerprint(ephemeral, &joiner_fp)
+        .await
+        .expect("the source must accept the matching fingerprint");
+    publish(&mut source, b"before the joiner confirmed").await;
+    let early = pump_many(&mut [&mut source, &mut dest1, &mut joiner]).await;
+    assert!(
+        early.iter().any(|e| matches!(
+            e,
+            DeRecEvent::MessageIgnored {
+                channel_id,
+                reason: IgnoreReason::PendingVerification,
+                ..
+            } if *channel_id == ephemeral
+        )),
+        "the joiner ignores a copy that arrives before it confirms, got {early:?}"
+    );
+    assert_holds(&dest1, sid, b"before the joiner confirmed").await;
+    assert!(
+        joiner
             .protocol
             .user_secret_store
             .load_latest(sid)
             .await
             .expect("load_latest")
-            .expect("Dest2 holds a snapshot");
-        assert!(
-            snapshot.secrets.iter().any(|us| us.data == payload),
-            "Dest2 must receive the publish carrying {:?}",
-            String::from_utf8_lossy(payload)
-        );
-    }
-    println!("  step 2: both publishes reached Dest2 on the group channel  ✓");
+            .is_none()
+    );
+    println!(
+        "  step 1: the source published before the joiner confirmed; the joiner ignored it  ✓"
+    );
 
-    println!("Protocol replica publish before handover ack flow test passed.");
+    let source_fp = source
+        .protocol
+        .get_fingerprint(ephemeral)
+        .await
+        .expect("source fingerprint");
+    joiner
+        .protocol
+        .verify_fingerprint(ephemeral, &source_fp)
+        .await
+        .expect("the joiner must accept the matching fingerprint");
+    joiner
+        .protocol
+        .start(DeRecFlow::ReplicaDiscovery)
+        .await
+        .expect("joiner start(ReplicaDiscovery) failed");
+    let caught_up = pump_many(&mut [&mut source, &mut dest1, &mut joiner]).await;
+    assert!(
+        caught_up
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::ReplicaSecretInstalled { .. })),
+        "the joiner installs the copy it asked for, got {caught_up:?}"
+    );
+    assert_holds(&joiner, sid, b"before the joiner confirmed").await;
+    assert_eq!(
+        load_channel_key(&joiner, sid, group_channel).await,
+        load_channel_key(&source, sid, group_channel).await,
+        "the answer carried the group key"
+    );
+    assert_eq!(member_channel(&joiner, sid, source_id).await, group_channel);
+    assert_eq!(
+        member_handover_channel(&joiner, sid, source_id).await,
+        Some(ephemeral)
+    );
+    assert_eq!(member_channel(&source, sid, joiner_id).await, ephemeral);
+    println!("  step 2: the joiner confirmed and asked; it holds the group key and the copy  ✓");
+
+    publish(&mut source, b"after the joiner caught up").await;
+    let _ = pump_many(&mut [&mut source, &mut dest1, &mut joiner]).await;
+    for peer in [&dest1, &joiner] {
+        assert_holds(peer, sid, b"after the joiner caught up").await;
+    }
+    assert_eq!(member_channel(&source, sid, joiner_id).await, group_channel);
+    assert!(channel_key(&source, sid, ephemeral).await.is_none());
+    assert!(channel_key(&joiner, sid, ephemeral).await.is_some());
+    println!(
+        "  step 3: the next publish reaches the joiner on the pairing channel; the source moves it  ✓"
+    );
+
+    publish(&mut source, b"on the group channel").await;
+    let _ = pump_many(&mut [&mut source, &mut dest1, &mut joiner]).await;
+    for peer in [&dest1, &joiner] {
+        assert_holds(peer, sid, b"on the group channel").await;
+    }
+    assert!(channel_key(&joiner, sid, ephemeral).await.is_none());
+    assert_eq!(member_handover_channel(&joiner, sid, source_id).await, None);
+    println!(
+        "  step 4: the source reaches the joiner on the group channel; the joiner drops the pairing key  ✓"
+    );
+
+    println!("Protocol replica late joiner flow test passed.");
+}
+
+/// Helper: the replica ids a peer records, sorted.
+async fn roster_ids(peer: &Peer, secret_id: u64) -> Vec<u64> {
+    let mut ids: Vec<u64> = peer
+        .protocol
+        .channel_store
+        .replicas(secret_id, ReplicaFilter::default())
+        .await
+        .expect("replicas")
+        .iter()
+        .map(|m| m.replica_id.0)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Removing a member: `UnpairReplica` drops it on the device that ran it and
+/// publishes the roster without it; the removed device drops everything when
+/// told and receives nothing afterwards; a device can also remove itself.
+async fn run_replica_removal_flow() {
+    println!("=== Protocol replica removal flow ===");
+    let sid = 0x7E40u64;
+    let a_id = 0x0A0A_0A0A_0A0A_0A0Au64;
+    let b_id = 0x0B0B_0B0B_0B0B_0B0Bu64;
+    let c_id = 0x0C0C_0C0C_0C0C_0C0Cu64;
+    let mut a = Peer::with_secret_id_and_replica_id("a", "https://a.example.com", sid, a_id);
+    let mut b = Peer::with_options("b", "https://b.example.com", 2, false, Some(b_id), sid);
+    let mut c = Peer::with_options("c", "https://c.example.com", 2, false, Some(c_id), sid);
+
+    let group = pair_replica_handshake(&mut a, &mut b, ChannelId(1)).await;
+    cross_confirm_fingerprint(&mut a, &mut b, group).await;
+    let _ = pump_many(&mut [&mut a, &mut b, &mut c]).await;
+    let joining = pair_replica_handshake(&mut a, &mut c, ChannelId(2)).await;
+    cross_confirm_fingerprint(&mut a, &mut c, joining).await;
+    let _ = pump_many(&mut [&mut a, &mut b, &mut c]).await;
+    publish(&mut a, b"before the removal").await;
+    let _ = pump_many(&mut [&mut a, &mut b, &mut c]).await;
+    for peer in [&b, &c] {
+        assert_holds(peer, sid, b"before the removal").await;
+    }
+
+    let started = a
+        .protocol
+        .start(DeRecFlow::UnpairReplica {
+            replica_id: c_id,
+            memo: Some("retired tablet".to_owned()),
+        })
+        .await
+        .expect("a start(UnpairReplica) failed");
+    assert!(
+        started
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::ReplicaRemoved { replica_id } if *replica_id == c_id)),
+        "the device running the removal drops the member at once, got {started:?}"
+    );
+    assert_eq!(roster_ids(&a, sid).await, vec![a_id, b_id]);
+    let published = a.drain();
+    assert!(
+        published.iter().any(|(tp, _)| tp.uri == c.uri),
+        "the removed member is told"
+    );
+    let to_c: Vec<Vec<u8>> = published
+        .iter()
+        .filter(|(tp, _)| tp.uri == c.uri)
+        .map(|(_, bytes)| bytes.clone())
+        .collect();
+    assert_eq!(
+        to_c.len(),
+        1,
+        "the removed member receives the notice and nothing else"
+    );
+    let mut seen_by_b = Vec::new();
+    for (tp, bytes) in published {
+        if tp.uri == b.uri {
+            seen_by_b.extend(deliver(&mut b, &bytes).await);
+        } else if tp.uri == c.uri {
+            let events = deliver(&mut c, &bytes).await;
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::SelfRemovedFromGroup { .. })),
+                "the removed member drops everything when told, got {events:?}"
+            );
+        }
+    }
+    println!(
+        "  step 1: removing a member drops it at once and publishes without it; it is told and drops everything  ✓"
+    );
+
+    seen_by_b.extend(pump_many(&mut [&mut a, &mut b, &mut c]).await);
+    assert!(
+        seen_by_b
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::ReplicaRemoved { replica_id } if *replica_id == c_id)),
+        "the remaining member drops it when the roster arrives, got {seen_by_b:?}"
+    );
+    assert_eq!(roster_ids(&b, sid).await, vec![a_id, b_id]);
+    assert!(roster_ids(&c, sid).await.is_empty());
+    assert!(
+        c.protocol
+            .user_secret_store
+            .load_latest(sid)
+            .await
+            .expect("load_latest")
+            .is_none(),
+        "the removed member keeps no copy of the secret"
+    );
+    println!(
+        "  step 2: the remaining member drops it with the roster; the removed member holds nothing  ✓"
+    );
+
+    publish(&mut a, b"after the removal").await;
+    let after = a.drain();
+    assert!(
+        after.iter().all(|(tp, _)| tp.uri != c.uri),
+        "nothing more is sent to the removed member"
+    );
+    for (tp, bytes) in after {
+        if tp.uri == b.uri {
+            deliver(&mut b, &bytes).await;
+        }
+    }
+    let _ = pump_many(&mut [&mut a, &mut b, &mut c]).await;
+    assert_holds(&b, sid, b"after the removal").await;
+    println!("  step 3: a later publish reaches the remaining member only  ✓");
+
+    let left = b
+        .protocol
+        .start(DeRecFlow::UnpairReplica {
+            replica_id: b_id,
+            memo: None,
+        })
+        .await
+        .expect("b start(UnpairReplica) on itself failed");
+    assert!(
+        left.iter()
+            .any(|e| matches!(e, DeRecEvent::SelfRemovedFromGroup { .. })),
+        "a device removing itself publishes and then drops everything, got {left:?}"
+    );
+    assert!(roster_ids(&b, sid).await.is_empty());
+    let mut farewell = Vec::new();
+    for (tp, bytes) in b.drain() {
+        if tp.uri == a.uri {
+            farewell.extend(deliver(&mut a, &bytes).await);
+        }
+    }
+    // The remaining member acknowledges the roster to a device that has
+    // already dropped the channel, which refuses the acknowledgement as an
+    // unknown channel.
+    let mut late = 0;
+    for (tp, bytes) in a.drain() {
+        if tp.uri == b.uri {
+            late += 1;
+            let refused = b.protocol.process(&bytes).await;
+            assert!(
+                refused.is_err(),
+                "an acknowledgement reaching the departed device finds no channel"
+            );
+        }
+    }
+    assert!(
+        late > 0,
+        "the remaining member acknowledges the departing roster"
+    );
+    assert!(
+        farewell
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::ReplicaRemoved { replica_id } if *replica_id == b_id)),
+        "the remaining member drops the device that left, got {farewell:?}"
+    );
+    assert_eq!(roster_ids(&a, sid).await, vec![a_id]);
+    println!(
+        "  step 4: a device removing itself publishes the roster without it, then drops everything  ✓"
+    );
+
+    println!("Protocol replica removal flow test passed.");
+}
+
+/// A message produced by the 0.0.11 release, from
+/// `library/tests/fixtures/legacy_messages.json`: accepted while the minimum
+/// protocol version admits 0.0, and ignored unread once it is 0.1.
+async fn run_legacy_message_and_minimum_version_flow() {
+    println!("=== Protocol legacy message and minimum protocol version ===");
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../library/tests/fixtures/legacy_messages.json"
+    ))
+    .expect("legacy fixture is JSON");
+    let field = |name: &str| fixture[name].as_str().expect(name).to_owned();
+    let unhex = |s: String| -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
+    };
+    let secret_id: u64 = field("secret_id").parse().expect("secret_id");
+    let channel = ChannelId(field("channel_id").parse().expect("channel_id"));
+    let key: [u8; 32] = unhex(field("shared_key_hex"))
+        .try_into()
+        .expect("a 32-byte key");
+    let request = unhex(field("store_share_request_hex"));
+
+    let process = |floor: ProtocolVersion| {
+        let request = request.clone();
+        async move {
+            let mut helper = Peer::with_min_protocol_version(
+                "helper",
+                "https://helper.example.com",
+                secret_id,
+                floor,
+            );
+            helper
+                .protocol
+                .channel_store
+                .save(
+                    secret_id,
+                    ChannelRecord::Helper(HelperChannel {
+                        channel_id: channel,
+                        transports: vec![TransportProtocol {
+                            uri: "https://owner.example.com".to_owned(),
+                            protocol: Protocol::Https.into(),
+                        }],
+                        communication_info: HashMap::new(),
+                        status: ChannelStatus::Paired,
+                        created_at: 0,
+                        peer_role: SenderKind::Owner,
+                        weight: 1,
+                    }),
+                )
+                .await
+                .expect("seed channel");
+            helper
+                .protocol
+                .secret_store
+                .save(secret_id, channel, SecretValue::SharedKey(key))
+                .await
+                .expect("seed key");
+            helper
+                .protocol
+                .process(&request)
+                .await
+                .expect("the legacy message is processed")
+        }
+    };
+
+    let accepted = process(ProtocolVersion { major: 0, minor: 0 }).await;
+    assert!(
+        !accepted.is_empty()
+            && !accepted
+                .iter()
+                .any(|e| matches!(e, DeRecEvent::MessageIgnored { .. })),
+        "a message from 0.0.11 is accepted by default, got {accepted:?}"
+    );
+    println!("  a message from 0.0.11 is accepted by default  ✓");
+
+    let ignored = process(ProtocolVersion { major: 0, minor: 1 }).await;
+    assert!(
+        matches!(
+            ignored.as_slice(),
+            [DeRecEvent::MessageIgnored {
+                reason: IgnoreReason::ProtocolVersionTooOld,
+                ..
+            }]
+        ),
+        "a message from 0.0.11 is ignored once the minimum is 0.1, got {ignored:?}"
+    );
+    println!("  a message from 0.0.11 is ignored once the minimum is 0.1  ✓");
+
+    println!("Protocol legacy message and minimum protocol version flow test passed.");
 }
 
 /// Helper: read a channel's stored 32-byte `SharedKey`, or `None` when the
@@ -7704,6 +8331,71 @@ async fn channel_key(peer: &Peer, secret_id: u64, channel_id: ChannelId) -> Opti
         Some(SecretValue::SharedKey(k)) => Some(k),
         _ => None,
     }
+}
+
+/// Helper: publish one user secret carrying `payload`.
+async fn publish(peer: &mut Peer, payload: &[u8]) {
+    peer.protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![0x42],
+                name: "handover".to_owned(),
+                data: payload.to_vec(),
+            }],
+            description: None,
+            weights: HashMap::new(),
+            threshold: None,
+        })
+        .await
+        .expect("start(ProtectSecret) failed");
+}
+
+/// Helper: assert a peer's latest snapshot carries `payload`.
+async fn assert_holds(peer: &Peer, secret_id: u64, payload: &[u8]) {
+    let snapshot = peer
+        .protocol
+        .user_secret_store
+        .load_latest(secret_id)
+        .await
+        .expect("load_latest")
+        .expect("a snapshot is held");
+    assert!(
+        snapshot.secrets.iter().any(|us| us.data == payload),
+        "{} must hold the publish carrying {:?}",
+        peer.label,
+        String::from_utf8_lossy(payload)
+    );
+}
+
+/// Helper: the channel a peer records `replica_id` on.
+async fn member_channel(peer: &Peer, secret_id: u64, replica_id: u64) -> ChannelId {
+    peer.protocol
+        .channel_store
+        .replicas(secret_id, ReplicaFilter::default())
+        .await
+        .expect("replicas")
+        .into_iter()
+        .find(|m| m.replica_id.0 == replica_id)
+        .expect("member row")
+        .channel_id
+}
+
+/// Helper: the channel a peer recorded `replica_id` as having handed the
+/// group over on, if it is still in use.
+async fn member_handover_channel(
+    peer: &Peer,
+    secret_id: u64,
+    replica_id: u64,
+) -> Option<ChannelId> {
+    peer.protocol
+        .channel_store
+        .replicas(secret_id, ReplicaFilter::default())
+        .await
+        .expect("replicas")
+        .into_iter()
+        .find(|m| m.replica_id.0 == replica_id)
+        .expect("member row")
+        .handover_channel
 }
 
 /// Helper: load a channel's stored 32-byte `SharedKey` from a peer's
@@ -7783,6 +8475,44 @@ async fn cross_confirm_fingerprint(owner: &mut Peer, replica: &mut Peer, channel
         .verify_fingerprint(channel_id, &owner_fp)
         .await
         .expect("cross-fingerprint verification must succeed");
+    let is_helper = owner
+        .protocol
+        .channel_store
+        .load(
+            owner.protocol.secret_id(),
+            ChannelQuery::Helper { channel_id },
+        )
+        .await
+        .expect("owner channel load")
+        .is_some();
+    if !is_helper {
+        publish_after_confirming(owner).await;
+    }
+}
+
+/// What the owner's application does once both sides of a replica pairing
+/// have confirmed: publish the latest snapshot, or an empty one when there is
+/// none, so the joiner receives the vault, the roster and the group key.
+async fn publish_after_confirming(source: &mut Peer) {
+    let latest = source
+        .protocol
+        .user_secret_store
+        .load_latest(source.protocol.secret_id())
+        .await
+        .expect("source load_latest failed");
+    let (secrets, description) = latest
+        .map(|s| (s.secrets, s.description))
+        .unwrap_or_default();
+    source
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets,
+            description,
+            weights: HashMap::new(),
+            threshold: None,
+        })
+        .await
+        .expect("the application's publish after confirming failed");
 }
 
 /// Drive only the helper-side `start(Pairing { kind: Helper })`. The
@@ -8275,6 +9005,7 @@ fn seeded_member(channel_id: u64, replica_id: u64) -> ChannelRecord {
         role: ReplicaRole::Destination,
         status: ChannelStatus::Pending,
         created_at: 1_700_000_000,
+        handover_channel: None,
     })
 }
 

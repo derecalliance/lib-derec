@@ -484,6 +484,7 @@ mod tests {
                     role,
                     status: ChannelStatus::Paired,
                     created_at: 0,
+                    handover_channel: None,
                 }),
             )
             .await
@@ -944,6 +945,7 @@ mod tests {
                     role: ReplicaRole::Destination,
                     status: ChannelStatus::Pending,
                     created_at: 0,
+                    handover_channel: None,
                 }),
             )
             .await

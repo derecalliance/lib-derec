@@ -241,16 +241,37 @@ type ReplicaDiscoveryParams struct{}
 
 // UnpairReplicaParams are the parameters for FlowKindUnpairReplica.
 // ReplicaID names the member being removed — this device for a voluntary
-// departure, another for an eviction.
+// departure, another for an eviction. A ReplicaID that names no current
+// member is rejected rather than silently doing nothing.
+//
+// Start tells every member, the departing one included. Removing another
+// member drops it on this device at once, with any key only it used, and
+// emits EventTypeReplicaRemoved. Removing this device keeps its own row out of
+// the roster, then drops this device's whole secret_id partition and emits
+// EventTypeSelfRemovedFromGroup. Either way Start then publishes the latest
+// snapshot, or an empty payload when there is none, with a roster that omits
+// the member; the events of that round follow, as for
+// FlowKindProtectSecret. The application does not publish anything itself to
+// complete a removal.
+//
+// The departing member is on no distribution list from then on: it receives
+// nothing more. Every other member flags it when told and drops it, with
+// EventTypeReplicaRemoved, once that roster arrives. Absence from a roster
+// alone never removes anyone. When this device removes itself, the remaining
+// members acknowledge the publish after it has dropped the group channel;
+// Process fails those acknowledgements with an unknown-channel error, which
+// the application can disregard.
 //
 // Any member may remove any member, the source included: a lost or stolen
 // source must be removable by the devices that remain, and the library checks
 // no role. Ask the user before starting this flow, above all when it names the
 // source. Removing the source promotes the first remaining member in the order
-// ChannelStore.ListReplicas returns. The removed member is not asked and gets
-// no event when told to leave: when a roster excluding it arrives it drops its
-// whole secret_id partition and emits EventTypeSelfRemovedFromGroup. The
-// secret survives on the remaining members and the helpers.
+// ChannelStore.ListReplicas returns; removing a sole source dissolves the
+// group. The removed member is not asked: when the notice naming it arrives it
+// drops its whole secret_id partition and emits EventTypeSelfRemovedFromGroup.
+// If the notice is lost it keeps what it held, but it is sent nothing new and
+// the remaining members refuse its messages once the roster without it has
+// reached them. The secret survives on the remaining members and the helpers.
 //
 // Removal does not replace the group key, so it relies on the removed device's
 // library deleting its copy. That covers a lost or stolen device whose storage

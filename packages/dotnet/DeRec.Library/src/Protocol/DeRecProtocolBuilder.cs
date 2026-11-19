@@ -42,7 +42,8 @@ public sealed record DeRecStores(
 /// <see cref="WithAutoRespondOnFailure"/> (false),
 /// <see cref="WithUnpairAck"/> (<see cref="UnpairAck.Required"/>),
 /// <see cref="WithAutoReplyTo"/> (false), <see cref="WithReplicaId"/> (unset),
-/// <see cref="WithMaxSubshares"/> (unset, no cap).
+/// <see cref="WithMaxSubshares"/> (unset, no cap),
+/// <see cref="WithMinProtocolVersion"/> (0.0).
 /// </para>
 /// </summary>
 public sealed class DeRecProtocolBuilder
@@ -237,6 +238,29 @@ public sealed class DeRecProtocolBuilder
     }
 
     /// <summary>
+    /// The oldest protocol version whose messages this device still accepts.
+    /// A message whose envelope names an older version is reported as
+    /// <see cref="MessageIgnoredEvent"/> with
+    /// <see cref="IgnoreReason.ProtocolVersionTooOld"/>: nothing is decrypted,
+    /// stored or answered. Pairing messages are included, so a device on an
+    /// older version can no longer pair either. Default: 0.0, accepting every
+    /// version.
+    /// </summary>
+    /// <remarks>
+    /// The envelope's version is authenticated: a copy inside the encrypted
+    /// payload is checked against it, and a message whose copy differs is
+    /// ignored with <see cref="IgnoreReason.ProtocolVersionMismatch"/>. A
+    /// message from an earlier release carries no copy, which reads as 0.0.
+    /// Raising the minimum to 0.1 once every peer runs 0.1.0 or later stops
+    /// accepting older releases.
+    /// </remarks>
+    public DeRecProtocolBuilder WithMinProtocolVersion(uint major, uint minor)
+    {
+        _config = _config with { MinProtocolVersion = new ProtocolVersion(major, minor) };
+        return this;
+    }
+
+    /// <summary>
     /// Whether the unpair initiator waits for the peer's ack before
     /// dropping local state. Default: <see cref="UnpairAck.Required"/>.
     /// </summary>
@@ -390,6 +414,7 @@ public sealed class DeRecProtocolBuilder
             CommunicationInfo = config.CommunicationInfo ?? current.CommunicationInfo,
             OwnTransports = config.OwnTransports ?? current.OwnTransports,
             ReplicaId = config.ReplicaId ?? current.ReplicaId,
+            MinProtocolVersion = config.MinProtocolVersion ?? current.MinProtocolVersion,
         };
         return this;
     }
