@@ -469,7 +469,9 @@ func runDiscoveryFlow() {
 // runEnvelopeTraceID mirrors run_envelope_trace_id_test in
 // smoke-tests/rust/src/primitives.rs: the trace_id helpers round-trip a value
 // through an envelope's outer field without disturbing the encrypted inner
-// payload — Extract still succeeds after re-stamping.
+// payload — Extract still succeeds after re-stamping, and EncryptedPayload
+// reads the same bytes off the re-stamped copy and different bytes off
+// another message.
 func runEnvelopeTraceID() {
 	fmt.Println("=== Envelope trace_id helpers test ===")
 
@@ -493,6 +495,18 @@ func runEnvelopeTraceID() {
 
 	_, err = discovery.Request.Extract(stamped, sharedKey)
 	must(err, "discovery.Request.Extract on re-stamped envelope")
+
+	original, err := envelope.EncryptedPayload(result)
+	must(err, "envelope.EncryptedPayload (original)")
+	restamped, err := envelope.EncryptedPayload(stamped)
+	must(err, "envelope.EncryptedPayload (re-stamped)")
+	assertTrue(len(original) > 0 && bytes.Equal(original, restamped), "a re-stamped copy must carry the same encrypted payload")
+
+	other, err := discovery.Request.Produce(channelID, sharedKey, nil)
+	must(err, "discovery.Request.Produce (second message)")
+	otherPayload, err := envelope.EncryptedPayload(other)
+	must(err, "envelope.EncryptedPayload (second message)")
+	assertTrue(!bytes.Equal(original, otherPayload), "two messages must carry different encrypted payloads")
 
 	fmt.Println("Envelope trace_id helpers test passed.")
 }

@@ -57,7 +57,7 @@ record gains a field.
 - **Removed: `message_id`.** *(breaking; every SDK)*
 
   Detecting a message delivered more than once is the application's job
-  entirely, and the library no longer offers an identifier for it:
+  entirely, and the library no longer computes an identifier for it:
   `derec_message::message_id` is gone, with `message_id_from_envelope` (C),
   `envelope_message_id` (WASM), .NET `Envelope.ReadMessageId`, Go
   `envelope.ReadMessageID` and `envelope.message_id` (Node, web, React
@@ -68,6 +68,18 @@ record gains a field.
   encrypted `message` field, which cannot be changed without failing
   decryption and differs for every message; not on a hash of the raw
   envelope, whose `sequence` and `traceId` are not authenticated.
+  `encrypted_payload` (below) reads that field.
+
+- **Added: `encrypted_payload`.** *(every SDK)*
+
+  Reads an envelope's encrypted `message` field, without the channel key,
+  so an application can key duplicate detection on it without decoding the
+  envelope itself: `derec_message::encrypted_payload` (Rust),
+  `encrypted_payload_from_envelope` (C), `envelope_encrypted_payload`
+  (WASM), .NET `Envelope.EncryptedPayload`, Go `envelope.EncryptedPayload`
+  and `envelope.encrypted_payload` (Node, web, React Native). It returns the
+  bytes as they arrived; how to key on them, and for how long, is the
+  application's choice.
 
 - **Changed: confirming a replica device publishes nothing.**
   *(breaking; every SDK)*

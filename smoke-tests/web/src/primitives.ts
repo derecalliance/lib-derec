@@ -283,6 +283,32 @@ export function runPrimitivesSmoke(): void {
   }
   console.log(`  default=0, apply/read round-trip 0x${traceAfter.toString(16)}, extract after re-stamp  ✓`);
 
+  {
+    const sameBytes = (a: Uint8Array, b: Uint8Array): boolean =>
+      a.length === b.length && a.every((v, i) => v === b[i]);
+    const payload = envelope.encrypted_payload(traced.envelope);
+    if (payload.length === 0) {
+      throw new Error("a sealed envelope must carry an encrypted payload");
+    }
+    if (!sameBytes(envelope.encrypted_payload(stamped), payload)) {
+      throw new Error("a re-stamped copy must have the same encrypted payload");
+    }
+    const another = primitives.discovery.request.produce(42n, traceKey);
+    if (sameBytes(envelope.encrypted_payload(another.envelope), payload)) {
+      throw new Error("two messages with the same body must have different encrypted payloads");
+    }
+    let refused = false;
+    try {
+      envelope.encrypted_payload(new Uint8Array([0xff, 0xff, 0xff]));
+    } catch {
+      refused = true;
+    }
+    if (!refused) {
+      throw new Error("encrypted_payload must throw on bytes that are not an envelope");
+    }
+    console.log("  encrypted_payload: same across a re-stamped copy, differs between messages  ✓");
+  }
+
   console.log("✓ Envelope trace_id helpers passed.\n");
 
 

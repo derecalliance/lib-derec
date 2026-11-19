@@ -96,4 +96,56 @@ public static class Envelope
         ArgumentNullException.ThrowIfNull(envelope);
         return ReadTraceId(envelope.ToProtoBytes());
     }
+
+    /// <summary>
+    /// Read the encrypted <c>message</c> field off an envelope, without the
+    /// channel key.
+    /// </summary>
+    /// <remarks>
+    /// This is the part of an envelope an application can key duplicate
+    /// detection on. It cannot be changed without failing decryption, and
+    /// every message is sealed under a fresh random nonce, so it is the same
+    /// for every copy of one message and different for every other message,
+    /// even one with the same body. The cleartext fields around it
+    /// (<c>sequence</c>, <c>traceId</c>) are not authenticated, and protobuf
+    /// accepts more than one encoding of the same envelope, so a copy can
+    /// arrive as different bytes: a hash of the raw envelope does not identify
+    /// a message. How to key on these bytes (as they are, or hashed) and for
+    /// how long is the application's choice.
+    ///
+    /// The plaintext <c>PrePair</c> leg of <c>HashedKeys</c> pairing is the
+    /// exception: its <c>message</c> field is not encrypted, so a copy
+    /// re-encoded inside it reads differently. That leg is not authenticated
+    /// at all; the contact's nonce is what binds it.
+    /// </remarks>
+    /// <param name="envelope">Wire bytes of a <c>DeRecMessage</c> envelope.</param>
+    /// <returns>The envelope's <c>message</c> field, as it arrived.</returns>
+    /// <exception cref="DeRecException">Thrown if the bytes are not an envelope.</exception>
+    public static byte[] EncryptedPayload(byte[] envelope)
+    {
+        ArgumentNullException.ThrowIfNull(envelope);
+
+        Native.Envelope.EncryptedPayloadResult nativeResult =
+            Native.Envelope.encrypted_payload_from_envelope(
+                envelope,
+                (UIntPtr)envelope.Length
+            );
+
+        try
+        {
+            Utils.ThrowIfError(nativeResult.Error);
+            return Utils.CopyBuffer(nativeResult.Payload);
+        }
+        finally
+        {
+            Utils.FreeBuffer(nativeResult.Payload);
+        }
+    }
+
+    /// <inheritdoc cref="EncryptedPayload(byte[])"/>
+    public static byte[] EncryptedPayload(DeRecMessage envelope)
+    {
+        ArgumentNullException.ThrowIfNull(envelope);
+        return EncryptedPayload(envelope.ToProtoBytes());
+    }
 }

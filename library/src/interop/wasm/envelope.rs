@@ -29,3 +29,12 @@ pub fn read_trace_id(envelope_bytes: &[u8]) -> Result<u64, JsValue> {
     derec_message::read_trace_id(envelope_bytes)
         .map_err(|e| js_error("envelope_decode_error", e.to_string()))
 }
+
+/// Read the encrypted `message` field off an envelope, without the channel
+/// key: the part of an envelope the application's duplicate detection can
+/// key on. Mirrors [`derec_message::encrypted_payload`].
+#[wasm_bindgen(js_name = "envelope_encrypted_payload")]
+pub fn encrypted_payload(envelope_bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+    derec_message::encrypted_payload(envelope_bytes)
+        .map_err(|e| js_error("envelope_decode_error", e.to_string()))
+}

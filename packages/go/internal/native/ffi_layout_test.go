@@ -40,6 +40,7 @@ var layoutMirrors = []layoutMirror{
 	{"DeRecRemovedChannelsResult", reflect.TypeOf(DeRecRemovedChannelsResult{}), [][2]string{{"Error", "error"}, {"Channels", "channels"}}},
 	{"DecodeContactMessageResult", reflect.TypeOf(decodeContactMessageResult{}), [][2]string{{"Error", "error"}, {"ContactJSON", "contact_json"}}},
 	{"EncodeContactMessageResult", reflect.TypeOf(encodeContactMessageResult{}), [][2]string{{"Error", "error"}, {"WireBytes", "wire_bytes"}}},
+	{"EncryptedPayloadResult", reflect.TypeOf(encryptedPayloadResult{}), [][2]string{{"Error", "error"}, {"Payload", "payload"}}},
 	{"ExtractGetSecretIdsVersionsRequestResult", reflect.TypeOf(extractGetSecretIdsVersionsRequestResult{}), [][2]string{{"Error", "error"}, {"ChannelID", "channel_id"}, {"RequestProtoBytes", "request_proto_bytes"}}},
 	{"ExtractGetSecretIdsVersionsResponseResult", reflect.TypeOf(extractGetSecretIdsVersionsResponseResult{}), [][2]string{{"Error", "error"}, {"ChannelID", "channel_id"}, {"ResponseProtoBytes", "response_proto_bytes"}}},
 	{"ExtractGetShareRequestResult", reflect.TypeOf(extractGetShareRequestResult{}), [][2]string{{"Error", "error"}, {"ChannelID", "channel_id"}, {"RequestProtoBytes", "request_proto_bytes"}}},

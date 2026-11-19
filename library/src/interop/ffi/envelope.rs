@@ -6,12 +6,12 @@
 //! The outer `DeRecMessage` envelope is plaintext, so a handful of metadata
 //! fields can be read or rewritten without touching the encrypted inner
 //! payload: `trace_id`, the opaque correlation token described on
-//! `DeRecMessage.traceId`, and the message identity the application's
-//! replay detection keys on.
+//! `DeRecMessage.traceId`, and the encrypted `message` field the
+//! application's duplicate detection can key on.
 
 use std::slice;
 
-use crate::derec_message::{apply_trace_id, read_trace_id};
+use crate::derec_message::{apply_trace_id, encrypted_payload, read_trace_id};
 use crate::interop::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
 use crate::interop::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, success,
@@ -22,6 +22,13 @@ pub struct ApplyTraceIdResult {
     pub error: DeRecError,
     /// Re-encoded envelope bytes with `trace_id` overwritten. Empty on error.
     pub wire_bytes: DeRecBuffer,
+}
+
+#[repr(C)]
+pub struct EncryptedPayloadResult {
+    pub error: DeRecError,
+    /// The envelope's encrypted `message` field. Empty on error.
+    pub payload: DeRecBuffer,
 }
 
 #[repr(C)]
@@ -111,5 +118,45 @@ pub extern "C" fn read_trace_id_from_envelope(
             ),
             trace_id: 0,
         },
+    }
+}
+
+/// Read the encrypted `message` field off an envelope, without the channel
+/// key: the part of an envelope the application's duplicate detection can
+/// key on.
+///
+/// Mirrors [`crate::derec_message::encrypted_payload`].
+///
+/// # Safety
+///
+/// `envelope_ptr` must point to a readable byte range of length `envelope_len`.
+#[unsafe(no_mangle)]
+pub extern "C" fn encrypted_payload_from_envelope(
+    envelope_ptr: *const u8,
+    envelope_len: usize,
+) -> EncryptedPayloadResult {
+    let with_err = |error| EncryptedPayloadResult {
+        error,
+        payload: empty_buffer(),
+    };
+
+    if envelope_ptr.is_null() && envelope_len > 0 {
+        return with_err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "envelope_ptr is null"));
+    }
+    let bytes = if envelope_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(envelope_ptr, envelope_len) }
+    };
+
+    match encrypted_payload(bytes) {
+        Ok(payload) => EncryptedPayloadResult {
+            error: success(),
+            payload: vec_into_buffer(payload),
+        },
+        Err(_) => with_err(ffi_error(
+            DEREC_CODE_FFI_BAD_PROTO,
+            "failed to decode DeRecMessage envelope",
+        )),
     }
 }

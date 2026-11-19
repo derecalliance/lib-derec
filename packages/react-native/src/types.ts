@@ -756,7 +756,7 @@ export interface ProtectSecretParams {
    * (`PairingCompleted` included); `accept()` throws after the pairing has
    * completed and its response was sent, without returning
    * `PairingCompleted`; `verifyFingerprint()` throws after the promotion,
-   * which stands, and a retry resolves `true` and publishes nothing. Call
+   * which stands, and a retry resolves and publishes nothing. Call
    * `start` with `ProtectSecret` and valid weights to publish.
    *
    * When the paired helpers' resolved total is below the round's threshold

@@ -38,7 +38,8 @@
 //! The library processes a copy of a message as often as it is delivered
 //! within the inbound window. Detecting copies, of what it received and of
 //! what it sent, is the application's job; see the security note on
-//! [`crate::protocol::DeRecProtocol::process`].
+//! [`crate::protocol::DeRecProtocol::process`]. [`encrypted_payload`] reads
+//! the part of an envelope that is safe to key that detection on.
 
 use crate::{
     Error,
@@ -143,6 +144,33 @@ pub(crate) fn fresh_trace_id() -> u64 {
 pub fn read_trace_id(envelope_bytes: &[u8]) -> Result<u64, Error> {
     let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
     Ok(envelope.trace_id)
+}
+
+/// Read the encrypted `message` field off an envelope, without the channel
+/// key.
+///
+/// This is the part of an envelope an application can key duplicate
+/// detection on. It cannot be changed without failing decryption, and every
+/// message is sealed under a fresh random nonce, so it is the same for every
+/// copy of one message and different for every other message, even one with
+/// the same body. The cleartext fields around it (`sequence`, `traceId`)
+/// are not authenticated, and protobuf accepts more than one encoding of the
+/// same envelope, so a copy can arrive as different bytes: a hash of the raw
+/// envelope does not identify a message. How to key on these bytes (as they
+/// are, or hashed) and for how long is the application's choice; see the
+/// security note on [`crate::protocol::DeRecProtocol::process`].
+///
+/// The plaintext `PrePair` leg of `HashedKeys` pairing is the exception: its
+/// `message` field is not encrypted, so a copy re-encoded inside it reads
+/// differently. That leg is not authenticated at all; the contact's nonce is
+/// what binds it.
+///
+/// # Errors
+///
+/// [`Error::ProtobufDecode`] when the bytes are not an envelope.
+pub fn encrypted_payload(envelope_bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
+    Ok(envelope.message)
 }
 
 /// Decrypt and decode a pairing envelope's payload, returning the protocol

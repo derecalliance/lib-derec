@@ -732,7 +732,7 @@ export interface ProtectSecretParams {
    * (`PairingCompleted` included); `accept()` throws after the pairing has
    * completed and its response was sent, without returning
    * `PairingCompleted`; `verifyFingerprint()` throws after the promotion,
-   * which stands, and a retry resolves `true` and publishes nothing. Call
+   * which stands, and a retry resolves and publishes nothing. Call
    * `start` with `ProtectSecret` and valid weights to publish.
    *
    * When the paired helpers' resolved total is below the round's threshold
@@ -2188,6 +2188,29 @@ export declare const envelope: {
    * protobuf default is indistinguishable from an explicit zero).
    */
   read_trace_id(envelope_bytes: Uint8Array): bigint;
+
+  /**
+   * Read the encrypted `message` field off an envelope, without the channel
+   * key: the part of an envelope an application can key duplicate detection
+   * on.
+   *
+   * It cannot be changed without failing decryption, and every message is
+   * sealed under a fresh random nonce, so it is the same for every copy of
+   * one message and different for every other message, even one with the
+   * same body. The cleartext fields around it (`sequence`, `traceId`) are
+   * not authenticated, and protobuf accepts more than one encoding of the
+   * same envelope, so a copy can arrive as different bytes: a hash of the
+   * raw envelope does not identify a message. How to key on these bytes (as
+   * they are, or hashed) and for how long is the application's choice.
+   *
+   * The plaintext `PrePair` leg of `HashedKeys` pairing is the exception: its
+   * `message` field is not encrypted, so a copy re-encoded inside it reads
+   * differently. That leg is not authenticated at all; the contact's nonce
+   * is what binds it.
+   *
+   * Throws when the bytes are not an envelope.
+   */
+  encrypted_payload(envelope_bytes: Uint8Array): Uint8Array;
 };
 
 export interface Timestamp {

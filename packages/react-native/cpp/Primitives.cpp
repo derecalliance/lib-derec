@@ -375,6 +375,22 @@ jsi::Value readTraceId(jsi::Runtime& rt,
   return jsi::Value(rt, jsi::BigInt::fromUint64(rt, result.trace_id));
 }
 
+/// `encrypted_payload_from_envelope(envelope: ArrayBuffer) -> ArrayBuffer`
+jsi::Value encryptedPayload(jsi::Runtime& rt,
+                            const jsi::Value&,
+                            const jsi::Value* args,
+                            size_t count) {
+  requireArgs(rt, "encrypted_payload_from_envelope", count, 1);
+  ByteView envelope = asBytes(rt, args[0]);
+  EncryptedPayloadResult result =
+      encrypted_payload_from_envelope(envelope.ptr, envelope.len);
+  if (result.error.code != 0) {
+    throwDeRecError(rt, result.error);
+  }
+  std::vector<uint8_t> bytes = takeBuffer(result.payload);
+  return toArrayBuffer(rt, bytes.data(), bytes.size());
+}
+
 /// `version() -> { major: number, minor: number }` — the protocol version the
 /// core writes into every envelope it produces.
 jsi::Value protocolVersion(jsi::Runtime& rt,
@@ -1385,6 +1401,7 @@ void installPrimitives(jsi::Runtime& rt, jsi::Object& host) {
        processGetSecretIdsVersionsResponseMessage);
   bind(rt, host, "apply_trace_id_to_envelope", 2, applyTraceId);
   bind(rt, host, "read_trace_id_from_envelope", 1, readTraceId);
+  bind(rt, host, "encrypted_payload_from_envelope", 1, encryptedPayload);
   bind(rt, host, "create_contact_message", 5, createContactMessage);
   bind(rt, host, "encode_contact_message", 1, encodeContactMessage);
   bind(rt, host, "decode_contact_message", 1, decodeContactMessage);

@@ -319,8 +319,9 @@ async fn drop_channel<S: StoreSet>(
 
 /// Handle an inbound `UnpairRequest` that names a group member.
 ///
-/// Flags the row and nothing more. Teardown waits for the completing roster —
-/// the second half of the safety rule.
+/// A notice naming this device tears it down at once, since nothing more is
+/// sent to it. A notice naming another member flags that member's row; the
+/// member is dropped when the roster without it arrives.
 async fn on_request<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,

@@ -459,3 +459,66 @@ mod payload_version {
         ));
     }
 }
+
+mod encrypted_payload {
+    use super::*;
+    use crate::derec_message::{apply_trace_id, encrypted_payload};
+    use crate::types::ChannelId;
+    use derec_proto::UnpairRequestMessage;
+
+    const KEY: [u8; 32] = [7; 32];
+
+    fn sealed() -> DeRecMessage {
+        DeRecMessageBuilder::channel()
+            .channel_id(ChannelId(9))
+            .timestamp(current_timestamp())
+            .message_body(MessageBody::UnpairRequest(UnpairRequestMessage::default()))
+            .encrypt(&KEY)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn it_is_the_envelopes_encrypted_message_field() {
+        let envelope = sealed();
+        assert_eq!(
+            encrypted_payload(&envelope.encode_to_vec()).unwrap(),
+            envelope.message
+        );
+    }
+
+    /// The unauthenticated cleartext fields do not change it.
+    #[test]
+    fn a_restamped_copy_has_the_same_encrypted_payload() {
+        let envelope = sealed();
+        let bytes = envelope.encode_to_vec();
+        let mut copy =
+            DeRecMessage::decode(apply_trace_id(&bytes, 42).unwrap().as_slice()).unwrap();
+        copy.sequence += 1;
+        let copy = copy.encode_to_vec();
+        assert_ne!(copy, bytes);
+        assert_eq!(
+            encrypted_payload(&copy).unwrap(),
+            encrypted_payload(&bytes).unwrap()
+        );
+    }
+
+    /// Every message is sealed under a fresh nonce, so two messages with the
+    /// same body differ.
+    #[test]
+    fn two_messages_with_the_same_body_differ() {
+        assert_ne!(
+            encrypted_payload(&sealed().encode_to_vec()).unwrap(),
+            encrypted_payload(&sealed().encode_to_vec()).unwrap()
+        );
+    }
+
+    #[test]
+    fn bytes_that_are_not_an_envelope_are_refused() {
+        assert!(matches!(
+            encrypted_payload(&[0xff, 0xff, 0xff]),
+            Err(Error::ProtobufDecode(_))
+        ));
+    }
+}

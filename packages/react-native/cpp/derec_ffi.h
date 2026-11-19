@@ -583,6 +583,14 @@ typedef struct ReadTraceIdResult {
   uint64_t trace_id;
 } ReadTraceIdResult;
 
+typedef struct EncryptedPayloadResult {
+  struct DeRecError error;
+  /**
+   * The envelope's encrypted `message` field. Empty on error.
+   */
+  struct DeRecBuffer payload;
+} EncryptedPayloadResult;
+
 /**
  * Result of a message JSON codec call. `bytes` is UTF-8 JSON for
  * [`derec_decode_message_json`] and protobuf wire bytes for
@@ -1454,6 +1462,20 @@ struct ApplyTraceIdResult apply_trace_id_to_envelope(const uint8_t *envelope_ptr
  */
 struct ReadTraceIdResult read_trace_id_from_envelope(const uint8_t *envelope_ptr,
                                                      size_t envelope_len);
+
+/**
+ * Read the encrypted `message` field off an envelope, without the channel
+ * key: the part of an envelope the application's duplicate detection can
+ * key on.
+ *
+ * Mirrors [`crate::derec_message::encrypted_payload`].
+ *
+ * # Safety
+ *
+ * `envelope_ptr` must point to a readable byte range of length `envelope_len`.
+ */
+struct EncryptedPayloadResult encrypted_payload_from_envelope(const uint8_t *envelope_ptr,
+                                                              size_t envelope_len);
 
 /**
  * Releases the owned strings carried by a [`DeRecError`]. After

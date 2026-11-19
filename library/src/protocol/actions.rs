@@ -469,8 +469,9 @@ impl<
 
     /// Auto-publish the cached secret if `events` contain a
     /// helper-side `PairingCompleted` (the freshly-paired Helper needs
-    /// shares). The replica-side equivalent fires from
-    /// `verify_fingerprint` once the channel leaves `Pending`.
+    /// shares). Confirming a replica pairing publishes nothing: releasing
+    /// the vault and the group key to the new device is the application's
+    /// call.
     ///
     /// The completion event is not on its own enough: a `NoKeys` pairing
     /// completes into `ChannelStatus::Pending` and is not a publish target

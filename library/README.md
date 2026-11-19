@@ -685,6 +685,8 @@ are worth knowing when choosing:
   under a fresh random nonce. `sequence` and `traceId` are not
   authenticated, and an envelope can be re-encoded, so a copy can arrive as
   different bytes: a hash of the raw envelope does not identify a message.
+  `derec_message::encrypted_payload(envelope)` reads that field, without
+  the channel key, in every SDK.
 - A copy can arrive for as long as the inbound window lasts, measured from
   the later of its arrival and its envelope `timestamp` (a message stamped
   ahead of this device's clock stays inside the window until that time has
@@ -1670,7 +1672,8 @@ before anything is sent, through
 [`DeRecShareStore::keep_version`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html#tymethod.keep_version)`(secret_id, version)`,
 where `version` is the version about to be distributed. Every round asks,
 whether the application started it with `ProtectSecret` or the library did
-(the pair-completion and fingerprint-confirmation publishes), and every
+(the pair-completion publish, and the publish when a `NoKeys` helper's
+fingerprint is confirmed), and every
 helper in the round receives the same answer. An answer equal to or greater
 than `version` fails the round with `SharingError::InvalidKeepVersion`
 (`invalid_keep_version`, code 67) before anything is sent; a helper that
@@ -2712,11 +2715,12 @@ Until a device confirms, it ignores everything the peer sends on that
 channel: `process` changes no store, sends nothing back, and returns
 `DeRecEvent::MessageIgnored { channel_id, reason:
 IgnoreReason::PendingVerification, trace_id }`. This matters most for a
-replica destination. The source's own confirmation publishes the vault
-immediately, so that copy usually arrives before the destination's user has
-confirmed. Confirming does not replay it: once the destination's
-`verify_fingerprint` succeeds, call `start(DeRecFlow::ReplicaDiscovery)` to
-pull the copy from the source.
+replica destination. Confirming publishes nothing on either device: the
+source's application calls `start(DeRecFlow::ProtectSecret)` once it knows
+both devices have confirmed. A copy that arrives before the destination's
+user has confirmed is ignored, and confirming does not replay it: once the
+destination's `verify_fingerprint` succeeds, call
+`start(DeRecFlow::ReplicaDiscovery)` to pull the copy from the source.
 
 Until a device confirms a member, that member is not part of the group as
 far as the device is concerned. It is left out of every roster the device

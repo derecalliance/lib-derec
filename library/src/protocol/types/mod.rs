@@ -956,15 +956,17 @@ pub struct ChannelShare {
 /// inside the encrypted payload **only** when the sender knows the
 /// receiver doesn't have it yet — i.e. on the first round to a newly
 /// paired Destination. That round travels on the ephemeral pairing
-/// channel under the pairing key, and both sides then leave that channel
-/// for the group channel:
+/// channel under the pairing key, and both sides leave that channel for
+/// the group channel only once the other side is known to be there:
 ///
-/// - **Sender**: moves the joiner's member row onto the group channel and
-///   drops the ephemeral channel's key as soon as the request is sent, so
-///   every later message to the joiner uses the group channel, whether or
-///   not its acknowledgement ever arrives.
+/// - **Sender**: keeps the joiner on the pairing channel, and the pairing
+///   key, until the joiner answers on the group channel, so a copy sent
+///   before the joiner confirmed, or whose acknowledgement was lost, can
+///   be sent again.
 /// - **Receiver**: hydrates onto the group channel, acknowledges there
-///   under the group key, and drops the ephemeral channel's key.
+///   under the group key, and records the pairing channel as its member
+///   row's `handover_channel`, so copies still arriving there are read. It
+///   drops the pairing key once the sender reaches it on the group channel.
 ///
 /// On the first-ever replica pair, the group key is implicitly the
 /// pair-handshake key — `shared_key` is left empty, no swap happens,

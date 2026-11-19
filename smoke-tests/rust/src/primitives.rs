@@ -2,7 +2,7 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::Error;
-use derec_library::derec_message::{apply_trace_id, read_trace_id};
+use derec_library::derec_message::{apply_trace_id, encrypted_payload, read_trace_id};
 use derec_library::primitives::discovery::{
     request as disc_request,
     response::{self as disc_response, SecretVersionEntry, VersionEntry},
@@ -902,6 +902,29 @@ fn run_envelope_trace_id_test() {
     let extracted = disc_request::extract(&stamped, &shared_key)
         .expect("extract on re-stamped envelope failed");
     assert!(extracted.request.timestamp.is_some());
+
+    let payload = encrypted_payload(&result.envelope).expect("encrypted_payload failed");
+    assert!(
+        !payload.is_empty(),
+        "a sealed envelope carries an encrypted payload"
+    );
+    assert_eq!(
+        encrypted_payload(&stamped).expect("encrypted_payload failed"),
+        payload,
+        "a re-stamped copy has the same encrypted payload"
+    );
+    let another =
+        disc_request::produce(channel_id, &shared_key, &[]).expect("disc_request::produce failed");
+    assert_ne!(
+        encrypted_payload(&another.envelope).expect("encrypted_payload failed"),
+        payload,
+        "two messages with the same body differ"
+    );
+    assert!(
+        encrypted_payload(&[0xff, 0xff, 0xff]).is_err(),
+        "bytes that are not an envelope are refused"
+    );
+    println!("  encrypted_payload: same across a re-stamped copy, differs between messages  ✓");
 
     println!("Envelope trace_id helpers test passed.");
 }

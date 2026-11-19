@@ -246,8 +246,9 @@ replays and reflections is the app's job, since the app owns the transport,
 and how it does so is its choice. `sequence` is not a replay counter. If the
 app does detect duplicates, key on the envelope's encrypted `message` field:
 it cannot be changed without failing decryption and differs for every
-message, since each is sealed under a fresh random nonce. Never key on a hash
-of the raw envelope: `sequence` and `traceId` are not authenticated and an
+message, since each is sealed under a fresh random nonce;
+`envelope.encrypted_payload` reads that field. Never key on a hash of the raw
+envelope: `sequence` and `traceId` are not authenticated and an
 envelope can be re-encoded, so a copy can arrive as different bytes. Keep each
 key for the inbound window measured from the later of the envelope's arrival
 (or send) and its `timestamp`, and keep the record across restarts. A sender
@@ -590,7 +591,7 @@ case nothing is sent:
 - `accept()` throws. The pairing has completed and its response was sent,
   but `PairingCompleted` is not returned.
 - `verifyFingerprint()` throws. The promotion stands: calling it again
-  resolves `true` and publishes nothing.
+  resolves and publishes nothing.
 
 Call `start` with `ProtectSecret` and valid weights to publish to every
 helper.

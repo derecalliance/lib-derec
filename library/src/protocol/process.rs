@@ -112,7 +112,9 @@ impl<
     /// again. Both ends of a channel encrypt under one key, so a message this
     /// device sent, delivered back to it, decrypts too. Detecting both is the
     /// **application's** job, and how is its choice. One that keys on the
-    /// envelope's encrypted `message` field gets a key that cannot be changed
+    /// envelope's encrypted `message` field
+    /// ([`crate::derec_message::encrypted_payload`] reads it) gets a key that
+    /// cannot be changed
     /// without failing decryption, and that differs for every message, since
     /// each is sealed under a fresh nonce; a hash of the raw envelope does
     /// not work, because `sequence` and `traceId` are not authenticated and a

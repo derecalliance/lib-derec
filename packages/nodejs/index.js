@@ -114,6 +114,7 @@ const primitives = {
 const envelope = {
   apply_trace_id: wasm.envelope_apply_trace_id,
   read_trace_id: wasm.envelope_read_trace_id,
+  encrypted_payload: wasm.envelope_encrypted_payload,
 };
 
 /**

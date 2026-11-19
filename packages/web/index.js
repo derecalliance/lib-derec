@@ -8,6 +8,7 @@ import {
   DeRecProtocolBuilder as DeRecProtocolBuilderImpl,
   envelope_apply_trace_id,
   envelope_read_trace_id,
+  envelope_encrypted_payload,
   protocol_version as protocolVersionImpl,
   generate_replica_id as generateReplicaIdImpl,
   shareStoreRefusal as shareStoreRefusalImpl,
@@ -88,6 +89,7 @@ export function singleEndpointTransport(dialer) {
 export const envelope = {
   apply_trace_id: envelope_apply_trace_id,
   read_trace_id: envelope_read_trace_id,
+  encrypted_payload: envelope_encrypted_payload,
 };
 
 export const DeRecProtocol = DeRecProtocolWasm;
