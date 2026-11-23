@@ -153,6 +153,7 @@ impl Rig {
                     role,
                     status,
                     created_at: now_secs(),
+                    handover_channel: None,
                 }),
             )
             .await
@@ -1301,6 +1302,7 @@ async fn failing_handover(rig: &Rig, respond: bool) -> Vec<DeRecEvent> {
                 role: ReplicaRole::Source,
                 status: ChannelStatus::Paired,
                 created_at: now_secs(),
+                handover_channel: None,
             }),
         )
         .await

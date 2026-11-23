@@ -4,7 +4,7 @@
 use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::{
     Error,
-    derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
+    derec_message::{DeRecMessageBuilder, current_timestamp, open_channel_message},
     primitives::unpairing::UnpairingError,
     types::{ChannelId, ChannelKey, SharedKey},
     utils::verify_timestamps,
@@ -139,7 +139,7 @@ pub fn produce(channel_id: ChannelId, channel_key: &ChannelKey) -> Result<Produc
 pub fn extract(envelope_bytes: &[u8], shared_key: &SharedKey) -> Result<ExtractResult, Error> {
     let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
-    let response = match extract_inner_message(&envelope.message, shared_key)? {
+    let response = match open_channel_message(&envelope, shared_key)? {
         MessageBody::UnpairResponse(message) => message,
         _ => {
             #[cfg(feature = "logging")]

@@ -91,6 +91,33 @@ pub(crate) fn verify_timestamps(
     }
 }
 
+/// Check that a payload's copy of the protocol version equals its
+/// envelope's.
+///
+/// The envelope's version is cleartext; the copy travels in the encrypted,
+/// authenticated payload. Equality is what makes the envelope's version
+/// impossible to change undetected. A payload from a release that writes no
+/// version reads as 0.0, the version such a release puts on its envelope.
+pub(crate) fn verify_protocol_version(
+    envelope: &derec_proto::DeRecMessage,
+    payload_version: (u32, u32),
+) -> Result<(), Error> {
+    if (
+        envelope.protocol_version_major,
+        envelope.protocol_version_minor,
+    ) == payload_version
+    {
+        return Ok(());
+    }
+
+    #[cfg(feature = "logging")]
+    tracing::warn!("protocol version invariant violated");
+
+    Err(Error::Invariant(
+        "Envelope protocol version does not match the request/response protocol version",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

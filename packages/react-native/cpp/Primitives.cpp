@@ -383,24 +383,20 @@ jsi::Value readTraceId(jsi::Runtime& rt,
   return jsi::Value(rt, jsi::BigInt::fromUint64(rt, result.trace_id));
 }
 
-/// `message_id_from_envelope(envelope: ArrayBuffer)
-///   -> { id: ArrayBuffer, timestamp: bigint }`
-jsi::Value messageId(jsi::Runtime& rt,
-                     const jsi::Value&,
-                     const jsi::Value* args,
-                     size_t count) {
-  requireArgs(rt, "message_id_from_envelope", count, 1);
+/// `encrypted_payload_from_envelope(envelope: ArrayBuffer) -> ArrayBuffer`
+jsi::Value encryptedPayload(jsi::Runtime& rt,
+                            const jsi::Value&,
+                            const jsi::Value* args,
+                            size_t count) {
+  requireArgs(rt, "encrypted_payload_from_envelope", count, 1);
   ByteView envelope = asBytes(rt, args[0]);
-  MessageIdResult result = message_id_from_envelope(envelope.ptr, envelope.len);
+  EncryptedPayloadResult result =
+      encrypted_payload_from_envelope(envelope.ptr, envelope.len);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
-  std::vector<uint8_t> id = takeBuffer(result.id);
-  auto payload = jsi::Object(rt);
-  payload.setProperty(rt, "id", toArrayBuffer(rt, id.data(), id.size()));
-  payload.setProperty(rt, "timestamp",
-                      jsi::BigInt::fromUint64(rt, result.timestamp));
-  return payload;
+  std::vector<uint8_t> bytes = takeBuffer(result.payload);
+  return toArrayBuffer(rt, bytes.data(), bytes.size());
 }
 
 /// `read_sequence_from_envelope(envelope: ArrayBuffer) -> number` — the epoch
@@ -1468,7 +1464,7 @@ void installPrimitives(jsi::Runtime& rt, jsi::Object& host) {
        processGetSecretIdsVersionsResponseMessage);
   bind(rt, host, "apply_trace_id_to_envelope", 2, applyTraceId);
   bind(rt, host, "read_trace_id_from_envelope", 1, readTraceId);
-  bind(rt, host, "message_id_from_envelope", 1, messageId);
+  bind(rt, host, "encrypted_payload_from_envelope", 1, encryptedPayload);
   bind(rt, host, "read_sequence_from_envelope", 1, readSequence);
   bind(rt, host, "derive_channel_key", 3, deriveChannelKey);
   bind(rt, host, "create_contact_message", 5, createContactMessage);

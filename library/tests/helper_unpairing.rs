@@ -473,6 +473,7 @@ fn a_timed_out_unpair_republishes_from_tick() {
                 StateItem::PendingUnpair {
                     channel_id: C,
                     started_at: 0,
+                    drop_on_rejection: false,
                 },
             )
             .await
@@ -524,5 +525,56 @@ fn removing_a_helper_that_holds_no_share_publishes_nothing() {
         let events = owner.start(unpair(C)).await.expect("unpair completes");
         assert!(published_to(&events).is_empty(), "got {events:?}");
         assert_eq!(rig.latest_version().await, Some(1));
+    });
+}
+
+/// A recovery helper that refuses the unpair after a restore loses its
+/// recovery channel all the same. Returning the channel to `Paired` would give
+/// that helper two channels into every later publish, and so two shares of
+/// each split.
+#[test]
+fn a_recovery_helper_that_refuses_the_unpair_still_loses_its_channel() {
+    run_async(async {
+        let rig = Rig::default();
+        rig.seed_helper(C, ChannelStatus::Paired).await;
+        let mut owner = rig.build();
+
+        let helper = |channel_id: ChannelId| HelperInfo {
+            channel_id: channel_id.0,
+            transports: vec![endpoint(channel_id)],
+            shared_key: key(channel_id).as_bytes().to_vec(),
+            communication_info: HashMap::new(),
+            weight: 1,
+            key_epoch: 0,
+        };
+        let secret = Secret {
+            helpers: vec![helper(A), helper(B)],
+            secrets: Vec::new(),
+            replicas: None,
+            threshold: Some(2),
+        };
+        owner
+            .restore(&secret, 1, 1)
+            .await
+            .expect("restore succeeds");
+
+        let events = owner
+            .process(&unpair_answer(C, StatusEnum::Rejected))
+            .await
+            .expect("a rejection is an event");
+        let rejected = events.iter().position(
+            |e| matches!(e, DeRecEvent::UnpairRejected { channel_id, .. } if *channel_id == C),
+        );
+        let unpaired = events
+            .iter()
+            .position(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == C));
+        assert!(
+            matches!((rejected, unpaired), (Some(r), Some(u)) if r < u),
+            "the refusal is reported, then the channel is dropped: got {events:?}"
+        );
+        assert_eq!(rig.status(C).await, None, "the recovery channel is gone");
+
+        let events = owner.start(protect_secret()).await.expect("publish starts");
+        assert_eq!(published_to(&events), vec![A, B], "got {events:?}");
     });
 }

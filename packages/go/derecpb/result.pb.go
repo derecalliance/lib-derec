@@ -75,9 +75,10 @@ const (
 	// - incorrect key material
 	// - corrupted ciphertext
 	StatusEnum_DECRYPTION_FAILED StatusEnum = 7
-	// The message signature or authentication could not be verified.
+	// A share does not verify against its Merkle commitment.
 	//
-	// This indicates that the message integrity or authenticity check failed.
+	// Sent in answer to a share whose subshares and Merkle path do not
+	// reproduce the commitment it carries.
 	StatusEnum_VERIFICATION_FAILED StatusEnum = 8
 	// The message format is invalid.
 	//

@@ -353,35 +353,13 @@ mod sharing_round_outcome {
 
     /// Rounds that complete in the same pass close together: one read of
     /// their weights and one removal of their rows. They are reported in
-    /// version order, and a departing member both let go is reported once,
-    /// by the first.
+    /// version order.
     #[test]
     fn rounds_completing_together_close_in_one_pass() {
         run_async(async {
             let mut protocol = build(2);
             seed_round(&mut protocol, 8, &[9002], &[1003]).await;
             seed_round(&mut protocol, 7, &[9001], &[1003]).await;
-            protocol
-                .channel_store
-                .save(
-                    SECRET_ID,
-                    crate::protocol::types::ChannelRecord::Replica(
-                        crate::protocol::types::ReplicaMember {
-                            channel_id: ChannelId(5001),
-                            replica_id: ReplicaId(1003),
-                            transports: vec![derec_proto::TransportProtocol {
-                                uri: "https://peer.example".to_owned(),
-                                protocol: derec_proto::Protocol::Https as i32,
-                            }],
-                            communication_info: std::collections::HashMap::new(),
-                            role: crate::protocol::types::ReplicaRole::Destination,
-                            status: crate::protocol::types::ChannelStatus::Unpairing,
-                            created_at: 0,
-                        },
-                    ),
-                )
-                .await
-                .expect("seed member");
 
             let mut events = Vec::new();
             for (channel, version) in [(9001u64, 7u32), (9002, 8)] {
@@ -409,13 +387,10 @@ mod sharing_round_outcome {
                     DeRecEvent::SharingComplete { version, .. } => {
                         Some(format!("complete v{version}"))
                     }
-                    DeRecEvent::ReplicaRemoved { replica_id } => {
-                        Some(format!("removed {replica_id}"))
-                    }
                     _ => None,
                 })
                 .collect();
-            assert_eq!(reported, ["complete v7", "removed 1003", "complete v8"]);
+            assert_eq!(reported, ["complete v7", "complete v8"]);
             assert_eq!(*protocol.share_store.load_many_calls.lock().unwrap(), 1);
             assert_eq!(*protocol.state_store.remove_many_calls.lock().unwrap(), 1);
             for version in [7u32, 8] {
@@ -451,6 +426,7 @@ mod sharing_round_outcome {
                     StateItem::PendingUnpair {
                         channel_id: ChannelId(4242),
                         started_at: now_secs().saturating_sub(600),
+                        drop_on_rejection: false,
                     },
                 )
                 .await
@@ -492,6 +468,7 @@ mod sharing_round_outcome {
                 StateItem::PendingUnpair {
                     channel_id: channel,
                     started_at: now_secs().saturating_sub(600),
+                    drop_on_rejection: false,
                 },
             )
             .await
@@ -620,6 +597,7 @@ mod sharing_round_outcome {
                     StateItem::PendingUnpair {
                         channel_id: ChannelId(4242),
                         started_at: now_secs(),
+                        drop_on_rejection: false,
                     },
                 )
                 .await
@@ -732,259 +710,6 @@ mod sharing_round_outcome {
                     .expect("load")
                     .is_some(),
                 "the round is still in flight"
-            );
-        });
-    }
-
-    /// The publisher drops a departing member's row once that member has
-    /// acknowledged the version excluding it.
-    ///
-    /// Reconciliation normally runs when a roster *arrives*, but the device
-    /// that ran the removal never receives the roster it just sent. Without a
-    /// publisher-side pass it would keep the flagged row forever and keep
-    /// addressing a member that has already torn itself down — the removal
-    /// would converge everywhere except on the device that ordered it.
-    #[test]
-    fn the_publisher_drops_a_departing_member_once_it_acknowledges() {
-        run_async(async {
-            let mut protocol = build(2);
-            seed_round(&mut protocol, 7, &[9001], &[1002, 1003]).await;
-
-            for (id, status) in [
-                (1002u64, crate::protocol::types::ChannelStatus::Paired),
-                (1003, crate::protocol::types::ChannelStatus::Unpairing),
-            ] {
-                protocol
-                    .channel_store
-                    .save(
-                        SECRET_ID,
-                        crate::protocol::types::ChannelRecord::Replica(
-                            crate::protocol::types::ReplicaMember {
-                                channel_id: ChannelId(5001),
-                                replica_id: ReplicaId(id),
-                                transports: vec![derec_proto::TransportProtocol {
-                                    uri: "https://peer.example".to_owned(),
-                                    protocol: derec_proto::Protocol::Https as i32,
-                                }],
-                                communication_info: std::collections::HashMap::new(),
-                                role: crate::protocol::types::ReplicaRole::Destination,
-                                status,
-                                created_at: 0,
-                            },
-                        ),
-                    )
-                    .await
-                    .expect("seed member");
-            }
-
-            let mut events = vec![
-                DeRecEvent::ShareConfirmed {
-                    channel_id: ChannelId(9001),
-                    version: 7,
-                },
-                DeRecEvent::ReplicaSecretAcked {
-                    channel_id: ChannelId(5001),
-                    from_replica_id: 1002,
-                    secret_id: SECRET_ID,
-                    version: 7,
-                    status: 0,
-                    memo: String::new(),
-                },
-                DeRecEvent::ReplicaSecretAcked {
-                    channel_id: ChannelId(5001),
-                    from_replica_id: 1003,
-                    secret_id: SECRET_ID,
-                    version: 7,
-                    status: 0,
-                    memo: String::new(),
-                },
-            ];
-            protocol
-                .update_sharing_round(&mut events)
-                .await
-                .expect("the rounds are settled");
-
-            let remaining: Vec<u64> = protocol
-                .channel_store
-                .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
-                .await
-                .expect("roster")
-                .into_iter()
-                .map(|m| m.replica_id.0)
-                .collect();
-            assert_eq!(
-                remaining,
-                vec![1002],
-                "the acknowledged departing member is gone; the other survives"
-            );
-            assert!(
-                events.iter().any(|e| matches!(
-                    e,
-                    DeRecEvent::ReplicaRemoved { replica_id } if *replica_id == 1003
-                )),
-                "the removal is reported to the application; got {events:?}"
-            );
-        });
-    }
-
-    /// The departed members' rows go in one call, so a store failure removes
-    /// none of them. The round is then kept rather than completed, and the
-    /// next call completes it and reports both departures.
-    #[test]
-    fn a_failed_member_removal_keeps_the_round_for_a_later_call() {
-        run_async(async {
-            let mut protocol = build(2);
-            seed_round(&mut protocol, 7, &[9001], &[1002, 1003]).await;
-            for id in [1002u64, 1003] {
-                protocol
-                    .channel_store
-                    .save(
-                        SECRET_ID,
-                        crate::protocol::types::ChannelRecord::Replica(
-                            crate::protocol::types::ReplicaMember {
-                                channel_id: ChannelId(5001),
-                                replica_id: ReplicaId(id),
-                                transports: vec![derec_proto::TransportProtocol {
-                                    uri: "https://peer.example".to_owned(),
-                                    protocol: derec_proto::Protocol::Https as i32,
-                                }],
-                                communication_info: std::collections::HashMap::new(),
-                                role: crate::protocol::types::ReplicaRole::Destination,
-                                status: crate::protocol::types::ChannelStatus::Unpairing,
-                                created_at: 0,
-                            },
-                        ),
-                    )
-                    .await
-                    .expect("seed member");
-            }
-            *protocol.channel_store.fail_remove_many.lock().unwrap() = true;
-
-            let mut events = vec![DeRecEvent::ShareConfirmed {
-                channel_id: ChannelId(9001),
-                version: 7,
-            }];
-            for id in [1002u64, 1003] {
-                events.push(DeRecEvent::ReplicaSecretAcked {
-                    channel_id: ChannelId(5001),
-                    from_replica_id: id,
-                    secret_id: SECRET_ID,
-                    version: 7,
-                    status: 0,
-                    memo: String::new(),
-                });
-            }
-            protocol
-                .update_sharing_round(&mut events)
-                .await
-                .expect("the rounds are settled");
-
-            assert!(
-                !events.iter().any(|e| matches!(
-                    e,
-                    DeRecEvent::SharingComplete { .. } | DeRecEvent::ReplicaRemoved { .. }
-                )),
-                "the round does not complete while its departures cannot be removed; got {events:?}"
-            );
-            assert_eq!(protocol.channel_store.member_rows.lock().unwrap().len(), 2);
-
-            *protocol.channel_store.fail_remove_many.lock().unwrap() = false;
-            let mut events = Vec::new();
-            protocol
-                .update_sharing_round(&mut events)
-                .await
-                .expect("the rounds are settled");
-
-            assert!(
-                events
-                    .iter()
-                    .any(|e| matches!(e, DeRecEvent::SharingComplete { version: 7, .. })),
-                "the kept round completes on the next call; got {events:?}"
-            );
-            let mut removed: Vec<u64> = events
-                .iter()
-                .filter_map(|e| match e {
-                    DeRecEvent::ReplicaRemoved { replica_id } => Some(*replica_id),
-                    _ => None,
-                })
-                .collect();
-            removed.sort_unstable();
-            assert_eq!(removed, vec![1002, 1003]);
-            assert!(
-                protocol
-                    .channel_store
-                    .member_rows
-                    .lock()
-                    .unwrap()
-                    .is_empty()
-            );
-        });
-    }
-
-    /// A member flagged as leaving that has **not** acknowledged keeps its row.
-    ///
-    /// Its departure is not complete until it has seen the excluding version,
-    /// and dropping it early would stop the publisher addressing the very
-    /// member it still needs to reach.
-    #[test]
-    fn a_departing_member_that_has_not_answered_is_kept() {
-        run_async(async {
-            let mut protocol = build(2);
-            seed_round(&mut protocol, 7, &[9001], &[1002]).await;
-
-            protocol
-                .channel_store
-                .save(
-                    SECRET_ID,
-                    crate::protocol::types::ChannelRecord::Replica(
-                        crate::protocol::types::ReplicaMember {
-                            channel_id: ChannelId(5001),
-                            replica_id: ReplicaId(1003),
-                            transports: vec![derec_proto::TransportProtocol {
-                                uri: "https://peer.example".to_owned(),
-                                protocol: derec_proto::Protocol::Https as i32,
-                            }],
-                            communication_info: std::collections::HashMap::new(),
-                            role: crate::protocol::types::ReplicaRole::Destination,
-                            status: crate::protocol::types::ChannelStatus::Unpairing,
-                            created_at: 0,
-                        },
-                    ),
-                )
-                .await
-                .expect("seed member");
-
-            let mut events = vec![
-                DeRecEvent::ShareConfirmed {
-                    channel_id: ChannelId(9001),
-                    version: 7,
-                },
-                DeRecEvent::ReplicaSecretAcked {
-                    channel_id: ChannelId(5001),
-                    from_replica_id: 1002,
-                    secret_id: SECRET_ID,
-                    version: 7,
-                    status: 0,
-                    memo: String::new(),
-                },
-            ];
-            protocol
-                .update_sharing_round(&mut events)
-                .await
-                .expect("the rounds are settled");
-
-            let remaining: Vec<u64> = protocol
-                .channel_store
-                .replicas(SECRET_ID, crate::protocol::types::ReplicaFilter::default())
-                .await
-                .expect("roster")
-                .into_iter()
-                .map(|m| m.replica_id.0)
-                .collect();
-            assert_eq!(
-                remaining,
-                vec![1003],
-                "an unacknowledged departure leaves the row in place"
             );
         });
     }

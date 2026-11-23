@@ -23,7 +23,7 @@ use super::discovery::{
     ProduceGetSecretIdsVersionsRequestMessageResult,
     ProduceGetSecretIdsVersionsResponseMessageResult,
 };
-use super::envelope::{ApplyTraceIdResult, MessageIdResult, ReadTraceIdResult};
+use super::envelope::{ApplyTraceIdResult, EncryptedPayloadResult, ReadTraceIdResult};
 use super::error::DeRecError;
 use super::message_json::DeRecMessageJsonResult;
 use super::pairing::{
@@ -124,13 +124,9 @@ fn generated() -> serde_json::Value {
             secret_list_bytes
         },
         ApplyTraceIdResult { error, wire_bytes },
+        EncryptedPayloadResult { error, payload },
         ReadTraceIdResult { error, trace_id },
         super::envelope::ReadSequenceResult { error, sequence },
-        MessageIdResult {
-            error,
-            id,
-            timestamp
-        },
         super::channel_key::DeriveChannelKeyResult { error, key_bytes },
         DeRecError {
             category,

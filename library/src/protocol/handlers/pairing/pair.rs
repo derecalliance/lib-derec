@@ -650,6 +650,7 @@ pub(super) async fn persist_peer_record<S: StoreSet>(
                 role,
                 status,
                 created_at: now_secs(),
+                handover_channel: None,
             })
         }
         None => ChannelRecord::Helper(HelperChannel {

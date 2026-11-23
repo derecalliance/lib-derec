@@ -726,7 +726,7 @@ export interface ProtectSecretParams {
    * (`PairingCompleted` included); `accept()` throws after the pairing has
    * completed and its response was sent, without returning
    * `PairingCompleted`; `verifyFingerprint()` throws after the promotion,
-   * which stands, and a retry resolves `true` and publishes nothing. Call
+   * which stands, and a retry resolves and publishes nothing. Call
    * `start` with `ProtectSecret` and valid weights to publish.
    *
    * When the paired helpers' resolved total is below the round's threshold
@@ -838,11 +838,13 @@ export type ReplicaDiscoveryParams = Record<string, never>;
  *  source must be removable by the devices that remain, and the library
  *  checks no role. Ask the user before starting this flow, above all when it
  *  names the source. Removing the source promotes the first remaining member
- *  in the order the channel store's `listReplicas` returns. The removed
- *  member is not asked and gets no event when told to leave: when a roster
- *  excluding it arrives it drops its whole `secret_id` partition and emits
- *  `SelfRemovedFromGroup`. The secret survives on the remaining members and
- *  the helpers.
+ *  in the order the channel store's `listReplicas` returns; removing a sole
+ *  source dissolves the group. The removed member is not asked: when the
+ *  notice naming it arrives it drops its whole `secret_id` partition and
+ *  emits `SelfRemovedFromGroup`. If the notice is lost it keeps what it held,
+ *  but it is sent nothing new and the remaining members refuse its messages
+ *  once the roster without it has reached them. The secret survives on the
+ *  remaining members and the helpers.
  *
  *  Removal does not replace the group key, so it relies on the removed
  *  device's library deleting its copy. That covers a lost or stolen device
@@ -975,7 +977,9 @@ export type DeRecEvent =
    *  display. */
   | { type: "ReplicaSyncFailed"; replica_id: string; version: number; reason: string }
   /** A member left the group and its roster row was dropped. Fires on the
-   *  members that remain. */
+   *  device that ran the removal, when it starts it, and on every other
+   *  remaining member when the roster without the member arrives. The
+   *  departing device reports `SelfRemovedFromGroup` instead. */
   | { type: "ReplicaRemoved"; replica_id: string }
   /** The group's source role moved to another member because the previous
    *  source is leaving. Fires on the device that chose the successor — which
@@ -984,9 +988,11 @@ export type DeRecEvent =
   | { type: "ReplicaSourceChanged"; replica_id: string }
   /** This device left the group and dropped its whole `secret_id` partition —
    *  group channel, helper channels, shares, secrets and the snapshot. Fires
-   *  only once it was told to leave *and* has since seen a roster excluding
-   *  it; absence alone never destroys a copy of the secret. The teardown is
-   *  automatic: this device is not asked first and gets no earlier event. */
+   *  when this device is told to leave, when it removes itself after
+   *  publishing the roster without it, or when a roster excluding it arrives
+   *  after it was told to leave by a device on an earlier release. The
+   *  teardown is automatic: this device is not asked first and gets no
+   *  earlier event. */
   | { type: "SelfRemovedFromGroup"; version: number }
   /** A replica catch-up finished. `fetched_from` is absent when this device
    *  was already current, in which case no hydration event follows. */
@@ -1500,8 +1506,15 @@ export type DeRecEvent =
    *  challenge stays outstanding and its own answer still completes it.
    *  `"Superseded"` means a `StoreShareRequest` for a version older than
    *  the newest one this helper stores on the channel, and not stored
-   *  itself; it is not stored and not answered. `"KeyUnavailable"` means
-   *  the envelope names an epoch whose key this device cannot obtain.
+   *  itself; it is not stored and not answered.
+   *  `"ProtocolVersionTooOld"` means the envelope names a protocol version
+   *  older than the one set with `withMinProtocolVersion`; nothing is
+   *  decrypted, stored or answered. `"ProtocolVersionMismatch"` means the
+   *  envelope's protocol version and the copy inside the encrypted payload
+   *  differ: the envelope was altered or built by a non-conforming peer; a
+   *  payload from a release that writes no version reads as 0.0, the version
+   *  such a release puts on its envelope. `"KeyUnavailable"` means the
+   *  envelope names an epoch whose key this device cannot obtain.
    *  `trace_id` matches the peer's `*Started` event for the same round
    *  (`"0"` when the sender set none). */
   | {
@@ -1575,7 +1588,9 @@ export type DeRecEvent =
    *  `UnpairAck.Required` the channel is now `"Unpairing"`, and an
    *  `Unpaired` event follows once the peer acknowledges or the
    *  acknowledgement window elapses, or `UnpairRejected` if the peer
-   *  refuses (the channel is `"Paired"` again). Under
+   *  refuses: after `start(Unpair)` the channel is `"Paired"` again; a
+   *  recovery channel `restore` unpaired is dropped instead, and
+   *  `Unpaired` follows the `UnpairRejected`. Under
    *  `UnpairAck.NotRequired`, `Unpaired` follows in the same event vec. */
   | { type: "UnpairFailed"; channel_id: string; error: string }
   | { type: "UnpairStarted"; channel_id: string; trace_id: string }
@@ -1713,7 +1728,8 @@ export interface DeRecAutoAcceptConfig {
  *   "unsafe_connection": false,
  *   "communication_info": { "name": "alice" },
  *   "own_transports": [{ "uri": "https://me.example.com/derec", "protocol": "https" }],
- *   "replica_id": "9007199254740993"
+ *   "replica_id": "9007199254740993",
+ *   "min_protocol_version": { "major": 0, "minor": 1 }
  * }
  * ```
  */
@@ -1737,6 +1753,7 @@ export interface DeRecProtocolConfig {
   /** Decimal string. A `bigint` throws `decode_error`; call
    *  {@link DeRecProtocolBuilder.withReplicaId} directly for a `bigint`. */
   replica_id?: string;
+  min_protocol_version?: { major: number; minor: number };
 }
 
 /**
@@ -1894,6 +1911,14 @@ export declare class DeRecProtocolBuilder {
    */
   withReplicaId(id: bigint | number): DeRecProtocolBuilder;
   /**
+   * The oldest protocol version whose messages this device still accepts.
+   * An inbound envelope naming an older version is ignored with
+   * `MessageIgnored` reason `"ProtocolVersionTooOld"`: nothing is
+   * decrypted, stored or answered. Default: 0.0, which accepts every
+   * version.
+   */
+  withMinProtocolVersion(major: number, minor: number): DeRecProtocolBuilder;
+  /**
    * Declare the bounds this node advertises during pair negotiation.
    *
    * Embedded in outbound `PairRequest` / `PairResponse` envelopes and
@@ -2017,15 +2042,30 @@ export declare class DeRecProtocol {
   start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.ReplicaDiscovery, params?: ReplicaDiscoveryParams): Promise<DeRecEvent[]>;
 
-  /** Remove a member: tell every member, flag the target locally, then
-   *  publish the roster omitting it as the next version — an ordinary
-   *  `start(FlowKind.ProtectSecret)` of the latest snapshot with the stored
-   *  weights and threshold, or an empty payload when nothing has been
-   *  published yet. Its events are returned with the announcement's.
-   *  `ReplicaRemoved` fires once that round completes, not from this call.
-   *  A publish that fails rejects with the announcement already sent and the
-   *  flag kept; the next `start(FlowKind.ProtectSecret)` completes the
-   *  removal. */
+  /** Remove a member from the replica group; naming this device is a
+   *  voluntary departure. It tells every member, the departing one included,
+   *  then either drops the named member on this device at once, with any key
+   *  only it used, and reports `ReplicaRemoved`, or, when removing this
+   *  device, publishes without its own row and then drops the whole
+   *  `secret_id` partition, reporting `SelfRemovedFromGroup`. Either way it
+   *  publishes the latest snapshot, or an empty payload when there is none,
+   *  with a roster that omits the member; that round's events follow, as for
+   *  `start(FlowKind.ProtectSecret)`. The application publishes nothing
+   *  itself to complete a removal. The round runs only when it reaches
+   *  someone: with no member left to sync and the helpers below the
+   *  threshold, nothing is published and no version is consumed.
+   *
+   *  A publish that fails rejects. A member removed by this device is
+   *  already dropped, and the next `start(FlowKind.ProtectSecret)` publishes
+   *  the roster without it; a device removing itself keeps its partition
+   *  until the removal is started again.
+   *
+   *  The departing member is on no distribution list from then on. Every
+   *  other member flags it when told and drops it, with `ReplicaRemoved`,
+   *  once that roster arrives. When this device removes itself, the remaining
+   *  members acknowledge the publish after it dropped the group channel, and
+   *  `process` fails those acknowledgements with an unknown-channel error,
+   *  which can be disregarded. */
   start(flowKind: FlowKind.UnpairReplica, params: UnpairReplicaParams): Promise<DeRecEvent[]>;
 
   /**
@@ -2189,19 +2229,27 @@ export declare const envelope: {
   read_trace_id(envelope_bytes: Uint8Array): bigint;
 
   /**
-   * Identify an envelope for replay and reflection detection. `id` (32
-   * bytes) is the same for every copy of one message, whatever its
-   * unauthenticated cleartext fields (sequence, trace id, protocol version)
-   * say, and different for every other message; never key on a hash of the
-   * raw bytes instead. Detecting a message delivered twice, or delivered
-   * back to its sender, is the application's job: keep the `id` of every
-   * envelope sent and of every envelope `process` accepted until
-   * `max(received or sent at, timestamp) + inbound_message_secs`, keep the
-   * record across restarts, and drop an inbound envelope whose `id` is kept.
-   * The README has the full contract. Throws when the bytes are not an
-   * envelope or carry no timestamp.
+   * Read the encrypted `message` field off an envelope, without the channel
+   * key: the part of an envelope an application can key duplicate detection
+   * on.
+   *
+   * It cannot be changed without failing decryption, and every message is
+   * sealed under a fresh random nonce, so it is the same for every copy of
+   * one message and different for every other message, even one with the
+   * same body. The cleartext fields around it (`sequence`, `traceId`) are
+   * not authenticated, and protobuf accepts more than one encoding of the
+   * same envelope, so a copy can arrive as different bytes: a hash of the
+   * raw envelope does not identify a message. How to key on these bytes (as
+   * they are, or hashed) and for how long is the application's choice.
+   *
+   * The plaintext `PrePair` leg of `HashedKeys` pairing is the exception: its
+   * `message` field is not encrypted, so a copy re-encoded inside it reads
+   * differently. That leg is not authenticated at all; the contact's nonce
+   * is what binds it.
+   *
+   * Throws when the bytes are not an envelope.
    */
-  message_id(envelope_bytes: Uint8Array): MessageId;
+  encrypted_payload(envelope_bytes: Uint8Array): Uint8Array;
 
   /**
    * Read `sequence` off an inbound envelope: the epoch of the channel key
@@ -2224,14 +2272,6 @@ export declare const channel_key: {
    */
   derive(key: Uint8Array, epoch: number, to_epoch: number): Uint8Array;
 };
-
-/** The identity of one delivered message; see `envelope.message_id`. */
-export interface MessageId {
-  /** SHA-256 of the envelope's encrypted `message` field. */
-  id: Uint8Array;
-  /** The envelope's send time, in seconds since the Unix epoch. */
-  timestamp: bigint;
-}
 
 export interface Timestamp {
 
@@ -2307,7 +2347,7 @@ export interface CommunicationInfo {
 
 /** Why a `MessageIgnored` event dropped a message. Matches the Rust
  *  `IgnoreReason` discriminants one-for-one. */
-export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse" | "Superseded" | "KeyUnavailable";
+export type IgnoreReason = "PendingVerification" | "Expired" | "TimestampMismatch" | "StaleResponse" | "Superseded" | "ProtocolVersionTooOld" | "ProtocolVersionMismatch" | "KeyUnavailable";
 
 /** Why a `PeerNotRestored` event left a roster entry without a channel.
  *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */

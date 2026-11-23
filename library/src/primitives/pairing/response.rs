@@ -4,17 +4,15 @@
 use super::parameter_range::check_compatibility;
 use super::request::check_parameter_range;
 use crate::Error;
-use crate::derec_message::{
-    DeRecMessageBuilder, current_timestamp, extract_inner_plaintext_message,
-};
+use crate::derec_message::{DeRecMessageBuilder, current_timestamp, open_plaintext_message};
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::contact_message::ContactMessageExt as _;
 use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::extensions::pair_request::PairRequestMessageExt as _;
 use crate::primitives::pairing::PairingError;
-use crate::protocol_version::ProtocolVersion;
 use crate::transport::TransportPolicy;
 use crate::types::{ChannelId, SharedKey};
+use crate::utils::verify_protocol_version;
 use crate::utils::{generate_seed, verify_timestamps};
 use derec_cryptography::pairing::{
     self as cryptography_pairing, DerecPairingError, FingerprintCommitment, FingerprintNonce,
@@ -388,17 +386,12 @@ pub fn produce_pre_pair(
         fingerprint_commitment: Some(commitment.to_vec()),
     };
 
-    let protocol_version = ProtocolVersion::current();
-    let envelope = DeRecMessage {
-        protocol_version_major: protocol_version.major,
-        protocol_version_minor: protocol_version.minor,
-        sequence: 0,
-        channel_id: channel_id.into(),
-        timestamp: Some(timestamp),
-        message: MessageBody::PrePairResponse(response).encode_to_vec(),
-        trace_id: 0,
-    }
-    .encode_to_vec();
+    let envelope = DeRecMessageBuilder::plaintext()
+        .channel_id(channel_id)
+        .timestamp(timestamp)
+        .message_body(MessageBody::PrePairResponse(response))
+        .build()?
+        .encode_to_vec();
 
     #[cfg(feature = "logging")]
     tracing::info!("PrePair response envelope produced");
@@ -479,17 +472,12 @@ pub fn produce_pre_pair_no_keys(
         fingerprint_commitment: Some(commitment.to_vec()),
     };
 
-    let protocol_version = ProtocolVersion::current();
-    let envelope = DeRecMessage {
-        protocol_version_major: protocol_version.major,
-        protocol_version_minor: protocol_version.minor,
-        sequence: 0,
-        channel_id: channel_id.into(),
-        timestamp: Some(timestamp),
-        message: MessageBody::PrePairResponse(response).encode_to_vec(),
-        trace_id: 0,
-    }
-    .encode_to_vec();
+    let envelope = DeRecMessageBuilder::plaintext()
+        .channel_id(channel_id)
+        .timestamp(timestamp)
+        .message_body(MessageBody::PrePairResponse(response))
+        .build()?
+        .encode_to_vec();
 
     #[cfg(feature = "logging")]
     tracing::info!("NoKeys PrePair response envelope produced with fresh key material");
@@ -623,18 +611,20 @@ pub fn extract(envelope_bytes: &[u8], ecies_secret_key: &[u8]) -> Result<Extract
     let plaintext = pairing_envelope::decrypt(&envelope.message, ecies_secret_key)
         .map_err(PairingError::PairingEncryption)?;
 
-    let response =
-        match MessageBody::decode_from_vec(plaintext.as_slice()).map_err(Error::ProtobufDecode)? {
-            MessageBody::PairResponse(r) => r,
-            _ => {
-                #[cfg(feature = "logging")]
-                tracing::warn!("unexpected message type; expected PairResponseMessage");
+    let (body, version) =
+        MessageBody::decode_versioned(plaintext.as_slice()).map_err(Error::ProtobufDecode)?;
+    verify_protocol_version(&envelope, version)?;
+    let response = match body {
+        MessageBody::PairResponse(r) => r,
+        _ => {
+            #[cfg(feature = "logging")]
+            tracing::warn!("unexpected message type; expected PairResponseMessage");
 
-                return Err(Error::Invariant(
-                    "Invalid message. Expected: PairResponseMessage",
-                ));
-            }
-        };
+            return Err(Error::Invariant(
+                "Invalid message. Expected: PairResponseMessage",
+            ));
+        }
+    };
 
     verify_timestamps(envelope.timestamp, response.timestamp)?;
 
@@ -699,7 +689,7 @@ pub fn extract(envelope_bytes: &[u8], ecies_secret_key: &[u8]) -> Result<Extract
 pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, Error> {
     let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
 
-    let response = match extract_inner_plaintext_message(&envelope.message)? {
+    let response = match open_plaintext_message(&envelope)? {
         MessageBody::PrePairResponse(r) => r,
         _ => {
             #[cfg(feature = "logging")]

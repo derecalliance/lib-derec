@@ -100,6 +100,12 @@
       "ts": "withAutoRespondOnFailure"
     },
     {
+      "rust": "min_protocol_version",
+      "dotnet": "WithMinProtocolVersion",
+      "go": "MinProtocolVersion",
+      "ts": "withMinProtocolVersion"
+    },
+    {
       "rust": "key_rotation",
       "dotnet": "WithKeyRotation",
       "go": "KeyRotation",
@@ -1171,12 +1177,12 @@
       "ts": "envelope.read_trace_id"
     },
     {
-      "rust": "derec_message::message_id",
-      "ffi": "message_id_from_envelope",
-      "wasm": "envelope_message_id",
-      "dotnet": "Envelope.ReadMessageId",
-      "go": "envelope.ReadMessageID",
-      "ts": "envelope.message_id"
+      "rust": "derec_message::encrypted_payload",
+      "ffi": "encrypted_payload_from_envelope",
+      "wasm": "envelope_encrypted_payload",
+      "dotnet": "Envelope.EncryptedPayload",
+      "go": "envelope.EncryptedPayload",
+      "ts": "envelope.encrypted_payload"
     },
     {
       "rust": "derec_message::read_sequence",

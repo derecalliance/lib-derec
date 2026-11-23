@@ -430,7 +430,18 @@ const (
 	// IgnoreReasonSuperseded: a StoreShareRequest for a version older than
 	// the newest one this helper stores on the channel, and not stored
 	// itself. It is not stored and not answered.
-	IgnoreReasonSuperseded     = "Superseded"
+	IgnoreReasonSuperseded = "Superseded"
+	// IgnoreReasonProtocolVersionTooOld: the envelope names a protocol
+	// version below MinProtocolVersion. Nothing is decrypted, stored or
+	// answered.
+	IgnoreReasonProtocolVersionTooOld = "ProtocolVersionTooOld"
+	// IgnoreReasonProtocolVersionMismatch: the protocol version copied into
+	// the encrypted payload differs from the envelope's. Nothing is stored or
+	// answered.
+	IgnoreReasonProtocolVersionMismatch = "ProtocolVersionMismatch"
+	// IgnoreReasonKeyUnavailable: the envelope's sequence names an epoch
+	// whose channel key this device cannot obtain. Nothing is decrypted and
+	// no state changes.
 	IgnoreReasonKeyUnavailable = "KeyUnavailable"
 )
 

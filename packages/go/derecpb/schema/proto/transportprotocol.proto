@@ -54,8 +54,10 @@ enum Protocol {
 /// how to establish communication channels.
 ///
 /// A TransportProtocol does not itself provide security guarantees.
-/// All DeRec protocol messages MUST still be signed and encrypted at the
-/// application layer, regardless of the underlying transport.
+/// DeRec protocol messages on an established channel are encrypted and
+/// authenticated with AES-256-GCM at the application layer, regardless of
+/// the underlying transport; the pairing messages are protected by the
+/// pairing handshake.
 ///
 /// # Semantics
 ///

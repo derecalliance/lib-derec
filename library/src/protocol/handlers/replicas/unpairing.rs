@@ -12,11 +12,14 @@
 //! application asks for as [`DeRecFlow::UnpairReplica`](crate::protocol::DeRecFlow)
 //! — and [`handle`] is what a peer does with it.
 //!
-//! Removal completes in two halves, and the safety rule spans both: a member
-//! is flagged when the departure is announced, and only removed once a roster
-//! arrives that both omits it and post-dates the flag. [`reconcile`] and
-//! [`tear_down`] are the second half, driven from the sharing flow as each new
-//! roster lands.
+//! The device running the removal drops the member at once and publishes a
+//! roster without it; the removed member drops everything as soon as it is
+//! told, and receives nothing afterwards. Every other member flags the
+//! departing member when told, and removes it once a roster arrives that both
+//! omits it and post-dates the flag: absence from a roster alone never
+//! removes anyone, since a device may hold members a roster has not caught up
+//! with yet. [`reconcile`] is that second half, driven from the sharing flow
+//! as each new roster lands.
 use super::{flag_unpairing, load_member_keys};
 use crate::derec_message::apply_trace_id;
 use crate::extensions::channel_store::ChannelStoreExt as _;
@@ -56,11 +59,15 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
     }
 }
 
-/// Tell every member that `target` is leaving, and flag it locally.
+/// Tell every member that `target` is leaving, and take it out of the group
+/// here.
 ///
-/// Returns the members notified. The caller publishes the new roster: the flag
-/// keeps `target` out of it while leaving it on the distribution list, which is
-/// how an evicted member learns it may finally tear down.
+/// Another member is dropped at once: its row, and any key only it used, are
+/// removed and [`DeRecEvent::ReplicaRemoved`] is reported. When `target` is
+/// this device, its own row is flagged instead, which keeps it out of the
+/// roster the caller publishes before tearing down. Either way the caller
+/// publishes the roster without `target` next; `target` is no longer on any
+/// distribution list, so it receives nothing more.
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(trace_id = trace_id, local.secret_id)))]
 pub(in crate::protocol) async fn start<S: StoreSet>(
     stores: &mut Stores<'_, S>,
@@ -121,12 +128,19 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         }
     }
 
-    flag_unpairing(stores, local, &member).await?;
+    let mut events = Vec::new();
+    if target.0 == own {
+        flag_unpairing(stores, local, &member).await?;
+    } else {
+        drop_member(stores, local, &member).await?;
+        events.push(DeRecEvent::ReplicaRemoved {
+            replica_id: target.0,
+        });
+    }
 
     // Promoted before the roster is built, so the completing publish carries the
-    // new source. The flagged row and the promoted row are distinct members, so
-    // the two writes cannot collide.
-    let mut events = Vec::new();
+    // new source. The departing row and the promoted row are distinct members,
+    // so the two writes cannot collide.
     if let Some(successor) = successor {
         stores
             .channels
@@ -199,6 +213,18 @@ pub(in crate::protocol) async fn reconcile<S: StoreSet>(
             self_removed = true;
             continue;
         }
+        if let Some(handover) = member.handover_channel {
+            let _ = stores
+                .secrets
+                .remove_many(
+                    local.secret_id,
+                    &[
+                        (handover, SecretKind::SharedKey),
+                        (handover, SecretKind::KeyRing),
+                    ],
+                )
+                .await;
+        }
         stores
             .channels
             .remove(
@@ -252,6 +278,18 @@ pub(in crate::protocol) async fn tear_down<S: StoreSet>(
         .replicas_matching(secret_id, ReplicaFilter::default())
         .await?
     {
+        if let Some(handover) = member.handover_channel {
+            let _ = stores
+                .secrets
+                .remove_many(
+                    secret_id,
+                    &[
+                        (handover, SecretKind::SharedKey),
+                        (handover, SecretKind::KeyRing),
+                    ],
+                )
+                .await;
+        }
         drop_channel(
             stores,
             local,
@@ -294,8 +332,9 @@ async fn drop_channel<S: StoreSet>(
 
 /// Handle an inbound `UnpairRequest` that names a group member.
 ///
-/// Flags the row and nothing more. Teardown waits for the completing roster —
-/// the second half of the safety rule.
+/// A notice naming this device tears it down at once, since nothing more is
+/// sent to it. A notice naming another member flags that member's row; the
+/// member is dropped when the roster without it arrives.
 async fn on_request<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -329,11 +368,77 @@ async fn on_request<S: StoreSet>(
             "unpair names a member that is not in the group",
         ))?;
 
+    // Told to leave: nothing more is sent to this device, so it drops
+    // everything now rather than waiting for a roster.
+    if Some(target.0) == local.replica_id {
+        let version = stores
+            .user_secrets
+            .load_latest(local.secret_id)
+            .await?
+            .map_or(0, |held| held.version);
+        tear_down(stores, local).await?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!(
+            version,
+            "told to leave the replica group; partition dropped"
+        );
+
+        return Ok(vec![DeRecEvent::SelfRemovedFromGroup { version }]);
+    }
+
     flag_unpairing(stores, local, &member).await?;
 
     // No event yet: nothing has been removed. The row is flagged, and the
     // removal is reported when the completing roster arrives.
     Ok(vec![DeRecEvent::NoOp])
+}
+
+/// Remove `member`'s row, and every key that only it used.
+///
+/// A member admitted here and not yet moved onto the group channel is still
+/// on its pairing channel, and a member this device joined through may hold a
+/// [`handover_channel`](ReplicaMember::handover_channel); either key is
+/// removed once no remaining member is recorded on that channel. The group
+/// channel's key stays: the remaining members use it.
+async fn drop_member<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    member: &ReplicaMember,
+) -> Result<()> {
+    let secret_id = local.secret_id;
+    stores
+        .channels
+        .remove(
+            secret_id,
+            ChannelQuery::Replica {
+                channel_id: member.channel_id,
+                replica_id: member.replica_id,
+            },
+        )
+        .await?;
+    let remaining = stores
+        .channels
+        .replicas_matching(secret_id, ReplicaFilter::default())
+        .await?;
+    for channel_id in [Some(member.channel_id), member.handover_channel]
+        .into_iter()
+        .flatten()
+    {
+        if !remaining.iter().any(|m| m.channel_id == channel_id) {
+            let _ = stores
+                .secrets
+                .remove_many(
+                    secret_id,
+                    &[
+                        (channel_id, SecretKind::SharedKey),
+                        (channel_id, SecretKind::KeyRing),
+                    ],
+                )
+                .await;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -378,6 +483,7 @@ mod tests {
                     role,
                     status,
                     created_at: 0,
+                    handover_channel: None,
                 }),
             )
             .await
@@ -726,10 +832,20 @@ mod tests {
                 "the chosen successor is reported to the application"
             );
             assert_eq!(role_of(&rig.channels, 1002).await, ReplicaRole::Source);
-            assert_eq!(
-                role_of(&rig.channels, 1001).await,
-                ReplicaRole::Source,
-                "the departing row is untouched; its absence from the next roster is what removes it"
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::ReplicaRemoved { replica_id } if *replica_id == 1001
+                )),
+                "the departing source is removed at once"
+            );
+            assert!(
+                rig.channels
+                    .replicas(SECRET_ID, ReplicaFilter::default())
+                    .await
+                    .expect("roster")
+                    .iter()
+                    .all(|m| m.replica_id.0 != 1001)
             );
         });
     }
@@ -966,8 +1082,8 @@ mod tests {
             );
             assert_eq!(
                 protocol.transport.sent_envelopes().len(),
-                4,
-                "both members are told of the removal, then both receive the new version"
+                3,
+                "both members are told of the removal, then only the remaining one receives the new version"
             );
         });
     }
@@ -1039,6 +1155,7 @@ mod tests {
                             role: ReplicaRole::Destination,
                             status: ChannelStatus::Paired,
                             created_at: 0,
+                            handover_channel: None,
                         }),
                     )
                     .await
@@ -1074,5 +1191,201 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// The device running a removal drops the member at once, with the key
+    /// only it used; the group key stays for the members that remain.
+    #[test]
+    fn removing_another_member_drops_its_row_and_its_own_key() {
+        const PAIRING: ChannelId = ChannelId(5002);
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, 1001);
+            let mut rig = StoreRig::with_transport(NoopTransport);
+            seed_group_key(&mut rig.secrets).await;
+            rig.secrets
+                .save(
+                    SECRET_ID,
+                    PAIRING,
+                    SecretValue::SharedKey(crate::types::SharedKey::new([0x22; 32])),
+                )
+                .await
+                .expect("seed pairing key");
+            for id in [1001, 1002] {
+                seed_member(
+                    &mut rig.channels,
+                    id,
+                    ReplicaRole::Destination,
+                    ChannelStatus::Paired,
+                )
+                .await;
+            }
+            rig.channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Replica(ReplicaMember {
+                        channel_id: PAIRING,
+                        replica_id: ReplicaId(1003),
+                        transports: vec![endpoint("https://joiner.example")],
+                        communication_info: HashMap::new(),
+                        role: ReplicaRole::Destination,
+                        status: ChannelStatus::Paired,
+                        created_at: 0,
+                        handover_channel: None,
+                    }),
+                )
+                .await
+                .expect("seed joiner");
+
+            let events = super::start(&mut rig.stores(), &lf.local(), 1003, None, TRACE_ID)
+                .await
+                .expect("start");
+
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::ReplicaRemoved { replica_id: 1003 })),
+                "{events:?}"
+            );
+            let mut ids: Vec<u64> = rig
+                .channels
+                .replicas(SECRET_ID, ReplicaFilter::default())
+                .await
+                .expect("roster")
+                .iter()
+                .map(|m| m.replica_id.0)
+                .collect();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![1001, 1002]);
+            assert!(
+                rig.secrets
+                    .load(SECRET_ID, PAIRING, SecretKind::SharedKey)
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "the key only the removed member used is dropped"
+            );
+            assert!(
+                rig.secrets
+                    .load(SECRET_ID, GROUP, SecretKind::SharedKey)
+                    .await
+                    .expect("load")
+                    .is_some(),
+                "the group key stays"
+            );
+        });
+    }
+
+    /// The removed member drops everything as soon as it is told: nothing
+    /// more will be sent to it.
+    #[test]
+    fn a_member_told_to_leave_drops_everything_at_once() {
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, 1002);
+            let mut rig = StoreRig::new();
+            seed_group_key(&mut rig.secrets).await;
+            for id in [1001, 1002] {
+                seed_member(
+                    &mut rig.channels,
+                    id,
+                    ReplicaRole::Destination,
+                    ChannelStatus::Paired,
+                )
+                .await;
+            }
+            rig.user_secrets
+                .save_latest(
+                    SECRET_ID,
+                    UserSecrets {
+                        version: 4,
+                        secrets: Vec::new(),
+                        description: None,
+                        author_replica_id: None,
+                        threshold: None,
+                    },
+                )
+                .await
+                .expect("seed snapshot");
+
+            let events = super::handle(
+                &mut rig.stores(),
+                &lf.local(),
+                1002,
+                MessageBody::UnpairRequest(UnpairRequestMessage::default()),
+            )
+            .await
+            .expect("handled");
+
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [DeRecEvent::SelfRemovedFromGroup { version: 4 }]
+                ),
+                "{events:?}"
+            );
+            assert!(
+                rig.channels
+                    .replicas(SECRET_ID, ReplicaFilter::default())
+                    .await
+                    .expect("roster")
+                    .is_empty()
+            );
+            assert!(
+                rig.secrets
+                    .load(SECRET_ID, GROUP, SecretKind::SharedKey)
+                    .await
+                    .expect("load")
+                    .is_none()
+            );
+            assert!(
+                rig.user_secrets
+                    .load_latest(SECRET_ID)
+                    .await
+                    .expect("load")
+                    .is_none()
+            );
+        });
+    }
+
+    /// Every other member only flags the departing one; the roster without it
+    /// completes the removal there.
+    #[test]
+    fn another_member_told_of_a_removal_only_flags_it() {
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, 1001);
+            let mut rig = StoreRig::new();
+            seed_group_key(&mut rig.secrets).await;
+            for id in [1001, 1002] {
+                seed_member(
+                    &mut rig.channels,
+                    id,
+                    ReplicaRole::Destination,
+                    ChannelStatus::Paired,
+                )
+                .await;
+            }
+
+            let events = super::handle(
+                &mut rig.stores(),
+                &lf.local(),
+                1002,
+                MessageBody::UnpairRequest(UnpairRequestMessage::default()),
+            )
+            .await
+            .expect("handled");
+
+            assert!(
+                matches!(events.as_slice(), [DeRecEvent::NoOp]),
+                "{events:?}"
+            );
+            let departing = rig
+                .channels
+                .replicas(SECRET_ID, ReplicaFilter::default())
+                .await
+                .expect("roster")
+                .into_iter()
+                .find(|m| m.replica_id.0 == 1002)
+                .expect("still recorded");
+            assert_eq!(departing.status, ChannelStatus::Unpairing);
+        });
     }
 }

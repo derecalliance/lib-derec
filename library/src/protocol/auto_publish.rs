@@ -32,9 +32,9 @@ impl<
     /// Publish the cached secret when `events` call for it: a helper-side
     /// `PairingCompleted` (the freshly-paired Helper needs shares), or an
     /// [`DeRecEvent::Unpaired`] for a channel in `share_holders` (the Helpers
-    /// that remain need a fresh split the removed one has no share of). The
-    /// replica-side pairing equivalent fires from `verify_fingerprint` once the
-    /// channel leaves `Pending`.
+    /// that remain need a fresh split the removed one has no share of).
+    /// Confirming a replica pairing publishes nothing: releasing the vault and
+    /// the group key to the new device is the application's call.
     ///
     /// The completion event is not on its own enough: a `NoKeys` pairing
     /// completes into `ChannelStatus::Pending` and is not a publish target
@@ -101,12 +101,12 @@ impl<
     }
 
     /// Publish the roster that completes a replica removal, right after
-    /// `start(UnpairReplica)` flagged the member.
+    /// `start(UnpairReplica)` took the member out.
     ///
-    /// The flag keeps the member out of the roster while leaving it on the
-    /// distribution list, so this round is what lets it tear down and what
-    /// makes every other member drop it. The latest snapshot is published, or
-    /// an empty payload when there is none: the roster is what the removal
+    /// The member is no longer on the distribution list, so this round
+    /// reaches every remaining member and the helpers, and is what makes
+    /// every other member drop it. The latest snapshot is published, or an
+    /// empty payload when there is none: the roster is what the removal
     /// needs, not the secrets.
     pub(super) async fn auto_publish_after_replica_removal(&mut self) -> Result<Vec<DeRecEvent>> {
         let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 )
 
@@ -163,6 +164,20 @@ type DeRecProtocolConfig struct {
 	// derec.GenerateReplicaID, persist it, and pass the same value on
 	// every init. Default: unset.
 	ReplicaID *uint64 `json:"replica_id,omitempty,string"`
+
+	// MinProtocolVersion is the oldest protocol version whose messages this
+	// device still accepts. A message whose envelope names an older version
+	// is reported as EventTypeMessageIgnored with
+	// IgnoreReasonProtocolVersionTooOld: nothing is decrypted, stored or
+	// answered. Pairing messages are included, so a device on an older
+	// version can no longer pair either.
+	//
+	// The envelope's version is authenticated, so a message relabelled to an
+	// older version is ignored with IgnoreReasonProtocolVersionMismatch
+	// whatever the minimum. Raise the minimum to 0.1 once every peer runs 0.1
+	// or later to stop accepting messages from older releases. Default: 0.0,
+	// accepting every version.
+	MinProtocolVersion *derec.ProtocolVersion `json:"min_protocol_version,omitempty"`
 }
 
 // UnmarshalJSON reads one layer of the canonical config JSON over c: each
@@ -235,6 +250,9 @@ func (c *DeRecProtocolConfig) UnmarshalJSON(data []byte) error {
 	}
 	if layer.ReplicaID != nil {
 		c.ReplicaID = layer.ReplicaID
+	}
+	if layer.MinProtocolVersion != nil {
+		c.MinProtocolVersion = layer.MinProtocolVersion
 	}
 	return nil
 }

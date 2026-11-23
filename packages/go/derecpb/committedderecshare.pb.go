@@ -118,9 +118,11 @@ func (x *CommittedDeRecShare) GetMerklePath() []*CommittedDeRecShare_SiblingHash
 // degree of the polynomial determines the threshold: t distinct subshares,
 // from any combination of helpers, reconstruct k at x = 0.
 //
-// The message also includes the secretId and the share version number,
-// because they must be serialized together with the share so that they
-// are covered by the same signature.
+// The message also includes the secretId and the share version number, so
+// that a holder can tell which secret and version a share belongs to. They
+// are not covered by the Merkle commitment, which hashes only the subshares:
+// in transit they are authenticated with the rest of the message by the
+// channel's authenticated encryption.
 type DeRecShare struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The result of serializing the secret to be shared and encrypting it

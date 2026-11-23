@@ -65,6 +65,7 @@ impl<
                 StateItem::PendingUnpair {
                     channel_id,
                     started_at,
+                    ..
                 } if now.saturating_sub(started_at) > self.timeouts.unpair_ack.as_secs() => {
                     Some(channel_id)
                 }

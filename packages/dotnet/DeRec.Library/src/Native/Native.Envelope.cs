@@ -35,11 +35,10 @@ internal static class Envelope
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct MessageIdResult
+    internal struct EncryptedPayloadResult
     {
         public DeRecError Error;
-        public Buffer Id;
-        public ulong Timestamp;
+        public Buffer Payload;
     }
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
@@ -62,7 +61,7 @@ internal static class Envelope
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern MessageIdResult message_id_from_envelope(
+    internal static extern EncryptedPayloadResult encrypted_payload_from_envelope(
         byte[] envelope,
         UIntPtr envelopeLen
     );

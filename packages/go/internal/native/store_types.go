@@ -51,6 +51,11 @@ type ReplicaMember struct {
 	Role              ReplicaRole
 	Status            ChannelStatus
 	CreatedAt         uint64
+	// HandoverChannel is the channel this member handed the group over to
+	// this device on, while it is still in use: set on the device that joined
+	// through this member, and cleared once the member reaches it on the group
+	// channel. Nil on every other row.
+	HandoverChannel *uint64
 }
 
 // ChannelRecord is what a ChannelStore holds at one address: either a
@@ -390,7 +395,8 @@ type StateKey struct {
 //     ShareChannels (the channel each share arrived on, index-aligned with
 //     Shares), Pending (the helpers asked that have not answered yet),
 //     StartedAt (unix seconds at which the share requests went out).
-//   - PendingUnpair: ChannelID, StartedAt (unix seconds).
+//   - PendingUnpair: ChannelID, StartedAt (unix seconds), DropOnRejection
+//     (true when the channel is dropped whatever the Helper answers).
 //   - SharingRound: Version, Pending/Confirmed/Failed (channel-id sets),
 //     PendingReplicas/SyncedReplicas/BehindReplicas (replica-id sets),
 //     StartedAt (unix seconds), KeepVersion (the older version every Helper
@@ -431,6 +437,10 @@ type StateItem struct {
 	// before 0.0.9 carry none, and the library judges such a round against
 	// the builder's threshold.
 	Threshold *uint32
+	// DropOnRejection is PendingUnpair only: true when the channel is dropped
+	// whatever the Helper answers, so a refused unpair still removes it.
+	// Rows written before 0.1.0 carry none and read as false.
+	DropOnRejection bool
 	// LocalVersion is the version this device held when a catch-up started.
 	LocalVersion *uint32
 	// Reported maps each member that has answered a catch-up to the version

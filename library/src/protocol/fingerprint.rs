@@ -19,9 +19,7 @@ use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::primitives::pairing;
 use crate::protocol::handlers::pairing::claim_own_member;
-use crate::protocol::types::{
-    ChannelQuery, ChannelRecord, ChannelStatus, ReplicaFilter, ReplicaRole,
-};
+use crate::protocol::types::{ChannelQuery, ChannelRecord, ChannelStatus, ReplicaFilter};
 use crate::transport::TransportPolicy;
 use crate::{Error, Result, types::ChannelId};
 
@@ -96,16 +94,26 @@ impl<
     /// confirmed replica pairing fixes the group's channel, and a device
     /// already in a group keeps its own.
     ///
-    /// On a promotion the current snapshot is published to the newly usable
-    /// peer, because it was not an eligible target while `Pending` and the
-    /// pairing-time hook therefore skipped it. That is the only push it gets —
-    /// nothing else republishes before the next explicit
-    /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret). A device holding no snapshot still
-    /// publishes an empty one to a promoted Destination, since the payload
-    /// carries the roster; a promoted helper, for which an empty payload is
-    /// inert, is sent nothing. The publish runs only when it reaches someone:
-    /// a promotion that leaves the Helpers below the threshold, with no
-    /// replica member to sync, publishes nothing and consumes no version.
+    /// Confirming a replica destination publishes nothing: releasing the vault
+    /// and the group key is the application's decision. Once the owner knows
+    /// the joiner has confirmed too, the application calls
+    /// `start(`[`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret)`)`
+    /// — with no secrets when there is nothing to share yet, since the
+    /// payload carries the roster and the group key. Publishing before the
+    /// joiner confirmed is not fatal: the joiner ignores that copy, and after
+    /// confirming it catches up with
+    /// [`DeRecFlow::ReplicaDiscovery`](crate::protocol::DeRecFlow::ReplicaDiscovery).
+    ///
+    /// On a helper promotion the current snapshot is published to the newly
+    /// usable helper, because it was not an eligible target while `Pending`
+    /// and the pairing-time hook therefore skipped it. That is the only push
+    /// it gets — nothing else republishes before the next explicit
+    /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret). A device holding no snapshot
+    /// sends a promoted helper nothing, since an empty payload is inert to
+    /// it, unless a replica destination is paired, which needs the roster.
+    /// The publish runs only when it reaches someone: a promotion that leaves
+    /// the Helpers below the threshold, with no replica member to sync,
+    /// publishes nothing and consumes no version.
     /// That publish reuses every Helper's stored
     /// weight, and a newly promoted Helper is at `1`. A stored weight that is
     /// invalid under the round's threshold fails it with
@@ -144,7 +152,6 @@ impl<
             transitioned_helper = true;
         }
 
-        let mut transitioned_replica = false;
         let mut confirmed_peer_role = None;
         let members = self
             .channel_store
@@ -160,9 +167,6 @@ impl<
         for mut member in members {
             if Some(member.replica_id.0) != self.replica_id {
                 confirmed_peer_role = Some(member.role);
-                if member.role == ReplicaRole::Destination {
-                    transitioned_replica = true;
-                }
             }
             member.status = ChannelStatus::Paired;
             self.channel_store
@@ -181,11 +185,11 @@ impl<
             .await?;
         }
 
-        if transitioned_replica || transitioned_helper {
+        if transitioned_helper {
             let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;
             let payload = match snapshot {
                 Some(s) => Some((s.secrets, s.description, s.threshold)),
-                None if transitioned_replica || self.has_paired_replica_destination().await? => {
+                None if self.has_paired_replica_destination().await? => {
                     Some((Vec::new(), None, None))
                 }
                 None => None,
@@ -439,6 +443,7 @@ mod tests {
                             role,
                             status: ChannelStatus::Pending,
                             created_at: now_secs(),
+                            handover_channel: None,
                         }),
                     )
                     .await
@@ -513,6 +518,103 @@ mod tests {
 
             let mut check = channels.clone();
             assert_eq!(status_of(&mut check).await, ChannelStatus::Paired);
+        });
+    }
+
+    /// Confirming a replica destination releases nothing: the application
+    /// publishes once the owner knows the joiner confirmed too.
+    #[test]
+    fn confirming_a_replica_destination_publishes_nothing() {
+        run_async(async {
+            use crate::protocol::tests::RecordingTransport;
+            use crate::protocol::types::{ReplicaMember, ReplicaRole};
+            const OWN: u64 = 9;
+            const JOINER: u64 = 7;
+            let mut channels = InMemChannelStore::default();
+            let mut secrets = InMemSecretStore::default();
+            channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Replica(ReplicaMember {
+                        channel_id: CHANNEL,
+                        replica_id: ReplicaId(JOINER),
+                        transports: vec![endpoint()],
+                        communication_info: HashMap::new(),
+                        role: ReplicaRole::Destination,
+                        status: ChannelStatus::Pending,
+                        created_at: now_secs(),
+                        handover_channel: None,
+                    }),
+                )
+                .await
+                .expect("seed joiner");
+            secrets
+                .save(
+                    SECRET_ID,
+                    CHANNEL,
+                    SecretValue::SharedKey(crate::types::SharedKey::new([7u8; 32])),
+                )
+                .await
+                .expect("seed shared key");
+            let mut user_secrets = InMemUserSecretStore::default();
+            user_secrets
+                .save_latest(
+                    SECRET_ID,
+                    UserSecrets {
+                        version: 4,
+                        secrets: Vec::new(),
+                        description: None,
+                        author_replica_id: Some(OWN),
+                        threshold: None,
+                    },
+                )
+                .await
+                .expect("seed snapshot");
+            let transport = RecordingTransport::default();
+            let mut protocol = DeRecProtocolBuilder::new(SECRET_ID)
+                .with_channel_store(channels.clone())
+                .with_share_store(InMemShareStore::default())
+                .with_secret_store(secrets)
+                .with_user_secret_store(user_secrets.clone())
+                .with_transport(transport.clone())
+                .with_state_store(InMemStateStore)
+                .with_own_transports(["https://owner.example.com"])
+                .with_threshold(2)
+                .with_replica_id(OWN)
+                .build()
+                .expect("test protocol builds");
+
+            let fingerprint = protocol
+                .get_fingerprint(CHANNEL)
+                .await
+                .expect("fingerprint");
+            protocol
+                .verify_fingerprint(CHANNEL, &fingerprint)
+                .await
+                .expect("verify_fingerprint");
+
+            let joiner = channels
+                .load(
+                    SECRET_ID,
+                    ChannelQuery::Replica {
+                        channel_id: CHANNEL,
+                        replica_id: ReplicaId(JOINER),
+                    },
+                )
+                .await
+                .expect("load joiner")
+                .expect("joiner row present");
+            assert_eq!(joiner.status(), ChannelStatus::Paired);
+            assert!(transport.sent_envelopes().is_empty(), "nothing is sent");
+            assert_eq!(
+                user_secrets
+                    .load_latest(SECRET_ID)
+                    .await
+                    .expect("load snapshot")
+                    .map(|s| s.version),
+                Some(4),
+                "no version is consumed"
+            );
         });
     }
 

@@ -24,10 +24,9 @@ type readSequenceResult struct {
 	Sequence uint32
 }
 
-type messageIdResult struct {
-	Error     DeRecError
-	ID        DeRecBuffer
-	Timestamp uint64
+type encryptedPayloadResult struct {
+	Error   DeRecError
+	Payload DeRecBuffer
 }
 
 var (
@@ -40,8 +39,8 @@ var (
 	readSequenceOnce sync.Once
 	readSequenceFn   func(envelope *byte, envelopeLen uintptr) readSequenceResult
 
-	messageIDOnce sync.Once
-	messageIDFn   func(envelope *byte, envelopeLen uintptr) messageIdResult
+	encryptedPayloadOnce sync.Once
+	encryptedPayloadFn   func(envelope *byte, envelopeLen uintptr) encryptedPayloadResult
 )
 
 func ApplyTraceIDToEnvelope(envelope []byte, traceID uint64) ([]byte, error) {
@@ -77,13 +76,13 @@ func ReadSequenceFromEnvelope(envelope []byte) (uint32, error) {
 	return res.Sequence, nil
 }
 
-func MessageIDFromEnvelope(envelope []byte) ([]byte, uint64, error) {
-	messageIDOnce.Do(func() {
-		purego.RegisterFunc(&messageIDFn, symbol("message_id_from_envelope"))
+func EncryptedPayloadFromEnvelope(envelope []byte) ([]byte, error) {
+	encryptedPayloadOnce.Do(func() {
+		purego.RegisterFunc(&encryptedPayloadFn, symbol("encrypted_payload_from_envelope"))
 	})
-	res := messageIDFn(bytePtr(envelope), uintptr(len(envelope)))
+	res := encryptedPayloadFn(bytePtr(envelope), uintptr(len(envelope)))
 	if err := errorFrom(res.Error); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	return bytesFromBuffer(res.ID), res.Timestamp, nil
+	return bytesFromBuffer(res.Payload), nil
 }

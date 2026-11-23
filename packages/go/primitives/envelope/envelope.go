@@ -4,7 +4,7 @@
 // Package envelope exposes helpers that read or rewrite an envelope's
 // cleartext fields without touching the encrypted inner message: trace ids
 // for correlating requests and responses, the sequence that selects the
-// channel key, and the message identity replay detection keys on.
+// channel key, and the encrypted payload duplicate detection keys on.
 package envelope
 
 import "github.com/derecalliance/lib-derec/packages/go/internal/native"
@@ -27,27 +27,27 @@ func ReadSequence(envelopeBytes []byte) (uint32, error) {
 	return native.ReadSequenceFromEnvelope(envelopeBytes)
 }
 
-// MessageID identifies an envelope for replay and reflection detection.
+// EncryptedPayload reads the encrypted message field off an envelope,
+// without the channel key.
 //
-// ID (32 bytes) is the same for every copy of one message, whatever its
-// unauthenticated cleartext fields (sequence, trace id, protocol version)
-// say, and different for every other message. Timestamp is the envelope's
-// send time in seconds since the Unix epoch.
-type MessageID struct {
-	ID        []byte
-	Timestamp uint64
-}
-
-// ReadMessageID reads the identity of an envelope. Detecting a message
-// delivered twice, or delivered back to its sender, is the application's
-// job: keep the ID of every envelope sent and every envelope Process
-// accepted until max(received or sent at, Timestamp) +
-// Timeouts.InboundMessageSecs, keep the record across restarts, and drop an
-// inbound envelope whose ID is kept. The README has the full contract.
-func ReadMessageID(envelopeBytes []byte) (MessageID, error) {
-	id, timestamp, err := native.MessageIDFromEnvelope(envelopeBytes)
-	if err != nil {
-		return MessageID{}, err
-	}
-	return MessageID{ID: id, Timestamp: timestamp}, nil
+// This is the part of an envelope an application can key duplicate
+// detection on. It cannot be changed without failing decryption, and every
+// message is sealed under a fresh random nonce, so it is the same for every
+// copy of one message and different for every other message, even one with
+// the same body. The cleartext fields around it (sequence, trace id) are not
+// authenticated, and protobuf accepts more than one encoding of the same
+// envelope, so a copy can arrive as different bytes: a hash of the raw
+// envelope does not identify a message. How to key on these bytes (as they
+// are, or hashed) and for how long is the application's choice; the README
+// covers duplicate detection and the inbound window.
+//
+// The plaintext PrePair leg of HashedKeys pairing is the exception: its
+// message field is not encrypted, so a copy re-encoded inside it reads
+// differently. That leg is not authenticated at all; the contact's nonce is
+// what binds it.
+//
+// Returns a *derec.Error with code derec.CodeFFIBadProto when the bytes are
+// not an envelope.
+func EncryptedPayload(envelope []byte) ([]byte, error) {
+	return native.EncryptedPayloadFromEnvelope(envelope)
 }

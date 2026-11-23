@@ -12,6 +12,7 @@ use std::fs;
 use derec_library::protocol::{
     AutoAcceptPolicy, DeRecProtocolConfig, ExpiredChannelsConfig, TimeoutsConfig, UnpairAck,
 };
+use derec_library::protocol_version::ProtocolVersion;
 use derec_proto::Protocol;
 use serde_json::Value;
 
@@ -49,6 +50,7 @@ fn full_fixture_sets_every_field() {
         communication_info,
         own_transports,
         replica_id,
+        min_protocol_version,
     } = c;
 
     assert_eq!(threshold, Some(3));
@@ -100,6 +102,10 @@ fn full_fixture_sets_every_field() {
     assert_eq!(transports[0].protocol, Protocol::Https);
     assert_eq!(transports[1].protocol, Protocol::Grpc);
     assert_eq!(replica_id, Some(9_007_199_254_740_993));
+    assert_eq!(
+        min_protocol_version,
+        Some(ProtocolVersion { major: 0, minor: 1 })
+    );
 }
 
 #[test]

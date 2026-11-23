@@ -36,17 +36,21 @@
 //! # Security: replay detection belongs to the transport
 //!
 //! The library processes a copy of a message as often as it is delivered
-//! within the inbound window. The application's transport layer MUST detect
-//! copies, of what it received and of what it sent, keyed on
-//! [`message_id`]; see the security note on
-//! [`crate::protocol::DeRecProtocol::process`] for the full contract.
+//! within the inbound window. Detecting copies, of what it received and of
+//! what it sent, is the application's job; see the security note on
+//! [`crate::protocol::DeRecProtocol::process`]. [`encrypted_payload`] reads
+//! the part of an envelope that is safe to key that detection on.
 
-use crate::{Error, primitives::pairing::PairingError, types::SharedKey, utils::random_u64};
+use crate::{
+    Error,
+    primitives::pairing::PairingError,
+    types::SharedKey,
+    utils::{random_u64, verify_protocol_version},
+};
 use derec_cryptography::channel;
 use derec_cryptography::pairing::{PairingSecretKeyMaterial, envelope};
 use derec_proto::{DeRecMessage, MessageBody};
 use prost::Message;
-use sha2::{Digest, Sha256};
 
 mod builder;
 pub use builder::*;
@@ -55,6 +59,28 @@ pub use error::*;
 
 #[cfg(test)]
 mod tests;
+
+/// Decrypt and decode a channel envelope's payload under `shared_key`, and
+/// check that the protocol version it carries equals the envelope's.
+pub(crate) fn open_channel_message(
+    envelope: &DeRecMessage,
+    shared_key: &SharedKey,
+) -> Result<MessageBody, Error> {
+    let decrypted = decrypt_inner_message(&envelope.message, shared_key)?;
+    let (body, version) =
+        MessageBody::decode_versioned(&decrypted).map_err(Error::ProtobufDecode)?;
+    verify_protocol_version(envelope, version)?;
+    Ok(body)
+}
+
+/// Decode a plaintext `PrePair` envelope's payload, and check that the
+/// protocol version it carries equals the envelope's.
+pub(crate) fn open_plaintext_message(envelope: &DeRecMessage) -> Result<MessageBody, Error> {
+    let (body, version) =
+        MessageBody::decode_versioned(&envelope.message).map_err(Error::ProtobufDecode)?;
+    verify_protocol_version(envelope, version)?;
+    Ok(body)
+}
 
 pub fn extract_inner_message(
     message_bytes: &[u8],
@@ -136,56 +162,43 @@ pub fn read_sequence(envelope_bytes: &[u8]) -> Result<u32, Error> {
     Ok(envelope.sequence)
 }
 
-/// The identity of one delivered message, read off its envelope without the
-/// channel key. See [`message_id`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct MessageId {
-    /// SHA-256 of the envelope's encrypted `message` field.
-    pub id: [u8; 32],
-    /// The envelope's send time, in seconds since the Unix epoch.
-    pub timestamp: u64,
-}
-
-/// Identify an envelope for replay and reflection detection.
+/// Read the encrypted `message` field off an envelope, without the channel
+/// key.
 ///
-/// Detecting a message delivered twice is the application's job, since it
-/// owns the transport. What to keep, for how long, and that the record must
-/// survive a restart is set out on
-/// [`process`](crate::protocol::DeRecProtocol::process). `id` is the same for
-/// every copy of one message and different for every other message:
-///
-/// - It covers only the encrypted `message` field. The cleartext fields
-///   around it (`sequence`, `traceId`, the protocol version) are not
-///   authenticated, and protobuf accepts more than one encoding of the same
-///   envelope, so a copy can arrive as different bytes and still be
-///   accepted. A hash of the raw envelope therefore does not identify it.
-/// - Changing the `message` field fails decryption, and every message is
-///   sealed under a fresh random nonce, so no other message, not even one
-///   with the same body, has the same `id`.
-///
-/// `timestamp` is the envelope's cleartext send time. Once
-/// [`process`](crate::protocol::DeRecProtocol::process) accepts the message
-/// it is proven equal to the authenticated time inside it.
+/// This is the part of an envelope an application can key duplicate
+/// detection on. It cannot be changed without failing decryption, and every
+/// message is sealed under a fresh random nonce, so it is the same for every
+/// copy of one message and different for every other message, even one with
+/// the same body. The cleartext fields around it (`sequence`, `traceId`)
+/// are not authenticated, and protobuf accepts more than one encoding of the
+/// same envelope, so a copy can arrive as different bytes: a hash of the raw
+/// envelope does not identify a message. How to key on these bytes (as they
+/// are, or hashed) and for how long is the application's choice; see the
+/// security note on [`crate::protocol::DeRecProtocol::process`].
 ///
 /// The plaintext `PrePair` leg of `HashedKeys` pairing is the exception: its
-/// `message` field is not encrypted, so a copy re-encoded inside it gets a
-/// different `id`. That leg is not authenticated at all; the contact's nonce
-/// is what binds it.
+/// `message` field is not encrypted, so a copy re-encoded inside it reads
+/// differently. That leg is not authenticated at all; the contact's nonce is
+/// what binds it.
 ///
 /// # Errors
 ///
-/// [`Error::ProtobufDecode`] when the bytes are not an envelope, and
-/// [`Error::InvalidInput`] when it carries no timestamp, which the protocol
-/// never accepts.
-pub fn message_id(envelope_bytes: &[u8]) -> Result<MessageId, Error> {
+/// [`Error::ProtobufDecode`] when the bytes are not an envelope.
+pub fn encrypted_payload(envelope_bytes: &[u8]) -> Result<Vec<u8>, Error> {
     let envelope = DeRecMessage::decode(envelope_bytes).map_err(Error::ProtobufDecode)?;
-    let timestamp = envelope
-        .timestamp
-        .ok_or(Error::InvalidInput("envelope carries no timestamp"))?;
-    Ok(MessageId {
-        id: Sha256::digest(&envelope.message).into(),
-        timestamp: u64::try_from(timestamp.seconds).unwrap_or(0),
-    })
+    Ok(envelope.message)
+}
+
+/// Decrypt and decode a pairing envelope's payload, returning the protocol
+/// version it carries alongside it for the caller to check against the
+/// envelope's.
+pub(crate) fn decode_pairing_payload(
+    message_bytes: &[u8],
+    pairing_secret: &PairingSecretKeyMaterial,
+) -> Result<(MessageBody, (u32, u32)), Error> {
+    let decrypted = envelope::decrypt(message_bytes, pairing_secret.ecies_secret_key())
+        .map_err(PairingError::PairingEncryption)?;
+    MessageBody::decode_versioned(&decrypted).map_err(Error::ProtobufDecode)
 }
 
 pub fn extract_inner_pairing_message(

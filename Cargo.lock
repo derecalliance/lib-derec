@@ -634,6 +634,7 @@ dependencies = [
  "derec-library",
  "derec-proto",
  "prost",
+ "serde_json",
  "tokio",
 ]
 

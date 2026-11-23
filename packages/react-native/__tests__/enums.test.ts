@@ -67,6 +67,8 @@ const NAME_UNIONS: Record<string, Record<string, true>> = {
     TimestampMismatch: true,
     StaleResponse: true,
     Superseded: true,
+    ProtocolVersionTooOld: true,
+    ProtocolVersionMismatch: true,
     KeyUnavailable: true,
   } satisfies Record<IgnoreReason, true>,
   NotRestoredReason: { NoTransports: true } satisfies Record<NotRestoredReason, true>,

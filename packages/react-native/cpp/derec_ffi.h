@@ -42,14 +42,15 @@
  * fields this build cannot see and writing the truncated result back.
  *
  * The value tracks the release that last changed the shape, not the release
- * that is current: it moved to 3 when `transport` became `transports`, and
- * stays there until the next shape change.
+ * that is current: it moved to 3 when `transport` became `transports`, to 4
+ * when [`ReplicaMember::handover_channel`] was added, and stays there until
+ * the next shape change.
  *
  * Declared unconditionally, unlike the serde impls that stamp it: the SDK
  * bridges mirror this number in their own encoders, and a constant they must
  * agree with should not appear and disappear with a feature flag.
  */
-#define CHANNEL_RECORD_SCHEMA_VERSION 3
+#define CHANNEL_RECORD_SCHEMA_VERSION 4
 
 /**
  * Latest encoding major version, used for all new encodes. Bump only on a
@@ -598,19 +599,13 @@ typedef struct ReadSequenceResult {
   uint32_t sequence;
 } ReadSequenceResult;
 
-typedef struct MessageIdResult {
+typedef struct EncryptedPayloadResult {
   struct DeRecError error;
   /**
-   * SHA-256 of the envelope's encrypted `message` field (32 bytes). Empty
-   * on error.
+   * The envelope's encrypted `message` field. Empty on error.
    */
-  struct DeRecBuffer id;
-  /**
-   * The envelope's send time, in seconds since the Unix epoch. Zero on
-   * error.
-   */
-  uint64_t timestamp;
-} MessageIdResult;
+  struct DeRecBuffer payload;
+} EncryptedPayloadResult;
 
 /**
  * Result of a message JSON codec call. `bytes` is UTF-8 JSON for
@@ -1562,17 +1557,18 @@ struct ReadSequenceResult read_sequence_from_envelope(const uint8_t *envelope_pt
                                                       size_t envelope_len);
 
 /**
- * Identify an envelope for replay and reflection detection: the same `id`
- * for every copy of one message, whatever its unauthenticated cleartext
- * fields say, and a different one for every other message.
+ * Read the encrypted `message` field off an envelope, without the channel
+ * key: the part of an envelope the application's duplicate detection can
+ * key on.
  *
- * Mirrors [`crate::derec_message::message_id`].
+ * Mirrors [`crate::derec_message::encrypted_payload`].
  *
  * # Safety
  *
  * `envelope_ptr` must point to a readable byte range of length `envelope_len`.
  */
-struct MessageIdResult message_id_from_envelope(const uint8_t *envelope_ptr, size_t envelope_len);
+struct EncryptedPayloadResult encrypted_payload_from_envelope(const uint8_t *envelope_ptr,
+                                                              size_t envelope_len);
 
 /**
  * Releases the owned strings carried by a [`DeRecError`]. After

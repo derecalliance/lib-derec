@@ -22,7 +22,8 @@ use crate::protocol::handlers::sharing::subshare_count;
 use crate::protocol::obligation::{Obligation, attempted, deliver, refused, reported};
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::types::{
-    ChannelQuery, ChannelShare, ReplicaMember, ReplicaRole, ReplicaSecretPayload, Share, UserSecret,
+    ChannelQuery, ChannelShare, ReplicaFilter, ReplicaMember, ReplicaRole, ReplicaSecretPayload,
+    Share, UserSecret,
 };
 use crate::protocol::{
     ChannelKey, DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, SecretKind,
@@ -42,6 +43,140 @@ use derec_proto::{
 };
 use prost::Message;
 use std::cmp::Ordering;
+use std::collections::HashMap;
+
+/// Complete the admission handover of `author` when a message from it
+/// arrives on this device's group channel.
+///
+/// A member this device admitted stays recorded on the ephemeral channel of
+/// that pairing until it holds the group key (see the sharing handler's
+/// admission handover). A message from it on `channel_id` that decrypted
+/// under the group channel's key proves it does: it is moved onto the group
+/// channel, and the ephemeral key is dropped.
+///
+/// Applies only when this device's own member row is on `channel_id`, so
+/// `channel_id` is the group channel, and only to a member this device has
+/// confirmed. Returns whether a member was moved; `false` leaves the caller
+/// to refuse the message as it would any member named on a channel it is not
+/// recorded on.
+pub(in crate::protocol) async fn complete_handover<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    channel_id: ChannelId,
+    author: u64,
+) -> Result<bool> {
+    use crate::protocol::types::{ChannelRecord, ChannelStatus};
+
+    let (Some(own_id), Ok(author)) = (local.replica_id, ReplicaId::try_from(author)) else {
+        return Ok(false);
+    };
+    let secret_id = local.secret_id;
+    let member = |replica_id| ChannelQuery::Replica {
+        channel_id,
+        replica_id,
+    };
+    let own_on_channel = stores
+        .channels
+        .load(secret_id, member(ReplicaId(own_id)))
+        .await?
+        .and_then(|record| record.as_replica().cloned())
+        .is_some_and(|own| own.channel_id == channel_id);
+    if !own_on_channel {
+        return Ok(false);
+    }
+    let Some(joiner) = stores
+        .channels
+        .load(secret_id, member(author))
+        .await?
+        .and_then(|record| record.as_replica().cloned())
+        .filter(|m| m.channel_id != channel_id && m.status == ChannelStatus::Paired)
+    else {
+        return Ok(false);
+    };
+
+    let ephemeral = joiner.channel_id;
+    stores
+        .channels
+        .save(
+            secret_id,
+            ChannelRecord::Replica(ReplicaMember {
+                channel_id,
+                handover_channel: None,
+                ..joiner
+            }),
+        )
+        .await?;
+    let _ = stores
+        .secrets
+        .remove_many(
+            secret_id,
+            &[
+                (ephemeral, SecretKind::SharedKey),
+                (ephemeral, SecretKind::KeyRing),
+            ],
+        )
+        .await;
+
+    #[cfg(feature = "logging")]
+    tracing::info!(
+        ephemeral_channel_id = ephemeral.0,
+        group_channel_id = channel_id.0,
+        replica_id = author.0,
+        "admitted member moved onto the group channel"
+    );
+    Ok(true)
+}
+
+/// Drop the channel `member` handed the group over on, once it has moved on.
+///
+/// The member that admitted this device keeps sending on the pairing channel
+/// until it learns this device holds the group key (see
+/// [`ReplicaMember::handover_channel`]). A message from it on any other
+/// channel, which can only be the group channel, shows it has: the pairing
+/// key is removed and the field cleared. Nothing to do for a member with no
+/// handover channel, or for one reached on that channel.
+pub(in crate::protocol) async fn release_handover<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    member: &ReplicaMember,
+    channel_id: ChannelId,
+) -> Result<()> {
+    use crate::protocol::types::ChannelRecord;
+
+    let Some(handover) = member.handover_channel.filter(|&h| h != channel_id) else {
+        return Ok(());
+    };
+    let secret_id = local.secret_id;
+    stores
+        .channels
+        .save(
+            secret_id,
+            ChannelRecord::Replica(ReplicaMember {
+                handover_channel: None,
+                ..member.clone()
+            }),
+        )
+        .await?;
+    let _ = stores
+        .secrets
+        .remove_many(
+            secret_id,
+            &[
+                (handover, SecretKind::SharedKey),
+                (handover, SecretKind::KeyRing),
+            ],
+        )
+        .await;
+
+    #[cfg(feature = "logging")]
+    tracing::info!(
+        handover_channel_id = handover.0,
+        group_channel_id = channel_id.0,
+        replica_id = member.replica_id.0,
+        "admitting member reached this device on the group channel; handover channel dropped"
+    );
+    Ok(())
+}
 
 /// How an incoming copy of the secret relates to the one this device holds.
 pub(in crate::protocol) enum Arrival {
@@ -322,11 +457,21 @@ pub(in crate::protocol) fn check<'a>(
 /// [`VerifySharesFailed`](crate::protocol::DeRecEvent::VerifySharesFailed)
 /// with `NoProof`.
 ///
+/// # Handover channel
+///
+/// A copy that arrived on a channel other than the roster's group channel is
+/// an admission handover: `sender`, the member it arrived from, is recorded
+/// with that channel as its
+/// [`handover_channel`](ReplicaMember::handover_channel), and the key there
+/// is kept. Every other member keeps the handover channel it already had, so
+/// a later copy does not erase one still in use.
+///
 /// Returns the group channel and its key when the payload carried a roster,
 /// so the caller can acknowledge there.
 pub(in crate::protocol) async fn hydrate<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
+    (arrived_on, sender): (ChannelId, ReplicaId),
     version: u32,
     checked: &Checked<'_>,
     description: String,
@@ -384,7 +529,20 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
         return Ok(None);
     };
 
+    let handover_channels: HashMap<ReplicaId, ChannelId> = stores
+        .channels
+        .replicas_matching(secret_id, ReplicaFilter::default())
+        .await?
+        .into_iter()
+        .filter_map(|m| m.handover_channel.map(|h| (m.replica_id, h)))
+        .collect();
+
     for (member, (replica_id, role)) in roster.members.iter().zip(&group.members) {
+        let handover_channel = if arrived_on != group.channel_id && *replica_id == sender {
+            Some(arrived_on)
+        } else {
+            handover_channels.get(replica_id).copied()
+        };
         stores
             .channels
             .save(
@@ -400,6 +558,7 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
                     role: *role,
                     status: ChannelStatus::Paired,
                     created_at: now_secs(),
+                    handover_channel,
                 }),
             )
             .await?;
@@ -480,10 +639,14 @@ async fn seat_ring<S: StoreSet>(
 /// If the payload carries a non-empty `shared_key` (32 bytes), the
 /// sender is asking us to adopt the replica-group key for this
 /// `secret_id`. Hydration saves it as the group channel's key and moves
-/// every member onto the group channel, and the ack travels there under
-/// the group key. The ephemeral pairing channel the request arrived on is
-/// then dropped: the sender moved this device onto the group channel when
-/// it sent the request, so all later traffic arrives there.
+/// every member onto the group channel, and every answer travels there
+/// under the group key. The pairing channel the request arrived on is kept
+/// as the sender's
+/// [`handover_channel`](crate::protocol::types::ReplicaMember::handover_channel):
+/// the sender keeps sending there until it receives this device's answer on
+/// the group channel, so a copy re-sent after a lost answer is still read and
+/// answered. The pairing key is dropped when the sender first reaches this
+/// device on the group channel.
 ///
 /// The embedded `shared_key` is delivered inside an already-decrypted
 /// authenticated envelope (the pair-handshake key authenticated the
@@ -567,15 +730,13 @@ async fn on_request<S: StoreSet>(
     };
     let shares = composite.shares;
 
-    // An admission handover carries the group key: the admitter dropped the
-    // ephemeral key when it sent this copy, so a refusal under that key
-    // could never be read. The admitter holds the key it sent, and the
-    // roster names the group channel, so the refusal goes there. A handover
-    // whose key is not 32 bytes or whose roster names no group leaves no
-    // channel the admitter can read, and neither does one that does not
-    // decode: those refusals are sent where the request arrived and the
-    // admitter learns of them only by timing out. The refusal goes out at
-    // the group channel's epoch, which the roster records with its key.
+    // An admission handover carries the group key, and every answer to it
+    // goes to the group channel under that key: the admitter holds the key it
+    // sent, and an answer there is what tells it this device holds the
+    // handover. A handover whose key is not 32 bytes or whose roster names no
+    // group leaves no such channel, and neither does one that does not
+    // decode: those are answered where the request arrived. The answer goes
+    // out at the group channel's epoch, which the roster records with its key.
     if let (Ok(group_key), Some(group)) = (
         <SharedKey>::try_from(composite.shared_key.as_slice()),
         secret.replicas.as_ref(),
@@ -636,7 +797,7 @@ async fn on_request<S: StoreSet>(
                     local,
                     channel,
                     &request,
-                    (channel.channel_id, key),
+                    reply,
                     StatusEnum::Ok,
                     "",
                     inbound_trace_id,
@@ -653,7 +814,7 @@ async fn on_request<S: StoreSet>(
                     local,
                     channel,
                     &request,
-                    (channel.channel_id, key),
+                    reply,
                     StatusEnum::VersionConflict,
                     "a different copy of this version is already held",
                     inbound_trace_id,
@@ -682,7 +843,7 @@ async fn on_request<S: StoreSet>(
                     local,
                     channel,
                     &request,
-                    (channel.channel_id, key),
+                    reply,
                     StatusEnum::VersionConflict,
                     "a newer version is already held",
                     inbound_trace_id,
@@ -720,7 +881,8 @@ async fn on_request<S: StoreSet>(
     // A copy arriving on the group channel pins its version there before it
     // is applied; once applied it is the only copy held, so the pins of every
     // other version then go. A copy on an admission channel pins nothing: that
-    // channel is dropped once the copy is applied.
+    // channel only carries the handover, and its key is dropped once the
+    // admitter reaches this device on the group channel.
     let on_group = secret
         .replicas
         .as_ref()
@@ -737,6 +899,7 @@ async fn on_request<S: StoreSet>(
     let hydrated = hydrate(
         stores,
         local,
+        (channel.channel_id, channel.replica_id),
         version,
         &checked,
         request.version_description.clone(),
@@ -797,31 +960,6 @@ async fn on_request<S: StoreSet>(
     // From here the copy is hydrated and the acknowledgement attempted, so
     // what follows completes the committed state; a failure in it is
     // reported after that state's events, never answered a second time.
-
-    // Admission handover: the sync arrived on the ephemeral channel minted
-    // by the pairing with the admitter. Hydration has already moved every
-    // member onto the group channel, so the only thing left at the ephemeral
-    // id is its key. The admitter dropped its side when it sent the sync.
-    if ack_channel != channel.channel_id {
-        let _ = stores
-            .secrets
-            .remove_many(
-                partition,
-                &[
-                    (channel.channel_id, SecretKind::SharedKey),
-                    (channel.channel_id, SecretKind::KeyRing),
-                ],
-            )
-            .await;
-
-        #[cfg(feature = "logging")]
-        tracing::info!(
-            ephemeral_channel_id = channel.channel_id.0,
-            group_channel_id = ack_channel.0,
-            secret_id,
-            "admission handover complete; ephemeral channel dropped"
-        );
-    }
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -1068,6 +1206,7 @@ mod tests {
                     role,
                     status: ChannelStatus::Paired,
                     created_at: 0,
+                    handover_channel: None,
                 }),
             )
             .await
@@ -1138,6 +1277,7 @@ mod tests {
             super::hydrate(
                 &mut rig.stores(),
                 &lf.local(),
+                (ChannelId(0), ReplicaId(0)),
                 4,
                 &super::check(&secret, &[]).expect("a well-formed roster"),
                 String::new(),
@@ -1219,6 +1359,7 @@ mod tests {
             super::hydrate(
                 &mut rig.stores(),
                 &lf.local(),
+                (ChannelId(0), ReplicaId(0)),
                 4,
                 &super::check(&secret, &[]).expect("a well-formed roster"),
                 String::new(),
@@ -1292,6 +1433,7 @@ mod tests {
             super::hydrate(
                 &mut rig.stores(),
                 &lf.local(),
+                (ChannelId(0), ReplicaId(0)),
                 4,
                 &super::check(&secret, &shares).expect("a well-formed roster"),
                 String::new(),
@@ -1337,6 +1479,7 @@ mod tests {
                 communication_info: HashMap::new(),
                 status: ChannelStatus::Paired,
                 created_at: 0,
+                handover_channel: None,
                 role: ReplicaRole::Destination,
             };
 
@@ -2345,7 +2488,7 @@ mod tests {
             ChannelShare, HelperInfo, ReplicaInfo, ReplicaSecretPayload, Replicas, Secret,
         };
         use crate::protocol::{
-            DeRecEvent, DeRecFlow, DeRecProtocol, DeRecSecretStore as _, SecretValue,
+            DeRecEvent, DeRecFlow, DeRecProtocol, DeRecSecretStore as _, SecretKind, SecretValue,
         };
         use derec_proto::{
             CommittedDeRecShare, DeRecMessage, MessageBody, StatusEnum, StoreShareResponseMessage,
@@ -2621,6 +2764,7 @@ mod tests {
                     role: ReplicaRole::Destination,
                     status: ChannelStatus::Paired,
                     created_at: 0,
+                    handover_channel: None,
                 };
                 let seen = on_response(GROUP_CHANNEL, &responder, &response)
                     .expect("the answer is handled");
@@ -2759,6 +2903,7 @@ mod tests {
                             role,
                             status: ChannelStatus::Paired,
                             created_at: 0,
+                            handover_channel: None,
                         }),
                     )
                     .await
@@ -2905,6 +3050,274 @@ mod tests {
                     ),
                     "{seen:?}"
                 );
+            });
+        }
+
+        const OTHER: u64 = 1003;
+
+        /// The group the admitter hands over: itself, this device, and one
+        /// more member already on the group channel.
+        fn group_roster() -> Secret {
+            let mut secret = roster(&[]);
+            if let Some(group) = secret.replicas.as_mut() {
+                group.members.push(ReplicaInfo {
+                    replica_id: OTHER,
+                    transports: vec![endpoint("https://other")],
+                    role: ReplicaRole::Destination as i32,
+                    communication_info: HashMap::new(),
+                });
+            }
+            secret
+        }
+
+        /// A copy of `version` from `sender`, sealed for `channel` under
+        /// `key`. A copy on any channel but the group channel carries the
+        /// group key, as an admitter's does until it moves the joiner.
+        fn copy(
+            channel: ChannelId,
+            key: &crate::types::SharedKey,
+            sender: u64,
+            version: u32,
+        ) -> Vec<u8> {
+            let payload = ReplicaSecretPayload {
+                secret: Some(group_roster()),
+                shares: Vec::new(),
+                shared_key: if channel == GROUP_CHANNEL {
+                    Vec::new()
+                } else {
+                    GROUP_KEY.as_bytes().to_vec()
+                },
+                version,
+                author_replica_id: Some(sender),
+            };
+            let timestamp = current_timestamp();
+            DeRecMessageBuilder::channel()
+                .channel_id(channel)
+                .timestamp(timestamp)
+                .message_body(MessageBody::StoreShareRequest(StoreShareRequestMessage {
+                    secret_id: SECRET_ID,
+                    share: payload.encode_to_vec(),
+                    version,
+                    replica_id: Some(sender),
+                    timestamp: Some(timestamp),
+                    ..Default::default()
+                }))
+                .encrypt(&crate::types::ChannelKey::new(0, key.clone()))
+                .expect("encrypt")
+                .build()
+                .expect("build")
+                .encode_to_vec()
+        }
+
+        fn member(rig: &Rig, replica_id: u64) -> ReplicaMember {
+            rig.channels
+                .member_rows
+                .lock()
+                .unwrap()
+                .get(&(SECRET_ID, replica_id))
+                .cloned()
+                .expect("member row")
+        }
+
+        fn holds_pairing_key(rig: &Rig) -> bool {
+            rig.secrets.data.lock().unwrap().contains_key(&(
+                SECRET_ID,
+                EPHEMERAL.0,
+                SecretKind::SharedKey as u8,
+            ))
+        }
+
+        fn last_sent_channel(rig: &Rig) -> ChannelId {
+            let sent = rig.transport.sent_envelopes();
+            let last = sent.last().expect("something was sent");
+            ChannelId(
+                DeRecMessage::decode(last.as_slice())
+                    .expect("envelope")
+                    .channel_id,
+            )
+        }
+
+        /// A joiner that installed the handover from the admitter.
+        async fn handed_over() -> Rig {
+            let mut joiner = joiner().await;
+            joiner
+                .protocol
+                .process(&copy(EPHEMERAL, &EPHEMERAL_KEY, ADMITTER, VERSION))
+                .await
+                .expect("the handover installs");
+            joiner
+        }
+
+        #[test]
+        fn a_handover_records_the_pairing_channel_on_the_admitters_row() {
+            run_async(async {
+                let joiner = handed_over().await;
+
+                for id in [ADMITTER, SELF_ID, OTHER] {
+                    assert_eq!(member(&joiner, id).channel_id, GROUP_CHANNEL, "member {id}");
+                }
+                assert_eq!(member(&joiner, ADMITTER).handover_channel, Some(EPHEMERAL));
+                assert_eq!(member(&joiner, SELF_ID).handover_channel, None);
+                assert_eq!(member(&joiner, OTHER).handover_channel, None);
+                assert!(holds_pairing_key(&joiner));
+                assert_eq!(last_sent_channel(&joiner), GROUP_CHANNEL, "the ack");
+            });
+        }
+
+        /// The admitter's acknowledgement was lost, so it sends its copy on
+        /// the pairing channel again: still read, and answered on the group
+        /// channel, where the answer completes the move on the admitter.
+        #[test]
+        fn a_copy_resent_on_the_pairing_channel_is_answered_on_the_group_channel() {
+            run_async(async {
+                let mut joiner = handed_over().await;
+
+                let events = joiner
+                    .protocol
+                    .process(&copy(EPHEMERAL, &EPHEMERAL_KEY, ADMITTER, VERSION))
+                    .await
+                    .expect("the resent copy is read");
+
+                assert!(
+                    matches!(events.as_slice(), [DeRecEvent::NoOp]),
+                    "{events:?}"
+                );
+                assert_eq!(joiner.transport.sent_envelopes().len(), 2);
+                assert_eq!(last_sent_channel(&joiner), GROUP_CHANNEL);
+                assert!(holds_pairing_key(&joiner));
+            });
+        }
+
+        #[test]
+        fn a_newer_copy_on_the_pairing_channel_is_installed() {
+            run_async(async {
+                let mut joiner = handed_over().await;
+
+                let events = joiner
+                    .protocol
+                    .process(&copy(EPHEMERAL, &EPHEMERAL_KEY, ADMITTER, VERSION + 1))
+                    .await
+                    .expect("the newer copy is read");
+
+                assert!(
+                    matches!(
+                        events.as_slice(),
+                        [DeRecEvent::ReplicaSecretReceived { version, .. }] if *version == VERSION + 1
+                    ),
+                    "{events:?}"
+                );
+                assert_eq!(last_sent_channel(&joiner), GROUP_CHANNEL);
+                assert_eq!(member(&joiner, ADMITTER).handover_channel, Some(EPHEMERAL));
+                assert!(holds_pairing_key(&joiner));
+            });
+        }
+
+        /// The admitter reaching this device on the group channel shows it
+        /// moved this device there: the pairing channel is dropped.
+        #[test]
+        fn the_admitters_first_message_on_the_group_channel_drops_the_pairing_key() {
+            run_async(async {
+                let mut joiner = handed_over().await;
+
+                joiner
+                    .protocol
+                    .process(&copy(GROUP_CHANNEL, &GROUP_KEY, ADMITTER, VERSION + 1))
+                    .await
+                    .expect("the copy on the group channel is read");
+
+                assert_eq!(member(&joiner, ADMITTER).channel_id, GROUP_CHANNEL);
+                assert_eq!(member(&joiner, ADMITTER).handover_channel, None);
+                assert!(!holds_pairing_key(&joiner));
+                assert!(
+                    joiner
+                        .protocol
+                        .process(&copy(EPHEMERAL, &EPHEMERAL_KEY, ADMITTER, VERSION + 2))
+                        .await
+                        .is_err(),
+                    "nothing is read on the dropped channel"
+                );
+            });
+        }
+
+        /// Another member reaching this device on the group channel says
+        /// nothing about the admitter, which may still be sending on the
+        /// pairing channel.
+        #[test]
+        fn another_members_message_on_the_group_channel_keeps_the_pairing_key() {
+            run_async(async {
+                let mut joiner = handed_over().await;
+
+                joiner
+                    .protocol
+                    .process(&copy(GROUP_CHANNEL, &GROUP_KEY, OTHER, VERSION + 1))
+                    .await
+                    .expect("the other member's copy is read");
+
+                assert_eq!(member(&joiner, ADMITTER).handover_channel, Some(EPHEMERAL));
+                assert!(holds_pairing_key(&joiner));
+                joiner
+                    .protocol
+                    .process(&copy(EPHEMERAL, &EPHEMERAL_KEY, ADMITTER, VERSION + 2))
+                    .await
+                    .expect("the admitter's copy on the pairing channel is still read");
+            });
+        }
+
+        /// Only the admitter is read on the pairing channel.
+        #[test]
+        fn another_member_named_on_the_pairing_channel_is_refused() {
+            run_async(async {
+                let mut joiner = handed_over().await;
+
+                let events = joiner
+                    .protocol
+                    .process(&copy(EPHEMERAL, &EPHEMERAL_KEY, OTHER, VERSION + 1))
+                    .await
+                    .expect("a refusal is an outcome");
+
+                assert!(
+                    matches!(
+                        events.as_slice(),
+                        [DeRecEvent::RequestFailed { message, .. }]
+                            if message.contains("names a member that is not in the group")
+                    ),
+                    "{events:?}"
+                );
+                assert_eq!(
+                    joiner.user_secrets.data.lock().unwrap()[&SECRET_ID].version,
+                    VERSION
+                );
+            });
+        }
+
+        /// This device sends to every member on the group channel, the
+        /// admitter included, whatever the admitter has yet to learn.
+        #[test]
+        fn the_joiner_publishes_to_the_admitter_on_the_group_channel() {
+            run_async(async {
+                let mut joiner = handed_over().await;
+
+                joiner
+                    .protocol
+                    .start(DeRecFlow::ProtectSecret {
+                        secrets: Vec::new(),
+                        description: None,
+                        weights: HashMap::new(),
+                        threshold: None,
+                    })
+                    .await
+                    .expect("the joiner publishes");
+
+                let sent = joiner.transport.sent_envelopes();
+                let uris = joiner.transport.sent_uris();
+                let to_admitter = uris
+                    .iter()
+                    .rposition(|uri| uri == "https://source")
+                    .expect("a copy for the admitter");
+                let envelope =
+                    DeRecMessage::decode(sent[to_admitter].as_slice()).expect("envelope");
+                assert_eq!(ChannelId(envelope.channel_id), GROUP_CHANNEL);
+                assert!(extract_inner_message(&envelope.message, &GROUP_KEY).is_ok());
             });
         }
 

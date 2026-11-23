@@ -27,9 +27,11 @@ use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::interop::wasm::now_secs;
 use crate::protocol::IgnoreReason;
 use crate::protocol::types::{ChannelQuery, ChannelStatus, ReplicaFilter};
+use crate::protocol_version::ProtocolVersion;
 use crate::types::{ChannelId, ChannelKey};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
+use crate::utils::verify_protocol_version;
 use crate::{Error, Result};
 use derec_proto::{DeRecMessage, PrePairRequestMessage, PrePairResponseMessage};
 use prost::Message;
@@ -120,24 +122,17 @@ impl<
     /// is ignored as `Expired`, but within that window this function keeps
     /// no record of what it has processed: a copy of a message is processed
     /// again. Both ends of a channel encrypt under one key, so a message this
-    /// device sent, delivered back to it, decrypts too. Detecting both
-    /// belongs to the **application's transport layer**, keyed on
-    /// [`message_id`](crate::derec_message::message_id):
-    ///
-    /// - Keep the `id` of every envelope this function accepted, and of
-    ///   every envelope this device sends, until
-    ///   `max(received or sent at, timestamp) + inbound_message`. A
-    ///   `timestamp` ahead of this device's clock stays acceptable for
-    ///   longer than the window measured from arrival.
-    /// - Drop an inbound envelope whose `id` is kept, without calling this
-    ///   function.
-    /// - Record an inbound `id` only once this function returned `Ok`
-    ///   without [`DeRecEvent::MessageIgnored`]: a corrupted copy raced
-    ///   ahead of the real message must not get the real one dropped.
-    /// - Keep the record across restarts, or hold inbound traffic for one
-    ///   window after starting.
-    /// - Never key on a hash of the raw envelope: its cleartext fields are
-    ///   not authenticated and a copy can arrive as different bytes.
+    /// device sent, delivered back to it, decrypts too. Detecting both is the
+    /// **application's** job, and how is its choice. One that keys on the
+    /// envelope's encrypted `message` field
+    /// ([`crate::derec_message::encrypted_payload`] reads it) gets a key that
+    /// cannot be changed
+    /// without failing decryption, and that differs for every message, since
+    /// each is sealed under a fresh nonce; a hash of the raw envelope does
+    /// not work, because `sequence` and `traceId` are not authenticated and a
+    /// copy can arrive as different bytes. Whatever the key, keep it for the
+    /// whole inbound window, measured from the later of arrival and the
+    /// envelope's `timestamp`, and across restarts.
     ///
     /// A message held back and delivered late is a first delivery, so no
     /// record catches it. Where its order matters to the protocol's own
@@ -272,6 +267,25 @@ impl<
         message: &DeRecMessage,
         channel_id: ChannelId,
     ) -> Result<Vec<DeRecEvent>> {
+        let version = ProtocolVersion {
+            major: message.protocol_version_major,
+            minor: message.protocol_version_minor,
+        };
+        if version < self.min_protocol_version {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                channel_id = channel_id.0,
+                major = version.major,
+                minor = version.minor,
+                "message ignored — protocol version below the configured minimum"
+            );
+            return Ok(vec![DeRecEvent::MessageIgnored {
+                channel_id,
+                reason: IgnoreReason::ProtocolVersionTooOld,
+                trace_id: message.trace_id,
+            }]);
+        }
+
         if message.is_expired(now_secs(), self.timeouts.inbound_message) {
             #[cfg(feature = "logging")]
             tracing::warn!(
@@ -420,15 +434,26 @@ impl<
     ) -> Result<Option<Vec<DeRecEvent>>> {
         use derec_proto::MessageBody;
 
-        if let Ok(inner) = derec_message::extract_inner_plaintext_message(&message.message) {
+        if let Ok((inner, payload_version)) = MessageBody::decode_versioned(&message.message) {
+            let version_mismatch = verify_protocol_version(message, payload_version)
+                .is_err()
+                .then(|| {
+                    vec![DeRecEvent::MessageIgnored {
+                        channel_id,
+                        reason: IgnoreReason::ProtocolVersionMismatch,
+                        trace_id: message.trace_id,
+                    }]
+                });
             match inner {
                 MessageBody::PrePairRequest(request) => {
                     return self
-                        .process_pre_pair_request(message, channel_id, &request)
+                        .process_pre_pair_request(message, channel_id, &request, version_mismatch)
                         .await;
                 }
                 MessageBody::PrePairResponse(response) => {
-                    return self.process_pre_pair_response(channel_id, &response).await;
+                    return self
+                        .process_pre_pair_response(channel_id, &response, version_mismatch)
+                        .await;
                 }
                 _ => {} // Fall through to the encrypted Pair path.
             }
@@ -457,11 +482,14 @@ impl<
 
     /// Handle a `PrePairRequest` on a channel this device holds a
     /// correlation record for, or return `None` when it holds neither kind.
+    /// `version_mismatch` is the event reporting a payload whose protocol
+    /// version differs from the envelope's, returned in place of handling.
     async fn process_pre_pair_request(
         &mut self,
         message: &DeRecMessage,
         channel_id: ChannelId,
         request: &PrePairRequestMessage,
+        version_mismatch: Option<Vec<DeRecEvent>>,
     ) -> Result<Option<Vec<DeRecEvent>>> {
         let has_pairing_secret = matches!(
             self.secret_store
@@ -477,6 +505,9 @@ impl<
         );
         if !has_pairing_secret && !has_pairing_contact {
             return Ok(None);
+        }
+        if let Some(ignored) = version_mismatch {
+            return Ok(Some(ignored));
         }
         if let Some(events) = handlers::pairing::ignored_if_expired(
             &mut borrow_stores!(self),
@@ -497,10 +528,13 @@ impl<
 
     /// Handle a `PrePairResponse` against the contact this device stored,
     /// or return `None` when it stored none for the channel.
+    /// `version_mismatch` is as for
+    /// [`process_pre_pair_request`](Self::process_pre_pair_request).
     async fn process_pre_pair_response(
         &mut self,
         channel_id: ChannelId,
         response: &PrePairResponseMessage,
+        version_mismatch: Option<Vec<DeRecEvent>>,
     ) -> Result<Option<Vec<DeRecEvent>>> {
         let Some(SecretValue::PairingContact(contact)) = self
             .secret_store
@@ -509,6 +543,9 @@ impl<
         else {
             return Ok(None);
         };
+        if let Some(ignored) = version_mismatch {
+            return Ok(Some(ignored));
+        }
         let events = handlers::pairing::pre_pair::on_response(
             &mut borrow_stores!(self),
             &local!(self),
@@ -564,6 +601,7 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::derec_message;
     use crate::derec_message::DeRecMessageBuilder;
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::tests::{
@@ -827,6 +865,7 @@ mod tests {
                     role,
                     status,
                     created_at: now_secs(),
+                    handover_channel: None,
                 }),
             )
             .await
@@ -1106,5 +1145,215 @@ mod tests {
             );
             assert!(transport.sent_envelopes().is_empty());
         });
+    }
+
+    mod minimum_protocol_version {
+        use super::*;
+        use crate::derec_message::apply_trace_id;
+        use crate::primitives::pairing::request::{create_contact, produce_pre_pair_request};
+        use derec_proto::ContactMode;
+
+        fn with_floor(
+            channels: InMemChannelStore,
+            secrets: InMemSecretStore,
+            transport: RecordingTransport,
+            floor: ProtocolVersion,
+        ) -> DeRecProtocol<
+            InMemChannelStore,
+            InMemShareStore,
+            InMemSecretStore,
+            InMemUserSecretStore,
+            InMemStateStore,
+            RecordingTransport,
+        > {
+            DeRecProtocolBuilder::new(SECRET_ID)
+                .with_channel_store(channels)
+                .with_share_store(InMemShareStore::default())
+                .with_secret_store(secrets)
+                .with_user_secret_store(InMemUserSecretStore::default())
+                .with_transport(transport)
+                .with_state_store(InMemStateStore)
+                .with_own_transports(["https://owner.example.com"])
+                .with_threshold(2)
+                .with_min_protocol_version(floor)
+                .build()
+                .expect("test protocol builds")
+        }
+
+        const OLDEST: ProtocolVersion = ProtocolVersion { major: 0, minor: 0 };
+        const CUTOFF: ProtocolVersion = ProtocolVersion { major: 0, minor: 1 };
+
+        /// `bytes` relabelled as version 0.0, the version an earlier release
+        /// writes.
+        fn as_version_0_0(bytes: &[u8]) -> Vec<u8> {
+            let mut envelope = DeRecMessage::decode(bytes).expect("envelope");
+            envelope.protocol_version_minor = 0;
+            envelope.encode_to_vec()
+        }
+
+        /// The request [`failing_request`] builds, as an earlier release
+        /// writes it: no version in the payload, version 0.0 on the envelope.
+        fn from_an_earlier_release() -> Vec<u8> {
+            let timestamp = derec_message::current_timestamp();
+            let body = MessageBody::VerifyShareRequest(derec_proto::VerifyShareRequestMessage {
+                secret_id: SECRET_ID,
+                version: 1,
+                nonce: 7,
+                timestamp: Some(timestamp),
+                reply_to_transports: Vec::new(),
+            });
+            DeRecMessage {
+                protocol_version_major: 0,
+                protocol_version_minor: 0,
+                sequence: 0,
+                channel_id: CHANNEL.0,
+                timestamp: Some(timestamp),
+                message: derec_cryptography::channel::encrypt_message(
+                    &body.encode_to_vec(),
+                    SHARED_KEY.as_bytes(),
+                    &[1u8; 32],
+                )
+                .expect("encrypt"),
+                trace_id: 0,
+            }
+            .encode_to_vec()
+        }
+
+        fn ignored_as_mismatch(events: &[DeRecEvent]) -> bool {
+            matches!(
+                events,
+                [DeRecEvent::MessageIgnored {
+                    reason: IgnoreReason::ProtocolVersionMismatch,
+                    ..
+                }]
+            )
+        }
+
+        async fn run(floor: ProtocolVersion, bytes: &[u8]) -> Result<Vec<DeRecEvent>> {
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed(&mut c, &mut s).await;
+            with_floor(channels, secrets, RecordingTransport::default(), floor)
+                .process(bytes)
+                .await
+                .map_err(|e| e.source)
+        }
+
+        fn processed(events: &[DeRecEvent]) -> bool {
+            events
+                .iter()
+                .any(|e| matches!(e, DeRecEvent::RequestFailed { .. }))
+        }
+
+        fn ignored_as_too_old(events: &[DeRecEvent]) -> bool {
+            matches!(
+                events,
+                [DeRecEvent::MessageIgnored {
+                    reason: IgnoreReason::ProtocolVersionTooOld,
+                    ..
+                }]
+            )
+        }
+
+        #[test]
+        fn a_current_message_is_accepted_at_either_floor() {
+            run_async(async {
+                for floor in [OLDEST, CUTOFF] {
+                    let events = run(floor, &failing_request()).await.expect("processed");
+                    assert!(processed(&events), "{floor:?}: {events:?}");
+                }
+            });
+        }
+
+        #[test]
+        fn a_message_from_an_earlier_version_is_accepted_by_default() {
+            run_async(async {
+                let events = run(OLDEST, &from_an_earlier_release())
+                    .await
+                    .expect("processed");
+                assert!(processed(&events), "{events:?}");
+            });
+        }
+
+        #[test]
+        fn a_message_below_the_floor_is_ignored_unread() {
+            run_async(async {
+                let channels = InMemChannelStore::default();
+                let secrets = InMemSecretStore::default();
+                let transport = RecordingTransport::default();
+                let (mut c, mut s) = (channels.clone(), secrets.clone());
+                seed(&mut c, &mut s).await;
+                let events = with_floor(channels, secrets, transport.clone(), CUTOFF)
+                    .process(&from_an_earlier_release())
+                    .await
+                    .expect("an ignored message is an outcome");
+                assert!(ignored_as_too_old(&events), "{events:?}");
+                assert!(transport.sent_envelopes().is_empty());
+            });
+        }
+
+        /// A current message relabelled 0.0 carries 0.1 in its encrypted
+        /// payload: it is ignored as a mismatch, or as too old once the floor
+        /// is raised, which is checked first.
+        #[test]
+        fn a_message_relabelled_to_an_earlier_version_is_ignored() {
+            run_async(async {
+                let relabelled = as_version_0_0(&failing_request());
+                let events = run(OLDEST, &relabelled).await.expect("ignored");
+                assert!(ignored_as_mismatch(&events), "{events:?}");
+                let events = run(CUTOFF, &relabelled).await.expect("ignored");
+                assert!(ignored_as_too_old(&events), "{events:?}");
+            });
+        }
+
+        /// A message from an earlier release relabelled 0.1 to pass the floor
+        /// carries no version in its payload, which reads as 0.0.
+        #[test]
+        fn an_earlier_message_relabelled_to_the_current_version_is_ignored() {
+            run_async(async {
+                let mut envelope =
+                    DeRecMessage::decode(from_an_earlier_release().as_slice()).expect("envelope");
+                envelope.protocol_version_minor = 1;
+                let events = run(CUTOFF, &envelope.encode_to_vec())
+                    .await
+                    .expect("ignored");
+                assert!(ignored_as_mismatch(&events), "{events:?}");
+            });
+        }
+
+        /// `traceId` is re-stamped after sealing, by the library and by
+        /// applications, so it is not covered.
+        #[test]
+        fn a_trace_id_stamped_after_sealing_is_accepted() {
+            run_async(async {
+                let bytes = apply_trace_id(&failing_request(), 0xFEED).expect("restamp");
+                let events = run(OLDEST, &bytes).await.expect("processed");
+                assert!(processed(&events), "{events:?}");
+            });
+        }
+
+        /// The floor is checked before routing, so it covers pairing
+        /// messages too.
+        #[test]
+        fn a_pairing_message_below_the_floor_is_ignored() {
+            run_async(async {
+                let contact = create_contact(
+                    ChannelId(9_999),
+                    ContactMode::NoKeys,
+                    vec![endpoint()],
+                    None,
+                )
+                .expect("contact")
+                .contact_message;
+                let pre_pair = produce_pre_pair_request(vec![endpoint()], &contact)
+                    .expect("pre-pair")
+                    .envelope;
+                let events = run(CUTOFF, &as_version_0_0(&pre_pair))
+                    .await
+                    .expect("ignored");
+                assert!(ignored_as_too_old(&events), "{events:?}");
+            });
+        }
     }
 }

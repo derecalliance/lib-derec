@@ -2,8 +2,8 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
-    ChannelRequest, DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore,
-    DeRecTransport, IgnoreReason, MissingPolicy, PendingAction, SecretKind, Share, ShareStoreError,
+    ChannelRequest, DeRecChannelStore, DeRecEvent, DeRecShareStore, DeRecTransport, IgnoreReason,
+    MissingPolicy, PendingAction, Share, ShareStoreError,
 };
 use super::pairing::own_communication_info;
 use super::replicas::sharing as replica;
@@ -149,7 +149,10 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 /// complete, so an interrupted round never leaves the version ahead of
 /// what peers actually received. Per-channel failures surface as
 /// `ProtectSecretFailed` and do not block the snapshot — the round stays
-/// addressable and failed peers retry on the next one.
+/// addressable and failed peers retry on the next one. With no peer paired
+/// at all there is nothing to distribute: the snapshot is saved at the next
+/// version and `Ok(None)` is returned, so the first publish that reaches a
+/// peer shares it.
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(trace_id = round.trace_id, secret_id = local.secret_id)))]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn start<S: StoreSet>(
@@ -181,7 +184,23 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     let threshold = round_threshold;
     let recorded_threshold = u32::try_from(threshold).ok();
 
+    // With no peer there is nothing to send, but the round still consumes a
+    // version and records its snapshot, so the publish that first reaches a
+    // peer shares it.
     if helpers.is_empty() && replicas.is_empty() {
+        stores
+            .user_secrets
+            .save_latest(
+                secret_id,
+                UserSecrets {
+                    version: previous.as_ref().map(|s| s.version + 1).unwrap_or(1),
+                    secrets,
+                    description,
+                    author_replica_id: local.replica_id,
+                    threshold: recorded_threshold,
+                },
+            )
+            .await?;
         return Ok(None);
     }
 
@@ -1044,15 +1063,14 @@ async fn load_all_paired_targets<S: StoreSet>(
     // deliberately includes our own row so the roster is reconstructible from
     // stores alone, so the exclusion is asked for here.
     //
-    // `Unpairing` members stay on the distribution list even though the roster
-    // built below drops them: receiving the version that excludes them is
-    // exactly how they learn their departure is complete.
+    // An `Unpairing` member is not a target: it was told to leave and drops
+    // everything when told, so nothing more is sent to it.
     let member_rows: Vec<_> = stores
         .channels
         .replicas_matching(
             secret_id,
             ReplicaFilter {
-                status: vec![ChannelStatus::Paired, ChannelStatus::Unpairing],
+                status: vec![ChannelStatus::Paired],
                 exclude: local.exclude_self(),
                 ..Default::default()
             },
@@ -1490,14 +1508,16 @@ async fn distribute_composite_to_destinations<S: StoreSet>(
 ///
 /// # Admission handover
 ///
-/// A member this device admitted since the last round is still recorded on
-/// the ephemeral channel of that pairing, under the pairing key. Its copy
-/// carries the group key, and the member moves onto the group channel as
-/// soon as it is sent: the member hydrates onto the group channel and drops
-/// the ephemeral one when it receives the copy, so every later message must
-/// already use the group channel. Waiting for the member's acknowledgement
-/// instead would strand it on a channel it no longer holds, for any publish
-/// sent before that acknowledgement lands, and for good if it never does.
+/// A member this device admitted since the last round is recorded on the
+/// ephemeral channel of that pairing, under the pairing key. Its copy
+/// carries the group key, and the member stays on the ephemeral channel
+/// after it is sent: this device moves it onto the group channel, and drops
+/// the ephemeral key, only when the member first speaks on the group channel
+/// under the group key, which proves it holds the handover. Until then every
+/// publish reaches it here, carrying the group key again, and a
+/// `ReplicaDiscovery` it sends here is answered, so a copy that arrived
+/// before the member confirmed the pairing, or never arrived, is recovered
+/// by the member asking.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_composite_to_destination<S: StoreSet>(
     stores: &mut Stores<'_, S>,
@@ -1542,36 +1562,6 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
     let envelope = apply_trace_id(&envelope_bytes, round.trace_id)?;
     stores.transport.send(&channel.transports, envelope).await?;
 
-    if let Some((group_channel, _)) = handover {
-        stores
-            .channels
-            .save(
-                local.secret_id,
-                ChannelRecord::Replica(ReplicaMember {
-                    channel_id: *group_channel,
-                    ..channel.clone()
-                }),
-            )
-            .await?;
-        let _ = stores
-            .secrets
-            .remove_many(
-                local.secret_id,
-                &[
-                    (channel.channel_id, SecretKind::SharedKey),
-                    (channel.channel_id, SecretKind::KeyRing),
-                ],
-            )
-            .await;
-
-        #[cfg(feature = "logging")]
-        tracing::info!(
-            ephemeral_channel_id = channel.channel_id.0,
-            group_channel_id = group_channel.0,
-            replica_id = channel.replica_id.0,
-            "admitted member moved onto the group channel"
-        );
-    }
     Ok(())
 }
 
@@ -3970,6 +3960,7 @@ mod group_conformance_tests {
                     role,
                     status: ChannelStatus::Paired,
                     created_at: 0,
+                    handover_channel: None,
                 }),
             )
             .await
@@ -4036,6 +4027,126 @@ mod group_conformance_tests {
                 !ids.contains(&1002),
                 "a member must never address itself, got {ids:?}"
             );
+        });
+    }
+
+    /// A joiner admitted into an existing group stays on its pairing channel
+    /// until it proves it holds the handover: every publish reaches it there,
+    /// under the pairing key, carrying the group key.
+    #[test]
+    fn a_handover_keeps_the_joiner_on_its_pairing_channel() {
+        run_async(async {
+            use crate::protocol::DeRecSecretStore;
+            use crate::protocol::context::Round;
+            use crate::protocol::types::{SecretKind, UserSecret};
+
+            const PAIRING: ChannelId = ChannelId(7101);
+            const PAIRING_KEY: crate::types::SharedKey = crate::types::SharedKey::new([0x33; 32]);
+            let lf = LocalFixture::with_replica(SECRET_ID, 1001);
+            let mut rig = StoreRig::new();
+            seed_member(
+                &mut rig.channels,
+                1001,
+                ReplicaRole::Source,
+                "https://alice",
+            )
+            .await;
+            seed_member(
+                &mut rig.channels,
+                1002,
+                ReplicaRole::Destination,
+                "https://alice-2",
+            )
+            .await;
+            seed_group_key(&mut rig.secrets).await;
+            rig.channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Replica(ReplicaMember {
+                        channel_id: PAIRING,
+                        replica_id: ReplicaId(1003),
+                        transports: vec![endpoint("https://alice-3")],
+                        communication_info: HashMap::new(),
+                        role: ReplicaRole::Destination,
+                        status: ChannelStatus::Paired,
+                        created_at: 0,
+                        handover_channel: None,
+                    }),
+                )
+                .await
+                .expect("seed joiner");
+            rig.secrets
+                .save(SECRET_ID, PAIRING, SecretValue::SharedKey(PAIRING_KEY))
+                .await
+                .expect("seed pairing key");
+
+            for round in 1..=2 {
+                rig.transport.clear();
+                super::start(
+                    &mut rig.stores(),
+                    &lf.local(),
+                    vec![UserSecret {
+                        id: b"id".to_vec(),
+                        name: "name".to_owned(),
+                        data: b"data".to_vec(),
+                    }],
+                    None,
+                    Some(&HashMap::new()),
+                    None,
+                    2,
+                    None,
+                    &Round {
+                        reply_to: &[],
+                        trace_id: round,
+                    },
+                )
+                .await
+                .expect("publish");
+
+                let joiner = rig
+                    .channels
+                    .load(
+                        SECRET_ID,
+                        crate::protocol::types::ChannelQuery::Replica {
+                            channel_id: PAIRING,
+                            replica_id: ReplicaId(1003),
+                        },
+                    )
+                    .await
+                    .expect("load joiner")
+                    .and_then(|r| r.as_replica().cloned())
+                    .expect("joiner row present");
+                assert_eq!(
+                    joiner.channel_id, PAIRING,
+                    "round {round}: the joiner stays"
+                );
+                assert!(
+                    rig.secrets
+                        .load(SECRET_ID, PAIRING, SecretKind::SharedKey)
+                        .await
+                        .expect("load pairing key")
+                        .is_some(),
+                    "round {round}: the pairing key is kept"
+                );
+
+                let to_joiner = rig
+                    .transport
+                    .sent_uris()
+                    .iter()
+                    .position(|uri| uri == "https://alice-3")
+                    .expect("the joiner is sent its copy");
+                let envelope = &rig.transport.sent_envelopes()[to_joiner];
+                let request = request::extract(envelope, &PAIRING_KEY)
+                    .expect("the copy opens under the pairing key")
+                    .request;
+                let payload = ReplicaSecretPayload::decode(request.share.as_slice())
+                    .expect("payload decodes");
+                assert_eq!(
+                    payload.shared_key,
+                    vec![0x42; 32],
+                    "round {round}: the copy carries the group key"
+                );
+            }
         });
     }
 
@@ -4175,6 +4286,7 @@ mod group_conformance_tests {
                         role: ReplicaRole::Destination,
                         status: ChannelStatus::Paired,
                         created_at: 0,
+                        handover_channel: None,
                     }),
                 )
                 .await
@@ -4349,6 +4461,7 @@ mod group_conformance_tests {
                         role: ReplicaRole::Destination,
                         status: ChannelStatus::Paired,
                         created_at: 0,
+                        handover_channel: None,
                     }),
                 )
                 .await
@@ -4485,6 +4598,7 @@ mod group_conformance_tests {
                     role: ReplicaRole::Destination,
                     status: ChannelStatus::Pending,
                     created_at: 0,
+                    handover_channel: None,
                 }),
             )
             .await
@@ -4890,6 +5004,7 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
     replica::hydrate(
         stores,
         local,
+        (arrived_on, ReplicaId(from_replica_id)),
         version,
         &checked,
         String::new(),
@@ -5087,6 +5202,7 @@ mod weighted_round_tests {
                         role: ReplicaRole::Destination,
                         status: ChannelStatus::Paired,
                         created_at: 0,
+                        handover_channel: None,
                     }),
                 )
                 .await
@@ -5986,6 +6102,7 @@ mod weighted_round_tests {
                             role,
                             status: ChannelStatus::Paired,
                             created_at: 0,
+                            handover_channel: None,
                         }),
                     )
                     .await
@@ -6184,6 +6301,91 @@ mod weighted_round_tests {
                 Some(4),
                 "no version is consumed"
             );
+        });
+    }
+
+    async fn latest_snapshot(rig: &ProtocolRig) -> Option<UserSecrets> {
+        rig.user_secrets.load_latest(SECRET_ID).await.unwrap()
+    }
+
+    /// With nothing paired there is nothing to send, but the round still
+    /// records its snapshot and consumes a version, as a round below the
+    /// threshold does.
+    #[test]
+    fn a_protect_with_no_peer_saves_the_snapshot_and_advances_the_version() {
+        run_async(async {
+            let mut rig = protocol_rig(&[], 3).await;
+
+            let events = protect(&mut rig, &[]).await;
+            assert!(events.is_empty(), "nothing is sent: {events:?}");
+            let snapshot = latest_snapshot(&rig).await.expect("the snapshot is saved");
+            assert_eq!(snapshot.version, 1);
+            assert_eq!(snapshot.secrets, secrets());
+            assert_eq!(
+                snapshot.threshold,
+                Some(3),
+                "the round's threshold is recorded"
+            );
+
+            protect(&mut rig, &[]).await;
+            assert_eq!(latest_snapshot(&rig).await.map(|s| s.version), Some(2));
+        });
+    }
+
+    /// The round is validated before anything is written, peers or not: an
+    /// invalid threshold fails it and saves no snapshot.
+    #[test]
+    fn a_protect_with_no_peer_still_validates_the_round() {
+        run_async(async {
+            let mut rig = protocol_rig(&[], 3).await;
+
+            let result = rig
+                .protocol
+                .start(DeRecFlow::ProtectSecret {
+                    secrets: secrets(),
+                    description: None,
+                    weights: HashMap::new(),
+                    threshold: Some(1),
+                })
+                .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::Sharing(SharingError::InvalidThreshold { .. }))
+                ),
+                "got {:?}",
+                result.map(|_| ())
+            );
+            assert!(
+                latest_snapshot(&rig).await.is_none(),
+                "no snapshot is saved"
+            );
+        });
+    }
+
+    /// The snapshot a no-peer round saved is what the first pairing to reach
+    /// the threshold publishes, at the next version.
+    #[test]
+    fn the_first_pairing_after_a_no_peer_protect_publishes_its_snapshot() {
+        run_async(async {
+            let mut rig = protocol_rig(&[], 2).await;
+            protect(&mut rig, &[]).await;
+
+            seed_helper(&mut rig.channels, &mut rig.secrets, 51).await;
+            seed_helper(&mut rig.channels, &mut rig.secrets, 52).await;
+            let events = rig
+                .protocol
+                .maybe_auto_publish(&[paired(52)], &std::collections::HashSet::new())
+                .await
+                .expect("auto-publish runs");
+
+            assert_eq!(started_weights(&events), vec![(51, 1), (52, 1)]);
+            let snapshot = latest_snapshot(&rig).await.expect("the snapshot is kept");
+            assert_eq!(snapshot.version, 2);
+            assert_eq!(snapshot.secrets, secrets());
+            assert_eq!(stored_subshares(&rig.shares, 51, 2), 1);
+            assert_eq!(stored_subshares(&rig.shares, 52, 2), 1);
         });
     }
 

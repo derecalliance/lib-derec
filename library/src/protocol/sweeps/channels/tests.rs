@@ -115,6 +115,7 @@ async fn seed_member(
                 role: ReplicaRole::Destination,
                 status,
                 created_at: now_secs().saturating_sub(age_secs),
+                handover_channel: None,
             }),
         )
         .await
@@ -348,6 +349,7 @@ async fn seed_member_on(
                 role: ReplicaRole::Destination,
                 status,
                 created_at: now_secs().saturating_sub(age_secs),
+                handover_channel: None,
             }),
         )
         .await
@@ -542,6 +544,7 @@ fn an_expired_channel_takes_its_unpair_state_with_it() {
                     StateItem::PendingUnpair {
                         channel_id: ChannelId(cid),
                         started_at: now_secs(),
+                        drop_on_rejection: false,
                     },
                 )
                 .await

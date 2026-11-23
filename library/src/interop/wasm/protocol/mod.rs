@@ -59,6 +59,7 @@ use crate::interop::protocol_names::unpair_ack_from_name;
 use crate::interop::recovered_secret;
 use crate::interop::strict_json::object_into;
 use crate::interop::wasm::primitives::pairing::ContactMessage as PairingContactMessage;
+use crate::protocol_version::ProtocolVersion;
 use crate::{
     interop::wasm::ts_bindings_utils::{js_error, js_error_from_lib},
     protocol::{
@@ -382,6 +383,15 @@ impl DeRecProtocolBuilderWasm {
     #[wasm_bindgen(js_name = withAutoRespondOnFailure)]
     pub fn with_auto_respond_on_failure(mut self, enabled: bool) -> DeRecProtocolBuilderWasm {
         self.config.auto_respond_on_failure = Some(enabled);
+        self
+    }
+
+    /// The oldest protocol version whose messages are still accepted; see
+    /// [`crate::protocol::DeRecProtocolBuilder::with_min_protocol_version`].
+    /// Default: 0.0.
+    #[wasm_bindgen(js_name = withMinProtocolVersion)]
+    pub fn with_min_protocol_version(mut self, major: u32, minor: u32) -> DeRecProtocolBuilderWasm {
+        self.config.min_protocol_version = Some(ProtocolVersion { major, minor });
         self
     }
 

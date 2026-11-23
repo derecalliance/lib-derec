@@ -237,6 +237,7 @@ impl Party {
                         role: *role,
                         status: ChannelStatus::Paired,
                         created_at: 0,
+                        handover_channel: None,
                     }),
                 )
                 .await

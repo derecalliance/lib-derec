@@ -42,12 +42,14 @@ func TestIgnoreReasonConstantsMatchTheFixture(t *testing.T) {
 	}
 
 	constants := map[string]bool{
-		IgnoreReasonPendingVerification: true,
-		IgnoreReasonExpired:             true,
-		IgnoreReasonTimestampMismatch:   true,
-		IgnoreReasonStaleResponse:       true,
-		IgnoreReasonSuperseded:          true,
-		IgnoreReasonKeyUnavailable:      true,
+		IgnoreReasonPendingVerification:     true,
+		IgnoreReasonExpired:                 true,
+		IgnoreReasonTimestampMismatch:       true,
+		IgnoreReasonStaleResponse:           true,
+		IgnoreReasonSuperseded:              true,
+		IgnoreReasonProtocolVersionTooOld:   true,
+		IgnoreReasonProtocolVersionMismatch: true,
+		IgnoreReasonKeyUnavailable:          true,
 	}
 	variants := reasons.Variants
 	for _, v := range variants {

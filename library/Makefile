@@ -60,10 +60,11 @@ _lint:
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 	cargo clippy -p derec-library --target wasm32-unknown-unknown -- -D warnings
 	cargo shear
-	# The SQL smoke crates are their own Cargo projects, outside the
-	# workspace, so the runs above do not reach them.
+	# The SQL smoke crates and the compatibility tests are their own Cargo
+	# projects, outside the workspace, so the runs above do not reach them.
 	cd $(ROOT)/smoke-tests/sqlite && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings && cargo shear
 	cd $(ROOT)/smoke-tests/postgres && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings && cargo shear
+	cd $(ROOT)/compat-tests && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings
 
 # Three crates publish to docs.rs, so a broken intra-doc link is as public as
 # a broken API. `-D warnings` makes rustdoc's lints fail the build the way
@@ -100,6 +101,9 @@ _test-rust:
 # resolver keeps build-dependency features separate from normal ones, so
 # `--workspace` compiles that test file to zero tests. It needs its own run.
 	cargo test -p derec-proto --features descriptor
+# Wire compatibility with released versions. Its own workspace: the
+# releases share package names with the in-tree crates.
+	cd $(ROOT)/compat-tests && cargo test
 
 # The Rust smoke suites are binaries: `cargo test` compiles them and runs
 # zero tests, so only `cargo run` exercises them. The SQL crates are outside

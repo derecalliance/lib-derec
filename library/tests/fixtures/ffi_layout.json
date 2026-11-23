@@ -341,6 +341,21 @@
           "offset": 0
         },
         {
+          "name": "payload",
+          "offset": 56
+        }
+      ],
+      "name": "EncryptedPayloadResult",
+      "size": 72
+    },
+    {
+      "align": 8,
+      "fields": [
+        {
+          "name": "error",
+          "offset": 0
+        },
+        {
           "name": "channel_id",
           "offset": 56
         },
@@ -601,25 +616,6 @@
         }
       ],
       "name": "ExtractVerifyShareResponseResult",
-      "size": 80
-    },
-    {
-      "align": 8,
-      "fields": [
-        {
-          "name": "error",
-          "offset": 0
-        },
-        {
-          "name": "id",
-          "offset": 56
-        },
-        {
-          "name": "timestamp",
-          "offset": 72
-        }
-      ],
-      "name": "MessageIdResult",
       "size": 80
     },
     {

@@ -128,9 +128,21 @@ pub enum MessageBody {
 
 impl MessageBody {
     /// Serializes the inner message to protobuf bytes using `prost`.
+    ///
+    /// Writes no protocol version, which reads as 0.0; see
+    /// [`encode_versioned`](Self::encode_versioned).
     pub fn encode_to_vec(&self) -> Vec<u8> {
+        self.encode_versioned(0, 0)
+    }
+
+    /// Serializes the inner message as a [`DeRecPayload`] carrying the
+    /// protocol version `major.minor`, the version of the envelope it goes
+    /// into.
+    ///
+    /// At version 0.0 the bytes are those of a `google.protobuf.Any`, exactly
+    /// as [`encode_to_vec`](Self::encode_to_vec) writes them.
+    pub fn encode_versioned(&self, major: u32, minor: u32) -> Vec<u8> {
         use prost::Message;
-        use prost_types::Any;
 
         let (type_name, value) = match self {
             MessageBody::PairRequest(m) => ("PairRequestMessage", m.encode_to_vec()),
@@ -162,12 +174,13 @@ impl MessageBody {
             MessageBody::PrePairResponse(m) => ("PrePairResponseMessage", m.encode_to_vec()),
         };
 
-        let any = Any {
+        DeRecPayload {
             type_url: format!("{}{}", TYPE_URL_PREFIX, type_name),
             value,
-        };
-
-        any.encode_to_vec()
+            protocol_version_major: major,
+            protocol_version_minor: minor,
+        }
+        .encode_to_vec()
     }
 
     /// Decodes a [`MessageBody`] from a [`prost_types::Any`]-wrapped
@@ -201,10 +214,23 @@ impl MessageBody {
     /// canonicalization gap downstream byte-level dedup or cross-
     /// implementation comparisons could otherwise be tricked by.
     pub fn decode_from_vec(message_bytes: &[u8]) -> Result<MessageBody, prost::DecodeError> {
-        use prost::Message;
-        use prost_types::Any;
+        Self::decode_versioned(message_bytes).map(|(body, _)| body)
+    }
 
-        let any = Any::decode(message_bytes)?;
+    /// Decodes a [`MessageBody`] like [`decode_from_vec`](Self::decode_from_vec),
+    /// together with the protocol version its [`DeRecPayload`] carries as
+    /// `(major, minor)`: `(0, 0)` for a payload written without one.
+    ///
+    /// # Errors
+    ///
+    /// As [`decode_from_vec`](Self::decode_from_vec).
+    pub fn decode_versioned(
+        message_bytes: &[u8],
+    ) -> Result<(MessageBody, (u32, u32)), prost::DecodeError> {
+        use prost::Message;
+
+        let any = DeRecPayload::decode(message_bytes)?;
+        let version = (any.protocol_version_major, any.protocol_version_minor);
 
         let type_name = any.type_url.strip_prefix(TYPE_URL_PREFIX).ok_or_else(|| {
             #[allow(deprecated)]
@@ -270,7 +296,7 @@ impl MessageBody {
             unknown => return Err(DecodeError::new(unknown.to_string())),
         };
 
-        Ok(body)
+        Ok((body, version))
     }
 }
 
@@ -286,6 +312,51 @@ mod tests {
             ..Default::default()
         }
         .encode_to_vec()
+    }
+
+    fn unpair_body() -> MessageBody {
+        MessageBody::UnpairRequest(UnpairRequestMessage {
+            memo: "bye".to_owned(),
+            ..Default::default()
+        })
+    }
+
+    /// The version written by `encode_versioned` comes back from
+    /// `decode_versioned`.
+    #[test]
+    fn a_payload_carries_its_protocol_version() {
+        let bytes = unpair_body().encode_versioned(0, 1);
+        let (body, version) = MessageBody::decode_versioned(&bytes).expect("decodes");
+        assert!(matches!(body, MessageBody::UnpairRequest(_)));
+        assert_eq!(version, (0, 1));
+    }
+
+    /// A payload at version 0.0 is byte-for-byte the `Any` earlier releases
+    /// write, so they keep reading it.
+    #[test]
+    fn a_version_0_0_payload_is_an_any() {
+        let any = Any {
+            type_url: "type.derec.org/UnpairRequestMessage".to_owned(),
+            value: unpair_request_bytes(),
+        };
+        assert_eq!(unpair_body().encode_versioned(0, 0), any.encode_to_vec());
+    }
+
+    /// An `Any` from an earlier release reads as version 0.0, and an earlier
+    /// release reads a versioned payload as the same `Any`.
+    #[test]
+    fn earlier_releases_and_this_one_read_each_other() {
+        let any = Any {
+            type_url: "type.derec.org/UnpairRequestMessage".to_owned(),
+            value: unpair_request_bytes(),
+        };
+        let (_, version) =
+            MessageBody::decode_versioned(&any.encode_to_vec()).expect("an Any decodes");
+        assert_eq!(version, (0, 0));
+
+        let read_as_any =
+            Any::decode(unpair_body().encode_versioned(0, 1).as_slice()).expect("an Any");
+        assert_eq!(read_as_any, any);
     }
 
     /// The canonical wire form (`type.derec.org/<MessageName>`) emitted by

@@ -411,74 +411,131 @@ fn read_sequence_refuses_bytes_that_are_not_an_envelope() {
     assert!(read_sequence(&[0xFF; 4]).is_err());
 }
 
-fn sealed_envelope() -> DeRecMessage {
-    DeRecMessageBuilder::channel()
-        .channel_id(CHANNEL_ID)
-        .timestamp(current_timestamp())
-        .message_body(MessageBody::PairRequest(sample_message()))
-        .encrypt(&CHANNEL_KEY)
-        .unwrap()
-        .build()
-        .unwrap()
+mod payload_version {
+    use super::*;
+    use crate::derec_message::{open_channel_message, open_plaintext_message};
+    use crate::types::{ChannelId, ChannelKey, SharedKey};
+    use derec_proto::{PrePairRequestMessage, UnpairRequestMessage};
+
+    const KEY: SharedKey = SharedKey::new([4; 32]);
+    const CHANNEL_KEY: ChannelKey = ChannelKey::new(0, KEY);
+
+    fn sealed() -> DeRecMessage {
+        DeRecMessageBuilder::channel()
+            .channel_id(ChannelId(5))
+            .timestamp(current_timestamp())
+            .message_body(MessageBody::UnpairRequest(UnpairRequestMessage::default()))
+            .encrypt(&CHANNEL_KEY)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    /// The payload carries the envelope's version, and opens.
+    #[test]
+    fn a_sealed_message_opens_with_its_version() {
+        let envelope = sealed();
+        let decrypted = decrypt_inner_message(&envelope.message, &KEY).unwrap();
+        let (_, version) = MessageBody::decode_versioned(&decrypted).unwrap();
+        assert_eq!(
+            version,
+            (
+                envelope.protocol_version_major,
+                envelope.protocol_version_minor
+            )
+        );
+        assert!(open_channel_message(&envelope, &KEY).is_ok());
+    }
+
+    /// An envelope whose version was changed no longer matches the copy in
+    /// its payload.
+    #[test]
+    fn a_relabelled_channel_message_does_not_open() {
+        let mut envelope = sealed();
+        envelope.protocol_version_minor += 1;
+        assert!(matches!(
+            open_channel_message(&envelope, &KEY),
+            Err(Error::Invariant(_))
+        ));
+    }
+
+    /// The same holds for the unencrypted `PrePair` leg.
+    #[test]
+    fn a_relabelled_plaintext_message_does_not_open() {
+        let mut envelope = DeRecMessageBuilder::plaintext()
+            .channel_id(ChannelId(6))
+            .timestamp(current_timestamp())
+            .message_body(MessageBody::PrePairRequest(PrePairRequestMessage::default()))
+            .build()
+            .unwrap();
+        assert!(open_plaintext_message(&envelope).is_ok());
+        envelope.protocol_version_minor += 1;
+        assert!(matches!(
+            open_plaintext_message(&envelope),
+            Err(Error::Invariant(_))
+        ));
+    }
 }
 
-/// The fields outside the ciphertext are not authenticated: a copy with any
-/// of them changed, or re-encoded with an unknown field, is still accepted.
-/// Such a copy is the same message, so it must carry the same id.
-#[test]
-fn test_message_id_ignores_the_unauthenticated_envelope_fields() {
-    let envelope = sealed_envelope();
-    let original = envelope.encode_to_vec();
-    let id = message_id(&original).unwrap();
+mod encrypted_payload {
+    use super::*;
+    use crate::derec_message::{apply_trace_id, encrypted_payload};
+    use crate::types::{ChannelId, ChannelKey, SharedKey};
+    use derec_proto::UnpairRequestMessage;
 
-    let mut altered = envelope.clone();
-    altered.sequence = 99;
-    altered.trace_id = 1234;
-    altered.protocol_version_minor += 1;
-    let mut altered = altered.encode_to_vec();
-    // Field 15 as a varint: unknown to the schema, skipped on decode.
-    altered.extend_from_slice(&[0x78, 0x01]);
+    const KEY: ChannelKey = ChannelKey::new(0, SharedKey::new([7; 32]));
 
-    assert_ne!(original, altered);
-    assert_eq!(message_id(&altered).unwrap(), id);
-}
+    fn sealed() -> DeRecMessage {
+        DeRecMessageBuilder::channel()
+            .channel_id(ChannelId(9))
+            .timestamp(current_timestamp())
+            .message_body(MessageBody::UnpairRequest(UnpairRequestMessage::default()))
+            .encrypt(&KEY)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
 
-/// Every message is sealed under a fresh nonce, so two messages carrying the
-/// same body are still two messages.
-#[test]
-fn test_message_id_differs_for_two_messages_with_the_same_body() {
-    let first = message_id(&sealed_envelope().encode_to_vec()).unwrap();
-    let second = message_id(&sealed_envelope().encode_to_vec()).unwrap();
+    #[test]
+    fn it_is_the_envelopes_encrypted_message_field() {
+        let envelope = sealed();
+        assert_eq!(
+            encrypted_payload(&envelope.encode_to_vec()).unwrap(),
+            envelope.message
+        );
+    }
 
-    assert_ne!(first.id, second.id);
-}
+    /// The unauthenticated cleartext fields do not change it.
+    #[test]
+    fn a_restamped_copy_has_the_same_encrypted_payload() {
+        let envelope = sealed();
+        let bytes = envelope.encode_to_vec();
+        let mut copy =
+            DeRecMessage::decode(apply_trace_id(&bytes, 42).unwrap().as_slice()).unwrap();
+        copy.sequence += 1;
+        let copy = copy.encode_to_vec();
+        assert_ne!(copy, bytes);
+        assert_eq!(
+            encrypted_payload(&copy).unwrap(),
+            encrypted_payload(&bytes).unwrap()
+        );
+    }
 
-#[test]
-fn test_message_id_carries_the_envelope_timestamp() {
-    let envelope = sealed_envelope();
-    let sent = envelope.timestamp.unwrap().seconds as u64;
+    /// Every message is sealed under a fresh nonce, so two messages with the
+    /// same body differ.
+    #[test]
+    fn two_messages_with_the_same_body_differ() {
+        assert_ne!(
+            encrypted_payload(&sealed().encode_to_vec()).unwrap(),
+            encrypted_payload(&sealed().encode_to_vec()).unwrap()
+        );
+    }
 
-    assert_eq!(
-        message_id(&envelope.encode_to_vec()).unwrap().timestamp,
-        sent
-    );
-}
-
-#[test]
-fn test_message_id_rejects_an_envelope_without_a_timestamp() {
-    let mut envelope = sealed_envelope();
-    envelope.timestamp = None;
-
-    assert!(matches!(
-        message_id(&envelope.encode_to_vec()),
-        Err(Error::InvalidInput(_))
-    ));
-}
-
-#[test]
-fn test_message_id_rejects_garbage() {
-    assert!(matches!(
-        message_id(b"not a valid protobuf"),
-        Err(Error::ProtobufDecode(_))
-    ));
+    #[test]
+    fn bytes_that_are_not_an_envelope_are_refused() {
+        assert!(matches!(
+            encrypted_payload(&[0xff, 0xff, 0xff]),
+            Err(Error::ProtobufDecode(_))
+        ));
+    }
 }

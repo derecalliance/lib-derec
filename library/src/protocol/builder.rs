@@ -34,6 +34,7 @@ use crate::primitives::pairing::parameter_range;
 use crate::protocol::AutoAcceptPolicy;
 use crate::protocol::ExpiredChannelCleanup;
 use crate::protocol::types::Timeouts;
+use crate::protocol_version::ProtocolVersion;
 use crate::transport;
 use crate::transport::IntoOwnTransport;
 use crate::transport::TransportPolicy;
@@ -120,6 +121,7 @@ pub struct DeRecProtocolBuilder<
     unsafe_connection: Option<bool>,
     communication_info: HashMap<String, String>,
     auto_respond_on_failure: bool,
+    min_protocol_version: ProtocolVersion,
     key_rotation: bool,
     unpair_ack: UnpairAck,
     auto_reply_to: bool,
@@ -159,6 +161,7 @@ impl
             unsafe_connection: None,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
+            min_protocol_version: ProtocolVersion { major: 0, minor: 0 },
             key_rotation: false,
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
@@ -392,6 +395,23 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// Default: `false`.
     pub fn with_auto_respond_on_failure(mut self, enabled: bool) -> Self {
         self.auto_respond_on_failure = enabled;
+        self
+    }
+
+    /// The oldest protocol version whose messages this device still accepts.
+    ///
+    /// A message whose envelope names an older version is reported as
+    /// [`DeRecEvent::MessageIgnored`](crate::protocol::DeRecEvent::MessageIgnored)
+    /// with [`IgnoreReason::ProtocolVersionTooOld`](crate::protocol::IgnoreReason::ProtocolVersionTooOld):
+    /// nothing is decrypted, stored or answered, as for a timestamp mismatch.
+    /// Pairing messages are included, so a device on an older version can no
+    /// longer pair either.
+    ///
+    /// Raise it once every peer runs a release at least this version.
+    ///
+    /// Default: 0.0, accepting every version.
+    pub fn with_min_protocol_version(mut self, version: ProtocolVersion) -> Self {
+        self.min_protocol_version = version;
         self
     }
 
@@ -653,6 +673,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             communication_info,
             own_transports,
             replica_id,
+            min_protocol_version,
         } = config;
         if let Some(threshold) = threshold {
             self = self.with_threshold(threshold);
@@ -693,6 +714,9 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         }
         if let Some(id) = replica_id {
             self = self.with_replica_id(id);
+        }
+        if let Some(version) = min_protocol_version {
+            self = self.with_min_protocol_version(version);
         }
         self
     }
@@ -796,6 +820,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            min_protocol_version: self.min_protocol_version,
             key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
@@ -848,6 +873,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            min_protocol_version: self.min_protocol_version,
             key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
@@ -900,6 +926,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            min_protocol_version: self.min_protocol_version,
             key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
@@ -955,6 +982,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            min_protocol_version: self.min_protocol_version,
             key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
@@ -1003,6 +1031,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore>
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            min_protocol_version: self.min_protocol_version,
             key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
@@ -1060,6 +1089,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            min_protocol_version: self.min_protocol_version,
             key_rotation: self.key_rotation,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
@@ -1178,6 +1208,7 @@ impl<
         )?;
         protocol.communication_info = self.communication_info;
         protocol.auto_respond_on_failure = self.auto_respond_on_failure;
+        protocol.min_protocol_version = self.min_protocol_version;
         protocol.key_rotation = self.key_rotation;
         protocol.unpair_ack = self.unpair_ack;
         protocol.auto_reply_to = self.auto_reply_to;
@@ -2760,6 +2791,7 @@ mod tests {
         unsafe_connection: Option<bool>,
         communication_info: HashMap<String, String>,
         auto_respond_on_failure: bool,
+        min_protocol_version: ProtocolVersion,
         key_rotation: bool,
         unpair_ack: UnpairAck,
         auto_reply_to: bool,
@@ -2779,6 +2811,7 @@ mod tests {
             unsafe_connection: b.unsafe_connection,
             communication_info: b.communication_info.clone(),
             auto_respond_on_failure: b.auto_respond_on_failure,
+            min_protocol_version: b.min_protocol_version,
             key_rotation: b.key_rotation,
             unpair_ack: b.unpair_ack,
             auto_reply_to: b.auto_reply_to,
@@ -2826,6 +2859,7 @@ mod tests {
                 transport::TransportProtocol::new("https://me.example.com/derec", Protocol::Https),
             ]),
             replica_id: Some(9_007_199_254_740_993),
+            min_protocol_version: Some(ProtocolVersion { major: 0, minor: 1 }),
         }
     }
 
@@ -2878,6 +2912,7 @@ mod tests {
                 ..Default::default()
             })
             .with_auto_respond_on_failure(true)
+            .with_min_protocol_version(ProtocolVersion { major: 0, minor: 1 })
             .with_key_rotation(true)
             .with_auto_reply_to(true)
             .with_unpair_ack(UnpairAck::NotRequired)

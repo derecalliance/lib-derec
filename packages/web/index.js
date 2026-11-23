@@ -8,7 +8,7 @@ import {
   DeRecProtocolBuilder as DeRecProtocolBuilderImpl,
   envelope_apply_trace_id,
   envelope_read_trace_id,
-  envelope_message_id,
+  envelope_encrypted_payload,
   envelope_read_sequence,
   channel_key_derive,
   protocol_version as protocolVersionImpl,
@@ -60,7 +60,7 @@ export function shareStoreRefusal(reason) {
 export const envelope = {
   apply_trace_id: envelope_apply_trace_id,
   read_trace_id: envelope_read_trace_id,
-  message_id: envelope_message_id,
+  encrypted_payload: envelope_encrypted_payload,
   read_sequence: envelope_read_sequence,
 };
 

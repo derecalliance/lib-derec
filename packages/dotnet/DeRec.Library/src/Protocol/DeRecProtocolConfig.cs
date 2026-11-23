@@ -32,7 +32,8 @@ namespace DeRec.Library.Orchestrator;
 /// are decimal strings; timeouts are whole seconds under
 /// <c>timeouts.inbound_message_secs</c>, <c>sharing_round_secs</c>,
 /// <c>unpair_ack_secs</c>, <c>get_share_response_secs</c>,
-/// <c>pairing_secs</c> and <c>expired_channels</c>. An unknown key, at any
+/// <c>pairing_secs</c> and <c>expired_channels</c>;
+/// <see cref="MinProtocolVersion"/> is <c>{ "major": n, "minor": n }</c>. An unknown key, at any
 /// level, fails the read with a <see cref="JsonException"/> naming it, so a
 /// misspelled setting is never silently dropped.
 /// </para>
@@ -84,6 +85,9 @@ public sealed record DeRecProtocolConfig
 
     /// <summary>See <see cref="DeRecProtocolBuilder.WithReplicaId"/>.</summary>
     public ulong? ReplicaId { get; init; }
+
+    /// <summary>See <see cref="DeRecProtocolBuilder.WithMinProtocolVersion"/>.</summary>
+    public ProtocolVersion? MinProtocolVersion { get; init; }
 }
 
 /// <summary>
@@ -150,6 +154,9 @@ internal sealed class DeRecProtocolConfigJsonConverter : JsonConverter<DeRecProt
             CommunicationInfo = w.CommunicationInfo,
             OwnTransports = w.OwnTransports?.Select(t => new TransportProtocol(t.Uri, t.Protocol)).ToList(),
             ReplicaId = ParseU64(w.ReplicaId, "replica_id"),
+            MinProtocolVersion = w.MinProtocolVersion is null
+                ? null
+                : new ProtocolVersion(w.MinProtocolVersion.Major, w.MinProtocolVersion.Minor),
         };
     }
 
@@ -213,6 +220,9 @@ internal sealed class DeRecProtocolConfigJsonConverter : JsonConverter<DeRecProt
             // Order is preserved verbatim: it is this node's preference order.
             OwnTransports = value.OwnTransports?.Select(t => new TransportWire { Uri = t.Uri, Protocol = t.Protocol }).ToList(),
             ReplicaId = value.ReplicaId?.ToString(CultureInfo.InvariantCulture),
+            MinProtocolVersion = value.MinProtocolVersion is not { } floor
+                ? null
+                : new VersionWire { Major = floor.Major, Minor = floor.Minor },
         };
         JsonSerializer.Serialize(writer, w, options);
     }
@@ -326,6 +336,19 @@ internal sealed class DeRecProtocolConfigJsonConverter : JsonConverter<DeRecProt
 
         [JsonPropertyName("replica_id"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public string? ReplicaId { get; init; }
+
+        [JsonPropertyName("min_protocol_version"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public VersionWire? MinProtocolVersion { get; init; }
+    }
+
+    [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+    private sealed class VersionWire
+    {
+        [JsonPropertyName("major"), JsonRequired]
+        public uint Major { get; init; }
+
+        [JsonPropertyName("minor"), JsonRequired]
+        public uint Minor { get; init; }
     }
 
     [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]

@@ -42,7 +42,8 @@
       { "uri": "https://me.example.com/derec", "protocol": "https" },
       { "uri": "grpcs://me.example.com:443", "protocol": "grpc" }
     ],
-    "replica_id": "9007199254740993"
+    "replica_id": "9007199254740993",
+    "min_protocol_version": { "major": 0, "minor": 1 }
   },
   "minimal": {
     "own_transports": [

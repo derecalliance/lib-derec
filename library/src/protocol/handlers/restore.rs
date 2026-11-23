@@ -202,8 +202,15 @@ pub enum RestoreError {
 ///    until its helper answers or the acknowledgement window elapses, so
 ///    no flow selects it in the meantime: the follow-up `ProtectSecret`
 ///    reaches only the restored helpers, and the helper's answer lands on
-///    a channel that still exists. Under `UnpairAck::NotRequired` its
-///    local state is dropped as the request goes out.
+///    a channel that still exists. Unlike `start(Unpair)`, the outcome does
+///    not depend on the answer: an acceptance, the acknowledgement timeout
+///    and a refusal all drop the channel and report
+///    [`DeRecEvent::Unpaired`], a refusal preceded by
+///    [`DeRecEvent::UnpairRejected`]. A recovery channel never returns to
+///    `Paired`: its helper also holds a restored channel, and a publish
+///    reaching both would hand that helper two shares of one split. Under
+///    `UnpairAck::NotRequired` its local state is dropped as the request
+///    goes out.
 ///
 ///    For the same reason the wipe cannot fail the restore. An old
 ///    helper that has gone away is the expected condition during
@@ -362,6 +369,7 @@ fn plan_restore(secret: &Secret) -> Result<RestorePlan> {
                     role,
                     status: ChannelStatus::Paired,
                     created_at: now_secs(),
+                    handover_channel: None,
                 });
             }
             if members.is_empty() {
@@ -509,14 +517,13 @@ async fn unpair_recovery_channels<S: StoreSet>(
     if recovery_ids.is_empty() {
         return Vec::new();
     }
-    let now = now_secs();
     let round = &Round {
         reply_to: &[],
         trace_id: fresh_trace_id(),
     };
     let mut events = Vec::new();
     for channel_id in recovery_ids {
-        match unpairing::start(stores, local, channel_id, None, unpair_ack, now, round).await {
+        match unpairing::start(stores, local, channel_id, None, unpair_ack, true, round).await {
             Ok(mut per_channel) => events.append(&mut per_channel),
             Err(e) => {
                 events.push(DeRecEvent::UnpairFailed {

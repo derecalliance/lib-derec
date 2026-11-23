@@ -1178,6 +1178,10 @@ internal static class Primitives
     ///   <c>Envelope.ReadTraceId</c> helpers round-trip the trace_id field
     ///   on the outer envelope without touching the encrypted inner
     ///   payload — <c>Extract</c> still succeeds after re-stamping.</description></item>
+    ///   <item><description><c>Envelope.EncryptedPayload</c> returns the
+    ///   envelope's encrypted <c>message</c> field: the same across a
+    ///   re-stamped copy, different between two messages, and refused on
+    ///   bytes that are not an envelope.</description></item>
     /// </list>
     /// </summary>
     private static void RunEnvelopeAndReplyToTest()
@@ -1215,6 +1219,43 @@ internal static class Primitives
         if (extracted.ChannelId != channelId)
             throw new InvalidOperationException(
                 "Envelope test failed: channel_id mismatch on extract after ApplyTraceId.");
+
+        // EncryptedPayload reads the envelope's encrypted `message` field.
+        byte[] payload = Envelope.EncryptedPayload(envWith);
+        byte[] parsedMessage = Proto.DeRecMessage.Parser
+            .ParseFrom(envWith.ToProtoBytes()).Message.ToByteArray();
+        if (!payload.SequenceEqual(parsedMessage))
+            throw new InvalidOperationException(
+                "Envelope test failed: EncryptedPayload differs from the envelope's message field.");
+
+        // The cleartext fields are not authenticated, so a copy can arrive with
+        // a different traceId or sequence; the encrypted payload stays the same.
+        var restamped = Proto.DeRecMessage.Parser.ParseFrom(stamped.ToProtoBytes());
+        restamped.Sequence += 7;
+        byte[] restampedBytes = Google.Protobuf.MessageExtensions.ToByteArray(restamped);
+        if (restampedBytes.SequenceEqual(envWith.ToProtoBytes()))
+            throw new InvalidOperationException(
+                "Envelope test failed: re-stamped copy must differ on the wire.");
+        if (!Envelope.EncryptedPayload(restampedBytes).SequenceEqual(payload))
+            throw new InvalidOperationException(
+                "Envelope test failed: EncryptedPayload changed across a re-stamped copy.");
+
+        // Every message is sealed under a fresh nonce, so a second message with
+        // the same body has a different payload.
+        DeRecMessage envAgain = Discovery.Request.Produce(channelId, sharedKey, 0u, replyTo);
+        if (Envelope.EncryptedPayload(envAgain).SequenceEqual(payload))
+            throw new InvalidOperationException(
+                "Envelope test failed: two messages share an EncryptedPayload.");
+
+        try
+        {
+            Envelope.EncryptedPayload(new byte[] { 0xFF, 0xFF, 0xFF });
+            throw new InvalidOperationException(
+                "Envelope test failed: EncryptedPayload accepted non-envelope bytes.");
+        }
+        catch (DeRecException e) when (e.Code == DeRecCode.FfiBadProto)
+        {
+        }
 
         Console.WriteLine("Envelope + replyTo helpers test passed.");
     }

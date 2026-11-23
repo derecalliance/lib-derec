@@ -708,7 +708,8 @@ public sealed class DeRecProtocol : IDisposable
         m.CommunicationInfo,
         m.Role.ToString(),
         m.Status.ToString(),
-        m.CreatedAt);
+        m.CreatedAt,
+        m.HandoverChannel);
 
     private static HelperChannel FromDto(HelperChannelDto d) => new(
         d.channel_id,
@@ -728,7 +729,8 @@ public sealed class DeRecProtocol : IDisposable
         Enum.Parse<ReplicaRole>(d.role),
         Enum.Parse<ChannelStatus>(
             d.status ?? throw new InvalidOperationException("ReplicaMember JSON is missing `status`")),
-        d.created_at);
+        d.created_at,
+        d.handover_channel);
 
     private int ChannelLoadImpl(IntPtr userData, ulong secretId, ulong channelId, ulong replicaId, out IntPtr outPtr, out UIntPtr outLen)
     {
@@ -1273,7 +1275,8 @@ public sealed class DeRecProtocol : IDisposable
         ReplicaDiscoveryReportDto[]? reported,
         string[]? share_channels,
         uint? keep_version,
-        uint? threshold);
+        uint? threshold,
+        bool? drop_on_rejection);
 
     private sealed record ReplicaDiscoveryReportDto(string replica_id, uint version);
 
@@ -1305,7 +1308,8 @@ public sealed class DeRecProtocol : IDisposable
             .ToArray(),
         item.ShareChannels?.Select(c => c.ToString()).ToArray(),
         item.KeepVersion,
-        item.Threshold);
+        item.Threshold,
+        item.DropOnRejection ? true : null);
 
     private static StateItem FromDto(StateItemDto dto)
     {
@@ -1346,7 +1350,8 @@ public sealed class DeRecProtocol : IDisposable
         return new StateItem(
             kind, channelId, secretId, dto.version, startedAt, dto.bytes, dto.shares,
             pending, confirmed, failed, pendingReplicas, syncedReplicas, behindReplicas,
-            dto.local_version, reported, shareChannels, dto.keep_version, dto.threshold);
+            dto.local_version, reported, shareChannels, dto.keep_version, dto.threshold,
+            dto.drop_on_rejection ?? false);
     }
 
     private static StateKey ParseKeyBuffer(IntPtr ptr, UIntPtr len)
@@ -1539,7 +1544,7 @@ public sealed class DeRecProtocol : IDisposable
     /// field set of the core it calls. The marker describes the shape being
     /// written, which is the shape of these DTOs.
     /// </remarks>
-    internal const byte ChannelRecordSchemaVersion = 3;
+    internal const byte ChannelRecordSchemaVersion = 4;
 
     // `schema_version` leads both records because the Rust struct declares it
     // first and serde emits fields in declaration order.
@@ -1561,7 +1566,8 @@ public sealed class DeRecProtocol : IDisposable
         Dictionary<string, string>? communication_info,
         string role,
         string? status,
-        ulong created_at);
+        ulong created_at,
+        ulong? handover_channel = null);
 
     /// <summary>
     /// Wire shape of a listing filter. Field names and the null/empty

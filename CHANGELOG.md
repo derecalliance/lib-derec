@@ -9,6 +9,8 @@ all of them unless it names a specific binding.
 
 ### 1.0.0-alpha.1 (unreleased)
 
+This release includes every change in 0.1.0, listed in its own section below.
+
 - **Changed: `restore` takes the newest version the helpers hold.**
   *(breaking; every SDK)*
 
@@ -470,12 +472,10 @@ all of them unless it names a specific binding.
   failed still dropped its failed helpers' proofs and reported their
   timeouts. A round whose removal failed was reported complete, and could
   be completed or timed out again later. A failed weight read reported
-  `threshold_met: false` for a round that may have met it. A failed
-  departed-member removal left the member's row behind for good. Now a
-  round reports its events and gives up its proofs only once its new state
-  is stored. A round that cannot read its helpers' weights or remove its
-  departed members is kept as it is and completes on a later call. Each
-  failure is logged.
+  `threshold_met: false` for a round that may have met it. Now a round
+  reports its events and gives up its proofs only once its new state is
+  stored. A round that cannot read its helpers' weights is kept as it is and
+  completes on a later call. Each failure is logged.
 
   A state store failure while `process` records a message's answers on the
   open rounds is now returned as a `ProcessError`, carrying the call's
@@ -498,6 +498,180 @@ all of them unless it names a specific binding.
   Migration: implement `DeRecTransport` (`ITransport`, `Transport`) directly,
   with the loop the adapter ran: dial each endpoint in order, return on the
   first success, and return the last error when every endpoint failed.
+
+### 0.1.0
+
+The protocol version on every message is now authenticated, an application
+can stop accepting messages from older releases once it has migrated, a
+device joining a replica group can no longer be stranded, and removing a
+replica member completes in one call. Releasing the vault and the group key
+to a new replica device is now the application's decision.
+
+The wire stays compatible with 0.0.10 and 0.0.11 in both directions:
+`compat-tests/` exchanges every message type, pairing included, with the
+published crates of both releases. Two things are breaking: the automatic
+publish on confirming a replica is gone, and the stored replica-member
+record gains a field.
+
+- **Added: the protocol version is authenticated.** *(every SDK)*
+
+  The encrypted payload of every message is now a `DeRecPayload`: the
+  `google.protobuf.Any` fields it always had (`type_url`, `value`) plus a
+  copy of the envelope's `protocolVersionMajor` and `protocolVersionMinor`.
+  The receiver checks the copy against the envelope, as it does the
+  timestamp, and a message whose versions differ is reported as
+  `MessageIgnored` with the new `IgnoreReason::ProtocolVersionMismatch`;
+  the primitives' `extract` functions refuse it. Messages are written at
+  protocol version 0.1. Together with the timestamp binding, every envelope
+  field is now covered except `sequence` and `traceId`, neither of which
+  the protocol reads; `channelId` selects the decryption key.
+
+  An earlier release decodes the payload as `Any` and skips the copy, and a
+  payload from an earlier release carries none, which reads as 0.0, the
+  version such a release puts on its envelope: both directions stay
+  compatible.
+
+- **Added: a minimum protocol version.** *(every SDK)*
+
+  `DeRecProtocolBuilder::with_min_protocol_version` (.NET
+  `WithMinProtocolVersion`, Go `MinProtocolVersion`, TypeScript
+  `withMinProtocolVersion`; `min_protocol_version` as `{major, minor}` in
+  the config JSON), default 0.0. A message naming an older version is
+  reported as `MessageIgnored` with the new `IgnoreReason::ProtocolVersionTooOld`
+  and nothing in it is decrypted, stored or answered; pairing messages
+  included.
+
+  *Migration:* nothing to do while older peers remain. Once every peer runs
+  0.1.0 or later, set the minimum to 0.1 to stop accepting messages from
+  older releases. A message relabelled to an older version is refused
+  either way, since its payload still carries its real version.
+
+- **Removed: `message_id`.** *(breaking; every SDK)*
+
+  Detecting a message delivered more than once is the application's job
+  entirely, and the library no longer computes an identifier for it:
+  `derec_message::message_id` is gone, with `message_id_from_envelope` (C),
+  `envelope_message_id` (WASM), .NET `Envelope.ReadMessageId`, Go
+  `envelope.ReadMessageID` and `envelope.message_id` (Node, web, React
+  Native). The protocol's flows stay safe to receive twice and report
+  conflicting copies.
+
+  *Migration:* keep deduplicating in the application. Key on the envelope's
+  encrypted `message` field, which cannot be changed without failing
+  decryption and differs for every message; not on a hash of the raw
+  envelope, whose `sequence` and `traceId` are not authenticated.
+  `encrypted_payload` (below) reads that field.
+
+- **Added: `encrypted_payload`.** *(every SDK)*
+
+  Reads an envelope's encrypted `message` field, without the channel key,
+  so an application can key duplicate detection on it without decoding the
+  envelope itself: `derec_message::encrypted_payload` (Rust),
+  `encrypted_payload_from_envelope` (C), `envelope_encrypted_payload`
+  (WASM), .NET `Envelope.EncryptedPayload`, Go `envelope.EncryptedPayload`
+  and `envelope.encrypted_payload` (Node, web, React Native). It returns the
+  bytes as they arrived; how to key on them, and for how long, is the
+  application's choice.
+
+- **Changed: confirming a replica device publishes nothing.**
+  *(breaking; every SDK)*
+
+  `verify_fingerprint` on the source used to publish as soon as it confirmed
+  a replica destination, sending the vault and the group key to a device
+  whose user may not have confirmed yet. It now only records the
+  confirmation. The confirmation of a helper paired with `NoKeys` still
+  publishes as before.
+
+  *Migration:* once the owner knows both devices confirmed, call
+  `start(ProtectSecret)` with the current secrets (an empty `ProtectSecret`
+  is enough when there is nothing to share yet). That call is the decision
+  to release the vault and the group key to the new device.
+
+- **Fixed: a device joining a replica group could be stranded.**
+  *(bug fix; every SDK)*
+
+  A copy that reached a joiner before its user confirmed was ignored, and
+  the source had already moved the joiner to the group channel and dropped
+  the pairing key, so nothing could reach it again. Now the source keeps
+  the joiner on its pairing channel, and the pairing key, until the joiner
+  answers on the group channel; a joiner that confirmed late catches up
+  with `ReplicaDiscovery`, whatever the order. The joiner keeps the pairing
+  key too, so a copy the source sends again after a lost acknowledgement is
+  still read, and drops it once the source reaches it on the group channel.
+  Each device always sends on the group channel once it holds the group
+  key.
+
+- **Changed: removing a replica member completes in one call, and the
+  member receives nothing afterwards.** *(breaking; every SDK)*
+
+  `start(UnpairReplica)` used to flag the member and wait: the application
+  had to publish a roster without it, and the device running the removal
+  kept sending every new version, secrets included, to the removed member
+  until it answered. A lost or stolen device that never answered kept
+  receiving new secrets indefinitely. Now:
+
+  - the device running the removal drops the member at once, with any key
+    only it used, reports `ReplicaRemoved`, and publishes the roster without
+    it in the same call;
+  - the removed member drops everything as soon as the notice naming it
+    arrives (`SelfRemovedFromGroup`) and is on no distribution list again;
+  - every other member flags it when told and drops it when the roster
+    arrives (`ReplicaRemoved`), as before;
+  - a device removing itself publishes the roster without itself, then drops
+    everything; the acknowledgements of that publish reach it after it left
+    and `process` fails them with an unknown-channel error, which can be
+    disregarded.
+
+  *Migration:* stop publishing after `UnpairReplica`; the call publishes.
+  Members flagged as leaving no longer appear on any distribution list, so
+  an application that filtered them out of its own reports can drop that.
+
+- **Changed: the stored replica-member record gains `handover_channel`.**
+  *(breaking for custom stores; Go, .NET)*
+
+  On the device that joined through a member, the record names the
+  pairing channel that member handed the group over on while it is still in
+  use (Go `ReplicaMember.HandoverChannel`, .NET `ReplicaMember.HandoverChannel`,
+  `handover_channel` in the record JSON, written only when set). The channel
+  record schema moves to 4. A store that keeps records as opaque JSON, as
+  the Rust and TypeScript SDKs do, needs no change; a Go or .NET store that
+  maps record fields must persist this one. A build of 0.0.x refuses a
+  record written by this version.
+
+- **Fixed (security): a helper that refused the unpair after a restore
+  received two shares.** *(bug fix; every SDK)*
+
+  After `restore`, the device holds two channels to every helper it
+  recovered from: the restored one and the recovery channel it collected
+  the share on, which `restore` unpairs. Under `UnpairAck::Required` a helper
+  that refused that unpair put the recovery channel back to `Paired`, so
+  every later `ProtectSecret` sent that helper one share on each channel.
+  With threshold 2 it could rebuild the vault alone, and in general
+  `⌈t/2⌉` such helpers were enough instead of `t`. Now a refusal drops a
+  recovery channel just like an acceptance or the timeout: `UnpairRejected`
+  is reported, then `Unpaired`. `start(Unpair)` is unchanged: a refusal
+  still returns that channel to `Paired`.
+
+  The pending-unpair state record gains `drop_on_rejection` (Go
+  `StateItem.DropOnRejection`, .NET `StateItem.DropOnRejection`, written
+  only when `true`). A store that keeps state rows as opaque JSON, as the
+  Rust and TypeScript SDKs do, needs no change; a Go or .NET store that maps
+  state fields must persist this one, or the fix does not apply. A row
+  written by 0.0.x reads as `false`.
+
+- **Fixed: a `ProtectSecret` with no paired peer lost its secrets.**
+  *(bug fix; every SDK)*
+
+  With no helper and no replica paired, the call returned without saving
+  the snapshot. It now saves it and consumes a version, as documented, so
+  the first pairing afterwards publishes it.
+
+- **Docs: messages are encrypted and authenticated, not signed.**
+  Several proto comments described signatures. Every message payload is
+  AES-256-GCM under the channel key (pairing messages: under the pairing
+  handshake's keys); the comments, and the README section on replays,
+  reflections and choosing the inbound window, now say so, along with which
+  fields of a `DeRecShare` the Merkle commitment covers.
 
 ### 0.0.11
 

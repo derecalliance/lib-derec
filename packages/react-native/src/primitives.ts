@@ -44,7 +44,6 @@ import type {
   GetSecretIdsVersionsResponseMessage,
   GetShareRequestMessage,
   GetShareResponseMessage,
-  MessageId,
   PairRequestMessage,
   PairResponseMessage,
   PairingProcessResult,
@@ -922,20 +921,28 @@ export const envelope = {
     return call('read_trace_id_from_envelope', envelope_bytes) as bigint;
   },
   /**
-   * Identify an envelope for replay and reflection detection. `id` is the
-   * same for every copy of one message, whatever its unauthenticated
-   * cleartext fields say, and different for every other message. Keep the
-   * `id` of every envelope sent and of every envelope `process` accepted
-   * until `max(received or sent at, timestamp) + inbound_message_secs`, keep
-   * the record across restarts, and drop an inbound envelope whose `id` is
-   * kept. The README has the full contract.
+   * Read the encrypted `message` field off an envelope, without the channel
+   * key: the part of an envelope an application can key duplicate detection
+   * on.
+   *
+   * It cannot be changed without failing decryption, and every message is
+   * sealed under a fresh random nonce, so it is the same for every copy of
+   * one message and different for every other message, even one with the
+   * same body. The cleartext fields around it (`sequence`, `traceId`) are
+   * not authenticated, and protobuf accepts more than one encoding of the
+   * same envelope, so a copy can arrive as different bytes: a hash of the
+   * raw envelope does not identify a message. How to key on these bytes (as
+   * they are, or hashed) and for how long is the application's choice.
+   *
+   * The plaintext `PrePair` leg of `HashedKeys` pairing is the exception: its
+   * `message` field is not encrypted, so a copy re-encoded inside it reads
+   * differently. That leg is not authenticated at all; the contact's nonce
+   * is what binds it.
+   *
+   * Throws when the bytes are not an envelope.
    */
-  message_id(envelope_bytes: Uint8Array): MessageId {
-    const result = call('message_id_from_envelope', envelope_bytes) as {
-      id: ArrayBuffer;
-      timestamp: bigint;
-    };
-    return { id: bytes(result.id), timestamp: result.timestamp };
+  encrypted_payload(envelope_bytes: Uint8Array): Uint8Array {
+    return bytes(call('encrypted_payload_from_envelope', envelope_bytes));
   },
 
   /**

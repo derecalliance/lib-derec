@@ -33,7 +33,6 @@
 //!
 //! - serialize flow-specific messages beyond encoding the provided protobuf message
 //! - decrypt payloads
-//! - verify signatures
 //! - interpret the meaning of the inner flow message
 //!
 //! ## Builder modes
@@ -104,6 +103,15 @@ pub struct PairingMode;
 #[derive(Debug)]
 pub struct ChannelMode;
 
+/// Builder mode for plaintext messages: the `PrePair` leg of pairing, sent
+/// before any key exists.
+///
+/// In this mode there is nothing to encrypt, and the builder exposes `build`
+/// directly (see the `impl DeRecMessageBuilder<NotEncrypted, PlaintextMode>`
+/// block).
+#[derive(Debug)]
+pub struct PlaintextMode;
+
 /// Builds a [`DeRecMessage`] envelope containing protocol metadata and an
 /// encrypted payload.
 ///
@@ -121,7 +129,8 @@ pub struct ChannelMode;
 /// # Type parameters
 ///
 /// * `State` - encryption state marker, typically [`NotEncrypted`] or [`Encrypted`]
-/// * `Mode` - builder mode marker, either [`PairingMode`] or [`ChannelMode`]
+/// * `Mode` - builder mode marker: [`PairingMode`], [`ChannelMode`] or
+///   [`PlaintextMode`]
 ///
 /// # Required fields
 ///
@@ -336,7 +345,7 @@ impl DeRecMessageBuilder<NotEncrypted, PairingMode> {
             .message
             .ok_or(DeRecMessageBuilderError::MissingMessage)?;
 
-        let encoded = message.encode_to_vec();
+        let encoded = versioned(&message);
         let encrypted = envelope::encrypt(&encoded, public_key.as_ref())?;
 
         Ok(DeRecMessageBuilder {
@@ -425,7 +434,7 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
         let mut nonce = [0u8; 32];
         Rng::fill_bytes(&mut os_rng(), &mut nonce[..12]);
 
-        let encoded = message.encode_to_vec();
+        let encoded = versioned(&message);
         let encrypted = channel::encrypt_message(&encoded, channel_key.key.as_bytes(), &nonce)?;
 
         Ok(DeRecMessageBuilder {
@@ -470,33 +479,108 @@ impl<Mode> DeRecMessageBuilder<Encrypted, Mode> {
     /// This function does not perform any additional cryptographic validation.
     /// It only validates that the required envelope fields are present.
     pub fn build(self) -> Result<DeRecMessage, DeRecMessageBuilderError> {
-        let protocol_version = ProtocolVersion::current();
-
-        let message = if self.encrypted.is_empty() {
+        if self.encrypted.is_empty() {
             return Err(DeRecMessageBuilderError::MissingMessage);
-        } else {
-            self.encrypted
-        };
-
-        let channel_id = self
-            .channel_id
-            .ok_or(DeRecMessageBuilderError::MissingChannelId)?;
-
-        let timestamp = Some(
-            self.timestamp
-                .ok_or(DeRecMessageBuilderError::MissingTimestamp)?,
-        );
-
-        Ok(DeRecMessage {
-            protocol_version_major: protocol_version.major,
-            protocol_version_minor: protocol_version.minor,
-            sequence: self.sequence,
-            channel_id: channel_id.into(),
-            timestamp,
-            message,
-            trace_id: self.trace_id.unwrap_or_default(),
-        })
+        }
+        seal(
+            self.sequence,
+            self.channel_id,
+            self.timestamp,
+            self.trace_id,
+            self.encrypted,
+        )
     }
+}
+
+impl DeRecMessageBuilder<NotEncrypted, PlaintextMode> {
+    /// Creates a new plaintext-mode [`DeRecMessageBuilder`].
+    ///
+    /// For the `PrePair` leg of pairing, which is sent before any shared or
+    /// asymmetric key exists: the payload is the encoded [`MessageBody`]
+    /// itself. There is nothing to encrypt, so [`build`](Self::build) is
+    /// available directly.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use derec_library::derec_message::{DeRecMessageBuilder, current_timestamp};
+    /// use derec_library::types::ChannelId;
+    /// use derec_proto::{MessageBody, PrePairRequestMessage};
+    ///
+    /// let envelope = DeRecMessageBuilder::plaintext()
+    ///     .channel_id(ChannelId(42))
+    ///     .timestamp(current_timestamp())
+    ///     .message_body(MessageBody::PrePairRequest(PrePairRequestMessage::default()))
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq!(envelope.channel_id, 42);
+    /// ```
+    pub fn plaintext() -> Self {
+        Self {
+            sequence: 0,
+            channel_id: None,
+            timestamp: None,
+            message: None,
+            trace_id: None,
+            encrypted: Vec::new(),
+            _state: PhantomData,
+            _mode: PhantomData,
+        }
+    }
+
+    /// Builds the plaintext [`DeRecMessage`] envelope: `message` carries the
+    /// encoded [`MessageBody`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeRecMessageBuilderError`] if:
+    ///
+    /// - [`DeRecMessageBuilderError::MissingMessage`] if no payload was set
+    /// - [`DeRecMessageBuilderError::MissingChannelId`] if `channel_id` was not set
+    /// - [`DeRecMessageBuilderError::MissingTimestamp`] if `timestamp` was not set
+    pub fn build(self) -> Result<DeRecMessage, DeRecMessageBuilderError> {
+        let message = self
+            .message
+            .ok_or(DeRecMessageBuilderError::MissingMessage)
+            .map(|message| versioned(&message))?;
+        seal(
+            self.sequence,
+            self.channel_id,
+            self.timestamp,
+            self.trace_id,
+            message,
+        )
+    }
+}
+
+/// Encode `message` as the payload of an envelope at the current protocol
+/// version, carrying a copy of that version for the receiver to check.
+fn versioned(message: &MessageBody) -> Vec<u8> {
+    let version = ProtocolVersion::current();
+    message.encode_versioned(version.major, version.minor)
+}
+
+/// Assemble the envelope around `message`.
+fn seal(
+    sequence: u32,
+    channel_id: Option<ChannelId>,
+    timestamp: Option<Timestamp>,
+    trace_id: Option<u64>,
+    message: Vec<u8>,
+) -> Result<DeRecMessage, DeRecMessageBuilderError> {
+    let protocol_version = ProtocolVersion::current();
+    let channel_id = channel_id.ok_or(DeRecMessageBuilderError::MissingChannelId)?;
+    let timestamp = Some(timestamp.ok_or(DeRecMessageBuilderError::MissingTimestamp)?);
+
+    Ok(DeRecMessage {
+        protocol_version_major: protocol_version.major,
+        protocol_version_minor: protocol_version.minor,
+        sequence,
+        channel_id: channel_id.into(),
+        timestamp,
+        message,
+        trace_id: trace_id.unwrap_or_default(),
+    })
 }
 
 /// Returns the current system time as a protobuf [`Timestamp`].

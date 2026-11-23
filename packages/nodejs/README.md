@@ -361,7 +361,7 @@ case nothing is sent:
 - `accept()` throws. The pairing has completed and its response was sent,
   but `PairingCompleted` is not returned.
 - `verifyFingerprint()` throws. The promotion stands: calling it again
-  resolves `true` and publishes nothing.
+  resolves and publishes nothing.
 
 Call `start(FlowKind.ProtectSecret, ...)` with valid weights to publish to
 every helper.
@@ -652,20 +652,47 @@ where either or both are absent, is ignored as `MessageIgnored` with
 `reason: "TimestampMismatch"`; this includes replies from 0.0.8 peers.
 
 Within the inbound window `process` handles every copy of a message it is
-given, including one of this device's own messages delivered back to it.
-Detecting both is the app's transport's job: `envelope.message_id(bytes)`
-returns an `id` that is the same for every copy of one message, whatever its
-unauthenticated fields (sequence, trace id, protocol version) say, and a
-`timestamp`. Keep the `id` of every envelope you send and of every envelope
-`process` accepted (no throw and no `MessageIgnored`) until
-`max(received or sent at, timestamp) + inbound_message_secs`, drop an inbound
-envelope whose `id` you kept, and keep the record across restarts. Never key
-on a hash of the raw bytes. A helper ignores a `StoreShareRequest` for a
-version older than the newest it stores on the channel, and not stored
-itself, as `MessageIgnored` with `reason: "Superseded"`, unanswered. Reject a
-contact update older than the last one you accepted on the channel, using the
+given, including one of this device's own messages delivered back to it: both
+ends of a channel encrypt under one key, so a reflected message decrypts as if
+the peer had sent it. The library bounds a message's age and keeps each flow
+safe to repeat; it does not remember which messages it has seen. Detecting
+replays and reflections is the app's job, since the app owns the transport,
+and how it does so is its choice. `sequence` is not a replay counter. If the
+app does detect duplicates, key on the envelope's encrypted `message` field:
+it cannot be changed without failing decryption and differs for every
+message, since each is sealed under a fresh random nonce;
+`envelope.encrypted_payload` reads that field. Never key on a hash of the raw
+envelope: `sequence` and `traceId` are not authenticated and an
+envelope can be re-encoded, so a copy can arrive as different bytes. Keep each
+key for the inbound window measured from the later of the envelope's arrival
+(or send) and its `timestamp`, and keep the record across restarts. A sender
+that retries by building the message again draws a new nonce, so its retry is
+a new message. A helper ignores a `StoreShareRequest` for a version older than
+the newest it stores on the channel, and not stored itself, as
+`MessageIgnored` with `reason: "Superseded"`, unanswered. Reject a contact
+update older than the last one you accepted on the channel, using the
 `timestamp` of the envelope that raised it; that needs auto-accept off for
 `UpdateChannelInfo`.
+
+Choose `timeouts.inbound_message_secs` to cover the longest a message can take
+to arrive plus the clock difference between devices (default 300 seconds; a
+store-and-forward relay with devices offline for long periods may need an
+hour); a longer window is a longer replay exposure, so a duplicate record must
+cover all of it. What each flow does with a message it already handled is in
+[Replays and
+reflections](https://github.com/derecalliance/lib-derec/tree/main/library#replays-and-reflections).
+
+The envelope's protocol version is copied into the encrypted payload and
+checked like the timestamp, so it cannot be changed undetected: a message
+whose copy differs is ignored as `MessageIgnored` with
+`reason: "ProtocolVersionMismatch"`. A message from an earlier release carries
+no copy, which reads as 0.0, its envelope's version.
+`withMinProtocolVersion(major, minor)` (default 0.0, every version;
+`min_protocol_version` in the config JSON) stops accepting older releases:
+once every peer runs 0.1.0 or later, raise it to 0.1, and a message naming an
+older version is ignored as `MessageIgnored` with
+`reason: "ProtocolVersionTooOld"`: nothing in it is decrypted, stored or
+answered.
 
 A pairing has a lifetime, `timeouts.pairing_secs` (default 30). Both sides
 enforce it and nothing is sent on expiry: `start(FlowKind.Pairing, …)` refuses
@@ -1153,11 +1180,13 @@ MITM-vulnerable replica.
 Until a device confirms, it ignores everything the peer sends on that
 channel: `process` changes no store, sends nothing back, and returns
 `{ type: "MessageIgnored", channel_id, reason: "PendingVerification",
-trace_id }`. This matters most for a replica destination. The source's own
-confirmation publishes the vault immediately, so that copy usually arrives
-before the destination's user has confirmed. Confirming does not replay it:
-once the destination's `verifyFingerprint` resolves `true`, call
-`start(FlowKind.ReplicaDiscovery)` to pull the copy from the source.
+trace_id }`. This matters most for a replica destination. Confirming
+publishes nothing on either device: the source's application calls
+`start(FlowKind.ProtectSecret, …)` once it knows both devices have confirmed.
+A copy that arrives before the destination's user has confirmed is ignored,
+and confirming does not replay it: once the destination's `verifyFingerprint`
+resolves, call `start(FlowKind.ReplicaDiscovery)` to pull the copy
+from the source.
 
 Until a device confirms a member, that member is not part of the group as
 far as the device is concerned. It is left out of every roster the device

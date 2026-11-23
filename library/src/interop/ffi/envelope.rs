@@ -7,16 +7,15 @@
 //! fields can be read or rewritten without touching the encrypted inner
 //! payload: `trace_id`, the opaque correlation token described on
 //! `DeRecMessage.traceId`, `sequence`, the epoch of the channel key that
-//! encrypted the payload, and the message identity the application's replay
-//! detection keys on.
+//! encrypted the payload, and the encrypted `message` field the application's
+//! duplicate detection can key on.
 
 use std::slice;
 
-use crate::derec_message::{apply_trace_id, message_id, read_sequence, read_trace_id};
+use crate::derec_message::{apply_trace_id, encrypted_payload, read_sequence, read_trace_id};
 use crate::interop::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
 use crate::interop::ffi::error::{
-    DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error,
-    success,
+    DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, success,
 };
 
 #[repr(C)]
@@ -24,6 +23,13 @@ pub struct ApplyTraceIdResult {
     pub error: DeRecError,
     /// Re-encoded envelope bytes with `trace_id` overwritten. Empty on error.
     pub wire_bytes: DeRecBuffer,
+}
+
+#[repr(C)]
+pub struct EncryptedPayloadResult {
+    pub error: DeRecError,
+    /// The envelope's encrypted `message` field. Empty on error.
+    pub payload: DeRecBuffer,
 }
 
 #[repr(C)]
@@ -39,17 +45,6 @@ pub struct ReadSequenceResult {
     pub error: DeRecError,
     /// Epoch of the channel key that encrypted the payload. Zero on error.
     pub sequence: u32,
-}
-
-#[repr(C)]
-pub struct MessageIdResult {
-    pub error: DeRecError,
-    /// SHA-256 of the envelope's encrypted `message` field (32 bytes). Empty
-    /// on error.
-    pub id: DeRecBuffer,
-    /// The envelope's send time, in seconds since the Unix epoch. Zero on
-    /// error.
-    pub timestamp: u64,
 }
 
 /// Overwrite `trace_id` on an already-produced envelope and return the
@@ -177,24 +172,23 @@ pub extern "C" fn read_sequence_from_envelope(
     }
 }
 
-/// Identify an envelope for replay and reflection detection: the same `id`
-/// for every copy of one message, whatever its unauthenticated cleartext
-/// fields say, and a different one for every other message.
+/// Read the encrypted `message` field off an envelope, without the channel
+/// key: the part of an envelope the application's duplicate detection can
+/// key on.
 ///
-/// Mirrors [`crate::derec_message::message_id`].
+/// Mirrors [`crate::derec_message::encrypted_payload`].
 ///
 /// # Safety
 ///
 /// `envelope_ptr` must point to a readable byte range of length `envelope_len`.
 #[unsafe(no_mangle)]
-pub extern "C" fn message_id_from_envelope(
+pub extern "C" fn encrypted_payload_from_envelope(
     envelope_ptr: *const u8,
     envelope_len: usize,
-) -> MessageIdResult {
-    let with_err = |error| MessageIdResult {
+) -> EncryptedPayloadResult {
+    let with_err = |error| EncryptedPayloadResult {
         error,
-        id: empty_buffer(),
-        timestamp: 0,
+        payload: empty_buffer(),
     };
 
     if envelope_ptr.is_null() && envelope_len > 0 {
@@ -206,12 +200,14 @@ pub extern "C" fn message_id_from_envelope(
         unsafe { slice::from_raw_parts(envelope_ptr, envelope_len) }
     };
 
-    match message_id(bytes) {
-        Ok(identity) => MessageIdResult {
+    match encrypted_payload(bytes) {
+        Ok(payload) => EncryptedPayloadResult {
             error: success(),
-            id: vec_into_buffer(identity.id.to_vec()),
-            timestamp: identity.timestamp,
+            payload: vec_into_buffer(payload),
         },
-        Err(error) => with_err(from_lib_error(error)),
+        Err(_) => with_err(ffi_error(
+            DEREC_CODE_FFI_BAD_PROTO,
+            "failed to decode DeRecMessage envelope",
+        )),
     }
 }

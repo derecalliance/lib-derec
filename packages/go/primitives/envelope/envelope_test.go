@@ -5,9 +5,15 @@ package envelope_test
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 
+	"google.golang.org/protobuf/proto"
+
+	"github.com/derecalliance/lib-derec/packages/go/derec"
+	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/channelkey"
+	"github.com/derecalliance/lib-derec/packages/go/primitives/discovery"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/envelope"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/verification"
 )
@@ -83,44 +89,89 @@ func TestReadSequenceAndDerive(t *testing.T) {
 	}
 }
 
-func TestMessageIDIgnoresTheTraceID(t *testing.T) {
-	key := sharedKey()
-	original, err := verification.Request.Produce(7, 42, 1, key, 0, nil)
+func TestEncryptedPayloadIsTheMessageField(t *testing.T) {
+	wire, err := verification.Request.Produce(7, 42, 1, sharedKey(), 0, nil)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}
-	restamped, err := envelope.ApplyTraceID(original, 0x7E57)
+
+	payload, err := envelope.EncryptedPayload(wire)
+	if err != nil {
+		t.Fatalf("encrypted payload: %v", err)
+	}
+
+	var decoded derecpb.DeRecMessage
+	if err := proto.Unmarshal(wire, &decoded); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if len(payload) == 0 || !bytes.Equal(payload, decoded.Message) {
+		t.Fatal("encrypted payload must equal the envelope's message field")
+	}
+}
+
+func TestEncryptedPayloadSurvivesRestamping(t *testing.T) {
+	wire, err := verification.Request.Produce(7, 42, 1, sharedKey(), 0, nil)
+	if err != nil {
+		t.Fatalf("produce: %v", err)
+	}
+	original, err := envelope.EncryptedPayload(wire)
+	if err != nil {
+		t.Fatalf("encrypted payload: %v", err)
+	}
+
+	traced, err := envelope.ApplyTraceID(wire, 0xABCD)
 	if err != nil {
 		t.Fatalf("apply trace id: %v", err)
 	}
-	another, err := verification.Request.Produce(7, 42, 1, key, 0, nil)
+	var decoded derecpb.DeRecMessage
+	if err := proto.Unmarshal(traced, &decoded); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	decoded.Sequence++
+	restamped, err := proto.Marshal(&decoded)
 	if err != nil {
-		t.Fatalf("produce: %v", err)
+		t.Fatalf("encode envelope: %v", err)
+	}
+	if bytes.Equal(restamped, wire) {
+		t.Fatal("restamped envelope must differ from the original on the wire")
 	}
 
-	first, err := envelope.ReadMessageID(original)
+	got, err := envelope.EncryptedPayload(restamped)
 	if err != nil {
-		t.Fatalf("message id: %v", err)
+		t.Fatalf("encrypted payload of restamped copy: %v", err)
 	}
-	copied, err := envelope.ReadMessageID(restamped)
-	if err != nil {
-		t.Fatalf("message id of the copy: %v", err)
+	if !bytes.Equal(got, original) {
+		t.Fatal("a restamped copy must carry the same encrypted payload")
 	}
-	other, err := envelope.ReadMessageID(another)
+}
+
+func TestEncryptedPayloadDiffersForSameBody(t *testing.T) {
+	first, err := discovery.Request.Produce(7, sharedKey(), 0, nil)
 	if err != nil {
-		t.Fatalf("message id of another message: %v", err)
+		t.Fatalf("produce first: %v", err)
+	}
+	second, err := discovery.Request.Produce(7, sharedKey(), 0, nil)
+	if err != nil {
+		t.Fatalf("produce second: %v", err)
 	}
 
-	if len(first.ID) != 32 || first.Timestamp == 0 {
-		t.Fatalf("unexpected identity %+v", first)
+	a, err := envelope.EncryptedPayload(first)
+	if err != nil {
+		t.Fatalf("encrypted payload first: %v", err)
 	}
-	if !bytes.Equal(first.ID, copied.ID) {
-		t.Fatal("a copy with another trace id must keep the message id")
+	b, err := envelope.EncryptedPayload(second)
+	if err != nil {
+		t.Fatalf("encrypted payload second: %v", err)
 	}
-	if bytes.Equal(first.ID, other.ID) {
-		t.Fatal("two messages must not share a message id")
+	if bytes.Equal(a, b) {
+		t.Fatal("two messages with the same body must carry different encrypted payloads")
 	}
-	if _, err := envelope.ReadMessageID([]byte("not an envelope")); err == nil {
-		t.Fatal("garbage must not yield a message id")
+}
+
+func TestEncryptedPayloadRejectsNonEnvelopeBytes(t *testing.T) {
+	_, err := envelope.EncryptedPayload([]byte{0xFF, 0xFF, 0xFF})
+	var derr *derec.Error
+	if !errors.As(err, &derr) || derr.Code != derec.CodeFFIBadProto {
+		t.Fatalf("want *derec.Error CodeFFIBadProto, got %#v", err)
 	}
 }

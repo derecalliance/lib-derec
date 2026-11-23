@@ -13,8 +13,7 @@ use crate::protocol::traits::{
     DeRecUserSecretStore,
 };
 use crate::protocol::types::{
-    ChannelQuery, ChannelStatus, MissingPolicy, ReplicaFilter, SharingRoundState, StateItem,
-    StateKey, StateKind,
+    MissingPolicy, ReplicaFilter, SharingRoundState, StateItem, StateKey, StateKind,
 };
 use crate::types::{ChannelId, ReplicaId};
 use derec_proto::StatusEnum;
@@ -165,19 +164,12 @@ impl<
     /// Each closed round emits [`DeRecEvent::SharingComplete`], then
     /// [`DeRecEvent::ReplicaSyncComplete`] when it had a replica leg —
     /// different success rule, different key, so a helpers-only publish stays
-    /// silent there — then one [`DeRecEvent::ReplicaRemoved`] per departed
-    /// member it let go. Rounds are reported in version order, and a member
-    /// several of them let go is reported by the first.
+    /// silent there. Rounds are reported in version order.
     ///
-    /// The rounds close together: one read of the confirmed helpers' weights,
-    /// one removal of the departed members and one removal of the rounds.
-    /// When the weights cannot be read or the departed members cannot be
-    /// removed, no round closes: all of them are returned, to be saved as they
-    /// stand and completed on a later call, so `threshold_met` is never
-    /// guessed and no departed member is left behind once its round is gone.
-    /// The departed members are removed before the rounds, so a failure to
-    /// remove the rounds after that reports no [`DeRecEvent::ReplicaRemoved`]
-    /// when they complete later.
+    /// The rounds close together: one read of the confirmed helpers' weights
+    /// and one removal of the rounds. When the weights cannot be read, no
+    /// round closes: all of them are returned, to be saved as they stand and
+    /// completed on a later call, so `threshold_met` is never guessed.
     async fn complete_rounds(
         &mut self,
         mut answered: Vec<(SharingRoundState, Settled)>,
@@ -189,8 +181,9 @@ impl<
         answered.sort_unstable_by_key(|(round, _)| round.version);
         let versions: Vec<u32> = answered.iter().map(|(round, _)| round.version).collect();
 
-        let (thresholds_met, removed) = match self.prepare_completion(&answered).await {
-            Ok(prepared) => prepared,
+        let rounds: Vec<&SharingRoundState> = answered.iter().map(|(round, _)| round).collect();
+        let thresholds_met = match self.thresholds_met(&rounds).await {
+            Ok(met) => met,
             Err(_error) => {
                 #[cfg(feature = "logging")]
                 tracing::warn!(
@@ -211,7 +204,6 @@ impl<
             return Vec::new();
         }
 
-        let mut unreported: BTreeSet<u64> = removed.into_iter().collect();
         for ((round, mut settled), threshold_met) in answered.into_iter().zip(thresholds_met) {
             if !round.synced_replicas.is_empty() && round.behind_replicas.is_empty() {
                 settled.synced.push(round.version);
@@ -226,18 +218,6 @@ impl<
                 threshold_met,
             }];
             events.extend(replica_summary(&round));
-            let departed: Vec<u64> = round
-                .synced_replicas
-                .iter()
-                .map(|replica_id| replica_id.0)
-                .filter(|replica_id| unreported.contains(replica_id))
-                .collect::<BTreeSet<u64>>()
-                .into_iter()
-                .collect();
-            for replica_id in departed {
-                unreported.remove(&replica_id);
-                events.push(DeRecEvent::ReplicaRemoved { replica_id });
-            }
 
             #[cfg(feature = "logging")]
             tracing::info!(
@@ -251,22 +231,6 @@ impl<
             written.record(settled, events);
         }
         Vec::new()
-    }
-
-    /// What closing `answered` needs before the rounds are removed: whether
-    /// each met its threshold, in order, and the departed members removed.
-    async fn prepare_completion(
-        &mut self,
-        answered: &[(SharingRoundState, Settled)],
-    ) -> Result<(Vec<bool>, Vec<u64>)> {
-        let rounds: Vec<&SharingRoundState> = answered.iter().map(|(round, _)| round).collect();
-        let thresholds_met = self.thresholds_met(&rounds).await?;
-        let synced: HashSet<ReplicaId> = rounds
-            .iter()
-            .flat_map(|round| round.synced_replicas.iter().copied())
-            .collect();
-        let removed = self.remove_departed_members(&synced).await?;
-        Ok((thresholds_met, removed))
     }
 
     /// Whether the confirmed helpers of each of `rounds` hold at least its
@@ -292,57 +256,6 @@ impl<
                 confirmed_weight >= round_threshold
             })
             .collect())
-    }
-
-    /// Drop the rows of the members in `synced` that were told to leave, and
-    /// return their ids, sorted.
-    ///
-    /// This is the publisher-side half of the removal rule: a member told to
-    /// leave completes its departure when it acknowledges the version that
-    /// excludes it, which is what `synced` records. Receive-side
-    /// reconciliation cannot do this — a publisher never receives the roster it
-    /// just sent — so without it the device that ran the removal would keep the
-    /// row forever and go on addressing a member that has already torn down.
-    ///
-    /// The rows go in one call, so either every one is removed or none is.
-    async fn remove_departed_members(&mut self, synced: &HashSet<ReplicaId>) -> Result<Vec<u64>> {
-        // An empty `ids` is "every member", not "no member", so a round
-        // that synced nobody must not reach the store at all.
-        if synced.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let departed = self
-            .channel_store
-            .replicas_matching(
-                self.secret_id,
-                ReplicaFilter {
-                    ids: synced.iter().copied().collect(),
-                    status: vec![ChannelStatus::Unpairing],
-                    ..Default::default()
-                },
-            )
-            .await?;
-
-        if departed.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let queries: Vec<ChannelQuery> = departed
-            .iter()
-            .map(|member| ChannelQuery::Replica {
-                channel_id: member.channel_id,
-                replica_id: member.replica_id,
-            })
-            .collect();
-
-        self.channel_store
-            .remove_many(self.secret_id, &queries)
-            .await?;
-
-        let mut removed: Vec<u64> = departed.iter().map(|member| member.replica_id.0).collect();
-        removed.sort_unstable();
-        Ok(removed)
     }
 
     /// Persist an open round.

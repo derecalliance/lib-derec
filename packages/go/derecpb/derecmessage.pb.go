@@ -87,9 +87,9 @@ const (
 // encrypt under one key, so a message delivered back to its own sender
 // decrypts there too. The transport MUST:
 //
-//   - identify an envelope by a hash of its `message` field only. `sequence`,
-//     `traceId` and the protocol version are not authenticated, and an
-//     envelope can be re-encoded, so a copy can arrive as different bytes;
+//   - identify an envelope by a hash of its `message` field only. `sequence`
+//     and `traceId` are not authenticated, and an envelope can be re-encoded,
+//     so a copy can arrive as different bytes;
 //   - keep the identity of every envelope it accepted and of every envelope
 //     it sent until the later of its arrival (or sending) and its `timestamp`,
 //     plus the inbound-message window, and drop an inbound envelope whose
@@ -151,8 +151,9 @@ type DeRecMessage struct {
 	// is not a message counter and does not order, deduplicate or replay-protect
 	// messages; replay protection relies on `timestamp`.
 	//
-	// This field is outside the encryption. A tampered value selects the wrong
-	// key and the payload does not decrypt.
+	// This field is outside the encryption and, unlike `timestamp` and the
+	// protocol version, has no copy in the encrypted payload. A tampered value
+	// selects the wrong key and the payload does not decrypt.
 	Sequence uint32 `protobuf:"varint,3,opt,name=sequence,proto3" json:"sequence,omitempty"`
 	// Channel identifier associated with this communication session.
 	//
@@ -181,12 +182,11 @@ type DeRecMessage struct {
 	Timestamp *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 	// Encrypted message payload.
 	//
-	// This field contains the encrypted bytes of a serialized MessageBody.
-	// The encryption scheme and key material are defined by the pairing process
-	// and subsequent key management flows.
-	//
-	// Upon decryption, this field MUST deserialize into a valid MessageBody
-	// containing exactly one protocol message.
+	// This field contains the encrypted bytes of a serialized DeRecPayload,
+	// which carries exactly one protocol message. The encryption scheme and key
+	// material are defined by the pairing process and subsequent key management
+	// flows. The `PrePair` leg of pairing, sent before any key exists, carries
+	// the DeRecPayload unencrypted.
 	Message []byte `protobuf:"bytes,6,opt,name=message,proto3" json:"message,omitempty"`
 	// Application-supplied correlation token, echoed verbatim by the
 	// responder on the matching response envelope.
@@ -305,6 +305,91 @@ func (x *DeRecMessage) GetTraceId() uint64 {
 	return 0
 }
 
+// The payload a DeRecMessage carries in `message`: one protocol message,
+// identified by name, and a copy of the envelope's protocol version.
+//
+// Fields 1 and 2 are those of google.protobuf.Any, so a reader that decodes
+// the payload as Any reads the same message and skips fields 3 and 4.
+//
+// The receiver checks that the copied version equals the envelope's
+// `protocolVersionMajor` and `protocolVersionMinor`, and discards the message
+// otherwise, as it does for the timestamp. The payload is encrypted and
+// authenticated, so the envelope's version cannot be changed undetected. A
+// payload from a release that writes no version reads as 0.0, the version
+// such a release puts on its envelope.
+type DeRecPayload struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// `type.derec.org/` followed by the message's name, e.g.
+	// `type.derec.org/StoreShareRequestMessage`.
+	TypeUrl string `protobuf:"bytes,1,opt,name=type_url,json=typeUrl,proto3" json:"type_url,omitempty"`
+	// The encoded protocol message.
+	Value []byte `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	// Copy of the envelope's `protocolVersionMajor`.
+	ProtocolVersionMajor uint32 `protobuf:"varint,3,opt,name=protocolVersionMajor,proto3" json:"protocolVersionMajor,omitempty"`
+	// Copy of the envelope's `protocolVersionMinor`.
+	ProtocolVersionMinor uint32 `protobuf:"varint,4,opt,name=protocolVersionMinor,proto3" json:"protocolVersionMinor,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *DeRecPayload) Reset() {
+	*x = DeRecPayload{}
+	mi := &file_derecmessage_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeRecPayload) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeRecPayload) ProtoMessage() {}
+
+func (x *DeRecPayload) ProtoReflect() protoreflect.Message {
+	mi := &file_derecmessage_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeRecPayload.ProtoReflect.Descriptor instead.
+func (*DeRecPayload) Descriptor() ([]byte, []int) {
+	return file_derecmessage_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *DeRecPayload) GetTypeUrl() string {
+	if x != nil {
+		return x.TypeUrl
+	}
+	return ""
+}
+
+func (x *DeRecPayload) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+func (x *DeRecPayload) GetProtocolVersionMajor() uint32 {
+	if x != nil {
+		return x.ProtocolVersionMajor
+	}
+	return 0
+}
+
+func (x *DeRecPayload) GetProtocolVersionMinor() uint32 {
+	if x != nil {
+		return x.ProtocolVersionMinor
+	}
+	return 0
+}
+
 // MessageBody defines all possible DeRec protocol messages that can be
 // transported inside the DeRecMessage envelope.
 //
@@ -337,7 +422,7 @@ type DeRecMessage_MessageBody struct {
 
 func (x *DeRecMessage_MessageBody) Reset() {
 	*x = DeRecMessage_MessageBody{}
-	mi := &file_derecmessage_proto_msgTypes[1]
+	mi := &file_derecmessage_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -349,7 +434,7 @@ func (x *DeRecMessage_MessageBody) String() string {
 func (*DeRecMessage_MessageBody) ProtoMessage() {}
 
 func (x *DeRecMessage_MessageBody) ProtoReflect() protoreflect.Message {
-	mi := &file_derecmessage_proto_msgTypes[1]
+	mi := &file_derecmessage_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -666,7 +751,12 @@ const file_derecmessage_proto_rawDesc = "" +
 	" updateChannelInfoResponseMessage\x18\x0f \x01(\v2B.org.derecalliance.derec.protobuf.UpdateChannelInfoResponseMessageH\x00R updateChannelInfoResponseMessage\x12o\n" +
 	"\x15prePairRequestMessage\x18\x10 \x01(\v27.org.derecalliance.derec.protobuf.PrePairRequestMessageH\x00R\x15prePairRequestMessage\x12r\n" +
 	"\x16prePairResponseMessage\x18\x11 \x01(\v28.org.derecalliance.derec.protobuf.PrePairResponseMessageH\x00R\x16prePairResponseMessageB\x06\n" +
-	"\x04bodyb\x06proto3"
+	"\x04body\"\xa7\x01\n" +
+	"\fDeRecPayload\x12\x19\n" +
+	"\btype_url\x18\x01 \x01(\tR\atypeUrl\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\x122\n" +
+	"\x14protocolVersionMajor\x18\x03 \x01(\rR\x14protocolVersionMajor\x122\n" +
+	"\x14protocolVersionMinor\x18\x04 \x01(\rR\x14protocolVersionMinorb\x06proto3"
 
 var (
 	file_derecmessage_proto_rawDescOnce sync.Once
@@ -680,48 +770,49 @@ func file_derecmessage_proto_rawDescGZIP() []byte {
 	return file_derecmessage_proto_rawDescData
 }
 
-var file_derecmessage_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_derecmessage_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_derecmessage_proto_goTypes = []any{
 	(*DeRecMessage)(nil),                        // 0: org.derecalliance.derec.protobuf.DeRecMessage
-	(*DeRecMessage_MessageBody)(nil),            // 1: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody
-	(*timestamppb.Timestamp)(nil),               // 2: google.protobuf.Timestamp
-	(*PairRequestMessage)(nil),                  // 3: org.derecalliance.derec.protobuf.PairRequestMessage
-	(*PairResponseMessage)(nil),                 // 4: org.derecalliance.derec.protobuf.PairResponseMessage
-	(*UnpairRequestMessage)(nil),                // 5: org.derecalliance.derec.protobuf.UnpairRequestMessage
-	(*UnpairResponseMessage)(nil),               // 6: org.derecalliance.derec.protobuf.UnpairResponseMessage
-	(*StoreShareRequestMessage)(nil),            // 7: org.derecalliance.derec.protobuf.StoreShareRequestMessage
-	(*StoreShareResponseMessage)(nil),           // 8: org.derecalliance.derec.protobuf.StoreShareResponseMessage
-	(*VerifyShareRequestMessage)(nil),           // 9: org.derecalliance.derec.protobuf.VerifyShareRequestMessage
-	(*VerifyShareResponseMessage)(nil),          // 10: org.derecalliance.derec.protobuf.VerifyShareResponseMessage
-	(*GetSecretIdsVersionsRequestMessage)(nil),  // 11: org.derecalliance.derec.protobuf.GetSecretIdsVersionsRequestMessage
-	(*GetSecretIdsVersionsResponseMessage)(nil), // 12: org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage
-	(*GetShareRequestMessage)(nil),              // 13: org.derecalliance.derec.protobuf.GetShareRequestMessage
-	(*GetShareResponseMessage)(nil),             // 14: org.derecalliance.derec.protobuf.GetShareResponseMessage
-	(*ErrorResponseMessage)(nil),                // 15: org.derecalliance.derec.protobuf.ErrorResponseMessage
-	(*UpdateChannelInfoRequestMessage)(nil),     // 16: org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage
-	(*UpdateChannelInfoResponseMessage)(nil),    // 17: org.derecalliance.derec.protobuf.UpdateChannelInfoResponseMessage
-	(*PrePairRequestMessage)(nil),               // 18: org.derecalliance.derec.protobuf.PrePairRequestMessage
-	(*PrePairResponseMessage)(nil),              // 19: org.derecalliance.derec.protobuf.PrePairResponseMessage
+	(*DeRecPayload)(nil),                        // 1: org.derecalliance.derec.protobuf.DeRecPayload
+	(*DeRecMessage_MessageBody)(nil),            // 2: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody
+	(*timestamppb.Timestamp)(nil),               // 3: google.protobuf.Timestamp
+	(*PairRequestMessage)(nil),                  // 4: org.derecalliance.derec.protobuf.PairRequestMessage
+	(*PairResponseMessage)(nil),                 // 5: org.derecalliance.derec.protobuf.PairResponseMessage
+	(*UnpairRequestMessage)(nil),                // 6: org.derecalliance.derec.protobuf.UnpairRequestMessage
+	(*UnpairResponseMessage)(nil),               // 7: org.derecalliance.derec.protobuf.UnpairResponseMessage
+	(*StoreShareRequestMessage)(nil),            // 8: org.derecalliance.derec.protobuf.StoreShareRequestMessage
+	(*StoreShareResponseMessage)(nil),           // 9: org.derecalliance.derec.protobuf.StoreShareResponseMessage
+	(*VerifyShareRequestMessage)(nil),           // 10: org.derecalliance.derec.protobuf.VerifyShareRequestMessage
+	(*VerifyShareResponseMessage)(nil),          // 11: org.derecalliance.derec.protobuf.VerifyShareResponseMessage
+	(*GetSecretIdsVersionsRequestMessage)(nil),  // 12: org.derecalliance.derec.protobuf.GetSecretIdsVersionsRequestMessage
+	(*GetSecretIdsVersionsResponseMessage)(nil), // 13: org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage
+	(*GetShareRequestMessage)(nil),              // 14: org.derecalliance.derec.protobuf.GetShareRequestMessage
+	(*GetShareResponseMessage)(nil),             // 15: org.derecalliance.derec.protobuf.GetShareResponseMessage
+	(*ErrorResponseMessage)(nil),                // 16: org.derecalliance.derec.protobuf.ErrorResponseMessage
+	(*UpdateChannelInfoRequestMessage)(nil),     // 17: org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage
+	(*UpdateChannelInfoResponseMessage)(nil),    // 18: org.derecalliance.derec.protobuf.UpdateChannelInfoResponseMessage
+	(*PrePairRequestMessage)(nil),               // 19: org.derecalliance.derec.protobuf.PrePairRequestMessage
+	(*PrePairResponseMessage)(nil),              // 20: org.derecalliance.derec.protobuf.PrePairResponseMessage
 }
 var file_derecmessage_proto_depIdxs = []int32{
-	2,  // 0: org.derecalliance.derec.protobuf.DeRecMessage.timestamp:type_name -> google.protobuf.Timestamp
-	3,  // 1: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.pairRequestMessage:type_name -> org.derecalliance.derec.protobuf.PairRequestMessage
-	4,  // 2: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.pairResponseMessage:type_name -> org.derecalliance.derec.protobuf.PairResponseMessage
-	5,  // 3: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.unpairRequestMessage:type_name -> org.derecalliance.derec.protobuf.UnpairRequestMessage
-	6,  // 4: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.unpairResponseMessage:type_name -> org.derecalliance.derec.protobuf.UnpairResponseMessage
-	7,  // 5: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.storeShareRequestMessage:type_name -> org.derecalliance.derec.protobuf.StoreShareRequestMessage
-	8,  // 6: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.storeShareResponseMessage:type_name -> org.derecalliance.derec.protobuf.StoreShareResponseMessage
-	9,  // 7: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.verifyShareRequestMessage:type_name -> org.derecalliance.derec.protobuf.VerifyShareRequestMessage
-	10, // 8: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.verifyShareResponseMessage:type_name -> org.derecalliance.derec.protobuf.VerifyShareResponseMessage
-	11, // 9: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.getSecretIdsVersionsRequestMessage:type_name -> org.derecalliance.derec.protobuf.GetSecretIdsVersionsRequestMessage
-	12, // 10: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.getSecretIdsVersionsResponseMessage:type_name -> org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage
-	13, // 11: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.getShareRequestMessage:type_name -> org.derecalliance.derec.protobuf.GetShareRequestMessage
-	14, // 12: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.getShareResponseMessage:type_name -> org.derecalliance.derec.protobuf.GetShareResponseMessage
-	15, // 13: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.errorResponseMessage:type_name -> org.derecalliance.derec.protobuf.ErrorResponseMessage
-	16, // 14: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.updateChannelInfoRequestMessage:type_name -> org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage
-	17, // 15: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.updateChannelInfoResponseMessage:type_name -> org.derecalliance.derec.protobuf.UpdateChannelInfoResponseMessage
-	18, // 16: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.prePairRequestMessage:type_name -> org.derecalliance.derec.protobuf.PrePairRequestMessage
-	19, // 17: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.prePairResponseMessage:type_name -> org.derecalliance.derec.protobuf.PrePairResponseMessage
+	3,  // 0: org.derecalliance.derec.protobuf.DeRecMessage.timestamp:type_name -> google.protobuf.Timestamp
+	4,  // 1: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.pairRequestMessage:type_name -> org.derecalliance.derec.protobuf.PairRequestMessage
+	5,  // 2: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.pairResponseMessage:type_name -> org.derecalliance.derec.protobuf.PairResponseMessage
+	6,  // 3: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.unpairRequestMessage:type_name -> org.derecalliance.derec.protobuf.UnpairRequestMessage
+	7,  // 4: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.unpairResponseMessage:type_name -> org.derecalliance.derec.protobuf.UnpairResponseMessage
+	8,  // 5: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.storeShareRequestMessage:type_name -> org.derecalliance.derec.protobuf.StoreShareRequestMessage
+	9,  // 6: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.storeShareResponseMessage:type_name -> org.derecalliance.derec.protobuf.StoreShareResponseMessage
+	10, // 7: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.verifyShareRequestMessage:type_name -> org.derecalliance.derec.protobuf.VerifyShareRequestMessage
+	11, // 8: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.verifyShareResponseMessage:type_name -> org.derecalliance.derec.protobuf.VerifyShareResponseMessage
+	12, // 9: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.getSecretIdsVersionsRequestMessage:type_name -> org.derecalliance.derec.protobuf.GetSecretIdsVersionsRequestMessage
+	13, // 10: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.getSecretIdsVersionsResponseMessage:type_name -> org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage
+	14, // 11: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.getShareRequestMessage:type_name -> org.derecalliance.derec.protobuf.GetShareRequestMessage
+	15, // 12: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.getShareResponseMessage:type_name -> org.derecalliance.derec.protobuf.GetShareResponseMessage
+	16, // 13: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.errorResponseMessage:type_name -> org.derecalliance.derec.protobuf.ErrorResponseMessage
+	17, // 14: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.updateChannelInfoRequestMessage:type_name -> org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage
+	18, // 15: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.updateChannelInfoResponseMessage:type_name -> org.derecalliance.derec.protobuf.UpdateChannelInfoResponseMessage
+	19, // 16: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.prePairRequestMessage:type_name -> org.derecalliance.derec.protobuf.PrePairRequestMessage
+	20, // 17: org.derecalliance.derec.protobuf.DeRecMessage.MessageBody.prePairResponseMessage:type_name -> org.derecalliance.derec.protobuf.PrePairResponseMessage
 	18, // [18:18] is the sub-list for method output_type
 	18, // [18:18] is the sub-list for method input_type
 	18, // [18:18] is the sub-list for extension type_name
@@ -743,7 +834,7 @@ func file_derecmessage_proto_init() {
 	file_updatechannelinfo_proto_init()
 	file_prepair_proto_init()
 	file_error_proto_init()
-	file_derecmessage_proto_msgTypes[1].OneofWrappers = []any{
+	file_derecmessage_proto_msgTypes[2].OneofWrappers = []any{
 		(*DeRecMessage_MessageBody_PairRequestMessage)(nil),
 		(*DeRecMessage_MessageBody_PairResponseMessage)(nil),
 		(*DeRecMessage_MessageBody_UnpairRequestMessage)(nil),
@@ -768,7 +859,7 @@ func file_derecmessage_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_derecmessage_proto_rawDesc), len(file_derecmessage_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
