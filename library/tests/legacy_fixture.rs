@@ -18,7 +18,7 @@ use derec_library::protocol::{
     SecretValue,
 };
 use derec_library::protocol_version::ProtocolVersion;
-use derec_library::types::ChannelId;
+use derec_library::types::{ChannelId, SharedKey};
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
 use protocol_doubles::{
     InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore, InMemUserSecretStore,
@@ -82,7 +82,7 @@ fn process(floor: ProtocolVersion) -> Vec<DeRecEvent> {
             .save(
                 legacy.secret_id,
                 legacy.channel,
-                SecretValue::SharedKey(legacy.key),
+                SecretValue::SharedKey(SharedKey::new(legacy.key)),
             )
             .await
             .expect("seed key");

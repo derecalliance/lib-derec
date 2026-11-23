@@ -17,7 +17,10 @@ cargo run -p derec-grpc-transport-smoke-test
 ```
 
 Three nodes come up on loopback — an owner and two helpers — pair over the
-wire, distribute a threshold-split secret, and prove possession of it:
+wire, distribute a threshold-split secret twice with key rotation on, and
+prove possession of it. The owner then recovers the secret, and a fresh device
+restored from it takes over the owner's endpoint and publishes again under the
+next key epoch:
 
 ```
 [owner] listening on grpc://127.0.0.1:50051
@@ -26,7 +29,14 @@ wire, distribute a threshold-split secret, and prove possession of it:
 [pair] owner and helper-a paired ✓
 [pair] owner and helper-b paired ✓
 [protect] share v1 stored and confirmed by both helpers ✓
-[verify] both helpers proved possession of v1 ✓
+[protect] share v2 stored and confirmed by both helpers ✓
+[rotation] owner and both helpers store KeyRing epoch 2 ✓
+[verify] both helpers proved possession of v2 ✓
+[rotation] sequence 515 at helper-a → MessageIgnored(KeyUnavailable), nothing sent, ring unchanged ✓
+[recover] owner recovered v2; the roster names key epoch 2 ✓
+[restore] a fresh device restored v2 at key epoch 2 on grpc://127.0.0.1:50051 ✓
+[protect] share v3 stored and confirmed by both helpers ✓
+[rotation] owner and both helpers store KeyRing epoch 3 ✓
 ```
 
 ### Why two helpers, and the silent failure behind it

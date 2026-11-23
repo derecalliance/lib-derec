@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::types::SharedKey;
 use crate::{
     Error,
     primitives::sharing::{
@@ -216,7 +217,7 @@ fn test_produce_store_share_request_message_valid() {
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
     let version = 7;
-    let shared_key = [42u8; 32];
+    let shared_key = SharedKey::new([42u8; 32]);
 
     let SplitResult { shares } =
         split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
@@ -233,7 +234,7 @@ fn test_produce_store_share_request_message_valid() {
         committed_share,
         0,
         "",
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         &[],
     )
     .expect("produce_store_share_request_message should succeed");
@@ -251,7 +252,7 @@ fn test_produce_store_share_request_message_with_keep_version_and_description() 
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
     let version = 3;
-    let shared_key = [7u8; 32];
+    let shared_key = SharedKey::new([7u8; 32]);
 
     let SplitResult { shares } =
         split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
@@ -268,7 +269,7 @@ fn test_produce_store_share_request_message_with_keep_version_and_description() 
         committed_share,
         2,
         "initial share distribution",
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         &[],
     )
     .expect("produce_store_share_request_message should succeed");
@@ -283,7 +284,7 @@ fn test_produce_store_share_request_message_with_keep_version_and_description() 
 fn a_keep_version_at_or_above_the_shared_version_is_refused() {
     let secret_id: u64 = 1;
     let version = 3;
-    let shared_key = [7u8; 32];
+    let shared_key = SharedKey::new([7u8; 32]);
     let SplitResult { shares } = split(
         &make_channel_ids(&[1, 2, 3]),
         secret_id,
@@ -302,7 +303,7 @@ fn a_keep_version_at_or_above_the_shared_version_is_refused() {
             committed_share,
             keep_version,
             "",
-            &shared_key,
+            &crate::types::ChannelKey::new(0, shared_key.clone()),
             &[],
         )
         .err()
@@ -336,7 +337,7 @@ fn test_produce_store_share_response_message_valid() {
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
     let version = 7;
-    let shared_key = [42u8; 32];
+    let shared_key = SharedKey::new([42u8; 32]);
 
     let SplitResult { shares } =
         split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
@@ -355,7 +356,7 @@ fn test_produce_store_share_response_message_valid() {
         committed_share,
         0,
         "",
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         &[],
     )
     .expect("produce_store_share_request_message should succeed");
@@ -369,8 +370,12 @@ fn test_produce_store_share_response_message_valid() {
         committed_share: returned_share,
         secret_id: returned_secret_id,
         version: returned_version,
-    } = produce_store_share_response_message(channel_id, &request, &shared_key)
-        .expect("produce_store_share_response_message should succeed");
+    } = produce_store_share_response_message(
+        channel_id,
+        &request,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("produce_store_share_response_message should succeed");
 
     assert!(
         !response_envelope.is_empty(),
@@ -408,8 +413,8 @@ fn test_extract_store_share_request_wrong_key() {
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
     let version = 7;
-    let shared_key = [42u8; 32];
-    let wrong_key = [99u8; 32];
+    let shared_key = SharedKey::new([42u8; 32]);
+    let wrong_key = SharedKey::new([99u8; 32]);
 
     let SplitResult { shares } =
         split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
@@ -428,7 +433,7 @@ fn test_extract_store_share_request_wrong_key() {
         committed_share,
         0,
         "",
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         &[],
     )
     .expect("produce_store_share_request_message should succeed");
@@ -482,7 +487,7 @@ fn test_process_store_share_response_message_valid() {
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
     let version = 7;
-    let shared_key = [42u8; 32];
+    let shared_key = SharedKey::new([42u8; 32]);
 
     let SplitResult { shares } =
         split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
@@ -501,7 +506,7 @@ fn test_process_store_share_response_message_valid() {
         committed_share,
         0,
         "",
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         &[],
     )
     .expect("produce_store_share_request_message should succeed");
@@ -513,8 +518,12 @@ fn test_process_store_share_response_message_valid() {
     let ProduceStoreShareResponseMessageResult {
         envelope: response_envelope,
         ..
-    } = produce_store_share_response_message(channel_id, &request, &shared_key)
-        .expect("produce_store_share_response_message should succeed");
+    } = produce_store_share_response_message(
+        channel_id,
+        &request,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("produce_store_share_response_message should succeed");
 
     let ExtractStoreShareResponseResult { response } =
         extract_store_share_response(&response_envelope, &shared_key)
@@ -531,7 +540,7 @@ fn test_process_store_share_response_message_wrong_version() {
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
     let version = 7;
-    let shared_key = [42u8; 32];
+    let shared_key = SharedKey::new([42u8; 32]);
 
     let SplitResult { shares } =
         split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
@@ -550,7 +559,7 @@ fn test_process_store_share_response_message_wrong_version() {
         committed_share,
         0,
         "",
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         &[],
     )
     .expect("produce_store_share_request_message should succeed");
@@ -562,8 +571,12 @@ fn test_process_store_share_response_message_wrong_version() {
     let ProduceStoreShareResponseMessageResult {
         envelope: response_envelope,
         ..
-    } = produce_store_share_response_message(channel_id, &request, &shared_key)
-        .expect("produce_store_share_response_message should succeed");
+    } = produce_store_share_response_message(
+        channel_id,
+        &request,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("produce_store_share_response_message should succeed");
 
     let ExtractStoreShareResponseResult { response } =
         extract_store_share_response(&response_envelope, &shared_key)
@@ -581,8 +594,8 @@ fn test_extract_store_share_response_wrong_key() {
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
     let version = 7;
-    let shared_key = [42u8; 32];
-    let wrong_key = [99u8; 32];
+    let shared_key = SharedKey::new([42u8; 32]);
+    let wrong_key = SharedKey::new([99u8; 32]);
 
     let SplitResult { shares } =
         split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
@@ -601,7 +614,7 @@ fn test_extract_store_share_response_wrong_key() {
         committed_share,
         0,
         "",
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         &[],
     )
     .expect("produce_store_share_request_message should succeed");
@@ -613,8 +626,12 @@ fn test_extract_store_share_response_wrong_key() {
     let ProduceStoreShareResponseMessageResult {
         envelope: response_envelope,
         ..
-    } = produce_store_share_response_message(channel_id, &request, &shared_key)
-        .expect("produce_store_share_response_message should succeed");
+    } = produce_store_share_response_message(
+        channel_id,
+        &request,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("produce_store_share_response_message should succeed");
 
     let result = extract_store_share_response(&response_envelope, &wrong_key);
     assert!(result.is_err(), "should fail with wrong key");
@@ -626,10 +643,14 @@ fn test_produce_store_share_response_message_rejects_empty_commitment() {
         share.commitment.clear();
     });
 
-    let shared_key = [1u8; 32];
+    let shared_key = SharedKey::new([1u8; 32]);
     let channel_id = ChannelId(1);
 
-    let result = produce_store_share_response_message(channel_id, &request, &shared_key);
+    let result = produce_store_share_response_message(
+        channel_id,
+        &request,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    );
     assert!(result.is_err(), "should reject share with empty commitment");
 }
 
@@ -639,10 +660,14 @@ fn test_produce_store_share_response_message_rejects_empty_merkle_path() {
         share.merkle_path.clear();
     });
 
-    let shared_key = [1u8; 32];
+    let shared_key = SharedKey::new([1u8; 32]);
     let channel_id = ChannelId(1);
 
-    let result = produce_store_share_response_message(channel_id, &request, &shared_key);
+    let result = produce_store_share_response_message(
+        channel_id,
+        &request,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    );
     assert!(
         result.is_err(),
         "should reject share with empty merkle_path"
@@ -657,10 +682,14 @@ fn test_produce_store_share_response_message_rejects_tampered_commitment() {
         }
     });
 
-    let shared_key = [1u8; 32];
+    let shared_key = SharedKey::new([1u8; 32]);
     let channel_id = ChannelId(1);
 
-    let result = produce_store_share_response_message(channel_id, &request, &shared_key);
+    let result = produce_store_share_response_message(
+        channel_id,
+        &request,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    );
     assert!(
         result.is_err(),
         "should reject share whose commitment does not match Merkle proof"
@@ -757,7 +786,7 @@ fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
 
     let channel_id = ChannelId(1);
     let committed_share = shares.get(&channel_id).expect("missing share");
-    let shared_key = [1u8; 32];
+    let shared_key = SharedKey::new([1u8; 32]);
 
     let malicious_reply_to = TransportProtocol {
         uri: "ws://attacker.example/inbox".to_owned(),
@@ -771,7 +800,7 @@ fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
         committed_share,
         0,
         String::new(),
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         slice::from_ref(&malicious_reply_to),
     )
     .expect("failed to produce store share request");
@@ -800,7 +829,7 @@ fn helper_bound_request_never_carries_a_replica_id() {
 
     let channel_id = ChannelId(1);
     let committed_share = shares.get(&channel_id).expect("missing share");
-    let shared_key = [42u8; 32];
+    let shared_key = SharedKey::new([42u8; 32]);
 
     let envelope = produce_store_share_request_message(
         channel_id,
@@ -809,7 +838,7 @@ fn helper_bound_request_never_carries_a_replica_id() {
         committed_share,
         0,
         String::new(),
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         &[],
     )
     .expect("helper-bound produce")

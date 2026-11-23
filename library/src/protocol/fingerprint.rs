@@ -9,21 +9,19 @@
 //! string and acting on the comparison are the two halves here.
 
 use super::DeRecProtocol;
-use super::context::{Round, local};
+use super::context::local;
 use super::stores::borrow_stores;
 use super::traits::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport,
     DeRecUserSecretStore,
 };
-use super::types::{SecretKind, SecretValue};
-use crate::derec_message;
 use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::primitives::pairing;
 use crate::protocol::handlers::pairing::claim_own_member;
 use crate::protocol::types::{ChannelQuery, ChannelRecord, ChannelStatus, ReplicaFilter};
 use crate::transport::TransportPolicy;
 use crate::{Error, Result, types::ChannelId};
-use derec_proto::TransportProtocol;
 
 impl<
     Ch: DeRecChannelStore,
@@ -41,26 +39,27 @@ impl<
     /// fingerprint for the same shared key, enabling visual out-of-band
     /// verification.
     ///
+    /// The fingerprint describes the key pairing established, which is the
+    /// channel's key while the channel is `Pending`. Once a channel rotates
+    /// its key, the value this returns differs from the one the peer was
+    /// shown at pairing; the comparison is meaningful only before that.
+    ///
     /// Returns an error if the channel has no shared key (not yet paired).
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(channel_id = channel_id.0)))]
     pub async fn get_fingerprint(&self, channel_id: ChannelId) -> Result<String> {
-        let shared_key = match self
+        let shared_key = self
             .secret_store
-            .load(self.secret_id, channel_id, SecretKind::SharedKey)
-            .await?
-        {
-            Some(SecretValue::SharedKey(key)) => key,
-            _ => {
-                return Err(Error::InvalidInput(
-                    "channel has no shared key — not yet paired",
-                ));
-            }
-        };
+            .paired_key(self.secret_id, channel_id)
+            .await?;
 
         Ok(pairing::fingerprint(&shared_key))
     }
 
     /// Verify that a fingerprint matches the one derived from a channel's shared key.
+    ///
+    /// The fingerprint describes the pairing key and is meaningful while the
+    /// channel is `Pending`; after a rotation it no longer matches the value
+    /// shown at pairing.
     ///
     /// If the fingerprint matches, the channel status is updated from `Pending`
     /// to `Paired`, enabling it to process protocol messages. Returns an error
@@ -112,6 +111,9 @@ impl<
     /// [`DeRecFlow::ProtectSecret`](crate::protocol::DeRecFlow::ProtectSecret). A device holding no snapshot
     /// sends a promoted helper nothing, since an empty payload is inert to
     /// it, unless a replica destination is paired, which needs the roster.
+    /// The publish runs only when it reaches someone: a promotion that leaves
+    /// the Helpers below the threshold, with no replica member to sync,
+    /// publishes nothing and consumes no version.
     /// That publish reuses every Helper's stored
     /// weight, and a newly promoted Helper is at `1`. A stored weight that is
     /// invalid under the round's threshold fails it with
@@ -153,8 +155,9 @@ impl<
         let mut confirmed_peer_role = None;
         let members = self
             .channel_store
-            .replicas_matching(
+            .replicas_on_channel(
                 self.secret_id,
+                channel_id,
                 ReplicaFilter {
                     status: vec![ChannelStatus::Pending],
                     ..Default::default()
@@ -162,9 +165,6 @@ impl<
             )
             .await?;
         for mut member in members {
-            if member.channel_id != channel_id {
-                continue;
-            }
             if Some(member.replica_id.0) != self.replica_id {
                 confirmed_peer_role = Some(member.role);
             }
@@ -188,27 +188,16 @@ impl<
         if transitioned_helper {
             let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;
             let payload = match snapshot {
-                Some(s) => Some((s.secrets, s.description)),
-                None if self.has_paired_replica_destination().await? => Some((Vec::new(), None)),
+                Some(s) => Some((s.secrets, s.description, s.threshold)),
+                None if self.has_paired_replica_destination().await? => {
+                    Some((Vec::new(), None, None))
+                }
                 None => None,
             };
-            if let Some((secrets, description)) = payload {
-                let reply_to: Vec<TransportProtocol> = if self.auto_reply_to {
-                    self.own_transports.clone()
-                } else {
-                    Vec::new()
-                };
-                self.start_protect_secret(
-                    secrets,
-                    description,
-                    None,
-                    None,
-                    &Round {
-                        reply_to: &reply_to,
-                        trace_id: derec_message::fresh_trace_id(),
-                    },
-                )
-                .await?;
+            if let Some((secrets, description, threshold)) = payload
+                && self.auto_round_reaches_anyone(threshold).await?
+            {
+                self.start_auto_protect_secret(secrets, description).await?;
             }
         }
 
@@ -222,9 +211,8 @@ impl<
     async fn revoke_pending_pairing(&mut self, channel_id: ChannelId) -> Result<()> {
         if self
             .channel_store
-            .load(self.secret_id, ChannelQuery::Helper { channel_id })
+            .load_helper(self.secret_id, channel_id)
             .await?
-            .and_then(|r| r.as_helper().cloned())
             .is_some_and(|helper| helper.status == ChannelStatus::Pending)
         {
             self.channel_store
@@ -234,8 +222,9 @@ impl<
 
         let peers = self
             .channel_store
-            .replicas_matching(
+            .replicas_on_channel(
                 self.secret_id,
+                channel_id,
                 ReplicaFilter {
                     status: vec![ChannelStatus::Pending],
                     exclude: self.exclude_self(),
@@ -243,7 +232,7 @@ impl<
                 },
             )
             .await?;
-        for peer in peers.into_iter().filter(|m| m.channel_id == channel_id) {
+        for peer in peers {
             self.channel_store
                 .remove(
                     self.secret_id,
@@ -271,18 +260,21 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::primitives::sharing::request;
+
     use crate::protocol::builder::DeRecProtocolBuilder;
     use crate::protocol::tests::{
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
     use crate::protocol::types::UserSecrets;
-    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, SecretValue};
+    use crate::protocol::types::{
+        ChannelRecord, ChannelStatus, HelperChannel, SecretKind, SecretValue,
+    };
     use crate::types::ReplicaId;
     use crate::utils::now_secs;
     use derec_proto::Protocol;
     use derec_proto::SenderKind;
+    use derec_proto::TransportProtocol;
     use std::collections::HashMap;
 
     const SECRET_ID: u64 = 0xF1;
@@ -318,7 +310,11 @@ mod tests {
             .await
             .expect("seed helper channel");
         secrets
-            .save(SECRET_ID, CHANNEL, SecretValue::SharedKey([7u8; 32]))
+            .save(
+                SECRET_ID,
+                CHANNEL,
+                SecretValue::SharedKey(crate::types::SharedKey::new([7u8; 32])),
+            )
             .await
             .expect("seed shared key");
     }
@@ -455,7 +451,11 @@ mod tests {
             }
             secrets
                 .clone()
-                .save(SECRET_ID, CHANNEL, SecretValue::SharedKey([7u8; 32]))
+                .save(
+                    SECRET_ID,
+                    CHANNEL,
+                    SecretValue::SharedKey(crate::types::SharedKey::new([7u8; 32])),
+                )
                 .await
                 .expect("seed shared key");
 
@@ -549,7 +549,11 @@ mod tests {
                 .await
                 .expect("seed joiner");
             secrets
-                .save(SECRET_ID, CHANNEL, SecretValue::SharedKey([7u8; 32]))
+                .save(
+                    SECRET_ID,
+                    CHANNEL,
+                    SecretValue::SharedKey(crate::types::SharedKey::new([7u8; 32])),
+                )
                 .await
                 .expect("seed shared key");
             let mut user_secrets = InMemUserSecretStore::default();
@@ -640,7 +644,11 @@ mod tests {
                 .await
                 .expect("seed paired helper");
             secrets
-                .save(SECRET_ID, OTHER, SecretValue::SharedKey([7u8; 32]))
+                .save(
+                    SECRET_ID,
+                    OTHER,
+                    SecretValue::SharedKey(crate::types::SharedKey::new([7u8; 32])),
+                )
                 .await
                 .expect("seed shared key");
             let mut user_secrets = InMemUserSecretStore::default();
@@ -689,10 +697,13 @@ mod tests {
                 .sent_envelopes()
                 .iter()
                 .map(|envelope| {
-                    request::extract(envelope, &[7u8; 32])
-                        .expect("extract store-share request")
-                        .request
-                        .keep_version
+                    crate::primitives::sharing::request::extract(
+                        envelope,
+                        &crate::types::SharedKey::new([7u8; 32]),
+                    )
+                    .expect("extract store-share request")
+                    .request
+                    .keep_version
                 })
                 .collect();
             assert_eq!(keep_versions, vec![2, 2]);

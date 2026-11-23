@@ -31,10 +31,52 @@ const VERSION: u32 = 3;
 const KEY: [u8; 32] = [0x5A; 32];
 const CHANNEL: u64 = 4242;
 
+/// The channel key as each build takes it: this build sends under a
+/// `ChannelKey` at epoch 0 and opens with the `SharedKey`; the releases take
+/// the raw 32 bytes for both.
+mod current_key {
+    use derec_library::types::{ChannelKey, SharedKey};
+
+    pub fn send() -> ChannelKey {
+        ChannelKey::new(0, SharedKey::new(super::KEY))
+    }
+
+    pub fn open() -> SharedKey {
+        SharedKey::new(super::KEY)
+    }
+}
+
+mod release_key {
+    pub fn send() -> [u8; 32] {
+        super::KEY
+    }
+
+    pub fn open() -> [u8; 32] {
+        super::KEY
+    }
+}
+
+/// A derived pairing key as bytes, whichever build derived it.
+trait KeyBytes {
+    fn key_bytes(&self) -> Vec<u8>;
+}
+
+impl KeyBytes for [u8; 32] {
+    fn key_bytes(&self) -> Vec<u8> {
+        self.to_vec()
+    }
+}
+
+impl KeyBytes for derec_library::types::SharedKey {
+    fn key_bytes(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
+    }
+}
+
 /// Store-share, verification, recovery, discovery and unpair: `$a` sends
 /// each request, `$b` answers it, and `$a` reads the answer.
 macro_rules! channel_exchanges {
-    ($a:ident, $ap:ident, $b:ident, $bp:ident) => {{
+    ($a:ident, $ap:ident, $ak:ident, $b:ident, $bp:ident, $bk:ident) => {{
         let a_channel = $a::types::ChannelId(CHANNEL);
         let b_channel = $b::types::ChannelId(CHANNEL);
         let a_endpoint = vec![$ap::TransportProtocol {
@@ -59,17 +101,17 @@ macro_rules! channel_exchanges {
             &share,
             0,
             "round",
-            &KEY,
+            &$ak::send(),
             &a_endpoint,
         )
         .expect("store-share request");
-        let stored = $b::primitives::sharing::request::extract(&store.envelope, &KEY)
+        let stored = $b::primitives::sharing::request::extract(&store.envelope, &$bk::open())
             .expect("store-share request opens")
             .request;
         assert_eq!((stored.secret_id, stored.version), (SECRET_ID, VERSION));
-        let answer = $b::primitives::sharing::response::produce(b_channel, &stored, &KEY)
+        let answer = $b::primitives::sharing::response::produce(b_channel, &stored, &$bk::send())
             .expect("store-share response");
-        let answered = $a::primitives::sharing::response::extract(&answer.envelope, &KEY)
+        let answered = $a::primitives::sharing::response::extract(&answer.envelope, &$ak::open())
             .expect("store-share response opens")
             .response;
         $a::primitives::sharing::response::process(VERSION, &answered)
@@ -79,56 +121,64 @@ macro_rules! channel_exchanges {
             a_channel,
             SECRET_ID,
             VERSION,
-            &KEY,
+            &$ak::send(),
             &a_endpoint,
         )
         .expect("verify request");
-        let challenge = $b::primitives::verification::request::extract(&verify.envelope, &KEY)
-            .expect("verify request opens")
-            .request;
+        let challenge =
+            $b::primitives::verification::request::extract(&verify.envelope, &$bk::open())
+                .expect("verify request opens")
+                .request;
         let proof = $b::primitives::verification::response::produce(
             b_channel,
             &challenge,
-            &KEY,
+            &$bk::send(),
             &stored.share,
         )
         .expect("verify response");
-        $a::primitives::verification::response::extract(&proof.envelope, &KEY)
+        $a::primitives::verification::response::extract(&proof.envelope, &$ak::open())
             .expect("verify response opens");
 
         let get = $a::primitives::recovery::request::produce(
             a_channel,
             SECRET_ID,
             VERSION,
-            &KEY,
+            &$ak::send(),
             &a_endpoint,
         )
         .expect("get-share request");
-        let asked = $b::primitives::recovery::request::extract(&get.envelope, &KEY)
+        let asked = $b::primitives::recovery::request::extract(&get.envelope, &$bk::open())
             .expect("get-share request opens")
             .request;
-        let served = $b::primitives::recovery::response::produce(b_channel, &asked, &stored, &KEY)
-            .expect("get-share response");
-        $a::primitives::recovery::response::extract(&served.envelope, &KEY)
+        let served =
+            $b::primitives::recovery::response::produce(b_channel, &asked, &stored, &$bk::send())
+                .expect("get-share response");
+        $a::primitives::recovery::response::extract(&served.envelope, &$ak::open())
             .expect("get-share response opens");
 
-        let discover = $a::primitives::discovery::request::produce(a_channel, &KEY, &a_endpoint)
-            .expect("discovery request");
-        $b::primitives::discovery::request::extract(&discover.envelope, &KEY)
+        let discover =
+            $a::primitives::discovery::request::produce(a_channel, &$ak::send(), &a_endpoint)
+                .expect("discovery request");
+        $b::primitives::discovery::request::extract(&discover.envelope, &$bk::open())
             .expect("discovery request opens");
-        let listed = $b::primitives::discovery::response::produce(b_channel, &[], &KEY)
+        let listed = $b::primitives::discovery::response::produce(b_channel, &[], &$bk::send())
             .expect("discovery response");
-        $a::primitives::discovery::response::extract(&listed.envelope, &KEY)
+        $a::primitives::discovery::response::extract(&listed.envelope, &$ak::open())
             .expect("discovery response opens");
 
-        let unpair =
-            $a::primitives::unpairing::request::produce(a_channel, "bye", &KEY, &a_endpoint, None)
-                .expect("unpair request");
-        $b::primitives::unpairing::request::extract(&unpair.envelope, &KEY)
+        let unpair = $a::primitives::unpairing::request::produce(
+            a_channel,
+            "bye",
+            &$ak::send(),
+            &a_endpoint,
+            None,
+        )
+        .expect("unpair request");
+        $b::primitives::unpairing::request::extract(&unpair.envelope, &$bk::open())
             .expect("unpair request opens");
-        let unpaired =
-            $b::primitives::unpairing::response::produce(b_channel, &KEY).expect("unpair response");
-        $a::primitives::unpairing::response::extract(&unpaired.envelope, &KEY)
+        let unpaired = $b::primitives::unpairing::response::produce(b_channel, &$bk::send())
+            .expect("unpair response");
+        $a::primitives::unpairing::response::extract(&unpaired.envelope, &$ak::open())
             .expect("unpair response opens");
     }};
 }
@@ -136,7 +186,7 @@ macro_rules! channel_exchanges {
 /// Channel messages with no primitive of their own, sealed by `$a`'s
 /// envelope builder and opened by `$b`.
 macro_rules! builder_exchanges {
-    ($a:ident, $ap:ident, $b:ident, $bp:ident) => {{
+    ($a:ident, $ap:ident, $ak:ident, $b:ident, $bp:ident, $bk:ident) => {{
         let bodies = vec![
             $ap::MessageBody::ErrorResponse($ap::ErrorResponseMessage {
                 timestamp: Some($a::derec_message::current_timestamp()),
@@ -157,13 +207,13 @@ macro_rules! builder_exchanges {
                 .channel_id($a::types::ChannelId(CHANNEL))
                 .timestamp($a::derec_message::current_timestamp())
                 .message_body(body)
-                .encrypt(&KEY)
+                .encrypt(&$ak::send())
                 .expect("encrypt")
                 .build()
                 .expect("build")
                 .encode_to_vec();
             let decoded = $bp::DeRecMessage::decode(envelope.as_slice()).expect("envelope decodes");
-            $b::derec_message::extract_inner_message(&decoded.message, &KEY)
+            $b::derec_message::extract_inner_message(&decoded.message, &$bk::open())
                 .unwrap_or_else(|e| panic!("{kind} does not open: {e:?}"));
         }
     }};
@@ -234,7 +284,8 @@ macro_rules! pairing_exchanges {
         )
         .expect("pair response accepted");
         assert_eq!(
-            paired.shared_key, response.shared_key,
+            paired.shared_key.key_bytes(),
+            response.shared_key.key_bytes(),
             "both sides derive one key"
         );
 
@@ -333,7 +384,7 @@ fn process_as_helper(envelope: &[u8], floor: ProtocolVersion) -> Vec<DeRecEvent>
             .save(
                 SECRET_ID,
                 derec_library::types::ChannelId(CHANNEL),
-                SecretValue::SharedKey(KEY),
+                SecretValue::SharedKey(derec_library::types::SharedKey::new(KEY)),
             )
             .await
             .expect("seed key");
@@ -374,22 +425,50 @@ macro_rules! compat_with {
 
             #[test]
             fn channel_messages_from_the_release_open_here() {
-                channel_exchanges!(old, old_proto, current, current_proto);
+                channel_exchanges!(
+                    old,
+                    old_proto,
+                    release_key,
+                    current,
+                    current_proto,
+                    current_key
+                );
             }
 
             #[test]
             fn channel_messages_from_here_open_in_the_release() {
-                channel_exchanges!(current, current_proto, old, old_proto);
+                channel_exchanges!(
+                    current,
+                    current_proto,
+                    current_key,
+                    old,
+                    old_proto,
+                    release_key
+                );
             }
 
             #[test]
             fn builder_sealed_messages_from_the_release_open_here() {
-                builder_exchanges!(old, old_proto, current, current_proto);
+                builder_exchanges!(
+                    old,
+                    old_proto,
+                    release_key,
+                    current,
+                    current_proto,
+                    current_key
+                );
             }
 
             #[test]
             fn builder_sealed_messages_from_here_open_in_the_release() {
-                builder_exchanges!(current, current_proto, old, old_proto);
+                builder_exchanges!(
+                    current,
+                    current_proto,
+                    current_key,
+                    old,
+                    old_proto,
+                    release_key
+                );
             }
 
             #[test]

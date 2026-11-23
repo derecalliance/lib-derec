@@ -28,6 +28,13 @@ internal static class Envelope
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    internal struct ReadSequenceResult
+    {
+        public DeRecError Error;
+        public uint Sequence;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     internal struct EncryptedPayloadResult
     {
         public DeRecError Error;
@@ -43,6 +50,12 @@ internal static class Envelope
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern ReadTraceIdResult read_trace_id_from_envelope(
+        byte[] envelope,
+        UIntPtr envelopeLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ReadSequenceResult read_sequence_from_envelope(
         byte[] envelope,
         UIntPtr envelopeLen
     );

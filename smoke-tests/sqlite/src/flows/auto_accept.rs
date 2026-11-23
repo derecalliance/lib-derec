@@ -3,7 +3,7 @@
 
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::UserSecret;
-use derec_library::protocol::{AutoAcceptPolicy, PendingAction, PendingActionKind};
+use derec_library::protocol::{AutoAcceptPolicy, PendingActionKind};
 use derec_library::types::ChannelId;
 
 use crate::db::Database;
@@ -76,10 +76,8 @@ pub async fn run() {
     let still_required = events.iter().any(|e| {
         matches!(
             e,
-            DeRecEvent::ActionRequired {
-                action: PendingAction::StoreShare { .. },
-                ..
-            }
+            DeRecEvent::ActionRequired { action, .. }
+                if action.kind() == PendingActionKind::StoreShare
         )
     });
     assert!(

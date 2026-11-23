@@ -32,6 +32,12 @@ pub(crate) fn generate_seed<const N: usize>() -> Zeroizing<[u8; N]> {
     entropy
 }
 
+/// `skip_serializing_if` predicate for a `u32` field omitted at its
+/// default.
+pub(crate) fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn now_secs() -> u64 {
     SystemTime::now()

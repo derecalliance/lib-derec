@@ -13,6 +13,8 @@ package main
 
 import (
 	"bytes"
+	"cmp"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -102,6 +104,15 @@ func (s *memChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, e
 	return existed, nil
 }
 
+func (s *memChannelStore) RemoveMany(secretID uint64, queries []protocol.ChannelQuery) error {
+	for _, q := range queries {
+		if _, err := s.Remove(secretID, q.ChannelID, q.ReplicaID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *memChannelStore) ListHelpers(secretID uint64, filter protocol.HelperFilter) ([]protocol.HelperChannel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -177,8 +188,10 @@ type secretStoreKey struct {
 type memSecretStore struct {
 	mu   sync.Mutex
 	data map[secretStoreKey]protocol.SecretValue
-	// loadManyCalls records the channelIDs of every LoadMany call, in order.
+	// loadManyCalls records the channelIDs of every LoadMany call, in order,
+	// and loadManyKinds the kind each of those calls asked for.
 	loadManyCalls [][]uint64
+	loadManyKinds []protocol.SecretKind
 }
 
 func newMemSecretStore() *memSecretStore {
@@ -196,6 +209,7 @@ func (s *memSecretStore) LoadMany(secretID uint64, channelIDs []uint64, kind pro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadManyCalls = append(s.loadManyCalls, append([]uint64(nil), channelIDs...))
+	s.loadManyKinds = append(s.loadManyKinds, kind)
 	out := make([]*protocol.SecretValue, len(channelIDs))
 	for i, c := range channelIDs {
 		if v, ok := s.data[secretStoreKey{secretID, c, kind}]; ok {
@@ -216,6 +230,15 @@ func (s *memSecretStore) Remove(secretID, channelID uint64, kind protocol.Secret
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.data, secretStoreKey{secretID, channelID, kind})
+	return nil
+}
+
+func (s *memSecretStore) RemoveMany(secretID uint64, entries []protocol.SecretEntry) error {
+	for _, e := range entries {
+		if err := s.Remove(secretID, e.ChannelID, e.Kind); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -259,8 +282,8 @@ func newMemShareStore() *memShareStore {
 	return &memShareStore{data: make(map[shareStoreKey]protocol.Share)}
 }
 
-func (s *memShareStore) matches(secretID uint64, channelIDs map[uint64]struct{}, versions map[uint32]struct{}) []protocol.Share {
-	var out []protocol.Share
+func (s *memShareStore) matches(secretID uint64, channelIDs map[uint64]struct{}, versions map[uint32]struct{}) []protocol.ShareEntry {
+	var out []protocol.ShareEntry
 	for k, share := range s.data {
 		if k.secretID != secretID {
 			continue
@@ -275,7 +298,15 @@ func (s *memShareStore) matches(secretID uint64, channelIDs map[uint64]struct{},
 				continue
 			}
 		}
-		out = append(out, share)
+		out = append(out, protocol.ShareEntry{ChannelID: k.channelID, Share: share})
+	}
+	return out
+}
+
+func sharesOf(entries []protocol.ShareEntry) []protocol.Share {
+	out := make([]protocol.Share, len(entries))
+	for i, e := range entries {
+		out[i] = e.Share
 	}
 	return out
 }
@@ -294,10 +325,10 @@ func toSet[T comparable](vals []T) map[T]struct{} {
 func (s *memShareStore) Load(secretID, channelID uint64, versions []uint32) ([]protocol.Share, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.matches(secretID, map[uint64]struct{}{channelID: {}}, toSet(versions)), nil
+	return sharesOf(s.matches(secretID, map[uint64]struct{}{channelID: {}}, toSet(versions))), nil
 }
 
-func (s *memShareStore) LoadMany(secretID uint64, channelIDs []uint64, versions []uint32) ([]protocol.Share, error) {
+func (s *memShareStore) LoadMany(secretID uint64, channelIDs []uint64, versions []uint32) ([]protocol.ShareEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.matches(secretID, toSet(channelIDs), toSet(versions)), nil
@@ -306,7 +337,7 @@ func (s *memShareStore) LoadMany(secretID uint64, channelIDs []uint64, versions 
 func (s *memShareStore) LoadAll(secretID uint64, channelIDs []uint64) ([]protocol.Share, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.matches(secretID, toSet(channelIDs), nil), nil
+	return sharesOf(s.matches(secretID, toSet(channelIDs), nil)), nil
 }
 
 func (s *memShareStore) LatestVersion(secretID uint64) (uint32, bool, error) {
@@ -360,6 +391,18 @@ func (s *memShareStore) RemoveVersions(secretID, channelID uint64, versions []ui
 	s.removeVersionsCalls = append(s.removeVersionsCalls, removeVersionsCall{secretID, channelID, append([]uint32(nil), versions...)})
 	for _, v := range versions {
 		delete(s.data, shareStoreKey{channelID, secretID, v})
+	}
+	return nil
+}
+
+func (s *memShareStore) RemoveVersionsMany(secretID uint64, entries []protocol.ShareVersionsEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range entries {
+		s.removeVersionsCalls = append(s.removeVersionsCalls, removeVersionsCall{secretID, e.ChannelID, append([]uint32(nil), e.Versions...)})
+		for _, v := range e.Versions {
+			delete(s.data, shareStoreKey{e.ChannelID, secretID, v})
+		}
 	}
 	return nil
 }
@@ -497,6 +540,15 @@ func (s *memStateStore) Remove(secretID uint64, key protocol.StateKey) (bool, er
 	_, existed := s.data[secretID][id]
 	delete(s.data[secretID], id)
 	return existed, nil
+}
+
+func (s *memStateStore) RemoveMany(secretID uint64, keys []protocol.StateKey) error {
+	for _, k := range keys {
+		if _, err := s.Remove(secretID, k); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *memStateStore) LoadAll(secretID uint64, kind protocol.StateKind) ([]protocol.StateItem, error) {
@@ -1005,7 +1057,7 @@ func runProtocol() {
 
 	fmt.Println("  pairing: two channels paired, fingerprints match ✓")
 
-	owner.secretStore.loadManyCalls = nil
+	owner.secretStore.loadManyCalls, owner.secretStore.loadManyKinds = nil, nil
 	secretData := []byte("super-secret-value")
 	description := "smoke-test distribution"
 	protectEvents, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
@@ -1014,13 +1066,17 @@ func runProtocol() {
 	})
 	must(err, "owner.Start(ProtectSecret)")
 
-	// The broadcast reads every helper's SharedKey through one
-	// SecretStore.LoadMany call rather than one Load per channel.
-	keyCalls := owner.secretStore.loadManyCalls
-	assertTrue(len(keyCalls) == 1, "ProtectSecret broadcast must call SecretStore.LoadMany once, got %v", keyCalls)
-	assertTrue(len(keyCalls[0]) == 2 && slices.Contains(keyCalls[0], channelA) && slices.Contains(keyCalls[0], channelB),
-		"SecretStore.LoadMany must receive both helper channels [%d %d], got %v", channelA, channelB, keyCalls[0])
-	fmt.Printf("  ProtectSecret broadcast → one SecretStore.LoadMany(%v)  ✓\n", keyCalls[0])
+	// The broadcast reads its channel keys in batches rather than one Load per
+	// channel: one SecretStore.LoadMany for every helper's SharedKey, then one
+	// for every helper's KeyRing.
+	keyCalls, keyKinds := owner.secretStore.loadManyCalls, owner.secretStore.loadManyKinds
+	assertTrue(slices.Equal(keyKinds, []protocol.SecretKind{protocol.SecretKindSharedKey, protocol.SecretKindKeyRing}),
+		"ProtectSecret broadcast must call SecretStore.LoadMany once per kind (SharedKey, KeyRing), got kinds %v for calls %v", keyKinds, keyCalls)
+	for _, call := range keyCalls {
+		assertTrue(len(call) == 2 && slices.Contains(call, channelA) && slices.Contains(call, channelB),
+			"SecretStore.LoadMany must receive both helper channels [%d %d], got %v", channelA, channelB, call)
+	}
+	fmt.Printf("  ProtectSecret broadcast → one SecretStore.LoadMany(%v) per kind (SharedKey, KeyRing)  ✓\n", keyCalls[0])
 
 	protectStartedVersions := map[uint64]uint32{}
 	for _, ev := range protectEvents {
@@ -2848,6 +2904,23 @@ func runRecoverRestoreRepublish() {
 	}
 	assertTrue(v1 != 0, "Start(ProtectSecret) must emit ProtectSecretStarted, got %+v", events)
 	pumpMany([]*peer{owner, helperA, helperB})
+
+	// A second version keeps the first, so the helpers hold both, and the
+	// device below restores the older one.
+	events, err = owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets:   []protocol.UserSecret{{ID: []byte{11}, Name: "restored secret", Data: []byte("a later edit")}},
+		Weights:   map[uint64]uint32{channelA: 2},
+		Threshold: &three,
+	})
+	must(err, "owner.Start(ProtectSecret) of the second version")
+	var newest uint32
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeProtectSecretStarted && ev.Version != nil {
+			newest = *ev.Version
+		}
+	}
+	assertTrue(newest > v1, "the second publish must be a newer version, got v%d", newest)
+	pumpMany([]*peer{owner, helperA, helperB})
 	owner.proto.Close()
 
 	// The new device pairs with each helper afresh; each helper links its
@@ -2885,7 +2958,7 @@ func runRecoverRestoreRepublish() {
 		"the recovered secret must carry weights A=2, B=1, got %v", recoveredWeights)
 	fmt.Println("  SecretRecovered carries t=3 and weights A=2, B=1  ✓")
 
-	restoreEvents, err := device.proto.Restore(*recovered, v1)
+	restoreEvents, err := device.proto.Restore(*recovered, v1, newest)
 	must(err, "device.Restore")
 	started := map[uint64]bool{}
 	for _, ev := range restoreEvents {
@@ -2916,9 +2989,11 @@ func runRecoverRestoreRepublish() {
 	fmt.Println("  Restore unpairs the recovery channels once their helpers answer  ✓")
 	snapshot, ok, err := device.userSecrets.LoadLatest(protocolSecretID)
 	must(err, "device.userSecrets.LoadLatest")
-	assertTrue(ok && snapshot.Version == v1 && subsharesText(snapshot.Threshold) == "3",
-		"Restore must store v%d at t=3 over the configured 2, got ok=%v v%d t=%s",
-		v1, ok, snapshot.Version, subsharesText(snapshot.Threshold))
+	assertTrue(ok && snapshot.Version == newest && subsharesText(snapshot.Threshold) == "3",
+		"Restore must record the recovered secrets at the newest v%d, at t=3 over the configured 2, got ok=%v v%d t=%s",
+		newest, ok, snapshot.Version, subsharesText(snapshot.Threshold))
+	assertTrue(len(snapshot.Secrets) == 1 && bytes.Equal(snapshot.Secrets[0].Data, secretData),
+		"the snapshot must carry the recovered secrets, got %+v", snapshot.Secrets)
 	storedWeights := map[uint64]uint32{}
 	for _, c := range []uint64{channelA, channelB} {
 		record, ok, err := device.channelStore.Load(protocolSecretID, c, 0)
@@ -2944,8 +3019,8 @@ func runRecoverRestoreRepublish() {
 			v2 = *ev.Version
 		}
 	}
-	assertTrue(v2 > v1 && republished[channelA] == 2 && republished[channelB] == 1,
-		"the republish must be a newer version with weights A=2, B=1; got v%d %v", v2, republished)
+	assertTrue(v2 == newest+1 && republished[channelA] == 2 && republished[channelB] == 1,
+		"the republish must follow the newest version with weights A=2, B=1; got v%d %v", v2, republished)
 	confirmed := 0
 	for _, ev := range pumpMany(all) {
 		if ev.Type == protocol.EventTypeShareConfirmed {
@@ -3101,7 +3176,7 @@ func runRestoreRecoveryUnpairRefused() {
 	}
 	assertTrue(recovered != nil, "RecoverSecret must surface SecretRecovered")
 
-	restoreEvents, err := device.proto.Restore(*recovered, version)
+	restoreEvents, err := device.proto.Restore(*recovered, version, version)
 	must(err, "device.Restore")
 	started := map[uint64]bool{}
 	for _, ev := range restoreEvents {
@@ -3514,7 +3589,7 @@ func runRestoreKeepsHelperDuties() {
 	}
 	assertTrue(recovered != nil, "the device must recover its own secret")
 
-	restoreEvents, err := device.proto.Restore(*recovered, version)
+	restoreEvents, err := device.proto.Restore(*recovered, version, version)
 	must(err, "device.Restore")
 	touched := map[uint64]bool{}
 	for _, ev := range restoreEvents {
@@ -3857,13 +3932,44 @@ func pairedChannelID(events []protocol.Event, transient uint64) uint64 {
 	return 0
 }
 
-// pairReplicaHandshake drives only the cryptographic handshake of replica
-// joining source's group as a Destination; both ends stay Pending until the
-// fingerprints are confirmed — mirroring `pair_replica_handshake` in
-// smoke-tests/rust/src/protocol.rs.
-func pairReplicaHandshake(source, replica *peer, transient uint64) uint64 {
-	startReplicaScan(replica, source, transient, protocol.SenderKindReplicaDestination)
-	return pairedChannelID(append(pump(replica, source), pump(source, replica)...), transient)
+// latestVersion is the version of the peer's latest user-secret snapshot, or
+// nil when nothing has been published.
+func latestVersion(p *peer) *uint32 {
+	snapshot, ok, err := p.userSecrets.LoadLatest(protocolSecretID)
+	must(err, fmt.Sprintf("[%s] userSecrets.LoadLatest", p.label))
+	if !ok {
+		return nil
+	}
+	return &snapshot.Version
+}
+
+func versionText(v *uint32) string {
+	if v == nil {
+		return "nil"
+	}
+	return strconv.FormatUint(uint64(*v), 10)
+}
+
+type storedShare struct {
+	channelID uint64
+	version   uint32
+}
+
+// storedVersions lists the (channel, version) of every ShareStored event,
+// ordered by channel.
+func storedVersions(events []protocol.Event) []storedShare {
+	var stored []storedShare
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeShareStored && ev.Version != nil {
+			stored = append(stored, storedShare{channelID: ev.ChannelID, version: *ev.Version})
+		}
+	}
+	return sortedByChannel(stored)
+}
+
+func sortedByChannel(shares []storedShare) []storedShare {
+	slices.SortFunc(shares, func(a, b storedShare) int { return cmp.Compare(a.channelID, b.channelID) })
+	return shares
 }
 
 // helperStartPair has helper start a Helper pairing on a fresh contact from
@@ -4294,7 +4400,7 @@ func runReplicaVerifiesOnlySyncedVersions() {
 	v2 := *synced.Version
 	assertTrue(v2 > v1, "joining must publish a newer version (v1=%d, v2=%d)", v1, v2)
 
-	_, err = bob.proto.Restore(*synced.Secret, v2)
+	_, err = bob.proto.Restore(*synced.Secret, v2, v2)
 	var restoreErr *derec.Error
 	assertTrue(errors.As(err, &restoreErr) && restoreErr.Code == derec.CodeAlreadyRestored,
 		"a synced destination is already provisioned; Restore must refuse it with CodeAlreadyRestored, got %v", err)
@@ -4469,7 +4575,7 @@ func runDiscoveryAndRecovery() {
 
 	restored := newPeerWithSecretID("restored-owner", "https://restored-discovery.example.com", protectedSecretID, 2)
 	defer restored.proto.Close()
-	_, err = restored.proto.Restore(*recovered, recoverVersion)
+	_, err = restored.proto.Restore(*recovered, recoverVersion, recoverVersion)
 	must(err, "Restore on a fresh peer")
 	snapshot, ok, err := restored.userSecrets.LoadLatest(protectedSecretID)
 	must(err, "restored userSecrets.LoadLatest")
@@ -4797,7 +4903,7 @@ func runReplyTo() {
 	fmt.Println("  AutoReplyTo stamps the outbound request with this device's endpoint  ✓")
 
 	const phantomURI = "https://phantom-replica.example.com"
-	crafted, err := discovery.Request.Produce(channelID, sharedKey,
+	crafted, err := discovery.Request.Produce(channelID, sharedKey, 0,
 		[]discovery.Endpoint{{URI: phantomURI, Protocol: int32(derecpb.Protocol_HTTPS)}})
 	must(err, "discovery.Request.Produce with replyTo")
 	helper.drain()
@@ -5672,4 +5778,308 @@ func runReplicaRemoval() {
 	fmt.Println("  step 4: a device removing itself publishes the roster without it, then drops everything  ✓")
 
 	fmt.Println("Protocol replica removal test passed.")
+}
+
+// pairReplicaHandshake drives only the cryptographic handshake of replica
+// joining source's group as a Destination; both ends stay Pending until the
+// fingerprints are confirmed — mirroring `pair_replica_handshake` in
+// smoke-tests/rust/src/protocol.rs.
+func pairReplicaHandshake(source, replica *peer, transient uint64) uint64 {
+	startReplicaScan(replica, source, transient, protocol.SenderKindReplicaDestination)
+	return pairedChannelID(append(pump(replica, source), pump(source, replica)...), transient)
+}
+
+// runPairingBelowThresholdPublishesNothing mirrors smoke-tests/rust/src/protocol.rs's
+// run_pairing_below_threshold_publishes_nothing_flow: a publish the library
+// starts on its own runs only once the helpers meet the threshold. With a
+// threshold of 3, pairing the second helper after a below-threshold
+// ProtectSecret publishes nothing and consumes no version, and pairing the
+// third publishes the stored snapshot to all three.
+func runPairingBelowThresholdPublishesNothing() {
+	fmt.Println("=== Protocol pairing below threshold publishes nothing flow test ===")
+
+	owner := newPeer("owner", "https://owner-below.example.com", 3)
+	helperA := newPeer("helper-a", "https://helper-a-below.example.com", 3)
+	helperB := newPeer("helper-b", "https://helper-b-below.example.com", 3)
+	helperC := newPeer("helper-c", "https://helper-c-below.example.com", 3)
+	for _, p := range []*peer{owner, helperA, helperB, helperC} {
+		defer p.proto.Close()
+	}
+
+	pairPeers(owner, helperA, 71)
+	_, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{7}, Name: "staged", Data: []byte("stored before the helpers meet the threshold")}},
+	})
+	must(err, "owner.Start(ProtectSecret)")
+	pumpMany([]*peer{owner, helperA})
+	assertTrue(versionText(latestVersion(owner)) == "1", "the snapshot must be v1, got %s", versionText(latestVersion(owner)))
+
+	helperStartPair(owner, helperB, 72)
+	events := pumpMany([]*peer{owner, helperA, helperB})
+	assertTrue(len(storedVersions(events)) == 0,
+		"two helpers cannot meet a threshold of 3, so nothing is shared: %+v", storedVersions(events))
+	assertTrue(versionText(latestVersion(owner)) == "1", "no version consumed, got %s", versionText(latestVersion(owner)))
+	fmt.Println("  second helper paired below the threshold: nothing published  ✓")
+
+	helperStartPair(owner, helperC, 73)
+	stored := storedVersions(pumpMany([]*peer{owner, helperA, helperB, helperC}))
+	assertTrue(len(stored) == 3, "every helper stores the snapshot: %+v", stored)
+	for _, s := range stored {
+		assertTrue(s.version == 2, "every helper stores v2: %+v", stored)
+	}
+	assertTrue(versionText(latestVersion(owner)) == "2", "the snapshot must be v2, got %s", versionText(latestVersion(owner)))
+	fmt.Println("  third helper meets the threshold: v2 shared with all three  ✓")
+
+	fmt.Println("Protocol pairing below threshold publishes nothing flow test passed.")
+}
+
+// runUnpairRepublishes mirrors smoke-tests/rust/src/protocol.rs's
+// run_unpair_republishes_flow: removing a helper that holds a share
+// republishes the latest snapshot to the helpers that remain once the helper
+// acknowledges, so the removed helper's share belongs to a split nothing else
+// is built on. A removal that leaves the helpers below the threshold
+// publishes nothing.
+func runUnpairRepublishes() {
+	fmt.Println("=== Protocol unpair republishes flow test ===")
+
+	owner := newPeer("owner", "https://owner-unpair.example.com", 2)
+	helperA := newPeer("helper-a", "https://helper-a-unpair.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-unpair.example.com", 2)
+	helperC := newPeer("helper-c", "https://helper-c-unpair.example.com", 2)
+	for _, p := range []*peer{owner, helperA, helperB, helperC} {
+		defer p.proto.Close()
+	}
+	channelA := pairPeers(owner, helperA, 81)
+	channelB := pairPeers(owner, helperB, 82)
+	channelC := pairPeers(owner, helperC, 83)
+
+	_, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{8}, Name: "republished", Data: []byte("split again when a helper leaves")}},
+	})
+	must(err, "owner.Start(ProtectSecret)")
+	pumpMany([]*peer{owner, helperA, helperB, helperC})
+	assertTrue(versionText(latestVersion(owner)) == "1", "the snapshot must be v1, got %s", versionText(latestVersion(owner)))
+
+	started, err := owner.proto.Start(protocol.FlowKindUnpair, protocol.UnpairParams{ChannelID: channelC})
+	must(err, "owner.Start(Unpair)")
+	for _, ev := range started {
+		assertTrue(ev.Type != protocol.EventTypeProtectSecretStarted,
+			"nothing is published before the helper acknowledges: %+v", started)
+	}
+	events := pumpMany([]*peer{owner, helperA, helperB, helperC})
+	var unpaired bool
+	for _, ev := range events {
+		unpaired = unpaired || (ev.Type == protocol.EventTypeUnpaired && ev.ChannelID == channelC)
+	}
+	assertTrue(unpaired, "expected Unpaired for helper-c: %+v", events)
+	want := sortedByChannel([]storedShare{{channelA, 2}, {channelB, 2}})
+	assertTrue(slices.Equal(storedVersions(events), want),
+		"the remaining helpers store v2 and the removed one nothing: got %+v, want %+v", storedVersions(events), want)
+	assertTrue(versionText(latestVersion(owner)) == "2", "the snapshot must be v2, got %s", versionText(latestVersion(owner)))
+	fmt.Println("  helper-c acknowledged its removal: v2 republished to helper-a and helper-b  ✓")
+
+	_, err = owner.proto.Start(protocol.FlowKindUnpair, protocol.UnpairParams{ChannelID: channelB})
+	must(err, "owner.Start(Unpair)")
+	events = pumpMany([]*peer{owner, helperA, helperB})
+	assertTrue(len(storedVersions(events)) == 0,
+		"one helper cannot meet a threshold of 2, so nothing is shared: %+v", storedVersions(events))
+	assertTrue(versionText(latestVersion(owner)) == "2", "no version consumed, got %s", versionText(latestVersion(owner)))
+	fmt.Println("  removal below the threshold: nothing published  ✓")
+
+	fmt.Println("Protocol unpair republishes flow test passed.")
+}
+
+// runReplicaRemovalPublishesTheRoster mirrors smoke-tests/rust/src/protocol.rs's
+// run_replica_removal_publishes_the_roster_flow: Start(UnpairReplica) drops
+// the member at once and tells it, so the removal completes with no further
+// call: the source reports ReplicaRemoved and the destination tears down.
+// With no member left and no helper, there is nothing to publish, so the
+// version does not move.
+func runReplicaRemovalPublishesTheRoster() {
+	fmt.Println("=== Protocol replica removal publishes the roster flow test ===")
+
+	sourceID, destinationID := uint64(0x5050_5050_5050_5050), uint64(0xD0D0_D0D0_D0D0_D0D0)
+	source := newPeerWithReplicaID("source", "https://source-removal.example.com", 2, &sourceID)
+	destination := newPeerWithReplicaID("destination", "https://destination-removal.example.com", 2, &destinationID)
+	defer source.proto.Close()
+	defer destination.proto.Close()
+
+	replicaChannel := pairReplicaHandshake(source, destination, 91)
+	crossConfirmFingerprint(source, destination, replicaChannel)
+	pump(source, destination)
+
+	_, err := source.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: []protocol.UserSecret{{ID: []byte{9}, Name: "mirrored", Data: []byte("held by both devices")}},
+	})
+	must(err, "source.Start(ProtectSecret)")
+	pump(source, destination)
+	before := latestVersion(source)
+	assertTrue(before != nil, "the source has published")
+
+	memo := "retired device"
+	started, err := source.proto.Start(protocol.FlowKindUnpairReplica, protocol.UnpairReplicaParams{ReplicaID: destinationID, Memo: &memo})
+	must(err, "source.Start(UnpairReplica)")
+	assertTrue(slices.ContainsFunc(started, func(ev protocol.Event) bool { return isReplicaRemoved(ev, destinationID) }),
+		"the source reports the removal at once: %+v", started)
+	after := latestVersion(source)
+	assertTrue(after != nil && *after == *before,
+		"with no member left and no helper, nothing is published: before %d, after %s", *before, versionText(after))
+
+	events := pump(source, destination)
+	assertTrue(slices.ContainsFunc(events, isSelfRemoved),
+		"the destination must tear down when told: %+v", events)
+	fmt.Println("  removal completed with no ProtectSecret from the application  ✓")
+
+	fmt.Println("Protocol replica removal publishes the roster flow test passed.")
+}
+
+// storedKeyEpoch is the epoch of the key ring p stores for channelID, read
+// from its own secret store: the ring's bytes are a version byte, 1 for the
+// encoding KeyRing::as_bytes documents, followed by the big-endian u32 epoch.
+func storedKeyEpoch(p *peer, channelID uint64) uint32 {
+	value, ok, err := p.secretStore.Load(protocolSecretID, channelID, protocol.SecretKindKeyRing)
+	must(err, fmt.Sprintf("[%s] secretStore.Load(KeyRing)", p.label))
+	assertTrue(ok && value.Kind == protocol.SecretKindKeyRing && len(value.Bytes) >= 5,
+		"[%s] channel %d must store a KeyRing, got ok=%v %+v", p.label, channelID, ok, value)
+	assertTrue(value.Bytes[0] == 1,
+		"[%s] channel %d stores KeyRing encoding %d, this reader knows 1", p.label, channelID, value.Bytes[0])
+	return binary.BigEndian.Uint32(value.Bytes[1:5])
+}
+
+// confirmedCount counts the ShareConfirmed events for version.
+func confirmedCount(events []protocol.Event, version uint32) int {
+	n := 0
+	for _, ev := range events {
+		if ev.Type == protocol.EventTypeShareConfirmed && ev.Version != nil && *ev.Version == version {
+			n++
+		}
+	}
+	return n
+}
+
+// runKeyRotation turns key rotation on for the owner. Each sharing round moves
+// both helper channels one key epoch, and both ends store the new epoch in
+// their key ring. An envelope whose sequence is past the forward-jump limit is
+// ignored as KeyUnavailable. The recovered secret names each channel's epoch,
+// and a fresh device restored from it publishes under the next one.
+func runKeyRotation() {
+	fmt.Println("=== Protocol key rotation test ===")
+
+	const ownerURI = "https://owner-rotation.example.com"
+	rotating := func(label string) *peer {
+		p, err := newPeerWithConfig(label, ownerURI, protocol.Config{
+			DeRecProtocolConfig: protocol.DeRecProtocolConfig{
+				Threshold:   proto.Uint32(2),
+				KeyRotation: proto.Bool(true),
+			},
+		})
+		must(err, fmt.Sprintf("protocol.New(%s)", label))
+		return p
+	}
+	owner := rotating("owner")
+	helperA := newPeer("helper-a", "https://helper-a-rotation.example.com", 2)
+	helperB := newPeer("helper-b", "https://helper-b-rotation.example.com", 2)
+	defer helperA.proto.Close()
+	defer helperB.proto.Close()
+
+	channelA := pairPeers(owner, helperA, 1)
+	channelB := pairPeers(owner, helperB, 2)
+	helpers := map[uint64]*peer{channelA: helperA, channelB: helperB}
+
+	for round := uint32(1); round <= 2; round++ {
+		_, err := owner.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+			Secrets: []protocol.UserSecret{{ID: []byte{21}, Name: "rotating", Data: []byte{byte(round)}}},
+		})
+		must(err, "owner.Start(ProtectSecret)")
+		events := pumpMany([]*peer{owner, helperA, helperB})
+		assertTrue(confirmedCount(events, round) == 2, "both helpers must confirm v%d, got %+v", round, events)
+	}
+	for channelID, helper := range helpers {
+		assertTrue(storedKeyEpoch(owner, channelID) == 2 && storedKeyEpoch(helper, channelID) == 2,
+			"channel %d must be at KeyRing epoch 2 on both ends, got owner %d, %s %d",
+			channelID, storedKeyEpoch(owner, channelID), helper.label, storedKeyEpoch(helper, channelID))
+	}
+	fmt.Println("  two rounds → owner and helpers store KeyRing epoch 2 on both channels  ✓")
+
+	_, err := owner.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+		SecretID: protocolSecretID,
+		Version:  2,
+		Target:   protocol.TargetAll(),
+	})
+	must(err, "owner.Start(VerifyShares)")
+	verified := map[uint64]bool{}
+	for _, ev := range pumpMany([]*peer{owner, helperA, helperB}) {
+		if ev.Type == protocol.EventTypeShareVerified && ev.Version != nil && *ev.Version == 2 {
+			verified[ev.ChannelID] = true
+		}
+	}
+	assertTrue(verified[channelA] && verified[channelB], "both channels must verify v2 at epoch 2, got %v", verified)
+	fmt.Println("  verification of v2 at epoch 2 → ShareVerified on both channels  ✓")
+
+	_, err = owner.proto.Start(protocol.FlowKindVerifyShares, protocol.VerifySharesParams{
+		SecretID: protocolSecretID,
+		Version:  2,
+		Target:   protocol.TargetOne(channelA),
+	})
+	must(err, "owner.Start(VerifyShares) on helper-a")
+	sent := owner.drain()
+	assertTrue(len(sent) == 1, "one challenge to helper-a, sent %d", len(sent))
+	var envelope derecpb.DeRecMessage
+	must(proto.Unmarshal(sent[0].message, &envelope), "decode the challenge envelope")
+	assertTrue(envelope.Sequence == 2, "the challenge must be under K2, sequence %d", envelope.Sequence)
+	envelope.Sequence = 2 + 513
+	forged, err := proto.Marshal(&envelope)
+	must(err, "encode the forged envelope")
+	ignored, err := helperA.proto.Process(forged)
+	must(err, "helper-a.Process(forged sequence)")
+	assertTrue(len(ignored) == 1 && ignored[0].Type == protocol.EventTypeMessageIgnored &&
+		ignored[0].Reason == protocol.IgnoreReasonKeyUnavailable && ignored[0].ChannelID == channelA,
+		"a sequence past the forward-jump limit must be MessageIgnored(KeyUnavailable), got %+v", ignored)
+	assertTrue(len(helperA.drain()) == 0, "a message with no usable key must not be answered")
+	assertTrue(storedKeyEpoch(helperA, channelA) == 2, "the ignored message must not move helper-a's ring")
+	fmt.Println("  sequence 515 → MessageIgnored(KeyUnavailable), nothing sent, ring unchanged  ✓")
+
+	_, err = owner.proto.Start(protocol.FlowKindRecoverSecret, protocol.RecoverSecretParams{
+		SecretID: protocolSecretID,
+		Version:  2,
+	})
+	must(err, "owner.Start(RecoverSecret)")
+	var recovered *protocol.Secret
+	for _, ev := range pumpMany([]*peer{owner, helperA, helperB}) {
+		if ev.Type == protocol.EventTypeSecretRecovered && ev.Secret != nil {
+			recovered = ev.Secret
+		}
+	}
+	assertTrue(recovered != nil, "RecoverSecret must surface SecretRecovered")
+	assertTrue(len(recovered.Helpers) == 2, "the recovered roster must name both helpers, got %+v", recovered.Helpers)
+	for _, h := range recovered.Helpers {
+		assertTrue(h.KeyEpoch == 2, "the roster must name key epoch 2 for channel %d, got %d", h.ChannelID, h.KeyEpoch)
+	}
+	fmt.Println("  SecretRecovered names key_epoch 2 for both helpers  ✓")
+	owner.proto.Close()
+
+	device := rotating("device")
+	defer device.proto.Close()
+	_, err = device.proto.Restore(*recovered, 2, 2)
+	must(err, "device.Restore")
+	for channelID := range helpers {
+		assertTrue(storedKeyEpoch(device, channelID) == 2,
+			"restore must rebuild channel %d at KeyRing epoch 2, got %d", channelID, storedKeyEpoch(device, channelID))
+	}
+	fmt.Println("  restore on a fresh device → KeyRing epoch 2 on both channels  ✓")
+
+	_, err = device.proto.Start(protocol.FlowKindProtectSecret, protocol.ProtectSecretParams{
+		Secrets: recovered.Secrets,
+	})
+	must(err, "device.Start(ProtectSecret) after Restore")
+	events := pumpMany([]*peer{device, helperA, helperB})
+	assertTrue(confirmedCount(events, 3) == 2, "both helpers must confirm v3 from the restored device, got %+v", events)
+	for channelID, helper := range helpers {
+		assertTrue(storedKeyEpoch(device, channelID) == 3 && storedKeyEpoch(helper, channelID) == 3,
+			"channel %d must be at KeyRing epoch 3 on both ends, got device %d, %s %d",
+			channelID, storedKeyEpoch(device, channelID), helper.label, storedKeyEpoch(helper, channelID))
+	}
+	fmt.Println("  the restored device publishes v3 → both helpers confirm, KeyRing epoch 3  ✓")
+
+	fmt.Println("Protocol key rotation test passed.")
 }

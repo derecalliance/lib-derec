@@ -34,6 +34,9 @@ pub fn produce(
     channel_id: u64,
     request: JsValue,
     shared_key: &[u8],
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
     share_content: &[u8],
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
@@ -43,7 +46,7 @@ pub fn produce(
     let result = response::produce(
         channel_id.into(),
         &request_proto,
-        &shared_key,
+        &crate::types::ChannelKey::new(epoch, shared_key),
         share_content,
     )
     .map_err(js_error_from_lib)?;

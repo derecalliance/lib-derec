@@ -33,9 +33,7 @@ fn test_policy() -> TransportPolicy {
 }
 use crate::transport::TransportPolicy;
 use crate::types::ChannelId;
-use derec_cryptography::pairing::{
-    PairingSecretKeyMaterial, PairingSharedKey, fingerprint_commitment,
-};
+use derec_cryptography::pairing::{PairingSecretKeyMaterial, fingerprint_commitment};
 use derec_proto::{
     ContactMessage, ContactMode, DeRecMessage, DeRecResult, MessageBody, PairRequestMessage,
     PairResponseMessage, ParameterRange, PrePairRequestMessage, PrePairResponseMessage, Protocol,
@@ -2852,7 +2850,7 @@ fn inline_keys_handshake() -> (
     ContactMessage,
     PairResponseMessage,
     PairingSecretKeyMaterial,
-    PairingSharedKey,
+    crate::types::SharedKey,
 ) {
     let CreateContactMessageResult {
         contact_message: contact,

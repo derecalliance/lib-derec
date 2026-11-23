@@ -4,8 +4,10 @@
 package native
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"unsafe"
 
@@ -16,12 +18,13 @@ import (
 // domain types — see the storeSet doc comment in callbacks.go.
 type shareStore interface {
 	Load(secretID, channelID uint64, versions []uint32) ([]Share, error)
-	LoadMany(secretID uint64, channelIDs []uint64, versions []uint32) ([]Share, error)
+	LoadMany(secretID uint64, channelIDs []uint64, versions []uint32) ([]ShareEntry, error)
 	LoadAll(secretID uint64, channelIDs []uint64) ([]Share, error)
 	LatestVersion(secretID uint64) (uint32, bool, error)
 	Save(secretID, channelID uint64, share Share) error
 	RemoveChannel(secretID, channelID uint64) error
 	RemoveVersions(secretID, channelID uint64, versions []uint32) error
+	RemoveVersionsMany(secretID uint64, entries []ShareVersionsEntry) error
 	KeepVersion(secretID uint64, version uint32) (uint32, error)
 	RecordVerification(secretID, channelID uint64, version uint32) error
 }
@@ -41,6 +44,7 @@ type ShareStoreCallbacks struct {
 	Save               uintptr
 	RemoveChannel      uintptr
 	RemoveVersions     uintptr
+	RemoveVersionsMany uintptr
 	KeepVersion        uintptr
 	RecordVerification uintptr
 	FreeBuffer         uintptr
@@ -161,7 +165,7 @@ func dispatchShareLoadMany(s *storeSet, secretID uint64, channelIDsJSON, version
 	if err != nil {
 		return ffiStatusFailure, nil
 	}
-	encoded, err := EncodeShareList(shares)
+	encoded, err := EncodeShareEntryList(shares)
 	if err != nil {
 		return ffiStatusFailure, nil
 	}
@@ -244,6 +248,50 @@ func dispatchShareRemoveVersions(s *storeSet, secretID, channelID uint64, versio
 		return ffiStatusFailure
 	}
 	return ffiStatusOK
+}
+
+func dispatchShareRemoveVersionsMany(s *storeSet, secretID uint64, entriesJSON []byte) (status int32) {
+	defer recoverInto(&status)
+	entries, err := decodeShareVersionsEntries(entriesJSON)
+	if err != nil {
+		return ffiStatusFailure
+	}
+	if err := s.share.RemoveVersionsMany(secretID, entries); err != nil {
+		return ffiStatusFailure
+	}
+	return ffiStatusOK
+}
+
+// decodeShareVersionsEntries parses the core's JSON array of
+// [channel_id, versions] pairs, the channel id a decimal string and the
+// versions an array of numbers.
+func decodeShareVersionsEntries(data []byte) ([]ShareVersionsEntry, error) {
+	var pairs [][2]json.RawMessage
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &pairs); err != nil {
+			return nil, err
+		}
+	}
+	entries := make([]ShareVersionsEntry, 0, len(pairs))
+	for _, p := range pairs {
+		var channelStr string
+		if err := json.Unmarshal(p[0], &channelStr); err != nil {
+			return nil, err
+		}
+		var versions []uint32
+		if err := json.Unmarshal(p[1], &versions); err != nil {
+			return nil, err
+		}
+		channelID, err := strconv.ParseUint(channelStr, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		if versions == nil {
+			versions = []uint32{}
+		}
+		entries = append(entries, ShareVersionsEntry{ChannelID: channelID, Versions: versions})
+	}
+	return entries, nil
 }
 
 func dispatchShareKeepVersion(s *storeSet, secretID uint64, version uint32) (status int32, keepVersion uint32) {
@@ -340,6 +388,15 @@ func shareRemoveVersionsCallback(userData uintptr, secretID, channelID uint64, v
 	return dispatchShareRemoveVersions(s, secretID, channelID, unsafe.Slice(versionsPtr, versionsLen))
 }
 
+func shareRemoveVersionsManyCallback(userData uintptr, secretID uint64, entriesPtr *byte, entriesLen uintptr) (status int32) {
+	defer recoverInto(&status)
+	s, ok := lookupStores(storeHandle(userData))
+	if !ok {
+		return ffiStatusFailure
+	}
+	return dispatchShareRemoveVersionsMany(s, secretID, readFilterBytes(entriesPtr, entriesLen))
+}
+
 func shareKeepVersionCallback(userData uintptr, secretID uint64, version uint32, outVersion *uint32) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
@@ -364,14 +421,14 @@ func shareRecordVerificationCallback(userData uintptr, secretID, channelID uint6
 
 // shareCallbackPtrs holds the purego.NewCallback address for every
 // ShareStoreCallbacks fn-pointer field except FreeBuffer (shared package-
-// wide via sharedFreeBufferCallback). These nine functions are stateless
+// wide via sharedFreeBufferCallback). These ten functions are stateless
 // package-level funcs, so each needs exactly one registration total — see
 // registerChannelCallbacks in callbacks_channel.go for why per-call
 // registration would exhaust purego's 2000-slot callback table.
 var (
 	shareCallbacksOnce sync.Once
 	shareCallbackPtrs  struct {
-		load, loadMany, loadAll, latestVersion, save, removeChannel, removeVersions, keepVersion, recordVerification uintptr
+		load, loadMany, loadAll, latestVersion, save, removeChannel, removeVersions, removeVersionsMany, keepVersion, recordVerification uintptr
 	}
 )
 
@@ -384,6 +441,7 @@ func registerShareCallbacks() {
 		shareCallbackPtrs.save = purego.NewCallback(shareSaveCallback)
 		shareCallbackPtrs.removeChannel = purego.NewCallback(shareRemoveChannelCallback)
 		shareCallbackPtrs.removeVersions = purego.NewCallback(shareRemoveVersionsCallback)
+		shareCallbackPtrs.removeVersionsMany = purego.NewCallback(shareRemoveVersionsManyCallback)
 		shareCallbackPtrs.keepVersion = purego.NewCallback(shareKeepVersionCallback)
 		shareCallbackPtrs.recordVerification = purego.NewCallback(shareRecordVerificationCallback)
 	})
@@ -403,6 +461,7 @@ func buildShareStoreCallbacks(h storeHandle) ShareStoreCallbacks {
 		Save:               shareCallbackPtrs.save,
 		RemoveChannel:      shareCallbackPtrs.removeChannel,
 		RemoveVersions:     shareCallbackPtrs.removeVersions,
+		RemoveVersionsMany: shareCallbackPtrs.removeVersionsMany,
 		KeepVersion:        shareCallbackPtrs.keepVersion,
 		RecordVerification: shareCallbackPtrs.recordVerification,
 		FreeBuffer:         sharedFreeBufferCallback(),

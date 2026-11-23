@@ -115,6 +115,7 @@ func goldenRestoreSecret() Secret {
 func TestWireGolden_Restore(t *testing.T) {
 	got, err := json.Marshal(restoreParamsWire{
 		Version:         7,
+		NewestVersion:   9,
 		RecoveredSecret: goldenRestoreSecret(),
 	})
 	if err != nil {
@@ -217,7 +218,7 @@ func TestWireGolden_Restore_NilReplicasOmitsField(t *testing.T) {
 		},
 		Secrets: []UserSecret{{ID: []byte{0x01}, Name: "n", Data: []byte{0x02}}},
 	}
-	got, err := json.Marshal(restoreParamsWire{Version: 1, RecoveredSecret: secret})
+	got, err := json.Marshal(restoreParamsWire{Version: 1, NewestVersion: 1, RecoveredSecret: secret})
 	if err != nil {
 		t.Fatalf("marshal restore params: %v", err)
 	}

@@ -15,13 +15,18 @@ public static partial class Unpairing
             public required byte[] ResponseProtoBytes { get; init; }
         }
 
-        public static DeRecMessage Produce(ulong channelId, byte[] sharedKey)
+        /// <summary>
+        /// <c>epoch</c> is the epoch of <c>sharedKey</c> in the channel's key chain,
+        /// stamped into the envelope's <c>sequence</c>; 0 for a freshly paired channel.
+        /// </summary>
+        public static DeRecMessage Produce(ulong channelId, byte[] sharedKey, uint epoch)
         {
             Native.Unpairing.ProduceUnpairResponseMessageResult nativeResult =
                 Native.Unpairing.produce_unpair_response_message(
                     channelId,
                     sharedKey,
-                    (UIntPtr)sharedKey.Length
+                    (UIntPtr)sharedKey.Length,
+                    epoch
                 );
 
             try

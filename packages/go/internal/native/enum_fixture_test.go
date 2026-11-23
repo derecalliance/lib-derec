@@ -118,6 +118,7 @@ func TestNumericEnumsMatchTheFixture(t *testing.T) {
 		"SharedKey":      SecretKindSharedKey,
 		"PairingSecret":  SecretKindPairingSecret,
 		"PairingContact": SecretKindPairingContact,
+		"KeyRing":        SecretKindKeyRing,
 	} {
 		got, ok := secret[name]
 		if !ok {
@@ -127,7 +128,7 @@ func TestNumericEnumsMatchTheFixture(t *testing.T) {
 			t.Fatalf("SecretKind %q: Go has %d, fixture says %d", name, want, got)
 		}
 	}
-	if len(secret) != 3 {
-		t.Fatalf("fixture lists %d SecretKind variants; Go knows 3", len(secret))
+	if len(secret) != 4 {
+		t.Fatalf("fixture lists %d SecretKind variants; Go knows 4", len(secret))
 	}
 }

@@ -390,6 +390,7 @@ func TestSecretValueRoundTrip_AllKinds(t *testing.T) {
 		{Kind: SecretKindSharedKey, Bytes: make([]byte, 32)},
 		{Kind: SecretKindPairingSecret, Bytes: []byte{1, 2, 3}},
 		{Kind: SecretKindPairingContact, Bytes: []byte{4, 5, 6, 7}},
+		{Kind: SecretKindKeyRing, Bytes: []byte{8, 9, 10, 11, 12}},
 	}
 	for _, want := range cases {
 		wire, err := EncodeSecretValue(want)

@@ -39,6 +39,10 @@ internal static class Protocol
         out uint outExisted);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int ChannelStoreRemoveManyDelegate(
+        IntPtr userData, ulong secretId, IntPtr queries, UIntPtr queriesLen);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreListDelegate(
         IntPtr userData, ulong secretId,
         IntPtr filter, UIntPtr filterLen,
@@ -64,6 +68,7 @@ internal static class Protocol
         public IntPtr Load;
         public IntPtr Save;
         public IntPtr Remove;
+        public IntPtr RemoveMany;
         public IntPtr ListHelpers;
         public IntPtr ListReplicas;
         public IntPtr LinkChannel;
@@ -91,6 +96,10 @@ internal static class Protocol
     internal delegate int SecretStoreRemoveDelegate(
         IntPtr userData, ulong secretId, ulong channelId, uint kind);
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int SecretStoreRemoveManyDelegate(
+        IntPtr userData, ulong secretId, IntPtr entries, UIntPtr entriesLen);
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct SecretStoreCallbacks
     {
@@ -99,6 +108,7 @@ internal static class Protocol
         public IntPtr LoadMany;
         public IntPtr Save;
         public IntPtr Remove;
+        public IntPtr RemoveMany;
         public IntPtr FreeBuffer;
     }
 
@@ -141,6 +151,10 @@ internal static class Protocol
         IntPtr versionsJsonPtr, UIntPtr versionsJsonLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int ShareStoreRemoveVersionsManyDelegate(
+        IntPtr userData, ulong secretId, IntPtr entries, UIntPtr entriesLen);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ShareStoreKeepVersionDelegate(
         IntPtr userData, ulong secretId, uint version,
         out uint outVersion);
@@ -160,6 +174,7 @@ internal static class Protocol
         public IntPtr Save;
         public IntPtr RemoveChannel;
         public IntPtr RemoveVersions;
+        public IntPtr RemoveVersionsMany;
         public IntPtr KeepVersion;
         public IntPtr RecordVerification;
         public IntPtr FreeBuffer;
@@ -207,6 +222,11 @@ internal static class Protocol
         out uint outRemoved);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int StateStoreRemoveManyDelegate(
+        IntPtr userData, ulong secretId,
+        IntPtr keysJsonPtr, UIntPtr keysJsonLen);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int StateStoreLoadAllDelegate(
         IntPtr userData, ulong secretId, uint kind,
         out IntPtr outPtr, out UIntPtr outLen);
@@ -218,6 +238,7 @@ internal static class Protocol
         public IntPtr Save;
         public IntPtr Load;
         public IntPtr Remove;
+        public IntPtr RemoveMany;
         public IntPtr LoadAll;
         public IntPtr FreeBuffer;
     }

@@ -3,7 +3,8 @@
 
 // Package envelope exposes helpers that read or rewrite an envelope's
 // cleartext fields without touching the encrypted inner message: trace ids
-// for correlating requests and responses.
+// for correlating requests and responses, the sequence that selects the
+// channel key, and the encrypted payload duplicate detection keys on.
 package envelope
 
 import "github.com/derecalliance/lib-derec/packages/go/internal/native"
@@ -18,6 +19,12 @@ func ApplyTraceID(envelopeBytes []byte, traceID uint64) ([]byte, error) {
 // encrypted inner payload.
 func ReadTraceID(envelopeBytes []byte) (uint64, error) {
 	return native.ReadTraceIDFromEnvelope(envelopeBytes)
+}
+
+// ReadSequence reads the sequence off an envelope without touching the
+// encrypted inner payload: the epoch of the channel key that encrypted it.
+func ReadSequence(envelopeBytes []byte) (uint32, error) {
+	return native.ReadSequenceFromEnvelope(envelopeBytes)
 }
 
 // EncryptedPayload reads the encrypted message field off an envelope,

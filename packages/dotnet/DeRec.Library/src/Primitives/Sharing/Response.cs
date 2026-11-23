@@ -27,10 +27,15 @@ public static partial class Sharing
             public required byte[] ResponseProtoBytes { get; init; }
         }
 
+        /// <summary>
+        /// <c>epoch</c> is the epoch of <c>sharedKey</c> in the channel's key chain,
+        /// stamped into the envelope's <c>sequence</c>; 0 for a freshly paired channel.
+        /// </summary>
         public static ProduceResult Produce(
             ulong channelId,
             byte[] requestProtoBytes,
-            byte[] sharedKey
+            byte[] sharedKey,
+            uint epoch
         )
         {
             ArgumentNullException.ThrowIfNull(requestProtoBytes);
@@ -42,7 +47,8 @@ public static partial class Sharing
                     requestProtoBytes,
                     (UIntPtr)requestProtoBytes.Length,
                     sharedKey,
-                    (UIntPtr)sharedKey.Length
+                    (UIntPtr)sharedKey.Length,
+                    epoch
                 );
 
             try

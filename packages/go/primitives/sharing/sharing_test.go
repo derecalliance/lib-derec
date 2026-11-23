@@ -95,7 +95,7 @@ func TestStoreShareRequestResponseRoundTrip(t *testing.T) {
 	for _, channelID := range channelIDs {
 		committedShare := shares[channelID]
 
-		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, 0, "", key, nil)
+		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, 0, "", key, 0, nil)
 		if err != nil {
 			t.Fatalf("channel %d: request produce: %v", channelID, err)
 		}
@@ -114,7 +114,7 @@ func TestStoreShareRequestResponseRoundTrip(t *testing.T) {
 			t.Fatalf("channel %d: extracted request proto is empty", channelID)
 		}
 
-		respResult, err := sharing.Response.Produce(channelID, extractedReq.RequestProto, key)
+		respResult, err := sharing.Response.Produce(channelID, extractedReq.RequestProto, key, 0)
 		if err != nil {
 			t.Fatalf("channel %d: response produce: %v", channelID, err)
 		}
@@ -177,7 +177,7 @@ func produceAndExtractStoreShare(t *testing.T, rt []sharing.Endpoint) []byte {
 	if err != nil {
 		t.Fatalf("split: %v", err)
 	}
-	wire, err := sharing.Request.Produce(1, version, secretID, shares[1], 0, "", key, rt)
+	wire, err := sharing.Request.Produce(1, version, secretID, shares[1], 0, "", key, 0, rt)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}

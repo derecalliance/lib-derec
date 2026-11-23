@@ -75,6 +75,9 @@ pub fn produce(
     keep_version: u32,
     description: String,
     shared_key: &[u8],
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
     // Optional `TransportProtocol` (serialized JS object) telling the
     // responder where to send the response. Pass `null`/`undefined` to
     // leave it absent (the responder routes to the channel's stored peer
@@ -92,7 +95,7 @@ pub fn produce(
         &committed_share_proto,
         keep_version,
         description,
-        &shared_key,
+        &crate::types::ChannelKey::new(epoch, shared_key),
         &reply_to_proto,
     )
     .map_err(js_error_from_lib)?;

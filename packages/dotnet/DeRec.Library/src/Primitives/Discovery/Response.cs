@@ -16,10 +16,15 @@ public static partial class Discovery
             public required byte[] ResponseProtoBytes { get; init; }
         }
 
+        /// <summary>
+        /// <c>epoch</c> is the epoch of <c>sharedKey</c> in the channel's key chain,
+        /// stamped into the envelope's <c>sequence</c>; 0 for a freshly paired channel.
+        /// </summary>
         public static DeRecMessage Produce(
             ulong channelId,
             IReadOnlyList<SecretVersionEntry> secretList,
-            byte[] sharedKey
+            byte[] sharedKey,
+            uint epoch
         )
         {
             ArgumentNullException.ThrowIfNull(secretList);
@@ -31,7 +36,8 @@ public static partial class Discovery
                     secretListBytes,
                     (UIntPtr)secretListBytes.Length,
                     sharedKey,
-                    (UIntPtr)sharedKey.Length
+                    (UIntPtr)sharedKey.Length,
+                    epoch
                 );
 
             try

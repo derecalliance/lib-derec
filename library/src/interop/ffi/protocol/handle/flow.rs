@@ -341,6 +341,7 @@ pub unsafe extern "C" fn derec_protocol_reject(
 /// ```json
 /// {
 ///   "version": 7,
+///   "newest_version": 9,
 ///   "recovered_secret": {
 ///     "helpers": [{ "channel_id": "11",
 ///                   "transports": [{ "uri": "https://helper.example", "protocol": "https" }],
@@ -358,6 +359,10 @@ pub unsafe extern "C" fn derec_protocol_reject(
 ///   }
 /// }
 /// ```
+///
+/// `version` is the recovered version and `newest_version` the newest one any
+/// helper reported, both required; see
+/// [`DeRecProtocol::restore`](crate::protocol::DeRecProtocol::restore).
 ///
 /// Field names mirror `SecretWire` in `protocol/events/wire.rs` — the
 /// same shape `SecretRecovered` carries, so the `secret` of that event can
@@ -434,7 +439,10 @@ pub unsafe extern "C" fn derec_protocol_restore(
 
     let h = unsafe { &*handle };
     let mut inner = h.lock_inner();
-    match h.runtime.block_on(inner.restore(&secret, params.version)) {
+    match h
+        .runtime
+        .block_on(inner.restore(&secret, params.version, params.newest_version))
+    {
         Ok(events) => {
             let json = encode_events(events);
             DeRecProtocolRestoreResult {
@@ -463,5 +471,6 @@ pub unsafe extern "C" fn derec_protocol_restore(
 #[derive(serde::Deserialize)]
 struct RestoreParamsJson {
     version: u32,
+    newest_version: u32,
     recovered_secret: RecoveredSecretIn,
 }

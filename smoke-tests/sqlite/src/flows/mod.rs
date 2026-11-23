@@ -6,6 +6,7 @@ pub mod helpers;
 
 pub mod auto_accept;
 pub mod discovery_recovery;
+pub mod key_rotation;
 pub mod multi_secret;
 pub mod multi_tenancy;
 pub mod pairing;
@@ -22,6 +23,7 @@ pub async fn run_all() {
     subshares::run().await;
     threshold::run().await;
     discovery_recovery::run().await;
+    key_rotation::run().await;
     unpairing::run().await;
     persistence::run().await;
     multi_tenancy::run().await;

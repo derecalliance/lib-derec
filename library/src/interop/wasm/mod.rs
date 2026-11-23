@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+pub mod channel_key;
 pub mod envelope;
 pub mod primitives;
 pub mod protocol;

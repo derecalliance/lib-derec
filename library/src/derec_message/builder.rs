@@ -12,7 +12,8 @@
 //!
 //! - protocol version
 //! - channel ID
-//! - sequence
+//! - sequence: the epoch of the channel key that encrypted the payload, set
+//!   by channel encryption; `0` for pairing envelopes
 //! - timestamp
 //!
 //! The `message` field contains the serialized bytes of an inner flow message.
@@ -69,7 +70,7 @@ use std::marker::PhantomData;
 use crate::{
     derec_message::DeRecMessageBuilderError,
     protocol_version::ProtocolVersion,
-    types::ChannelId,
+    types::{ChannelId, ChannelKey},
     utils::{os_rng, random_u64},
 };
 use derec_cryptography::{channel, pairing::envelope};
@@ -173,19 +174,19 @@ pub struct PlaintextMode;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # let channel_id = ChannelId(1);
 /// # let verify_request = VerifyShareRequestMessage::default();
-/// # let shared_key = [0u8; 32];
+/// # let channel_key = derec_library::types::ChannelKey::new(0, derec_library::types::SharedKey::new([0u8; 32]));
 /// let envelope = DeRecMessageBuilder::channel()
 ///     .channel_id(channel_id)
 ///     .timestamp(current_timestamp())
 ///     .message_body(MessageBody::VerifyShareRequest(verify_request))
-///     .encrypt(&shared_key)?
+///     .encrypt(&channel_key)?
 ///     .build()?;
 /// # Ok(())
 /// # }
 /// ```
 #[derive(Debug)]
 pub struct DeRecMessageBuilder<State, Mode> {
-    pub(crate) sequence: Option<u32>,
+    pub(crate) sequence: u32,
     pub(crate) channel_id: Option<ChannelId>,
     pub(crate) timestamp: Option<Timestamp>,
     pub(crate) message: Option<MessageBody>,
@@ -210,23 +211,6 @@ impl<State, Mode> DeRecMessageBuilder<State, Mode> {
     /// The updated builder.
     pub fn channel_id(mut self, channel_id: ChannelId) -> Self {
         self.channel_id = Some(channel_id);
-        self
-    }
-
-    /// Sets the sequence number for the envelope.
-    ///
-    /// The sequence number tracks message ordering and may also be used by
-    /// higher-level protocol logic such as key rotation or replay detection.
-    ///
-    /// # Arguments
-    ///
-    /// * `sequence` - monotonically increasing message counter
-    ///
-    /// # Returns
-    ///
-    /// The updated builder.
-    pub fn sequence(mut self, sequence: u32) -> Self {
-        self.sequence = Some(sequence);
         self
     }
 
@@ -322,7 +306,7 @@ impl DeRecMessageBuilder<NotEncrypted, PairingMode> {
     /// ```
     pub fn pairing() -> Self {
         Self {
-            sequence: None,
+            sequence: 0,
             channel_id: None,
             timestamp: None,
             message: None,
@@ -397,7 +381,7 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
     /// ```
     pub fn channel() -> Self {
         Self {
-            sequence: None,
+            sequence: 0,
             channel_id: None,
             timestamp: None,
             message: None,
@@ -414,12 +398,15 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
     /// Every call draws a fresh random 96-bit AES-GCM nonce from the operating
     /// system's random number generator; it is prepended to the ciphertext.
     ///
+    /// The envelope's `sequence` is set to `channel_key`'s epoch, which tells
+    /// the receiver which key in the channel's chain opens the payload.
+    ///
     /// After successful encryption, the builder transitions to the
     /// [`Encrypted`] state, enabling [`build`](DeRecMessageBuilder::build).
     ///
     /// # Arguments
     ///
-    /// * `shared_key` - 32-byte symmetric channel key
+    /// * `channel_key` - the channel key and its epoch
     ///
     /// # Returns
     ///
@@ -434,7 +421,7 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
     /// - the underlying channel encryption routine fails
     pub fn encrypt(
         self,
-        shared_key: &[u8; 32],
+        channel_key: &ChannelKey,
     ) -> Result<DeRecMessageBuilder<Encrypted, ChannelMode>, DeRecMessageBuilderError> {
         let message = self
             .message
@@ -448,13 +435,13 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
         Rng::fill_bytes(&mut os_rng(), &mut nonce[..12]);
 
         let encoded = versioned(&message);
-        let encrypted = channel::encrypt_message(&encoded, shared_key, &nonce)?;
+        let encrypted = channel::encrypt_message(&encoded, channel_key.key.as_bytes(), &nonce)?;
 
         Ok(DeRecMessageBuilder {
             message: None,
             encrypted,
             timestamp: self.timestamp,
-            sequence: self.sequence,
+            sequence: channel_key.epoch,
             channel_id: Some(channel_id),
             trace_id: self.trace_id,
             _state: PhantomData,
@@ -475,7 +462,7 @@ impl<Mode> DeRecMessageBuilder<Encrypted, Mode> {
     ///
     /// - protocol version from [`ProtocolVersion::current`]
     /// - `channel_id`
-    /// - `sequence` or `0` if no sequence was set
+    /// - `sequence`: the channel key's epoch, or `0` for a pairing envelope
     /// - `timestamp`
     /// - `message` containing the encrypted payload bytes
     ///
@@ -530,7 +517,7 @@ impl DeRecMessageBuilder<NotEncrypted, PlaintextMode> {
     /// ```
     pub fn plaintext() -> Self {
         Self {
-            sequence: None,
+            sequence: 0,
             channel_id: None,
             timestamp: None,
             message: None,
@@ -575,7 +562,7 @@ fn versioned(message: &MessageBody) -> Vec<u8> {
 
 /// Assemble the envelope around `message`.
 fn seal(
-    sequence: Option<u32>,
+    sequence: u32,
     channel_id: Option<ChannelId>,
     timestamp: Option<Timestamp>,
     trace_id: Option<u64>,
@@ -588,7 +575,7 @@ fn seal(
     Ok(DeRecMessage {
         protocol_version_major: protocol_version.major,
         protocol_version_minor: protocol_version.minor,
-        sequence: sequence.unwrap_or_default(),
+        sequence,
         channel_id: channel_id.into(),
         timestamp,
         message,

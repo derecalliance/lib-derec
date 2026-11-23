@@ -7,16 +7,23 @@
 //! back to `accept()` or `reject()` without inspecting them.
 //!
 //! Wire format:
-//! - 1 byte: discriminant (0..8)
+//! - 1 byte: discriminant (0, 7..14)
 //! - 8 bytes: channel_id (big-endian u64)
 //! - 8 bytes: trace_id (u64 BE) — echoed verbatim on the response
+//! - For channel message types and RespondToFailure:
+//!   - 4 bytes: epoch (u32 BE), the epoch of the channel key the action is
+//!     answered under: the key its request arrived under
+//!   - 32 bytes: the action's seal (an HMAC-SHA256 under a key derived from
+//!     the answering channel's key at that epoch; see `events::seal`)
+//!
+//!   Pairing and PrePair carry neither: they are answered under no channel
+//!   key.
 //! - For Pairing:
 //!   - 4 bytes: my_kind (i32 BE)
 //!   - 4 bytes: request_len (u32 BE)
 //!   - N bytes: protobuf-encoded PairRequestMessage
 //! - For channel message types (StoreShare, VerifyShare, Discovery,
 //!   GetShare, Unpair, UpdateChannelInfo):
-//!   - 32 bytes: shared_key
 //!   - remaining: protobuf-encoded request message
 //! - For PrePair (initiator side, before any key material exists):
 //!   - remaining: protobuf-encoded PrePairRequestMessage
@@ -28,14 +35,22 @@
 //!   - 1 byte: failed-request discriminant (0..6)
 //!   - remaining: protobuf-encoded request message, empty for `Undecodable`
 //!
-//! RespondToFailure carries no shared key: the response is encrypted under
-//! the reply channel's key, loaded when it is sent.
+//! No token carries key material, and none can be altered undetected: the
+//! seal covers the channel_id, trace_id, epoch and everything after it, so
+//! `accept` and `reject` refuse a token that was edited, built by hand, or
+//! moved to another channel or epoch. A channel message is answered under
+//! the channel's key at the token's epoch, and RespondToFailure under the
+//! reply channel's, each taken from the channel's key ring in the secret
+//! store when the response is sent. A token whose epoch's key the ring can no
+//! longer give is refused as too late. Pairing and PrePair load
+//! `PairingSecret` from the secret store at accept time. The secret store is
+//! the single source of truth for every key.
 //!
-//! No pairing secret is carried for Pairing or PrePair — both accept
-//! handlers load `PairingSecret` from the secret store at accept time
-//! (single source of truth), so the token never holds private key material.
+//! Tokens issued by v0.0.10, whose channel messages used discriminants 1..6
+//! and carried the shared key, are refused.
 
-use crate::protocol::{FailedRequest, PendingAction, ReplyTarget};
+use crate::protocol::events::seal::{SEAL_LEN, Seal};
+use crate::protocol::{Action, ChannelRequest, FailedRequest, PendingAction, ReplyTarget};
 use crate::types::ChannelId;
 use derec_proto::{
     GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PairRequestMessage,
@@ -46,14 +61,18 @@ use prost::Message;
 use std::collections::HashMap;
 
 const TAG_PAIRING: u8 = 0;
-const TAG_STORE_SHARE: u8 = 1;
-const TAG_VERIFY_SHARE: u8 = 2;
-const TAG_DISCOVERY: u8 = 3;
-const TAG_GET_SHARE: u8 = 4;
-const TAG_UNPAIR: u8 = 5;
-const TAG_UPDATE_CHANNEL_INFO: u8 = 6;
 const TAG_PRE_PAIR: u8 = 7;
 const TAG_RESPOND_TO_FAILURE: u8 = 8;
+const TAG_STORE_SHARE: u8 = 9;
+const TAG_VERIFY_SHARE: u8 = 10;
+const TAG_DISCOVERY: u8 = 11;
+const TAG_GET_SHARE: u8 = 12;
+const TAG_UNPAIR: u8 = 13;
+const TAG_UPDATE_CHANNEL_INFO: u8 = 14;
+
+/// The highest channel-message discriminant of a v0.0.10 token, which carried
+/// the shared key; discriminants 1 up to it are refused.
+const V0_0_10_LAST_CHANNEL_TAG: u8 = 6;
 
 const FAILED_STORE_SHARE: u8 = 0;
 const FAILED_VERIFY_SHARE: u8 = 1;
@@ -63,126 +82,41 @@ const FAILED_UNPAIR: u8 = 4;
 const FAILED_UPDATE_CHANNEL_INFO: u8 = 5;
 const FAILED_UNDECODABLE: u8 = 6;
 
-pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
-    let mut buf = Vec::new();
+/// The length of the epoch a sealed token carries.
+const EPOCH_LEN: usize = 4;
 
-    match action {
-        PendingAction::Pairing {
-            channel_id,
-            request,
-            kind,
-            trace_id,
-            ..
-        } => {
-            buf.push(TAG_PAIRING);
-            buf.extend_from_slice(&channel_id.0.to_be_bytes());
-            buf.extend_from_slice(&trace_id.to_be_bytes());
-            buf.extend_from_slice(&(kind as i32).to_be_bytes());
+pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
+    let seal = action.seal().map(|seal| *seal.as_bytes());
+    let epoch = action.epoch();
+    let (channel_id, trace_id, action) = action.into_parts();
+    let (tag, body) = match action {
+        Action::Pairing { request, kind, .. } => {
+            let mut body = (kind as i32).to_be_bytes().to_vec();
             let request_bytes = request.encode_to_vec();
-            buf.extend_from_slice(&(request_bytes.len() as u32).to_be_bytes());
-            buf.extend_from_slice(&request_bytes);
+            body.extend_from_slice(&(request_bytes.len() as u32).to_be_bytes());
+            body.extend_from_slice(&request_bytes);
+            (TAG_PAIRING, body)
         }
-        PendingAction::StoreShare {
-            channel_id,
-            request,
-            shared_key,
-            trace_id,
-        } => {
-            buf.push(TAG_STORE_SHARE);
-            buf.extend_from_slice(&channel_id.0.to_be_bytes());
-            buf.extend_from_slice(&trace_id.to_be_bytes());
-            buf.extend_from_slice(&shared_key);
-            buf.extend_from_slice(&request.encode_to_vec());
-        }
-        PendingAction::VerifyShare {
-            channel_id,
-            request,
-            shared_key,
-            trace_id,
-        } => {
-            buf.push(TAG_VERIFY_SHARE);
-            buf.extend_from_slice(&channel_id.0.to_be_bytes());
-            buf.extend_from_slice(&trace_id.to_be_bytes());
-            buf.extend_from_slice(&shared_key);
-            buf.extend_from_slice(&request.encode_to_vec());
-        }
-        PendingAction::Discovery {
-            channel_id,
-            request,
-            shared_key,
-            trace_id,
-        } => {
-            buf.push(TAG_DISCOVERY);
-            buf.extend_from_slice(&channel_id.0.to_be_bytes());
-            buf.extend_from_slice(&trace_id.to_be_bytes());
-            buf.extend_from_slice(&shared_key);
-            buf.extend_from_slice(&request.encode_to_vec());
-        }
-        PendingAction::GetShare {
-            channel_id,
-            request,
-            shared_key,
-            trace_id,
-        } => {
-            buf.push(TAG_GET_SHARE);
-            buf.extend_from_slice(&channel_id.0.to_be_bytes());
-            buf.extend_from_slice(&trace_id.to_be_bytes());
-            buf.extend_from_slice(&shared_key);
-            buf.extend_from_slice(&request.encode_to_vec());
-        }
-        PendingAction::Unpair {
-            channel_id,
-            request,
-            shared_key,
-            trace_id,
-        } => {
-            buf.push(TAG_UNPAIR);
-            buf.extend_from_slice(&channel_id.0.to_be_bytes());
-            buf.extend_from_slice(&trace_id.to_be_bytes());
-            buf.extend_from_slice(&shared_key);
-            buf.extend_from_slice(&request.encode_to_vec());
-        }
-        PendingAction::UpdateChannelInfo {
-            channel_id,
-            request,
-            shared_key,
-            trace_id,
-        } => {
-            buf.push(TAG_UPDATE_CHANNEL_INFO);
-            buf.extend_from_slice(&channel_id.0.to_be_bytes());
-            buf.extend_from_slice(&trace_id.to_be_bytes());
-            buf.extend_from_slice(&shared_key);
-            buf.extend_from_slice(&request.encode_to_vec());
-        }
-        PendingAction::PrePair {
-            channel_id,
-            request,
-            trace_id,
-        } => {
-            buf.push(TAG_PRE_PAIR);
-            buf.extend_from_slice(&channel_id.0.to_be_bytes());
-            buf.extend_from_slice(&trace_id.to_be_bytes());
-            buf.extend_from_slice(&request.encode_to_vec());
-        }
-        PendingAction::RespondToFailure {
-            channel_id,
-            trace_id,
-            reply,
-            request,
-        } => {
-            buf.push(TAG_RESPOND_TO_FAILURE);
-            buf.extend_from_slice(&channel_id.0.to_be_bytes());
-            buf.extend_from_slice(&trace_id.to_be_bytes());
-            buf.extend_from_slice(&reply.channel_id.0.to_be_bytes());
+        Action::PrePair(request) => (TAG_PRE_PAIR, request.encode_to_vec()),
+        Action::Request(request) => match request {
+            ChannelRequest::StoreShare(r) => (TAG_STORE_SHARE, r.encode_to_vec()),
+            ChannelRequest::VerifyShare(r) => (TAG_VERIFY_SHARE, r.encode_to_vec()),
+            ChannelRequest::Discovery(r) => (TAG_DISCOVERY, r.encode_to_vec()),
+            ChannelRequest::GetShare(r) => (TAG_GET_SHARE, r.encode_to_vec()),
+            ChannelRequest::Unpair(r) => (TAG_UNPAIR, r.encode_to_vec()),
+            ChannelRequest::UpdateChannelInfo(r) => (TAG_UPDATE_CHANNEL_INFO, r.encode_to_vec()),
+        },
+        Action::RespondToFailure { reply, request } => {
+            let mut body = reply.channel_id.0.to_be_bytes().to_vec();
             let count = u32::try_from(reply.endpoints.len())
                 .map_err(|_| "too many reply endpoints".to_owned())?;
-            buf.extend_from_slice(&count.to_be_bytes());
+            body.extend_from_slice(&count.to_be_bytes());
             for endpoint in &reply.endpoints {
                 let endpoint_bytes = endpoint.encode_to_vec();
                 let len = u32::try_from(endpoint_bytes.len())
                     .map_err(|_| "reply endpoint too large".to_owned())?;
-                buf.extend_from_slice(&len.to_be_bytes());
-                buf.extend_from_slice(&endpoint_bytes);
+                body.extend_from_slice(&len.to_be_bytes());
+                body.extend_from_slice(&endpoint_bytes);
             }
             let (request_tag, request_bytes) = match request {
                 FailedRequest::StoreShare(r) => (FAILED_STORE_SHARE, r.encode_to_vec()),
@@ -197,148 +131,125 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
                 }
                 FailedRequest::Undecodable => (FAILED_UNDECODABLE, Vec::new()),
             };
-            buf.push(request_tag);
-            buf.extend_from_slice(&request_bytes);
+            body.push(request_tag);
+            body.extend_from_slice(&request_bytes);
+            (TAG_RESPOND_TO_FAILURE, body)
         }
+    };
+
+    match (is_sealed(tag), seal) {
+        (true, None) => return Err("a sealed action carries no seal".to_owned()),
+        (false, Some(_)) => return Err("a pairing action carries a seal".to_owned()),
+        _ => {}
     }
 
+    let mut buf = Vec::with_capacity(1 + 8 + 8 + EPOCH_LEN + SEAL_LEN + body.len());
+    buf.push(tag);
+    buf.extend_from_slice(&channel_id.0.to_be_bytes());
+    buf.extend_from_slice(&trace_id.to_be_bytes());
+    if let Some(seal) = seal {
+        buf.extend_from_slice(&epoch.to_be_bytes());
+        buf.extend_from_slice(&seal);
+    }
+    buf.extend_from_slice(&body);
     Ok(buf)
 }
 
 pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
-    if bytes.is_empty() {
+    let Some((&tag, rest)) = bytes.split_first() else {
         return Err("empty action bytes".to_owned());
+    };
+    if (1..=V0_0_10_LAST_CHANNEL_TAG).contains(&tag) {
+        return Err(
+            "action issued by v0.0.10, which carried the shared key, is not accepted".to_owned(),
+        );
     }
-
-    let tag = bytes[0];
-    let rest = &bytes[1..];
-
-    if rest.len() < 8 {
-        return Err("action bytes too short for channel_id".to_owned());
+    if rest.len() < 16 {
+        return Err("action bytes too short for channel_id and trace_id".to_owned());
     }
     let channel_id = ChannelId(u64::from_be_bytes(rest[..8].try_into().unwrap()));
-    let rest = &rest[8..];
+    let trace_id = u64::from_be_bytes(rest[8..16].try_into().unwrap());
+    let (epoch, seal, body) = if is_sealed(tag) {
+        let Some(epoch) = rest.get(16..16 + EPOCH_LEN) else {
+            return Err("action bytes too short for the epoch".to_owned());
+        };
+        let Some(seal) = rest.get(16 + EPOCH_LEN..16 + EPOCH_LEN + SEAL_LEN) else {
+            return Err("action bytes too short for the seal".to_owned());
+        };
+        (
+            u32::from_be_bytes(epoch.try_into().unwrap()),
+            Some(Seal::from_bytes(seal.try_into().unwrap())),
+            &rest[16 + EPOCH_LEN + SEAL_LEN..],
+        )
+    } else {
+        (0, None, &rest[16..])
+    };
 
-    match tag {
+    let action = match tag {
         TAG_PAIRING => {
-            if rest.len() < 16 {
+            if body.len() < 8 {
                 return Err("pairing action bytes too short".to_owned());
             }
-            let trace_id = u64::from_be_bytes(rest[..8].try_into().unwrap());
-            let kind_i32 = i32::from_be_bytes(rest[8..12].try_into().unwrap());
-            let request_len = u32::from_be_bytes(rest[12..16].try_into().unwrap()) as usize;
-            let rest = &rest[16..];
-            if rest.len() < request_len {
+            let kind_i32 = i32::from_be_bytes(body[..4].try_into().unwrap());
+            let request_len = u32::from_be_bytes(body[4..8].try_into().unwrap()) as usize;
+            let body = &body[8..];
+            if body.len() < request_len {
                 return Err("pairing action bytes truncated (request)".to_owned());
             }
-            let request = PairRequestMessage::decode(&rest[..request_len])
+            let request = PairRequestMessage::decode(&body[..request_len])
                 .map_err(|e| format!("failed to decode PairRequestMessage: {e}"))?;
-
-            let kind = i32_to_sender_kind(kind_i32)?;
-
-            Ok(PendingAction::Pairing {
-                channel_id,
+            Action::Pairing {
                 request,
-                kind,
+                kind: i32_to_sender_kind(kind_i32)?,
                 peer_communication_info: HashMap::new(),
-                trace_id,
-            })
-        }
-        TAG_STORE_SHARE => {
-            let (trace_id, shared_key, request_bytes) = split_trace_id_and_shared_key(rest)?;
-            let request = StoreShareRequestMessage::decode(request_bytes)
-                .map_err(|e| format!("failed to decode StoreShareRequestMessage: {e}"))?;
-            Ok(PendingAction::StoreShare {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            })
-        }
-        TAG_VERIFY_SHARE => {
-            let (trace_id, shared_key, request_bytes) = split_trace_id_and_shared_key(rest)?;
-            let request = VerifyShareRequestMessage::decode(request_bytes)
-                .map_err(|e| format!("failed to decode VerifyShareRequestMessage: {e}"))?;
-            Ok(PendingAction::VerifyShare {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            })
-        }
-        TAG_DISCOVERY => {
-            let (trace_id, shared_key, request_bytes) = split_trace_id_and_shared_key(rest)?;
-            let request = GetSecretIdsVersionsRequestMessage::decode(request_bytes)
-                .map_err(|e| format!("failed to decode GetSecretIdsVersionsRequestMessage: {e}"))?;
-            Ok(PendingAction::Discovery {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            })
-        }
-        TAG_GET_SHARE => {
-            let (trace_id, shared_key, request_bytes) = split_trace_id_and_shared_key(rest)?;
-            let request = GetShareRequestMessage::decode(request_bytes)
-                .map_err(|e| format!("failed to decode GetShareRequestMessage: {e}"))?;
-            Ok(PendingAction::GetShare {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            })
-        }
-        TAG_UNPAIR => {
-            let (trace_id, shared_key, request_bytes) = split_trace_id_and_shared_key(rest)?;
-            let request = UnpairRequestMessage::decode(request_bytes)
-                .map_err(|e| format!("failed to decode UnpairRequestMessage: {e}"))?;
-            Ok(PendingAction::Unpair {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            })
-        }
-        TAG_UPDATE_CHANNEL_INFO => {
-            let (trace_id, shared_key, request_bytes) = split_trace_id_and_shared_key(rest)?;
-            let request = UpdateChannelInfoRequestMessage::decode(request_bytes)
-                .map_err(|e| format!("failed to decode UpdateChannelInfoRequestMessage: {e}"))?;
-            Ok(PendingAction::UpdateChannelInfo {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            })
-        }
-        TAG_PRE_PAIR => {
-            if rest.len() < 8 {
-                return Err("PrePair action bytes too short for trace_id".to_owned());
             }
-            let trace_id = u64::from_be_bytes(rest[..8].try_into().unwrap());
-            let request = PrePairRequestMessage::decode(&rest[8..])
-                .map_err(|e| format!("failed to decode PrePairRequestMessage: {e}"))?;
-            Ok(PendingAction::PrePair {
-                channel_id,
-                request,
-                trace_id,
-            })
         }
+        TAG_PRE_PAIR => Action::PrePair(
+            PrePairRequestMessage::decode(body)
+                .map_err(|e| format!("failed to decode PrePairRequestMessage: {e}"))?,
+        ),
+        TAG_STORE_SHARE => Action::Request(ChannelRequest::StoreShare(
+            StoreShareRequestMessage::decode(body)
+                .map_err(|e| format!("failed to decode StoreShareRequestMessage: {e}"))?,
+        )),
+        TAG_VERIFY_SHARE => Action::Request(ChannelRequest::VerifyShare(
+            VerifyShareRequestMessage::decode(body)
+                .map_err(|e| format!("failed to decode VerifyShareRequestMessage: {e}"))?,
+        )),
+        TAG_DISCOVERY => Action::Request(ChannelRequest::Discovery(
+            GetSecretIdsVersionsRequestMessage::decode(body)
+                .map_err(|e| format!("failed to decode GetSecretIdsVersionsRequestMessage: {e}"))?,
+        )),
+        TAG_GET_SHARE => Action::Request(ChannelRequest::GetShare(
+            GetShareRequestMessage::decode(body)
+                .map_err(|e| format!("failed to decode GetShareRequestMessage: {e}"))?,
+        )),
+        TAG_UNPAIR => Action::Request(ChannelRequest::Unpair(
+            UnpairRequestMessage::decode(body)
+                .map_err(|e| format!("failed to decode UnpairRequestMessage: {e}"))?,
+        )),
+        TAG_UPDATE_CHANNEL_INFO => Action::Request(ChannelRequest::UpdateChannelInfo(
+            UpdateChannelInfoRequestMessage::decode(body)
+                .map_err(|e| format!("failed to decode UpdateChannelInfoRequestMessage: {e}"))?,
+        )),
         TAG_RESPOND_TO_FAILURE => {
-            if rest.len() < 8 {
-                return Err("RespondToFailure action bytes too short for trace_id".to_owned());
-            }
-            let trace_id = u64::from_be_bytes(rest[..8].try_into().unwrap());
-            let (reply, rest) = split_reply_target(&rest[8..])?;
-            let request = decode_failed_request(rest)?;
-            Ok(PendingAction::RespondToFailure {
-                channel_id,
-                trace_id,
+            let (reply, body) = split_reply_target(body)?;
+            Action::RespondToFailure {
                 reply,
-                request,
-            })
+                request: decode_failed_request(body)?,
+            }
         }
-        _ => Err(format!("unknown action tag: {tag}")),
-    }
+        _ => return Err(format!("unknown action tag: {tag}")),
+    };
+    Ok(PendingAction::from_parts(
+        channel_id, trace_id, epoch, seal, action,
+    ))
+}
+
+/// Whether a token with `tag` carries a seal: every action answered under a
+/// channel key does.
+fn is_sealed(tag: u8) -> bool {
+    !matches!(tag, TAG_PAIRING | TAG_PRE_PAIR)
 }
 
 fn split_reply_target(bytes: &[u8]) -> Result<(ReplyTarget, &[u8]), String> {
@@ -409,24 +320,6 @@ fn decode_failed_request(bytes: &[u8]) -> Result<FailedRequest, String> {
     })
 }
 
-fn split_shared_key(bytes: &[u8]) -> Result<([u8; 32], &[u8]), String> {
-    if bytes.len() < 32 {
-        return Err("action bytes too short for shared_key".to_owned());
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&bytes[..32]);
-    Ok((key, &bytes[32..]))
-}
-
-fn split_trace_id_and_shared_key(bytes: &[u8]) -> Result<(u64, [u8; 32], &[u8]), String> {
-    if bytes.len() < 8 {
-        return Err("action bytes too short for trace_id".to_owned());
-    }
-    let trace_id = u64::from_be_bytes(bytes[..8].try_into().unwrap());
-    let (shared_key, rest) = split_shared_key(&bytes[8..])?;
-    Ok((trace_id, shared_key, rest))
-}
-
 fn i32_to_sender_kind(val: i32) -> Result<SenderKind, String> {
     match val {
         0 => Ok(SenderKind::Owner),
@@ -440,7 +333,7 @@ fn i32_to_sender_kind(val: i32) -> Result<SenderKind, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{FailedRequest, ReplyTarget};
+    use crate::protocol::{ChannelKey, FailedRequest, ReplyTarget};
     use derec_proto::{Protocol, TransportProtocol};
 
     fn reply() -> ReplyTarget {
@@ -504,27 +397,28 @@ mod tests {
     #[test]
     fn respond_to_failure_round_trips_every_failed_request() {
         for request in every_failed_request() {
-            let bytes = serialize(PendingAction::RespondToFailure {
-                channel_id: ChannelId(u64::MAX),
-                trace_id: 0xDEAD_BEEF,
-                reply: reply(),
-                request: request.clone(),
-            })
+            let bytes = serialize(
+                PendingAction::failure(ChannelId(u64::MAX), 0xDEAD_BEEF, reply(), request.clone())
+                    .sealed_with(&crate::protocol::ChannelKey {
+                        epoch: 0,
+                        key: crate::types::SharedKey::new([0; 32]),
+                    }),
+            )
             .unwrap_or_else(|e| panic!("{request:?} serializes: {e}"));
 
-            match deserialize(&bytes).unwrap_or_else(|e| panic!("{request:?} decodes: {e}")) {
-                PendingAction::RespondToFailure {
-                    channel_id,
-                    trace_id,
+            let decoded =
+                deserialize(&bytes).unwrap_or_else(|e| panic!("{request:?} decodes: {e}"));
+            assert_eq!(decoded.channel_id(), ChannelId(u64::MAX));
+            assert_eq!(decoded.trace_id(), 0xDEAD_BEEF);
+            match decoded.action() {
+                Action::RespondToFailure {
                     reply: decoded_reply,
                     request: decoded_request,
                 } => {
-                    assert_eq!(channel_id, ChannelId(u64::MAX));
-                    assert_eq!(trace_id, 0xDEAD_BEEF);
-                    assert_eq!(decoded_reply, reply());
-                    assert_eq!(decoded_request, request, "{request:?}");
+                    assert_eq!(*decoded_reply, reply());
+                    assert_eq!(*decoded_request, request, "{request:?}");
                 }
-                other => panic!("{request:?} decoded as {other:?}"),
+                _ => panic!("{request:?} decoded as {decoded:?}"),
             }
         }
     }
@@ -537,60 +431,131 @@ mod tests {
             channel_id: ChannelId(3),
             endpoints: Vec::new(),
         };
-        let bytes = serialize(PendingAction::RespondToFailure {
-            channel_id: ChannelId(3),
-            trace_id: 1,
-            reply: target.clone(),
-            request: FailedRequest::Undecodable,
-        })
+        let bytes = serialize(
+            PendingAction::failure(ChannelId(3), 1, target.clone(), FailedRequest::Undecodable)
+                .sealed_with(&crate::protocol::ChannelKey {
+                    epoch: 0,
+                    key: crate::types::SharedKey::new([0; 32]),
+                }),
+        )
         .expect("serializes");
-        let PendingAction::RespondToFailure { reply, .. } = deserialize(&bytes).expect("decodes")
-        else {
+        let decoded = deserialize(&bytes).expect("decodes");
+        let Action::RespondToFailure { reply, .. } = decoded.action() else {
             panic!("wrong variant");
         };
-        assert_eq!(reply, target);
+        assert_eq!(*reply, target);
     }
 
-    /// Bytes an SDK persisted before the new tag existed still decode to the
-    /// same action.
+    /// A token issued by v0.0.10, which carried the channel key, is refused
+    /// whatever request it holds.
     #[test]
-    fn an_existing_tag_decodes_unchanged() {
+    fn a_v0_0_10_token_is_refused() {
         let request = StoreShareRequestMessage {
             share: vec![0xCD; 8],
             version: 2,
             ..Default::default()
         };
-        let mut bytes = vec![TAG_STORE_SHARE];
-        bytes.extend_from_slice(&9u64.to_be_bytes());
-        bytes.extend_from_slice(&11u64.to_be_bytes());
-        bytes.extend_from_slice(&[0x5A; 32]);
-        bytes.extend_from_slice(&request.encode_to_vec());
+        for tag in 1..=V0_0_10_LAST_CHANNEL_TAG {
+            let mut bytes = vec![tag];
+            bytes.extend_from_slice(&9u64.to_be_bytes());
+            bytes.extend_from_slice(&11u64.to_be_bytes());
+            bytes.extend_from_slice(&[0x5A; 32]);
+            bytes.extend_from_slice(&request.encode_to_vec());
 
-        let PendingAction::StoreShare {
-            channel_id,
-            request: decoded,
-            shared_key,
-            trace_id,
-        } = deserialize(&bytes).expect("decodes")
-        else {
-            panic!("wrong variant");
+            assert!(deserialize(&bytes).is_err(), "tag {tag}");
+        }
+    }
+
+    /// A channel message's token is its tag, ids, seal and request: the key
+    /// it is sealed under is not in it.
+    #[test]
+    fn a_channel_message_token_carries_no_key() {
+        let key = ChannelKey {
+            epoch: 3,
+            key: crate::types::SharedKey::new([0x5A; 32]),
         };
-        assert_eq!(channel_id, ChannelId(9));
-        assert_eq!(trace_id, 11);
-        assert_eq!(shared_key, [0x5A; 32]);
-        assert_eq!(decoded, request);
+        let request = UnpairRequestMessage {
+            memo: "moving devices".to_owned(),
+            ..Default::default()
+        };
+        let bytes = serialize(
+            PendingAction::request(ChannelId(9), 11, ChannelRequest::Unpair(request.clone()))
+                .sealed_with(&key),
+        )
+        .expect("serializes");
+
+        assert_eq!(
+            bytes.len(),
+            1 + 8 + 8 + EPOCH_LEN + SEAL_LEN + request.encode_to_vec().len()
+        );
+        assert!(
+            !bytes.windows(32).any(|window| window == key.key.as_bytes()),
+            "the token holds no copy of the key"
+        );
+        let decoded = deserialize(&bytes).expect("decodes");
+        assert_eq!(decoded.channel_id(), ChannelId(9));
+        assert_eq!(decoded.trace_id(), 11);
+        assert!(matches!(
+            decoded.action(),
+            Action::Request(ChannelRequest::Unpair(decoded)) if *decoded == request
+        ));
+    }
+
+    /// A sealed token carries the epoch of the key its request arrived under,
+    /// as 4 bytes after the trace id, and comes back with it: the action is
+    /// answered, and its seal checked, under that epoch's key.
+    #[test]
+    fn sealed_tokens_round_trip_the_epoch() {
+        let key = ChannelKey {
+            epoch: 0x0102_0304,
+            key: crate::types::SharedKey::new([0x5A; 32]),
+        };
+        let request = ChannelRequest::Unpair(UnpairRequestMessage::default());
+        let failure = PendingAction::failure(ChannelId(9), 11, reply(), FailedRequest::Undecodable);
+        for action in [
+            PendingAction::request(ChannelId(9), 11, request.clone()).sealed_with(&key),
+            failure.sealed_with(&key),
+        ] {
+            let bytes = serialize(action).expect("serializes");
+            assert_eq!(&bytes[17..21], &[0x01, 0x02, 0x03, 0x04]);
+            for len in 17..17 + EPOCH_LEN + SEAL_LEN {
+                assert!(deserialize(&bytes[..len]).is_err(), "cut at {len}");
+            }
+            let decoded = deserialize(&bytes).expect("decodes");
+            assert_eq!(decoded.epoch(), 0x0102_0304);
+            assert!(decoded.seal_verifies(&key));
+        }
+    }
+
+    /// A pairing token carries no epoch: it is answered under no channel key.
+    #[test]
+    fn a_pairing_token_is_at_epoch_zero() {
+        let bytes = serialize(PendingAction::pre_pair(
+            ChannelId(9),
+            11,
+            PrePairRequestMessage::default(),
+        ))
+        .expect("serializes");
+        assert_eq!(bytes.len(), 1 + 8 + 8);
+        assert_eq!(deserialize(&bytes).expect("decodes").epoch(), 0);
     }
 
     /// Truncated or corrupted token bytes are refused with an error, never a
     /// panic.
     #[test]
     fn truncated_respond_to_failure_bytes_are_refused() {
-        let bytes = serialize(PendingAction::RespondToFailure {
-            channel_id: ChannelId(1),
-            trace_id: 2,
-            reply: reply(),
-            request: FailedRequest::Unpair(UnpairRequestMessage::default()),
-        })
+        let bytes = serialize(
+            PendingAction::failure(
+                ChannelId(1),
+                2,
+                reply(),
+                FailedRequest::Unpair(UnpairRequestMessage::default()),
+            )
+            .sealed_with(&crate::protocol::ChannelKey {
+                epoch: 0,
+                key: crate::types::SharedKey::new([0; 32]),
+            }),
+        )
         .expect("serializes");
         for len in 1..bytes.len() - 1 {
             let _ = deserialize(&bytes[..len]);

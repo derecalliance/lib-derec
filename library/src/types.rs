@@ -121,7 +121,136 @@ impl fmt::Display for ReplicaId {
 ///
 /// A `SharedKey` is established during the pairing flow and used to encrypt
 /// and authenticate all subsequent protocol messages on the associated channel.
-pub type SharedKey = [u8; 32];
+///
+/// The bytes are wiped from memory when the key is dropped. The type is not
+/// `Copy`, so a copy of the key exists only where [`Clone::clone`] makes one.
+/// `Debug` prints no key material, and `==` compares in constant time.
+///
+/// Build one from its bytes with [`SharedKey::new`], `From<[u8; 32]>` or
+/// `TryFrom<&[u8]>`, and read them with [`SharedKey::as_bytes`]: those are the only ways the bytes
+/// cross into or out of the type, which is where a store or a binding moves
+/// them.
+///
+/// With the `serde` feature, it serializes exactly as the `[u8; 32]` it wraps,
+/// so a key persisted through serde reads back unchanged.
+#[derive(Clone, zeroize::ZeroizeOnDrop)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(transparent)
+)]
+pub struct SharedKey([u8; 32]);
+
+impl SharedKey {
+    /// Wrap the key's 32 bytes.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// The key's 32 bytes.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for SharedKey {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl TryFrom<&[u8]> for SharedKey {
+    type Error = std::array::TryFromSliceError;
+
+    /// Read a key from bytes that must be exactly 32 long.
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        <[u8; 32]>::try_from(bytes).map(Self)
+    }
+}
+
+impl PartialEq for SharedKey {
+    fn eq(&self, other: &Self) -> bool {
+        subtle::ConstantTimeEq::ct_eq(&self.0[..], &other.0[..]).into()
+    }
+}
+
+impl Eq for SharedKey {}
+
+impl std::fmt::Debug for SharedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedKey(<redacted>)")
+    }
+}
+
+/// A channel key together with its epoch, the key's position in the
+/// channel's key chain.
+///
+/// A channel starts at epoch 0 under the key pairing established. When the
+/// owner rotates keys, the chain moves forward one epoch at a time:
+/// K₍ₑ₊₁₎ = `HMAC-SHA256(Kₑ, "derec channel key v1" ‖ be32(e+1))`. The chain
+/// only runs forward, so a key does not reveal the ones before it.
+///
+/// Every channel envelope carries the epoch of the key that encrypted it in
+/// `DeRecMessage.sequence`, which tells the receiver which key opens it.
+/// Encrypting under a `ChannelKey` stamps that epoch, so key and epoch cannot
+/// drift apart in the envelope. Build a key with [`ChannelKey::new`] from a
+/// key and the epoch it belongs to, and move it forward with
+/// [`ChannelKey::derive`]; a key paired with the wrong epoch produces
+/// envelopes the peer cannot open.
+///
+/// `Debug` prints no key material.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ChannelKey {
+    pub(crate) epoch: u32,
+    pub(crate) key: SharedKey,
+}
+
+impl ChannelKey {
+    /// The most epochs [`ChannelKey::derive`] moves a key in one call. It
+    /// matches how far a party following the protocol derives to open a
+    /// message, which bounds the work a forged `sequence` can cause.
+    pub const MAX_DERIVE_STEPS: u32 = crate::protocol::FORWARD_JUMP_LIMIT;
+
+    /// Pair `key` with the epoch it belongs to. A freshly paired channel's
+    /// key is at epoch 0.
+    pub const fn new(epoch: u32, key: SharedKey) -> Self {
+        Self { epoch, key }
+    }
+
+    /// The key's epoch.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// The key itself.
+    pub fn key(&self) -> &SharedKey {
+        &self.key
+    }
+
+    /// The key at `epoch`, derived forward from this one.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidInput`] if `epoch` is below this key's epoch,
+    /// since the chain does not run backward, or more than
+    /// [`ChannelKey::MAX_DERIVE_STEPS`] above it.
+    pub fn derive(&self, epoch: u32) -> crate::Result<ChannelKey> {
+        let Some(steps) = epoch.checked_sub(self.epoch) else {
+            return Err(crate::Error::InvalidInput(
+                "a channel key derives forward only",
+            ));
+        };
+        if steps > Self::MAX_DERIVE_STEPS {
+            return Err(crate::Error::InvalidInput(
+                "a channel key derives at most MAX_DERIVE_STEPS epochs at once",
+            ));
+        }
+        Ok(ChannelKey {
+            epoch,
+            key: crate::protocol::derive_key(&self.key, self.epoch, epoch),
+        })
+    }
+}
 
 #[cfg(test)]
 mod replica_id_tests {
@@ -140,5 +269,106 @@ mod replica_id_tests {
         let id = ReplicaId::try_from(1002u64).expect("1002 is a valid replica id");
         assert_eq!(u64::from(id), 1002);
         assert_eq!(id, 1002u64);
+    }
+}
+
+#[cfg(test)]
+mod shared_key_tests {
+    use super::SharedKey;
+
+    /// The key is wiped when it is dropped.
+    #[test]
+    fn a_key_is_zeroized_on_drop() {
+        fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        wiped_on_drop::<SharedKey>();
+    }
+
+    /// `Debug` prints no key byte.
+    #[test]
+    fn debug_prints_no_key_material() {
+        let rendered = format!("{:?}", SharedKey::new([0xAB; 32]));
+        assert_eq!(rendered, "SharedKey(<redacted>)");
+    }
+
+    /// Keys compare by their bytes.
+    #[test]
+    fn keys_compare_by_their_bytes() {
+        assert_eq!(SharedKey::new([1; 32]), SharedKey::from([1; 32]));
+        let mut other = [1; 32];
+        other[31] = 2;
+        assert_ne!(SharedKey::new([1; 32]), SharedKey::new(other));
+    }
+
+    /// Only exactly 32 bytes read as a key.
+    #[test]
+    fn a_key_is_read_only_from_32_bytes() {
+        assert_eq!(
+            SharedKey::try_from([7u8; 32].as_slice()).expect("32 bytes"),
+            SharedKey::new([7; 32])
+        );
+        assert!(SharedKey::try_from([7u8; 31].as_slice()).is_err());
+        assert!(SharedKey::try_from([7u8; 33].as_slice()).is_err());
+    }
+
+    /// A key serializes exactly as the `[u8; 32]` it wraps, so a key stored
+    /// through serde before the type existed reads back unchanged.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_key_serializes_as_its_bytes() {
+        let bytes: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let as_array = serde_json::to_string(&bytes).expect("serialize array");
+        let as_key = serde_json::to_string(&SharedKey::new(bytes)).expect("serialize key");
+        assert_eq!(as_key, as_array);
+        let read: SharedKey = serde_json::from_str(&as_array).expect("deserialize");
+        assert_eq!(read, SharedKey::new(bytes));
+    }
+}
+
+#[cfg(test)]
+mod channel_key_tests {
+    use super::{ChannelKey, SharedKey};
+
+    const K0: ChannelKey = ChannelKey::new(0, SharedKey::new([3u8; 32]));
+
+    /// Deriving one epoch at a time and deriving straight to the target
+    /// reach the same key: the chain has one key per epoch.
+    #[test]
+    fn derive_walks_the_chain_one_epoch_at_a_time() {
+        let mut stepped = K0.clone();
+        for epoch in 1..=5 {
+            stepped = stepped.derive(epoch).expect("one step forward");
+        }
+        let direct = K0.derive(5).expect("five steps forward");
+
+        assert_eq!(direct, stepped);
+        assert_eq!(direct.epoch(), 5);
+        assert_ne!(direct.key(), K0.key());
+    }
+
+    #[test]
+    fn derive_to_its_own_epoch_is_the_same_key() {
+        assert_eq!(K0.derive(0).expect("no steps"), K0);
+    }
+
+    #[test]
+    fn derive_refuses_an_earlier_epoch() {
+        let k3 = K0.derive(3).expect("forward");
+        assert!(matches!(k3.derive(2), Err(crate::Error::InvalidInput(_))));
+    }
+
+    #[test]
+    fn derive_is_bounded_by_max_derive_steps() {
+        assert!(K0.derive(ChannelKey::MAX_DERIVE_STEPS).is_ok());
+        assert!(matches!(
+            K0.derive(ChannelKey::MAX_DERIVE_STEPS + 1),
+            Err(crate::Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn debug_prints_no_key_material() {
+        let rendered = format!("{:?}", ChannelKey::new(4, SharedKey::new([0xAB; 32])));
+        assert!(!rendered.contains("171") && !rendered.to_lowercase().contains("ab, "));
+        assert!(rendered.contains("epoch: 4"));
     }
 }

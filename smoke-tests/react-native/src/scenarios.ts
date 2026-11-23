@@ -62,6 +62,10 @@ class SlowChannelStore implements ChannelStore {
     return false;
   }
 
+  async removeMany(): Promise<void> {
+    await delay(this.delayMs);
+  }
+
   async listHelpers(): Promise<Uint8Array | null> {
     await delay(this.delayMs);
     return null;
@@ -91,6 +95,7 @@ class EmptySecretStore implements SecretStore {
   }
   async save(): Promise<void> {}
   async remove(): Promise<void> {}
+  async removeMany(): Promise<void> {}
 }
 
 class EmptyShareStore implements ShareStore {
@@ -109,6 +114,7 @@ class EmptyShareStore implements ShareStore {
   }
   async removeChannel(): Promise<void> {}
   async removeVersions(): Promise<void> {}
+  async removeVersionsMany(): Promise<void> {}
   async keepVersion(_secretId: string, version: number): Promise<number> {
     return version - 1;
   }
@@ -131,6 +137,7 @@ class EmptyStateStore implements StateStore {
   async remove(): Promise<boolean> {
     return false;
   }
+  async removeMany(): Promise<void> {}
   async loadAll(): Promise<[]> {
     return [];
   }

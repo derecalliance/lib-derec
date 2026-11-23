@@ -45,10 +45,10 @@
 //! Secret      { helpers:[Helper], secrets:[UserSecret], replicas?:Replicas,
 //!               threshold?:int }
 //! Helper      { channel_id:str<u64>, transports:[Endpoint], shared_key:base64,
-//!               communication_info?:{str:str}, weight?:int }
+//!               communication_info?:{str:str}, weight?:int, key_epoch?:int }
 //! UserSecret  { id:base64, name:str, data:base64 }
 //! Replicas    { members:[ReplicaInfo], shared_key:base64,
-//!               channel_id:str<u64> }
+//!               channel_id:str<u64>, key_epoch?:int }
 //! ReplicaInfo { replica_id:str<u64>, transports:[Endpoint],
 //!               role:"Source"|"Destination",
 //!               communication_info?:{str:str} }
@@ -69,6 +69,13 @@
 //! the payload malformed. The field was added within v3: a decoder that
 //! predates it ignores the key, and every roster written before it decodes
 //! with no threshold.
+//!
+//! `key_epoch` is the epoch of the entry's `shared_key` on its channel: the
+//! key the round that wrote the roster used there. Restoring the roster
+//! rebuilds each channel's key at that epoch. It is omitted when `0`, and an
+//! absent key decodes as `0`, the epoch of the key pairing established. The
+//! field was added within v3: a decoder that predates it ignores the key, and
+//! every roster written before it decodes with every key at epoch `0`.
 //!
 //! ## What changed from v2
 //!

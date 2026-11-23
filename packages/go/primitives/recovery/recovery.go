@@ -51,8 +51,11 @@ var Request requestAPI
 //
 // replyTo lists the endpoints, in preference order, the peer should answer
 // on; nil or empty means answer on the endpoints recorded for the channel.
-func (requestAPI) Produce(channelID, secretID uint64, version uint32, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
-	return native.ProduceGetShareRequest(channelID, secretID, version, sharedKey, replyTo)
+//
+// epoch is the epoch of sharedKey in the channel's key chain, stamped into
+// the envelope's sequence; 0 for a freshly paired channel.
+func (requestAPI) Produce(channelID, secretID uint64, version uint32, sharedKey []byte, epoch uint32, replyTo []Endpoint) ([]byte, error) {
+	return native.ProduceGetShareRequest(channelID, secretID, version, sharedKey, epoch, replyTo)
 }
 
 // Extract decrypts a get-share request envelope and returns its channel id
@@ -76,8 +79,11 @@ var Response responseAPI
 // RequestProto returned by Request.Extract) with the helper's
 // storedShareProto (the RequestProto returned by sharing's
 // Request.Extract at storage time), encrypted under sharedKey.
-func (responseAPI) Produce(channelID uint64, requestProto, storedShareProto, sharedKey []byte) ([]byte, error) {
-	return native.ProduceGetShareResponse(channelID, requestProto, storedShareProto, sharedKey)
+//
+// epoch is the epoch of sharedKey in the channel's key chain, stamped into
+// the envelope's sequence; 0 for a freshly paired channel.
+func (responseAPI) Produce(channelID uint64, requestProto, storedShareProto, sharedKey []byte, epoch uint32) ([]byte, error) {
+	return native.ProduceGetShareResponse(channelID, requestProto, storedShareProto, sharedKey, epoch)
 }
 
 // Extract decrypts a get-share response envelope and returns its channel id

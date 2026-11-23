@@ -28,7 +28,7 @@ func TestUnpairRequestRoundTrip(t *testing.T) {
 	const memo = "no longer needed"
 	key := sharedKey()
 
-	envelope, err := unpairing.Request.Produce(channelID, memo, key, nil)
+	envelope, err := unpairing.Request.Produce(channelID, memo, key, 0, nil)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestUnpairRequestRoundTrip(t *testing.T) {
 }
 
 func TestUnpairRequestRejectsShortKey(t *testing.T) {
-	_, err := unpairing.Request.Produce(1, "reason", make([]byte, 16), nil)
+	_, err := unpairing.Request.Produce(1, "reason", make([]byte, 16), 0, nil)
 	if err == nil {
 		t.Fatal("expected an error for a 16-byte shared key")
 	}
@@ -69,7 +69,7 @@ func TestUnpairResponseRoundTrip(t *testing.T) {
 	const channelID = uint64(7)
 	key := sharedKey()
 
-	reqEnvelope, err := unpairing.Request.Produce(channelID, "no longer needed", key, nil)
+	reqEnvelope, err := unpairing.Request.Produce(channelID, "no longer needed", key, 0, nil)
 	if err != nil {
 		t.Fatalf("request produce: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestUnpairResponseRoundTrip(t *testing.T) {
 		t.Fatalf("request extract: %v", err)
 	}
 
-	respEnvelope, err := unpairing.Response.Produce(channelID, key)
+	respEnvelope, err := unpairing.Response.Produce(channelID, key, 0)
 	if err != nil {
 		t.Fatalf("response produce: %v", err)
 	}
@@ -123,7 +123,7 @@ var replyTo = []unpairing.Endpoint{
 
 func TestUnpairRequestCarriesReplyTo(t *testing.T) {
 	key := sharedKey()
-	envelope, err := unpairing.Request.Produce(7, "bye", key, replyTo)
+	envelope, err := unpairing.Request.Produce(7, "bye", key, 0, replyTo)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestUnpairRequestCarriesReplyTo(t *testing.T) {
 
 func TestUnpairRequestNilReplyToIsEmpty(t *testing.T) {
 	key := sharedKey()
-	envelope, err := unpairing.Request.Produce(7, "bye", key, nil)
+	envelope, err := unpairing.Request.Produce(7, "bye", key, 0, nil)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}

@@ -48,6 +48,7 @@ fn golden_secret() -> Secret {
             shared_key: vec![0x01, 0x02, 0x03],
             communication_info: HashMap::new(),
             weight: 1,
+            key_epoch: 0,
         }],
         secrets: vec![UserSecret {
             id: vec![0x0A],
@@ -74,6 +75,7 @@ fn golden_secret_full() -> Secret {
             shared_key: vec![0x01, 0x02, 0x03],
             communication_info: HashMap::from([("k".to_owned(), "v".to_owned())]),
             weight: 1,
+            key_epoch: 0,
         }],
         secrets: vec![UserSecret {
             id: vec![0x0A],
@@ -103,6 +105,7 @@ fn golden_secret_full() -> Secret {
                 },
             ],
             shared_key: vec![0x04, 0x05, 0x06],
+            key_epoch: 0,
         }),
         threshold: None,
     }
@@ -121,6 +124,7 @@ fn golden_secret_weighted() -> Secret {
         shared_key: vec![0x01, 0x02, 0x03],
         communication_info: HashMap::new(),
         weight,
+        key_epoch: 0,
     };
     Secret {
         helpers: vec![
@@ -158,6 +162,35 @@ fn encoder_matches_golden_json_threshold() {
 #[test]
 fn golden_threshold_round_trips() {
     let secret = golden_secret_threshold();
+    assert_eq!(Secret::decode(&secret.encode()).unwrap(), secret);
+}
+
+/// A roster written after the owner's keys moved on: every helper and the
+/// group carry the epoch of their key. `key_epoch` is written only when it is
+/// not `0`, which is what keeps the vectors above unchanged.
+fn golden_secret_key_epoch() -> Secret {
+    let mut secret = golden_secret_full();
+    secret.helpers[0].key_epoch = 16;
+    if let Some(replicas) = secret.replicas.as_mut() {
+        replicas.key_epoch = 3;
+        replicas.members.truncate(1);
+        replicas.members[0].communication_info = HashMap::new();
+    }
+    secret.helpers[0].communication_info = HashMap::new();
+    secret
+}
+
+#[test]
+fn encoder_matches_golden_json_key_epoch() {
+    assert_matches_golden(
+        &golden_secret_key_epoch(),
+        include_bytes!("golden/secret_v3_key_epoch.json"),
+    );
+}
+
+#[test]
+fn golden_key_epoch_round_trips() {
+    let secret = golden_secret_key_epoch();
     assert_eq!(Secret::decode(&secret.encode()).unwrap(), secret);
 }
 

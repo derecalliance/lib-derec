@@ -648,11 +648,6 @@ func TestOrchestrator_InvalidKeepVersionFailsTheRound(t *testing.T) {
 	}
 }
 
-// TestOrchestrator_SecretStoreLoadManyServesTheWholeBroadcast checks that a
-// broadcast to several helpers reads every SharedKey through one
-// SecretStore.LoadMany call, and that a nil entry is judged by the
-// library's missing-entry policy: discovery needs a key for every target,
-// so it fails with CodeMissingSharedKey naming the channel without one.
 // TestOrchestrator_OwnerKeepVersionReachesHelpers has the owner roll back
 // v2 by keeping v1 for the v3 round: KeepVersion is asked once per round,
 // and both helpers end up holding exactly v1 and v3.
@@ -705,6 +700,12 @@ func TestOrchestrator_OwnerKeepVersionReachesHelpers(t *testing.T) {
 	}
 }
 
+// TestOrchestrator_SecretStoreLoadManyServesTheWholeBroadcast checks that a
+// broadcast to several helpers reads its channel keys in batches, not one
+// Load per channel: one SecretStore.LoadMany for every SharedKey, then one
+// for every KeyRing. A nil entry is judged by the library's missing-entry
+// policy: discovery needs a key for every target, so it fails with
+// CodeMissingSharedKey naming the channel without one.
 func TestOrchestrator_SecretStoreLoadManyServesTheWholeBroadcast(t *testing.T) {
 	const threshold = 2
 
@@ -715,27 +716,29 @@ func TestOrchestrator_SecretStoreLoadManyServesTheWholeBroadcast(t *testing.T) {
 	channelA := pairOrchestratorPeers(t, owner, helperA, 1)
 	channelB := pairOrchestratorPeers(t, owner, helperB, 2)
 
-	owner.secretStore.loadManyCalls = nil
+	owner.secretStore.loadManyCalls, owner.secretStore.loadManyKinds = nil, nil
 	if _, err := owner.protocol.Start(FlowKindDiscovery, DiscoveryParams{Target: TargetMany(channelA, channelB)}); err != nil {
 		t.Fatalf("Start(Discovery): %v", err)
 	}
-	calls := owner.secretStore.loadManyCalls
-	if len(calls) != 1 {
-		t.Fatalf("discovery broadcast must call LoadMany once, got %d calls: %v", len(calls), calls)
+	calls, kinds := owner.secretStore.loadManyCalls, owner.secretStore.loadManyKinds
+	if want := []SecretKind{SecretKindSharedKey, SecretKindKeyRing}; !slices.Equal(kinds, want) {
+		t.Fatalf("discovery broadcast must call LoadMany once per kind %v, got kinds %v for calls %v", want, kinds, calls)
 	}
-	got := map[uint64]bool{}
-	for _, c := range calls[0] {
-		got[c] = true
-	}
-	if len(calls[0]) != 2 || !got[channelA] || !got[channelB] {
-		t.Fatalf("LoadMany must receive both helper channels [%d %d], got %v", channelA, channelB, calls[0])
+	for _, call := range calls {
+		got := map[uint64]bool{}
+		for _, c := range call {
+			got[c] = true
+		}
+		if len(call) != 2 || !got[channelA] || !got[channelB] {
+			t.Fatalf("LoadMany must receive both helper channels [%d %d], got %v", channelA, channelB, call)
+		}
 	}
 	owner.transport.drain()
 
 	if err := owner.secretStore.Remove(orchestratorSecretID, channelB, SecretKindSharedKey); err != nil {
 		t.Fatal(err)
 	}
-	owner.secretStore.loadManyCalls = nil
+	owner.secretStore.loadManyCalls, owner.secretStore.loadManyKinds = nil, nil
 	_, err := owner.protocol.Start(FlowKindDiscovery, DiscoveryParams{Target: TargetMany(channelA, channelB)})
 	var derecErr *derec.Error
 	if !errors.As(err, &derecErr) || derecErr.Code != derec.CodeMissingSharedKey {
@@ -744,8 +747,8 @@ func TestOrchestrator_SecretStoreLoadManyServesTheWholeBroadcast(t *testing.T) {
 	if !strings.Contains(derecErr.Message, strconv.FormatUint(channelB, 10)) {
 		t.Fatalf("MissingSharedKey must name channel %d: %s", channelB, derecErr.Message)
 	}
-	if len(owner.secretStore.loadManyCalls) != 1 {
-		t.Fatalf("the failing broadcast must still be one LoadMany call, got %v", owner.secretStore.loadManyCalls)
+	if kinds := owner.secretStore.loadManyKinds; !slices.Equal(kinds, []SecretKind{SecretKindSharedKey}) {
+		t.Fatalf("the failing broadcast must stop at its one SharedKey LoadMany call, got kinds %v for calls %v", kinds, owner.secretStore.loadManyCalls)
 	}
 }
 

@@ -19,10 +19,15 @@ public static partial class Verification
             public required byte[] ResponseProtoBytes { get; init; }
         }
 
+        /// <summary>
+        /// <c>epoch</c> is the epoch of <c>sharedKey</c> in the channel's key chain,
+        /// stamped into the envelope's <c>sequence</c>; 0 for a freshly paired channel.
+        /// </summary>
         public static DeRecMessage Produce(
             ulong channelId,
             byte[] requestProtoBytes,
             byte[] sharedKey,
+            uint epoch,
             byte[] shareContent
         )
         {
@@ -33,6 +38,7 @@ public static partial class Verification
                     (UIntPtr)requestProtoBytes.Length,
                     sharedKey,
                     (UIntPtr)sharedKey.Length,
+                    epoch,
                     shareContent,
                     (UIntPtr)shareContent.Length
                 );

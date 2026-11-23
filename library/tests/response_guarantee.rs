@@ -47,13 +47,13 @@ use protocol_doubles::{
 
 const SECRET_ID: u64 = 0x5EC2_E700;
 const CHANNEL: ChannelId = ChannelId(6060);
-const KEY: SharedKey = [0x11; 32];
+const KEY: SharedKey = SharedKey::new([0x11; 32]);
 const OWNER_URI: &str = "https://owner.example.com/derec";
 const TRACE: u64 = 0x7_ACE;
 const GENERIC_MEMO: &str = "request could not be processed";
 
 const GROUP: ChannelId = ChannelId(7070);
-const GROUP_KEY: SharedKey = [0x42; 32];
+const GROUP_KEY: SharedKey = SharedKey::new([0x42; 32]);
 const SOURCE_ID: u64 = 1001;
 const SELF_ID: u64 = 1002;
 const SOURCE_URI: &str = "https://source.example.com/derec";
@@ -226,7 +226,7 @@ fn wire(channel_id: ChannelId, key: &SharedKey, mut body: MessageBody) -> Vec<u8
         .timestamp(timestamp)
         .trace_id(TRACE)
         .message_body(body)
-        .encrypt(key)
+        .encrypt(&derec_library::types::ChannelKey::new(0, key.clone()))
         .expect("encrypt")
         .build()
         .expect("build")
@@ -244,8 +244,17 @@ fn valid_store_share() -> StoreShareRequestMessage {
     )
     .expect("split");
     let committed = split.shares.get(&CHANNEL).expect("share for the channel");
-    let produced =
-        request::produce(CHANNEL, 1, SECRET_ID, committed, 0, "", &KEY, &[]).expect("produce");
+    let produced = request::produce(
+        CHANNEL,
+        1,
+        SECRET_ID,
+        committed,
+        0,
+        "",
+        &derec_library::types::ChannelKey::new(0, KEY.clone()),
+        &[],
+    )
+    .expect("produce");
     request::extract(&produced.envelope, &KEY)
         .expect("extract")
         .request
@@ -266,7 +275,8 @@ fn roster(members: &[(u64, ReplicaRole, &str)]) -> Secret {
                     communication_info: HashMap::new(),
                 })
                 .collect(),
-            shared_key: GROUP_KEY.to_vec(),
+            shared_key: GROUP_KEY.as_bytes().to_vec(),
+            key_epoch: 0,
         }),
         threshold: None,
     }
@@ -1054,7 +1064,11 @@ fn exempt_messages_are_never_answered() {
             rig.seed_helper_channel(SenderKind::Owner).await;
             let mut protocol = rig.build(respond, policy, false);
             let _ = protocol
-                .process(&wire(CHANNEL, &[0x99; 32], Req::Discovery.body()))
+                .process(&wire(
+                    CHANNEL,
+                    &derec_library::types::SharedKey::new([0x99; 32]),
+                    Req::Discovery.body(),
+                ))
                 .await;
             assert!(rig.sends().is_empty(), "undecryptable, respond={respond}");
 
@@ -1073,7 +1087,7 @@ fn exempt_messages_are_never_answered() {
                 .timestamp(stale)
                 .trace_id(TRACE)
                 .message_body(body)
-                .encrypt(&KEY)
+                .encrypt(&derec_library::types::ChannelKey::new(0, KEY.clone()))
                 .expect("encrypt")
                 .build()
                 .expect("build")
@@ -1100,7 +1114,7 @@ fn exempt_messages_are_never_answered() {
                 .timestamp(now)
                 .trace_id(TRACE)
                 .message_body(body)
-                .encrypt(&KEY)
+                .encrypt(&derec_library::types::ChannelKey::new(0, KEY.clone()))
                 .expect("encrypt")
                 .build()
                 .expect("build")
@@ -1271,7 +1285,7 @@ fn a_replica_request_with_a_refused_reply_to_is_answered_on_the_member() {
 /// The ephemeral pairing channel an admission handover arrives on, and its
 /// key.
 const EPHEMERAL: ChannelId = ChannelId(7171);
-const EPHEMERAL_KEY: SharedKey = [0x33; 32];
+const EPHEMERAL_KEY: SharedKey = SharedKey::new([0x33; 32]);
 
 /// Process an admission handover that fails after it is recognised, before
 /// `hydrate` stores the group key.
@@ -1304,7 +1318,7 @@ async fn failing_handover(rig: &Rig, respond: bool) -> Vec<DeRecEvent> {
     let payload = ReplicaSecretPayload {
         secret: Some(full_roster()),
         shares: Vec::new(),
-        shared_key: GROUP_KEY.to_vec(),
+        shared_key: GROUP_KEY.as_bytes().to_vec(),
         version: 1,
         author_replica_id: None,
     };
@@ -1490,7 +1504,8 @@ fn undecodable(channel_id: ChannelId, key: &SharedKey) -> Vec<u8> {
     let mut envelope =
         DeRecMessage::decode(wire(channel_id, key, Req::Discovery.body()).as_slice())
             .expect("a DeRec envelope");
-    envelope.message = encrypt_message(b"not a message body", key, &[7u8; 32]).expect("encrypt");
+    envelope.message =
+        encrypt_message(b"not a message body", key.as_bytes(), &[7u8; 32]).expect("encrypt");
     envelope.encode_to_vec()
 }
 
@@ -1633,7 +1648,12 @@ fn an_undecryptable_body_fails_and_is_never_answered() {
             rig.seed_helper_channel(SenderKind::Owner).await;
             let mut protocol = rig.build(respond, AutoAcceptPolicy::all(), false);
 
-            let result = protocol.process(&undecodable(CHANNEL, &[0x99; 32])).await;
+            let result = protocol
+                .process(&undecodable(
+                    CHANNEL,
+                    &derec_library::types::SharedKey::new([0x99; 32]),
+                ))
+                .await;
             assert!(result.is_err(), "respond={respond}: {result:?}");
             assert!(rig.sends().is_empty(), "respond={respond}");
         });
@@ -1687,7 +1707,7 @@ fn a_received_error_response_is_reported_and_never_answered() {
                 .timestamp(now)
                 .trace_id(TRACE)
                 .message_body(stale)
-                .encrypt(&KEY)
+                .encrypt(&derec_library::types::ChannelKey::new(0, KEY.clone()))
                 .expect("encrypt")
                 .build()
                 .expect("build")

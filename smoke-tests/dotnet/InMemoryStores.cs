@@ -47,6 +47,12 @@ internal sealed class InMemoryChannelStore : IChannelStore
             ? _helpers.Remove((secretId, channelId))
             : _members.Remove((secretId, replicaId));
 
+    public void RemoveMany(ulong secretId, IReadOnlyList<(ulong ChannelId, ulong ReplicaId)> queries)
+    {
+        foreach (var (channelId, replicaId) in queries)
+            Remove(secretId, channelId, replicaId);
+    }
+
     public IEnumerable<HelperChannel> ListHelpers(ulong secretId, HelperFilter filter) =>
         _helpers
             .Where(kv => kv.Key.Item1 == secretId)
@@ -110,6 +116,12 @@ internal sealed class InMemorySecretStore : ISecretStore
 
     public void Remove(ulong secretId, ulong channelId, SecretKind kind) =>
         _data.Remove((secretId, channelId, kind));
+
+    public void RemoveMany(ulong secretId, IReadOnlyList<(ulong ChannelId, SecretKind Kind)> entries)
+    {
+        foreach (var (channelId, kind) in entries)
+            Remove(secretId, channelId, kind);
+    }
 }
 
 /// <summary>
@@ -132,14 +144,14 @@ internal sealed class InMemoryShareStore : IShareStore
             .ToArray();
     }
 
-    public IEnumerable<Share> LoadMany(ulong secretId, ulong[] channelIds, uint[] versions)
+    public IEnumerable<(ulong ChannelId, Share Share)> LoadMany(ulong secretId, ulong[] channelIds, uint[] versions)
     {
         var cset = new HashSet<ulong>(channelIds);
         var filter = versions.Length == 0 ? null : new HashSet<uint>(versions);
         return _data
             .Where(kv => kv.Key.Item1 == secretId && cset.Contains(kv.Key.Item2) &&
                           (filter is null || filter.Contains(kv.Key.Item3)))
-            .Select(kv => kv.Value)
+            .Select(kv => (kv.Key.Item2, kv.Value))
             .ToArray();
     }
 
@@ -184,6 +196,15 @@ internal sealed class InMemoryShareStore : IShareStore
     {
         RemoveVersionsCalls.Add((secretId, channelId, versions));
         foreach (var v in versions) _data.Remove((secretId, channelId, v));
+    }
+
+    public void RemoveVersionsMany(ulong secretId, IReadOnlyList<(ulong ChannelId, uint[] Versions)> entries)
+    {
+        foreach (var (channelId, versions) in entries)
+        {
+            RemoveVersionsCalls.Add((secretId, channelId, versions));
+            foreach (var v in versions) _data.Remove((secretId, channelId, v));
+        }
     }
 
     /// <summary>
@@ -255,6 +276,12 @@ internal sealed class InMemoryStateStore : IStateStore
     {
         RequestedKeys.Add(key);
         return _data.Remove((secretId, key));
+    }
+
+    public void RemoveMany(ulong secretId, IReadOnlyList<StateKey> keys)
+    {
+        foreach (var key in keys)
+            Remove(secretId, key);
     }
 
     public IEnumerable<StateItem> LoadAll(ulong secretId, StateKind kind) =>

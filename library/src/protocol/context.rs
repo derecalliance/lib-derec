@@ -12,8 +12,8 @@
 
 use crate::protocol::obligation::Obligation;
 use crate::transport::TransportPolicy;
+use crate::types::ChannelId;
 use crate::types::ReplicaId;
-use crate::types::{ChannelId, SharedKey};
 use derec_proto::ParameterRange;
 use derec_proto::TransportProtocol;
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ use std::time::Duration;
 /// Identity and configuration constant for the lifetime of a protocol
 /// instance.
 ///
-/// Every handler takes this whether or not it reads all five fields, for the
+/// Every handler takes this whether or not it reads all of its fields, for the
 /// same reason it takes every store: the shape of a signature should not
 /// encode which values a flow happens to need today.
 pub(crate) struct Local<'a> {
@@ -57,6 +57,10 @@ pub(crate) struct Local<'a> {
     /// fields are checked for overlap at pairing but enforced by the
     /// application's share store, not read from this field.
     pub(crate) parameter_range: Option<&'a ParameterRange>,
+    /// Whether this device advances channel keys: helper channels in each
+    /// sharing round that reaches the threshold, the group channel on each
+    /// publish to replicas.
+    pub(crate) key_rotation: bool,
 }
 
 impl Local<'_> {
@@ -85,7 +89,8 @@ impl Local<'_> {
 /// about every one of them.
 pub(crate) struct Exchange<'a> {
     pub(crate) channel_id: ChannelId,
-    pub(crate) shared_key: &'a SharedKey,
+    /// The key this exchange's messages are encrypted under, with its epoch.
+    pub(crate) key: &'a crate::protocol::ChannelKey,
     /// The correlation token for this exchange.
     ///
     /// One field for what handlers spelled two ways: `inbound_trace_id` when
@@ -151,6 +156,7 @@ macro_rules! local {
             policy: $crate::transport::TransportPolicy::new($protocol.unsafe_connection),
             communication_info: &$protocol.communication_info,
             parameter_range: $protocol.parameter_range.as_ref(),
+            key_rotation: $protocol.key_rotation,
         }
     };
 }

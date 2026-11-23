@@ -85,7 +85,7 @@ pub fn produce(
     to_js(&ProduceResult {
         envelope: result.envelope,
         peer_transports: result.peer_transports.into_iter().map(Into::into).collect(),
-        shared_key: result.shared_key.to_vec(),
+        shared_key: result.shared_key.as_bytes().to_vec(),
         channel_id: result.channel_id.into(),
     })
 }
@@ -123,7 +123,7 @@ pub fn process(
     .map_err(js_error_from_lib)?;
 
     to_js(&ProcessResult {
-        shared_key: result.shared_key.to_vec(),
+        shared_key: result.shared_key.as_bytes().to_vec(),
         channel_id: result.channel_id.into(),
     })
 }

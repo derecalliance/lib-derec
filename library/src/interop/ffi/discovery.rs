@@ -85,6 +85,9 @@ pub extern "C" fn produce_get_secret_ids_versions_request_message(
     channel_id: u64,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
     // See `produce_store_share_request_message` for the `reply_to`
     // semantics — `reply_to_len == 0` means "no override".
     reply_to_ptr: *const u8,
@@ -105,7 +108,11 @@ pub extern "C" fn produce_get_secret_ids_versions_request_message(
         Err(e) => return with_err(e),
     };
 
-    match request::produce(channel_id.into(), &shared_key, &reply_to) {
+    match request::produce(
+        channel_id.into(),
+        &crate::types::ChannelKey::new(epoch, shared_key),
+        &reply_to,
+    ) {
         Ok(r) => ProduceGetSecretIdsVersionsRequestMessageResult {
             error: success(),
             envelope_wire_bytes: vec_into_buffer(r.envelope),
@@ -172,6 +179,9 @@ pub extern "C" fn produce_get_secret_ids_versions_response_message(
     secret_list_len: usize,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
 ) -> ProduceGetSecretIdsVersionsResponseMessageResult {
     let with_err = |error| ProduceGetSecretIdsVersionsResponseMessageResult {
         error,
@@ -193,7 +203,11 @@ pub extern "C" fn produce_get_secret_ids_versions_response_message(
         Err(e) => return with_err(ffi_error(DEREC_CODE_FFI_BAD_PROTO, e)),
     };
 
-    match response::produce(channel_id.into(), &secret_list, &shared_key) {
+    match response::produce(
+        channel_id.into(),
+        &secret_list,
+        &crate::types::ChannelKey::new(epoch, shared_key),
+    ) {
         Ok(r) => ProduceGetSecretIdsVersionsResponseMessageResult {
             error: success(),
             envelope_wire_bytes: vec_into_buffer(r.envelope),
@@ -303,9 +317,9 @@ fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], 
     }
 }
 
-fn parse_shared_key(ptr: *const u8, len: usize) -> Result<[u8; 32], DeRecError> {
+fn parse_shared_key(ptr: *const u8, len: usize) -> Result<crate::types::SharedKey, DeRecError> {
     let bytes = parse_buffer(ptr, len, "shared_key_ptr")?;
-    bytes.try_into().map_err(|_| {
+    crate::types::SharedKey::try_from(bytes).map_err(|_| {
         ffi_error(
             DEREC_CODE_FFI_BAD_SHARED_KEY,
             "shared_key must be exactly 32 bytes",

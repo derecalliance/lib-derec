@@ -48,6 +48,15 @@ func (m *mockChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, 
 	return ok, nil
 }
 
+func (m *mockChannelStore) RemoveMany(secretID uint64, queries []ChannelQuery) error {
+	for _, q := range queries {
+		if _, err := m.Remove(secretID, q.ChannelID, q.ReplicaID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (m *mockChannelStore) ListHelpers(secretID uint64, _ HelperFilter) ([]HelperChannel, error) {
 	out := make([]HelperChannel, 0, len(m.data[secretID]))
 	for _, r := range m.data[secretID] {
@@ -105,6 +114,10 @@ func (m *mockSecretStore) Remove(secretID, channelID uint64, kind SecretKind) er
 	return nil
 }
 
+func (m *mockSecretStore) RemoveMany(secretID uint64, entries []SecretEntry) error {
+	return nil
+}
+
 var _ SecretStore = (*mockSecretStore)(nil)
 
 type mockShareStore struct{}
@@ -112,7 +125,7 @@ type mockShareStore struct{}
 func (m *mockShareStore) Load(secretID, channelID uint64, versions []uint32) ([]Share, error) {
 	return nil, nil
 }
-func (m *mockShareStore) LoadMany(secretID uint64, channelIDs []uint64, versions []uint32) ([]Share, error) {
+func (m *mockShareStore) LoadMany(secretID uint64, channelIDs []uint64, versions []uint32) ([]ShareEntry, error) {
 	return nil, nil
 }
 func (m *mockShareStore) LoadAll(secretID uint64, channelIDs []uint64) ([]Share, error) {
@@ -128,6 +141,9 @@ func (m *mockShareStore) RemoveChannel(secretID, channelID uint64) error {
 	return nil
 }
 func (m *mockShareStore) RemoveVersions(secretID, channelID uint64, versions []uint32) error {
+	return nil
+}
+func (m *mockShareStore) RemoveVersionsMany(secretID uint64, entries []ShareVersionsEntry) error {
 	return nil
 }
 func (m *mockShareStore) KeepVersion(secretID uint64, version uint32) (uint32, error) {
@@ -163,6 +179,9 @@ func (m *mockStateStore) Load(secretID uint64, key StateKey) (StateItem, bool, e
 }
 func (m *mockStateStore) Remove(secretID uint64, key StateKey) (bool, error) {
 	return false, nil
+}
+func (m *mockStateStore) RemoveMany(secretID uint64, keys []StateKey) error {
+	return nil
 }
 func (m *mockStateStore) LoadAll(secretID uint64, kind StateKind) ([]StateItem, error) {
 	return nil, nil

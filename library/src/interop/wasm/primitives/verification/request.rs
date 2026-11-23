@@ -32,6 +32,9 @@ pub fn produce(
     secret_id: u64,
     version: u32,
     shared_key: &[u8],
+    // The epoch of `shared_key` in the channel's key chain, stamped into
+    // the envelope's `sequence` so the receiver can pick the key.
+    epoch: u32,
     // Optional `TransportProtocol`. Pass null/undefined for no override.
     reply_to: JsValue,
 ) -> Result<JsValue, JsValue> {
@@ -41,7 +44,7 @@ pub fn produce(
         channel_id.into(),
         secret_id,
         version,
-        &shared_key,
+        &crate::types::ChannelKey::new(epoch, shared_key),
         &reply_to_proto,
     )
     .map_err(js_error_from_lib)?;

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use crate::extensions::derec_result::DeRecResultExt as _;
+use crate::types::SharedKey;
 use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp},
@@ -44,7 +45,7 @@ fn entry(id: u64, versions: &[(u32, &str)]) -> SecretVersionEntry {
 
 fn build_response_envelope(
     channel_id: ChannelId,
-    shared_key: &[u8; 32],
+    shared_key: &SharedKey,
     result: Option<DeRecResult>,
     secret_list: Vec<VersionList>,
 ) -> Vec<u8> {
@@ -61,7 +62,7 @@ fn build_response_envelope(
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::GetSecretIdsVersionsResponse(message))
-        .encrypt(shared_key)
+        .encrypt(&crate::types::ChannelKey::new(0, shared_key.clone()))
         .expect("failed to encrypt response")
         .build()
         .expect("failed to build response envelope")
@@ -70,7 +71,7 @@ fn build_response_envelope(
 
 fn build_response_envelope_with_mismatched_timestamp(
     channel_id: ChannelId,
-    shared_key: &[u8; 32],
+    shared_key: &SharedKey,
 ) -> Vec<u8> {
     let message_timestamp = current_timestamp();
     let mut envelope_timestamp = message_timestamp;
@@ -87,7 +88,7 @@ fn build_response_envelope_with_mismatched_timestamp(
         .channel_id(channel_id)
         .timestamp(envelope_timestamp)
         .message_body(MessageBody::GetSecretIdsVersionsResponse(message))
-        .encrypt(shared_key)
+        .encrypt(&crate::types::ChannelKey::new(0, shared_key.clone()))
         .expect("failed to encrypt response")
         .build()
         .expect("failed to build response envelope")
@@ -99,8 +100,12 @@ fn test_produce_discovery_request_returns_non_empty_envelope() {
     let channel_id = ChannelId(1);
     let shared_key = make_shared_key(1);
 
-    let ProduceRequestResult { envelope } =
-        produce_discovery_request(channel_id, &shared_key, &[]).expect("produce should succeed");
+    let ProduceRequestResult { envelope } = produce_discovery_request(
+        channel_id,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+        &[],
+    )
+    .expect("produce should succeed");
 
     assert!(!envelope.is_empty());
 }
@@ -110,8 +115,12 @@ fn test_produce_extract_discovery_request_roundtrip() {
     let channel_id = ChannelId(1);
     let shared_key = make_shared_key(1);
 
-    let ProduceRequestResult { envelope } =
-        produce_discovery_request(channel_id, &shared_key, &[]).expect("produce should succeed");
+    let ProduceRequestResult { envelope } = produce_discovery_request(
+        channel_id,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+        &[],
+    )
+    .expect("produce should succeed");
 
     let ExtractRequestResult { request } =
         extract_discovery_request(&envelope, &shared_key).expect("extract should succeed");
@@ -125,8 +134,12 @@ fn test_extract_discovery_request_wrong_key_fails() {
     let shared_key = make_shared_key(1);
     let wrong_key = make_shared_key(2);
 
-    let ProduceRequestResult { envelope } =
-        produce_discovery_request(channel_id, &shared_key, &[]).expect("produce should succeed");
+    let ProduceRequestResult { envelope } = produce_discovery_request(
+        channel_id,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+        &[],
+    )
+    .expect("produce should succeed");
 
     let result = extract_discovery_request(&envelope, &wrong_key);
 
@@ -163,7 +176,7 @@ fn test_extract_discovery_request_mismatched_timestamp_fails() {
         .channel_id(channel_id)
         .timestamp(envelope_timestamp)
         .message_body(MessageBody::GetSecretIdsVersionsRequest(message))
-        .encrypt(&shared_key)
+        .encrypt(&crate::types::ChannelKey::new(0, shared_key.clone()))
         .expect("failed to encrypt")
         .build()
         .expect("failed to build")
@@ -194,7 +207,7 @@ fn test_extract_discovery_request_wrong_message_type_fails() {
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::GetShareRequest(message))
-        .encrypt(&shared_key)
+        .encrypt(&crate::types::ChannelKey::new(0, shared_key.clone()))
         .expect("failed to encrypt")
         .build()
         .expect("failed to build")
@@ -210,9 +223,12 @@ fn test_produce_discovery_response_empty_list_succeeds() {
     let channel_id = ChannelId(1);
     let shared_key = make_shared_key(1);
 
-    let ProduceResponseResult { envelope } =
-        produce_discovery_response(channel_id, &[], &shared_key)
-            .expect("produce with empty list should succeed");
+    let ProduceResponseResult { envelope } = produce_discovery_response(
+        channel_id,
+        &[],
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("produce with empty list should succeed");
 
     assert!(!envelope.is_empty());
 }
@@ -227,9 +243,12 @@ fn test_produce_discovery_response_with_secrets_returns_non_empty_envelope() {
         entry(2, &[(1, "initial")]),
     ];
 
-    let ProduceResponseResult { envelope } =
-        produce_discovery_response(channel_id, &secret_list, &shared_key)
-            .expect("produce should succeed");
+    let ProduceResponseResult { envelope } = produce_discovery_response(
+        channel_id,
+        &secret_list,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("produce should succeed");
 
     assert!(!envelope.is_empty());
 }
@@ -241,9 +260,12 @@ fn test_produce_extract_discovery_response_roundtrip() {
 
     let secret_list = vec![entry(1, &[(1, "v1"), (2, "v2")]), entry(2, &[(3, "v3")])];
 
-    let ProduceResponseResult { envelope } =
-        produce_discovery_response(channel_id, &secret_list, &shared_key)
-            .expect("produce should succeed");
+    let ProduceResponseResult { envelope } = produce_discovery_response(
+        channel_id,
+        &secret_list,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("produce should succeed");
 
     let ExtractResponseResult { response } =
         extract_discovery_response(&envelope, &shared_key).expect("extract should succeed");
@@ -274,8 +296,12 @@ fn test_extract_discovery_response_wrong_key_fails() {
     let shared_key = make_shared_key(1);
     let wrong_key = make_shared_key(2);
 
-    let ProduceResponseResult { envelope } =
-        produce_discovery_response(channel_id, &[], &shared_key).expect("produce should succeed");
+    let ProduceResponseResult { envelope } = produce_discovery_response(
+        channel_id,
+        &[],
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("produce should succeed");
 
     let result = extract_discovery_response(&envelope, &wrong_key);
 
@@ -316,7 +342,7 @@ fn test_extract_discovery_response_wrong_message_type_fails() {
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::GetShareResponse(message))
-        .encrypt(&shared_key)
+        .encrypt(&crate::types::ChannelKey::new(0, shared_key.clone()))
         .expect("failed to encrypt")
         .build()
         .expect("failed to build")
@@ -337,9 +363,12 @@ fn test_process_discovery_response_ok_returns_secret_list() {
         entry(2, &[(3, "third")]),
     ];
 
-    let ProduceResponseResult { envelope } =
-        produce_discovery_response(channel_id, &secret_list, &shared_key)
-            .expect("produce should succeed");
+    let ProduceResponseResult { envelope } = produce_discovery_response(
+        channel_id,
+        &secret_list,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("produce should succeed");
 
     let ExtractResponseResult { response } =
         extract_discovery_response(&envelope, &shared_key).expect("extract should succeed");
@@ -364,8 +393,12 @@ fn test_process_discovery_response_empty_list_ok() {
     let channel_id = ChannelId(1);
     let shared_key = make_shared_key(1);
 
-    let ProduceResponseResult { envelope } =
-        produce_discovery_response(channel_id, &[], &shared_key).expect("produce should succeed");
+    let ProduceResponseResult { envelope } = produce_discovery_response(
+        channel_id,
+        &[],
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("produce should succeed");
 
     let ExtractResponseResult { response } =
         extract_discovery_response(&envelope, &shared_key).expect("extract should succeed");
@@ -419,8 +452,12 @@ fn test_full_discovery_roundtrip() {
     // Owner → Helper: produce discovery request
     let ProduceRequestResult {
         envelope: request_envelope,
-    } = produce_discovery_request(channel_id, &shared_key, &[])
-        .expect("produce request should succeed");
+    } = produce_discovery_request(
+        channel_id,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+        &[],
+    )
+    .expect("produce request should succeed");
 
     // Helper: extract discovery request
     let ExtractRequestResult { request } =
@@ -444,8 +481,12 @@ fn test_full_discovery_roundtrip() {
 
     let ProduceResponseResult {
         envelope: response_envelope,
-    } = produce_discovery_response(channel_id, &secret_list, &shared_key)
-        .expect("produce response should succeed");
+    } = produce_discovery_response(
+        channel_id,
+        &secret_list,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("produce response should succeed");
 
     // Owner: extract + process
     let ExtractResponseResult { response } =
@@ -490,9 +531,12 @@ fn test_version_descriptions_are_preserved_through_roundtrip() {
         ],
     }];
 
-    let ProduceResponseResult { envelope } =
-        produce_discovery_response(channel_id, &secret_list, &shared_key)
-            .expect("produce should succeed");
+    let ProduceResponseResult { envelope } = produce_discovery_response(
+        channel_id,
+        &secret_list,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
+    )
+    .expect("produce should succeed");
 
     let ExtractResponseResult { response } =
         extract_discovery_response(&envelope, &shared_key).expect("extract should succeed");
@@ -515,7 +559,7 @@ fn test_version_descriptions_are_preserved_through_roundtrip() {
 #[test]
 fn test_extract_discovery_request_rejects_scheme_mismatched_reply_to() {
     let channel_id = ChannelId(7);
-    let shared_key = [73u8; 32];
+    let shared_key = SharedKey::new([73u8; 32]);
 
     let malicious_reply_to = TransportProtocol {
         uri: "ws://attacker.example/inbox".to_owned(),
@@ -524,7 +568,7 @@ fn test_extract_discovery_request_rejects_scheme_mismatched_reply_to() {
 
     let ProduceRequestResult { envelope } = produce_discovery_request(
         channel_id,
-        &shared_key,
+        &crate::types::ChannelKey::new(0, shared_key.clone()),
         slice::from_ref(&malicious_reply_to),
     )
     .expect("failed to produce discovery request");

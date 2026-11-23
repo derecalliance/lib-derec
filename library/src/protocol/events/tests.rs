@@ -8,81 +8,66 @@ use derec_proto::{
     VerifyShareRequestMessage,
 };
 
+fn channel_request(request: ChannelRequest) -> PendingAction {
+    PendingAction::request(ChannelId(1), 0, request).sealed_with(&crate::protocol::ChannelKey {
+        epoch: 0,
+        key: crate::types::SharedKey::new([0; 32]),
+    })
+}
+
 fn store_share_action() -> PendingAction {
-    PendingAction::StoreShare {
-        channel_id: ChannelId(1),
-        request: StoreShareRequestMessage::default(),
-        shared_key: [0u8; 32],
-        trace_id: 0,
-    }
+    channel_request(ChannelRequest::StoreShare(
+        StoreShareRequestMessage::default(),
+    ))
 }
 
 fn verify_share_action() -> PendingAction {
-    PendingAction::VerifyShare {
-        channel_id: ChannelId(1),
-        request: VerifyShareRequestMessage::default(),
-        shared_key: [0u8; 32],
-        trace_id: 0,
-    }
+    channel_request(ChannelRequest::VerifyShare(
+        VerifyShareRequestMessage::default(),
+    ))
 }
 
 fn discovery_action() -> PendingAction {
-    PendingAction::Discovery {
-        channel_id: ChannelId(1),
-        request: GetSecretIdsVersionsRequestMessage::default(),
-        shared_key: [0u8; 32],
-        trace_id: 0,
-    }
+    channel_request(ChannelRequest::Discovery(
+        GetSecretIdsVersionsRequestMessage::default(),
+    ))
 }
 
 fn get_share_action() -> PendingAction {
-    PendingAction::GetShare {
-        channel_id: ChannelId(1),
-        request: GetShareRequestMessage::default(),
-        shared_key: [0u8; 32],
-        trace_id: 0,
-    }
+    channel_request(ChannelRequest::GetShare(GetShareRequestMessage::default()))
 }
 
 fn unpair_action() -> PendingAction {
-    PendingAction::Unpair {
-        channel_id: ChannelId(1),
-        request: UnpairRequestMessage::default(),
-        shared_key: [0u8; 32],
-        trace_id: 0,
-    }
+    channel_request(ChannelRequest::Unpair(UnpairRequestMessage::default()))
 }
 
 fn update_channel_info_action() -> PendingAction {
-    PendingAction::UpdateChannelInfo {
-        channel_id: ChannelId(1),
-        request: UpdateChannelInfoRequestMessage::default(),
-        shared_key: [0u8; 32],
-        trace_id: 0,
-    }
+    channel_request(ChannelRequest::UpdateChannelInfo(
+        UpdateChannelInfoRequestMessage::default(),
+    ))
 }
 
 fn pre_pair_action() -> PendingAction {
-    PendingAction::PrePair {
-        channel_id: ChannelId(1),
-        request: PrePairRequestMessage::default(),
-        trace_id: 0,
-    }
+    PendingAction::pre_pair(ChannelId(1), 0, PrePairRequestMessage::default())
 }
 
 fn respond_to_failure_action() -> PendingAction {
-    PendingAction::RespondToFailure {
-        channel_id: ChannelId(1),
-        trace_id: 5,
-        reply: ReplyTarget {
+    PendingAction::failure(
+        ChannelId(1),
+        5,
+        ReplyTarget {
             channel_id: ChannelId(1),
             endpoints: Vec::new(),
         },
-        request: FailedRequest::StoreShare(StoreShareRequestMessage {
+        FailedRequest::StoreShare(StoreShareRequestMessage {
             share: vec![0xAB; 4],
             ..Default::default()
         }),
-    }
+    )
+    .sealed_with(&crate::protocol::ChannelKey {
+        epoch: 0,
+        key: crate::types::SharedKey::new([0; 32]),
+    })
 }
 
 #[test]
@@ -312,6 +297,7 @@ mod golden {
                 shared_key: vec![0x11, 0x12, 0x13],
                 communication_info: info("name", "Helper"),
                 weight: 2,
+                key_epoch: 16,
             }],
             secrets: vec![UserSecret {
                 id: vec![0x21, 0x22],
@@ -327,6 +313,7 @@ mod golden {
                     communication_info: info("device", "Laptop"),
                 }],
                 shared_key: vec![0x41, 0x42],
+                key_epoch: 3,
             }),
             threshold: Some(3),
         }

@@ -216,7 +216,13 @@ pub(in crate::protocol) async fn reconcile<S: StoreSet>(
         if let Some(handover) = member.handover_channel {
             let _ = stores
                 .secrets
-                .remove(local.secret_id, handover, SecretKind::SharedKey)
+                .remove_many(
+                    local.secret_id,
+                    &[
+                        (handover, SecretKind::SharedKey),
+                        (handover, SecretKind::KeyRing),
+                    ],
+                )
                 .await;
         }
         stores
@@ -275,7 +281,13 @@ pub(in crate::protocol) async fn tear_down<S: StoreSet>(
         if let Some(handover) = member.handover_channel {
             let _ = stores
                 .secrets
-                .remove(secret_id, handover, SecretKind::SharedKey)
+                .remove_many(
+                    secret_id,
+                    &[
+                        (handover, SecretKind::SharedKey),
+                        (handover, SecretKind::KeyRing),
+                    ],
+                )
                 .await;
         }
         drop_channel(
@@ -308,6 +320,7 @@ async fn drop_channel<S: StoreSet>(
     let _ = stores.shares.remove_channel(secret_id, channel_id).await;
     for kind in [
         SecretKind::SharedKey,
+        SecretKind::KeyRing,
         SecretKind::PairingSecret,
         SecretKind::PairingContact,
     ] {
@@ -333,7 +346,7 @@ async fn on_request<S: StoreSet>(
     // it: this leg raises no `ActionRequired` (a roster removal is not the
     // application's to confirm), and `ReplicaRemoved`, emitted later by
     // `reconcile`, carries no memo field. The owner↔helper leg does surface
-    // it, by handing the whole request to `PendingAction::Unpair`.
+    // it, by handing the whole request to `ChannelRequest::Unpair`.
     let _ = request;
     let target = ReplicaId::try_from(target)?;
     let member = stores
@@ -415,7 +428,13 @@ async fn drop_member<S: StoreSet>(
         if !remaining.iter().any(|m| m.channel_id == channel_id) {
             let _ = stores
                 .secrets
-                .remove(secret_id, channel_id, SecretKind::SharedKey)
+                .remove_many(
+                    secret_id,
+                    &[
+                        (channel_id, SecretKind::SharedKey),
+                        (channel_id, SecretKind::KeyRing),
+                    ],
+                )
                 .await;
         }
     }
@@ -698,7 +717,11 @@ mod tests {
                 .await
                 .expect("seed helper");
             rig.secrets
-                .save(SECRET_ID, GROUP, SecretValue::SharedKey([0x33; 32]))
+                .save(
+                    SECRET_ID,
+                    GROUP,
+                    SecretValue::SharedKey(crate::types::SharedKey::new([0x33; 32])),
+                )
                 .await
                 .expect("seed key");
             rig.user_secrets
@@ -754,7 +777,11 @@ mod tests {
 
     async fn seed_group_key(secrets: &mut InMemSecretStore) {
         secrets
-            .save(SECRET_ID, GROUP, SecretValue::SharedKey([7u8; 32]))
+            .save(
+                SECRET_ID,
+                GROUP,
+                SecretValue::SharedKey(crate::types::SharedKey::new([7u8; 32])),
+            )
             .await
             .expect("seed group key");
     }
@@ -965,6 +992,125 @@ mod tests {
         });
     }
 
+    type GroupProtocol = crate::protocol::DeRecProtocol<
+        InMemChannelStore,
+        crate::protocol::tests::InMemShareStore,
+        InMemSecretStore,
+        crate::protocol::tests::InMemUserSecretStore,
+        crate::protocol::tests::InMemPersistedStateStore,
+        crate::protocol::tests::RecordingTransport,
+    >;
+
+    /// This device (1001, the source) in a group with two destinations.
+    async fn group_member(
+        snapshot: Option<UserSecrets>,
+    ) -> (GroupProtocol, crate::protocol::tests::InMemUserSecretStore) {
+        let mut channels = InMemChannelStore::default();
+        let mut secrets = InMemSecretStore::default();
+        seed_group_key(&mut secrets).await;
+        for (id, role) in [
+            (1001, ReplicaRole::Source),
+            (1002, ReplicaRole::Destination),
+            (1003, ReplicaRole::Destination),
+        ] {
+            seed_member(&mut channels, id, role, ChannelStatus::Paired).await;
+        }
+        let mut user_secrets = crate::protocol::tests::InMemUserSecretStore::default();
+        if let Some(snapshot) = snapshot {
+            user_secrets
+                .save_latest(SECRET_ID, snapshot)
+                .await
+                .expect("seed snapshot");
+        }
+        let protocol = crate::protocol::DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(channels)
+            .with_share_store(crate::protocol::tests::InMemShareStore::default())
+            .with_secret_store(secrets)
+            .with_user_secret_store(user_secrets.clone())
+            .with_transport(crate::protocol::tests::RecordingTransport::default())
+            .with_state_store(crate::protocol::tests::InMemPersistedStateStore::default())
+            .with_own_transports(["https://self.example"])
+            .with_replica_id(1001)
+            .build()
+            .expect("test protocol builds");
+        (protocol, user_secrets)
+    }
+
+    fn unpair_replica(replica_id: u64) -> crate::protocol::DeRecFlow {
+        crate::protocol::DeRecFlow::UnpairReplica {
+            replica_id,
+            memo: None,
+        }
+    }
+
+    /// The flow publishes the roster that omits the member itself, so the
+    /// removal completes without the application publishing.
+    #[test]
+    fn removing_a_member_publishes_the_next_version() {
+        run_async(async {
+            let (mut protocol, user_secrets) = group_member(Some(UserSecrets {
+                version: 1,
+                secrets: vec![crate::protocol::types::UserSecret {
+                    id: b"id".to_vec(),
+                    name: "name".to_owned(),
+                    data: b"data".to_vec(),
+                }],
+                description: None,
+                author_replica_id: Some(1001),
+                threshold: None,
+            }))
+            .await;
+
+            protocol
+                .start(unpair_replica(1003))
+                .await
+                .expect("the removal starts");
+
+            let snapshot = user_secrets
+                .load_latest(SECRET_ID)
+                .await
+                .expect("load")
+                .expect("snapshot");
+            assert_eq!(
+                snapshot.version, 2,
+                "the removal published the next version"
+            );
+            assert_eq!(
+                snapshot.secrets.len(),
+                1,
+                "the secrets are republished unchanged"
+            );
+            assert_eq!(
+                protocol.transport.sent_envelopes().len(),
+                3,
+                "both members are told of the removal, then only the remaining one receives the new version"
+            );
+        });
+    }
+
+    /// With nothing published yet the roster still has to travel, so the
+    /// removal publishes an empty payload rather than leaving the member
+    /// flagged.
+    #[test]
+    fn removing_a_member_without_a_snapshot_publishes_the_roster() {
+        run_async(async {
+            let (mut protocol, user_secrets) = group_member(None).await;
+
+            protocol
+                .start(unpair_replica(1003))
+                .await
+                .expect("the removal starts");
+
+            let snapshot = user_secrets
+                .load_latest(SECRET_ID)
+                .await
+                .expect("load")
+                .expect("the roster round saves a snapshot");
+            assert_eq!(snapshot.version, 1);
+            assert!(snapshot.secrets.is_empty());
+        });
+    }
+
     /// A member that has just joined still talks on its pairing channel,
     /// under that channel's key, until it is handed the group channel. Each
     /// notice is sealed under the key of the channel it travels on, whichever
@@ -972,8 +1118,8 @@ mod tests {
     #[test]
     fn each_notice_is_sealed_under_its_own_channel_key() {
         const PAIRING: ChannelId = ChannelId(5002);
-        const GROUP_KEY: SharedKey = [7u8; 32];
-        const PAIRING_KEY: SharedKey = [0x22; 32];
+        const GROUP_KEY: SharedKey = SharedKey::new([7u8; 32]);
+        const PAIRING_KEY: SharedKey = SharedKey::new([0x22; 32]);
 
         for leaving in [1002, 1003] {
             run_async(async {
@@ -1057,7 +1203,11 @@ mod tests {
             let mut rig = StoreRig::with_transport(NoopTransport);
             seed_group_key(&mut rig.secrets).await;
             rig.secrets
-                .save(SECRET_ID, PAIRING, SecretValue::SharedKey([0x22; 32]))
+                .save(
+                    SECRET_ID,
+                    PAIRING,
+                    SecretValue::SharedKey(crate::types::SharedKey::new([0x22; 32])),
+                )
                 .await
                 .expect("seed pairing key");
             for id in [1001, 1002] {

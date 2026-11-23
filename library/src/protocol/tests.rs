@@ -46,6 +46,8 @@ pub(crate) struct InMemChannelStore {
     /// Undirected edges, stored both ways so a walk can start at either end.
     #[allow(clippy::type_complexity)]
     pub(crate) links: Arc<Mutex<HashMap<(u64, u64), Vec<u64>>>>,
+    /// When set, `remove_many` fails and removes nothing.
+    pub(crate) fail_remove_many: Arc<Mutex<bool>>,
 }
 
 impl DeRecChannelStore for InMemChannelStore {
@@ -103,6 +105,26 @@ impl DeRecChannelStore for InMemChannelStore {
                 .is_some(),
         };
         Box::pin(future::ready(Ok(removed)))
+    }
+    fn remove_many(&mut self, sid: u64, queries: &[ChannelQuery]) -> ChannelStoreFuture<'_, ()> {
+        if *self.fail_remove_many.lock().unwrap() {
+            return Box::pin(std::future::ready(Err(
+                crate::protocol::ChannelStoreError::Backend("channel store unavailable".into()),
+            )));
+        }
+        let mut helpers = self.helper_rows.lock().unwrap();
+        let mut members = self.member_rows.lock().unwrap();
+        for query in queries {
+            match *query {
+                ChannelQuery::Helper { channel_id } => {
+                    helpers.remove(&(sid, channel_id.0));
+                }
+                ChannelQuery::Replica { replica_id, .. } => {
+                    members.remove(&(sid, replica_id.0));
+                }
+            }
+        }
+        Box::pin(std::future::ready(Ok(())))
     }
 
     fn helpers(
@@ -222,6 +244,7 @@ impl DeRecSecretStore for InMemSecretStore {
             SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
             SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
             SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
+            SecretValue::KeyRing(_) => SecretKind::KeyRing as u8,
         };
         self.data.lock().unwrap().insert((sid, cid.0, k), value);
         Box::pin(future::ready(Ok(())))
@@ -229,6 +252,17 @@ impl DeRecSecretStore for InMemSecretStore {
     fn remove(&mut self, sid: u64, cid: ChannelId, kind: SecretKind) -> SecretStoreFuture<'_, ()> {
         self.data.lock().unwrap().remove(&(sid, cid.0, kind as u8));
         Box::pin(future::ready(Ok(())))
+    }
+    fn remove_many(
+        &mut self,
+        sid: u64,
+        entries: &[(ChannelId, SecretKind)],
+    ) -> SecretStoreFuture<'_, ()> {
+        let mut data = self.data.lock().unwrap();
+        for &(cid, kind) in entries {
+            data.remove(&(sid, cid.0, kind as u8));
+        }
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 
@@ -245,10 +279,38 @@ pub(crate) struct InMemShareStore {
     /// When set, every [`DeRecShareStore::keep_version`] fails with a backend
     /// error.
     pub(crate) keep_version_error: Arc<Mutex<bool>>,
+    /// How many times the single-channel [`DeRecShareStore::load`] and the
+    /// bulk [`DeRecShareStore::load_many`] were called.
+    pub(crate) load_calls: Arc<Mutex<usize>>,
+    pub(crate) load_many_calls: Arc<Mutex<usize>>,
+    /// How many times [`DeRecShareStore::remove_versions_many`] was called.
+    pub(crate) remove_versions_many_calls: Arc<Mutex<usize>>,
+    /// When set, every [`DeRecShareStore::load_many`] fails with a backend
+    /// error.
+    pub(crate) fail_load_many: Arc<Mutex<bool>>,
+}
+
+impl InMemShareStore {
+    /// The shares under `sid` on `cids` at `versions` (every version when
+    /// empty), with their channels, ordered by version then channel.
+    fn select(&self, sid: u64, cids: &[ChannelId], versions: &[u32]) -> Vec<(ChannelId, Share)> {
+        let wanted: Vec<u64> = cids.iter().map(|c| c.0).collect();
+        let lock = self.data.lock().unwrap();
+        let mut out: Vec<(ChannelId, Share)> = lock
+            .iter()
+            .filter(|((s, c, v), _)| {
+                *s == sid && wanted.contains(c) && (versions.is_empty() || versions.contains(v))
+            })
+            .map(|((_, c, _), share)| (ChannelId(*c), share.clone()))
+            .collect();
+        out.sort_by_key(|(c, share)| (share.version, c.0));
+        out
+    }
 }
 
 impl DeRecShareStore for InMemShareStore {
     fn load(&self, sid: u64, cid: ChannelId, versions: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
+        *self.load_calls.lock().unwrap() += 1;
         let lock = self.data.lock().unwrap();
         let out: Vec<Share> = lock
             .iter()
@@ -269,24 +331,21 @@ impl DeRecShareStore for InMemShareStore {
         sid: u64,
         cids: &[ChannelId],
         versions: &[u32],
-    ) -> ShareStoreFuture<'_, Vec<Share>> {
-        let wanted: Vec<u64> = cids.iter().map(|c| c.0).collect();
-        let lock = self.data.lock().unwrap();
-        let mut out: Vec<(u64, Share)> = lock
-            .iter()
-            .filter(|((s, c, v), _)| {
-                *s == sid && wanted.contains(c) && (versions.is_empty() || versions.contains(v))
-            })
-            .map(|((_, c, _), share)| (*c, share.clone()))
-            .collect();
-        out.sort_by_key(|(c, share)| (share.version, *c));
-        Box::pin(future::ready(Ok(out
+    ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
+        *self.load_many_calls.lock().unwrap() += 1;
+        if *self.fail_load_many.lock().unwrap() {
+            return Box::pin(std::future::ready(Err(
+                crate::protocol::ShareStoreError::Backend("share store backend unavailable".into()),
+            )));
+        }
+        Box::pin(std::future::ready(Ok(self.select(sid, cids, versions))))
+    }
+    fn load_all(&self, sid: u64, cids: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
+        Box::pin(std::future::ready(Ok(self
+            .select(sid, cids, &[])
             .into_iter()
             .map(|(_, share)| share)
             .collect())))
-    }
-    fn load_all(&self, sid: u64, cids: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
-        self.load_many(sid, cids, &[])
     }
     fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
         Box::pin(future::ready(Ok(None)))
@@ -310,6 +369,20 @@ impl DeRecShareStore for InMemShareStore {
             .unwrap()
             .retain(|(s, c, v), _| !(*s == sid && *c == cid.0 && versions.contains(v)));
         Box::pin(future::ready(Ok(())))
+    }
+    fn remove_versions_many(
+        &mut self,
+        sid: u64,
+        entries: &[(ChannelId, Vec<u32>)],
+    ) -> ShareStoreFuture<'_, ()> {
+        *self.remove_versions_many_calls.lock().unwrap() += 1;
+        self.data.lock().unwrap().retain(|(s, c, v), _| {
+            !(*s == sid
+                && entries
+                    .iter()
+                    .any(|(cid, versions)| *c == cid.0 && versions.contains(v)))
+        });
+        Box::pin(std::future::ready(Ok(())))
     }
     fn keep_version(&self, sid: u64, version: u32) -> ShareStoreFuture<'_, u32> {
         self.keep_version_calls.lock().unwrap().push((sid, version));
@@ -381,7 +454,7 @@ impl DeRecShareStore for RefusingShareStore {
         secret_id: u64,
         channel_ids: &[ChannelId],
         versions: &[u32],
-    ) -> ShareStoreFuture<'_, Vec<Share>> {
+    ) -> ShareStoreFuture<'_, Vec<(ChannelId, Share)>> {
         self.inner.load_many(secret_id, channel_ids, versions)
     }
     fn load_all(
@@ -424,6 +497,13 @@ impl DeRecShareStore for RefusingShareStore {
         versions: &[u32],
     ) -> ShareStoreFuture<'_, ()> {
         self.inner.remove_versions(secret_id, channel_id, versions)
+    }
+    fn remove_versions_many(
+        &mut self,
+        secret_id: u64,
+        entries: &[(ChannelId, Vec<u32>)],
+    ) -> ShareStoreFuture<'_, ()> {
+        self.inner.remove_versions_many(secret_id, entries)
     }
     fn keep_version(&self, secret_id: u64, version: u32) -> ShareStoreFuture<'_, u32> {
         self.inner.keep_version(secret_id, version)
@@ -483,6 +563,9 @@ impl DeRecStateStore for InMemStateStore {
     fn remove(&mut self, _: u64, _: StateKey) -> StateStoreFuture<'_, bool> {
         Box::pin(future::ready(Ok(false)))
     }
+    fn remove_many(&mut self, _: u64, _: &[StateKey]) -> StateStoreFuture<'_, ()> {
+        Box::pin(std::future::ready(Ok(())))
+    }
     fn load_all(&self, _: u64, _: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
         Box::pin(future::ready(Ok(Vec::new())))
     }
@@ -496,9 +579,28 @@ impl DeRecStateStore for InMemStateStore {
 pub(crate) struct InMemPersistedStateStore {
     #[allow(clippy::type_complexity)]
     pub(crate) data: Arc<Mutex<HashMap<(u64, StateKey), StateItem>>>,
+    /// How many times `load_all` was asked for each kind.
+    pub(crate) load_all_calls: Arc<Mutex<HashMap<StateKind, usize>>>,
+    /// When set, every `save`, `remove` and `remove_many` fails with a
+    /// backend error and changes nothing.
+    pub(crate) fail_writes: Arc<Mutex<bool>>,
+    /// How many times `remove_many` was called.
+    pub(crate) remove_many_calls: Arc<Mutex<usize>>,
+}
+impl InMemPersistedStateStore {
+    fn refused<T: Send + 'static>(&self) -> Option<StateStoreFuture<'_, T>> {
+        (*self.fail_writes.lock().unwrap()).then(|| -> StateStoreFuture<'_, T> {
+            Box::pin(std::future::ready(Err(
+                crate::protocol::StateStoreError::Backend("state store backend unavailable".into()),
+            )))
+        })
+    }
 }
 impl DeRecStateStore for InMemPersistedStateStore {
     fn save(&mut self, sid: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
+        if let Some(refused) = self.refused() {
+            return refused;
+        }
         self.data.lock().unwrap().insert((sid, item.key()), item);
         Box::pin(future::ready(Ok(())))
     }
@@ -507,10 +609,25 @@ impl DeRecStateStore for InMemPersistedStateStore {
         Box::pin(future::ready(Ok(v)))
     }
     fn remove(&mut self, sid: u64, key: StateKey) -> StateStoreFuture<'_, bool> {
+        if let Some(refused) = self.refused() {
+            return refused;
+        }
         let removed = self.data.lock().unwrap().remove(&(sid, key)).is_some();
         Box::pin(future::ready(Ok(removed)))
     }
+    fn remove_many(&mut self, sid: u64, keys: &[StateKey]) -> StateStoreFuture<'_, ()> {
+        *self.remove_many_calls.lock().unwrap() += 1;
+        if let Some(refused) = self.refused() {
+            return refused;
+        }
+        let mut data = self.data.lock().unwrap();
+        for key in keys {
+            data.remove(&(sid, key.clone()));
+        }
+        Box::pin(std::future::ready(Ok(())))
+    }
     fn load_all(&self, sid: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
+        *self.load_all_calls.lock().unwrap().entry(kind).or_default() += 1;
         let v: Vec<StateItem> = self
             .data
             .lock()
@@ -792,6 +909,7 @@ impl LocalFixture {
             policy: self.policy,
             communication_info: &self.communication_info,
             parameter_range: self.parameter_range.as_ref(),
+            key_rotation: false,
         }
     }
 }

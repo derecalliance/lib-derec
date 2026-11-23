@@ -223,6 +223,7 @@ fn unpair_ack_out_of_range(value: Option<&Value>) -> Option<DeRecError> {
 ///   "own_transports": [{ "uri": "https://example.com/derec", "protocol": "https" }],
 ///   "threshold": 3,
 ///   "auto_respond_on_failure": false,
+///   "key_rotation": false,
 ///   "unpair_ack": 0,
 ///   "auto_reply_to": false,
 ///   "auto_accept": {
@@ -276,6 +277,9 @@ fn unpair_ack_out_of_range(value: Option<&Value>) -> Option<DeRecError> {
 ///   NotRequired; omitted means Required.
 ///   Any other value is rejected with `DEREC_CODE_FFI_INVALID_ENUM`.
 /// - `auto_respond_on_failure` / `auto_reply_to`: omitted means `false`.
+/// - `key_rotation`: whether each helper channel advances one key epoch in
+///   every sharing round that reaches the threshold, and the replica group
+///   channel on every publish to replicas; omitted means `false`.
 /// - `timeouts`: the four waiting periods, in whole seconds. Each field is
 ///   optional and omitted means the [`crate::protocol::types::Timeouts`]
 ///   default. `expired_channels` is the automatic removal of `Pending`
@@ -777,6 +781,7 @@ mod tests {
                 "own_transports": [{ "uri": "https://example.com/derec", "protocol": "https" }],
                 "threshold": 3,
                 "auto_respond_on_failure": false,
+                "key_rotation": true,
                 "unpair_ack": 0,
                 "auto_reply_to": false,
                 "auto_accept": {
@@ -809,6 +814,7 @@ mod tests {
         assert_eq!(protocol.secret_id(), 12_345_678_901_234_567_890);
         assert_eq!(protocol.replica_id, None);
         assert_eq!(protocol.max_subshares, None);
+        assert!(protocol.key_rotation);
         assert_eq!(
             protocol.own_transports[0].uri,
             "https://example.com/derec".to_owned()

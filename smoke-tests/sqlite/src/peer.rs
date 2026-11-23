@@ -80,7 +80,15 @@ impl Peer {
         uri: &str,
         policy: AutoAcceptPolicy,
     ) -> Self {
-        Self::with_full_options(connection, label, uri, PeerOptions::default(), policy, None)
+        Self::with_full_options(
+            connection,
+            label,
+            uri,
+            PeerOptions::default(),
+            policy,
+            None,
+            false,
+        )
     }
 
     /// Construct a peer whose `Pending` channels are swept only by the
@@ -102,6 +110,7 @@ impl Peer {
                 expired_channels: policy,
                 ..Default::default()
             }),
+            false,
         )
     }
 
@@ -118,6 +127,21 @@ impl Peer {
             options,
             AutoAcceptPolicy::default(),
             None,
+            false,
+        )
+    }
+
+    /// Construct a peer that advances each helper channel one key epoch per
+    /// sharing round that reaches the threshold.
+    pub fn rotating(connection: SharedConnection, label: &'static str, uri: &str) -> Self {
+        Self::with_full_options(
+            connection,
+            label,
+            uri,
+            PeerOptions::default(),
+            derec_library::protocol::AutoAcceptPolicy::default(),
+            None,
+            true,
         )
     }
 
@@ -128,6 +152,7 @@ impl Peer {
         options: PeerOptions,
         auto_accept: AutoAcceptPolicy,
         timeouts: Option<Timeouts>,
+        key_rotation: bool,
     ) -> Self {
         let transport = InProcessTransport::new();
         let channel_store = SqliteChannelStore::new(connection.clone());
@@ -145,7 +170,8 @@ impl Peer {
             .with_state_store(state_store)
             .with_own_transports([uri])
             .with_threshold(options.threshold)
-            .with_auto_accept(auto_accept);
+            .with_auto_accept(auto_accept)
+            .with_key_rotation(key_rotation);
         if let Some(rid) = options.replica_id {
             builder = builder.with_replica_id(rid);
         }

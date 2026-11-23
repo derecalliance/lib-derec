@@ -17,6 +17,7 @@ type stateStore interface {
 	Save(secretID uint64, item StateItem) error
 	Load(secretID uint64, key StateKey) (StateItem, bool, error)
 	Remove(secretID uint64, key StateKey) (bool, error)
+	RemoveMany(secretID uint64, keys []StateKey) error
 	LoadAll(secretID uint64, kind StateKind) ([]StateItem, error)
 }
 
@@ -27,6 +28,7 @@ type StateStoreCallbacks struct {
 	Save       uintptr
 	Load       uintptr
 	Remove     uintptr
+	RemoveMany uintptr
 	LoadAll    uintptr
 	FreeBuffer uintptr
 }
@@ -95,6 +97,38 @@ func dispatchStateRemove(s *storeSet, secretID uint64, keyJSON []byte) (status i
 	return ffiStatusOK, removed
 }
 
+func dispatchStateRemoveMany(s *storeSet, secretID uint64, keysJSON []byte) (status int32) {
+	defer recoverInto(&status)
+	keys, err := decodeStateKeyList(keysJSON)
+	if err != nil {
+		return ffiStatusFailure
+	}
+	if err := s.state.RemoveMany(secretID, keys); err != nil {
+		return ffiStatusFailure
+	}
+	return ffiStatusOK
+}
+
+// decodeStateKeyList parses the core's JSON array of the key records
+// StateStoreCallbacks.remove receives one at a time.
+func decodeStateKeyList(data []byte) ([]StateKey, error) {
+	var raw []json.RawMessage
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, err
+		}
+	}
+	keys := make([]StateKey, 0, len(raw))
+	for _, r := range raw {
+		key, err := DecodeStateKey(r)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
+}
+
 func dispatchStateLoadAll(s *storeSet, secretID uint64, kind uint32) (status int32, out []byte) {
 	defer recoverInto(&status)
 	items, err := s.state.LoadAll(secretID, StateKind(kind))
@@ -146,6 +180,15 @@ func stateRemoveCallback(userData uintptr, secretID uint64, keyPtr *byte, keyLen
 	return st
 }
 
+func stateRemoveManyCallback(userData uintptr, secretID uint64, keysPtr *byte, keysLen uintptr) (status int32) {
+	defer recoverInto(&status)
+	s, ok := lookupStores(storeHandle(userData))
+	if !ok {
+		return ffiStatusFailure
+	}
+	return dispatchStateRemoveMany(s, secretID, readFilterBytes(keysPtr, keysLen))
+}
+
 func stateLoadAllCallback(userData uintptr, secretID uint64, kind uint32, outPtr, outLen *uintptr) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
@@ -162,14 +205,14 @@ func stateLoadAllCallback(userData uintptr, secretID uint64, kind uint32, outPtr
 
 // stateCallbackPtrs holds the purego.NewCallback address for every
 // StateStoreCallbacks fn-pointer field except FreeBuffer (shared package-
-// wide via sharedFreeBufferCallback). These four functions are stateless
+// wide via sharedFreeBufferCallback). These five functions are stateless
 // package-level funcs, so each needs exactly one registration total — see
 // registerChannelCallbacks in callbacks_channel.go for why per-call
 // registration would exhaust purego's 2000-slot callback table.
 var (
 	stateCallbacksOnce sync.Once
 	stateCallbackPtrs  struct {
-		save, load, remove, loadAll uintptr
+		save, load, remove, removeMany, loadAll uintptr
 	}
 )
 
@@ -178,6 +221,7 @@ func registerStateCallbacks() {
 		stateCallbackPtrs.save = purego.NewCallback(stateSaveCallback)
 		stateCallbackPtrs.load = purego.NewCallback(stateLoadCallback)
 		stateCallbackPtrs.remove = purego.NewCallback(stateRemoveCallback)
+		stateCallbackPtrs.removeMany = purego.NewCallback(stateRemoveManyCallback)
 		stateCallbackPtrs.loadAll = purego.NewCallback(stateLoadAllCallback)
 	})
 }
@@ -192,6 +236,7 @@ func buildStateStoreCallbacks(h storeHandle) StateStoreCallbacks {
 		Save:       stateCallbackPtrs.save,
 		Load:       stateCallbackPtrs.load,
 		Remove:     stateCallbackPtrs.remove,
+		RemoveMany: stateCallbackPtrs.removeMany,
 		LoadAll:    stateCallbackPtrs.loadAll,
 		FreeBuffer: sharedFreeBufferCallback(),
 	}

@@ -2,8 +2,8 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
-    DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport, IgnoreReason,
-    MissingPolicy, PendingAction, SecretKind, SecretValue, ShareStoreError, StateItem, StateKey,
+    ChannelKey, ChannelRequest, DeRecEvent, DeRecShareStore, DeRecStateStore, DeRecTransport,
+    IgnoreReason, KeyRing, MissingPolicy, PendingAction, ShareStoreError, StateItem, StateKey,
     VerifyFailureReason,
 };
 use super::NO_SHARE_FOR_VERSION;
@@ -11,6 +11,7 @@ use crate::derec_message::apply_trace_id;
 use crate::extensions::advertised_endpoints::reply_to_owned;
 use crate::extensions::channel_store::{ChannelStoreExt as _, send_channel_message};
 use crate::extensions::derec_result::DeRecResultExt as _;
+use crate::extensions::secret_store::SecretStoreExt as _;
 use crate::extensions::verify_share_response::VerifyShareResponseExt as _;
 use crate::protocol::context::{Exchange, Local, Round};
 use crate::protocol::obligation::{deliver, refused, reported};
@@ -24,7 +25,7 @@ use crate::{
         response::{self as verification_response},
     },
     protocol::types::Target,
-    types::{ChannelId, SharedKey},
+    types::ChannelId,
 };
 use derec_proto::{
     DeRecResult, MessageBody, StatusEnum, StoreShareRequestMessage, TransportProtocol,
@@ -130,12 +131,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
 
     let keys = stores
         .secrets
-        .load_many(
-            secret_id,
-            &channel_ids,
-            SecretKind::SharedKey,
-            MissingPolicy::Fail,
-        )
+        .key_rings_many(secret_id, &channel_ids, MissingPolicy::Fail)
         .await?;
 
     let roster = stores
@@ -267,8 +263,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
         Err(other) => return Err(other.into()),
     }
 
-    let resp =
-        verification_response::produce(channel_id, request, exchange.shared_key, &stored.share)?;
+    let resp = verification_response::produce(channel_id, request, exchange.key, &stored.share)?;
 
     let envelope = apply_trace_id(&resp.envelope, exchange.trace_id)?;
     let endpoint = stores
@@ -327,7 +322,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         secret_id,
         channel_id,
         failure_response(request, status, memo),
-        exchange.shared_key,
+        exchange.key,
         exchange.trace_id,
         local.policy,
         &reply_to_owned(request),
@@ -375,12 +370,12 @@ fn on_request(
 ) -> Result<Vec<DeRecEvent>> {
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id: exchange.channel_id,
-        action: PendingAction::VerifyShare {
-            channel_id: exchange.channel_id,
-            request,
-            shared_key: *exchange.shared_key,
-            trace_id: exchange.trace_id,
-        },
+        action: PendingAction::request(
+            exchange.channel_id,
+            exchange.trace_id,
+            ChannelRequest::VerifyShare(request),
+        )
+        .sealed_with(exchange.key),
     }])
 }
 
@@ -504,18 +499,18 @@ async fn dispatch_all<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     secret_id: u64,
     version: u32,
-    keys: Vec<(ChannelId, SecretValue)>,
+    keys: Vec<(ChannelId, Option<KeyRing>)>,
     reply_to: &[TransportProtocol],
     round: &Round<'_>,
 ) -> Vec<DeRecEvent> {
     let mut events = Vec::with_capacity(keys.len());
-    for (channel_id, value) in keys {
-        let SecretValue::SharedKey(shared_key) = value else {
+    for (channel_id, ring) in keys {
+        let Some(ring) = ring else {
             events.push(DeRecEvent::VerifySharesFailed {
                 channel_id,
                 version,
                 reason: VerifyFailureReason::NoSharedKey,
-                error: "channel has no shared key".to_owned(),
+                error: super::NO_USABLE_KEY.to_owned(),
             });
             continue;
         };
@@ -547,7 +542,7 @@ async fn dispatch_all<S: StoreSet>(
             secret_id,
             version,
             channel_id,
-            &shared_key,
+            &ring.current(),
             reply_to,
             round,
         )
@@ -606,7 +601,7 @@ async fn dispatch_one<S: StoreSet>(
     secret_id: u64,
     version: u32,
     channel_id: ChannelId,
-    shared_key: &SharedKey,
+    key: &ChannelKey,
     reply_to: &[TransportProtocol],
     round: &Round<'_>,
 ) -> Result<()> {
@@ -614,8 +609,7 @@ async fn dispatch_one<S: StoreSet>(
         .channels
         .peer_endpoints(secret_id, channel_id)
         .await?;
-    let msg =
-        produce_verify_share_request_message(channel_id, secret_id, version, shared_key, reply_to)?;
+    let msg = produce_verify_share_request_message(channel_id, secret_id, version, key, reply_to)?;
 
     let reply_to_transports = reply_to.to_vec();
 
@@ -646,6 +640,8 @@ mod tests {
     use super::*;
     use crate::protocol::tests::{LocalFixture, StoreRig, run_async};
     use crate::protocol::types::Share;
+    use crate::protocol::{DeRecSecretStore, SecretValue};
+    use crate::types::SharedKey;
 
     const SECRET_ID: u64 = 0x5E1F;
     const CHANNEL: ChannelId = ChannelId(21);
@@ -706,7 +702,10 @@ mod tests {
                 &local.local(),
                 &Exchange {
                     channel_id: CHANNEL,
-                    shared_key: &[0u8; 32],
+                    key: &crate::protocol::ChannelKey {
+                        epoch: 0,
+                        key: (crate::types::SharedKey::new([0u8; 32])).clone(),
+                    },
                     trace_id: 0,
                     obligation: None,
                 },
@@ -768,7 +767,7 @@ mod tests {
         >;
 
         const HELPER_PARTITION: u64 = 0x4E1;
-        const KEY: SharedKey = [0xC3; 32];
+        const KEY: SharedKey = SharedKey::new([0xC3; 32]);
 
         async fn helper(auto_accept: AutoAcceptPolicy) -> (TestProto, RecordingTransport) {
             let mut rig = StoreRig::new();
@@ -858,7 +857,10 @@ mod tests {
                 &local.local(),
                 &Exchange {
                     channel_id: CHANNEL,
-                    shared_key: &KEY,
+                    key: &crate::protocol::ChannelKey {
+                        epoch: 0,
+                        key: (KEY).clone(),
+                    },
                     trace_id: 0,
                     obligation: None,
                 },
@@ -882,9 +884,14 @@ mod tests {
         }
 
         fn challenge() -> (Vec<u8>, u64) {
-            let produced =
-                produce_verify_share_request_message(CHANNEL, SECRET_ID, VERSION, &KEY, &[])
-                    .expect("challenge produced");
+            let produced = produce_verify_share_request_message(
+                CHANNEL,
+                SECRET_ID,
+                VERSION,
+                &crate::types::ChannelKey::new(0, KEY.clone()),
+                &[],
+            )
+            .expect("challenge produced");
             (produced.envelope, produced.nonce)
         }
 
@@ -976,7 +983,7 @@ mod tests {
 
         const REC_SECRET_ID: u64 = 0xBEE5;
         const REC_CHANNEL: ChannelId = ChannelId(41);
-        const REC_KEY: SharedKey = [7u8; 32];
+        const REC_KEY: SharedKey = SharedKey::new([7u8; 32]);
 
         type RecRig = StoreRig<
             InMemChannelStore,
@@ -1096,7 +1103,10 @@ mod tests {
                 &local.local(),
                 &Exchange {
                     channel_id: REC_CHANNEL,
-                    shared_key: &REC_KEY,
+                    key: &crate::protocol::ChannelKey {
+                        epoch: 0,
+                        key: (REC_KEY).clone(),
+                    },
                     trace_id: 0,
                     obligation: None,
                 },
@@ -1123,7 +1133,10 @@ mod tests {
                     &local.local(),
                     &Exchange {
                         channel_id: REC_CHANNEL,
-                        shared_key: &REC_KEY,
+                        key: &crate::protocol::ChannelKey {
+                            epoch: 0,
+                            key: (REC_KEY).clone(),
+                        },
                         trace_id: 1,
                         obligation: None,
                     },
@@ -1173,7 +1186,10 @@ mod tests {
                         &local.local(),
                         &Exchange {
                             channel_id: REC_CHANNEL,
-                            shared_key: &REC_KEY,
+                            key: &crate::protocol::ChannelKey {
+                                epoch: 0,
+                                key: (REC_KEY).clone(),
+                            },
                             trace_id: 1,
                             obligation: None,
                         },
@@ -1207,7 +1223,10 @@ mod tests {
                     &local.local(),
                     &Exchange {
                         channel_id: REC_CHANNEL,
-                        shared_key: &REC_KEY,
+                        key: &crate::protocol::ChannelKey {
+                            epoch: 0,
+                            key: (REC_KEY).clone(),
+                        },
                         trace_id: 1,
                         obligation: None,
                     },
@@ -1245,12 +1264,15 @@ mod tests {
                     rig.shares.set_verification_backend_error(true);
                     let local = LocalFixture::new(REC_SECRET_ID);
                     let request = rec_request(1, 0x0BAD_5EED);
-                    let action = PendingAction::VerifyShare {
-                        channel_id: REC_CHANNEL,
-                        request: request.clone(),
-                        shared_key: REC_KEY,
-                        trace_id: 1,
-                    };
+                    let action = PendingAction::request(
+                        REC_CHANNEL,
+                        1,
+                        ChannelRequest::VerifyShare(request.clone()),
+                    )
+                    .sealed_with(&crate::protocol::ChannelKey {
+                        epoch: 0,
+                        key: REC_KEY,
+                    });
                     let obligation =
                         Obligation::for_action(&action, local.local().policy).expect("a request");
 
@@ -1259,7 +1281,10 @@ mod tests {
                         &local.local(),
                         &Exchange {
                             channel_id: REC_CHANNEL,
-                            shared_key: &REC_KEY,
+                            key: &crate::protocol::ChannelKey {
+                                epoch: 0,
+                                key: (REC_KEY).clone(),
+                            },
                             trace_id: 1,
                             obligation: Some(&obligation),
                         },
@@ -1301,12 +1326,11 @@ mod tests {
                         }
                         other => panic!("expected one RequestFailed, got {other:?}"),
                     };
-                    if let Some(PendingAction::RespondToFailure {
+                    if let Some((
                         channel_id,
                         trace_id,
-                        reply,
-                        request,
-                    }) = token
+                        crate::protocol::Action::RespondToFailure { reply, request },
+                    )) = token.map(PendingAction::into_parts)
                     {
                         assert!(rig.transport.sent_envelopes().is_empty());
                         let answer = Obligation::for_failure(
@@ -1346,10 +1370,10 @@ mod tests {
         use crate::protocol::tests::LocalFixture;
         use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel};
         use crate::protocol::{DeRecChannelStore, IgnoreReason, VerifyFailureReason};
-        use derec_proto::{ContactMessage, Protocol, SenderKind, TransportProtocol};
+        use derec_proto::{Protocol, SenderKind, TransportProtocol};
 
         const OTHER: ChannelId = ChannelId(22);
-        const KEY: SharedKey = [0x3C; 32];
+        const KEY: SharedKey = SharedKey::new([0x3C; 32]);
         const PROOF: &[u8] = b"the share bytes the owner committed to";
 
         fn endpoint(uri: &str) -> TransportProtocol {
@@ -1458,8 +1482,13 @@ mod tests {
         /// A helper's OK answer to the challenge with `nonce`, proving
         /// possession of `share`.
         fn answer(nonce: u64, share: &[u8]) -> VerifyShareResponseMessage {
-            let produced = verification_response::produce(CHANNEL, &request(nonce), &KEY, share)
-                .expect("response produced");
+            let produced = verification_response::produce(
+                CHANNEL,
+                &request(nonce),
+                &crate::types::ChannelKey::new(0, KEY.clone()),
+                share,
+            )
+            .expect("response produced");
             verification_response::extract(&produced.envelope, &KEY)
                 .expect("response extracted")
                 .response
@@ -1489,7 +1518,10 @@ mod tests {
                 &local.local(),
                 &Exchange {
                     channel_id: CHANNEL,
-                    shared_key: &KEY,
+                    key: &crate::protocol::ChannelKey {
+                        epoch: 0,
+                        key: (KEY).clone(),
+                    },
                     trace_id: 77,
                     obligation: None,
                 },
@@ -1788,10 +1820,7 @@ mod tests {
                     &mut rig.stores(),
                     SECRET_ID,
                     VERSION,
-                    vec![(
-                        CHANNEL,
-                        SecretValue::PairingContact(ContactMessage::default()),
-                    )],
+                    vec![(CHANNEL, None)],
                     &[],
                     &Round {
                         reply_to: &[],
@@ -1823,7 +1852,7 @@ mod tests {
                     &mut rig.stores(),
                     SECRET_ID,
                     VERSION,
-                    vec![(CHANNEL, SecretValue::SharedKey(KEY))],
+                    vec![(CHANNEL, Some(KeyRing::fresh(KEY)))],
                     &[],
                     &Round {
                         reply_to: &[],

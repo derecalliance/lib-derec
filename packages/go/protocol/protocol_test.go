@@ -83,6 +83,15 @@ func (s *inMemoryChannelStore) Remove(secretID, channelID, replicaID uint64) (bo
 	return existed, nil
 }
 
+func (s *inMemoryChannelStore) RemoveMany(secretID uint64, queries []ChannelQuery) error {
+	for _, q := range queries {
+		if _, err := s.Remove(secretID, q.ChannelID, q.ReplicaID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *inMemoryChannelStore) ListHelpers(secretID uint64, filter HelperFilter) ([]HelperChannel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -158,8 +167,10 @@ type secretStoreKey struct {
 type inMemorySecretStore struct {
 	mu   sync.Mutex
 	data map[secretStoreKey]SecretValue
-	// loadManyCalls records the channelIDs of every LoadMany call, in order.
+	// loadManyCalls records the channelIDs of every LoadMany call, in order,
+	// and loadManyKinds the kind each of those calls asked for.
 	loadManyCalls [][]uint64
+	loadManyKinds []SecretKind
 }
 
 func newInMemorySecretStore() *inMemorySecretStore {
@@ -177,6 +188,7 @@ func (s *inMemorySecretStore) LoadMany(secretID uint64, channelIDs []uint64, kin
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadManyCalls = append(s.loadManyCalls, append([]uint64(nil), channelIDs...))
+	s.loadManyKinds = append(s.loadManyKinds, kind)
 	out := make([]*SecretValue, len(channelIDs))
 	for i, c := range channelIDs {
 		if v, ok := s.data[secretStoreKey{secretID, c, kind}]; ok {
@@ -197,6 +209,15 @@ func (s *inMemorySecretStore) Remove(secretID, channelID uint64, kind SecretKind
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.data, secretStoreKey{secretID, channelID, kind})
+	return nil
+}
+
+func (s *inMemorySecretStore) RemoveMany(secretID uint64, entries []SecretEntry) error {
+	for _, e := range entries {
+		if err := s.Remove(secretID, e.ChannelID, e.Kind); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -229,8 +250,8 @@ func newInMemoryShareStore() *inMemoryShareStore {
 	return &inMemoryShareStore{data: make(map[shareStoreKey]Share)}
 }
 
-func (s *inMemoryShareStore) matches(secretID uint64, channelIDs map[uint64]struct{}, versions map[uint32]struct{}) []Share {
-	var out []Share
+func (s *inMemoryShareStore) matches(secretID uint64, channelIDs map[uint64]struct{}, versions map[uint32]struct{}) []ShareEntry {
+	var out []ShareEntry
 	for k, share := range s.data {
 		if k.secretID != secretID {
 			continue
@@ -245,7 +266,15 @@ func (s *inMemoryShareStore) matches(secretID uint64, channelIDs map[uint64]stru
 				continue
 			}
 		}
-		out = append(out, share)
+		out = append(out, ShareEntry{ChannelID: k.channelID, Share: share})
+	}
+	return out
+}
+
+func sharesOf(entries []ShareEntry) []Share {
+	out := make([]Share, len(entries))
+	for i, e := range entries {
+		out[i] = e.Share
 	}
 	return out
 }
@@ -264,10 +293,10 @@ func toSet[T comparable](vals []T) map[T]struct{} {
 func (s *inMemoryShareStore) Load(secretID, channelID uint64, versions []uint32) ([]Share, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.matches(secretID, map[uint64]struct{}{channelID: {}}, toSet(versions)), nil
+	return sharesOf(s.matches(secretID, map[uint64]struct{}{channelID: {}}, toSet(versions))), nil
 }
 
-func (s *inMemoryShareStore) LoadMany(secretID uint64, channelIDs []uint64, versions []uint32) ([]Share, error) {
+func (s *inMemoryShareStore) LoadMany(secretID uint64, channelIDs []uint64, versions []uint32) ([]ShareEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.matches(secretID, toSet(channelIDs), toSet(versions)), nil
@@ -276,7 +305,7 @@ func (s *inMemoryShareStore) LoadMany(secretID uint64, channelIDs []uint64, vers
 func (s *inMemoryShareStore) LoadAll(secretID uint64, channelIDs []uint64) ([]Share, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.matches(secretID, toSet(channelIDs), nil), nil
+	return sharesOf(s.matches(secretID, toSet(channelIDs), nil)), nil
 }
 
 func (s *inMemoryShareStore) LatestVersion(secretID uint64) (uint32, bool, error) {
@@ -319,6 +348,17 @@ func (s *inMemoryShareStore) RemoveVersions(secretID, channelID uint64, versions
 	defer s.mu.Unlock()
 	for _, v := range versions {
 		delete(s.data, shareStoreKey{channelID, secretID, v})
+	}
+	return nil
+}
+
+func (s *inMemoryShareStore) RemoveVersionsMany(secretID uint64, entries []ShareVersionsEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range entries {
+		for _, v := range e.Versions {
+			delete(s.data, shareStoreKey{e.ChannelID, secretID, v})
+		}
 	}
 	return nil
 }
@@ -434,6 +474,15 @@ func (s *inMemoryStateStore) Remove(secretID uint64, key StateKey) (bool, error)
 	_, existed := s.data[secretID][id]
 	delete(s.data[secretID], id)
 	return existed, nil
+}
+
+func (s *inMemoryStateStore) RemoveMany(secretID uint64, keys []StateKey) error {
+	for _, k := range keys {
+		if _, err := s.Remove(secretID, k); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *inMemoryStateStore) LoadAll(secretID uint64, kind StateKind) ([]StateItem, error) {
